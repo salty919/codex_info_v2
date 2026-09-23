@@ -308,13 +308,15 @@ internal static class GraphPlotProjection
         var dashedY = new List<double>();
         var anchors = Enumerable.Range(firstRenderable, scene.Timestamps.Count - firstRenderable)
             .Where(index => double.IsFinite(scene.Remaining[index]) &&
-                scene.RemainingOrigins[index] is GraphRemainingOrigin.Raw)
+                scene.RemainingOrigins[index] is GraphRemainingOrigin.Raw &&
+                !scene.IsNonOwnedAt(scene.Timestamps[index]))
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
         if (baselineMode is GraphRemainingBaselineMode.PeriodStartAtFullQuota &&
             anchors.Length > 0 &&
             scene.RemainingObserved[anchors[0]] &&
-            scene.Timestamps[anchors[0]] > scene.PeriodStartAt)
+            scene.Timestamps[anchors[0]] > scene.PeriodStartAt &&
+            !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[anchors[0]]))
         {
             // Full quota at the period boundary is a renderer-only convention.
             // Keep it out of GraphScene's raw/history arrays and visibly infer
@@ -331,6 +333,10 @@ internal static class GraphPlotProjection
         {
             var left = anchors[anchor - 1];
             var right = anchors[anchor];
+            if (scene.OverlapsNonOwnedInterval(scene.Timestamps[left], scene.Timestamps[right]))
+            {
+                continue;
+            }
             var before = RemainingValue(scene, left);
             var current = RemainingValue(scene, right);
             var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)
@@ -353,9 +359,10 @@ internal static class GraphPlotProjection
                         scene.Timestamps[left],
                         scene.Timestamps[right]) ||
                     crossesPrediction ||
+                    IsLongUnobservedTokenIncrease(scene, left, right) ||
                     !measured;
                 if (!dashed && SameDoubleBits(current, before) && IsConfirmedIdleInterval(
-                        scene,
+                        scene.IdleIntervals,
                         scene.Timestamps[left],
                         scene.Timestamps[right]))
                 {
@@ -399,7 +406,8 @@ internal static class GraphPlotProjection
         }
 
         var previous = anchors.LastOrDefault(-1);
-        if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous])
+        if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous] &&
+            !scene.OverlapsNonOwnedInterval(scene.Timestamps[previous], scene.PeriodEndAt))
         {
             // The remote source may stop while the current period continues.
             // Keep only the last measured value, horizontally and dashed;
@@ -456,21 +464,27 @@ internal static class GraphPlotProjection
         var risingY = new List<double>();
         var dashedX = new List<double>();
         var dashedY = new List<double>();
+        var idleIntervals = scene.IdleIntervalsForModel(values);
         var anchors = Enumerable.Range(0, values.Count)
             .Where(index => double.IsFinite(values[index]) && values[index] >= 0 &&
                 !scene.ModelSynthetic[index] &&
+                !scene.IsNonOwnedAt(scene.Timestamps[index]) &&
                 (scene.IsModelIntervalReliable(values, index, index) ||
-                 IsConfirmedIdleTimestamp(scene, scene.Timestamps[index])))
+                 IsConfirmedIdleTimestamp(idleIntervals, scene.Timestamps[index])))
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, ProjectionStyle Style)>();
         for (var anchor = 1; anchor < anchors.Length; anchor++)
         {
             var left = anchors[anchor - 1];
             var right = anchors[anchor];
+            if (scene.OverlapsNonOwnedInterval(scene.Timestamps[left], scene.Timestamps[right]))
+            {
+                continue;
+            }
             var before = values[left];
             var current = values[right];
             var confirmedIdle = IsConfirmedIdleInterval(
-                scene,
+                idleIntervals,
                 scene.Timestamps[left],
                 scene.Timestamps[right]);
             if (!confirmedIdle &&
@@ -521,6 +535,7 @@ internal static class GraphPlotProjection
                 var dashed = scene.HasConfirmedGapBetween(
                         scene.Timestamps[left],
                         scene.Timestamps[right]) ||
+                    IsLongUnobservedTokenIncrease(scene, left, right) ||
                     crossesPrediction;
                 smoothableIntervals.Add((
                     left,
@@ -567,7 +582,8 @@ internal static class GraphPlotProjection
         }
 
         var previous = anchors.LastOrDefault(-1);
-        if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous])
+        if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous] &&
+            !scene.OverlapsNonOwnedInterval(scene.Timestamps[previous], scene.PeriodEndAt))
         {
             AppendSegment(
                 dashedX,
@@ -585,19 +601,51 @@ internal static class GraphPlotProjection
             new GraphLineProjection(dashedX, dashedY));
     }
 
-    private static bool IsConfirmedIdleInterval(GraphScene scene, double startAt, double endAt) =>
-        scene.IdleIntervals.Any(interval =>
+    private static bool IsConfirmedIdleInterval(
+        IReadOnlyList<GraphIdleInterval> intervals,
+        double startAt,
+        double endAt) =>
+        intervals.Any(interval =>
             startAt >= interval.StartAt && endAt <= interval.EndAt);
 
-    private static bool IsConfirmedIdleTimestamp(GraphScene scene, double timestamp) =>
-        scene.IdleIntervals.Any(interval =>
+    private static bool IsConfirmedIdleTimestamp(
+        IReadOnlyList<GraphIdleInterval> intervals,
+        double timestamp) =>
+        intervals.Any(interval =>
             timestamp >= interval.StartAt && timestamp <= interval.EndAt);
+
+    private static bool IsLongUnobservedTokenIncrease(GraphScene scene, int left, int right) =>
+        scene.Metric == GraphMetric.Tokens &&
+        scene.Timestamps[right] - scene.Timestamps[left] >= GraphScene.SustainedUnusedMinimumSeconds &&
+        scene.TryGetTokenIntervalEvidence(left, right, out var advanced) &&
+        advanced;
 
     /// <summary>Returns every evidence interval without a pixel-width filter.</summary>
     public static IReadOnlyList<GraphIdleInterval> BuildVisibleIdleIntervals(GraphScene scene)
     {
         ArgumentNullException.ThrowIfNull(scene);
         return scene.IdleIntervals.ToArray();
+    }
+
+    public static IReadOnlyList<GraphUnusedInterval> BuildVisibleUnusedIntervals(GraphScene scene)
+    {
+        ArgumentNullException.ThrowIfNull(scene);
+        var intervals = scene.IdleIntervals
+            .Select(interval => new GraphUnusedInterval(interval.StartAt, interval.EndAt))
+            .OrderBy(interval => interval.StartAt);
+        var merged = new List<GraphUnusedInterval>();
+        foreach (var interval in intervals)
+        {
+            if (merged.Count > 0 && interval.StartAt <= merged[^1].EndAt)
+            {
+                merged[^1] = merged[^1] with { EndAt = Math.Max(interval.EndAt, merged[^1].EndAt) };
+            }
+            else
+            {
+                merged.Add(interval);
+            }
+        }
+        return merged;
     }
 
     public static IReadOnlyList<GraphEndpointLabel> BuildEndpointLabels(

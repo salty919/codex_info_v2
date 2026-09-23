@@ -288,7 +288,14 @@ fn default_account_readers(codex_home: &Path, data_root: &Path) -> Result<Accoun
                 partition.current_interval_end,
                 reader,
             )
-            .with_login_id(database_login_id.or(partition.login_id.clone())),
+            .with_login_id(database_login_id.or(partition.login_id.clone()))
+            .with_ownership_intervals(
+                partition.lifecycle_intervals.iter().map(|interval|
+                    codex_info_rest_contract::PublicAccountOwnershipInterval {
+                        start_at: interval.start_at,
+                        end_at: interval.end_at,
+                    }).collect(),
+            ),
         );
     }
     Ok(AccountCatalog {

@@ -703,7 +703,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                         : Texts.HistoricalAccountSuffix,
                 })))
             .ToArray();
-        var accountsChanged = !accounts.SequenceEqual(normalizedAccounts);
+        var accountsChanged = accounts.Count != normalizedAccounts.Length ||
+            !accounts.Zip(normalizedAccounts).All(pair =>
+                (pair.First with { OwnershipIntervals = null }) ==
+                    (pair.Second with { OwnershipIntervals = null }) &&
+                SameOwnershipIntervals(pair.First.OwnershipIntervals, pair.Second.OwnershipIntervals));
         if (accountsChanged)
         {
             accounts.ReplaceAll(normalizedAccounts, notify: false);
@@ -733,6 +737,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         var previousSelected = selectedAccount;
         var changed = previousSelected?.Id != next?.Id;
         var accountKindChanged = previousSelected?.IsCurrent != next?.IsCurrent;
+        var ownershipChanged = !SameOwnershipIntervals(
+            previousSelected?.OwnershipIntervals,
+            next?.OwnershipIntervals);
         var labelChanged = previousSelected?.MainDisplayLabel != next?.MainDisplayLabel;
         selectedAccount = next;
         if (changed || accountKindChanged)
@@ -746,7 +753,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(Accounts));
             Notify(nameof(HasAccounts));
         }
-        if (changed || accountKindChanged)
+        if (changed || accountKindChanged || ownershipChanged)
         {
             Notify(nameof(SelectedAccount));
         }
@@ -765,6 +772,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
         return true;
     }
+
+    private static bool SameOwnershipIntervals(
+        IReadOnlyList<ApiAccountOwnershipInterval>? left,
+        IReadOnlyList<ApiAccountOwnershipInterval>? right) =>
+        left is null ? right is null : right is not null && left.SequenceEqual(right);
 
     private void ClearAccountPresentationLocked()
     {

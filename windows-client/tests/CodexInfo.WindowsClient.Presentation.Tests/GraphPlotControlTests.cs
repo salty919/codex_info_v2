@@ -1931,6 +1931,273 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void TokenFlatQuotaDropIsIdleWithoutFlatteningRemaining()
+    {
+        using var document = LoadGraphEvidenceOracle();
+        var fixture = document.RootElement.GetProperty("issue137_token_flat_quota_drop_v1");
+        var expected = fixture.GetProperty("expected");
+        var samples = Issue137TokenFlatQuotaDropSamples(fixture);
+        var periodStart = fixture.GetProperty("period_start").GetInt64();
+        var periodEnd = fixture.GetProperty("period_end").GetInt64();
+        var scene = GraphScene.Create(samples, GraphMetric.Tokens, periodStart, periodEnd);
+
+        Assert.Equal(
+            expected.GetProperty("idle_intervals").EnumerateArray().Select(interval =>
+                new GraphIdleInterval(interval[0].GetInt64(), interval[1].GetInt64(), false)),
+            scene.IdleIntervals);
+        Assert.Equal(
+            expected.GetProperty("remaining_input").EnumerateArray().Select(value => value.GetDouble()),
+            scene.ObservedRemainingValues);
+        Assert.Equal(
+            expected.GetProperty("remaining_effective").EnumerateArray().Select(value => value.GetDouble()),
+            scene.Remaining);
+
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        Assert.Equal(
+            SegmentPairs(expected.GetProperty("model_segments").GetProperty("SOL").GetProperty("idle")),
+            SegmentPairs(model.Idle));
+        Assert.Empty(model.Flat.X);
+        Assert.Empty(model.Rising.X);
+        Assert.Empty(model.Dashed.X);
+        Assert.All(model.Idle.Y, value => Assert.Equal(model.Idle.Y[0], value));
+    }
+
+    [Fact]
+    public void SingleUnavailableSlotKeepsObservedQuotaStep()
+    {
+        var samples = new[]
+        {
+            CompleteModelSample(0, 90, 1, 100),
+            new ApiHistorySample(
+                300,
+                10_000,
+                89,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.UnavailableModelSource)
+            {
+                ModelsComplete = false,
+                ModelSamples = [],
+            },
+            CompleteModelSample(600, 88, 1, 100),
+        };
+
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 600);
+
+        Assert.Equal(89d, scene.ObservedRemainingValues[1]);
+    }
+
+    [Fact]
+    public void SingleUnavailableSixtySecondQuotaStepPreservesObservedAnchor()
+    {
+        static ApiHistorySample Complete(long timestamp, double remaining) =>
+            new(
+                timestamp,
+                2_000,
+                remaining,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                TaskActiveSincePrevious = false,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("LUNA", null, null, null, 0)
+                    {
+                        TotalTokens = 0,
+                    },
+                    new ApiHistoryModelSample("SOL", null, null, null, 1)
+                    {
+                        TotalTokens = 100,
+                    },
+                ],
+            };
+
+        static ApiHistorySample Unavailable(long timestamp) =>
+            new(
+                timestamp,
+                2_000,
+                89,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.UnavailableModelSource)
+            {
+                ModelsComplete = false,
+                TaskActiveSincePrevious = false,
+                ModelSamples = null,
+            };
+
+        var samples = Enumerable.Range(0, 11)
+            .Select(minute => minute == 5
+                ? Unavailable(minute * 60)
+                : Complete(minute * 60, minute < 5 ? 90 : minute < 10 ? 89 : 88))
+            .ToArray();
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 600);
+        var expectedTimestamps = Enumerable.Range(0, 11)
+            .Select(minute => (double)(minute * 60))
+            .ToArray();
+        var expectedRemaining = new[]
+        {
+            90d, 90d, 90d, 90d, 90d, 89d, 89d, 89d, 89d, 89d, 88d,
+        };
+        var expectedSegments = Enumerable.Range(0, 10)
+            .Select(index => ((long)(index * 60), (long)((index + 1) * 60)))
+            .ToArray();
+
+        Assert.Equal(expectedTimestamps, scene.Timestamps);
+        Assert.Equal(expectedRemaining, scene.ObservedRemainingValues);
+        Assert.Equal(expectedRemaining, scene.Remaining);
+        Assert.Equal(89d, scene.ObservedRemainingValues[5]);
+        Assert.Equal(89d, scene.Remaining[5]);
+        Assert.Empty(scene.IdleIntervals);
+
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Equal(expectedSegments, SegmentPairs(remaining.Solid));
+        Assert.Empty(remaining.Idle.X);
+        Assert.Empty(remaining.Dashed.X);
+        Assert.Equal(3f, GraphPlotControl.MeasuredRemainingLineWidth);
+
+        foreach (var (model, expectedValue) in new[]
+                 {
+                     (scene.Luna, 0d),
+                     (scene.Sol, 1d),
+                 })
+        {
+            var lines = GraphPlotProjection.BuildModelLines(scene, model);
+            Assert.Equal([(240L, 360L)], SegmentPairs(lines.Dashed));
+            Assert.Equal([expectedValue, expectedValue], lines.Dashed.Y);
+            Assert.Empty(lines.Idle.X);
+            Assert.Empty(lines.Rising.X);
+            Assert.Equal(1f, GraphPlotControl.InferredLineWidth);
+        }
+    }
+
+    [Fact]
+    public void Issue137_token_flat_quota_drop_matches_literal_oracle()
+    {
+        using var document = LoadGraphEvidenceOracle();
+        var fixture = document.RootElement.GetProperty("issue137_token_flat_quota_drop_v1");
+        var expected = fixture.GetProperty("expected");
+        var samples = Issue137TokenFlatQuotaDropSamples(fixture);
+        var periodStart = fixture.GetProperty("period_start").GetInt64();
+        var periodEnd = fixture.GetProperty("period_end").GetInt64();
+        var expectedTimestamps = expected.GetProperty("timestamps")
+            .EnumerateArray()
+            .Select(value => value.GetInt64())
+            .ToArray();
+        var expectedUniverse = expected.GetProperty("model_universe")
+            .EnumerateArray()
+            .Select(value => value.GetString())
+            .ToArray();
+        var expectedIdle = expected.GetProperty("idle_intervals")
+            .EnumerateArray()
+            .Select(interval => new GraphIdleInterval(
+                interval[0].GetInt64(),
+                interval[1].GetInt64(),
+                PreserveBoundary: false))
+            .ToArray();
+
+        GraphScene? dollarScene = null;
+        GraphScene? tokenScene = null;
+        foreach (var (metric, seriesProperty) in new[]
+                 {
+                     (GraphMetric.Dollars, "dollar_series"),
+                     (GraphMetric.Tokens, "token_series"),
+                 })
+        {
+            var scene = GraphScene.Create(samples, metric, periodStart, periodEnd);
+            if (metric == GraphMetric.Dollars)
+                dollarScene = scene;
+            else
+                tokenScene = scene;
+
+            Assert.Equal(expectedTimestamps.Select(value => (double)value), scene.Timestamps);
+            Assert.Equal(expectedUniverse, scene.ModelSeries.Keys);
+            var expectedSeries = expected.GetProperty(seriesProperty);
+            foreach (var model in expectedUniverse)
+            {
+                Assert.Equal(
+                    expectedSeries.GetProperty(model!).EnumerateArray().Select(value => value.GetDouble()),
+                    scene.ModelSeries[model!]);
+            }
+
+            Assert.Equal(expectedIdle, scene.IdleIntervals);
+            Assert.Equal(
+                expected.GetProperty("remaining_input").EnumerateArray().Select(value => value.GetDouble()),
+                scene.ObservedRemainingValues);
+            Assert.Equal(
+                expected.GetProperty("remaining_effective").EnumerateArray().Select(value => value.GetDouble()),
+                scene.Remaining);
+
+            foreach (var modelName in expectedUniverse)
+            {
+                var modelLines = GraphPlotProjection.BuildModelLines(scene, scene.ModelSeries[modelName!]);
+                var expectedModel = expected.GetProperty("model_segments").GetProperty(modelName!);
+                Assert.Equal(
+                    expectedTimestamps.Select(value => (double)value),
+                    modelLines.Idle.X);
+                Assert.Equal(SegmentPairs(expectedModel.GetProperty("idle")), SegmentPairs(modelLines.Idle));
+                Assert.Equal(SegmentPairs(expectedModel.GetProperty("flat")), SegmentPairs(modelLines.Flat));
+                Assert.Equal(SegmentPairs(expectedModel.GetProperty("rising")), SegmentPairs(modelLines.Rising));
+                Assert.Equal(SegmentPairs(expectedModel.GetProperty("dashed")), SegmentPairs(modelLines.Dashed));
+                var expectedModelLineValues = expected.GetProperty("model_line_values")
+                    .GetProperty(metric == GraphMetric.Dollars ? "dollars" : "tokens")
+                    .GetProperty(modelName!)
+                    .EnumerateArray()
+                    .Select(value => value.GetDouble())
+                    .ToArray();
+                Assert.Equal(expectedModelLineValues, modelLines.Idle.Y);
+                Assert.All(modelLines.Idle.Y, value => Assert.Equal(modelLines.Idle.Y[0], value));
+                Assert.Empty(modelLines.Flat.Y);
+                Assert.Empty(modelLines.Rising.Y);
+                Assert.Empty(modelLines.Dashed.Y);
+            }
+
+            var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+            var expectedRemaining = expected.GetProperty("remaining_segments");
+            Assert.Equal(
+                SegmentPairs(expectedRemaining.GetProperty("idle")),
+                SegmentPairs(remaining.Idle));
+            Assert.Equal(
+                SegmentPairs(expectedRemaining.GetProperty("solid")),
+                SegmentPairs(remaining.Solid));
+            Assert.Equal(
+                SegmentPairs(expectedRemaining.GetProperty("dashed")),
+                SegmentPairs(remaining.Dashed));
+        }
+
+        Assert.NotNull(dollarScene);
+        Assert.NotNull(tokenScene);
+        var expectedLineWidths = expected.GetProperty("line_widths");
+        Assert.Equal(expectedLineWidths.GetProperty("model_idle").GetSingle(), GraphPlotControl.IdleLineWidth);
+        Assert.Equal(expectedLineWidths.GetProperty("remaining_idle").GetSingle(), GraphPlotControl.IdleLineWidth);
+        Assert.Equal(
+            expectedLineWidths.GetProperty("remaining_solid").GetSingle(),
+            GraphPlotControl.MeasuredRemainingLineWidth);
+
+        var labels = GraphPlotProjection.BuildEndpointLabels(dollarScene!, CultureInfo.InvariantCulture);
+        Assert.Contains(labels, label =>
+            label.Series == GraphSeries.Sol &&
+            label.Text == expected.GetProperty("latest_labels").GetProperty("SOL").GetString());
+        Assert.Contains(labels, label =>
+            label.Series == GraphSeries.Remaining &&
+            label.Text == expected.GetProperty("latest_labels").GetProperty("remaining").GetString());
+    }
+
+    [Fact]
     public async Task Issue137_continuity_v4_oracle_is_identical_for_dollars_tokens_and_exact_period_end()
     {
         using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(
@@ -3368,6 +3635,125 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void ModelIdleIgnoresQuotaAndOtherModelTokenChanges()
+    {
+        static ApiHistorySample Complete(
+            long timestamp,
+            double remaining,
+            ulong lunaTokens,
+            ulong solTokens,
+            ulong terraTokens,
+            double lunaDollars,
+            double solDollars,
+            double terraDollars) =>
+            new(
+                timestamp,
+                2_000,
+                remaining,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("LUNA", null, null, null, lunaDollars)
+                    {
+                        TotalTokens = lunaTokens,
+                    },
+                    new ApiHistoryModelSample("SOL", null, null, null, solDollars)
+                    {
+                        TotalTokens = solTokens,
+                    },
+                    new ApiHistoryModelSample("TERRA", null, null, null, terraDollars)
+                    {
+                        TotalTokens = terraTokens,
+                    },
+                ],
+            };
+
+        var samples = new[]
+        {
+            Complete(0, 90, 0, 100, 0, 0, 100, 0),
+            Complete(600, 89, 0, 100, 10, 0, 100, 10),
+            Complete(1_200, 88, 0, 100, 20, 0, 100, 20),
+        };
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 1_200);
+
+        var luna = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
+        var sol = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        var terra = GraphPlotProjection.BuildModelLines(scene, scene.Terra);
+
+        Assert.Equal([(0L, 600L), (600L, 1_200L)], SegmentPairs(luna.Idle));
+        Assert.Equal([(0L, 600L), (600L, 1_200L)], SegmentPairs(sol.Idle));
+        Assert.Equal([(0L, 600L), (600L, 1_200L)], SegmentPairs(terra.Rising));
+        Assert.Empty(terra.Idle.X);
+        Assert.Empty(scene.IdleIntervals);
+    }
+
+    [Fact]
+    public void OwnTokenIncreaseInterruptsOnlyThatModelsIdleLine()
+    {
+        static ApiHistorySample Complete(
+            long timestamp,
+            double remaining,
+            ulong lunaTokens,
+            ulong solTokens,
+            ulong terraTokens,
+            double lunaDollars,
+            double solDollars,
+            double terraDollars) =>
+            new(
+                timestamp,
+                2_000,
+                remaining,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("LUNA", null, null, null, lunaDollars)
+                    {
+                        TotalTokens = lunaTokens,
+                    },
+                    new ApiHistoryModelSample("SOL", null, null, null, solDollars)
+                    {
+                        TotalTokens = solTokens,
+                    },
+                    new ApiHistoryModelSample("TERRA", null, null, null, terraDollars)
+                    {
+                        TotalTokens = terraTokens,
+                    },
+                ],
+            };
+
+        var samples = new[]
+        {
+            Complete(0, 90, 0, 100, 0, 0, 100, 0),
+            Complete(600, 90, 1, 100, 0, 1, 100, 0),
+            Complete(1_200, 90, 1, 100, 0, 1, 100, 0),
+        };
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 1_200);
+
+        var luna = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
+        var sol = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+
+        Assert.Equal([(0L, 600L)], SegmentPairs(luna.Rising));
+        Assert.Equal([(600L, 1_200L)], SegmentPairs(luna.Idle));
+        Assert.Equal([(0L, 600L), (600L, 1_200L)], SegmentPairs(sol.Idle));
+    }
+
+    [Fact]
     public void Source_regression_with_a_partial_zero_vector_is_not_idle_or_a_quota_staircase()
     {
         static ApiHistorySample Complete(long timestamp, double remaining) =>
@@ -3636,6 +4022,47 @@ public sealed class GraphPlotControlTests
                     out var taskActive) && taskActive.ValueKind != JsonValueKind.Null
                         ? taskActive.GetBoolean()
                         : null,
+            })
+            .ToArray();
+
+    private static JsonDocument LoadGraphEvidenceOracle() =>
+        JsonDocument.Parse(File.ReadAllText(Path.Combine(
+            AppContext.BaseDirectory,
+            "Fixtures",
+            "graph_evidence_oracle.json")));
+
+    private static ApiHistorySample[] Issue137TokenFlatQuotaDropSamples(JsonElement fixture) =>
+        fixture.GetProperty("samples")
+            .EnumerateArray()
+            .Select(sample =>
+            {
+                var models = sample.GetProperty("models")
+                    .EnumerateArray()
+                    .Select(model => new ApiHistoryModelSample(
+                        model.GetProperty("model").GetString()!,
+                        null,
+                        null,
+                        null,
+                        model.GetProperty("total_dollars").GetDouble())
+                    {
+                        TotalTokens = model.GetProperty("total_tokens").GetUInt64(),
+                    })
+                    .ToArray();
+                return new ApiHistorySample(
+                    sample.GetProperty("timestamp").GetInt64(),
+                    10_000,
+                    sample.GetProperty("remaining_percent").GetDouble(),
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    sample.GetProperty("model_source").GetString()!)
+                {
+                    ModelsComplete = sample.GetProperty("models_complete").GetBoolean(),
+                    ModelSamples = models,
+                };
             })
             .ToArray();
 

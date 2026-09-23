@@ -262,6 +262,48 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public void AccountDirectoryRefreshNotifiesSelectedOwnershipOnlyWhenIntervalsChange()
+    {
+        static ApiAccountsSnapshot Directory(long secondStart) => new(
+            "account-7",
+            [new ApiAccount("account-7", true, 1790077988, null)
+            {
+                OwnershipIntervals =
+                [
+                    new ApiAccountOwnershipInterval(1789951507, 1789967251),
+                    new ApiAccountOwnershipInterval(secondStart, null),
+                ],
+            }]);
+
+        using var viewModel = new MainWindowViewModel(new AccountScopedClient());
+        Assert.True(ApplyAccountsSnapshot(viewModel, Directory(1790077988)));
+        var generation = AccountSelectionGeneration(viewModel);
+        var selectedNotifications = 0;
+        var accountsNotifications = 0;
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(MainWindowViewModel.SelectedAccount))
+            {
+                selectedNotifications++;
+            }
+            if (args.PropertyName == nameof(MainWindowViewModel.Accounts))
+            {
+                accountsNotifications++;
+            }
+        };
+
+        Assert.True(ApplyAccountsSnapshot(viewModel, Directory(1790077988)));
+        Assert.Equal(0, selectedNotifications);
+        Assert.Equal(0, accountsNotifications);
+
+        Assert.True(ApplyAccountsSnapshot(viewModel, Directory(1790077989)));
+        Assert.Equal(1, selectedNotifications);
+        Assert.Equal(1, accountsNotifications);
+        Assert.Equal(1790077989, viewModel.SelectedAccount!.OwnershipIntervals![1].StartAt);
+        Assert.Equal(generation, AccountSelectionGeneration(viewModel));
+    }
+
+    [Fact]
     public async Task LoginChangeClearsOldPresentationAndRoutesTheNextRefreshToCurrent()
     {
         var client = new AccountScopedClient();

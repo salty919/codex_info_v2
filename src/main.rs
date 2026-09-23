@@ -7474,7 +7474,6 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         .collect::<BTreeSet<_>>();
     let (accepted_tokens, _) =
         accepted_graph_model_timelines(raw_timelines, &projection_minutes, true, confirmed_gaps);
-
     // Only a non-empty vector of lossless same-minute raw observations can
     // prove inactivity. Legacy raw values participate only in exact equality
     // here; they remain excluded from arithmetic baselines.
@@ -7506,26 +7505,6 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         // appeared in a legacy row elsewhere must not be fabricated here.
         (!vector.is_empty()).then_some((vector, all_legacy))
     };
-    let direct_remaining = |timestamp: i64| -> Option<u64> {
-        let mut accepted = None;
-        for sample in samples.iter().filter(|sample| {
-            sample.timestamp.div_euclid(60) * 60 == timestamp
-                && sample.timestamp >= period_start
-                && sample.timestamp <= period_end
-        }) {
-            let value = sample.remaining_percent;
-            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
-                return None;
-            }
-            let bits = value.to_bits();
-            if accepted.is_some_and(|prior| prior != bits) {
-                return None;
-            }
-            accepted = Some(bits);
-        }
-        accepted
-    };
-
     let exact_model_timestamps = raw_timelines
         .values()
         .flat_map(BTreeMap::keys)
@@ -7543,36 +7522,32 @@ fn token_idle_timestamp_intervals_with_render_evidence(
     // Every direct observation inside a sparse interval must preserve the
     // exact endpoint model set and lossless token totals. Dollars are derived
     // display values and never participate in this authority path.
-    let direct_models_remain_flat =
-        |start: i64, end: i64, values: &[(String, u64)], remaining_bits: u64| {
-            let baseline = values
+    let direct_models_remain_flat = |start: i64, end: i64, values: &[(String, u64)]| {
+        let baseline = values
+            .iter()
+            .map(|(name, tokens)| (name.as_str(), *tokens))
+            .collect::<BTreeMap<_, _>>();
+        for timestamp in exact_model_timestamps.range((
+            std::ops::Bound::Excluded(start),
+            std::ops::Bound::Excluded(end),
+        )) {
+            let Some((vector, _)) = raw_idle_vector(*timestamp) else {
+                return false;
+            };
+            let values = vector
                 .iter()
                 .map(|(name, tokens)| (name.as_str(), *tokens))
                 .collect::<BTreeMap<_, _>>();
-            for timestamp in exact_model_timestamps.range((
-                std::ops::Bound::Excluded(start),
-                std::ops::Bound::Excluded(end),
-            )) {
-                if direct_remaining(*timestamp) != Some(remaining_bits) {
-                    return false;
-                }
-                let Some((vector, _)) = raw_idle_vector(*timestamp) else {
-                    return false;
-                };
-                let values = vector
+            if values.len() != baseline.len()
+                || baseline
                     .iter()
-                    .map(|(name, tokens)| (name.as_str(), *tokens))
-                    .collect::<BTreeMap<_, _>>();
-                if values.len() != baseline.len()
-                    || baseline
-                        .iter()
-                        .any(|(name, expected)| values.get(name).copied() != Some(*expected))
-                {
-                    return false;
-                }
+                    .any(|(name, expected)| values.get(name).copied() != Some(*expected))
+            {
+                return false;
             }
-            true
-        };
+        }
+        true
+    };
 
     let mut anchors = raw_timelines
         .values()
@@ -7583,10 +7558,10 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         .into_iter()
         .filter_map(|timestamp| {
             let (vector, is_legacy) = raw_idle_vector(timestamp)?;
-            Some((timestamp, vector, direct_remaining(timestamp)?, is_legacy))
+            Some((timestamp, vector, is_legacy))
         })
         .collect::<Vec<_>>();
-    anchors.sort_by_key(|(timestamp, _, _, _)| *timestamp);
+    anchors.sort_by_key(|(timestamp, _, _)| *timestamp);
     // Any explicit non-raw source row is a boundary. Timestamp sparsity by
     // itself is not: two adjacent valid anchors may still be far apart.
     let has_numeric_incomplete_row = |start: i64, end: i64| {
@@ -7617,16 +7592,14 @@ fn token_idle_timestamp_intervals_with_render_evidence(
     };
     let mut proven = Vec::<(i64, i64)>::new();
     for pair in anchors.windows(2) {
-        let [(start, start_vector, start_remaining, _), (end, end_vector, end_remaining, _)] = pair
-        else {
+        let [(start, start_vector, _), (end, end_vector, _)] = pair else {
             continue;
         };
         if end <= start
             || start_vector != end_vector
-            || start_remaining != end_remaining
             || has_numeric_incomplete_row(*start, *end)
             || has_unavailable_incomplete_row(*start, *end)
-            || !direct_models_remain_flat(*start, *end, start_vector, *start_remaining)
+            || !direct_models_remain_flat(*start, *end, start_vector)
             || graph_interval_overlaps_confirmed_gap(*start, *end, confirmed_gaps)
         {
             continue;
@@ -44898,6 +44871,229 @@ mod tests {
                 preserve_boundary: false,
             }]
         );
+    }
+
+    #[test]
+    fn graph_idle_token_flat_quota_drop_preserves_remaining_truth() {
+        // Literal 20-minute run: recorded model consumption never changes,
+        // while independently observed quota falls twice.
+        let timestamps = [0_i64, 300, 600, 900, 1_200];
+        let raw_remaining = [90.0, 90.0, 89.0, 89.0, 88.0];
+        let raw_sol_dollars = [1.0, 1.0, 1.01, 1.01, 1.01];
+        let samples = timestamps
+            .into_iter()
+            .zip(raw_remaining)
+            .map(|(timestamp, remaining)| {
+                UsageHistorySample::new(
+                    timestamp,
+                    1_200,
+                    remaining,
+                    ModelDollarTotals::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let raw: super::GraphModelTimelines = BTreeMap::from([
+            (
+                "SOL".to_owned(),
+                timestamps
+                    .into_iter()
+                    .zip(raw_sol_dollars)
+                    .map(|(timestamp, dollar)| {
+                        (
+                            timestamp,
+                            super::GraphModelPoint {
+                                dollar,
+                                tokens: 100.0,
+                                raw_tokens: Some(100),
+                                origin: super::GraphModelOrigin::Direct,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            (
+                "LUNA".to_owned(),
+                timestamps
+                    .into_iter()
+                    .map(|timestamp| {
+                        (
+                            timestamp,
+                            super::GraphModelPoint {
+                                dollar: 0.0,
+                                tokens: 0.0,
+                                raw_tokens: Some(0),
+                                origin: super::GraphModelOrigin::Direct,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+        ]);
+        let remaining_evidence = super::remaining_evidence_from_model_timelines(
+            &references,
+            0,
+            1_200,
+            &raw,
+            true,
+            &[],
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            remaining_evidence
+                .iter()
+                .map(|point| (point.timestamp, point.raw, point.effective, point.origin))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, Some(90.0), 90.0, super::GraphRemainingOrigin::Raw),
+                (300, Some(90.0), 90.0, super::GraphRemainingOrigin::Raw),
+                (600, Some(89.0), 89.0, super::GraphRemainingOrigin::Raw),
+                (900, Some(89.0), 89.0, super::GraphRemainingOrigin::Raw),
+                (1_200, Some(88.0), 88.0, super::GraphRemainingOrigin::Raw),
+            ]
+        );
+
+        for show_tokens in [false, true] {
+            let graph = super::graph_paths_for_selection_with_sources_and_astra(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 1_200,
+                    show_luna: true,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &[],
+                    model_timelines: &raw,
+                },
+            );
+            assert_eq!(
+                graph.unused_intervals,
+                [super::UnusedIntervalPosition {
+                    start: 0.0,
+                    width: 100.0,
+                    preserve_boundary: false,
+                }],
+                "a valid quota decrease cannot erase a 20-minute raw-token idle band"
+            );
+            assert!(!graph.sol_idle.is_empty());
+            assert!(!graph.luna_idle.is_empty());
+            assert!(graph.sol_flat.is_empty());
+            assert!(graph.sol_rising.is_empty());
+            assert!(graph.sol_inferred.is_empty());
+            assert!(graph.remaining_idle.contains("M0.00 10.80 L25.00 10.80"));
+            assert!(graph.remaining_solid.contains("50.00 11.78"));
+            assert!(graph.remaining_solid.contains("100.00 12.76"));
+            assert!(graph.remaining_inferred.is_empty());
+            assert_eq!(graph.current_remaining_label, "88%");
+            assert_eq!(graph.current_sol_label, if show_tokens { "100" } else { "$1.00" });
+        }
+    }
+
+    #[test]
+    fn graph_idle_single_unavailable_quota_step_preserves_raw_anchor() {
+        // One exact 60-second unavailable slot has its own valid quota
+        // observation. Dropping that slot would erase the 89% raw anchor.
+        let samples = (0_i64..=10)
+            .map(|minute| {
+                UsageHistorySample::new(
+                    minute * 60,
+                    1_200,
+                    if minute < 5 {
+                        90.0
+                    } else if minute == 5 {
+                        89.0
+                    } else {
+                        88.0
+                    },
+                    ModelDollarTotals::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let unavailable = BTreeSet::from([300_i64]);
+        let timelines = [("LUNA", 0_u64, 0.0), ("SOL", 100_u64, 1.0)]
+            .into_iter()
+            .map(|(name, tokens, dollar)| {
+                (
+                    name.to_owned(),
+                    (0_i64..=10)
+                        .filter(|minute| *minute != 5)
+                        .map(|minute| {
+                            (
+                                minute * 60,
+                                super::GraphModelPoint {
+                                    dollar,
+                                    tokens: tokens as f64,
+                                    raw_tokens: Some(tokens),
+                                    origin: super::GraphModelOrigin::Direct,
+                                },
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<super::GraphModelTimelines>();
+
+        assert!(super::recoverable_sampling_jitter_minutes(
+            &references,
+            0,
+            600,
+            &timelines,
+            &unavailable,
+            &unavailable,
+            &[],
+        )
+        .is_empty());
+        let remaining = super::remaining_evidence_from_model_timelines(
+            &references,
+            0,
+            600,
+            &timelines,
+            true,
+            &[],
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .find(|point| point.timestamp == 300)
+                .map(|point| (point.timestamp, point.raw, point.effective, point.origin)),
+            Some((300, Some(89.0), 89.0, super::GraphRemainingOrigin::Raw)),
+        );
+
+        for show_tokens in [false, true] {
+            let graph =
+                super::graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: 0,
+                        period_end: 600,
+                        show_luna: true,
+                        show_terra: false,
+                        show_sol: true,
+                        show_astra: false,
+                        show_tokens,
+                        untrusted_minutes: &unavailable,
+                        confirmed_gaps: &[],
+                        model_timelines: &timelines,
+                    },
+                    None,
+                    Some(&unavailable),
+                );
+            assert!(graph.unused_intervals.is_empty());
+            assert!(graph.sol_idle.is_empty());
+            assert!(graph.luna_idle.is_empty());
+            // Native *_inferred paths contain the visible 1px dashed bridges.
+            assert!(graph.sol_inferred.matches('M').count() > 1);
+            assert!(graph.luna_inferred.matches('M').count() > 1);
+            assert!(graph.remaining_idle.is_empty());
+            assert!(graph.remaining_solid.contains("50.00 11.78"));
+            assert!(graph.remaining_inferred.is_empty());
+            assert_eq!(graph.current_remaining_label, "88%");
+        }
     }
 
     #[test]
