@@ -3930,6 +3930,37 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void Low_rate_long_model_change_is_connected_and_marked_unused()
+    {
+        const long start = 1_000;
+        const long shortInterval = 60;
+        const long tenYears = 10 * 365 * 24 * 60 * 60;
+        var longGapStart = start + 2 * shortInterval;
+        var longGapEnd = longGapStart + tenYears;
+        var points = new[]
+        {
+            Point(start, 100, 1, 0, 0),
+            Point(start + shortInterval, 99, 2, 0, 0),
+            Point(longGapStart, 98, 3, 0, 0),
+            Point(longGapEnd, 97, 4, 0, 0),
+            Point(longGapEnd + shortInterval, 96, 5, 0, 0),
+        };
+
+        var scene = Scene(points);
+        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        var longGap = (longGapStart, longGapEnd);
+
+        Assert.Equal(
+            [(start, start + shortInterval),
+             (start + shortInterval, longGapStart),
+             (longGapEnd, longGapEnd + shortInterval)],
+            SegmentPairs(lines.Rising));
+        Assert.Contains(longGap, SegmentPairs(lines.Dashed));
+        Assert.Contains(scene.IdleIntervals, interval =>
+            interval.StartAt <= longGapStart && interval.EndAt >= longGapEnd);
+    }
+
+    [Fact]
     public void Idle_band_never_labels_a_long_unobserved_spend_gap_as_idle()
     {
         var points = new[]
@@ -3944,6 +3975,164 @@ public sealed class GraphPlotControlTests
 
         Assert.DoesNotContain(Scene(points).IdleIntervals, candidate =>
             candidate.StartAt == 1_060 && candidate.EndAt == 1_180);
+    }
+
+    [Fact]
+    public void Sep22_low_rate_interval_keeps_lines_connected_and_shows_unused_band()
+    {
+        const long beforeRateStart = 1_789_965_300;
+        const long beforeRateEnd = 1_789_965_360;
+        const long gapStart = 1_789_967_100;
+        const long gapEnd = 1_790_077_980;
+        const long afterFlat = 1_790_078_040;
+        const long afterRateEnd = 1_790_078_100;
+        const ulong solTokens = 12_322_064;
+        const double solDollars = 10.937907;
+        const ulong lunaTokensBeforeRate = 69_400_651;
+        const ulong lunaTokensAtGapStart = 69_952_744;
+        const ulong lunaTokensAtGapEnd = 70_091_500;
+        const ulong lunaTokensAfterRate = 70_179_945;
+        const double lunaDollarsBeforeRate = 2.04153588;
+        const double lunaDollarsAtGapStart = 2.05719484;
+        const double lunaDollarsAtGapEnd = 2.0679956;
+        const double lunaDollarsAfterRate = 2.07092012;
+        const long resetAt = 1_790_461_476;
+
+        var points = new[]
+        {
+            DirectVectorPoint(
+                beforeRateStart,
+                77,
+                solTokens,
+                solDollars,
+                lunaTokensBeforeRate,
+                lunaDollarsBeforeRate),
+            DirectVectorPoint(
+                beforeRateEnd,
+                76,
+                solTokens,
+                solDollars,
+                lunaTokensAtGapStart,
+                lunaDollarsAtGapStart),
+            DirectVectorPoint(
+                gapStart,
+                75,
+                solTokens,
+                solDollars,
+                lunaTokensAtGapStart,
+                lunaDollarsAtGapStart),
+            DirectVectorPoint(
+                gapEnd,
+                67,
+                solTokens,
+                solDollars,
+                lunaTokensAtGapEnd,
+                lunaDollarsAtGapEnd,
+                true),
+            DirectVectorPoint(
+                afterFlat,
+                67,
+                solTokens,
+                solDollars,
+                lunaTokensAtGapEnd,
+                lunaDollarsAtGapEnd),
+            DirectVectorPoint(
+                afterRateEnd,
+                67,
+                solTokens,
+                solDollars,
+                lunaTokensAfterRate,
+                lunaDollarsAfterRate),
+        };
+        var ownership = new[]
+        {
+            new GraphAccountOwnershipInterval(1_789_951_507, 1_789_967_251),
+            new GraphAccountOwnershipInterval(1_790_077_988, 1_790_091_547),
+        };
+        var scene = GraphScene.Create(
+            points,
+            GraphMetric.Dollars,
+            beforeRateStart,
+            afterRateEnd,
+            null,
+            null,
+            ownership);
+        var sol = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        var luna = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+
+        Assert.Equal(
+            [beforeRateStart, beforeRateEnd, gapStart, gapEnd, afterFlat, afterRateEnd],
+            scene.Timestamps.Select(timestamp => (long)timestamp));
+        Assert.Equal([solDollars, solDollars, solDollars, solDollars, solDollars, solDollars], scene.Sol);
+        Assert.Equal(
+            [lunaDollarsBeforeRate, lunaDollarsAtGapStart, lunaDollarsAtGapStart,
+                lunaDollarsAtGapEnd, lunaDollarsAtGapEnd, lunaDollarsAfterRate],
+            scene.Luna);
+        Assert.Equal([77d, 76d, 75d, 67d, 67d, 67d], scene.Remaining);
+        Assert.Equal(true, points[3].TaskActiveSincePrevious);
+        Assert.Equal(
+            [resetAt, resetAt, resetAt, resetAt, resetAt, resetAt],
+            points.Select(point => point.ResetAt));
+
+        var unownedSegments = new[]
+        {
+            (gapStart, gapEnd),
+            (gapEnd, afterFlat),
+        };
+        Assert.All(unownedSegments, segment =>
+        {
+            Assert.Contains(segment, SegmentPairs(sol.Dashed));
+            Assert.Contains(segment, SegmentPairs(luna.Dashed));
+            Assert.Contains(segment, SegmentPairs(remaining.Dashed));
+            Assert.DoesNotContain(segment, SegmentPairs(sol.Idle, sol.Flat, sol.Rising));
+            Assert.DoesNotContain(segment, SegmentPairs(luna.Idle, luna.Flat, luna.Rising));
+            Assert.DoesNotContain(segment, SegmentPairs(remaining.Idle, remaining.Solid));
+        });
+        Assert.Contains(scene.IdleIntervals, interval =>
+            interval.StartAt <= gapStart && interval.EndAt >= gapEnd);
+
+        var shortScene = GraphScene.Create(
+            [
+                DirectVectorPoint(
+                    gapStart - 60,
+                    75,
+                    solTokens,
+                    solDollars,
+                    lunaTokensAtGapStart,
+                    lunaDollarsAtGapStart),
+                DirectVectorPoint(
+                    gapStart,
+                    75,
+                    solTokens,
+                    solDollars,
+                    lunaTokensAtGapStart,
+                    lunaDollarsAtGapStart),
+                DirectVectorPoint(
+                    gapStart + 60,
+                    67,
+                    solTokens,
+                    solDollars,
+                    lunaTokensAtGapEnd,
+                    lunaDollarsAtGapEnd,
+                    true),
+                DirectVectorPoint(
+                    gapStart + 120,
+                    67,
+                    solTokens,
+                    solDollars,
+                    lunaTokensAtGapEnd,
+                    lunaDollarsAtGapEnd,
+                    true),
+            ],
+            GraphMetric.Dollars,
+            gapStart - 60,
+            gapStart + 120);
+        var shortLuna = GraphPlotProjection.BuildModelLines(shortScene, shortScene.Luna);
+        var shortRemaining = GraphPlotProjection.BuildRemainingLines(shortScene);
+
+        Assert.Contains((gapStart, gapStart + 60), SegmentPairs(shortLuna.Rising));
+        Assert.Contains((gapStart, gapStart + 60), SegmentPairs(shortRemaining.Solid));
     }
 
     private static ApiHistorySample Point(long timestamp, double? remaining, double sol, double terra, double luna) =>
@@ -3963,6 +4152,30 @@ public sealed class GraphPlotControlTests
             // Synthetic unit-test points explicitly model a confirmed idle
             // marker; production samples pass the nullable wire value through.
             TaskActiveSincePrevious = false,
+        };
+
+    private static ApiHistorySample DirectVectorPoint(
+        long timestamp,
+        double remaining,
+        ulong solTokens,
+        double solDollars,
+        ulong lunaTokens,
+        double lunaDollars,
+        bool? taskActiveSincePrevious = null) =>
+        new(
+            timestamp,
+            1_790_461_476,
+            remaining,
+            solDollars,
+            0,
+            lunaDollars,
+            solTokens,
+            0,
+            lunaTokens,
+            ApiHistorySample.ConfirmedModelSource)
+        {
+            ModelsComplete = true,
+            TaskActiveSincePrevious = taskActiveSincePrevious,
         };
 
     private static ApiHistorySample CompleteModelSample(
