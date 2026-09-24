@@ -163,7 +163,7 @@ public sealed class GraphPlotControl : AvaPlot
 
         var axes = BuildAxesForCurrentWidth(scene);
         AddPlotGrid(scene, axes);
-        foreach (var interval in GraphPlotProjection.BuildVisibleIdleIntervals(scene))
+        foreach (var interval in GraphPlotProjection.BuildVisibleUnusedIntervals(scene))
         {
             var band = Plot.Add.Rectangle(
                 interval.StartAt,

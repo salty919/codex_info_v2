@@ -68,7 +68,12 @@ public sealed class LoopbackStatusClient :
         "is_current",
         "activation_at",
         "deactivation_at",
+        "ownership_intervals",
         "login_id");
+
+    private static readonly HashSet<string> AccountOwnershipIntervalProperties = CreatePropertySet(
+        "start_at",
+        "end_at");
 
     private static readonly HashSet<string> QuotaProperties = CreatePropertySet(
         "remaining_percent",
@@ -1679,7 +1684,7 @@ public sealed class LoopbackStatusClient :
             var currentCount = 0;
             foreach (var account in accountProperty.EnumerateArray())
             {
-                if (!HasAllowedProperties(account, AccountProperties, 4, 5) ||
+                if (!HasAllowedProperties(account, AccountProperties, 4, 6) ||
                     !TryGetBoundedString(account, "id", 1, 512, out var id) ||
                     !IsSafeAccountId(id) ||
                     !ids.Add(id) ||
@@ -1687,6 +1692,7 @@ public sealed class LoopbackStatusClient :
                     !TryGetNullableUnixSeconds(account, "activation_at", out var activationAt) ||
                     !TryGetNullableUnixSeconds(account, "deactivation_at", out var deactivationAt) ||
                     !TryGetOptionalTrimmedBoundedString(account, "login_id", 1, 254, out var loginId) ||
+                    !TryGetAccountOwnershipIntervals(account, out var ownershipIntervals) ||
                     (activationAt is { } activation &&
                      deactivationAt is { } deactivation && deactivation < activation))
                 {
@@ -1698,7 +1704,10 @@ public sealed class LoopbackStatusClient :
                     currentCount++;
                 }
 
-                accounts.Add(new ApiAccount(id, isCurrent, activationAt, deactivationAt, loginId));
+                accounts.Add(new ApiAccount(id, isCurrent, activationAt, deactivationAt, loginId)
+                {
+                    OwnershipIntervals = ownershipIntervals,
+                });
             }
 
             if ((defaultId is null && currentCount != 0) ||
@@ -1722,6 +1731,39 @@ public sealed class LoopbackStatusClient :
         {
             return null;
         }
+    }
+
+    private static bool TryGetAccountOwnershipIntervals(
+        JsonElement account,
+        out IReadOnlyList<ApiAccountOwnershipInterval>? ownershipIntervals)
+    {
+        ownershipIntervals = null;
+        if (!account.TryGetProperty("ownership_intervals", out var property))
+        {
+            return true;
+        }
+        if (property.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        var parsed = new List<ApiAccountOwnershipInterval>(property.GetArrayLength());
+        foreach (var item in property.EnumerateArray())
+        {
+            if (!HasExactlyProperties(item, AccountOwnershipIntervalProperties, 2) ||
+                !TryGetNullableUnixSeconds(item, "start_at", out var startAt) ||
+                !TryGetNullableUnixSeconds(item, "end_at", out var endAt) ||
+                startAt is { } start && endAt is { } end && start >= end ||
+                parsed.Count > 0 &&
+                    (parsed[^1].EndAt is null || startAt is null ||
+                        parsed[^1].EndAt > startAt))
+            {
+                return false;
+            }
+            parsed.Add(new ApiAccountOwnershipInterval(startAt, endAt));
+        }
+        ownershipIntervals = new System.Collections.ObjectModel.ReadOnlyCollection<ApiAccountOwnershipInterval>(parsed);
+        return true;
     }
 
     private static bool TryParseDetails(

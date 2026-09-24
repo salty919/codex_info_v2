@@ -8,7 +8,7 @@
 #![deny(unsafe_code)]
 
 use chrono::{DateTime, Months, Utc};
-use codex_info::{protocol_contract, security, thread_contract};
+use codex_info::{security, thread_contract};
 use codex_info_db_writer::{
     classify_quota_transition, finalize_session_timeline_recovery, session_event_is_replay,
     ActiveThreadRecord, ActiveThreadSnapshot, PreviousQuotaState, QuotaCandidate, QuotaTransition,
@@ -243,9 +243,8 @@ fn account_boundary_generation() -> u64 {
     APP_SERVER_ACCOUNT_BOUNDARY.generation()
 }
 
-/// Linearize each durable mutation against an in-process account/updated
-/// notification. A writer that acquires the fence first belongs to the old
-/// epoch; a notification that acquires it first prevents every later write.
+/// Linearize durable mutations against a verified change of the local account
+/// authority. App-server notifications only invalidate their acquisition lane.
 fn account_epoch_commit_fence() -> Result<RwLockReadGuard<'static, ()>, RecorderError> {
     APP_SERVER_ACCOUNT_BOUNDARY.commit_fence()
 }
@@ -353,80 +352,6 @@ impl AccountEpochProof {
             return Err(RecorderError::AccountBoundaryChanged);
         }
         Ok(operation())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AccountUpdateTracker {
-    generation: u64,
-    valid: bool,
-    signal_boundary: bool,
-}
-
-impl Default for AccountUpdateTracker {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            valid: true,
-            signal_boundary: false,
-        }
-    }
-}
-
-impl AccountUpdateTracker {
-    fn for_app_server() -> Self {
-        Self {
-            signal_boundary: true,
-            ..Self::default()
-        }
-    }
-
-    fn invalidate(&mut self, boundary: &AccountBoundaryState) {
-        self.valid = false;
-        if self.signal_boundary {
-            boundary.signal();
-        }
-    }
-
-    /// Consume one JSON-RPC line before request-id matching.  Notifications
-    /// are out-of-band responses and must not be silently discarded while a
-    /// quota or thread request is in flight.
-    fn observe(&mut self, value: &Value, raw: &str) -> Result<bool, String> {
-        self.observe_with_boundary(value, raw, &APP_SERVER_ACCOUNT_BOUNDARY)
-    }
-
-    fn observe_with_boundary(
-        &mut self,
-        value: &Value,
-        raw: &str,
-        boundary: &AccountBoundaryState,
-    ) -> Result<bool, String> {
-        if !value.is_object() {
-            return Ok(false);
-        }
-        let is_account_updated = protocol_contract::is_account_updated_notification_json(raw)
-            .map_err(|_| {
-                self.invalidate(boundary);
-                "Codex account update notification is invalid".to_owned()
-            })?;
-        if !is_account_updated {
-            return Ok(false);
-        }
-        if !self.valid
-            || protocol_contract::validate_account_updated_notification_json(raw).is_err()
-        {
-            self.invalidate(boundary);
-            return Err("Codex account update notification is invalid".to_owned());
-        }
-        let Some(generation) = self.generation.checked_add(1) else {
-            self.invalidate(boundary);
-            return Err("Codex account update generation is exhausted".to_owned());
-        };
-        self.generation = generation;
-        if self.signal_boundary {
-            boundary.signal();
-        }
-        Ok(true)
     }
 }
 
@@ -714,8 +639,7 @@ fn decode_codex_authentication_state(value: &Value) -> Result<CodexAuthenticatio
 
 /// Confirm the current Codex authentication state through two reads from one
 /// app-server process. A missing local auth file is never enough to claim
-/// logout: both reads must independently report the documented auth-required
-/// shape without an intervening account/updated generation.
+/// logout: both reads must independently report the auth-required shape.
 pub fn probe_codex_authentication_state() -> Result<CodexAuthenticationState, String> {
     let executable = resolve_codex_executable()?;
     let mut child = Command::new(executable)
@@ -738,7 +662,6 @@ pub fn probe_codex_authentication_state() -> Result<CodexAuthenticationState, St
     };
     let output = app_server_reader(stdout);
     let result = (|| {
-        let mut account_updates = AccountUpdateTracker::for_app_server();
         request_app_server(
             &mut input,
             &output,
@@ -751,29 +674,22 @@ pub fn probe_codex_authentication_state() -> Result<CodexAuthenticationState, St
                 },
                 "capabilities": {"experimentalApi": true}
             }),
-            &mut account_updates,
         )?;
-        let generation = account_updates.generation;
         let before = decode_codex_authentication_state(&request_app_server(
             &mut input,
             &output,
             2,
             "account/read",
             json!({}),
-            &mut account_updates,
         )?)?;
-        if !account_updates.valid || account_updates.generation != generation {
-            return Err("Codex account identity changed during auth probe".to_owned());
-        }
         let after = decode_codex_authentication_state(&request_app_server(
             &mut input,
             &output,
             3,
             "account/read",
             json!({}),
-            &mut account_updates,
         )?)?;
-        if !account_updates.valid || account_updates.generation != generation || before != after {
+        if before != after {
             return Err("Codex account identity changed during auth probe".to_owned());
         }
         Ok(before)
@@ -792,7 +708,6 @@ pub fn probe_codex_authentication_state() -> Result<CodexAuthenticationState, St
 struct AccountIdentityWindow {
     authority: AccountAuthority,
     account: AppServerAccount,
-    update_generation: u64,
 }
 
 impl fmt::Debug for AccountIdentityWindow {
@@ -802,24 +717,12 @@ impl fmt::Debug for AccountIdentityWindow {
 }
 
 impl AccountIdentityWindow {
-    fn new(authority: AccountAuthority, account: AppServerAccount, update_generation: u64) -> Self {
-        Self {
-            authority,
-            account,
-            update_generation,
-        }
+    fn new(authority: AccountAuthority, account: AppServerAccount) -> Self {
+        Self { authority, account }
     }
 
-    fn is_stable(
-        &self,
-        authority: &AccountAuthority,
-        account: &AppServerAccount,
-        updates: &AccountUpdateTracker,
-    ) -> bool {
-        updates.valid
-            && updates.generation == self.update_generation
-            && self.authority == *authority
-            && self.account == *account
+    fn is_stable(&self, authority: &AccountAuthority, account: &AppServerAccount) -> bool {
+        self.authority == *authority && self.account == *account
     }
 }
 
@@ -1101,13 +1004,7 @@ fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), ()> {
 }
 
 fn fetch_quota_snapshot() -> QuotaPollResult {
-    let authority_before = match read_account_authority(&default_codex_home()) {
-        Ok(authority) => authority,
-        Err(error) => {
-            signal_account_boundary_changed();
-            return Err(error);
-        }
-    };
+    let authority_before = read_account_authority(&default_codex_home())?;
     let executable = resolve_codex_executable()?;
     let mut child = Command::new(executable)
         .args(["app-server", "--stdio"])
@@ -1129,7 +1026,6 @@ fn fetch_quota_snapshot() -> QuotaPollResult {
     };
     let output = app_server_reader(stdout);
     let result = (|| {
-        let mut account_updates = AccountUpdateTracker::for_app_server();
         request_app_server(
             &mut input,
             &output,
@@ -1142,51 +1038,28 @@ fn fetch_quota_snapshot() -> QuotaPollResult {
                 },
                 "capabilities": {"experimentalApi": true}
             }),
-            &mut account_updates,
         )?;
-        let generation_before_read = account_updates.generation;
-        let account_value = request_app_server(
-            &mut input,
-            &output,
-            2,
-            "account/read",
-            json!({}),
-            &mut account_updates,
-        )?;
-        if !account_updates.valid || account_updates.generation != generation_before_read {
-            signal_account_boundary_changed();
-            return Err("Codex account identity changed during account read".to_owned());
-        }
+        let account_value = request_app_server(&mut input, &output, 2, "account/read", json!({}))?;
         let account = decode_app_server_account(&account_value)?;
-        let identity = AccountIdentityWindow::new(
-            authority_before.clone(),
-            account.clone(),
-            account_updates.generation,
-        );
+        let identity = AccountIdentityWindow::new(authority_before.clone(), account.clone());
         let rate_limits = request_app_server(
             &mut input,
             &output,
             3,
             "account/rateLimits/read",
             Value::Null,
-            &mut account_updates,
         )?;
         let snapshot = parse_app_server_quota(&rate_limits, &account.plan_type)?;
-        let account_recheck = request_app_server(
-            &mut input,
-            &output,
-            4,
-            "account/read",
-            json!({}),
-            &mut account_updates,
-        )?;
+        let account_recheck =
+            request_app_server(&mut input, &output, 4, "account/read", json!({}))?;
         let account_after = decode_app_server_account(&account_recheck)?;
-        let authority_after = read_account_authority(&default_codex_home()).map_err(|_| {
+        let authority_after = read_account_authority(&default_codex_home())
+            .map_err(|_| "Codex account identity changed during quota read".to_owned())?;
+        if authority_after != authority_before {
             signal_account_boundary_changed();
-            "Codex account identity changed during quota read".to_owned()
-        })?;
-        if !identity.is_stable(&authority_after, &account_after, &account_updates) {
-            signal_account_boundary_changed();
+            return Err("Codex account authority changed during quota read".to_owned());
+        }
+        if !identity.is_stable(&authority_after, &account_after) {
             return Err("Codex account identity changed during quota read".to_owned());
         }
         let epoch = AccountEpochProof::from_verified_authority(authority_after)?;
@@ -1305,7 +1178,6 @@ fn request_app_server(
     id: u64,
     method: &str,
     params: Value,
-    account_updates: &mut AccountUpdateTracker,
 ) -> Result<Value, String> {
     request_app_server_before_deadline(
         input,
@@ -1314,7 +1186,6 @@ fn request_app_server(
         method,
         params,
         Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
-        account_updates,
     )
 }
 
@@ -1325,7 +1196,6 @@ fn request_app_server_before_deadline(
     method: &str,
     params: Value,
     deadline: Instant,
-    account_updates: &mut AccountUpdateTracker,
 ) -> Result<Value, String> {
     let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
     writeln!(input, "{message}")
@@ -1356,9 +1226,8 @@ fn request_app_server_before_deadline(
                 continue;
             }
         };
-        if account_updates.observe(&value, &line)? {
-            continue;
-        }
+        // JSON-RPC notifications are transport events, not account authority.
+        // A bounded number may precede a matching response in any CLI version.
         if value.get("id").and_then(Value::as_u64) != Some(id) {
             ignored = ignored.saturating_add(1);
             if ignored > APP_SERVER_MAX_IGNORED_MESSAGES {
@@ -1384,10 +1253,7 @@ fn collect_active_thread_snapshot(
     if active_paths.is_empty() {
         return match AccountEpochProof::capture(&default_codex_home()) {
             Ok(epoch) => ActiveThreadPollResult::Empty { epoch },
-            Err(error) => {
-                signal_account_boundary_changed();
-                ActiveThreadPollResult::Failed(error)
-            }
+            Err(error) => ActiveThreadPollResult::Failed(error),
         };
     }
 
@@ -1443,10 +1309,7 @@ fn collect_active_thread_snapshot(
     };
     let authority_before = match read_account_authority(&default_codex_home()) {
         Ok(authority) => authority,
-        Err(error) => {
-            signal_account_boundary_changed();
-            return ActiveThreadPollResult::Failed(error);
-        }
+        Err(error) => return ActiveThreadPollResult::Failed(error),
     };
     let mut child = match Command::new(executable)
         .args(["app-server", "--stdio"])
@@ -1473,7 +1336,6 @@ fn collect_active_thread_snapshot(
     };
     let output = app_server_reader(stdout);
     let result = (|| {
-        let mut account_updates = AccountUpdateTracker::for_app_server();
         request_app_server_before_deadline(
             &mut input,
             &output,
@@ -1487,9 +1349,7 @@ fn collect_active_thread_snapshot(
                 "capabilities": {"experimentalApi": true}
             }),
             deadline,
-            &mut account_updates,
         )?;
-        let generation_before_read = account_updates.generation;
         let account_value = request_app_server_before_deadline(
             &mut input,
             &output,
@@ -1497,18 +1357,9 @@ fn collect_active_thread_snapshot(
             "account/read",
             json!({}),
             deadline,
-            &mut account_updates,
         )?;
-        if !account_updates.valid || account_updates.generation != generation_before_read {
-            signal_account_boundary_changed();
-            return Err("Codex account identity changed during thread read".to_owned());
-        }
         let account = decode_app_server_account(&account_value)?;
-        let identity = AccountIdentityWindow::new(
-            authority_before.clone(),
-            account,
-            account_updates.generation,
-        );
+        let identity = AccountIdentityWindow::new(authority_before.clone(), account);
         let mut next_request_id = 3_u64;
         let mut seen_ids = BTreeSet::new();
         let mut rollouts = BTreeMap::new();
@@ -1526,7 +1377,6 @@ fn collect_active_thread_snapshot(
                 "thread/read",
                 json!({"threadId": thread_id, "includeTurns": false}),
                 deadline,
-                &mut account_updates,
             )?;
             let result_object = result
                 .as_object()
@@ -1559,15 +1409,15 @@ fn collect_active_thread_snapshot(
             "account/read",
             json!({}),
             deadline,
-            &mut account_updates,
         )?;
         let account_after = decode_app_server_account(&account_recheck)?;
-        let authority_after = read_account_authority(&default_codex_home()).map_err(|_| {
+        let authority_after = read_account_authority(&default_codex_home())
+            .map_err(|_| "Codex account identity changed during thread read".to_owned())?;
+        if authority_after != authority_before {
             signal_account_boundary_changed();
-            "Codex account identity changed during thread read".to_owned()
-        })?;
-        if !identity.is_stable(&authority_after, &account_after, &account_updates) {
-            signal_account_boundary_changed();
+            return Err("Codex account authority changed during thread read".to_owned());
+        }
+        if !identity.is_stable(&authority_after, &account_after) {
             return Err("Codex account identity changed during thread read".to_owned());
         }
         let epoch = AccountEpochProof::from_verified_authority(authority_after)?;
@@ -7233,8 +7083,7 @@ mod tests {
     }
 
     #[test]
-    fn recorder_account_identity_contract_window_rejects_authority_account_and_generation_changes()
-    {
+    fn recorder_account_identity_contract_window_rejects_authority_and_account_changes() {
         let authority = AccountAuthority {
             account_id: AccountAuthorityId::from_str("authority-1").unwrap(),
         };
@@ -7242,43 +7091,41 @@ mod tests {
             email: "person@example.invalid".to_owned(),
             plan_type: "pro".to_owned(),
         };
-        let window = AccountIdentityWindow::new(authority.clone(), account.clone(), 7);
-        let stable_updates = AccountUpdateTracker {
-            generation: 7,
-            ..AccountUpdateTracker::default()
-        };
-        assert!(window.is_stable(&authority, &account, &stable_updates));
+        let window = AccountIdentityWindow::new(authority.clone(), account.clone());
+        assert!(window.is_stable(&authority, &account));
 
         let changed_authority = AccountAuthority {
             account_id: AccountAuthorityId::from_str("authority-2").unwrap(),
         };
-        assert!(!window.is_stable(&changed_authority, &account, &stable_updates));
+        assert!(!window.is_stable(&changed_authority, &account));
 
         let changed_account = AppServerAccount {
             email: "other@example.invalid".to_owned(),
             ..account.clone()
         };
-        assert!(!window.is_stable(&authority, &changed_account, &stable_updates));
-
-        let changed_generation = AccountUpdateTracker {
-            generation: 8,
-            ..stable_updates
-        };
-        assert!(!window.is_stable(&authority, &account, &changed_generation));
+        assert!(!window.is_stable(&authority, &changed_account));
     }
 
     #[test]
-    fn recorder_account_identity_contract_tracks_account_updated_as_boundary() {
-        let boundary = AccountBoundaryState::new();
-        let raw = r#"{"jsonrpc":"2.0","method":"account/updated","params":{"authMode":"chatgpt","planType":"pro"}}"#;
-        let value: Value = serde_json::from_str(raw).unwrap();
-        let mut tracker = AccountUpdateTracker::for_app_server();
-        assert!(tracker
-            .observe_with_boundary(&value, raw, &boundary)
-            .unwrap());
-        assert_eq!(tracker.generation, 1);
-        assert!(tracker.valid);
-        assert!(boundary.changed());
+    fn recorder_account_identity_contract_ignores_notification_payload() {
+        let boundary_generation = account_boundary_generation();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(
+                r#"{"jsonrpc":"2.0","method":"account/updated","params":{"futureField":true}}"#
+                    .to_owned(),
+            ))
+            .unwrap();
+        sender
+            .send(Ok(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.to_owned()
+            ))
+            .unwrap();
+        let mut input = Vec::new();
+        let result =
+            request_app_server(&mut input, &receiver, 1, "initialize", Value::Null).unwrap();
+        assert_eq!(result, json!({"ok": true}));
+        assert_eq!(account_boundary_generation(), boundary_generation);
     }
 
     #[cfg(unix)]

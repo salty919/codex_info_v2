@@ -159,6 +159,13 @@ pub struct PublicThread {
 /// bounded display metadata only; it never carries a token and never takes
 /// part in storage selection. A missing display id or deactivation boundary
 /// is represented as `null` rather than guessed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicAccountOwnershipInterval {
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicAccountV3 {
@@ -166,6 +173,8 @@ pub struct PublicAccountV3 {
     pub is_current: bool,
     pub activation_at: Option<i64>,
     pub deactivation_at: Option<i64>,
+    #[serde(default)]
+    pub ownership_intervals: Vec<PublicAccountOwnershipInterval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_id: Option<String>,
 }
@@ -232,6 +241,20 @@ impl PublicAccountsV3 {
                     .is_some_and(|value| !valid_public_login_id(value))
             {
                 return Err(ContractError::InvalidModel);
+            }
+            for (index, interval) in account.ownership_intervals.iter().enumerate() {
+                if interval
+                    .start_at
+                    .is_some_and(|value| !valid_timestamp(value))
+                    || interval.end_at.is_some_and(|value| !valid_timestamp(value))
+                    || matches!((interval.start_at, interval.end_at), (Some(start), Some(end)) if start >= end)
+                    || index > 0
+                        && (account.ownership_intervals[index - 1].end_at.is_none()
+                            || interval.start_at.is_none()
+                            || account.ownership_intervals[index - 1].end_at > interval.start_at)
+                {
+                    return Err(ContractError::InvalidModel);
+                }
             }
             if self.default_account_id.as_deref() == Some(account.id.as_str()) {
                 default_found = true;
@@ -952,6 +975,7 @@ mod tests {
                     is_current: true,
                     activation_at: Some(1_800_000_000),
                     deactivation_at: None,
+                    ownership_intervals: vec![],
                     login_id: Some("current@example.com".to_owned()),
                 },
                 PublicAccountV3 {
@@ -959,6 +983,7 @@ mod tests {
                     is_current: false,
                     activation_at: None,
                     deactivation_at: None,
+                    ownership_intervals: vec![],
                     login_id: None,
                 },
             ],
@@ -983,6 +1008,7 @@ mod tests {
                 is_current: true,
                 activation_at: None,
                 deactivation_at: None,
+                ownership_intervals: vec![],
                 login_id: Some(" current@example.com".to_owned()),
             }],
         };
@@ -1000,6 +1026,7 @@ mod tests {
                 is_current: false,
                 activation_at: Some(1_800_000_000),
                 deactivation_at: Some(1_800_000_600),
+                ownership_intervals: vec![],
                 login_id: Some("previous@example.com".to_owned()),
             }],
         };

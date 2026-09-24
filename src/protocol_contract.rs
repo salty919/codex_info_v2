@@ -55,10 +55,9 @@ impl fmt::Display for ContractError {
     }
 }
 
-/// Validates the exact app-server v2 `account/updated` notification used as
-/// the local account-generation boundary. Unknown or duplicate JSON members
-/// are rejected by the caller's JSON parser/object cardinality check rather
-/// than being treated as a harmless notification.
+/// Validates the historical app-server v2 `account/updated` shape for callers
+/// that need that protocol contract. Recorder account authority comes from
+/// `auth.json`; notification payloads do not stop Session persistence.
 pub fn validate_account_updated_notification(value: &Value) -> Result<(), ContractError> {
     const AUTH_MODES: [&str; 7] = [
         "apikey",

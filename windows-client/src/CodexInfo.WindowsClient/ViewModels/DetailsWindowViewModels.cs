@@ -1462,12 +1462,15 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         var sourceCount = period.Samples.Count;
         var confirmedGaps = BuildConfirmedGaps(period);
         var hiddenModelNames = BuildHiddenModelNames(period.Samples);
+        var accountOwnershipIntervals = main.SelectedAccount?.OwnershipIntervals?
+            .Select(interval => new GraphAccountOwnershipInterval(interval.StartAt, interval.EndAt))
+            .ToArray();
         if (sourceCount <= BackgroundBuildThreshold)
         {
             try
             {
                 PublishPoints(
-                    BuildProjection(period, metric, confirmedGaps, hiddenModelNames),
+                    BuildProjection(period, metric, confirmedGaps, hiddenModelNames, accountOwnershipIntervals),
                     period,
                     metric);
             }
@@ -1493,7 +1496,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 {
                     Task.Delay(previewDelay, cancellationToken).GetAwaiter().GetResult();
                 }
-                return BuildProjection(period, metric, confirmedGaps, hiddenModelNames);
+                return BuildProjection(period, metric, confirmedGaps, hiddenModelNames, accountOwnershipIntervals);
             }, cancellationToken)
             .ContinueWith(
                 task =>
@@ -1580,7 +1583,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         ApiHistoryPeriod period,
         GraphMetric metric,
         IReadOnlyList<GraphConfirmedGap> confirmedGaps,
-        IReadOnlySet<string> hiddenModelNames)
+        IReadOnlySet<string> hiddenModelNames,
+        IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var samples = BuildGraphSamples(period, now);
@@ -1593,7 +1597,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 period.StartAt,
                 EffectiveGraphEnd(period, now),
                 confirmedGaps,
-                hiddenModelNames));
+                hiddenModelNames,
+                accountOwnershipIntervals));
     }
 
     private void PublishPoints(

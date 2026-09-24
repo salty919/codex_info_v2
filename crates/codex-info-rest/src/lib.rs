@@ -312,6 +312,7 @@ pub struct AccountReader {
     pub is_current: bool,
     pub activation_at: Option<i64>,
     pub deactivation_at: Option<i64>,
+    pub ownership_intervals: Vec<codex_info_rest_contract::PublicAccountOwnershipInterval>,
     pub login_id: Option<String>,
     pub reader: DbReader,
 }
@@ -331,9 +332,18 @@ impl AccountReader {
             is_current,
             activation_at,
             deactivation_at,
+            ownership_intervals: Vec::new(),
             login_id: None,
             reader,
         }
+    }
+
+    pub fn with_ownership_intervals(
+        mut self,
+        intervals: Vec<codex_info_rest_contract::PublicAccountOwnershipInterval>,
+    ) -> Self {
+        self.ownership_intervals = intervals;
+        self
     }
 
     pub fn with_login_id(mut self, login_id: Option<String>) -> Self {
@@ -400,6 +410,7 @@ impl SnapshotStore {
                 is_current: account.is_current,
                 activation_at: account.activation_at,
                 deactivation_at: account.deactivation_at,
+                ownership_intervals: account.ownership_intervals,
                 login_id: account.login_id,
             };
             descriptors.push(descriptor);
@@ -1857,7 +1868,17 @@ mod tests {
         let reader_b = DbReader::open(&path_b).expect("account B reader");
         let mut server = RestServer::start_with_accounts(
             vec![
-                AccountReader::new("account-7", 7, true, Some(1_800_000_000), None, reader_a),
+                AccountReader::new("account-7", 7, true, Some(1_800_000_000), None, reader_a)
+                    .with_ownership_intervals(vec![
+                        codex_info_rest_contract::PublicAccountOwnershipInterval {
+                            start_at: Some(1_799_999_000),
+                            end_at: Some(1_799_999_600),
+                        },
+                        codex_info_rest_contract::PublicAccountOwnershipInterval {
+                            start_at: Some(1_800_000_000),
+                            end_at: None,
+                        },
+                    ]),
                 AccountReader::new("account-13", 13, false, None, None, reader_b),
             ],
             "account-7",
@@ -1878,6 +1899,22 @@ mod tests {
         assert_eq!(accounts["accounts"][0]["is_current"], true);
         assert_eq!(accounts["accounts"][0]["activation_at"], 1_800_000_000_i64);
         assert!(accounts["accounts"][0]["deactivation_at"].is_null());
+        assert_eq!(
+            accounts["accounts"][0]["ownership_intervals"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            accounts["accounts"][0]["ownership_intervals"][0]["end_at"],
+            1_799_999_600_i64
+        );
+        assert_eq!(
+            accounts["accounts"][0]["ownership_intervals"][1]["start_at"],
+            1_800_000_000_i64
+        );
+        assert!(accounts["accounts"][0]["ownership_intervals"][1]["end_at"].is_null());
         assert_eq!(accounts["accounts"][1]["id"], "account-13");
         assert_eq!(accounts["accounts"][1]["is_current"], false);
         assert!(accounts["accounts"][1]["activation_at"].is_null());
