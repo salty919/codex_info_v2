@@ -670,7 +670,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionKeepsSparseEqualDirectEndpointsFlat()
+    public void PlotProjectionClassifiesSparseEqualDirectEndpointsAsIdleDespiteQuotaChange()
     {
         var scene = Scene(
             [
@@ -682,8 +682,9 @@ public sealed class GraphPlotControlTests
 
         var lines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
 
-        Assert.Equal([1_060d, 3_600d], lines.Flat.X);
-        Assert.Equal([1d, 1d], lines.Flat.Y);
+        Assert.Equal([1_060d, 3_600d], lines.Idle.X);
+        Assert.Equal([1d, 1d], lines.Idle.Y);
+        Assert.Empty(lines.Flat.X);
         Assert.Equal([1_000d, 1_060d, double.NaN, 3_600d, 3_660d], lines.Rising.X);
         Assert.Equal([0d, 1d, double.NaN, 1d, 2d], lines.Rising.Y);
         Assert.Empty(lines.Dashed.X);
@@ -2883,10 +2884,13 @@ public sealed class GraphPlotControlTests
             activeModelScene,
             activeModelScene.Sol);
         Assert.Empty(activeModelScene.IdleIntervals);
-        Assert.InRange(RenderedAt(activeModel.Flat.Line, 1_600), 0.000_001, 39.999_999);
-        Assert.InRange(RenderedAt(activeModel.Flat.Line, 2_800), 40.000_001, 79.999_999);
-        Assert.InRange(RenderedAt(activeModel.Flat.Line, 3_400), 40.000_001, 79.999_999);
-        Assert.Equal(80d, RenderedAt(activeModel.Flat.Line, 4_000), precision: 6);
+        Assert.Empty(activeModel.Flat.Line.X);
+        Assert.Equal(0d, RenderedAt(activeModel.Idle.Line, 1_600), precision: 6);
+        Assert.Equal(40d, RenderedAt(activeModel.Idle.Line, 2_800), precision: 6);
+        Assert.Equal(80d, RenderedAt(activeModel.Idle.Line, 3_400), precision: 6);
+        Assert.Equal(80d, RenderedAt(activeModel.Idle.Line, 4_000), precision: 6);
+        Assert.Equal(40d, RenderedAt(activeModel.Rising.Line, 2_200), precision: 6);
+        Assert.Equal(80d, RenderedAt(activeModel.Rising.Line, 3_400), precision: 6);
 
         var idleModelPoints = new[]
         {

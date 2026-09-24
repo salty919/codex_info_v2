@@ -1899,9 +1899,21 @@ mod tests {
         assert_eq!(accounts["accounts"][0]["is_current"], true);
         assert_eq!(accounts["accounts"][0]["activation_at"], 1_800_000_000_i64);
         assert!(accounts["accounts"][0]["deactivation_at"].is_null());
-        assert_eq!(accounts["accounts"][0]["ownership_intervals"].as_array().unwrap().len(), 2);
-        assert_eq!(accounts["accounts"][0]["ownership_intervals"][0]["end_at"], 1_799_999_600_i64);
-        assert_eq!(accounts["accounts"][0]["ownership_intervals"][1]["start_at"], 1_800_000_000_i64);
+        assert_eq!(
+            accounts["accounts"][0]["ownership_intervals"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            accounts["accounts"][0]["ownership_intervals"][0]["end_at"],
+            1_799_999_600_i64
+        );
+        assert_eq!(
+            accounts["accounts"][0]["ownership_intervals"][1]["start_at"],
+            1_800_000_000_i64
+        );
         assert!(accounts["accounts"][0]["ownership_intervals"][1]["end_at"].is_null());
         assert_eq!(accounts["accounts"][1]["id"], "account-13");
         assert_eq!(accounts["accounts"][1]["is_current"], false);

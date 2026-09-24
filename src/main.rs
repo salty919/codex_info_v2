@@ -44884,12 +44884,7 @@ mod tests {
             .into_iter()
             .zip(raw_remaining)
             .map(|(timestamp, remaining)| {
-                UsageHistorySample::new(
-                    timestamp,
-                    1_200,
-                    remaining,
-                    ModelDollarTotals::default(),
-                )
+                UsageHistorySample::new(timestamp, 1_200, remaining, ModelDollarTotals::default())
             })
             .collect::<Vec<_>>();
         let references = samples.iter().collect::<Vec<_>>();
@@ -44988,7 +44983,10 @@ mod tests {
             assert!(graph.remaining_solid.contains("100.00 12.76"));
             assert!(graph.remaining_inferred.is_empty());
             assert_eq!(graph.current_remaining_label, "88%");
-            assert_eq!(graph.current_sol_label, if show_tokens { "100" } else { "$1.00" });
+            assert_eq!(
+                graph.current_sol_label,
+                if show_tokens { "100" } else { "$1.00" }
+            );
         }
     }
 

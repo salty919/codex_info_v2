@@ -243,12 +243,15 @@ impl PublicAccountsV3 {
                 return Err(ContractError::InvalidModel);
             }
             for (index, interval) in account.ownership_intervals.iter().enumerate() {
-                if interval.start_at.is_some_and(|value| !valid_timestamp(value))
+                if interval
+                    .start_at
+                    .is_some_and(|value| !valid_timestamp(value))
                     || interval.end_at.is_some_and(|value| !valid_timestamp(value))
                     || matches!((interval.start_at, interval.end_at), (Some(start), Some(end)) if start >= end)
-                    || index > 0 && (account.ownership_intervals[index - 1].end_at.is_none()
-                        || interval.start_at.is_none()
-                        || account.ownership_intervals[index - 1].end_at > interval.start_at)
+                    || index > 0
+                        && (account.ownership_intervals[index - 1].end_at.is_none()
+                            || interval.start_at.is_none()
+                            || account.ownership_intervals[index - 1].end_at > interval.start_at)
                 {
                     return Err(ContractError::InvalidModel);
                 }
