@@ -474,8 +474,7 @@ internal static class GraphPlotProjection
         var anchors = Enumerable.Range(0, values.Count)
             .Where(index => double.IsFinite(values[index]) && values[index] >= 0 &&
                 !scene.ModelSynthetic[index] &&
-                (scene.IsModelIntervalReliable(values, index, index) ||
-                 IsConfirmedIdleTimestamp(idleIntervals, scene.Timestamps[index])))
+                scene.IsModelIntervalReliable(values, index, index))
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, ProjectionStyle Style)>();
         for (var anchor = 1; anchor < anchors.Length; anchor++)
@@ -505,14 +504,13 @@ internal static class GraphPlotProjection
             {
                 continue;
             }
-            var crossesPrediction = !confirmedIdle &&
-                Enumerable.Range(left + 1, right - left - 1)
-                    .Any(index => !scene.IsModelIntervalReliable(values, index, index));
+            var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)
+                .Any(index => !scene.IsModelIntervalReliable(values, index, index));
             var crossesCorrection = scene.HasModelCorrectionBetween(
                 values,
                 scene.Timestamps[left],
                 scene.Timestamps[right]);
-            if (confirmedIdle)
+            if (confirmedIdle && !crossesPrediction)
             {
                 if (scene.HasModelTokenCountChange(values, left, right))
                 {

@@ -89,33 +89,40 @@ public sealed class GraphAccountOwnershipIntervalTests
         Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
         Assert.Empty(scene.IdleIntervals);
 
-        var modelLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Luna);
+        var modelLines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
         AssertNoOwnershipGapCrossings(
             ownershipGapStartAt,
             ownershipGapEndAt,
-            modelLines.Idle.Line,
-            modelLines.Flat.Line,
-            modelLines.Rising.Line,
-            modelLines.Dashed.Line);
+            modelLines.Idle,
+            modelLines.Flat,
+            modelLines.Rising);
+        AssertOwnershipDashedSegments(
+            modelLines.Dashed,
+            firstTimestamp,
+            secondTimestamp);
 
-        var solModelLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
+        var solModelLines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         AssertNoOwnershipGapCrossings(
             ownershipGapStartAt,
             ownershipGapEndAt,
-            solModelLines.Idle.Line,
-            solModelLines.Flat.Line,
-            solModelLines.Rising.Line,
-            solModelLines.Dashed.Line);
+            solModelLines.Idle,
+            solModelLines.Flat,
+            solModelLines.Rising);
+        AssertOwnershipDashedSegments(
+            solModelLines.Dashed,
+            firstTimestamp,
+            secondTimestamp);
 
-        var remainingLines = GraphPlotProjection.BuildCanonicalRemainingLines(
-            scene,
-            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        var remainingLines = GraphPlotProjection.BuildRemainingLines(scene);
         AssertNoOwnershipGapCrossings(
             ownershipGapStartAt,
             ownershipGapEndAt,
-            remainingLines.Idle.Line,
-            remainingLines.Solid.Line,
-            remainingLines.Dashed.Line);
+            remainingLines.Idle,
+            remainingLines.Solid);
+        AssertOwnershipDashedSegments(
+            remainingLines.Dashed,
+            firstTimestamp,
+            secondTimestamp);
 
         var noOwnershipScene = GraphScene.Create(
             samples,
@@ -149,6 +156,19 @@ public sealed class GraphAccountOwnershipIntervalTests
             noOwnershipRemainingLines.Idle.Line,
             noOwnershipRemainingLines.Solid.Line);
         Assert.NotEmpty(noOwnershipRemainingLines.Dashed.Line.X);
+    }
+
+    private static void AssertOwnershipDashedSegments(
+        GraphLineProjection line,
+        long firstTimestamp,
+        long secondTimestamp)
+    {
+        var pairs = line.X
+            .Zip(line.X.Skip(1))
+            .Where(pair => double.IsFinite(pair.First) && double.IsFinite(pair.Second))
+            .Select(pair => ((long)pair.First, (long)pair.Second))
+            .ToArray();
+        Assert.Contains((firstTimestamp, secondTimestamp), pairs);
     }
 
     private static void AssertNoOwnershipGapCrossings(

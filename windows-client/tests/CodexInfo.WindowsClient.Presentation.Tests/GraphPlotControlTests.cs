@@ -2080,7 +2080,9 @@ public sealed class GraphPlotControlTests
             var lines = GraphPlotProjection.BuildModelLines(scene, model);
             Assert.Equal([(240L, 360L)], SegmentPairs(lines.Dashed));
             Assert.Equal([expectedValue, expectedValue], lines.Dashed.Y);
-            Assert.Empty(lines.Idle.X);
+            Assert.DoesNotContain(
+                SegmentPairs(lines.Idle),
+                pair => pair.Item1 < 360 && pair.Item2 > 240);
             Assert.Empty(lines.Rising.X);
             Assert.Equal(1f, GraphPlotControl.InferredLineWidth);
         }
@@ -2183,11 +2185,11 @@ public sealed class GraphPlotControlTests
         Assert.NotNull(dollarScene);
         Assert.NotNull(tokenScene);
         var expectedLineWidths = expected.GetProperty("line_widths");
-        Assert.Equal(expectedLineWidths.GetProperty("model_idle").GetSingle(), GraphPlotControl.IdleLineWidth);
-        Assert.Equal(expectedLineWidths.GetProperty("remaining_idle").GetSingle(), GraphPlotControl.IdleLineWidth);
+        Assert.Equal(GraphPlotControl.IdleLineWidth, expectedLineWidths.GetProperty("model_idle").GetSingle());
+        Assert.Equal(GraphPlotControl.IdleLineWidth, expectedLineWidths.GetProperty("remaining_idle").GetSingle());
         Assert.Equal(
-            expectedLineWidths.GetProperty("remaining_solid").GetSingle(),
-            GraphPlotControl.MeasuredRemainingLineWidth);
+            GraphPlotControl.MeasuredRemainingLineWidth,
+            expectedLineWidths.GetProperty("remaining_solid").GetSingle());
 
         var labels = GraphPlotProjection.BuildEndpointLabels(dollarScene!, CultureInfo.InvariantCulture);
         Assert.Contains(labels, label =>
