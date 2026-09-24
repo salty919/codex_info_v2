@@ -3421,6 +3421,44 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void Period_start_display_reaches_first_raw_remaining_across_non_owned_leading_span()
+    {
+        const long periodStart = 1_789_856_676;
+        const long firstRaw = 1_789_951_500;
+        const long secondRaw = 1_789_951_560;
+        const long resetAt = 1_790_461_476;
+        var samples = new[]
+        {
+            new ApiHistorySample(firstRaw, resetAt, 89, 1, 0, 0, 10, 0, 0),
+            new ApiHistorySample(secondRaw, resetAt, 89, 1, 0, 0, 10, 0, 0),
+        };
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            periodStart,
+            secondRaw,
+            null,
+            null,
+            [new GraphAccountOwnershipInterval(firstRaw + 7, null)]);
+
+        Assert.Equal([89d, 89d], scene.Remaining);
+        Assert.Equal([firstRaw, secondRaw], scene.Timestamps.Select(value => (long)value));
+        var raw = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.DoesNotContain(raw.Idle.X, value => value == periodStart);
+        Assert.DoesNotContain(raw.Solid.X, value => value == periodStart);
+        Assert.DoesNotContain(raw.Dashed.X, value => value == periodStart);
+
+        var display = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.StartsWith("M0.00 1.00", display.Dashed.Path);
+        Assert.Equal((double)periodStart, display.Dashed.Line.X[0]);
+        Assert.Equal(100d, display.Dashed.Line.Y[0]);
+        Assert.Contains(display.Dashed.Line.X, value => value >= firstRaw);
+        Assert.Contains(display.Dashed.Line.Y, value => value == 89d);
+    }
+
+    [Fact]
     public void Period_start_display_begins_at_100_percent_until_first_raw_remaining_observation()
     {
         const long periodStart = 1_000;
