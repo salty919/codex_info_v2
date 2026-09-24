@@ -314,8 +314,7 @@ internal static class GraphPlotProjection
         if (baselineMode is GraphRemainingBaselineMode.PeriodStartAtFullQuota &&
             anchors.Length > 0 &&
             scene.RemainingObserved[anchors[0]] &&
-            scene.Timestamps[anchors[0]] > scene.PeriodStartAt &&
-            !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[anchors[0]]))
+            scene.Timestamps[anchors[0]] > scene.PeriodStartAt)
         {
             // Full quota at the period boundary is a renderer-only convention.
             // Keep it out of GraphScene's raw/history arrays and visibly infer
