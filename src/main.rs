@@ -12974,15 +12974,7 @@ struct StagedServiceCurrentBundle {
 /// The v3 account directory exposes stable public ids, lifecycle boundaries,
 /// and an optional bounded display-only login id. It never carries tokens,
 /// account-scope hashes, filesystem paths, or backend authority values.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-struct ServiceAccountV3 {
-    id: String,
-    is_current: bool,
-    activation_at: Option<i64>,
-    deactivation_at: Option<i64>,
-    login_id: Option<String>,
-}
+type ServiceAccountV3 = codex_info_rest_contract::PublicAccountV3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -12991,8 +12983,6 @@ struct ServiceAccountsV3Document {
     default_account_id: Option<String>,
     accounts: Vec<ServiceAccountV3>,
 }
-
-const MAX_SERVICE_ACCOUNTS: usize = 256;
 
 struct CodexInfoState {
     i18n: I18n,
@@ -14507,6 +14497,7 @@ impl CodexInfoState {
                 is_current: true,
                 activation_at: Some(now - 86_400),
                 deactivation_at: None,
+                ownership_intervals: Vec::new(),
                 login_id: state.email.clone(),
             };
             state.service_accounts = vec![preview_account];
@@ -21099,65 +21090,12 @@ fn validate_service_accounts(document: &ServiceAccountsV3Document) -> Result<(),
     if document.api_version != "v3" {
         return Err("accounts document api_version is not v3".into());
     }
-    if document.accounts.len() > MAX_SERVICE_ACCOUNTS {
-        return Err("accounts document exceeds the public safety bound".into());
+    codex_info_rest_contract::PublicAccountsV3 {
+        default_account_id: document.default_account_id.clone(),
+        accounts: document.accounts.clone(),
     }
-    if document
-        .default_account_id
-        .as_deref()
-        .is_some_and(|account_id| !valid_public_account_id(account_id))
-    {
-        return Err("accounts document has no valid default account".into());
-    }
-    let mut ids = BTreeSet::new();
-    let mut current_count = 0usize;
-    let mut default_is_current = false;
-    for account in &document.accounts {
-        if !valid_public_account_id(&account.id) || !ids.insert(account.id.as_str()) {
-            return Err("accounts document contains an invalid or duplicate public id".into());
-        }
-        if account.login_id.as_deref().is_some_and(|value| {
-            value.is_empty()
-                || value.trim() != value
-                || value.chars().count() > 254
-                || value.chars().any(char::is_control)
-        }) {
-            return Err("accounts document contains an invalid login id".into());
-        }
-        for timestamp in [account.activation_at, account.deactivation_at]
-            .into_iter()
-            .flatten()
-        {
-            if DateTime::<Utc>::from_timestamp(timestamp, 0).is_none() {
-                return Err("accounts document contains an invalid lifecycle timestamp".into());
-            }
-        }
-        if account
-            .activation_at
-            .zip(account.deactivation_at)
-            .is_some_and(|(activation, deactivation)| activation > deactivation)
-        {
-            return Err("accounts document contains a reversed lifecycle boundary".into());
-        }
-        if account.is_current {
-            current_count = current_count.saturating_add(1);
-        }
-        if document.default_account_id.as_deref() == Some(account.id.as_str()) {
-            default_is_current = account.is_current;
-        }
-    }
-    match document.default_account_id.as_deref() {
-        Some(default_account_id)
-            if !ids.contains(default_account_id) || !default_is_current || current_count != 1 =>
-        {
-            return Err("accounts document default id is not present in accounts".into())
-        }
-        None if current_count != 0 => {
-            return Err("accounts document has a current account without a default".into())
-        }
-        _ => {}
-    }
-    Ok(())
+    .validate()
+    .map_err(|error| format!("accounts document violates v3 contract: {error}"))
 }
 
 fn parse_service_accounts_v3_document(bytes: &[u8]) -> Result<ServiceAccountsV3Document, String> {
@@ -23638,6 +23576,7 @@ mod tests {
                 is_current: true,
                 activation_at: Some(1),
                 deactivation_at: None,
+                ownership_intervals: Vec::new(),
                 login_id: Some("same@example.com".into()),
             },
             super::ServiceAccountV3 {
@@ -23645,6 +23584,7 @@ mod tests {
                 is_current: false,
                 activation_at: Some(2),
                 deactivation_at: Some(3),
+                ownership_intervals: Vec::new(),
                 login_id: Some("same@example.com".into()),
             },
         ];
