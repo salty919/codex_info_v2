@@ -5064,6 +5064,7 @@ fn graph_model_is_lossless_idle_observation(point: &GraphModelPoint) -> bool {
 /// inside that run is therefore a dollar-side projection error, not usage
 /// evidence. Legacy observations are eligible only inside an independently
 /// confirmed idle interval and retain their non-authoritative provenance.
+#[cfg(test)]
 fn normalize_graph_dollars_from_token_identity(
     dollar_timelines: &mut GraphModelTimelines,
     token_timelines: &GraphModelTimelines,
@@ -5968,6 +5969,7 @@ fn recoverable_sampling_jitter_minutes(
         .collect()
 }
 
+#[cfg(test)]
 fn graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
     input: GraphSelectionInput<'_>,
     task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
@@ -6129,12 +6131,10 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_sampli
                 RemainingPathContext {
                     points: &remaining_points,
                     samples,
-                    model_points: &minute,
                     period_start,
                     period_end,
                     confirmed_gaps: line_gaps,
                     correction_starts: &remaining_correction_starts,
-                    model_timelines: None,
                     remaining_evidence: Some(&remaining_evidence),
                     idle_timestamp_intervals: &idle_timestamp_intervals,
                 },
@@ -7154,6 +7154,7 @@ fn metric_line_segments_with_boundaries(
     )
 }
 
+#[cfg(test)]
 fn metric_line_segments_with_boundaries_and_idle(
     points: &[HourlyModelSpend],
     value: impl Fn(&HourlyModelSpend) -> f64,
@@ -7164,29 +7165,45 @@ fn metric_line_segments_with_boundaries_and_idle(
     idle_timestamp_intervals: &[(i64, i64)],
 ) -> Vec<GraphMetricSegment> {
     metric_line_segments_with_boundaries_and_idle_with_tokens(
-        points,
+        MetricSegmentContext {
+            points,
+            confirmed_gaps,
+            untrusted_minutes,
+            require_legacy_vector,
+            correction_starts,
+            idle_timestamp_intervals,
+            token_timeline: None,
+            non_owned_gaps: &[],
+        },
         value,
+    )
+}
+
+struct MetricSegmentContext<'a> {
+    points: &'a [HourlyModelSpend],
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    untrusted_minutes: &'a BTreeSet<i64>,
+    require_legacy_vector: bool,
+    correction_starts: &'a BTreeSet<i64>,
+    idle_timestamp_intervals: &'a [(i64, i64)],
+    token_timeline: Option<&'a BTreeMap<i64, GraphModelPoint>>,
+    non_owned_gaps: &'a [GraphConfirmedGap],
+}
+
+fn metric_line_segments_with_boundaries_and_idle_with_tokens(
+    context: MetricSegmentContext<'_>,
+    value: impl Fn(&HourlyModelSpend) -> f64,
+) -> Vec<GraphMetricSegment> {
+    let MetricSegmentContext {
+        points,
         confirmed_gaps,
         untrusted_minutes,
         require_legacy_vector,
         correction_starts,
         idle_timestamp_intervals,
-        None,
-        &[],
-    )
-}
-
-fn metric_line_segments_with_boundaries_and_idle_with_tokens(
-    points: &[HourlyModelSpend],
-    value: impl Fn(&HourlyModelSpend) -> f64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    untrusted_minutes: &BTreeSet<i64>,
-    require_legacy_vector: bool,
-    correction_starts: &BTreeSet<i64>,
-    idle_timestamp_intervals: &[(i64, i64)],
-    token_timeline: Option<&BTreeMap<i64, GraphModelPoint>>,
-    non_owned_gaps: &[GraphConfirmedGap],
-) -> Vec<GraphMetricSegment> {
+        token_timeline,
+        non_owned_gaps,
+    } = context;
     let is_exact = |index: usize| {
         let point = &points[index];
         let point_value = value(point);
@@ -7308,15 +7325,17 @@ fn split_metric_line_paths_with_evidence_idle_and_tokens(
         )
     };
     let mut segments = metric_line_segments_with_boundaries_and_idle_with_tokens(
-        context.points,
+        MetricSegmentContext {
+            points: context.points,
+            confirmed_gaps: context.confirmed_gaps,
+            untrusted_minutes: context.untrusted_minutes,
+            require_legacy_vector: context.require_legacy_vector,
+            correction_starts: context.correction_starts,
+            idle_timestamp_intervals: context.idle_timestamp_intervals,
+            token_timeline,
+            non_owned_gaps,
+        },
         &value,
-        context.confirmed_gaps,
-        context.untrusted_minutes,
-        context.require_legacy_vector,
-        context.correction_starts,
-        context.idle_timestamp_intervals,
-        token_timeline,
-        non_owned_gaps,
     );
     apply_confirmed_idle_to_metric_segments(
         &mut segments,
@@ -7679,8 +7698,7 @@ fn graph_nearest_short_model_rate(
 }
 
 fn graph_low_rate_long_model_change(
-    start: i64,
-    end: i64,
+    interval: (i64, i64),
     before: &[(String, u64)],
     after: &[(String, u64)],
     raw_timelines: &GraphModelTimelines,
@@ -7688,6 +7706,7 @@ fn graph_low_rate_long_model_change(
     samples: &[&UsageHistorySample],
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> bool {
+    let (start, end) = interval;
     if end <= start || before.len() != after.len() {
         return false;
     }
@@ -7696,7 +7715,7 @@ fn graph_low_rate_long_model_change(
         .map(|sample| (sample.timestamp.div_euclid(60) * 60, sample.reset_at))
         .collect::<BTreeMap<_, _>>();
     if reset_at_by_minute.get(&start) != reset_at_by_minute.get(&end)
-        || reset_at_by_minute.get(&start).is_none()
+        || !reset_at_by_minute.contains_key(&start)
     {
         return false;
     }
@@ -7920,8 +7939,7 @@ fn token_idle_timestamp_intervals_for_model(
         if end <= start
             || (start_vector != end_vector
                 && !graph_low_rate_long_model_change(
-                    *start,
-                    *end,
+                    (*start, *end),
                     start_vector,
                     end_vector,
                     raw_timelines,
@@ -8336,7 +8354,7 @@ fn quota_point_is_observed(samples: &[&UsageHistorySample], timestamp: i64, valu
 fn remaining_paths_with_evidence_and_idle(
     points: &[(i64, f64)],
     samples: &[&UsageHistorySample],
-    model_points: &[HourlyModelSpend],
+    _model_points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
     confirmed_gaps: &[GraphConfirmedGap],
@@ -8346,12 +8364,10 @@ fn remaining_paths_with_evidence_and_idle(
     remaining_paths_with_boundaries_and_idle(RemainingPathContext {
         points,
         samples,
-        model_points,
         period_start,
         period_end,
         confirmed_gaps,
         correction_starts: &correction_starts,
-        model_timelines: None,
         remaining_evidence: None,
         idle_timestamp_intervals,
     })
@@ -8412,22 +8428,21 @@ fn remaining_segments_with_boundaries(
     )
 }
 
+#[cfg(test)]
 fn remaining_segments_with_boundaries_and_evidence(
     points: &[(i64, f64)],
     samples: &[&UsageHistorySample],
-    model_points: &[HourlyModelSpend],
+    _model_points: &[HourlyModelSpend],
     confirmed_gaps: &[GraphConfirmedGap],
     correction_starts: &BTreeSet<i64>,
-    model_timelines: Option<(&GraphModelTimelines, bool)>,
+    _model_timelines: Option<(&GraphModelTimelines, bool)>,
     remaining_evidence: Option<&[GraphRemainingEvidence]>,
 ) -> Vec<GraphRemainingSegment> {
     remaining_segments_with_boundaries_and_evidence_and_non_owned(
         points,
         samples,
-        model_points,
         confirmed_gaps,
         correction_starts,
-        model_timelines,
         remaining_evidence,
         &[],
     )
@@ -8436,10 +8451,8 @@ fn remaining_segments_with_boundaries_and_evidence(
 fn remaining_segments_with_boundaries_and_evidence_and_non_owned(
     points: &[(i64, f64)],
     samples: &[&UsageHistorySample],
-    _model_points: &[HourlyModelSpend],
     confirmed_gaps: &[GraphConfirmedGap],
     correction_starts: &BTreeSet<i64>,
-    _model_timelines: Option<(&GraphModelTimelines, bool)>,
     remaining_evidence: Option<&[GraphRemainingEvidence]>,
     non_owned_gaps: &[GraphConfirmedGap],
 ) -> Vec<GraphRemainingSegment> {
@@ -8545,12 +8558,10 @@ fn remaining_point_has_measured_quota(
 struct RemainingPathContext<'a> {
     points: &'a [(i64, f64)],
     samples: &'a [&'a UsageHistorySample],
-    model_points: &'a [HourlyModelSpend],
     period_start: i64,
     period_end: i64,
     confirmed_gaps: &'a [GraphConfirmedGap],
     correction_starts: &'a BTreeSet<i64>,
-    model_timelines: Option<(&'a GraphModelTimelines, bool)>,
     remaining_evidence: Option<&'a [GraphRemainingEvidence]>,
     idle_timestamp_intervals: &'a [(i64, i64)],
 }
@@ -8568,12 +8579,10 @@ fn remaining_paths_with_boundaries_and_idle_with_non_owned(
     let RemainingPathContext {
         points,
         samples,
-        model_points,
         period_start,
         period_end,
         confirmed_gaps,
         correction_starts,
-        model_timelines,
         remaining_evidence,
         idle_timestamp_intervals,
     } = context;
@@ -8589,10 +8598,8 @@ fn remaining_paths_with_boundaries_and_idle_with_non_owned(
     let mut segments = remaining_segments_with_boundaries_and_evidence_and_non_owned(
         points,
         samples,
-        model_points,
         confirmed_gaps,
         correction_starts,
-        model_timelines,
         remaining_evidence,
         non_owned_gaps,
     );
