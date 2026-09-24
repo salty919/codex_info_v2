@@ -87,7 +87,7 @@ Codex app-server / session JSONL / thread rollout
    timestampへ書き戻さない。backup保持と単一表置換の詳細は`HISTORY-CANONICAL-134`を正本とする。
 3. DB書き込みはtransaction内だけで行う。busy、I/O、full、corrupt、schema不一致、migration中断はrollbackし、旧DBと旧メモリ世代を保持する。
 4. 有効な完全snapshotだけを公開する。account usageのcommit/publish admissionは現行の
-   `(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)` tupleだけを正本とし、candidateの7要素が全て現行値と一致する場合だけDB、memory、REST、UIへ進める。`SupervisorLeaseIdentity`は同一profile serviceの単一publisher所有権を別に固定し、account generationの代用にしない。
+   `(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, CollectorEpoch, CycleSeq)` tupleだけを正本とし、candidateの6要素が全て現行値と一致する場合だけDB、memory、REST、UIへ進める。`SupervisorLeaseIdentity`は同一profile serviceの単一publisher所有権を別に固定し、account generationの代用にしない。
    stale lease/epoch/cycleまたはtuple欠落・不一致はcandidateを破棄し、DB、memory、REST、UIを0変更とする。部分的な履歴、thread、model usage、REST応答を成功値として公開しない。
 5. local usage JSONLとlive rolloutを同じrecord隔離規則へ丸めない。live rolloutではUTF-8、JSON、
    envelope、event kind、task-stateへの非影響を完全検証できない改行済みrecordを含むcycleはfail-closedにする。
@@ -143,7 +143,7 @@ Codex app-server / session JSONL / thread rollout
 | schema mismatch/migration失敗 | 旧DB、旧backup世代 | 新DB候補 | migrationを修正して別途再実行 |
 | backup/rotation/restore失敗 | 現行DB、検証済み3世代、旧memory/root | partial backup/candidate、未検証世代 | 次のmaintenanceまたは明示restore。自動復元0 |
 | confirmed daemon stop gap | 前後のvalid sample、gap ledger、旧完全root | gap区間の補間値・複製値 | source cursor確認後にのみ確定。確定後は次の実sampleで再開 |
-| status/details pair不一致・stale admission tuple | 直前の完全status/details pair、現行`(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)`とprofile publisher lease | 片側だけ進んだcandidate、stale account/lease/epoch/cycle candidate | 次cycleで現行tupleを再取得・検証し、DB/memory/REST/UIは不一致中0変更 |
+| status/details pair不一致・stale admission tuple | 直前の完全status/details pair、現行`(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, CollectorEpoch, CycleSeq)`とprofile publisher lease | 片側だけ進んだcandidate、stale account/lease/epoch/cycle candidate | 次cycleで現行tupleを再取得・検証し、DB/memory/REST/UIは不一致中0変更 |
 | 認証喪失・アカウント切替 | 非認証root（旧account表示は消去）と非破壊DB | 旧accountの画面公開値 | 認証成功後に再読込 |
 | reset hint expired / auth epoch切替 | source log、旧DB、旧root、tombstone hint | `now >= reset_at`の旧期間scan/row、次期間への誤帰属、旧epochの公開値 | 旧hintをexpiredまたはtombstonedとして無効化し、source logを保持。current epochのfresh authenticated hint後だけ次のbounded one-shot |
 | UI/REST publish失敗 | DBのcommit済み世代、旧表示snapshot | 失敗した公開試行 | 次のroot更新または明示操作 |
@@ -388,8 +388,8 @@ read-only catalogへ公開し、画面は利用者が明示選択した一つだ
 欠損時は既存AccountScopeIdを再生成せずrecovery-requiredとする。
 
 canonical AccountKeyはowner-only・regular・0600・1..65536 bytesで前後identityが安定した
-`CODEX_HOME/auth.json`のexact `tokens.account_id` bytesである。前後`account/read`とprocess-local
-`AccountUpdateGeneration`を含むconfirmed windowが不一致なら、DB/WAL/SHM、checkpoint、publishを0件にする。
+`CODEX_HOME/auth.json`のexact `tokens.account_id` bytesである。raw AccountKeyが前後で不一致または再検証不能なら、DB/WAL/SHM、checkpoint、publishを0件にする。
+前後`account/read`が不一致ならquota/thread取得結果とその公開更新だけを棄却し、raw AccountKeyが一致するSession記録は継続する。
 raw AccountKeyとtokenはpath、profile metadata、DB、journal、log、RESTへ保存しない。login IDは1..254 Unicode scalar、
 trim済み・control文字なしを再検証し、owner-only account registryと当該account DBの表示label、およびloopback限定
 `GET /v3/accounts`のnullable `login_id`にだけ使用する。login IDの取得・保存失敗はusage記録を停止させない。
@@ -413,7 +413,6 @@ bare integerを異なるnamespace間で比較しない。採用型は次のと�
 - `BootId`: Linux `/proc/sys/kernel/random/boot_id`のUUID。
 - `SupervisorLeaseIdentity`: canonical DB profile、BootId、PID、process start ticks、128-bit owner nonceのtuple。
 - `auth_epoch`: logout、account change、identity failure、account worker restartごとに増えるprocess-local u64。overflowはprocess restartによるrecovery-requiredとする。
-- `AccountUpdateGeneration`: 同じapp-server processでstrictな`account/updated`受理ごとに増えるprocess-local u64。別process値と比較せず、malformed/overflowでauthorityを失効する。
 - `CollectorEpoch`: service startと各identity boundaryで生成する128-bit random ID。同じepochだけSession continuityを認める。
 - `CycleSeq`: CollectorEpoch内で1から始まり、admitted cycleごとに1増えるu64。
 - `DataGeneration`: partition内で0から始まり、usage rowとcheckpointの同一transaction commitごとに1増えるu64。
