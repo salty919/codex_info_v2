@@ -247,6 +247,9 @@ public sealed record ApiThreadDetails(
         : null;
 }
 
+/// <summary>One half-open account lifecycle interval.</summary>
+public sealed record ApiAccountOwnershipInterval(long? StartAt, long? EndAt);
+
 /// <summary>
 /// An account choice exposed by the v3 account selector.  The request id is
 /// the public account-N key; the optional login id is display metadata and is
@@ -259,6 +262,9 @@ public sealed record ApiAccount(
     long? DeactivationAt,
     string? LoginId = null)
 {
+    /// <summary>Complete half-open lifecycle intervals when supplied by v3/accounts.</summary>
+    public IReadOnlyList<ApiAccountOwnershipInterval>? OwnershipIntervals { get; init; }
+
     /// <summary>Localized state marker; it never contains a lifecycle time.</summary>
     public string? DisplayStatusSuffix { get; init; }
 
