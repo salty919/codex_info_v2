@@ -61,6 +61,7 @@ public sealed class GraphScene
     // flat intervals establish a candidate, but ordinary short publication
     // pauses must remain part of the foreground timeline.
     internal const long SustainedUnusedMinimumSeconds = 10 * 60;
+    private const long RecoverableSamplingJitterSeconds = 60;
 
     private GraphScene(
         long periodStartAt,
@@ -505,8 +506,8 @@ public sealed class GraphScene
             if (middle.IsSyntheticTail ||
                 middle.ModelSource != ApiHistorySample.UnavailableModelSource ||
                 middle.ModelsComplete ||
-                middle.Timestamp - left.Timestamp != 60 ||
-                right.Timestamp - middle.Timestamp != 60 ||
+                middle.Timestamp - left.Timestamp != RecoverableSamplingJitterSeconds ||
+                right.Timestamp - middle.Timestamp != RecoverableSamplingJitterSeconds ||
                 left.ResetAt != middle.ResetAt ||
                 left.ResetAt != right.ResetAt ||
                 left.RemainingPercent is not double leftRemaining ||
@@ -575,6 +576,159 @@ public sealed class GraphScene
         return name is null || !ModelLineReliability.TryGetValue(name, out var reliability) ||
             (before >= 0 && after >= 0 && before < reliability.Count && after < reliability.Count &&
                 reliability[before] && reliability[after]);
+    }
+
+    internal bool HasModelTokenCountChange(
+        IReadOnlyList<double> values,
+        int before,
+        int after)
+    {
+        var name = ModelSeries
+            .FirstOrDefault(pair => ReferenceEquals(pair.Value, values))
+            .Key;
+        return name is not null && TokenModelSeries.TryGetValue(name, out var tokens) &&
+            before >= 0 && after >= 0 && before < tokens.Count && after < tokens.Count &&
+            double.IsFinite(tokens[before]) && double.IsFinite(tokens[after]) &&
+            tokens[before] != tokens[after];
+    }
+
+    private static bool IsLowRateLongModelChange(
+        IReadOnlyList<ApiHistorySample> samples,
+        int before,
+        int after,
+        IReadOnlyDictionary<string, DirectModelValue> beforeVector,
+        IReadOnlyDictionary<string, DirectModelValue> afterVector,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        string? modelName)
+    {
+        if (after <= before || beforeVector.Count != afterVector.Count ||
+            !beforeVector.Keys.All(afterVector.ContainsKey))
+        {
+            return false;
+        }
+
+        IEnumerable<string> names = modelName is null ? beforeVector.Keys : [modelName];
+        var hasChange = false;
+        var elapsed = samples[after].Timestamp - samples[before].Timestamp;
+        if (elapsed <= 0)
+        {
+            return false;
+        }
+
+        foreach (var name in names)
+        {
+            if (!beforeVector.TryGetValue(name, out var left) ||
+                !afterVector.TryGetValue(name, out var right) ||
+                right.TotalTokens < left.TotalTokens)
+            {
+                return false;
+            }
+            if (right.TotalTokens == left.TotalTokens)
+            {
+                continue;
+            }
+
+            hasChange = true;
+            if (!TryGetNearestShortModelRate(
+                    samples,
+                    before,
+                    name,
+                    searchBefore: true,
+                    samples[before].ResetAt,
+                    confirmedGaps,
+                    out var beforeRate) ||
+                !TryGetNearestShortModelRate(
+                    samples,
+                    after,
+                    name,
+                    searchBefore: false,
+                    samples[before].ResetAt,
+                    confirmedGaps,
+                    out var afterRate))
+            {
+                return false;
+            }
+
+            var intervalRate = (double)(right.TotalTokens - left.TotalTokens) / elapsed;
+            if (!(intervalRate < beforeRate && intervalRate < afterRate))
+            {
+                return false;
+            }
+        }
+
+        return hasChange;
+    }
+
+    private static bool TryGetNearestShortModelRate(
+        IReadOnlyList<ApiHistorySample> samples,
+        int endpoint,
+        string modelName,
+        bool searchBefore,
+        long resetAt,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        out double tokensPerSecond)
+    {
+        if (searchBefore)
+        {
+            for (var rightIndex = endpoint; rightIndex > 0; rightIndex--)
+            {
+                if (TryGetShortModelRate(
+                        samples[rightIndex - 1],
+                        samples[rightIndex],
+                        modelName,
+                        resetAt,
+                        confirmedGaps,
+                        out tokensPerSecond))
+                {
+                    return true;
+                }
+            }
+        }
+        else
+        {
+            for (var leftIndex = endpoint; leftIndex + 1 < samples.Count; leftIndex++)
+            {
+                if (TryGetShortModelRate(
+                        samples[leftIndex],
+                        samples[leftIndex + 1],
+                        modelName,
+                        resetAt,
+                        confirmedGaps,
+                        out tokensPerSecond))
+                {
+                    return true;
+                }
+            }
+        }
+
+        tokensPerSecond = 0;
+        return false;
+    }
+
+    private static bool TryGetShortModelRate(
+        ApiHistorySample before,
+        ApiHistorySample after,
+        string modelName,
+        long resetAt,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        out double tokensPerSecond)
+    {
+        tokensPerSecond = 0;
+        var elapsed = after.Timestamp - before.Timestamp;
+        if (elapsed != RecoverableSamplingJitterSeconds ||
+            before.ResetAt != resetAt || after.ResetAt != resetAt ||
+            HasConfirmedGapBetween(confirmedGaps, before.Timestamp, after.Timestamp) ||
+            !TryGetIdleModelVector(before, modelName, out var beforeVector) ||
+            !TryGetIdleModelVector(after, modelName, out var afterVector) ||
+            !beforeVector.TryGetValue(modelName, out var first) ||
+            !afterVector.TryGetValue(modelName, out var last) ||
+            last.TotalTokens <= first.TotalTokens)
+        {
+            return false;
+        }
+
+        tokensPerSecond = (double)(last.TotalTokens - first.TotalTokens) / elapsed;
+        return true;
     }
 
     internal IReadOnlyList<GraphIdleInterval> IdleIntervalsForModel(
@@ -1135,7 +1289,15 @@ public sealed class GraphScene
             var right = samples[after.Index];
             if (right.Timestamp <= left.Timestamp ||
                 left.ResetAt != right.ResetAt ||
-                !TokenVectorsEqual(before.Vector, after.Vector) ||
+                (!TokenVectorsEqual(before.Vector, after.Vector) &&
+                    !IsLowRateLongModelChange(
+                        samples,
+                        before.Index,
+                        after.Index,
+                        before.Vector,
+                        after.Vector,
+                        confirmedGaps,
+                        modelName)) ||
                 HasConfirmedGapBetween(
                     confirmedGaps,
                     left.Timestamp,
@@ -1190,9 +1352,26 @@ public sealed class GraphScene
         ModelProjection tokenProjection,
         string? modelName)
     {
-        for (var index = before + 1; index <= after; index++)
+        // The endpoint pair is evaluated by the exact-equality or low-rate
+        // rule before this check; only intermediate observations contradict it.
+        for (var index = before + 1; index < after; index++)
         {
             var sample = samples[index];
+            // A missing model sample between matching direct observations is
+            // not a model change. Keep its independent remaining observation.
+            if (modelName is not null && index == before + 1 && after == index + 1 &&
+                sample.ModelSource == ApiHistorySample.UnavailableModelSource &&
+                !sample.ModelsComplete && !sample.IsSyntheticTail &&
+                samples[before].ModelSource == ApiHistorySample.ConfirmedModelSource &&
+                samples[before].ModelsComplete &&
+                samples[after].ModelSource == ApiHistorySample.ConfirmedModelSource &&
+                samples[after].ModelsComplete &&
+                sample.ResetAt == resetAt &&
+                sample.Timestamp - samples[before].Timestamp == RecoverableSamplingJitterSeconds &&
+                samples[after].Timestamp - sample.Timestamp == RecoverableSamplingJitterSeconds)
+            {
+                continue;
+            }
             if (sample.ResetAt != resetAt ||
                 !TryGetIdleModelVector(sample, modelName, out var vector) ||
                 !AcceptedIdleVectorAt(index, vector, tokenProjection) ||

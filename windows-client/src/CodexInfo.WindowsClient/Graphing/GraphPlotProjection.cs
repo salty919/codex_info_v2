@@ -308,8 +308,7 @@ internal static class GraphPlotProjection
         var dashedY = new List<double>();
         var anchors = Enumerable.Range(firstRenderable, scene.Timestamps.Count - firstRenderable)
             .Where(index => double.IsFinite(scene.Remaining[index]) &&
-                scene.RemainingOrigins[index] is GraphRemainingOrigin.Raw &&
-                !scene.IsNonOwnedAt(scene.Timestamps[index]))
+                scene.RemainingOrigins[index] is GraphRemainingOrigin.Raw)
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
         if (baselineMode is GraphRemainingBaselineMode.PeriodStartAtFullQuota &&
@@ -335,6 +334,13 @@ internal static class GraphPlotProjection
             var right = anchors[anchor];
             if (scene.OverlapsNonOwnedInterval(scene.Timestamps[left], scene.Timestamps[right]))
             {
+                AppendSegment(
+                    dashedX,
+                    dashedY,
+                    scene.Timestamps[left],
+                    RemainingValue(scene, left),
+                    scene.Timestamps[right],
+                    RemainingValue(scene, right));
                 continue;
             }
             var before = RemainingValue(scene, left);
@@ -468,9 +474,7 @@ internal static class GraphPlotProjection
         var anchors = Enumerable.Range(0, values.Count)
             .Where(index => double.IsFinite(values[index]) && values[index] >= 0 &&
                 !scene.ModelSynthetic[index] &&
-                !scene.IsNonOwnedAt(scene.Timestamps[index]) &&
-                (scene.IsModelIntervalReliable(values, index, index) ||
-                 IsConfirmedIdleTimestamp(idleIntervals, scene.Timestamps[index])))
+                scene.IsModelIntervalReliable(values, index, index))
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, ProjectionStyle Style)>();
         for (var anchor = 1; anchor < anchors.Length; anchor++)
@@ -479,6 +483,13 @@ internal static class GraphPlotProjection
             var right = anchors[anchor];
             if (scene.OverlapsNonOwnedInterval(scene.Timestamps[left], scene.Timestamps[right]))
             {
+                AppendSegment(
+                    dashedX,
+                    dashedY,
+                    scene.Timestamps[left],
+                    values[left],
+                    scene.Timestamps[right],
+                    values[right]);
                 continue;
             }
             var before = values[left];
@@ -493,22 +504,36 @@ internal static class GraphPlotProjection
             {
                 continue;
             }
-            var crossesPrediction = !confirmedIdle &&
-                Enumerable.Range(left + 1, right - left - 1)
-                    .Any(index => !scene.IsModelIntervalReliable(values, index, index));
+            var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)
+                .Any(index => !scene.IsModelIntervalReliable(values, index, index));
             var crossesCorrection = scene.HasModelCorrectionBetween(
                 values,
                 scene.Timestamps[left],
                 scene.Timestamps[right]);
-            if (confirmedIdle)
+            if (confirmedIdle && !crossesPrediction)
             {
-                AppendSegment(
-                    idleX,
-                    idleY,
-                    scene.Timestamps[left],
-                    before,
-                    scene.Timestamps[right],
-                    before);
+                if (scene.HasModelTokenCountChange(values, left, right))
+                {
+                    // Keep the measured endpoints connected, but show a
+                    // low-rate change as uncertain rather than active use.
+                    AppendSegment(
+                        dashedX,
+                        dashedY,
+                        scene.Timestamps[left],
+                        before,
+                        scene.Timestamps[right],
+                        current);
+                }
+                else
+                {
+                    AppendSegment(
+                        idleX,
+                        idleY,
+                        scene.Timestamps[left],
+                        before,
+                        scene.Timestamps[right],
+                        before);
+                }
             }
             else if (current < before)
             {
