@@ -455,7 +455,7 @@ public sealed class PresentationBoundaryTests
             .Where(element => element.Name.LocalName == "Button")
             .ToArray();
         Assert.Equal(
-            ["Graph.Window.Minimize", "Graph.Window.Maximize", "Graph.Window.Close"],
+            new string?[] { "Graph.Window.Minimize", "Graph.Window.Maximize", "Graph.Window.Close" },
             buttons.Select(button => button.Attribute("AutomationProperties.AutomationId")?.Value).ToArray());
 
         var controlStyle = document.Descendants()
