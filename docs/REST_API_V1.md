@@ -16,7 +16,8 @@ API-DEPRECATION-01
 
 `ACCOUNT-SELECT-134`: `GET /v3/accounts`は初期化済みaccount partitionの有限catalogを返す。各要素は
 `id`（`account-<StorageEpoch>`形式の非秘密selector）、`is_current`、nullableな`activation_at`、
-`deactivation_at`、`login_id`だけを持つ。認証中はrootの`default_account_id`が唯一の`is_current=true`要素を
+`deactivation_at`、`login_id`と、任意の`ownership_intervals`を持つ。各intervalのnullableな`start_at`と`end_at`は
+半開区間の境界であり、field欠落時は空配列として扱う。認証中はrootの`default_account_id`が唯一の`is_current=true`要素を
 指し、ログアウト中は`default_account_id=null`かつ`is_current=true`が0件となる（保持済みaccountを履歴要素として
 返してもよい）。`login_id`は前後の同一
 `account/read`で確認し、owner-onlyな当該account DBへ保存した1..254 Unicode scalar、trim済み・control文字なしの
