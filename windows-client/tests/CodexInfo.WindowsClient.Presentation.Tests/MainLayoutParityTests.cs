@@ -118,13 +118,44 @@ public sealed class MainLayoutParityTests
 
         var status = document.Descendants().Single(element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.StatusBanner");
+
+        var updateButton = status.Descendants().Single(element =>
+            element.Name.LocalName == "Button" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.Status.Update");
+        var updateParent = updateButton.Parent ?? throw new InvalidOperationException(
+            "Update CTA button has no direct parent");
+        Assert.Equal("2", updateParent.Attribute("Grid.RowSpan")?.Value);
+
+        Assert.Equal("StackPanel", updateParent.Name.LocalName);
+        foreach (var ctaId in new[] { "AuthStart", "AuthCheck", "Retry", "Refreshing" })
+        {
+            var button = status.Descendants().Single(element =>
+                element.Name.LocalName == "Button" &&
+                element.Attribute("AutomationProperties.AutomationId")?.Value == $"Main.Status.{ctaId}");
+            var cta = button.Parent ?? throw new InvalidOperationException(
+                $"CTA button has no direct parent: {ctaId}");
+            Assert.Equal("StackPanel", cta.Name.LocalName);
+            Assert.Equal("2", cta.Attribute("Grid.RowSpan")?.Value);
+        }
+
+        Assert.Equal("9,2,7,2", status.Attribute("Padding")?.Value);
+
         var statusGrid = status.Descendants().Single(element =>
             element.Name.LocalName == "Grid" &&
             element.Attribute("RowDefinitions")?.Value == "17,18");
-        Assert.Equal("11,2", status.Attribute("Padding")?.Value);
-        Assert.Contains(statusGrid.Descendants(), element =>
+        Assert.Equal("10", statusGrid.Attribute("ColumnSpacing")?.Value);
+
+        var statusDot = status.Descendants().Single(element =>
             element.Name.LocalName == "Border" &&
-            element.Attribute("Margin")?.Value == "0,14,0,0");
+            element.Attribute("Background")?.Value == "{Binding StatusAccent}");
+        Assert.Equal("8", statusDot.Attribute("Width")?.Value);
+        Assert.Equal("8", statusDot.Attribute("Height")?.Value);
+        Assert.Equal("0,14,0,0", statusDot.Attribute("Margin")?.Value);
+
+        var showLastReceived = status.Descendants().Single(element =>
+            element.Name.LocalName == "StackPanel" &&
+            element.Attribute("IsVisible")?.Value == "{Binding ShowLastReceived}");
+        Assert.Equal("0,0,4,0", showLastReceived.Attribute("Margin")?.Value);
 
         var accountStyle = document.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
