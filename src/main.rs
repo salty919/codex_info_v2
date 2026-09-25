@@ -14888,7 +14888,10 @@ impl CodexInfoState {
     }
 
     fn account_selector_options(&self) -> Vec<String> {
-        service_account_labels(&self.service_accounts, &self.i18n)
+        self.main_account_options()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
     }
 
     fn main_account_options(&self) -> Vec<(String, bool)> {
@@ -21493,37 +21496,6 @@ fn parse_service_accounts_v3_document(bytes: &[u8]) -> Result<ServiceAccountsV3D
     Ok(accounts)
 }
 
-fn service_account_labels(accounts: &[ServiceAccountV3], i18n: &I18n) -> Vec<String> {
-    let base = accounts
-        .iter()
-        .map(|account| {
-            let number = account.id.strip_prefix("account-").unwrap_or(&account.id);
-            let identity = account
-                .login_id
-                .clone()
-                .unwrap_or_else(|| format!("アカウント {number} · ID未復元"));
-            format!(
-                "{identity}{}",
-                i18n.account_selector_status(account.is_current)
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut counts = BTreeMap::new();
-    for label in &base {
-        *counts.entry(label.clone()).or_insert(0usize) += 1;
-    }
-    base.into_iter()
-        .zip(accounts)
-        .map(|(label, account)| {
-            if counts.get(&label).copied().unwrap_or(0) > 1 {
-                format!("{label} · {}", account.id)
-            } else {
-                label
-            }
-        })
-        .collect()
-}
-
 fn service_main_account_options(accounts: &[ServiceAccountV3]) -> Vec<(String, bool)> {
     let base = accounts
         .iter()
@@ -23967,8 +23939,6 @@ mod tests {
                 login_id: Some("same@example.com".into()),
             },
         ];
-        let i18n = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
-
         assert_eq!(
             super::service_main_account_options(&accounts),
             vec![
@@ -23976,9 +23946,17 @@ mod tests {
                 ("same@example.com · account-13".to_owned(), false),
             ]
         );
-        let graph = super::service_account_labels(&accounts, &i18n);
-        assert!(graph[0].contains("ログイン中"));
-        assert!(graph[1].contains("履歴"));
+        let graph = super::service_main_account_options(&accounts)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            graph,
+            vec![
+                "same@example.com · account-7".to_owned(),
+                "same@example.com · account-13".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -24711,17 +24689,11 @@ mod tests {
         let document = super::parse_service_accounts_v3_document(body).expect("valid accounts");
         assert_eq!(document.default_account_id.as_deref(), Some("account-7"));
         assert_eq!(
-            super::service_account_labels(
-                &document.accounts,
-                &I18n::from_parts(
-                    codex_info::i18n::Language::Japanese,
-                    chrono_tz::Tz::Asia__Tokyo,
-                ),
-            ),
+            super::service_main_account_options(&document.accounts),
             vec![
-                "current@example.com［ログイン中］",
-                "アカウント 13 · ID未復元［履歴］",
-                "past@example.com［履歴］",
+                ("current@example.com".to_owned(), true),
+                ("アカウント 13 · ID未復元".to_owned(), false),
+                ("past@example.com".to_owned(), false),
             ]
         );
 
@@ -24864,13 +24836,7 @@ mod tests {
         ));
 
         let labels = state.account_selector_options();
-        assert_eq!(
-            labels[1],
-            format!(
-                "アカウント 13 · ID未復元{}",
-                state.i18n.account_selector_status(false)
-            )
-        );
+        assert_eq!(labels[1], "アカウント 13 · ID未復元");
         assert!(state.select_account_label(&labels[1]));
         assert_eq!(
             state.service_selected_account_id.as_deref(),
