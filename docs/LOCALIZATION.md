@@ -40,6 +40,10 @@ UTCの順で解決し、非空で不正な`TZ`はUTCへfail closedします。`T
 - 日本語catalogの絶対時刻はGregorian calendar・ASCII digit・24時間表記の
   `yyyy/MM/dd HH:mm ±HH:MM`へ固定します。fixture `1787356800` はUTCで
   `2026/08/22 00:00 +00:00`、Asia/Tokyoで`2026/08/22 09:00 +09:00`です。
+  MainのWeekGaugeにあるリセット・観測時刻と、末尾StatusBannerの前回受信時刻だけは、
+  Windows Mainと同じ日付・時分の表示形式を使い、秒と数値UTC offsetを画面に付けません。
+  日本語では`yyyy/MM/dd HH:mm`とし、同じepochをactive表示timezoneへ変換します。
+  このMain限定表示によってUTC epoch、期間境界、Graph・履歴など他の絶対時刻の形式を変更しません。
   timezone selectorの保存値は両platformとも`local`または`UTC`だけとし、`local`の具体IANA zoneは
   実行hostから解決して表示へ使います。IANA zone名自体を設定値として保存しません。Linuxの
   presentation preferenceは`$XDG_CONFIG_HOME/codex-info/settings.json`、`XDG_CONFIG_HOME`未設定時は
@@ -56,7 +60,9 @@ UTCの順で解決し、非空で不正な`TZ`はUTCへfail closedします。`T
 
 ## 固定文言
 
-固定UI文言はcatalogで管理します。thread title、email、モデル名、製品名、ライセンス名、ログ生値は原文を表示し、数値とepoch秒だけを表示時のlocale・timezoneへ変換します。
+固定UI文言はcatalogで管理します。MainのWeekGaugeはWindows Mainと同じ期間名と残り時間を別欄に置き、
+通常時のStatusBannerは状態名・説明・前回受信時刻を別欄に置きます。thread title、email、モデル名、製品名、
+ライセンス名、ログ生値は原文を表示し、数値とepoch秒だけを表示時のlocale・timezoneへ変換します。
 
 日本語・韓国語フォントは`assets/NotoSansJP.ttf`と`assets/NotoSansKR.otf`をSlintへ埋め込み、起動時localeのフォントを各Windowへ適用します。フォントのOFL-1.1通知は[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)と[assets/NOTICE.txt](../assets/NOTICE.txt)に記載します。
 

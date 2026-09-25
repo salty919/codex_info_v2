@@ -153,16 +153,21 @@
                      VerticalAlignment="Center"
                      Text="◈" />
         </Border>
-        <StackPanel VerticalAlignment="Center">
-          <TextBlock FontSize="22"
-                     FontWeight="SemiBold"
+        <Grid RowDefinitions="28,17" Margin="0,3,0,0" VerticalAlignment="Top">
+          <TextBlock Grid.Row="0"
+                     FontSize="22"
+                     FontWeight="Bold"
                      Foreground="#E9EFF8"
                      Text="{Binding Texts.UsageStatus}"
+                     VerticalAlignment="Center"
                      AutomationProperties.AutomationId="Main.UsageStatus" />
-          <TextBlock Classes="label"
+          <TextBlock Grid.Row="1"
+                     Classes="label"
+                     FontSize="12"
+                     VerticalAlignment="Center"
                      AutomationProperties.AutomationId="Main.ProductVersion"
                      Text="{Binding ProductVersionText}" />
-        </StackPanel>
+        </Grid>
       </StackPanel>
       <ToggleButton Grid.Column="1"
                     Classes="account-selector"

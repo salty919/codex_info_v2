@@ -61,9 +61,12 @@ export component MainWindow inherits Window {
     in-out property <int> active-thread-other-count: 0;
     in-out property <string> estimated-cost-label;
     in-out property <string> remaining-label: "—";
+    in-out property <string> week-title;
     in-out property <string> week-label;
     in-out property <string> reset-label;
+    in-out property <string> reset-value;
     in-out property <string> observed-label;
+    in-out property <string> observed-value;
     in-out property <string> model-usage-names;
     in-out property <string> model-usage-input-tokens;
     in-out property <string> model-usage-input-costs;
@@ -170,12 +173,17 @@ export component MainWindow inherits Window {
                 height: 78px;
                 visible: root.show-data-cards;
                 remaining-days: root.remaining-days;
+                period-title: root.week-title;
                 remaining-label: root.has-usage && root.has-quota-percent && !root.historical-account
-                    ? root.week-label : root.strings.no-records;
+                    ? root.week-label : "";
                 reset-label: root.has-usage && root.has-quota-percent && !root.historical-account
                     ? root.reset-label : "";
+                reset-value: root.has-usage && root.has-quota-percent && !root.historical-account
+                    ? root.reset-value : "";
                 observed-label: root.has-usage && root.has-quota-percent && !root.historical-account
                     ? root.observed-label : "";
+                observed-value: root.has-usage && root.has-quota-percent && !root.historical-account
+                    ? root.observed-value : "";
                 show-gauge: root.has-usage && root.has-quota-percent && !root.historical-account;
             }
             AccountActivity {
