@@ -34,6 +34,30 @@ public sealed class MainLayoutParityTests
     }
 
     [Fact]
+    public void MainHeaderMatchesLinuxReference()
+    {
+        var document = XDocument.Parse(LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "MainWindow.axaml"));
+        var title = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.UsageStatus");
+        var version = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.ProductVersion");
+        var titleBlock = title.Parent ?? throw new InvalidOperationException("Main title has no layout parent");
+
+        // WIN-PARITY-UX: the Linux reference places the 22px title in a
+        // 28px row at y=3 and the 12px version in a 17px row at y=31.
+        Assert.Equal("Grid", titleBlock.Name.LocalName);
+        Assert.Same(titleBlock, version.Parent);
+        Assert.Equal("28,17", titleBlock.Attribute("RowDefinitions")?.Value);
+        Assert.Equal("0,3,0,0", titleBlock.Attribute("Margin")?.Value);
+        Assert.Equal("0", title.Attribute("Grid.Row")?.Value);
+        Assert.Equal("1", version.Attribute("Grid.Row")?.Value);
+        Assert.Equal("22", title.Attribute("FontSize")?.Value);
+        Assert.Equal("Bold", title.Attribute("FontWeight")?.Value);
+        Assert.Equal("12", version.Attribute("FontSize")?.Value);
+    }
+
+    [Fact]
     public void MainSectionsUseTheIssue349HybridComposition()
     {
         var document = XDocument.Parse(LoadRepositoryFile(

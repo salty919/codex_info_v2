@@ -795,9 +795,12 @@ component ActionButton inherits Rectangle {
 
 export component WeekGauge inherits Rectangle {
     in property <float> remaining-days;
+    in property <string> period-title;
     in property <string> remaining-label;
     in property <string> reset-label;
+    in property <string> reset-value;
     in property <string> observed-label;
+    in property <string> observed-value;
     in property <bool> show-gauge: true;
     property <length> segment-width: (root.width - 48px) / 7;
     height: 78px;
@@ -809,12 +812,24 @@ export component WeekGauge inherits Rectangle {
     Text {
         x: 12px;
         y: 5px;
-        width: parent.width - 24px;
+        width: parent.width - 296px;
         height: 18px;
-        text: root.remaining-label;
+        text: root.period-title;
         color: DesignTokens.main-label;
         font-size: 12px;
         font-weight: 600;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Text {
+        x: parent.width - 284px;
+        y: 5px;
+        width: 272px;
+        height: 18px;
+        text: root.remaining-label;
+        color: DesignTokens.main-text-primary;
+        font-size: 13px;
+        horizontal-alignment: right;
         vertical-alignment: center;
         overflow: elide;
     }
@@ -881,11 +896,17 @@ export component WeekGauge inherits Rectangle {
     if root.show-gauge && root.remaining-days - 4 > 0 : DayFill { x: 12px + 4 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 4)); height: 20px; }
     if root.show-gauge && root.remaining-days - 5 > 0 : DayFill { x: 12px + 5 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 5)); height: 20px; }
     if root.show-gauge && root.remaining-days - 6 > 0 : DayFill { x: 12px + 6 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 6)); height: 20px; }
-    Text { x: 12px; y: 49px; width: (parent.width - 32px) / 2; height: 20px;
+    Text { x: 12px; y: 49px; width: 84px; height: 20px;
         text: root.reset-label; color: DesignTokens.main-label; font-size: 11px;
         vertical-alignment: center; overflow: elide; }
-    Text { x: 20px + (parent.width - 32px) / 2; y: 49px; width: (parent.width - 32px) / 2; height: 20px;
+    Text { x: 104px; y: 49px; width: parent.width - 548px; height: 20px;
+        text: root.reset-value; color: DesignTokens.main-text-primary; font-size: 11px;
+        vertical-alignment: center; overflow: elide; }
+    Text { x: parent.width - 412px; y: 49px; width: 116px; height: 20px;
         text: root.observed-label; color: DesignTokens.main-label; font-size: 11px;
+        vertical-alignment: center; overflow: elide; }
+    Text { x: parent.width - 288px; y: 49px; width: 276px; height: 20px;
+        text: root.observed-value; color: DesignTokens.main-text-primary; font-size: 11px;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
 }
 
