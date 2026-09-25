@@ -66,7 +66,7 @@ cleanup条件と削除予定:
 
 - 1 taskにつき一時branch 1本、一時worktree 1個とする。同じfile/pathにwriterを1人だけ割り当て、owned pathsと変更禁止範囲を宣言する。
 - `AGENTS.md`、workflow、lockfile、共通仕様、要件台帳等のcross-cutting fileは排他的所有とし、同時に別のwritable taskを走らせてはならない。ユーザー通常worktreeの同じpathにdirty/untracked変更がある、ownershipが重複する、または一時worktreeに不明差分が現れた場合は停止する。
-- サブエージェントは宣言済み一時worktreeとowned pathsだけを扱う。サブエージェントによるbranch/worktreeの作成・削除、ref/config/remote操作、commit、push、PR操作を禁止し、管理は主担当だけが行う。
+- サブエージェントは宣言済み一時worktreeとowned pathsだけを扱う。branch/worktreeの作成・削除、ref/config/remote操作、commit、push、PR操作は禁止し、これらの管理はroot agentだけが行う。SOL subagentへの製品判断委譲はGit操作権限を移さない。
 - Codexは宣言した最小のformatter、check、testを実行し、0件のtestをPASSにしてはならない。既往障害、security、cross-cutting governance等で独立判断が必要な場合だけfresh evaluatorを使う。
 - commitはユーザーが明示許可した場合に限り、owned filesだけをstageして行う。pushとPR作成も宣言に含まれ明示許可された場合だけ行い、Codexが作るPRのbaseは`feat/next`に限定する。
 - Codexは、ユーザーから依頼または許可を受けた場合も、いかなるPRもmergeせず、auto-mergeを設定または解除しない。この禁止に例外はなく、merge操作はユーザー本人だけが行う。Codexは`codex/<task> -> feat/next`のPR作成・更新と作業証拠のcommentを行える。PRのapprove、ready化、closeおよびworkflowのapproveまたはrerunは、exact targetと操作についてユーザーの明示許可がある場合だけ実施できる。
@@ -79,7 +79,7 @@ cleanup条件と削除予定:
 
 ### race、cleanup、復旧、報告
 
-- cleanupは主担当だけが、宣言済みbranchとcanonical pathに対して行う。merge/fast-forwardではcommit ancestryを確認し、squash、rebase、cherry-pick相当ではdeclared diffがtargetへ反映されたことと受入checkを確認する。PRの状態だけを統合証拠にしてはならず、同等性が曖昧な場合は削除しない。
+- cleanupはroot agentだけが、宣言済みbranchとcanonical pathに対して行う。merge/fast-forwardではcommit ancestryを確認し、squash、rebase、cherry-pick相当ではdeclared diffがtargetへ反映されたことと受入checkを確認する。PRの状態だけを統合証拠にしてはならず、同等性が曖昧な場合は削除しない。
 - cleanup前に一時worktreeのtracked/untracked差分と生成物を確認する。不明差分、未commit変更、未統合のunique commitがある場合は保持し、完全SHA、対象path、PR状態、復旧方法を報告してユーザーのintegrate/discard判断を待つ。
 - cleanupにはforceなしの`git worktree remove`、統合済みbranchに対する`git branch -d`、許可済みremote一時branchの削除だけを使用する。`rm -rf`、`git branch -D`、`git worktree remove --force`、`git clean`、force pushを禁止する。
 - task開始時と終了時に、時刻、canonical worktree path、branch、完全なbase/HEAD SHA、dirty状態、owned/non-owned scope、許可された操作と期限、check結果、commit、push、PR URL/state、残存worktree/local/remote ref、cleanup結果、復旧手段を、terminalで再現できるコマンドとともにchatで報告する。repositoryへagent台帳やEvidence文書を追加してはならない。
