@@ -36152,10 +36152,8 @@ mod tests {
         }
 
         let japanese = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
-        let countdown = japanese.format_period_remaining(
-            86_400 + 3_600 + 60,
-            codex_info::i18n::PeriodKind::Weekly,
-        );
+        let countdown = japanese
+            .format_period_remaining(86_400 + 3_600 + 60, codex_info::i18n::PeriodKind::Weekly);
         if countdown != "残り 1日 1時間 1分" {
             mismatches.push(format!("combined period/countdown label: {countdown:?}"));
         }

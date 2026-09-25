@@ -641,7 +641,9 @@ impl I18n {
             (Language::Korean, PeriodKind::Monthly) => "월간: 재설정까지",
             (Language::Spanish, PeriodKind::Weekly) => "Ciclo de 7 días: hasta el restablecimiento",
             (Language::Spanish, PeriodKind::Monthly) => "Mensual: hasta el restablecimiento",
-            (Language::French, PeriodKind::Weekly) => "Cycle de 7 jours : jusqu’à la réinitialisation",
+            (Language::French, PeriodKind::Weekly) => {
+                "Cycle de 7 jours : jusqu’à la réinitialisation"
+            }
             (Language::French, PeriodKind::Monthly) => "Mensuel : jusqu’à la réinitialisation",
             (Language::German, PeriodKind::Weekly) => "7-Tage-Zyklus: bis zum Zurücksetzen",
             (Language::German, PeriodKind::Monthly) => "Monatlich: bis zum Zurücksetzen",
@@ -713,7 +715,11 @@ impl I18n {
             Language::English => "%m/%d/%Y %I:%M %p",
             _ => "%d/%m/%Y %H:%M",
         };
-        Some(time.with_timezone(&self.timezone).format(pattern).to_string())
+        Some(
+            time.with_timezone(&self.timezone)
+                .format(pattern)
+                .to_string(),
+        )
     }
 
     pub fn main_ready_status_detail(&self) -> &'static str {
