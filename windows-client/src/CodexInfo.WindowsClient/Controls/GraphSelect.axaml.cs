@@ -13,7 +13,7 @@ using Avalonia.VisualTree;
 
 namespace CodexInfo.WindowsClient.Controls;
 
-public partial class GraphSelect : UserControl
+public partial class GraphSelect : ToggleButton
 {
     public static readonly StyledProperty<string> FieldLabelProperty =
         AvaloniaProperty.Register<GraphSelect, string>(nameof(FieldLabel), "");
@@ -58,39 +58,41 @@ public partial class GraphSelect : UserControl
     public GraphSelect()
     {
         InitializeComponent();
-        MenuPopup.PlacementTarget = Field;
+        MenuPopup.PlacementTarget = this;
+        MenuPopup.Closed += (_, _) =>
+        {
+            Chevron.Text = "⌄";
+            if (IsChecked == true)
+            {
+                IsChecked = false;
+            }
+        };
     }
 
-    private void OnFieldPressed(object? sender, PointerPressedEventArgs e)
+    private void OnFieldClick(object? sender, RoutedEventArgs e)
     {
-        if (!IsEnabled || ItemsSource is null)
+        if (IsChecked != true || !IsEnabled || ItemsSource is null)
         {
+            IsChecked = false;
+            ClosePopup();
             return;
         }
 
-        if (MenuPopup.IsOpen)
+        var count = ItemsSource.Cast<object>().Count();
+        if (count == 0)
         {
-            Close();
+            IsChecked = false;
+            ClosePopup();
+            return;
         }
-        else
-        {
-            var count = ItemsSource.Cast<object>().Count();
-            if (count == 0)
-            {
-                return;
-            }
 
-            PopupSurface.Width = LimitPopupToField ? Math.Min(PopupWidth, Bounds.Width) : PopupWidth;
-            MenuList.Height = Math.Min(count, MaxVisibleItems) * 32;
-            MenuPopup.Placement = PopupOnLeft
-                ? PlacementMode.LeftEdgeAlignedTop
-                : PlacementMode.BottomEdgeAlignedLeft;
-            MenuPopup.IsOpen = true;
-            Chevron.Text = "⌃";
-            Field.Background = Avalonia.Media.Brush.Parse("#244D74");
-            Field.BorderBrush = Avalonia.Media.Brush.Parse("#56B2F5");
-        }
-        e.Handled = true;
+        PopupSurface.Width = LimitPopupToField ? Math.Min(PopupWidth, Bounds.Width) : PopupWidth;
+        MenuList.Height = Math.Min(count, MaxVisibleItems) * 32;
+        MenuPopup.Placement = PopupOnLeft
+            ? PlacementMode.LeftEdgeAlignedTop
+            : PlacementMode.BottomEdgeAlignedLeft;
+        MenuPopup.IsOpen = true;
+        Chevron.Text = "⌃";
     }
 
     private void OnSelectionChanged(object? sender, SelectionChangedEventArgs e)
@@ -120,9 +122,16 @@ public partial class GraphSelect : UserControl
 
     public void Close()
     {
+        if (IsChecked == true)
+        {
+            IsChecked = false;
+        }
+        ClosePopup();
+    }
+
+    private void ClosePopup()
+    {
         MenuPopup.IsOpen = false;
         Chevron.Text = "⌄";
-        Field.Background = Avalonia.Media.Brush.Parse("#111B2C");
-        Field.BorderBrush = Avalonia.Media.Brush.Parse("#405779");
     }
 }

@@ -22,6 +22,15 @@
         Background="#0E141E"
         Foreground="#E9EFF8">
   <Window.Styles>
+    <Style Selector="controls|GraphSelect.graph-select-field">
+      <Setter Property="Background" Value="#111B2C" />
+      <Setter Property="BorderBrush" Value="#405779" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="controls|GraphSelect.graph-select-field:checked">
+      <Setter Property="Background" Value="#244D74" />
+      <Setter Property="BorderBrush" Value="#56B2F5" />
+    </Style>
     <Style Selector="TextBlock.label">
       <Setter Property="FontSize" Value="13" />
       <Setter Property="Foreground" Value="#78879C" />
@@ -104,16 +113,17 @@
                             ValueText="{Binding SelectedAccountValueText}"
                             ItemsSource="{Binding Accounts}" SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
                             MenuAutomationId="Graph.AccountMenu" PopupWidth="560" MaxVisibleItems="4"
-                            IsEnabled="{Binding HasAccounts}" AutomationProperties.Name="{Binding Texts.Account}"
+                            IsEnabled="{Binding HasAccounts}"
+                            AutomationProperties.Name="{Binding Texts.Account}"
                             AutomationProperties.AutomationId="Graph.AccountSelector"
                             AutomationProperties.HelpText="{Binding SelectedAccountText}"
                             ToolTip.Tip="{Binding SelectedAccountText}">
         <controls:GraphSelect.ItemTemplate>
           <DataTemplate x:DataType="core:ApiAccount">
-            <TextBlock Text="{Binding DisplayLabel}" TextWrapping="Wrap"
-                       ToolTip.Tip="{Binding DisplayLabel}"
-                       AutomationProperties.Name="{Binding DisplayLabel}"
-                       AutomationProperties.HelpText="{Binding DisplayLabel}" />
+            <TextBlock Text="{Binding MainDisplayLabel}" TextWrapping="Wrap"
+                       ToolTip.Tip="{Binding MainDisplayLabel}"
+                       AutomationProperties.Name="{Binding MainDisplayLabel}"
+                       AutomationProperties.HelpText="{Binding MainDisplayLabel}" />
           </DataTemplate>
         </controls:GraphSelect.ItemTemplate>
       </controls:GraphSelect>
@@ -123,7 +133,8 @@
                             ValueText="{Binding SelectedPeriodValueText}"
                             ItemsSource="{Binding Periods}" SelectedItem="{Binding SelectedPeriod, Mode=TwoWay}"
                             MenuAutomationId="Graph.PeriodMenu" PopupWidth="620" LimitPopupToField="True" MaxVisibleItems="10"
-                            IsEnabled="{Binding HasPeriods}" AutomationProperties.Name="{Binding Texts.PeriodSelectorHeading}"
+                            IsEnabled="{Binding HasPeriods}"
+                            AutomationProperties.Name="{Binding Texts.PeriodSelectorHeading}"
                             AutomationProperties.AutomationId="Graph.PeriodSelector"
                             AutomationProperties.HelpText="{Binding SelectedPeriodText}"
                             ToolTip.Tip="{Binding SelectedPeriodText}">
