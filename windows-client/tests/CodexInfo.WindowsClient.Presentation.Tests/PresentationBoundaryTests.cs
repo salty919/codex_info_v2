@@ -434,8 +434,10 @@ public sealed class PresentationBoundaryTests
     {
         var document = XDocument.Parse(LoadRepositoryFile(
             "windows-client", "src", "CodexInfo.WindowsClient", "GraphWindow.axaml"));
+        var xamlName = XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml");
         var metricSelector = document.Descendants()
-            .Single(element => element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.MetricSelector");
+            .Single(element => element.Name.LocalName == "GraphSelect" &&
+                element.Attribute(xamlName)?.Value == "MetricSelector");
         var header = metricSelector.Parent;
         Assert.NotNull(header);
         Assert.Equal("Grid", header.Name.LocalName);
@@ -475,19 +477,20 @@ public sealed class PresentationBoundaryTests
         Assert.Equal(controlGroupWidth, int.Parse(columns[3]));
 
         var accountSelector = document.Descendants()
-            .Single(element => element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.AccountSelector");
+            .Single(element => element.Name.LocalName == "GraphSelect" &&
+                element.Attribute(xamlName)?.Value == "AccountSelector");
         Assert.Equal("0,6,0,0", accountSelector.Attribute("Margin")?.Value);
-        var accountFields = accountSelector.Descendants().Single(element => element.Name.LocalName == "Grid");
-        Assert.Equal("82,1,*,14", accountFields.Attribute("ColumnDefinitions")?.Value);
-        Assert.Equal("{Binding SelectedAccountValueText}", accountFields.Elements().Single(element => element.Attribute("Grid.Column")?.Value == "2").Attribute("Text")?.Value);
+        Assert.Equal("{Binding SelectedAccountValueText}", accountSelector.Attribute("ValueText")?.Value);
+        Assert.Equal("Graph.AccountSelector", accountSelector.Attribute("AutomationProperties.AutomationId")?.Value);
 
         var periodSelector = document.Descendants()
-            .Single(element => element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.PeriodSelector");
+            .Single(element => element.Name.LocalName == "GraphSelect" &&
+                element.Attribute(xamlName)?.Value == "PeriodSelector");
         Assert.Equal("0,12,0,0", periodSelector.Attribute("Margin")?.Value);
         Assert.Equal("2", periodSelector.Attribute("Grid.Row")?.Value);
         Assert.Equal("1", accountSelector.Attribute("Grid.Row")?.Value);
-        var periodFields = periodSelector.Descendants().Single(element => element.Name.LocalName == "Grid");
-        Assert.Equal("{Binding SelectedPeriodValueText}", periodFields.Elements().Single(element => element.Attribute("Grid.Column")?.Value == "2").Attribute("Text")?.Value);
+        Assert.Equal("{Binding SelectedPeriodValueText}", periodSelector.Attribute("ValueText")?.Value);
+        Assert.Equal("Graph.PeriodSelector", periodSelector.Attribute("AutomationProperties.AutomationId")?.Value);
 
         var controlSurface = document.Descendants()
             .Single(element => element.Name.LocalName == "Border" &&
@@ -500,12 +503,21 @@ public sealed class PresentationBoundaryTests
             element.Attribute("Width")?.Value == "504");
         Assert.Equal("120,90,90,90,90", legend.Attribute("ColumnDefinitions")?.Value);
 
-        var metricMenu = document.Descendants()
-            .Single(element => element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.MetricMenu")
-            .Parent;
-        Assert.NotNull(metricMenu);
-        var metricMenuRightMargin = int.Parse(metricMenu.Attribute("Margin")!.Value.Split(',')[2]);
-        Assert.Equal(int.Parse(columns[2]) + controlGroupWidth, metricMenuRightMargin);
+        Assert.Equal("Graph.MetricSelector", metricSelector.Attribute("AutomationProperties.AutomationId")?.Value);
+        Assert.Equal("Graph.MetricMenu", metricSelector.Attribute("MenuAutomationId")?.Value);
+        Assert.Equal("128", metricSelector.Attribute("PopupWidth")?.Value);
+        Assert.Equal("True", metricSelector.Attribute("PopupOnLeft")?.Value);
+
+        var field = XDocument.Parse(LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "Controls", "GraphSelect.axaml"));
+        var fieldGrid = field.Descendants().Single(element =>
+            element.Name.LocalName == "Grid" &&
+            element.Attribute("ColumnDefinitions")?.Value == "Auto,*,14");
+        Assert.Equal("12,0", fieldGrid.Attribute("Margin")?.Value);
+        var labelGrid = fieldGrid.Elements().Single(element =>
+            element.Name.LocalName == "Grid" &&
+            element.Attribute("ColumnDefinitions")?.Value == "82,1");
+        Assert.Equal("{Binding HasFieldLabel, ElementName=Root}", labelGrid.Attribute("IsVisible")?.Value);
     }
 
     [Fact]

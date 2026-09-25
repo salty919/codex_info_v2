@@ -5,6 +5,7 @@
         xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
         xmlns:core="using:CodexInfo.WindowsClient.Core"
         xmlns:plot="using:CodexInfo.WindowsClient.Controls"
+        xmlns:controls="using:CodexInfo.WindowsClient.Controls"
         x:Class="CodexInfo.WindowsClient.GraphWindow"
         x:DataType="vm:GraphWindowViewModel"
         Width="940"
@@ -21,32 +22,18 @@
         Background="#0E141E"
         Foreground="#E9EFF8">
   <Window.Styles>
-    <Style Selector="TextBlock.label">
-      <Setter Property="FontSize" Value="13" />
-      <Setter Property="Foreground" Value="#78879C" />
-    </Style>
-    <Style Selector="ToggleButton.selector">
-      <Setter Property="Height" Value="36" />
-      <Setter Property="Padding" Value="12,0" />
-      <Setter Property="HorizontalAlignment" Value="Stretch" />
-      <Setter Property="HorizontalContentAlignment" Value="Left" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
+    <Style Selector="controls|GraphSelect.graph-select-field">
       <Setter Property="Background" Value="#111B2C" />
       <Setter Property="BorderBrush" Value="#405779" />
       <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="6" />
-      <Setter Property="Foreground" Value="#E9EFF8" />
     </Style>
-    <Style Selector="ToggleButton.selector.metric">
-      <Setter Property="Padding" Value="12,0" />
-    </Style>
-    <Style Selector="ToggleButton.selector:pointerover">
-      <Setter Property="Background" Value="#1B2A3D" />
-      <Setter Property="BorderBrush" Value="#47769F" />
-    </Style>
-    <Style Selector="ToggleButton.selector:checked">
+    <Style Selector="controls|GraphSelect.graph-select-field:checked">
       <Setter Property="Background" Value="#244D74" />
       <Setter Property="BorderBrush" Value="#56B2F5" />
+    </Style>
+    <Style Selector="TextBlock.label">
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="Foreground" Value="#78879C" />
     </Style>
     <Style Selector="ToggleButton.series-toggle">
       <Setter Property="Height" Value="24" />
@@ -104,13 +91,16 @@
 
       <Grid Grid.Row="0" ColumnDefinitions="*,128,8,108" Background="Transparent">
         <TextBlock Margin="0,0,8,0" FontSize="24" FontWeight="Bold" VerticalAlignment="Center" Text="{Binding Texts.GraphWindowTitle}" />
-        <ToggleButton x:Name="MetricSelector" Grid.Column="1" Classes="selector metric"
-                      ClickMode="Press"
-                      IsCheckedChanged="OnMetricSelectorCheckedChanged" Content="{Binding SelectedMetric}"
-                      AutomationProperties.Name="{Binding Texts.ModelUsage}"
-                      AutomationProperties.AutomationId="Graph.MetricSelector"
-                      AutomationProperties.HelpText="{Binding SelectedMetric}"
-                      ToolTip.Tip="{Binding Texts.ModelUsage}" />
+        <controls:GraphSelect x:Name="MetricSelector" Grid.Column="1"
+                              ValueText="{Binding SelectedMetric}"
+                              ItemsSource="{Binding MetricOptions}"
+                              SelectedItem="{Binding SelectedMetric, Mode=TwoWay}"
+                              MenuAutomationId="Graph.MetricMenu"
+                              PopupWidth="128" PopupOnLeft="True" MaxVisibleItems="4"
+                              AutomationProperties.Name="{Binding Texts.ModelUsage}"
+                              AutomationProperties.AutomationId="Graph.MetricSelector"
+                              AutomationProperties.HelpText="{Binding SelectedMetric}"
+                              ToolTip.Tip="{Binding Texts.ModelUsage}" />
         <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="0" VerticalAlignment="Top">
           <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Graph.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
           <Button Classes="window-control" Click="OnMaximizeWindow" AutomationProperties.Name="{Binding Texts.Maximize}" AutomationProperties.AutomationId="Graph.Window.Maximize" Content="□" ToolTip.Tip="{Binding Texts.Maximize}" />
@@ -118,37 +108,45 @@
         </StackPanel>
       </Grid>
 
-      <ToggleButton x:Name="AccountSelector" Grid.Row="1" Margin="0,6,0,0" Classes="selector"
-                    ClickMode="Press"
-                    IsCheckedChanged="OnAccountSelectorCheckedChanged"
-                    IsEnabled="{Binding HasAccounts}" AutomationProperties.Name="{Binding Texts.Account}"
-                    AutomationProperties.AutomationId="Graph.AccountSelector"
-                    AutomationProperties.HelpText="{Binding SelectedAccountText}"
-                    ToolTip.Tip="{Binding SelectedAccountText}">
-        <Grid ColumnDefinitions="82,1,*,14">
-          <TextBlock VerticalAlignment="Center" Foreground="#56B2F5" FontSize="11" Text="{Binding Texts.Account}" />
-          <Rectangle Grid.Column="1" Width="1" Height="20" Margin="7,0,0,0" HorizontalAlignment="Left" Fill="#405779" />
-          <TextBlock Grid.Column="2" Margin="17,0,0,0" VerticalAlignment="Center" Text="{Binding SelectedAccountValueText}" TextTrimming="CharacterEllipsis" />
-          <TextBlock Grid.Column="3" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="16" Foreground="#A8B7CA" Text="⌄" />
-        </Grid>
-      </ToggleButton>
+      <controls:GraphSelect x:Name="AccountSelector" Grid.Row="1" Margin="0,6,0,0"
+                            FieldLabel="{Binding Texts.Account}" HasFieldLabel="True" ValueMargin="17,0,0,0"
+                            ValueText="{Binding SelectedAccountValueText}"
+                            ItemsSource="{Binding Accounts}" SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
+                            MenuAutomationId="Graph.AccountMenu" PopupWidth="560" MaxVisibleItems="4"
+                            IsEnabled="{Binding HasAccounts}"
+                            AutomationProperties.Name="{Binding Texts.Account}"
+                            AutomationProperties.AutomationId="Graph.AccountSelector"
+                            AutomationProperties.HelpText="{Binding SelectedAccountText}"
+                            ToolTip.Tip="{Binding SelectedAccountText}">
+        <controls:GraphSelect.ItemTemplate>
+          <DataTemplate x:DataType="core:ApiAccount">
+            <TextBlock Text="{Binding MainDisplayLabel}" TextWrapping="Wrap"
+                       ToolTip.Tip="{Binding MainDisplayLabel}"
+                       AutomationProperties.Name="{Binding MainDisplayLabel}"
+                       AutomationProperties.HelpText="{Binding MainDisplayLabel}" />
+          </DataTemplate>
+        </controls:GraphSelect.ItemTemplate>
+      </controls:GraphSelect>
 
-      <ToggleButton x:Name="PeriodSelector" Classes="selector"
-                    Grid.Row="2"
-                    Margin="0,12,0,0"
-                    ClickMode="Press"
-                    IsCheckedChanged="OnPeriodSelectorCheckedChanged"
-                    IsEnabled="{Binding HasPeriods}" AutomationProperties.Name="{Binding Texts.PeriodSelectorHeading}"
-                    AutomationProperties.AutomationId="Graph.PeriodSelector"
-                    AutomationProperties.HelpText="{Binding SelectedPeriodText}"
-                    ToolTip.Tip="{Binding SelectedPeriodText}">
-        <Grid ColumnDefinitions="82,1,*,14">
-          <TextBlock VerticalAlignment="Center" Foreground="#56B2F5" FontSize="11" Text="{Binding Texts.PeriodSelectorHeading}" />
-          <Rectangle Grid.Column="1" Width="1" Height="20" Margin="7,0,0,0" HorizontalAlignment="Left" Fill="#405779" />
-          <TextBlock Grid.Column="2" Margin="17,0,0,0" VerticalAlignment="Center" Text="{Binding SelectedPeriodValueText}" TextTrimming="CharacterEllipsis" />
-          <TextBlock Grid.Column="3" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="16" Foreground="#A8B7CA" Text="⌄" />
-        </Grid>
-      </ToggleButton>
+      <controls:GraphSelect x:Name="PeriodSelector" Grid.Row="2" Margin="0,12,0,0"
+                            FieldLabel="{Binding Texts.PeriodSelectorHeading}" HasFieldLabel="True" ValueMargin="17,0,0,0"
+                            ValueText="{Binding SelectedPeriodValueText}"
+                            ItemsSource="{Binding Periods}" SelectedItem="{Binding SelectedPeriod, Mode=TwoWay}"
+                            MenuAutomationId="Graph.PeriodMenu" PopupWidth="620" LimitPopupToField="True" MaxVisibleItems="10"
+                            IsEnabled="{Binding HasPeriods}"
+                            AutomationProperties.Name="{Binding Texts.PeriodSelectorHeading}"
+                            AutomationProperties.AutomationId="Graph.PeriodSelector"
+                            AutomationProperties.HelpText="{Binding SelectedPeriodText}"
+                            ToolTip.Tip="{Binding SelectedPeriodText}">
+        <controls:GraphSelect.ItemTemplate>
+          <DataTemplate x:DataType="core:ApiHistoryPeriod">
+            <TextBlock Text="{Binding Label}" TextWrapping="Wrap"
+                       ToolTip.Tip="{Binding Label}"
+                       AutomationProperties.Name="{Binding Label}"
+                       AutomationProperties.HelpText="{Binding Label}" />
+          </DataTemplate>
+        </controls:GraphSelect.ItemTemplate>
+      </controls:GraphSelect>
 
       <Grid Grid.Row="4" Width="504" Height="24" HorizontalAlignment="Left"
             ColumnDefinitions="120,90,90,90,90" ColumnSpacing="6">
@@ -194,50 +192,6 @@
         </Grid>
       </Border>
 
-      <!-- Pre-measured in-window menus: opening them is an opacity-only change. -->
-      <Grid Grid.RowSpan="6" ZIndex="100">
-      <Border x:Name="AccountMenu" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="0,72,0,0"
-              Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="560" MaxWidth="700" MaxHeight="320" Padding="4"
-              Background="#1B2838" BorderBrush="#47769F" BorderThickness="1" CornerRadius="6">
-        <ListBox ItemsSource="{Binding Accounts}" SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
-                 SelectionChanged="OnAccountSelectionChanged"
-                 AutomationProperties.AutomationId="Graph.AccountMenu">
-          <ListBox.ItemTemplate>
-            <DataTemplate x:DataType="core:ApiAccount">
-              <TextBlock Text="{Binding DisplayLabel}"
-                         TextWrapping="Wrap"
-                         ToolTip.Tip="{Binding DisplayLabel}"
-                         AutomationProperties.Name="{Binding DisplayLabel}"
-                         AutomationProperties.HelpText="{Binding DisplayLabel}" />
-            </DataTemplate>
-          </ListBox.ItemTemplate>
-        </ListBox>
-      </Border>
-      <Border x:Name="PeriodMenu" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="0,108,0,0"
-              Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="560" MaxWidth="700" MaxHeight="320" Padding="4"
-              Background="#1B2838" BorderBrush="#47769F" BorderThickness="1" CornerRadius="6">
-        <ListBox ItemsSource="{Binding Periods}" SelectedItem="{Binding SelectedPeriod, Mode=TwoWay}"
-                 SelectionChanged="OnPeriodSelectionChanged"
-                 AutomationProperties.AutomationId="Graph.PeriodMenu">
-          <ListBox.ItemTemplate>
-            <DataTemplate x:DataType="core:ApiHistoryPeriod">
-              <TextBlock Text="{Binding Label}"
-                         TextWrapping="Wrap"
-                         ToolTip.Tip="{Binding Label}"
-                         AutomationProperties.Name="{Binding Label}"
-                         AutomationProperties.HelpText="{Binding Label}" />
-            </DataTemplate>
-          </ListBox.ItemTemplate>
-        </ListBox>
-      </Border>
-      <Border x:Name="MetricMenu" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,36,116,0"
-              Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="128" MaxHeight="160" Padding="4"
-              Background="#1B2838" BorderBrush="#47769F" BorderThickness="1" CornerRadius="6">
-        <ListBox ItemsSource="{Binding MetricOptions}" SelectedItem="{Binding SelectedMetric, Mode=TwoWay}"
-                 SelectionChanged="OnMetricSelectionChanged"
-                 AutomationProperties.AutomationId="Graph.MetricMenu" />
-      </Border>
-      </Grid>
     </Grid>
 
     <Border x:Name="ResizeNorthWest" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" PointerPressed="OnResizeNorthWest" />
