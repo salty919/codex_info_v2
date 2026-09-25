@@ -67,7 +67,7 @@ cleanup条件と削除予定:
 - 1 taskにつき一時branch 1本、一時worktree 1個とする。同じfile/pathにwriterを1人だけ割り当て、owned pathsと変更禁止範囲を宣言する。
 - `AGENTS.md`、workflow、lockfile、共通仕様、要件台帳等のcross-cutting fileは排他的所有とし、同時に別のwritable taskを走らせてはならない。ユーザー通常worktreeの同じpathにdirty/untracked変更がある、ownershipが重複する、または一時worktreeに不明差分が現れた場合は停止する。
 - サブエージェントは宣言済み一時worktreeとowned pathsだけを扱う。branch/worktreeの作成・削除、ref/config/remote操作、commit、push、PR操作は禁止し、これらの管理はroot agentだけが行う。SOL subagentへの製品判断委譲はGit操作権限を移さない。
-- Codexは宣言した最小のformatter、check、testを実行し、0件のtestをPASSにしてはならない。
+- Codexは宣言した最小のformatter、check、testを実行し、0件のtestをPASSにしてはならない。既往障害、security、cross-cutting governance等で独立判断が必要な場合だけfresh evaluatorを使う。
 - commitはユーザーが明示許可した場合に限り、owned filesだけをstageして行う。pushとPR作成も宣言に含まれ明示許可された場合だけ行い、Codexが作るPRのbaseは`feat/next`に限定する。
 - Codexは、ユーザーから依頼または許可を受けた場合も、いかなるPRもmergeせず、auto-mergeを設定または解除しない。この禁止に例外はなく、merge操作はユーザー本人だけが行う。Codexは`codex/<task> -> feat/next`のPR作成・更新と作業証拠のcommentを行える。PRのapprove、ready化、closeおよびworkflowのapproveまたはrerunは、exact targetと操作についてユーザーの明示許可がある場合だけ実施できる。
 - CodexはPRのURL、base/headの完全SHA、変更file、検証結果、未確認事項、`main`へ統合した場合の影響を提示し、ユーザーが変更と動作を確認できる状態でmerge前に停止する。Codex自身の実装・検証・review結果を、ユーザーによる統合判断の代替にしてはならない。
