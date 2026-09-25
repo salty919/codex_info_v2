@@ -631,60 +631,103 @@ impl I18n {
         Some(self.unit_text(minutes, Unit::Minute))
     }
 
-    pub fn format_period_remaining(&self, seconds: i64, kind: PeriodKind) -> String {
+    pub fn main_period_title(&self, kind: PeriodKind) -> &'static str {
+        match (self.language, kind) {
+            (Language::Japanese, PeriodKind::Weekly) => "7日周期：リセットまで",
+            (Language::Japanese, PeriodKind::Monthly) => "月間：リセットまで",
+            (Language::SimplifiedChinese, PeriodKind::Weekly) => "7天周期：重置倒计时",
+            (Language::SimplifiedChinese, PeriodKind::Monthly) => "月度：重置倒计时",
+            (Language::Korean, PeriodKind::Weekly) => "7일 주기: 재설정까지",
+            (Language::Korean, PeriodKind::Monthly) => "월간: 재설정까지",
+            (Language::Spanish, PeriodKind::Weekly) => "Ciclo de 7 días: hasta el restablecimiento",
+            (Language::Spanish, PeriodKind::Monthly) => "Mensual: hasta el restablecimiento",
+            (Language::French, PeriodKind::Weekly) => "Cycle de 7 jours : jusqu’à la réinitialisation",
+            (Language::French, PeriodKind::Monthly) => "Mensuel : jusqu’à la réinitialisation",
+            (Language::German, PeriodKind::Weekly) => "7-Tage-Zyklus: bis zum Zurücksetzen",
+            (Language::German, PeriodKind::Monthly) => "Monatlich: bis zum Zurücksetzen",
+            (Language::Portuguese, PeriodKind::Weekly) => "Ciclo de 7 dias: até a redefinição",
+            (Language::Portuguese, PeriodKind::Monthly) => "Mensal: até a redefinição",
+            (Language::Italian, PeriodKind::Weekly) => "Ciclo di 7 giorni: fino al ripristino",
+            (Language::Italian, PeriodKind::Monthly) => "Mensile: fino al ripristino",
+            (Language::Russian, PeriodKind::Weekly) => "Цикл 7 дней: до сброса",
+            (Language::Russian, PeriodKind::Monthly) => "Месячный: до сброса",
+            (Language::English, PeriodKind::Weekly) => "7-day cycle: until reset",
+            (Language::English, PeriodKind::Monthly) => "Monthly: until reset",
+        }
+    }
+
+    pub fn format_period_remaining(&self, seconds: i64, _kind: PeriodKind) -> String {
         let seconds = seconds.max(0);
-        if seconds < 60 {
+        if seconds == 0 {
             return self.text(TextKey::SoonReset).into();
+        }
+        if seconds < 60 {
+            return match self.language {
+                Language::Japanese => "残り 1分未満",
+                Language::SimplifiedChinese => "剩余不到1分钟",
+                Language::Korean => "1분 미만 남음",
+                Language::Spanish => "Menos de 1 minuto",
+                Language::French => "Moins d’une minute",
+                Language::German => "Weniger als 1 Minute",
+                Language::Portuguese => "Menos de 1 minuto",
+                Language::Italian => "Meno di 1 minuto",
+                Language::Russian => "Меньше минуты",
+                Language::English => "Less than 1 minute",
+            }
+            .into();
         }
         let (days, hours, minutes) = (
             seconds / 86_400,
             (seconds / 3_600) % 24,
             (seconds / 60) % 60,
         );
+        let (prefix, day_unit, hour_unit, minute_unit) = match self.language {
+            Language::Japanese => ("残り ", "日", "時間", "分"),
+            Language::SimplifiedChinese => ("剩余 ", "天", "小时", "分"),
+            Language::Korean => ("남은 시간 ", "일", "시간", "분"),
+            Language::Spanish => ("Quedan ", "d", "h", "min"),
+            Language::French => ("Restant ", "j", "h", "min"),
+            Language::German => ("Verbleibend ", "T", "Std.", "Min."),
+            Language::Portuguese => ("Restam ", "d", "h", "min"),
+            Language::Italian => ("Restano ", "g", "h", "min"),
+            Language::Russian => ("Осталось ", "д", "ч", "мин"),
+            Language::English => ("Remaining ", "d", "h", "min"),
+        };
         let mut parts = Vec::new();
         if days > 0 {
-            parts.push(self.unit_text(days, Unit::Day));
+            parts.push(format!("{days}{day_unit}"));
         }
         if hours > 0 {
-            parts.push(self.unit_text(hours, Unit::Hour));
+            parts.push(format!("{hours}{hour_unit}"));
         }
-        if minutes > 0 {
-            parts.push(self.unit_text(minutes, Unit::Minute));
+        if minutes > 0 || parts.is_empty() {
+            parts.push(format!("{minutes}{minute_unit}"));
         }
-        let duration = parts.join(self.separator());
-        match (self.language, kind) {
-            (Language::Japanese, PeriodKind::Weekly) => format!("7日間、あと{duration}"),
-            (Language::Japanese, PeriodKind::Monthly) => format!("月間、あと{duration}"),
-            (Language::SimplifiedChinese, PeriodKind::Weekly) => format!("7天，剩余{duration}"),
-            (Language::SimplifiedChinese, PeriodKind::Monthly) => format!("每月，剩余{duration}"),
-            (Language::Korean, PeriodKind::Weekly) => format!("7일 기간, {duration} 남음"),
-            (Language::Korean, PeriodKind::Monthly) => format!("월간, {duration} 남음"),
-            (Language::English, PeriodKind::Weekly) => {
-                format!("7-day period, {duration} remaining")
-            }
-            (Language::English, PeriodKind::Monthly) => format!("Monthly, {duration} remaining"),
-            (Language::Spanish, PeriodKind::Weekly) => {
-                format!("Periodo de 7 días: quedan {duration}")
-            }
-            (Language::Spanish, PeriodKind::Monthly) => format!("Mensual: quedan {duration}"),
-            (Language::French, PeriodKind::Weekly) => {
-                format!("Période de 7 jours : {duration} restantes")
-            }
-            (Language::French, PeriodKind::Monthly) => format!("Mensuel : {duration} restantes"),
-            (Language::German, PeriodKind::Weekly) => format!("7-Tage-Zeitraum, {duration} übrig"),
-            (Language::German, PeriodKind::Monthly) => format!("Monatlich, {duration} übrig"),
-            (Language::Portuguese, PeriodKind::Weekly) => {
-                format!("Período de 7 dias: restam {duration}")
-            }
-            (Language::Portuguese, PeriodKind::Monthly) => format!("Mensal: restam {duration}"),
-            (Language::Italian, PeriodKind::Weekly) => {
-                format!("Periodo di 7 giorni: restano {duration}")
-            }
-            (Language::Italian, PeriodKind::Monthly) => format!("Mensile: restano {duration}"),
-            (Language::Russian, PeriodKind::Weekly) => {
-                format!("Период 7 дней: осталось {duration}")
-            }
-            (Language::Russian, PeriodKind::Monthly) => format!("За месяц осталось {duration}"),
+        format!("{prefix}{}", parts.join(" "))
+    }
+
+    pub fn format_main_timestamp(&self, timestamp: i64) -> Option<String> {
+        let time = DateTime::<Utc>::from_timestamp(timestamp, 0)?;
+        let pattern = match self.language {
+            Language::Japanese | Language::SimplifiedChinese | Language::Korean => "%Y/%m/%d %H:%M",
+            Language::English => "%m/%d/%Y %I:%M %p",
+            _ => "%d/%m/%Y %H:%M",
+        };
+        Some(time.with_timezone(&self.timezone).format(pattern).to_string())
+    }
+
+    pub fn main_ready_status_detail(&self) -> &'static str {
+        match self.language {
+            Language::Japanese => "Linux 側の最新スナップショットを表示しています。",
+            Language::SimplifiedChinese => "正在显示最新的 Linux 快照。",
+            Language::Korean => "최신 Linux 스냅샷을 표시합니다.",
+            Language::Spanish => "Mostrando la instantánea más reciente de Linux.",
+            Language::French => "Dernier instantané Linux affiché.",
+            Language::German => "Der aktuelle Linux-Snapshot wird angezeigt.",
+            Language::Portuguese => "Exibindo o instantâneo mais recente do Linux.",
+            Language::Italian => "Visualizzazione dell’istantanea Linux più recente.",
+            Language::Russian => "Показан последний снимок Linux.",
+            Language::English => "Showing the latest Linux snapshot.",
         }
     }
 
@@ -953,9 +996,9 @@ impl I18n {
 
     pub fn format_last_updated(&self, timestamp: Option<i64>) -> String {
         let time = timestamp
-            .and_then(|ts| self.format_clock(ts))
+            .and_then(|ts| self.format_main_timestamp(ts))
             .unwrap_or_else(|| "—".into());
-        format!("{} {}", self.text(TextKey::LastUpdated), time)
+        format!("{}: {}", self.text(TextKey::LastUpdated), time)
     }
 
     /// Label an immutable account snapshot with its full observation time.
@@ -1051,13 +1094,6 @@ impl I18n {
         }
     }
 
-    fn separator(&self) -> &'static str {
-        if self.language == Language::Japanese {
-            "と"
-        } else {
-            ", "
-        }
-    }
     fn elapsed_separator(&self) -> &'static str {
         if matches!(
             self.language,
@@ -2344,7 +2380,7 @@ mod tests {
         );
         assert_eq!(
             i18n.format_period_remaining(86_400 + 3_600 + 60, PeriodKind::Weekly),
-            "7-day period, 1 day, 1 hour, 1 minute remaining"
+            "Remaining 1d 1h 1min"
         );
     }
 

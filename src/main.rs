@@ -19119,8 +19119,8 @@ fn native_main_labels(
             "残量警告",
             "残量不足",
             "リセット警告",
-            "リセット",
-            "観測",
+            "リセット時刻",
+            "Linux の観測時刻",
         ),
         "zh-Hans" => (
             "设置",
@@ -19131,8 +19131,8 @@ fn native_main_labels(
             "配额警告",
             "配额不足",
             "即将重置",
-            "重置",
-            "观测",
+            "重置时间",
+            "Linux 观测时间",
         ),
         "ko" => (
             "설정",
@@ -19143,8 +19143,8 @@ fn native_main_labels(
             "잔여량 경고",
             "잔여량 부족",
             "곧 재설정",
-            "재설정",
-            "관측",
+            "재설정 시각",
+            "Linux 관측 시각",
         ),
         "es" => (
             "Configuración",
@@ -19155,8 +19155,8 @@ fn native_main_labels(
             "Advertencia de cuota",
             "Cuota crítica",
             "Restablecimiento próximo",
-            "Restablecimiento",
-            "Observado",
+            "Hora de restablecimiento",
+            "Observación de Linux",
         ),
         "fr" => (
             "Paramètres",
@@ -19167,8 +19167,8 @@ fn native_main_labels(
             "Alerte de quota",
             "Quota critique",
             "Réinitialisation imminente",
-            "Réinitialisation",
-            "Observé",
+            "Heure de réinitialisation",
+            "Observation Linux",
         ),
         "de" => (
             "Einstellungen",
@@ -19179,8 +19179,8 @@ fn native_main_labels(
             "Kontingentwarnung",
             "Kontingent kritisch",
             "Zurücksetzung steht bevor",
-            "Zurücksetzung",
-            "Beobachtet",
+            "Zurücksetzzeit",
+            "Linux-Beobachtung",
         ),
         "pt" => (
             "Configurações",
@@ -19191,8 +19191,8 @@ fn native_main_labels(
             "Aviso de cota",
             "Cota crítica",
             "Redefinição próxima",
-            "Redefinição",
-            "Observado",
+            "Hora de redefinição",
+            "Observação do Linux",
         ),
         "it" => (
             "Impostazioni",
@@ -19203,8 +19203,8 @@ fn native_main_labels(
             "Avviso quota",
             "Quota critica",
             "Ripristino imminente",
-            "Ripristino",
-            "Osservato",
+            "Ora di ripristino",
+            "Osservazione Linux",
         ),
         "ru" => (
             "Настройки",
@@ -19215,8 +19215,8 @@ fn native_main_labels(
             "Предупреждение о квоте",
             "Критическая квота",
             "Скорый сброс",
-            "Сброс",
-            "Наблюдение",
+            "Время сброса",
+            "Наблюдение Linux",
         ),
         _ => (
             "Settings",
@@ -19227,8 +19227,8 @@ fn native_main_labels(
             "Quota warning",
             "Quota critical",
             "Reset soon",
-            "Reset",
-            "Observed",
+            "Reset time",
+            "Linux observation",
         ),
     }
 }
@@ -19651,7 +19651,7 @@ impl CodexInfoState {
         if !self.selected_account_is_historical()
             && detail == self.i18n.format_last_updated(self.last_success_at)
         {
-            String::new()
+            self.i18n.main_ready_status_detail().into()
         } else {
             detail
         }
@@ -19762,6 +19762,17 @@ impl CodexInfoState {
             }
             .into(),
         );
+        ui.set_week_title(if self.has_quota_percent && !historical_account {
+            self.i18n
+                .main_period_title(if self.monthly {
+                    PeriodKind::Monthly
+                } else {
+                    PeriodKind::Weekly
+                })
+                .into()
+        } else {
+            self.i18n.text(TextKey::NoRecords).into()
+        });
         ui.set_week_label(if self.has_quota_percent && !historical_account {
             self.i18n
                 .format_period_remaining(
@@ -19780,14 +19791,16 @@ impl CodexInfoState {
             native_main_labels(&self.i18n);
         let reset_value = self
             .reset_at
-            .and_then(|value| self.i18n.format_timestamp(value))
+            .and_then(|value| self.i18n.format_main_timestamp(value))
             .unwrap_or_else(|| "—".into());
         let observed_value = self
             .last_success_at
-            .and_then(|value| self.i18n.format_timestamp(value))
+            .and_then(|value| self.i18n.format_main_timestamp(value))
             .unwrap_or_else(|| "—".into());
-        ui.set_reset_label(format!("{reset_prefix} {reset_value}").into());
-        ui.set_observed_label(format!("{observed_prefix} {observed_value}").into());
+        ui.set_reset_label(reset_prefix.into());
+        ui.set_reset_value(reset_value.into());
+        ui.set_observed_label(observed_prefix.into());
+        ui.set_observed_value(observed_value.into());
         let (
             model_names,
             input_tokens,
@@ -36101,6 +36114,60 @@ mod tests {
 
         assert!(!state.authenticated);
         assert_eq!(state.status_level(), "warning");
+    }
+
+    #[test]
+    fn issue_360_linux_main_week_and_status_match_windows_reference() {
+        let app = include_str!("../ui/app.slint");
+        let components = include_str!("../ui/components.slint");
+        let week = components
+            .split("export component WeekGauge inherits Rectangle {")
+            .nth(1)
+            .and_then(|body| body.split("component ThreadModelStat").next())
+            .expect("WeekGauge");
+        let mut mismatches = Vec::new();
+        for marker in [
+            "in property <string> period-title;",
+            "in property <string> reset-value;",
+            "in property <string> observed-value;",
+            "text: root.period-title;",
+            "text: root.reset-value;",
+            "text: root.observed-value;",
+        ] {
+            if !week.contains(marker) {
+                mismatches.push(format!("missing separate weekly field: {marker}"));
+            }
+        }
+        for marker in [
+            "in-out property <string> week-title;",
+            "in-out property <string> reset-value;",
+            "in-out property <string> observed-value;",
+            "period-title: root.week-title;",
+            "? root.reset-value : \"\";",
+            "? root.observed-value : \"\";",
+        ] {
+            if !app.contains(marker) {
+                mismatches.push(format!("missing Main weekly binding: {marker}"));
+            }
+        }
+
+        let japanese = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
+        let countdown = japanese.format_period_remaining(
+            86_400 + 3_600 + 60,
+            codex_info::i18n::PeriodKind::Weekly,
+        );
+        if countdown != "残り 1日 1時間 1分" {
+            mismatches.push(format!("combined period/countdown label: {countdown:?}"));
+        }
+        let mut ready = CodexInfoState::preview("normal");
+        ready.i18n = japanese;
+        ready.status = ready.i18n.format_last_updated(ready.last_success_at);
+        let detail = ready.display_status_detail();
+        if detail != "Linux 側の最新スナップショットを表示しています。" {
+            mismatches.push(format!("normal status detail: {detail:?}"));
+        }
+
+        assert!(mismatches.is_empty(), "{}", mismatches.join("; "));
     }
 
     #[test]

@@ -283,8 +283,9 @@ component順や表示所有者を変更しない。
   `22px`の利用状況title、`12px`のversionを置く。account selectorは`250×44px`とし、
   右列に推移、法的通知、設定、最小化、閉じるを置く。期間labelをHeaderへ重複表示しない。
 - RemainingQuotaはWindowsの単一card内で主値と概算を並べ、その下のbarをcard内の利用可能幅
-  全体（左右`14px`を除く`828px`、高さ`6px`）へ伸ばす。WeekGaugeはLinuxのlabel上段＋
-  `20px`高の7区分barを使い、その下にreset時刻とWindowsの観測時刻を残す。quota値、期間境界、
+  全体（左右`14px`を除く`828px`、高さ`6px`）へ伸ばす。WeekGaugeはWindows Mainの表示を参照し、
+  上段の期間名と残り時間を左右に分け、中央に`20px`高の7等幅区分bar、下段にリセットと観測の
+  各label・絶対時刻を別欄に置く。Mainの時刻表記は`PROC-I18N-01`に従い、quota値、期間境界、
   reset/observed epochをUIで再計算しない。
 - AccountActivityはWindowsのtotal＋model別件数構成を使う。0件ではempty表示だけを出して
   `Details`を表示せず、1件以上でだけ`68×30px`の`Details`を表示する。historical accountでは
