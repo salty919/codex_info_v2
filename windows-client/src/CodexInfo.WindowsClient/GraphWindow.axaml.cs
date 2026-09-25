@@ -7,17 +7,12 @@ using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.VisualTree;
-using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.ViewModels;
 
 namespace CodexInfo.WindowsClient;
 
 public partial class GraphWindow : Window
 {
-    private string? periodSelectionAtOpen;
-    private string? metricSelectionAtOpen;
-    private string? accountSelectionAtOpen;
-
     public GraphWindow()
     {
         InitializeComponent();
@@ -61,95 +56,6 @@ public partial class GraphWindow : Window
         Close();
     }
 
-    private void OnPeriodSelectorCheckedChanged(object? sender, RoutedEventArgs eventArgs)
-    {
-        var open = PeriodSelector.IsChecked == true;
-        periodSelectionAtOpen = open
-            ? (DataContext as GraphWindowViewModel)?.SelectedPeriod?.Id
-            : null;
-        SetMenuOpen(PeriodMenu, open);
-        if (open)
-        {
-            SetMenuOpen(MetricMenu, false);
-            MetricSelector.IsChecked = false;
-        }
-    }
-
-    private void OnMetricSelectorCheckedChanged(object? sender, RoutedEventArgs eventArgs)
-    {
-        var open = MetricSelector.IsChecked == true;
-        metricSelectionAtOpen = open
-            ? (DataContext as GraphWindowViewModel)?.SelectedMetric
-            : null;
-        SetMenuOpen(MetricMenu, open);
-        if (open)
-        {
-            SetMenuOpen(PeriodMenu, false);
-            PeriodSelector.IsChecked = false;
-        }
-    }
-
-    private void OnAccountSelectorCheckedChanged(object? sender, RoutedEventArgs eventArgs)
-    {
-        var open = AccountSelector.IsChecked == true;
-        accountSelectionAtOpen = open
-            ? (DataContext as GraphWindowViewModel)?.SelectedAccount?.Id
-            : null;
-        SetMenuOpen(AccountMenu, open);
-        if (open)
-        {
-            SetMenuOpen(PeriodMenu, false);
-            SetMenuOpen(MetricMenu, false);
-            PeriodSelector.IsChecked = false;
-            MetricSelector.IsChecked = false;
-        }
-    }
-
-    private void OnPeriodSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
-    {
-        if (!PeriodMenu.IsEnabled || sender is not ListBox { SelectedItem: ApiHistoryPeriod selected } ||
-            string.Equals(selected.Id, periodSelectionAtOpen, StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        SetMenuOpen(PeriodMenu, false);
-        PeriodSelector.IsChecked = false;
-    }
-
-    private void OnMetricSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
-    {
-        if (!MetricMenu.IsEnabled || sender is not ListBox { SelectedItem: string selected } ||
-            string.Equals(selected, metricSelectionAtOpen, StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        SetMenuOpen(MetricMenu, false);
-        MetricSelector.IsChecked = false;
-    }
-
-    private void OnAccountSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
-    {
-        if (!AccountMenu.IsEnabled || sender is not ListBox { SelectedItem: ApiAccount selected } ||
-            string.Equals(selected.Id, accountSelectionAtOpen, StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        SetMenuOpen(AccountMenu, false);
-        AccountSelector.IsChecked = false;
-    }
-
-    private static void SetMenuOpen(Control menu, bool open)
-    {
-        // Keep the bounded list measured so opening is a compositor-only
-        // opacity change instead of synchronous template creation/layout.
-        menu.Opacity = open ? 1 : 0;
-        menu.IsEnabled = open;
-        menu.IsHitTestVisible = open;
-    }
-
     private void AttachMenuDismissHandlers()
     {
         AddHandler(
@@ -167,19 +73,9 @@ public partial class GraphWindow : Window
         }
 
         if (IsWithin(eventArgs.Source, PeriodSelector) ||
-            IsWithin(eventArgs.Source, PeriodMenu) ||
             IsWithin(eventArgs.Source, MetricSelector) ||
-            IsWithin(eventArgs.Source, MetricMenu) ||
-            IsWithin(eventArgs.Source, AccountSelector) ||
-            IsWithin(eventArgs.Source, AccountMenu))
+            IsWithin(eventArgs.Source, AccountSelector))
         {
-            return;
-        }
-
-        if (PeriodMenu.IsEnabled || MetricMenu.IsEnabled || AccountMenu.IsEnabled)
-        {
-            CloseMenus();
-            eventArgs.Handled = true;
             return;
         }
 
@@ -208,12 +104,9 @@ public partial class GraphWindow : Window
 
     private void CloseMenus()
     {
-        SetMenuOpen(PeriodMenu, false);
-        SetMenuOpen(MetricMenu, false);
-        SetMenuOpen(AccountMenu, false);
-        PeriodSelector.IsChecked = false;
-        MetricSelector.IsChecked = false;
-        AccountSelector.IsChecked = false;
+        PeriodSelector.Close();
+        MetricSelector.Close();
+        AccountSelector.Close();
     }
 
     private static bool IsWithin(object? source, Visual ancestor)
