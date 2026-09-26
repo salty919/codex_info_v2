@@ -8355,13 +8355,45 @@ mod tests {
     #[test]
     fn paginated_history_base_survives_cycle_and_restart_before_first_token() {
         let (root, database) = prepare("paginated-history-base");
-        Connection::open(&database)
-            .unwrap()
+        let connection = Connection::open(&database).unwrap();
+        connection
             .execute(
                 "ALTER TABLE session_checkpoints DROP COLUMN history_base_pending",
                 [],
             )
             .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN context_usage_tokens",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN context_window_tokens",
+                [],
+            )
+            .unwrap();
+        let columns = {
+            let mut statement = connection
+                .prepare("SELECT name FROM pragma_table_info('session_checkpoints') ORDER BY cid")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(columns.len(), 19);
+        for absent_column in [
+            "history_base_pending",
+            "context_usage_tokens",
+            "context_window_tokens",
+        ] {
+            assert!(!columns.iter().any(|column| column == absent_column));
+        }
+        assert_eq!(columns[17], "last_task_running");
+        assert_eq!(columns[18], "previous_cache_write_input");
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
         let session_meta =
