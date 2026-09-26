@@ -58,6 +58,31 @@ public sealed class MainLayoutParityTests
     }
 
     [Fact]
+    public void MainClosedAccountSelectorMatchesLinuxReference()
+    {
+        var document = XDocument.Parse(LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "MainWindow.axaml"));
+        var selector = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.AccountSelector");
+        var content = selector.Elements().Single(element => element.Name.LocalName == "Grid");
+        var labelColumn = content.Descendants().Single(element =>
+            element.Name.LocalName == "StackPanel" && element.Attribute("Grid.Column")?.Value == "1");
+        var chevron = content.Descendants().Single(element =>
+            element.Attribute("Text")?.Value == "⌄");
+
+        Assert.Equal("250", selector.Attribute("Width")?.Value);
+        Assert.Equal("44", selector.Attribute("Height")?.Value);
+        Assert.Equal("Stretch", selector.Attribute("HorizontalContentAlignment")?.Value);
+        Assert.Equal("18,*,14", content.Attribute("ColumnDefinitions")?.Value);
+        Assert.Contains(labelColumn.Descendants(), element =>
+            element.Attribute("Text")?.Value == "{Binding Texts.Account}");
+        Assert.Contains(labelColumn.Descendants(), element =>
+            element.Attribute("Text")?.Value == "{Binding SelectedAccountText}");
+        Assert.Equal("2", chevron.Attribute("Grid.Column")?.Value);
+        Assert.Equal("Center", chevron.Attribute("HorizontalAlignment")?.Value);
+    }
+
+    [Fact]
     public void MainSectionsUseTheIssue349HybridComposition()
     {
         var document = XDocument.Parse(LoadRepositoryFile(
@@ -126,18 +151,28 @@ public sealed class MainLayoutParityTests
         var gaugeGrid = gauge.Parent;
         Assert.NotNull(gaugeGrid);
         Assert.Equal("18,20,24", gaugeGrid.Attribute("RowDefinitions")?.Value);
+        Assert.Equal("Auto,*,Auto,Auto,*,Auto", gaugeGrid.Attribute("ColumnDefinitions")?.Value);
         Assert.Equal("0", gaugeGrid.Attribute("RowSpacing")?.Value);
+        Assert.Equal("6", gauge.Attribute("Grid.ColumnSpan")?.Value);
+        Assert.Equal("5", gaugeGrid.Elements().Single(element =>
+            element.Attribute("Text")?.Value == "{Binding QuotaWindowText}" &&
+            element.Attribute("Grid.Row") is null).Attribute("Grid.ColumnSpan")?.Value);
+        Assert.Equal("5", gaugeGrid.Elements().Single(element =>
+            element.Attribute("Text")?.Value == "{Binding QuotaRemainingText}").Attribute("Grid.Column")?.Value);
+        Assert.Equal("3", gaugeGrid.Elements().Single(element =>
+            element.Attribute("Text")?.Value == "{Binding Texts.ObservedAt}").Attribute("Grid.Column")?.Value);
         var quotaStyle = document.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
             element.Attribute("Selector")?.Value == "Border.quota-segment");
         Assert.Equal("20", quotaStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" &&
             element.Attribute("Property")?.Value == "Height").Attribute("Value")?.Value);
-        foreach (var timestamp in new[] { "Main.QuotaResetAt", "Main.QuotaObservedAt" })
+        foreach (var (timestamp, column) in new[] { ("Main.QuotaResetAt", "2"), ("Main.QuotaObservedAt", "5") })
         {
             var element = document.Descendants().Single(candidate =>
                 candidate.Attribute("AutomationProperties.AutomationId")?.Value == timestamp);
             Assert.Equal("0,2,0,0", element.Attribute("Margin")?.Value);
+            Assert.Equal(column, element.Attribute("Grid.Column")?.Value);
         }
 
         var status = document.Descendants().Single(element =>

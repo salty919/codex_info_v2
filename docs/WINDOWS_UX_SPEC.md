@@ -281,11 +281,22 @@ component順や表示所有者を変更しない。
   着色しない。
 - Headerは`210px / 250px / 残幅`の3列と`10px`列間隔を使い、左列に`36×36px`のmark、
   `22px`の利用状況title、`12px`のversionを置く。account selectorは`250×44px`とし、
+  閉じたselector内のaccount labelとIDを左`28px`に揃え、矢印は幅全体の右端から`24px`の
+  `14px`欄の中央へ置く。展開listの形状と選択動作は変更しない。
   右列に推移、法的通知、設定、最小化、閉じるを置く。期間labelをHeaderへ重複表示しない。
 - RemainingQuotaはWindowsの単一card内で主値と概算を並べ、その下のbarをcard内の利用可能幅
   全体（左右`14px`を除く`828px`、高さ`6px`）へ伸ばす。WeekGaugeはWindows Mainの表示を参照し、
   上段の期間名と残り時間を左右に分け、中央に`20px`高の7等幅区分bar、下段にリセットと観測の
-  各label・絶対時刻を別欄に置く。Mainの時刻表記は`PROC-I18N-01`に従い、quota値、期間境界、
+  各label・絶対時刻を別欄に置く。文字はWindowsと同じMedium相当の太さとし、上段の期間名`12px`・
+  残り時間`13px`、下段のlabel`11px`・時刻`13px`とする。下段の時刻群の配置だけはLinux Mainを
+  参照し、reset label、reset時刻、左に`12px`余白を持つobserved label、observed時刻の順に置く。
+  各label・時刻の自然幅を確保し、reset時刻の前とobserved時刻の前へ残る横幅を等分する。
+  上段の残り時間と下段のobserved時刻は右端を揃え、その列は両値の自然幅の大きい方で決める。
+  Windowsでは横間隔`8px`の`Auto,*,Auto,Auto,*,Auto`の6列を使い、下段の4項目を
+  0・2・3・5列へ置く。上段の期間名は0～4列、残り時間は5列、中央barは全6列を使う。
+  下段はcard内`y=45px`から表示し、日本語・900×480の参照画面ではreset時刻の文字左端が
+  約`318px`、observed labelの文字左端が約`445px`、observed時刻の文字右端が約`865px`となる。
+  Mainの時刻表記は`PROC-I18N-01`に従い、quota値、期間境界、
   reset/observed epochをUIで再計算しない。
 - AccountActivityはWindowsのtotal＋model別件数構成を使う。0件ではempty表示だけを出して
   `Details`を表示せず、1件以上でだけ`68×30px`の`Details`を表示する。historical accountでは
