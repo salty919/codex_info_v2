@@ -2402,12 +2402,12 @@ mod tests {
         let english = I18n::from_parts(Language::English, Tz::UTC);
         assert_eq!(english.format_context_usage(0, 100), "0%");
         assert_eq!(english.format_context_usage(50, 100), "50%");
-        assert_eq!(english.format_context_usage(1, 3), "33.3%");
+        assert_eq!(english.format_context_usage(1, 3), "33.33%");
         assert_eq!(english.format_context_usage(u64::MAX, 100), "100%");
         assert_eq!(english.format_context_usage(1, 0), "—");
 
         let french = I18n::from_parts(Language::French, Tz::UTC);
-        assert_eq!(french.format_context_usage(1, 3), "33,3%");
+        assert_eq!(french.format_context_usage(1, 3), "33,33%");
     }
 
     #[test]
