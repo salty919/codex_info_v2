@@ -175,7 +175,7 @@
                     Width="250"
                     Height="44"
                     HorizontalAlignment="Stretch"
-                    HorizontalContentAlignment="Left"
+                    HorizontalContentAlignment="Stretch"
                     ClickMode="Press"
                     IsCheckedChanged="OnAccountSelectorCheckedChanged"
                     IsVisible="{Binding HasAccounts}"
@@ -290,13 +290,13 @@
     <!-- WeekGauge owns the seven-cell weekly/monthly period gauge, the
          remaining countdown, and the exact reset/observation timestamps. -->
     <Border Grid.Row="2" Classes="section" Padding="11,4" IsVisible="{Binding ShowAuthenticatedContent}">
-      <Grid RowDefinitions="18,20,24" ColumnDefinitions="Auto,*,Auto,Auto" RowSpacing="0" ColumnSpacing="8">
+      <Grid RowDefinitions="18,20,24" ColumnDefinitions="Auto,*,Auto,Auto,*,Auto" RowSpacing="0" ColumnSpacing="8">
           <TextBlock Classes="label"
-                     Grid.ColumnSpan="3"
+                     Grid.ColumnSpan="5"
                      VerticalAlignment="Center"
                      Text="{Binding QuotaWindowText}"
                      TextWrapping="NoWrap" />
-          <TextBlock Grid.Column="3"
+          <TextBlock Grid.Column="5"
                      Classes="value"
                      FontSize="13"
                      HorizontalAlignment="Right"
@@ -304,7 +304,7 @@
                      Text="{Binding QuotaRemainingText}"
                      TextWrapping="NoWrap" />
           <ItemsControl Grid.Row="1"
-                        Grid.ColumnSpan="4"
+                        Grid.ColumnSpan="6"
                         Margin="0,1,0,0"
                         VerticalAlignment="Center"
                         ItemsSource="{Binding QuotaSegments}"
@@ -336,7 +336,7 @@
                the same semantic name/help text so installed E2E/UIA sees
                the rendered gauge rather than a source-only attribute. -->
           <TextBlock Grid.Row="1"
-                     Grid.ColumnSpan="4"
+                     Grid.ColumnSpan="6"
                      HorizontalAlignment="Stretch"
                      VerticalAlignment="Stretch"
                      IsVisible="{Binding HasQuota}"
@@ -347,9 +347,9 @@
                      AutomationProperties.Name="{Binding QuotaWindowText}"
                      AutomationProperties.HelpText="{Binding QuotaRemainingText}" />
           <TextBlock Grid.Row="2" Classes="metric-label" Margin="0,2,0,0" VerticalAlignment="Top" Text="{Binding Texts.ResetTime}" />
-          <TextBlock Grid.Row="2" Grid.Column="1" Classes="metric-value" Margin="0,2,0,0" VerticalAlignment="Top" Text="{Binding ResetAtText}" AutomationProperties.AutomationId="Main.QuotaResetAt" />
-          <TextBlock Grid.Row="2" Grid.Column="2" Classes="metric-label" Margin="12,2,0,0" VerticalAlignment="Top" Text="{Binding Texts.ObservedAt}" />
-          <TextBlock Grid.Row="2" Grid.Column="3" Classes="metric-value" Margin="0,2,0,0" VerticalAlignment="Top" Text="{Binding ObservedAtText}" AutomationProperties.AutomationId="Main.QuotaObservedAt" />
+          <TextBlock Grid.Row="2" Grid.Column="2" Classes="metric-value" Margin="0,2,0,0" VerticalAlignment="Top" Text="{Binding ResetAtText}" AutomationProperties.AutomationId="Main.QuotaResetAt" />
+          <TextBlock Grid.Row="2" Grid.Column="3" Classes="metric-label" Margin="12,2,0,0" VerticalAlignment="Top" Text="{Binding Texts.ObservedAt}" />
+          <TextBlock Grid.Row="2" Grid.Column="5" Classes="metric-value" Margin="0,2,0,0" VerticalAlignment="Top" Text="{Binding ObservedAtText}" AutomationProperties.AutomationId="Main.QuotaObservedAt" />
       </Grid>
     </Border>
 

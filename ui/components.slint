@@ -809,30 +809,6 @@ export component WeekGauge inherits Rectangle {
     border-color: DesignTokens.main-section-border;
     background: DesignTokens.main-section;
 
-    Text {
-        x: 12px;
-        y: 5px;
-        width: parent.width - 296px;
-        height: 18px;
-        text: root.period-title;
-        color: DesignTokens.main-label;
-        font-size: 12px;
-        font-weight: 600;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-    Text {
-        x: parent.width - 284px;
-        y: 5px;
-        width: 272px;
-        height: 18px;
-        text: root.remaining-label;
-        color: DesignTokens.main-text-primary;
-        font-size: 13px;
-        horizontal-alignment: right;
-        vertical-alignment: center;
-        overflow: elide;
-    }
     DaySegment {
         x: 12px;
         y: 24px;
@@ -896,18 +872,97 @@ export component WeekGauge inherits Rectangle {
     if root.show-gauge && root.remaining-days - 4 > 0 : DayFill { x: 12px + 4 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 4)); height: 20px; }
     if root.show-gauge && root.remaining-days - 5 > 0 : DayFill { x: 12px + 5 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 5)); height: 20px; }
     if root.show-gauge && root.remaining-days - 6 > 0 : DayFill { x: 12px + 6 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 6)); height: 20px; }
-    Text { x: 12px; y: 49px; width: 84px; height: 20px;
-        text: root.reset-label; color: DesignTokens.main-label; font-size: 11px;
-        vertical-alignment: center; overflow: elide; }
-    Text { x: 104px; y: 49px; width: parent.width - 548px; height: 20px;
-        text: root.reset-value; color: DesignTokens.main-text-primary; font-size: 11px;
-        vertical-alignment: center; overflow: elide; }
-    Text { x: parent.width - 412px; y: 49px; width: 116px; height: 20px;
-        text: root.observed-label; color: DesignTokens.main-label; font-size: 11px;
-        vertical-alignment: center; overflow: elide; }
-    Text { x: parent.width - 288px; y: 49px; width: 276px; height: 20px;
-        text: root.observed-value; color: DesignTokens.main-text-primary; font-size: 11px;
-        horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
+    GridLayout {
+        x: 12px;
+        y: 5px;
+        width: parent.width - 24px;
+        height: 60px;
+        spacing-horizontal: 8px;
+        spacing-vertical: 0px;
+        Text {
+            row: 0;
+            col: 0;
+            colspan: 3;
+            height: 18px;
+            text: root.period-title;
+            color: DesignTokens.main-label;
+            font-size: 12px;
+            font-weight: 500;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Text {
+            row: 0;
+            col: 3;
+            height: 18px;
+            text: root.remaining-label;
+            color: DesignTokens.main-text-primary;
+            font-size: 13px;
+            font-weight: 500;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Rectangle {
+            row: 1;
+            col: 0;
+            colspan: 4;
+            height: 22px;
+            background: transparent;
+        }
+        Text {
+            row: 2;
+            col: 0;
+            height: 20px;
+            text: root.reset-label;
+            color: DesignTokens.main-label;
+            font-size: 11px;
+            font-weight: 500;
+            vertical-alignment: top;
+            overflow: elide;
+        }
+        Text {
+            row: 2;
+            col: 1;
+            height: 20px;
+            text: root.reset-value;
+            color: DesignTokens.main-text-primary;
+            font-size: 13px;
+            font-weight: 500;
+            horizontal-stretch: 1;
+            horizontal-alignment: right;
+            vertical-alignment: top;
+            overflow: elide;
+        }
+        HorizontalLayout {
+            row: 2;
+            col: 2;
+            height: 20px;
+            spacing: 0px;
+            horizontal-stretch: 0;
+            Rectangle { width: 12px; height: 1px; background: transparent; }
+            Text {
+                text: root.observed-label;
+                color: DesignTokens.main-label;
+                font-size: 11px;
+                font-weight: 500;
+                vertical-alignment: top;
+                overflow: elide;
+            }
+        }
+        Text {
+            row: 2;
+            col: 3;
+            height: 20px;
+            text: root.observed-value;
+            color: DesignTokens.main-text-primary;
+            font-size: 13px;
+            font-weight: 500;
+            horizontal-alignment: right;
+            vertical-alignment: top;
+            overflow: elide;
+        }
+    }
 }
 
 component ThreadModelStat inherits Rectangle {

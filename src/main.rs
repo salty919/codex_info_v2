@@ -36117,6 +36117,104 @@ mod tests {
     }
 
     #[test]
+    fn issue_360_week_gauge_typography_and_position_match_windows() {
+        fn text_style<'a>(week: &'a str, binding: &str) -> &'a str {
+            let end = week.find(binding).expect("weekly text binding") + binding.len();
+            let start = week[..end].rfind("Text {").expect("weekly Text");
+            let close = end + week[end..].find('}').expect("weekly Text close");
+            &week[start..close]
+        }
+
+        let components = include_str!("../ui/components.slint");
+        let week = components
+            .split("export component WeekGauge inherits Rectangle {")
+            .nth(1)
+            .and_then(|body| body.split("component ThreadModelStat").next())
+            .expect("WeekGauge");
+
+        for (binding, size) in [
+            ("text: root.period-title;", 12),
+            ("text: root.remaining-label;", 13),
+            ("text: root.reset-label;", 11),
+            ("text: root.reset-value;", 13),
+            ("text: root.observed-label;", 11),
+            ("text: root.observed-value;", 13),
+        ] {
+            let style = text_style(week, binding);
+            assert!(
+                style.contains(format!("font-size: {size}px;").as_str()),
+                "{binding} size"
+            );
+            assert!(style.contains("font-weight: 500;"), "{binding} weight");
+        }
+        let grid = week
+            .split("GridLayout {")
+            .nth(1)
+            .and_then(|body| body.rsplit_once("\n    }").map(|(grid, _)| grid))
+            .expect("one shared Windows weekly grid");
+        assert!(grid.contains("y: 5px;"), "Windows weekly grid top");
+        assert!(grid.contains("height: 60px;"), "Windows weekly grid height");
+        assert!(
+            grid.contains("spacing-horizontal: 8px;"),
+            "Windows shared column spacing"
+        );
+        assert!(
+            grid.contains("spacing-vertical: 0px;"),
+            "Windows shared row spacing"
+        );
+        let middle_row_spacer = grid
+            .split("Rectangle {")
+            .find(|block| block.contains("row: 1;"))
+            .and_then(|block| block.split('}').next())
+            .expect("middle row spacer");
+        assert!(
+            middle_row_spacer.contains("colspan: 4;"),
+            "middle row must not constrain one Windows grid column"
+        );
+        assert!(
+            !middle_row_spacer.contains("width: 1px;"),
+            "middle row must reserve height without fixing a column width"
+        );
+        for (binding, row, col) in [
+            ("text: root.period-title;", 0, 0),
+            ("text: root.remaining-label;", 0, 3),
+            ("text: root.reset-label;", 2, 0),
+            ("text: root.reset-value;", 2, 1),
+            ("text: root.observed-value;", 2, 3),
+        ] {
+            let style = text_style(week, binding);
+            assert!(
+                style.contains(format!("row: {row};").as_str()),
+                "{binding} row"
+            );
+            assert!(
+                style.contains(format!("col: {col};").as_str()),
+                "{binding} column"
+            );
+        }
+        let title = text_style(week, "text: root.period-title;");
+        assert!(
+            title.contains("colspan: 3;"),
+            "Windows title spans columns 0-2"
+        );
+        let observed_label_cell = grid
+            .split("HorizontalLayout {")
+            .nth(1)
+            .expect("observed label inset cell");
+        assert!(observed_label_cell.contains("row: 2;"));
+        assert!(observed_label_cell.contains("col: 2;"));
+        assert!(observed_label_cell.contains("horizontal-stretch: 0;"));
+        assert!(observed_label_cell.contains("Rectangle { width: 12px;"));
+        assert!(observed_label_cell.contains("text: root.observed-label;"));
+        let reset = text_style(week, "text: root.reset-value;");
+        assert!(reset.contains("horizontal-stretch: 1;"));
+        assert!(reset.contains("horizontal-alignment: right;"));
+        assert!(
+            text_style(week, "text: root.observed-value;").contains("horizontal-alignment: right;")
+        );
+    }
+
+    #[test]
     fn issue_360_linux_main_week_and_status_match_windows_reference() {
         let app = include_str!("../ui/app.slint");
         let components = include_str!("../ui/components.slint");
@@ -36216,11 +36314,30 @@ mod tests {
             "y: 5px;",
             "y: 24px;",
             "height: 20px;",
-            "y: 49px;",
             "reset-label",
             "observed-label",
         ] {
             assert!(week.contains(marker), "week gauge marker: {marker}");
+        }
+        let week_grid = week
+            .split("GridLayout {")
+            .nth(1)
+            .and_then(|body| body.split("\n    }").next())
+            .expect("shared weekly grid");
+        // The lower row starts at y=45px: grid y=5px, then 18px + 22px rows with no gap.
+        for marker in [
+            "y: 5px;",
+            "height: 60px;",
+            "spacing-vertical: 0px;",
+            "height: 18px;",
+            "height: 22px;",
+            "height: 20px;",
+            "row: 2;",
+        ] {
+            assert!(
+                week_grid.contains(marker),
+                "week lower-row marker: {marker}"
+            );
         }
         for marker in [
             "height: 42px;",
