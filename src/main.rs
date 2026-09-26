@@ -35750,7 +35750,9 @@ mod tests {
         const ARROW_RIGHT_X: usize = ARROW_ORIGIN_X + ARROW_WIDTH + ARROW_STROKE_WIDTH / 2;
         const TITLE_LANE_X: usize = 95;
         assert_eq!(ARROW_RIGHT_X, 81);
-        assert!(ARROW_RIGHT_X < TITLE_LANE_X);
+        const {
+            assert!(ARROW_RIGHT_X < TITLE_LANE_X);
+        }
     }
 
     #[test]
@@ -35799,14 +35801,13 @@ mod tests {
         let actual_rails = presentation
             .iter()
             .enumerate()
-            .filter_map(|(index, row)| {
-                row.connected_to_parent.then(|| {
-                    (
-                        10 + 16 * row.forest_depth.saturating_sub(1).min(3),
-                        expected_row_y[index - 1],
-                        expected_row_y[index],
-                    )
-                })
+            .filter(|&(_, row)| row.connected_to_parent)
+            .map(|(index, row)| {
+                (
+                    10 + 16 * row.forest_depth.saturating_sub(1).min(3),
+                    expected_row_y[index - 1],
+                    expected_row_y[index],
+                )
             })
             .collect::<Vec<_>>();
         assert_eq!(actual_rails, [(10, 48, 144), (26, 144, 240)]);
