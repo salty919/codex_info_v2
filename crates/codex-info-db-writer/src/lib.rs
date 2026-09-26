@@ -7320,13 +7320,19 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         let legacy_cache_write_columns = *table == "session_model_totals"
             && actual.len() + 1 == expected.len()
             && actual == expected[..actual.len()];
-        let legacy_history_base_pending = *table == "session_checkpoints"
-            && actual.len() + 1 == expected.len()
-            && actual == expected[..actual.len()];
-        let legacy_session_checkpoint_suffix = *table == "session_checkpoints"
-            && actual.len() < expected.len()
-            && actual.len() + 2 >= expected.len()
-            && actual == expected[..actual.len()];
+        let legacy_session_checkpoint_shape = *table == "session_checkpoints"
+            && match schema_version {
+                0 => {
+                    actual == legacy_session_checkpoint_columns()
+                        || actual.as_slice() == &expected[..18]
+                        || actual.as_slice() == &expected[..19]
+                        || actual.as_slice() == &expected[..20]
+                }
+                1..=ACCOUNT_DB_SCHEMA_VERSION => {
+                    actual.as_slice() == &expected[..19] || actual.as_slice() == &expected[..20]
+                }
+                _ => false,
+            };
         let legacy_storage_partition_login_id = *table == "storage_partition"
             && schema_version < 9
             && actual.len() + 1 == expected.len()
@@ -7342,16 +7348,13 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             && !(allow_unversioned_legacy
                 && ((*table == "recorder_gap_ledger"
                     && actual == legacy_recorder_gap_ledger_columns())
-                    || (*table == "session_checkpoints"
-                        && actual == legacy_session_checkpoint_columns())
-                    || legacy_session_checkpoint_suffix
                     || legacy_history_continuity
                     || legacy_cache_write_columns
                     || legacy_storage_partition_login_id))
+            && !legacy_session_checkpoint_shape
             && !legacy_active_thread_snapshot_columns
             && !legacy_storage_partition_login_id
             && !legacy_collection_generation_quota_reset
-            && !legacy_history_base_pending
         {
             return Err(UsageStoreError::InvalidImport(format!(
                 "account partition {table} schema mismatch"
@@ -7802,14 +7805,6 @@ fn ensure_session_checkpoint_schema(transaction: &rusqlite::Transaction<'_>) -> 
             [],
         )?;
     }
-    for column in ["context_usage_tokens", "context_window_tokens"] {
-        if !cache_write_column_present(transaction, "session_checkpoints", column)? {
-            transaction.execute(
-                &format!("ALTER TABLE session_checkpoints ADD COLUMN {column} TEXT"),
-                [],
-            )?;
-        }
-    }
     for (table, column) in [
         ("session_checkpoints", "previous_cache_write_input"),
         ("session_model_totals", "cache_write_input_tokens"),
@@ -7825,6 +7820,14 @@ fn ensure_session_checkpoint_schema(transaction: &rusqlite::Transaction<'_>) -> 
              CHECK (history_base_pending IN (0, 1))",
             [],
         )?;
+    }
+    for column in ["context_usage_tokens", "context_window_tokens"] {
+        if !cache_write_column_present(transaction, "session_checkpoints", column)? {
+            transaction.execute(
+                &format!("ALTER TABLE session_checkpoints ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }
@@ -14223,6 +14226,20 @@ mod tests {
         store
             .connection
             .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN context_usage_tokens",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN context_window_tokens",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
                 "ALTER TABLE session_model_totals DROP COLUMN cache_write_input_tokens",
                 [],
             )
@@ -20538,6 +20555,135 @@ mod wave_b_correction_tests {
     }
 
     #[test]
+    fn issue_362_checkpoint_schema_accepts_only_supported_legacy_shapes() {
+        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        const SHAPE_MATRIX: &[(usize, &[i64])] = &[
+            (22, SUPPORTED_VERSIONS),
+            (21, &[]),
+            (20, SUPPORTED_VERSIONS),
+            (19, SUPPORTED_VERSIONS),
+            (18, &[0]),
+            (17, &[0]),
+        ];
+
+        let path = database_path("issue-362-checkpoint-schema-matrix");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 63,
+            partition_id: "33".repeat(32),
+        };
+        let store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+
+        for (column_count, accepted_versions) in SHAPE_MATRIX {
+            let actual_column_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('session_checkpoints')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual_column_count, *column_count as i64);
+
+            for schema_version in 0..=ACCOUNT_DB_SCHEMA_VERSION {
+                connection
+                    .pragma_update(None, "user_version", schema_version)
+                    .unwrap();
+                let observed_version = account_db_schema_version(&connection).unwrap();
+                let accepted = validate_partition_schema(&connection, observed_version).is_ok();
+                assert_eq!(
+                    accepted,
+                    accepted_versions.contains(&schema_version),
+                    "session_checkpoints with {column_count} columns and user_version {schema_version}"
+                );
+            }
+
+            let column_to_drop = match column_count {
+                22 => Some("context_window_tokens"),
+                21 => Some("context_usage_tokens"),
+                20 => Some("history_base_pending"),
+                19 => Some("previous_cache_write_input"),
+                18 => Some("last_task_running"),
+                17 => None,
+                _ => unreachable!("shape matrix must use declared column counts"),
+            };
+            if let Some(column) = column_to_drop {
+                connection
+                    .execute(
+                        &format!("ALTER TABLE session_checkpoints DROP COLUMN {column}"),
+                        [],
+                    )
+                    .unwrap();
+            }
+        }
+        drop(connection);
+        cleanup(&path);
+
+        let invalid_path = database_path("issue-362-checkpoint-schema-invalid");
+        let invalid_identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 63,
+            partition_id: "33".repeat(32),
+        };
+        let store = UsageStore::create_partitioned(&invalid_path, &invalid_identity).unwrap();
+        drop(store);
+        let invalid = Connection::open(&invalid_path).unwrap();
+
+        invalid
+            .pragma_update(None, "user_version", ACCOUNT_DB_SCHEMA_VERSION + 1)
+            .unwrap();
+        assert!(account_db_schema_version(&invalid).is_err());
+        invalid
+            .pragma_update(None, "user_version", ACCOUNT_DB_SCHEMA_VERSION)
+            .unwrap();
+
+        invalid
+            .execute(
+                "ALTER TABLE session_checkpoints ADD COLUMN unsupported_extra TEXT",
+                [],
+            )
+            .unwrap();
+        for schema_version in 0..=ACCOUNT_DB_SCHEMA_VERSION {
+            assert!(
+                validate_partition_schema(&invalid, schema_version).is_err(),
+                "extra session_checkpoints column accepted with user_version {schema_version}"
+            );
+        }
+        invalid
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN unsupported_extra",
+                [],
+            )
+            .unwrap();
+
+        invalid
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN previous_cache_write_input",
+                [],
+            )
+            .unwrap();
+        invalid
+            .execute(
+                "ALTER TABLE session_checkpoints ADD COLUMN previous_cache_write_input TEXT",
+                [],
+            )
+            .unwrap();
+        for schema_version in 0..=ACCOUNT_DB_SCHEMA_VERSION {
+            assert!(
+                validate_partition_schema(&invalid, schema_version).is_err(),
+                "reordered session_checkpoints columns accepted with user_version {schema_version}"
+            );
+        }
+        drop(invalid);
+        cleanup(&invalid_path);
+    }
+
+    #[test]
     fn issue_362_legacy_checkpoint_context_migrates_to_null() {
         let path = database_path("issue-362-context-legacy");
         let identity = StoragePartitionIdentity {
@@ -20582,7 +20728,43 @@ mod wave_b_correction_tests {
                 [],
             )
             .unwrap();
+        let legacy_checkpoint_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_checkpoints')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_checkpoint_columns, 20);
+        let legacy_schema_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
         drop(connection);
+
+        let legacy_reader = UsageStore::open_read_only_partitioned(&path, &identity).unwrap();
+        let read_only_state = legacy_reader.load_session_collection_state().unwrap();
+        assert_eq!(read_only_state.checkpoints.len(), 1);
+        assert_eq!(read_only_state.checkpoints[0].context_usage_tokens, None);
+        assert_eq!(read_only_state.checkpoints[0].context_window_tokens, None);
+        drop(legacy_reader);
+        let unchanged = Connection::open(&path).unwrap();
+        assert_eq!(
+            unchanged
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('session_checkpoints')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            legacy_checkpoint_columns
+        );
+        assert_eq!(
+            unchanged
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            legacy_schema_version
+        );
+        drop(unchanged);
 
         let store = UsageStore::open_partitioned(&path, &identity).unwrap();
         let checkpoint = store
