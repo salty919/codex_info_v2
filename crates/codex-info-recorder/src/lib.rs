@@ -599,6 +599,14 @@ impl ThreadPoller {
     pub fn drain(&self) -> Vec<ActiveThreadPollResult> {
         self.receiver.try_iter().collect()
     }
+
+    /// Wait for an already submitted probe without starting another probe.
+    /// The recorder uses this only during the existing fixed-rate sleep, so a
+    /// completed result can be committed in the current generation while the
+    /// periodic collection cadence remains unchanged.
+    pub fn wait_for(&self, timeout: Duration) -> Option<ActiveThreadPollResult> {
+        self.receiver.recv_timeout(timeout).ok()
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1540,10 +1548,12 @@ fn read_active_rollout(
         complete_len > parse_start,
         modified_age,
     );
-    let mut parser = thread_contract::RolloutAccumulator::seeded(
+    let mut parser = thread_contract::RolloutAccumulator::seeded_with_context(
         checkpoint.last_model.clone(),
         checkpoint.previous_total,
         running_seed,
+        checkpoint.context_usage_tokens,
+        checkpoint.context_window_tokens,
     );
     if complete_len > parse_start {
         file.seek(SeekFrom::Start(parse_start))
@@ -4091,6 +4101,8 @@ fn initial_source_baseline_checkpoint(
         history_base_pending: false,
         last_model: None,
         last_task_running: None,
+        context_usage_tokens: None,
+        context_window_tokens: None,
         previous_total: 0,
         previous_input: 0,
         previous_cached_input: 0,
@@ -4389,10 +4401,20 @@ fn scan_source(
         mut history_base_pending,
         mut last_model,
         mut last_task_running,
+        mut context_usage_tokens,
+        mut context_window_tokens,
         mut previous,
         mut prefix_generation_value,
         mut prefix_sha256,
     ) = if let Some(checkpoint) = continuous {
+        let (checkpoint_context_usage_tokens, checkpoint_context_window_tokens) =
+            match (
+                checkpoint.context_usage_tokens,
+                checkpoint.context_window_tokens,
+            ) {
+                (Some(usage), Some(window)) => (Some(usage), Some(window)),
+                _ => (None, None),
+            };
         (
             checkpoint.committed_offset,
             checkpoint.discard_until_lf,
@@ -4401,6 +4423,8 @@ fn scan_source(
             checkpoint.history_base_pending,
             checkpoint.last_model.clone(),
             checkpoint.last_task_running,
+            checkpoint_context_usage_tokens,
+            checkpoint_context_window_tokens,
             TokenSnapshot {
                 total: checkpoint.previous_total,
                 input: checkpoint.previous_input,
@@ -4431,6 +4455,8 @@ fn scan_source(
             false,
             last_model,
             None,
+            None,
+            None,
             TokenSnapshot::default(),
             prefix_generation,
             prefix_sha256,
@@ -4442,6 +4468,8 @@ fn scan_source(
             prior.is_none() && !baseline_existing,
             prior.is_none() && !baseline_existing && !baseline_first_counter,
             false,
+            None,
+            None,
             None,
             None,
             TokenSnapshot::default(),
@@ -4580,6 +4608,10 @@ fn scan_source(
             if let Some(model) = summary.event_model() {
                 last_model = ModelTotals::checkpoint_model(model);
             }
+        }
+        if let Some((usage, window)) = summary.context_pair() {
+            context_usage_tokens = Some(usage);
+            context_window_tokens = Some(window);
         }
         let Some(current) = summary.token_snapshot() else {
             continue;
@@ -4793,6 +4825,8 @@ fn scan_source(
         history_base_pending,
         last_model,
         last_task_running,
+        context_usage_tokens,
+        context_window_tokens,
         previous_total: previous.total,
         previous_input: previous.input,
         previous_cached_input: previous.cached_input,
@@ -5801,6 +5835,7 @@ enum SessionJsonKey {
     Info,
     TotalTokenUsage,
     LastTokenUsage,
+    ModelContextWindow,
     TotalTokens,
     CacheWriteInputTokens,
     InputTokens,
@@ -5809,7 +5844,7 @@ enum SessionJsonKey {
     Other,
 }
 
-const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 14] = [
+const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 15] = [
     (b"type", SessionJsonKey::Type),
     (b"timestamp", SessionJsonKey::Timestamp),
     (b"model", SessionJsonKey::Model),
@@ -5819,6 +5854,7 @@ const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 14] = [
     (b"info", SessionJsonKey::Info),
     (b"total_token_usage", SessionJsonKey::TotalTokenUsage),
     (b"last_token_usage", SessionJsonKey::LastTokenUsage),
+    (b"model_context_window", SessionJsonKey::ModelContextWindow),
     (b"total_tokens", SessionJsonKey::TotalTokens),
     (
         b"cache_write_input_tokens",
@@ -5888,6 +5924,9 @@ struct PayloadSummary {
     last_token_usage_seen: bool,
     last_token_usage_object: bool,
     last_token_usage: TokenUsageSummary,
+    context_window: Option<u64>,
+    context_window_seen: bool,
+    context_window_malformed: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -5974,6 +6013,30 @@ impl SessionRecordSummary {
             .flatten()
     }
 
+    fn context_usage_tokens(&self) -> Option<u64> {
+        (self.event_type() == Some("token_count")
+            && self.payload_object
+            && self.payload.info_object
+            && self.payload.last_token_usage_seen
+            && self.payload.last_token_usage_object)
+            .then(|| self.payload.last_token_usage.valid_snapshot().map(|value| value.total))
+            .flatten()
+    }
+
+    fn context_window_tokens(&self) -> Option<u64> {
+        (self.event_type() == Some("token_count")
+            && self.payload_object
+            && self.payload.info_object
+            && self.payload.context_window_seen)
+            .then_some(self.payload.context_window)
+            .flatten()
+    }
+
+    fn context_pair(&self) -> Option<(u64, u64)> {
+        self.context_usage_tokens()
+            .zip(self.context_window_tokens())
+    }
+
     fn event_timestamp(&self) -> i64 {
         self.timestamp
             .as_deref()
@@ -6004,6 +6067,7 @@ impl SessionRecordSummary {
                     || !self.payload.token_usage_object
                     || !self.payload.token_usage.total_seen
                     || self.payload.token_usage.malformed
+                    || self.payload.context_window_malformed
                     || self.timestamp_malformed
                     || !self.timestamp_seen
                     || !timestamp_valid
@@ -6292,6 +6356,11 @@ impl<'a, R: BufRead> SessionRecordInput<'a, R> {
                         self.skip_value()?;
                         summary.payload.last_token_usage.malformed = true;
                     }
+                } else if key == SessionJsonKey::ModelContextWindow {
+                    summary.payload.context_window_seen = true;
+                    let (value, malformed) = self.parse_u64_value()?;
+                    summary.payload.context_window = value;
+                    summary.payload.context_window_malformed = malformed || value.is_none();
                 } else {
                     self.skip_value()?;
                 }
@@ -6887,6 +6956,26 @@ mod tests {
             assert_eq!(now, anchor + interval * cycle);
         }
     }
+
+    #[test]
+    fn issue_362_thread_poller_wait_publishes_already_completed_probe() {
+        let (sender, _commands) = mpsc::sync_channel(1);
+        let (results, receiver) = mpsc::sync_channel(1);
+        results
+            .send(ActiveThreadPollResult::Failed("issue-362-ready".to_owned()))
+            .unwrap();
+        let worker = thread::spawn(|| {});
+        let poller = ThreadPoller {
+            sender,
+            receiver,
+            _worker: worker,
+        };
+
+        assert_eq!(
+            poller.wait_for(Duration::ZERO),
+            Some(ActiveThreadPollResult::Failed("issue-362-ready".to_owned()))
+        );
+    }
     use rusqlite::Connection;
     use std::io::Write;
     #[cfg(unix)]
@@ -6975,6 +7064,182 @@ mod tests {
             total,
             total
         )
+    }
+
+    fn context_token(total: u64, context: u64, window: u64, timestamp: i64) -> String {
+        format!(
+            "{}\n",
+            json!({
+                "type": "event_msg",
+                "timestamp": DateTime::<Utc>::from_timestamp(timestamp, 0)
+                    .unwrap()
+                    .to_rfc3339(),
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "total_tokens": total,
+                            "input_tokens": total,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                        },
+                        "last_token_usage": {"total_tokens": context},
+                        "model_context_window": window,
+                    }
+                }
+            })
+        )
+    }
+
+    #[test]
+    fn issue_362_context_checkpoint_and_rollout_results_match() {
+        let (root, database) = prepare("issue-362-context-checkpoint");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&source, context_token(400, 400, 16_000, now)).unwrap();
+
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let first = recorder.state().unwrap().checkpoints;
+        assert_eq!(first[0].context_usage_tokens, Some(400));
+        assert_eq!(first[0].context_window_tokens, Some(16_000));
+        let metadata = fs::metadata(&source).unwrap();
+        let mut complete = first[0].clone();
+        complete.committed_offset = metadata.len();
+        let direct = read_active_rollout(&root.join("sessions"), &source, &metadata, &complete)
+            .unwrap();
+        assert_eq!(direct.context_usage_tokens(), Some(400));
+        assert_eq!(direct.context_window_tokens(), Some(16_000));
+
+        let mut incomplete = complete.clone();
+        incomplete.context_window_tokens = None;
+        let direct_incomplete =
+            read_active_rollout(&root.join("sessions"), &source, &metadata, &incomplete).unwrap();
+        assert_eq!(direct_incomplete.context_usage_tokens(), None);
+        assert_eq!(direct_incomplete.context_window_tokens(), None);
+        drop(recorder);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "type": "event_msg",
+                        "timestamp": DateTime::<Utc>::from_timestamp(now + 1, 0)
+                            .unwrap()
+                            .to_rfc3339(),
+                        "payload": {"type": "token_count", "info": null}
+                    })
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let second = recorder.state().unwrap().checkpoints;
+        assert_eq!(second[0].context_usage_tokens, Some(400));
+        assert_eq!(second[0].context_window_tokens, Some(16_000));
+        drop(recorder);
+
+        let recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        let restarted = recorder.state().unwrap().checkpoints;
+        assert_eq!(restarted[0].context_usage_tokens, Some(400));
+        assert_eq!(restarted[0].context_window_tokens, Some(16_000));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn issue_362_context_partial_fields_preserve_last_complete_pair() {
+        let (root, database) = prepare("issue-362-context-partial");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&source, context_token(400, 400, 16_000, now)).unwrap();
+
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        drop(recorder);
+
+        let partial_usage = format!(
+            "{}\n",
+            json!({
+                "type": "event_msg",
+                "timestamp": DateTime::<Utc>::from_timestamp(now + 1, 0)
+                    .unwrap()
+                    .to_rfc3339(),
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {"total_tokens": 500},
+                        "last_token_usage": {"total_tokens": 500},
+                    }
+                }
+            })
+        );
+        let partial_window = format!(
+            "{}\n",
+            json!({
+                "type": "event_msg",
+                "timestamp": DateTime::<Utc>::from_timestamp(now + 2, 0)
+                    .unwrap()
+                    .to_rfc3339(),
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {"total_tokens": 600},
+                        "model_context_window": 32_000,
+                    }
+                }
+            })
+        );
+        let null_info = format!(
+            "{}\n",
+            json!({
+                "type": "event_msg",
+                "timestamp": DateTime::<Utc>::from_timestamp(now + 3, 0)
+                    .unwrap()
+                    .to_rfc3339(),
+                "payload": {"type": "token_count", "info": null}
+            })
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!("{partial_usage}{partial_window}{null_info}").as_bytes(),
+            )
+            .unwrap();
+
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let checkpoint = recorder.state().unwrap().checkpoints.remove(0);
+        assert_eq!(checkpoint.context_usage_tokens, Some(400));
+        assert_eq!(checkpoint.context_window_tokens, Some(16_000));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn issue_362_context_zero_is_persisted_as_zero() {
+        let (root, database) = prepare("issue-362-context-zero");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&source, context_token(0, 0, 16_000, now)).unwrap();
+
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let checkpoint = recorder.state().unwrap().checkpoints.remove(0);
+        assert_eq!(checkpoint.context_usage_tokens, Some(0));
+        assert_eq!(checkpoint.context_window_tokens, Some(16_000));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn paginated_token(total: u64, last_total: u64, timestamp: i64) -> String {
@@ -7347,6 +7612,8 @@ mod tests {
                 history_base_pending: false,
                 last_model: None,
                 last_task_running: None,
+                context_usage_tokens: None,
+                context_window_tokens: None,
                 previous_total: 0,
                 previous_input: 0,
                 previous_cached_input: 0,
@@ -7417,6 +7684,8 @@ mod tests {
                 history_base_pending: false,
                 last_model: None,
                 last_task_running: None,
+                context_usage_tokens: None,
+                context_window_tokens: None,
                 previous_total: 0,
                 previous_input: 0,
                 previous_cached_input: 0,
@@ -7556,6 +7825,8 @@ mod tests {
             history_base_pending: false,
             last_model: None,
             last_task_running: None,
+            context_usage_tokens: None,
+            context_window_tokens: None,
             previous_total: 0,
             previous_input: 0,
             previous_cached_input: 0,
@@ -8166,6 +8437,8 @@ mod tests {
             history_base_pending: false,
             last_model: None,
             last_task_running: None,
+            context_usage_tokens: None,
+            context_window_tokens: None,
             previous_total: 10,
             previous_input: 10,
             previous_cached_input: 0,
@@ -9052,6 +9325,8 @@ mod tests {
             history_base_pending: false,
             last_model: Some("gpt-5.6-sol".to_owned()),
             last_task_running: Some(true),
+            context_usage_tokens: None,
+            context_window_tokens: None,
             previous_total: 42,
             previous_input: 40,
             previous_cached_input: 0,
@@ -9107,6 +9382,8 @@ mod tests {
             history_base_pending: false,
             last_model: Some("gpt-5.6-sol".to_owned()),
             last_task_running: Some(true),
+            context_usage_tokens: None,
+            context_window_tokens: None,
             previous_total: 42,
             previous_input: 40,
             previous_cached_input: 0,

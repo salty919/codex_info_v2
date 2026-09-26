@@ -198,6 +198,7 @@ export struct ActiveThreadRow {
     title: string,
     full-title: string,
     model: string,
+    model-class: string,
     tokens: string,
     context-usage: string,
     thread-age: string,
@@ -1298,7 +1299,7 @@ export component ThreadsWindow inherits Window {
     callback minimize-window();
     callback close-window();
     // The 384px list viewport owns four complete 96px rows. Each row contains
-    // a 92px card and a 4px gap, independent of the number of active threads.
+    // an 84px card with six pixel vertical margins, matching Windows.
     property <length> thread-row-height: 96px;
 
     Rectangle {
@@ -1382,19 +1383,22 @@ export component ThreadsWindow inherits Window {
                 height: root.thread-row-height;
                 background: DesignTokens.canvas;
                 property <int> display-depth: min(row.tree-depth, 3);
-                property <length> tree-gutter-width: 64px;
-                property <length> tree-base-x: 8px;
-                property <length> tree-depth-step: 12px;
+                property <length> tree-gutter-width: 80px;
+                property <length> tree-base-x: 10px;
+                property <length> tree-depth-step: 16px;
                 property <length> tree-junction-y: 48px;
-                property <length> tree-junction-end-x: self.tree-gutter-width - 5px;
+                property <length> tree-junction-end-x: self.tree-gutter-width;
+                property <length> info-spacing: 12px;
 
                 row-card := Rectangle {
-                    width: parent.width;
-                    height: 92px;
-                    background: mod(index, 2) == 0 ? DesignTokens.raised : DesignTokens.canvas;
+                    x: 80px;
+                    y: 6px;
+                    width: parent.width - 96px;
+                    height: 84px;
+                    background: row.has-children ? #243E5A : #151F2D;
                     border-width: 1px;
-                    border-color: DesignTokens.border-subtle;
-                    border-radius: 6px;
+                    border-color: #2B425B;
+                    border-radius: 8px;
                 }
 
                 // Every vertical rail owns the full 96px stride where the
@@ -1405,150 +1409,218 @@ export component ThreadsWindow inherits Window {
                     y: 0px;
                     width: 2px;
                     height: root.thread-row-height;
-                    background: DesignTokens.warning;
-                    opacity: 0.72;
+                    background: #76A7CC;
+                    opacity: 1;
+                    border-radius: 1px;
                 }
                 if row.ancestor-guide-2 : Rectangle {
                     x: parent.tree-base-x + parent.tree-depth-step;
                     y: 0px;
                     width: 2px;
                     height: root.thread-row-height;
-                    background: DesignTokens.warning;
-                    opacity: 0.72;
+                    background: #76A7CC;
+                    opacity: 1;
+                    border-radius: 1px;
                 }
                 if row.ancestor-guide-3 : Rectangle {
                     x: parent.tree-base-x + 2 * parent.tree-depth-step;
                     y: 0px;
                     width: 2px;
                     height: root.thread-row-height;
-                    background: DesignTokens.warning;
-                    opacity: 0.72;
+                    background: #76A7CC;
+                    opacity: 1;
+                    border-radius: 1px;
                 }
                 if row.connected-to-parent : Rectangle {
-                    x: parent.tree-base-x + (parent.display-depth - 1) * parent.tree-depth-step;
+                    x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step;
                     y: 0px;
                     width: 2px;
                     height: row.has-next-sibling ? root.thread-row-height : parent.tree-junction-y;
-                    background: DesignTokens.warning;
-                    opacity: 0.72;
+                    background: #76A7CC;
+                    opacity: 1;
+                    border-radius: 1px;
                 }
                 if row.connected-to-parent : Rectangle {
-                    x: parent.tree-base-x + (parent.display-depth - 1) * parent.tree-depth-step;
+                    x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step;
                     y: parent.tree-junction-y - 1px;
                     width: parent.tree-junction-end-x - self.x;
                     height: 2px;
-                    background: DesignTokens.warning;
-                    opacity: 0.72;
+                    background: #76A7CC;
+                    opacity: 1;
+                    border-radius: 1px;
                 }
-                if row.connected-to-parent : Rectangle {
-                    x: parent.tree-junction-end-x - 3px;
-                    y: parent.tree-junction-y - 3px;
-                    width: 6px;
-                    height: 6px;
-                    border-radius: 3px;
-                    background: DesignTokens.warning;
-                    opacity: 0.82;
+                if !row.connected-to-parent : Rectangle {
+                    x: parent.tree-base-x;
+                    y: parent.tree-junction-y - 1px;
+                    width: parent.tree-junction-end-x - self.x;
+                    height: 2px;
+                    background: #76A7CC;
+                    opacity: 1;
+                    border-radius: 1px;
+                }
+                if row.connected-to-parent : Path {
+                    x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step - 4px;
+                    y: parent.tree-junction-y - 4px;
+                    width: 8px;
+                    height: 8px;
+                    viewbox-width: 8;
+                    viewbox-height: 8;
+                    commands: "M 4 0 L 8 4 L 4 8 L 0 4 Z";
+                    fill: #76A7CC;
+                    opacity: 1;
+                }
+                if !row.connected-to-parent && !row.has-children : Path {
+                    x: parent.tree-base-x - 4px;
+                    y: parent.tree-junction-y - 4px;
+                    width: 8px;
+                    height: 8px;
+                    viewbox-width: 8;
+                    viewbox-height: 8;
+                    commands: "M 4 0 L 8 4 L 4 8 L 0 4 Z";
+                    fill: #76A7CC;
+                    opacity: 1;
+                }
+                if row.has-children : Path {
+                    x: parent.tree-base-x + min(parent.display-depth, 3) * parent.tree-depth-step - 4px;
+                    y: parent.tree-junction-y - 4px;
+                    width: 8px;
+                    height: 8px;
+                    viewbox-width: 8;
+                    viewbox-height: 8;
+                    commands: "M 4 0 L 8 4 L 4 8 L 0 4 Z";
+                    fill: #76A7CC;
+                    opacity: 1;
+                }
+                if row.connected-to-parent : Path {
+                    x: parent.tree-junction-end-x - 7px;
+                    y: parent.tree-junction-y - 5px;
+                    width: 7px;
+                    height: 10px;
+                    viewbox-width: 7;
+                    viewbox-height: 10;
+                    commands: "M 0 0 L 7 5 L 0 10";
+                    stroke: #76A7CC;
+                    stroke-width: 2px;
+                    opacity: 1;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                }
+                if !row.connected-to-parent : Path {
+                    x: parent.tree-junction-end-x - 7px;
+                    y: parent.tree-junction-y - 5px;
+                    width: 7px;
+                    height: 10px;
+                    viewbox-width: 7;
+                    viewbox-height: 10;
+                    commands: "M 0 0 L 7 5 L 0 10";
+                    stroke: #76A7CC;
+                    stroke-width: 2px;
+                    opacity: 1;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
                 }
                 if row.has-children : Rectangle {
                     x: parent.tree-base-x + min(parent.display-depth, 3) * parent.tree-depth-step;
                     y: parent.tree-junction-y;
                     width: 2px;
                     height: root.thread-row-height - parent.tree-junction-y;
-                    background: DesignTokens.warning;
-                    opacity: 0.72;
+                    background: #76A7CC;
+                    opacity: 1;
+                    border-radius: 1px;
                 }
 
-                role-lane := Rectangle {
-                    x: 72px;
-                    width: 110px;
-                    height: 92px;
+                title-lane := Rectangle {
+                    x: 95px;
+                    y: 15px;
+                    width: parent.width - 538px;
+                    height: 66px;
                     Text {
+                        x: 0px;
+                        y: 0px;
                         width: parent.width;
                         height: parent.height;
-                        text: row.relation + " · " + root.strings.running;
-                        color: row.is-main ? DesignTokens.accent-primary : DesignTokens.warning;
-                        font-size: 14px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                        wrap: word-wrap;
-                    }
-                }
-                title-lane := Rectangle {
-                    x: 192px;
-                    width: 242px;
-                    height: 92px;
-                    Text {
-                        y: 26px;
-                        width: parent.width;
-                        height: 40px;
                         text: row.title;
                         accessible-role: text;
                         accessible-label: row.full-title;
                         color: DesignTokens.text-primary;
-                        font-size: 14px;
+                        font-size: 15px;
                         font-weight: 700;
-                        vertical-alignment: center;
+                        vertical-alignment: top;
                         wrap: char-wrap;
                         overflow: clip;
                     }
                 }
                 model-lane := Rectangle {
-                    x: 444px;
-                    width: 190px;
-                    height: 92px;
+                    x: parent.width - 431px;
+                    y: 15px;
+                    width: 180px;
+                    height: 66px;
+                    model-accent := Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: 2px;
+                        height: 12px;
+                        background: row.model-class == "ASTRA" ? #E86E9F : (row.model-class == "LUNA" ? #F1B35A : (row.model-class == "TERRA" ? #71D39A : (row.model-class == "SOL" ? #B79BFF : #A8B7CA)));
+                    }
                     Text {
-                        y: 21px;
-                        width: parent.width;
+                        x: 8px;
+                        y: 0px;
+                        width: parent.width - 8px;
                         height: 20px;
                         text: row.model;
-                        color: DesignTokens.text-secondary;
+                        color: row.model-class == "ASTRA" ? #E86E9F : (row.model-class == "LUNA" ? #F1B35A : (row.model-class == "TERRA" ? #71D39A : (row.model-class == "SOL" ? #B79BFF : #A8B7CA)));
                         font-size: 13px;
                         font-weight: 600;
-                        vertical-alignment: center;
+                        vertical-alignment: top;
                         overflow: elide;
                     }
                     Text {
-                        y: 47px;
+                        x: 0px;
+                        y: 24px;
                         width: parent.width;
-                        height: 26px;
+                        height: parent.height - 24px;
                         text: root.strings.context-usage + " " + row.context-usage;
                         color: DesignTokens.text-secondary;
                         font-size: 12px;
-                        vertical-alignment: center;
+                        vertical-alignment: top;
                         wrap: word-wrap;
                         visible: row.context-usage != "";
                     }
                 }
                 time-lane := Rectangle {
-                    x: 644px;
-                    width: 180px;
-                    height: 92px;
+                    x: parent.width - 239px;
+                    y: 15px;
+                    width: 208px;
+                    height: 66px;
                     Text {
-                        y: 16px;
+                        x: 0px;
+                        y: 0px;
                         width: parent.width;
                         height: 18px;
                         text: root.strings.running + " " + row.thread-age;
                         color: DesignTokens.text-secondary;
                         font-size: 12px;
                         horizontal-alignment: right;
-                        vertical-alignment: center;
+                        vertical-alignment: top;
                         overflow: elide;
                         visible: row.thread-age != "";
                     }
                     Text {
-                        y: 38px;
+                        x: 0px;
+                        y: 20px;
                         width: parent.width;
                         height: 18px;
                         text: root.strings.instruction + " " + row.instruction-age;
                         color: DesignTokens.text-secondary;
                         font-size: 12px;
                         horizontal-alignment: right;
-                        vertical-alignment: center;
+                        vertical-alignment: top;
                         overflow: elide;
                         visible: row.instruction-age != "";
                     }
                     Text {
-                        y: 60px;
+                        x: 0px;
+                        y: 40px;
                         width: parent.width;
                         height: 18px;
                         text: row.tokens;
@@ -1556,7 +1628,7 @@ export component ThreadsWindow inherits Window {
                         font-size: 12px;
                         font-weight: 600;
                         horizontal-alignment: right;
-                        vertical-alignment: center;
+                        vertical-alignment: top;
                         overflow: elide;
                         visible: row.tokens != "";
                     }

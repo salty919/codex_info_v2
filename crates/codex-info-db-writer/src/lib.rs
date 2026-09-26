@@ -133,6 +133,8 @@ CREATE TABLE session_checkpoints (
     last_task_running INTEGER CHECK (last_task_running IS NULL OR last_task_running IN (0, 1)),
     previous_cache_write_input TEXT,
     history_base_pending INTEGER NOT NULL DEFAULT 0 CHECK (history_base_pending IN (0, 1)),
+    context_usage_tokens TEXT,
+    context_window_tokens TEXT,
     PRIMARY KEY (
         root_identity,
         relative_path,
@@ -1185,6 +1187,8 @@ pub struct SessionCheckpoint {
     pub history_base_pending: bool,
     pub last_model: Option<String>,
     pub last_task_running: Option<bool>,
+    pub context_usage_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
     pub previous_total: u64,
     pub previous_input: u64,
     pub previous_cached_input: u64,
@@ -2109,6 +2113,16 @@ fn validate_session_checkpoint(checkpoint: &SessionCheckpoint) -> Result<()> {
     }
     validate_sha256(&checkpoint.prefix_sha256, "session checkpoint prefix")?;
     Ok(())
+}
+
+fn canonical_context_pair(
+    context_usage_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    match (context_usage_tokens, context_window_tokens) {
+        (Some(usage), Some(window)) => (Some(usage), Some(window)),
+        _ => (None, None),
+    }
 }
 
 fn valid_session_model(model: &str) -> bool {
@@ -7012,6 +7026,8 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                 ("last_task_running", "INTEGER", 0),
                 ("previous_cache_write_input", "TEXT", 0),
                 ("history_base_pending", "INTEGER", 0),
+                ("context_usage_tokens", "TEXT", 0),
+                ("context_window_tokens", "TEXT", 0),
             ],
         ),
         (
@@ -7785,6 +7801,14 @@ fn ensure_session_checkpoint_schema(transaction: &rusqlite::Transaction<'_>) -> 
              CHECK (last_task_running IS NULL OR last_task_running IN (0, 1))",
             [],
         )?;
+    }
+    for column in ["context_usage_tokens", "context_window_tokens"] {
+        if !cache_write_column_present(transaction, "session_checkpoints", column)? {
+            transaction.execute(
+                &format!("ALTER TABLE session_checkpoints ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
     }
     for (table, column) in [
         ("session_checkpoints", "previous_cache_write_input"),
@@ -10028,12 +10052,31 @@ impl UsageStore {
             // which does not exist yet.
             "NULL"
         };
+        let context_usage_column = if cache_write_column_present(
+            &transaction,
+            "session_checkpoints",
+            "context_usage_tokens",
+        )? {
+            "context_usage_tokens"
+        } else {
+            "NULL"
+        };
+        let context_window_column = if cache_write_column_present(
+            &transaction,
+            "session_checkpoints",
+            "context_window_tokens",
+        )? {
+            "context_window_tokens"
+        } else {
+            "NULL"
+        };
         let checkpoint_query = format!(
             "SELECT root_identity, relative_path, file_device, file_inode,
                     committed_offset, discard_until_lf, collector_epoch, cycle_seq,
                     prefix_generation, prefix_sha256, fully_attributed_from_zero,
                     token_baseline_known, {history_base_column}, last_model,
-                    {task_running_column}, previous_total, previous_input,
+                    {task_running_column}, {context_usage_column},
+                    {context_window_column}, previous_total, previous_input,
                     previous_cached_input, previous_output, {cache_write_column}
              FROM session_checkpoints
              ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation",
@@ -10063,6 +10106,24 @@ impl UsageStore {
                     .ok()
                     .filter(|parsed| parsed.to_string() == cycle_seq)
                     .ok_or(rusqlite::Error::InvalidQuery)?;
+                let context_usage_tokens = row
+                    .get::<_, Option<String>>(15)?
+                    .map(|text| {
+                        text.parse::<u64>()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?;
+                let context_window_tokens = row
+                    .get::<_, Option<String>>(16)?
+                    .map(|text| {
+                        text.parse::<u64>()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?;
+                let (context_usage_tokens, context_window_tokens) = canonical_context_pair(
+                    context_usage_tokens,
+                    context_window_tokens,
+                );
                 Ok(SessionCheckpoint {
                     root_identity: row.get(0)?,
                     relative_path: row.get(1)?,
@@ -10093,24 +10154,26 @@ impl UsageStore {
                         Some(1) => Some(true),
                         Some(_) => return Err(rusqlite::Error::InvalidQuery),
                     },
+                    context_usage_tokens,
+                    context_window_tokens,
                     previous_total: row
-                        .get::<_, String>(15)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    previous_input: row
-                        .get::<_, String>(16)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    previous_cached_input: row
                         .get::<_, String>(17)?
                         .parse()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    previous_output: row
+                    previous_input: row
                         .get::<_, String>(18)?
                         .parse()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    previous_cached_input: row
+                        .get::<_, String>(19)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    previous_output: row
+                        .get::<_, String>(20)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     previous_cache_write_input: row
-                        .get::<_, Option<String>>(19)?
+                        .get::<_, Option<String>>(21)?
                         .map(|text| {
                             text.parse::<u64>()
                                 .map_err(|_| rusqlite::Error::InvalidQuery)
@@ -11869,7 +11932,14 @@ impl UsageStore {
         }
         let mut canonical_checkpoints = BTreeMap::new();
         for checkpoint in checkpoints {
-            validate_session_checkpoint(checkpoint)?;
+            let mut checkpoint = checkpoint.clone();
+            let (context_usage_tokens, context_window_tokens) = canonical_context_pair(
+                checkpoint.context_usage_tokens,
+                checkpoint.context_window_tokens,
+            );
+            checkpoint.context_usage_tokens = context_usage_tokens;
+            checkpoint.context_window_tokens = context_window_tokens;
+            validate_session_checkpoint(&checkpoint)?;
             let key = (
                 checkpoint.root_identity.clone(),
                 checkpoint.relative_path.clone(),
@@ -11877,17 +11947,14 @@ impl UsageStore {
                 checkpoint.file_inode,
                 checkpoint.prefix_generation,
             );
-            if canonical_checkpoints
-                .insert(key, checkpoint.clone())
-                .is_some()
-            {
-                return Err(UsageStoreError::InvalidImport(
-                    "duplicate session checkpoint".into(),
-                ));
-            }
             if checkpoint.collector_epoch != collector_epoch || checkpoint.cycle_seq != cycle_seq {
                 return Err(UsageStoreError::InvalidImport(
                     "checkpoint admission generation mismatch".into(),
+                ));
+            }
+            if canonical_checkpoints.insert(key, checkpoint).is_some() {
+                return Err(UsageStoreError::InvalidImport(
+                    "duplicate session checkpoint".into(),
                 ));
             }
         }
@@ -12465,11 +12532,12 @@ impl UsageStore {
                     committed_offset, discard_until_lf, collector_epoch, cycle_seq,
                     prefix_generation, prefix_sha256, fully_attributed_from_zero,
                     token_baseline_known, history_base_pending, last_model,
-                    last_task_running, previous_total, previous_input,
-                    previous_cached_input, previous_output, previous_cache_write_input
+                    last_task_running, context_usage_tokens, context_window_tokens,
+                    previous_total, previous_input, previous_cached_input,
+                    previous_output, previous_cache_write_input
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
                  )
                  ON CONFLICT (
                     root_identity, relative_path, file_device, file_inode, prefix_generation
@@ -12484,6 +12552,8 @@ impl UsageStore {
                     history_base_pending = excluded.history_base_pending,
                     last_model = excluded.last_model,
                     last_task_running = excluded.last_task_running,
+                    context_usage_tokens = excluded.context_usage_tokens,
+                    context_window_tokens = excluded.context_window_tokens,
                     previous_total = excluded.previous_total,
                     previous_input = excluded.previous_input,
                     previous_cached_input = excluded.previous_cached_input,
@@ -12507,6 +12577,12 @@ impl UsageStore {
                     i64::from(checkpoint.history_base_pending),
                     checkpoint.last_model.as_deref(),
                     checkpoint.last_task_running.map(i64::from),
+                    checkpoint
+                        .context_usage_tokens
+                        .map(|value| value.to_string()),
+                    checkpoint
+                        .context_window_tokens
+                        .map(|value| value.to_string()),
                     checkpoint.previous_total.to_string(),
                     checkpoint.previous_input.to_string(),
                     checkpoint.previous_cached_input.to_string(),
@@ -13996,6 +14072,8 @@ mod tests {
             history_base_pending: false,
             last_model: Some("SOL".into()),
             last_task_running: None,
+            context_usage_tokens: None,
+            context_window_tokens: None,
             previous_total: 20,
             previous_input: 12,
             previous_cached_input: 2,
@@ -20363,5 +20441,153 @@ mod wave_b_correction_tests {
         );
         drop(store);
         cleanup(&copied_path);
+    }
+
+    #[test]
+    fn issue_362_session_checkpoint_schema_has_nullable_context_columns() {
+        let path = database_path("issue-362-context-schema");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 62,
+            partition_id: "33".repeat(32),
+        };
+        let store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let columns = ["context_usage_tokens", "context_window_tokens"];
+        for column in columns {
+            let present: bool = store
+                .connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info('session_checkpoints') WHERE name=?1
+                    )",
+                    params![column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing session checkpoint column {column}");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn issue_362_context_incomplete_checkpoint_is_not_adopted() {
+        let path = database_path("issue-362-context-incomplete");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "d".repeat(64),
+            storage_epoch: 362,
+            partition_id: "d".repeat(64),
+        };
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let source = RecordedSessionSource {
+            root_identity: "unix:10:20".into(),
+            relative_path: "one.jsonl".into(),
+            file_bytes: 123,
+            modified_nanos: 1_700_000_000_000_000_000,
+            file_device: 10,
+            file_inode: 20,
+        };
+        let checkpoint = SessionCheckpoint {
+            previous_cache_write_input: None,
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            committed_offset: source.file_bytes,
+            discard_until_lf: false,
+            collector_epoch: 0x1234,
+            cycle_seq: 1,
+            prefix_generation: 0x5678,
+            prefix_sha256: "00".repeat(32),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            history_base_pending: false,
+            last_model: Some("SOL".into()),
+            last_task_running: None,
+            context_usage_tokens: Some(400),
+            context_window_tokens: None,
+            previous_total: 20,
+            previous_input: 12,
+            previous_cached_input: 2,
+            previous_output: 8,
+        };
+
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: 1_800_604_800,
+                window_seconds: 604_800,
+                collector_epoch: 0x1234,
+                cycle_seq: 1,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&checkpoint),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: std::slice::from_ref(&source),
+            })
+            .unwrap();
+
+        let stored = store
+            .load_session_collection_state()
+            .unwrap()
+            .checkpoints
+            .remove(0);
+        assert_eq!(stored.context_usage_tokens, None);
+        assert_eq!(stored.context_window_tokens, None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn issue_362_legacy_checkpoint_context_migrates_to_null() {
+        let path = database_path("issue-362-context-legacy");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 63,
+            partition_id: "33".repeat(32),
+        };
+        let store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_checkpoints (
+                    root_identity, relative_path, file_device, file_inode,
+                    committed_offset, discard_until_lf, collector_epoch, cycle_seq,
+                    prefix_generation, prefix_sha256, fully_attributed_from_zero,
+                    token_baseline_known, last_model, previous_total, previous_input,
+                    previous_cached_input, previous_output, last_task_running,
+                    previous_cache_write_input, history_base_pending
+                 ) VALUES (?1, ?2, '1', '2', 0, 0, ?3, '1', ?4, ?5, 1, 1,
+                           NULL, '0', '0', '0', '0', NULL, NULL, 0)",
+                params![
+                    "root",
+                    "one.jsonl",
+                    format!("{:032x}", 1_u128),
+                    format!("{:032x}", 2_u128),
+                    "00".repeat(32),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute("ALTER TABLE session_checkpoints DROP COLUMN context_usage_tokens", [])
+            .unwrap();
+        connection
+            .execute("ALTER TABLE session_checkpoints DROP COLUMN context_window_tokens", [])
+            .unwrap();
+        drop(connection);
+
+        let store = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let checkpoint = store
+            .load_session_collection_state()
+            .unwrap()
+            .checkpoints
+            .remove(0);
+        assert_eq!(checkpoint.context_usage_tokens, None);
+        assert_eq!(checkpoint.context_window_tokens, None);
+        cleanup(&path);
     }
 }

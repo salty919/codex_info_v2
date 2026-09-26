@@ -39,7 +39,7 @@
       <Setter Property="Height" Value="12" />
       <Setter Property="CornerRadius" Value="2" />
       <Setter Property="HorizontalAlignment" Value="Left" />
-      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="VerticalAlignment" Value="Top" />
     </Style>
     <Style Selector="Button.window-control">
       <Setter Property="Width" Value="32" />
@@ -77,6 +77,7 @@
               <Grid Height="96">
                 <Border Classes="thread-card"
                         Margin="80,6,16,6"
+                        Background="{Binding CardBackgroundHex}"
                         AutomationProperties.Name="{Binding Title}">
                   <Grid Margin="0"
                         ColumnDefinitions="*,180,208"
@@ -84,7 +85,7 @@
                     <TextBlock Grid.Column="0"
                                FontSize="15"
                                FontWeight="SemiBold"
-                               VerticalAlignment="Center"
+                               VerticalAlignment="Top"
                                AutomationProperties.AutomationId="{Binding Id}"
                                AutomationProperties.Name="{Binding Title}"
                                Text="{Binding Title}"
@@ -95,7 +96,7 @@
                     <Grid Grid.Column="1"
                           RowDefinitions="Auto,Auto"
                           RowSpacing="4"
-                          VerticalAlignment="Center">
+                          VerticalAlignment="Top">
                       <Border Grid.Row="0"
                               Classes="model-accent"
                               Background="{Binding ModelAccentHex}" />
@@ -108,14 +109,13 @@
                                  TextTrimming="CharacterEllipsis" />
                       <TextBlock Grid.Row="1"
                                  Classes="label"
-                                 IsVisible="{Binding HasContextUsage}"
                                  Text="{Binding ContextUsageText}"
                                  TextWrapping="Wrap"
                                  MaxLines="2"
                                  AutomationProperties.Name="{Binding ContextUsageText}"
                                  ToolTip.Tip="{Binding ContextUsageText}" />
                     </Grid>
-                    <StackPanel Grid.Column="2" Spacing="2" VerticalAlignment="Center">
+                    <StackPanel Grid.Column="2" Spacing="2" VerticalAlignment="Top">
                       <TextBlock Classes="label"
                                  HorizontalAlignment="Right"
                                  IsVisible="{Binding HasElapsedMinutes}"
