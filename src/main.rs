@@ -36314,11 +36314,30 @@ mod tests {
             "y: 5px;",
             "y: 24px;",
             "height: 20px;",
-            "y: 49px;",
             "reset-label",
             "observed-label",
         ] {
             assert!(week.contains(marker), "week gauge marker: {marker}");
+        }
+        let week_grid = week
+            .split("GridLayout {")
+            .nth(1)
+            .and_then(|body| body.split("\n    }").next())
+            .expect("shared weekly grid");
+        // The lower row starts at y=45px: grid y=5px, then 18px + 22px rows with no gap.
+        for marker in [
+            "y: 5px;",
+            "height: 60px;",
+            "spacing-vertical: 0px;",
+            "height: 18px;",
+            "height: 22px;",
+            "height: 20px;",
+            "row: 2;",
+        ] {
+            assert!(
+                week_grid.contains(marker),
+                "week lower-row marker: {marker}"
+            );
         }
         for marker in [
             "height: 42px;",
