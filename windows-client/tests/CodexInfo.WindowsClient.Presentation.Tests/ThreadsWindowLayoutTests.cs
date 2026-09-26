@@ -425,11 +425,29 @@ public sealed class ThreadsWindowLayoutTests
             "property <length> tree-junction-y: 48px;",
             "property <length> tree-junction-end-x: self.tree-gutter-width;",
             "width: parent.tree-junction-end-x - self.x;",
-            "x: parent.tree-junction-end-x - 3px;",
-            "width: 6px;",
         })
         {
             Assert.Contains(marker, linuxThreads, StringComparison.Ordinal);
+        }
+
+        const string connectedPathStartMarker = "if row.connected-to-parent : Path {";
+        var connectedPathStart = linuxThreads.IndexOf(
+            connectedPathStartMarker,
+            StringComparison.Ordinal);
+        Assert.True(connectedPathStart >= 0, "missing connected-to-parent path block");
+        var connectedPathEnd = linuxThreads.IndexOf('}', connectedPathStart);
+        Assert.True(connectedPathEnd >= 0, "unterminated connected-to-parent path block");
+        var connectedPath = linuxThreads[connectedPathStart..connectedPathEnd];
+        foreach (var marker in new[]
+        {
+            "x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step - 4px;",
+            "y: parent.tree-junction-y - 4px;",
+            "width: 8px;",
+            "height: 8px;",
+            "commands: \"M 4 0 L 8 4 L 4 8 L 0 4 Z\";",
+        })
+        {
+            Assert.Contains(marker, connectedPath, StringComparison.Ordinal);
         }
     }
 

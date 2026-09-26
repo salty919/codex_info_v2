@@ -35683,7 +35683,10 @@ mod tests {
                 "stroke-line-cap: round;",
                 "stroke-line-join: round;",
             ] {
-                assert!(block.contains(marker), "missing arrow rendering contract: {marker}");
+                assert!(
+                    block.contains(marker),
+                    "missing arrow rendering contract: {marker}"
+                );
             }
         }
     }
@@ -35797,11 +35800,13 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                row.connected_to_parent.then(|| (
-                    10 + 16 * row.forest_depth.saturating_sub(1).min(3),
-                    expected_row_y[index - 1],
-                    expected_row_y[index],
-                ))
+                row.connected_to_parent.then(|| {
+                    (
+                        10 + 16 * row.forest_depth.saturating_sub(1).min(3),
+                        expected_row_y[index - 1],
+                        expected_row_y[index],
+                    )
+                })
             })
             .collect::<Vec<_>>();
         assert_eq!(actual_rails, [(10, 48, 144), (26, 144, 240)]);
@@ -35818,10 +35823,7 @@ mod tests {
                 row_junctions.push((10, expected_row_y[index]));
             }
             if row.has_children {
-                let outgoing = (
-                    10 + 16 * row.forest_depth.min(3),
-                    expected_row_y[index],
-                );
+                let outgoing = (10 + 16 * row.forest_depth.min(3), expected_row_y[index]);
                 if !row_junctions.contains(&outgoing) {
                     row_junctions.push(outgoing);
                 }
@@ -35868,7 +35870,10 @@ mod tests {
             "background: #76A7CC;",
             "opacity: 1;",
         ] {
-            assert!(threads.contains(marker), "missing connector contract: {marker}");
+            assert!(
+                threads.contains(marker),
+                "missing connector contract: {marker}"
+            );
         }
         let path_block = |marker: &str, occurrence: usize| {
             threads
@@ -35896,7 +35901,10 @@ mod tests {
             "x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step - 4px;",
         );
         assert_diamond(
-            path_block("if !row.connected-to-parent && !row.has-children : Path {", 1),
+            path_block(
+                "if !row.connected-to-parent && !row.has-children : Path {",
+                1,
+            ),
             "x: parent.tree-base-x - 4px;",
         );
         assert_diamond(
@@ -35962,9 +35970,8 @@ mod tests {
         let actual_rail_x = presentation
             .iter()
             .filter_map(|row| {
-                row.connected_to_parent.then_some(
-                    10 + 16 * row.forest_depth.saturating_sub(1).min(3),
-                )
+                row.connected_to_parent
+                    .then_some(10 + 16 * row.forest_depth.saturating_sub(1).min(3))
             })
             .collect::<Vec<_>>();
         assert_eq!(actual_rail_x, [10, 26, 42, 58]);
@@ -35985,7 +35992,10 @@ mod tests {
             "if row.ancestor-guide-3 : Rectangle {",
             "if row.has-children : Rectangle {",
         ] {
-            assert!(threads.contains(marker), "missing depth-cap contract: {marker}");
+            assert!(
+                threads.contains(marker),
+                "missing depth-cap contract: {marker}"
+            );
         }
     }
 
@@ -49287,7 +49297,10 @@ mod tests {
             "x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step - 4px;",
         );
         assert_diamond(
-            path_block("if !row.connected-to-parent && !row.has-children : Path {", 1),
+            path_block(
+                "if !row.connected-to-parent && !row.has-children : Path {",
+                1,
+            ),
             "x: parent.tree-base-x - 4px;",
         );
         assert_diamond(
@@ -49314,7 +49327,11 @@ mod tests {
         const ROW_HEIGHT: usize = 96;
         const CARD_HEIGHT: usize = 84;
         const CARD_TOP_BOTTOM_MARGIN: usize = 6;
-        assert_eq!(384 / ROW_HEIGHT, 4, "the viewport must contain four complete rows");
+        assert_eq!(
+            384 / ROW_HEIGHT,
+            4,
+            "the viewport must contain four complete rows"
+        );
         assert_eq!(
             ROW_HEIGHT,
             CARD_HEIGHT + 2 * CARD_TOP_BOTTOM_MARGIN,
@@ -49462,7 +49479,10 @@ mod tests {
             "width: parent.width - 96px;",
             "height: 84px;",
         ] {
-            assert!(card.contains(marker), "missing Windows card geometry: {marker}");
+            assert!(
+                card.contains(marker),
+                "missing Windows card geometry: {marker}"
+            );
         }
         assert!(card.contains("border-width: 1px;"));
         assert!(card.contains("border-radius: 8px;"));
@@ -49711,12 +49731,14 @@ mod tests {
             [("A", true), ("B", true), ("C", false), ("D", false)]
         );
 
-        let windows_view_model =
-            include_str!("../windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs");
+        let windows_view_model = include_str!(
+            "../windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs"
+        );
         assert!(windows_view_model.contains(
             "internal static string FormatCardBackground(bool isParent) => isParent ? \"#243E5A\" : \"#151F2D\";"
         ));
-        let windows = include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
+        let windows =
+            include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
         assert!(windows.contains("Background=\"{Binding CardBackgroundHex}\""));
         assert!(windows.contains("<Setter Property=\"BorderBrush\" Value=\"#2B425B\" />"));
 
@@ -49751,8 +49773,9 @@ mod tests {
             ("SOL", "#B79BFF"),
             ("OTHER", "#A8B7CA"),
         ];
-        let windows_view_model =
-            include_str!("../windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs");
+        let windows_view_model = include_str!(
+            "../windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs"
+        );
         for (model, color) in model_colors {
             if model == "OTHER" {
                 assert!(windows_view_model.contains(&format!("return \"{color}\";")));
@@ -49768,7 +49791,8 @@ mod tests {
             }
         }
 
-        let windows = include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
+        let windows =
+            include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
         assert!(windows.contains("<Style Selector=\"Border.model-accent\">"));
         assert!(windows.contains("<Setter Property=\"Width\" Value=\"2\" />"));
         assert!(windows.contains("<Setter Property=\"Height\" Value=\"12\" />"));
@@ -49802,10 +49826,7 @@ mod tests {
 
     #[test]
     fn issue_362_context_percentage_precision_matches_windows() {
-        let i18n = I18n::from_parts(
-            codex_info::i18n::Language::Japanese,
-            chrono_tz::Tz::UTC,
-        );
+        let i18n = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
         for (used, window, expected) in [
             (800, 16_000, "5%"),
             (400, 16_000, "2.5%"),

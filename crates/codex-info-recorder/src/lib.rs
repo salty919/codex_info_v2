@@ -4407,14 +4407,13 @@ fn scan_source(
         mut prefix_generation_value,
         mut prefix_sha256,
     ) = if let Some(checkpoint) = continuous {
-        let (checkpoint_context_usage_tokens, checkpoint_context_window_tokens) =
-            match (
-                checkpoint.context_usage_tokens,
-                checkpoint.context_window_tokens,
-            ) {
-                (Some(usage), Some(window)) => (Some(usage), Some(window)),
-                _ => (None, None),
-            };
+        let (checkpoint_context_usage_tokens, checkpoint_context_window_tokens) = match (
+            checkpoint.context_usage_tokens,
+            checkpoint.context_window_tokens,
+        ) {
+            (Some(usage), Some(window)) => (Some(usage), Some(window)),
+            _ => (None, None),
+        };
         (
             checkpoint.committed_offset,
             checkpoint.discard_until_lf,
@@ -6019,7 +6018,12 @@ impl SessionRecordSummary {
             && self.payload.info_object
             && self.payload.last_token_usage_seen
             && self.payload.last_token_usage_object)
-            .then(|| self.payload.last_token_usage.valid_snapshot().map(|value| value.total))
+            .then(|| {
+                self.payload
+                    .last_token_usage
+                    .valid_snapshot()
+                    .map(|value| value.total)
+            })
             .flatten()
     }
 
@@ -7107,8 +7111,8 @@ mod tests {
         let metadata = fs::metadata(&source).unwrap();
         let mut complete = first[0].clone();
         complete.committed_offset = metadata.len();
-        let direct = read_active_rollout(&root.join("sessions"), &source, &metadata, &complete)
-            .unwrap();
+        let direct =
+            read_active_rollout(&root.join("sessions"), &source, &metadata, &complete).unwrap();
         assert_eq!(direct.context_usage_tokens(), Some(400));
         assert_eq!(direct.context_window_tokens(), Some(16_000));
 
@@ -7212,9 +7216,7 @@ mod tests {
             .append(true)
             .open(&source)
             .unwrap()
-            .write_all(
-                format!("{partial_usage}{partial_window}{null_info}").as_bytes(),
-            )
+            .write_all(format!("{partial_usage}{partial_window}{null_info}").as_bytes())
             .unwrap();
 
         let mut recorder =

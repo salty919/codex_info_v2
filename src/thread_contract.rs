@@ -1233,13 +1233,7 @@ impl RolloutAccumulator {
         previous_total: u64,
         last_task_running: Option<bool>,
     ) -> Self {
-        Self::seeded_with_context(
-            last_model,
-            previous_total,
-            last_task_running,
-            None,
-            None,
-        )
+        Self::seeded_with_context(last_model, previous_total, last_task_running, None, None)
     }
 
     pub fn seeded_with_context(

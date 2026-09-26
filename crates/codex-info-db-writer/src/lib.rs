@@ -10120,10 +10120,8 @@ impl UsageStore {
                             .map_err(|_| rusqlite::Error::InvalidQuery)
                     })
                     .transpose()?;
-                let (context_usage_tokens, context_window_tokens) = canonical_context_pair(
-                    context_usage_tokens,
-                    context_window_tokens,
-                );
+                let (context_usage_tokens, context_window_tokens) =
+                    canonical_context_pair(context_usage_tokens, context_window_tokens);
                 Ok(SessionCheckpoint {
                     root_identity: row.get(0)?,
                     relative_path: row.get(1)?,
@@ -20573,10 +20571,16 @@ mod wave_b_correction_tests {
             )
             .unwrap();
         connection
-            .execute("ALTER TABLE session_checkpoints DROP COLUMN context_usage_tokens", [])
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN context_usage_tokens",
+                [],
+            )
             .unwrap();
         connection
-            .execute("ALTER TABLE session_checkpoints DROP COLUMN context_window_tokens", [])
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN context_window_tokens",
+                [],
+            )
             .unwrap();
         drop(connection);
 

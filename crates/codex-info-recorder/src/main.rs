@@ -134,9 +134,7 @@ where
             }
             Err(error) => {
                 *thread_health = LaneHealth::Failed;
-                eprintln!(
-                    "codex-info-recorder active-thread snapshot commit failed: {error}"
-                );
+                eprintln!("codex-info-recorder active-thread snapshot commit failed: {error}");
                 sync_acquisition_health(recorder, quota_health, *thread_health);
             }
         }
@@ -533,9 +531,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut wait_for = |duration: Duration| thread_poller.wait_for(duration);
         let mut sleep = |duration: Duration| std::thread::sleep(duration);
         let mut clock = || Instant::now();
-        let mut epoch_matches = |epoch: &AccountEpochProof| {
-            recorder_epoch_matches(&options, epoch)
-        };
+        let mut epoch_matches = |epoch: &AccountEpochProof| recorder_epoch_matches(&options, epoch);
         if !complete_cycle_publication_and_wait(
             publication,
             &options,
@@ -732,9 +728,9 @@ fn default_codex_home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use codex_info_db_writer::ActiveThreadRecord;
     use serde_json::Value;
-    use super::*;
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -979,9 +975,8 @@ mod tests {
         };
         let mut clock = || now.get();
         let mut epoch_values = epoch_values.into_iter();
-        let mut epoch_matches = move |_epoch: &AccountEpochProof| {
-            epoch_values.next().unwrap_or(true)
-        };
+        let mut epoch_matches =
+            move |_epoch: &AccountEpochProof| epoch_values.next().unwrap_or(true);
         let mut thread_health = LaneHealth::Unknown;
         complete_cycle_publication_and_wait(
             publication,
@@ -1045,7 +1040,8 @@ mod tests {
                 "degraded",
             ),
         ];
-        for (name, publication, quota_health, has_pending, acquisition_degraded, expected) in cases {
+        for (name, publication, quota_health, has_pending, acquisition_degraded, expected) in cases
+        {
             let mut fixture = issue_362_fixture(name);
             fixture.seed_state(has_pending, acquisition_degraded);
             let anchor = Instant::now();
@@ -1111,7 +1107,14 @@ mod tests {
         assert_eq!(before_sleep, anchor + Duration::from_secs(1));
         assert_eq!(sleep_state["write_state"], "ready");
         assert_eq!(sleep_state["data_generation"], 2);
-        assert_eq!(fixture.recorder.state().expect("committed state").data_generation, 2);
+        assert_eq!(
+            fixture
+                .recorder
+                .state()
+                .expect("committed state")
+                .data_generation,
+            2
+        );
         assert_eq!(fixture.state_value()["write_state"], "ready");
         assert_eq!(now.get(), anchor + Duration::from_secs(60));
         assert_eq!(
@@ -1138,10 +1141,7 @@ mod tests {
         let first_wait_result = fixture.poll_result("async", 2);
 
         collection_calls += 1;
-        fixture
-            .recorder
-            .run_cycle()
-            .expect("first collection");
+        fixture.recorder.run_cycle().expect("first collection");
         assert!(issue_362_drive_cycle(
             &mut fixture,
             CyclePublication::NoCommit,
@@ -1158,10 +1158,7 @@ mod tests {
         .expect("first shared cycle path"));
 
         collection_calls += 1;
-        fixture
-            .recorder
-            .run_cycle()
-            .expect("second collection");
+        fixture.recorder.run_cycle().expect("second collection");
         assert!(issue_362_drive_cycle(
             &mut fixture,
             CyclePublication::NoCommit,
@@ -1210,7 +1207,14 @@ mod tests {
             &mut wait_calls,
         )
         .expect_err("changed epoch before commit");
-        assert_eq!(before_commit.recorder.state().expect("prior state").data_generation, 1);
+        assert_eq!(
+            before_commit
+                .recorder
+                .state()
+                .expect("prior state")
+                .data_generation,
+            1
+        );
         assert_eq!(before_commit.state_bytes(), before_state);
         assert!(matches!(
             error.downcast_ref::<RecorderError>(),
@@ -1241,7 +1245,14 @@ mod tests {
             &mut wait_calls,
         )
         .expect_err("changed epoch before acknowledgement");
-        assert_eq!(after_commit.recorder.state().expect("committed DB state").data_generation, 2);
+        assert_eq!(
+            after_commit
+                .recorder
+                .state()
+                .expect("committed DB state")
+                .data_generation,
+            2
+        );
         assert_eq!(after_commit.state_bytes(), before_state);
         assert!(matches!(
             error.downcast_ref::<RecorderError>(),
