@@ -33895,10 +33895,10 @@ mod tests {
         );
         assert_eq!(
             rows[0].context_usage.as_str(),
-            "87.1%\n225,000 / 258,400トークン"
+            "87.07%\n225,000 / 258,400トークン"
         );
         assert_eq!(rows[1].relation.as_str(), "サブ");
-        assert_eq!(rows[1].context_usage.as_str(), "");
+        assert_eq!(rows[1].context_usage.as_str(), "未観測");
         assert_eq!(rows[1].tree_depth, 1);
         assert!(rows[1].connected_to_parent);
         assert!(!rows[1].has_next_sibling);
