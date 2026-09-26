@@ -732,9 +732,7 @@ mod tests {
     use codex_info_db_writer::ActiveThreadRecord;
     use serde_json::Value;
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static ISSUE_362_FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn version_is_the_recorder_package_version() {
@@ -777,12 +775,12 @@ mod tests {
     }
 
     struct Issue362AsyncFixture {
-        root: PathBuf,
         options: Options,
         epoch: AccountEpochProof,
         recorder: Recorder,
         state_writer: RecorderStateWriter,
         _lease: ProfileLease,
+        _temp_dir: tempfile::TempDir,
     }
 
     impl Issue362AsyncFixture {
@@ -818,19 +816,27 @@ mod tests {
         }
 
         fn cleanup(self) {
-            let root = self.root.clone();
-            drop(self);
-            let _ = fs::remove_dir_all(root);
+            let Self {
+                recorder,
+                state_writer,
+                _lease,
+                _temp_dir,
+                ..
+            } = self;
+            drop(recorder);
+            drop(state_writer);
+            drop(_lease);
+            _temp_dir.close().expect("Issue 362 fixture cleanup");
         }
     }
 
     fn issue_362_fixture(name: &str) -> Issue362AsyncFixture {
-        let sequence = ISSUE_362_FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "codex-info-recorder-{name}-{}-{sequence}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let temp_dir = tempfile::Builder::new()
+            .prefix(&format!("codex-info-recorder-{name}-"))
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("Issue 362 fixture directory");
+        let root = temp_dir.path();
         let codex_home = root.join("codex-home");
         let sessions_root = root.join("sessions");
         let data_root = root.join("data");
@@ -904,12 +910,12 @@ mod tests {
         let state_writer =
             RecorderStateWriter::new(&data_root, &identity, &lease).expect("state writer");
         Issue362AsyncFixture {
-            root,
             options,
             epoch,
             recorder,
             state_writer,
             _lease: lease,
+            _temp_dir: temp_dir,
         }
     }
 
@@ -1078,6 +1084,9 @@ mod tests {
     #[test]
     fn issue_362_async_result_commits_before_next_scheduled_cycle() {
         let mut fixture = issue_362_fixture("commit-before-next-cycle");
+        let root_metadata = fs::symlink_metadata(fixture._temp_dir.path())
+            .expect("Issue 362 fixture root metadata");
+        assert_eq!(root_metadata.permissions().mode() & 0o777, 0o700);
         fixture.seed_state(false, false);
         let anchor = Instant::now();
         let now = Cell::new(anchor);
