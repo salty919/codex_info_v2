@@ -7,6 +7,8 @@ ACCOUNT-LIFECYCLE-134
 LIVE-RESET-129
 CURRENT-PERIOD-BOUNDS-129
 REST-172
+THREAD-TITLE-362
+THREAD-CONTEXT-362
 CUM-138-04
 G137-GRAPH-01
 WIN-PARITY-DATA
@@ -102,9 +104,15 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - repositoryの`run.sh`はarchive内の`run.sh`とbyte-identicalなruntime launcherであり、installed launcherへ委譲するだけとする。Cargo build、`target/`、source tree、別binaryへのfallbackを行わない。
 - CLIヘルプを含む利用者向け固定メッセージは、画面本体と同じ対応localeのi18nカタログから導出する。起動スクリプトへ単一言語の製品文言を複製しない。
 
+### 2.1 実行中Thread詳細の共通契約（Issue #362）
+
+- Linux/WindowsのThreads詳細のgeometry、tree、色、lane配置はUX ownerの`X-THREAD-01`へ委譲する。両platformは同じWindows masterの表示契約を使用し、製品要件ではgeometryを再定義しない。
+- `THREAD-TITLE-362`: `thread/read`で取得する上流保存名を表示する。生成元がtask_nameを外部の`thread/name/set`で保存している場合はその保存値をそのまま使い、空または未設定なら`未設定`を表示する。汎用状態名、preview値、agent_path、nickname、body、その他の推測値を表示名へ使わない。この製品はobserverであり、外部のsetter mutationを呼ばず、保存済み名称の取得と表示だけを行う。
+- `THREAD-CONTEXT-362`: 同じthreadで観測したusage/window pairだけを表示する。usage=0かつ正のwindowは0%として表示し、pair欠落、windowが0以下、旧checkpointのNULLは`未観測`とする。NULLを0へ変換せず、累積値や別sourceからcontextを合成しない。保存・再起動・appendの境界はDATA ownerの`SESSION-129`/`DB-129`に従う。
+
 ## 3. 収集・API・live判定
 
-- `REST-172`: 同一profileのresident serviceをquota、local usage、historyの唯一のauthority/writerとする。service内のrecorderとREST publisherは同じ有効owner、lease、epoch、cycleに従い、旧世代の結果を公開しない。1秒周期のrecorder死亡監視は常時維持する一方、REST snapshotの検証・互換JSON生成・published pair更新は、公開domain stateが実際に変化したworker event、recorder試行結果、または60秒周期の鮮度確認があるcycleだけで行う。不変な1秒tickおよび同じcanonical Thread結果ではDB、Session、履歴走査、JSON再生成を行わず、前回のimmutable snapshotを再利用する。記録周期を延長してCPU使用量を下げたことにしてはならない。
+- `REST-172`: 同一profileのresident serviceをquota、local usage、historyの唯一のauthority/writerとする。service内のrecorderとREST publisherは同じ有効owner、lease、epoch、cycleに従い、旧世代の結果を公開しない。recorder死亡監視は既存周期を維持し、REST snapshotの検証・互換JSON生成・published pair更新は、公開domain stateが実際に変化したworker event、recorder試行結果、または60秒周期の鮮度確認があるcycleだけで行う。不変なtickおよび同じcanonical Thread結果ではDB、Session、履歴走査、JSON再生成を行わず、前回のimmutable snapshotを再利用する。wait要求は既存probeの完了を待ち、次の60秒周期前に同一epochのvalid resultだけをcommitする。ackは既存のpublication policyに従い、quota-not-readyをready扱いせず、has_pendingとDegradedを保持する。NoCommitではackせず、epoch不一致ではcommitもackもしない。wait中に新しい完全candidateを得られない場合は、wait結果を現在の公開state・published pairのまま返す。collection、session scan、probe/RPCの固定周期回数を増やさず、未計測の1秒保証を表明しない。
 - coreの性能契約は入力規模に対する処理量で定義する。不変owner tickは`O(1)`かつDB/Session/history/JSON処理0、同じthread結果はactive thread数との比較だけ、currentはcurrent model数、periodsはperiod数、history初回は選択期間のsample×model数、deltaはcursor後のsample×model数、threadsはactive thread数にだけ比例させる。DB machine、CPU、storage、同時負荷および通常payload bytesは利用者ごとに変わるため、未定義の最低動作環境へ根拠のない固定時間・固定件数を課さない。P90/P95は環境と入力規模を併記した退行観測に用い、正常データの拒否条件にしない。固定するのはschema、整合性、保持・取得範囲、failure isolation、OOM/DoS安全境界であり、低性能環境で処理が遅れても記録を捨てたり、UI取得失敗をrecorder停止へ波及させたりしない。
 - DBは履歴inventoryであり、実行中判定の単独根拠にしない。同一cycleで検証したprocess identityとrollout terminal stateの両方を用いる。
 - live rolloutではtask lifecycle、model、token stateを決めるrecordをstrict検証し、不正ならcycleを拒否して最後の完全snapshotを保持する。途中終了した`response_item`等の表示内容recordは状態値へ使わず隔離し、後続の完全な状態recordまで失敗させない。

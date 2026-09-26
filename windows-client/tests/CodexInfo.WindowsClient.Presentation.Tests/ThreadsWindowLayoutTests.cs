@@ -73,6 +73,7 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal("*,180,208", row.Attribute("ColumnDefinitions")?.Value);
         Assert.Equal("0", row.Attribute("Margin")?.Value);
         Assert.Equal(expectedColumnGap.ToString(), row.Attribute("ColumnSpacing")?.Value);
+        Assert.Equal("{Binding CardBackgroundHex}", card.Attribute("Background")?.Value);
         var treeControl = Assert.Single(document.Descendants(
             XName.Get("ThreadTreeControl", "using:CodexInfo.WindowsClient.Controls")));
         Assert.Equal(expectedListWidth.ToString(), treeControl.Attribute("Width")?.Value);
@@ -83,6 +84,7 @@ public sealed class ThreadsWindowLayoutTests
         var title = BoundText(row, "{Binding Title}");
         Assert.Equal("0", title.Attribute("Grid.Column")?.Value);
         Assert.Null(title.Attribute("Grid.Row"));
+        Assert.Equal("Top", title.Attribute("VerticalAlignment")?.Value);
         Assert.Equal("Wrap", title.Attribute("TextWrapping")?.Value);
         Assert.Equal("2", title.Attribute("MaxLines")?.Value);
         Assert.Null(title.Attribute("TextTrimming"));
@@ -103,10 +105,15 @@ public sealed class ThreadsWindowLayoutTests
         var modelAccent = Assert.Single(row.Descendants(Avalonia + "Border"),
             element => element.Attribute("Classes")?.Value == "model-accent");
         Assert.Equal("{Binding ModelAccentHex}", modelAccent.Attribute("Background")?.Value);
+        Assert.Equal("Top", StyleSetter(
+            Assert.Single(document.Descendants(Avalonia + "Style"),
+                element => element.Attribute("Selector")?.Value == "Border.model-accent"),
+            "VerticalAlignment"));
         var context = BoundText(row, "{Binding ContextUsageText}");
         Assert.Equal("1", model.Parent?.Attribute("Grid.Column")?.Value);
         Assert.Same(model.Parent, context.Parent);
-        Assert.Equal("{Binding HasContextUsage}", context.Attribute("IsVisible")?.Value);
+        Assert.Equal("Top", model.Parent?.Attribute("VerticalAlignment")?.Value);
+        Assert.Null(context.Attribute("IsVisible"));
         Assert.Equal("Wrap", context.Attribute("TextWrapping")?.Value);
         Assert.Equal("2", context.Attribute("MaxLines")?.Value);
         Assert.Null(context.Attribute("TextTrimming"));
@@ -114,6 +121,7 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal("{Binding ContextUsageText}", context.Attribute("ToolTip.Tip")?.Value);
         var elapsed = BoundText(row, "{Binding ElapsedMinutesText}");
         Assert.Equal("2", elapsed.Parent?.Attribute("Grid.Column")?.Value);
+        Assert.Equal("Top", elapsed.Parent?.Attribute("VerticalAlignment")?.Value);
         Assert.Equal("{Binding HasElapsedMinutes}", elapsed.Attribute("IsVisible")?.Value);
         Assert.Equal("{Binding HasInstructionMinutes}",
             BoundText(row, "{Binding InstructionMinutesText}").Attribute("IsVisible")?.Value);
@@ -131,51 +139,142 @@ public sealed class ThreadsWindowLayoutTests
             forbiddenBindings.Contains(element.Attribute("Text")?.Value, StringComparer.Ordinal));
 
         var now = 2_000_000L;
-        var child = new ApiThreadDetails(
-            "child",
-            "A complete title that remains available to UI Automation",
-            "parent",
-            "gpt-luna",
-            "LUNA",
-            600,
-            50,
-            200,
-            now - (125 * 60),
-            now - (7 * 60),
-            true,
-            2,
-            false);
+        var fixture = new[]
+        {
+            new ApiThreadDetails("a", "task-A", null, "gpt-terra", "TERRA", 2400, 800, 16000,
+                now - (60 * 60), now - (5 * 60), false, 0, false),
+            new ApiThreadDetails("b", "task-B", "a", "gpt-luna", "LUNA", 1200, 400, 16000,
+                now - (40 * 60), now - (7 * 60), true, 1, false),
+            new ApiThreadDetails("c", "task-C", "b", "gpt-luna", "LUNA", 600, 0, 16000,
+                now - (20 * 60), now - (9 * 60), true, 2, false),
+            new ApiThreadDetails("d", "task-D", null, "gpt-sol", "SOL", null, null, null,
+                now - (10 * 60), null, false, 0, false),
+        };
         var texts = LocalizationService.Current;
-        var roleText = InvokeFormatter("FormatRoleStatus", texts, child);
-        Assert.Contains(texts.SubThread, roleText, StringComparison.Ordinal);
-        Assert.Contains(ActiveLabel(texts), roleText, StringComparison.Ordinal);
-        Assert.DoesNotContain("D2", roleText, StringComparison.Ordinal);
+        var parentIds = InvokeParentIds(fixture);
+        Assert.Equal(new[] { "a", "b" }, parentIds.OrderBy(value => value, StringComparer.Ordinal));
+        Assert.Equal("task-A", InvokeFormatter("FormatThreadTitle", texts, fixture[0]));
+        Assert.Equal("未設定", InvokeFormatter("FormatThreadTitle", texts, fixture[3] with { Title = "" }));
 
-        var contextText = InvokeFormatter("FormatContextUsage", texts, child);
+        var contextText = InvokeFormatter("FormatContextUsage", texts, fixture[1]);
         var contextLines = contextText.Split('\n');
         Assert.Equal(2, contextLines.Length);
         Assert.Contains(texts.Context, contextLines[0], StringComparison.Ordinal);
-        Assert.Contains("25", contextLines[0], StringComparison.Ordinal);
+        Assert.Contains("2.5", contextLines[0], StringComparison.Ordinal);
         Assert.Contains("%", contextLines[0], StringComparison.Ordinal);
-        Assert.Contains("50", contextLines[1], StringComparison.Ordinal);
-        Assert.Contains("200", contextLines[1], StringComparison.Ordinal);
+        Assert.Contains("400", contextLines[1], StringComparison.Ordinal);
+        Assert.Contains("16,000", contextLines[1], StringComparison.Ordinal);
         Assert.Contains(texts.Tokens, contextLines[1], StringComparison.Ordinal);
 
-        var elapsedText = InvokeFormatter("FormatMinuteAge", texts, child.CreatedAt, texts.Elapsed, now);
-        var instruction = InvokeFormatter("FormatMinuteAge", texts, child.LastUserMessageAt, texts.Instruction, now);
-        Assert.Contains("125", elapsedText, StringComparison.Ordinal);
+        Assert.Contains("5", InvokeFormatter("FormatContextUsage", texts, fixture[0]), StringComparison.Ordinal);
+        Assert.Contains("0", InvokeFormatter("FormatContextUsage", texts, fixture[2]), StringComparison.Ordinal);
+        Assert.Contains("未観測", InvokeFormatter("FormatContextUsage", texts, fixture[3]), StringComparison.Ordinal);
+
+        var elapsedText = InvokeFormatter("FormatMinuteAge", texts, fixture[1].CreatedAt, texts.Elapsed, now);
+        var instruction = InvokeFormatter("FormatMinuteAge", texts, fixture[1].LastUserMessageAt, texts.Instruction, now);
+        Assert.Contains("40", elapsedText, StringComparison.Ordinal);
         Assert.Contains("7", instruction, StringComparison.Ordinal);
         Assert.Equal(string.Empty, InvokeFormatter("FormatMinuteAge", texts, null, texts.Instruction, now));
 
-        var missing = child with
+        Assert.NotEqual(
+            InvokeFormatter("FormatCardBackground", false),
+            InvokeFormatter("FormatCardBackground", true));
+        Assert.Equal(string.Empty, InvokeFormatter("FormatDisplayToken", texts, fixture[3]));
+    }
+
+    [Fact]
+    public async Task ThreadTreeMarksOnlyNestedAcceptedParentsWithParentCardColor()
+    {
+        var now = 2_000_000L;
+        var fixture = new[]
         {
-            CumulativeTokens = null,
-            ContextTokens = null,
-            ContextLimit = null,
-            LastUserMessageAt = null,
+            new ApiThreadDetails("a", "task-A", null, "TERRA", "TERRA", null, 800, 16000,
+                now - 3600, now - 300, false, 0, false),
+            new ApiThreadDetails("b", "task-B", "a", "LUNA", "LUNA", null, 400, 16000,
+                now - 2400, now - 420, true, 1, false),
+            new ApiThreadDetails("c", "task-C", "b", "LUNA", "LUNA", null, 0, 16000,
+                now - 1800, now - 540, true, 2, false),
+            new ApiThreadDetails("d", "task-D", null, "SOL", "SOL", null, null, null,
+                now - 1200, null, false, 0, false),
         };
-        Assert.Equal(string.Empty, InvokeFormatter("FormatContextUsage", texts, missing));
-        Assert.Equal(string.Empty, InvokeFormatter("FormatDisplayToken", texts, missing));
+        var details = new ApiDetailsSnapshot(
+            ApiState.Ready,
+            now,
+            true,
+            "Pro",
+            null,
+            [],
+            4,
+            [],
+            [],
+            fixture,
+            "未取得")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
+        using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)));
+        main.Start();
+        await WaitUntilAsync(() => main.HasDetails);
+
+        using var viewModel = new ThreadsWindowViewModel(main, action => action());
+        Assert.Collection(
+            viewModel.Threads,
+            item =>
+            {
+                Assert.Equal("a", item.Id);
+                Assert.True(item.IsParent);
+                Assert.Equal("#243E5A", item.CardBackgroundHex);
+            },
+            item =>
+            {
+                Assert.Equal("b", item.Id);
+                Assert.True(item.IsParent);
+                Assert.Equal("#243E5A", item.CardBackgroundHex);
+            },
+            item =>
+            {
+                Assert.Equal("c", item.Id);
+                Assert.False(item.IsParent);
+                Assert.Equal("#151F2D", item.CardBackgroundHex);
+            },
+            item =>
+            {
+                Assert.Equal("d", item.Id);
+                Assert.False(item.IsParent);
+                Assert.Equal("#151F2D", item.CardBackgroundHex);
+            });
+    }
+
+    [Theory]
+    [InlineData(800UL, 16000UL, "5%")]
+    [InlineData(400UL, 16000UL, "2.5%")]
+    [InlineData(2900UL, 16000UL, "18.13%")]
+    [InlineData(1UL, 3UL, "33.33%")]
+    [InlineData(0UL, 16000UL, "0%")]
+    [InlineData(16001UL, 16000UL, "100%")]
+    public void ThreadContextFormatterUsesExactRoundedRateOracle(
+        ulong used,
+        ulong limit,
+        string expectedPercent)
+    {
+        var texts = LocalizationService.Current;
+        var thread = new ApiThreadDetails(
+            "context",
+            "task-context",
+            null,
+            "SOL",
+            "SOL",
+            null,
+            used,
+            limit,
+            null,
+            null,
+            false,
+            0,
+            false);
+        var expected = $"{texts.Context} {expectedPercent}\n{used:N0} / {limit:N0} {texts.Tokens}";
+
+        Assert.Equal(expected, InvokeFormatter("FormatContextUsage", texts, thread));
     }
 
     [Fact]
@@ -320,17 +419,35 @@ public sealed class ThreadsWindowLayoutTests
             .Split("export component ModelUsage inherits Rectangle {")[0];
         foreach (var marker in new[]
         {
-            "property <length> tree-gutter-width: 64px;",
-            "property <length> tree-base-x: 8px;",
-            "property <length> tree-depth-step: 12px;",
+            "property <length> tree-gutter-width: 80px;",
+            "property <length> tree-base-x: 10px;",
+            "property <length> tree-depth-step: 16px;",
             "property <length> tree-junction-y: 48px;",
-            "property <length> tree-junction-end-x: self.tree-gutter-width - 5px;",
+            "property <length> tree-junction-end-x: self.tree-gutter-width;",
             "width: parent.tree-junction-end-x - self.x;",
-            "x: parent.tree-junction-end-x - 3px;",
-            "width: 6px;",
         })
         {
             Assert.Contains(marker, linuxThreads, StringComparison.Ordinal);
+        }
+
+        const string connectedPathStartMarker = "if row.connected-to-parent : Path {";
+        var connectedPathStart = linuxThreads.IndexOf(
+            connectedPathStartMarker,
+            StringComparison.Ordinal);
+        Assert.True(connectedPathStart >= 0, "missing connected-to-parent path block");
+        var connectedPathEnd = linuxThreads.IndexOf('}', connectedPathStart);
+        Assert.True(connectedPathEnd >= 0, "unterminated connected-to-parent path block");
+        var connectedPath = linuxThreads[connectedPathStart..connectedPathEnd];
+        foreach (var marker in new[]
+        {
+            "x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step - 4px;",
+            "y: parent.tree-junction-y - 4px;",
+            "width: 8px;",
+            "height: 8px;",
+            "commands: \"M 4 0 L 8 4 L 4 8 L 0 4 Z\";",
+        })
+        {
+            Assert.Contains(marker, connectedPath, StringComparison.Ordinal);
         }
     }
 
@@ -351,19 +468,31 @@ public sealed class ThreadsWindowLayoutTests
         return Assert.IsType<string>(formatter!.Invoke(null, arguments));
     }
 
-    private static string ActiveLabel(UiText texts) => texts.LanguageCode switch
+    private static IReadOnlySet<string> InvokeParentIds(IReadOnlyList<ApiThreadDetails> threads)
     {
-        "ja" => "実行中",
-        "zh-Hans" => "活跃",
-        "ko" => "활성",
-        "es" => "Activo",
-        "fr" => "Actif",
-        "de" => "Aktiv",
-        "pt" => "Ativo",
-        "it" => "Attivo",
-        "ru" => "Активен",
-        _ => "Active",
-    };
+        var formatter = typeof(ThreadsWindowViewModel).GetMethod(
+            "AcceptedParentIds",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(formatter);
+        return Assert.IsAssignableFrom<IReadOnlySet<string>>(formatter!.Invoke(null, [threads]));
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        for (var attempt = 0; attempt < 200 && !condition(); attempt++)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.True(condition());
+    }
+
+    private sealed class StaticCombinedClient(DetailsFetchResult result) : HealthyDetailsClientBase
+    {
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(result);
+    }
 
     private static string LoadRepositoryFile(params string[] segments)
     {

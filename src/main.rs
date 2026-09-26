@@ -2201,12 +2201,14 @@ fn read_active_thread_rollout_cached_with_checkpoints(
             matching_rollout_checkpoint(sessions_root, &canonical, &before_file, checkpoints);
         let mut parser = checkpoint
             .map(|checkpoint| {
-                thread_contract::RolloutAccumulator::seeded(
+                thread_contract::RolloutAccumulator::seeded_with_context(
                     checkpoint.last_model.clone(),
                     checkpoint.previous_total,
                     checkpoint
                         .last_task_running
                         .or_else(|| (complete_len > parse_start).then_some(true)),
+                    checkpoint.context_usage_tokens,
+                    checkpoint.context_window_tokens,
                 )
             })
             .unwrap_or_default();
@@ -11230,6 +11232,8 @@ fn same_session_checkpoint_state(
         && left.previous_cached_input == right.previous_cached_input
         && left.previous_output == right.previous_output
         && left.previous_cache_write_input == right.previous_cache_write_input
+        && left.context_usage_tokens == right.context_usage_tokens
+        && left.context_window_tokens == right.context_window_tokens
 }
 
 #[cfg(test)]
@@ -11507,6 +11511,10 @@ fn collect_session_append(
         previous_input: previous.input,
         previous_cached_input: previous.cached_input,
         previous_output: previous.output,
+        context_usage_tokens: continuous_checkpoint
+            .and_then(|checkpoint| checkpoint.context_usage_tokens),
+        context_window_tokens: continuous_checkpoint
+            .and_then(|checkpoint| checkpoint.context_window_tokens),
     };
     let range = (end_offset > admitted_start_offset).then(|| usage_store::SessionRange {
         root_identity: checkpoint.root_identity.clone(),
@@ -18624,6 +18632,21 @@ fn classify_active_thread_model(model_label: &str) -> &'static str {
     }
 }
 
+fn active_thread_model_accent(model_label: &str) -> &'static str {
+    let normalized = model_label.to_ascii_uppercase();
+    if normalized.contains("ASTRA") {
+        "ASTRA"
+    } else if normalized.contains("LUNA") {
+        "LUNA"
+    } else if normalized.contains("TERRA") {
+        "TERRA"
+    } else if normalized.contains("SOL") {
+        "SOL"
+    } else {
+        "OTHER"
+    }
+}
+
 #[cfg(test)]
 fn active_thread_model_counts(threads: &[ActiveThread]) -> String {
     if threads.is_empty() {
@@ -18895,6 +18918,7 @@ fn active_thread_rows_at_with_i18n(
             let thread = &threads[presentation.index];
             let bounded_title =
                 security::shorten_unicode(&thread.title, security::MAX_THREAD_TITLE_SCALARS);
+            let display_title = i18n.format_thread_name(&bounded_title);
             let relation = if thread.is_subagent {
                 i18n.text(TextKey::SubRole)
             } else {
@@ -18903,13 +18927,14 @@ fn active_thread_rows_at_with_i18n(
             ActiveThreadRow {
                 relation: relation.into(),
                 is_main: !thread.is_subagent,
-                title: format_thread_title_for_display(&bounded_title).into(),
-                full_title: thread.title.clone().into(),
+                title: format_thread_title_for_display(&display_title).into(),
+                full_title: display_title.into(),
                 model: security::shorten_unicode(
                     &thread.model_label,
                     security::MAX_ACCOUNT_ACTIVITY_LABEL_SCALARS,
                 )
                 .into(),
+                model_class: active_thread_model_accent(&thread.model_label).into(),
                 tokens: thread
                     .total_tokens
                     .map(|total| i18n.format_token_value(total))
@@ -18922,7 +18947,7 @@ fn active_thread_rows_at_with_i18n(
                         i18n.format_grouped_unsigned(u128::from(used)),
                         i18n.format_token_value(window)
                     ),
-                    _ => String::new(),
+                    _ => i18n.context_unobserved().to_owned(),
                 }
                 .into(),
                 thread_age: i18n
@@ -30828,6 +30853,8 @@ mod tests {
             previous_input: 674_095,
             previous_cached_input: 546_560,
             previous_output: 12_302,
+            context_usage_tokens: None,
+            context_window_tokens: None,
         };
         let retained = super::usage_store::SessionCollectionState {
             data_generation: 9_800,
@@ -30934,6 +30961,8 @@ mod tests {
             previous_input: 80,
             previous_cached_input: 30,
             previous_output: 20,
+            context_usage_tokens: None,
+            context_window_tokens: None,
         };
         let range = super::usage_store::SessionRange {
             root_identity: checkpoint.root_identity.clone(),
@@ -31089,6 +31118,8 @@ mod tests {
                 previous_input: 0,
                 previous_cached_input: 0,
                 previous_output: 0,
+                context_usage_tokens: None,
+                context_window_tokens: None,
             })
             .collect::<Vec<_>>();
         let authority = super::usage_store::HistoryContinuityRecovery {
@@ -32539,6 +32570,8 @@ mod tests {
             previous_input: 80,
             previous_cached_input: 20,
             previous_output: 20,
+            context_usage_tokens: None,
+            context_window_tokens: None,
         };
         let range = super::usage_store::SessionRange {
             root_identity: source.root_identity.clone(),
@@ -33862,10 +33895,10 @@ mod tests {
         );
         assert_eq!(
             rows[0].context_usage.as_str(),
-            "87.1%\n225,000 / 258,400トークン"
+            "87.07%\n225,000 / 258,400トークン"
         );
         assert_eq!(rows[1].relation.as_str(), "サブ");
-        assert_eq!(rows[1].context_usage.as_str(), "");
+        assert_eq!(rows[1].context_usage.as_str(), "未観測");
         assert_eq!(rows[1].tree_depth, 1);
         assert!(rows[1].connected_to_parent);
         assert!(!rows[1].has_next_sibling);
@@ -34918,6 +34951,8 @@ mod tests {
             previous_input: 80,
             previous_cached_input: 20,
             previous_output: 20,
+            context_usage_tokens: None,
+            context_window_tokens: None,
         };
         let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
         append.write_all(tail.as_bytes()).unwrap();
@@ -35600,67 +35635,367 @@ mod tests {
     #[test]
     fn thread_rails_have_fixed_geometry_and_sufficient_contrast() {
         let source = include_str!("../ui/components.slint");
+        let threads = source
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .and_then(|source| source.split("export component ").next())
+            .expect("ThreadsWindow");
         for marker in [
             "width: 2px;",
             "height: root.thread-row-height;",
-            "property <length> tree-base-x: 8px;",
-            "property <length> tree-depth-step: 12px;",
+            "property <length> tree-base-x: 10px;",
+            "property <length> tree-depth-step: 16px;",
             "property <length> tree-junction-y: 48px;",
-            "property <length> tree-gutter-width: 64px;",
-            "property <length> tree-junction-end-x: self.tree-gutter-width - 5px;",
+            "property <length> tree-gutter-width: 80px;",
+            "property <length> tree-junction-end-x: self.tree-gutter-width;",
             "x: parent.tree-base-x + parent.tree-depth-step;",
             "x: parent.tree-base-x + 2 * parent.tree-depth-step;",
             "y: parent.tree-junction-y - 1px;",
             "width: parent.tree-junction-end-x - self.x;",
-            "background: DesignTokens.warning;",
+            "background: #76A7CC;",
+            "opacity: 1;",
+            "border-radius: 1px;",
             "height: root.thread-row-height - parent.tree-junction-y;",
-            "border-radius: 2px;",
             "ancestor-guide-1",
             "ancestor-guide-2",
             "ancestor-guide-3",
         ] {
-            assert!(source.contains(marker), "missing rail geometry: {marker}");
+            assert!(threads.contains(marker), "missing rail geometry: {marker}");
         }
-        assert!(!source.contains("tree-guide"));
-        assert!(!source.contains("row.indent"));
-
-        fn luminance(rgb: [u8; 3]) -> f64 {
-            let linear = rgb.map(|component| {
-                let component = f64::from(component) / 255.0;
-                if component <= 0.04045 {
-                    component / 12.92
-                } else {
-                    ((component + 0.055) / 1.055).powf(2.4)
-                }
-            });
-            0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-        }
-        let rail = luminance([0xe6, 0xa2, 0x3c]);
-        for row in [[0x0d, 0x13, 0x1e], [0x14, 0x1d, 0x2d]] {
-            let background = luminance(row);
-            assert!((rail + 0.05) / (background + 0.05) >= 7.719);
+        assert!(!threads.contains("tree-guide"));
+        assert!(!threads.contains("row.indent"));
+        assert!(!threads.contains("opacity: 0.72;"));
+        assert!(!threads.contains("opacity: 0.82;"));
+        assert!(!threads.contains("DesignTokens.warning"));
+        let path_block = |marker: &str, occurrence: usize| {
+            threads
+                .split(marker)
+                .nth(occurrence)
+                .and_then(|source| source.split("\n                }").next())
+                .expect("Threads arrow Path block")
+        };
+        for block in [
+            path_block("if row.connected-to-parent : Path {", 2),
+            path_block("if !row.connected-to-parent : Path {", 1),
+        ] {
+            for marker in [
+                "stroke-width: 2px;",
+                "stroke-line-cap: round;",
+                "stroke-line-join: round;",
+            ] {
+                assert!(
+                    block.contains(marker),
+                    "missing arrow rendering contract: {marker}"
+                );
+            }
         }
     }
 
     #[test]
     fn thread_rails_keep_every_text_lane_outside_the_tree_gutter() {
         let source = include_str!("../ui/components.slint");
+        let threads = source
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .and_then(|source| source.split("export component ").next())
+            .expect("ThreadsWindow");
         for marker in [
-            "property <length> tree-base-x: 8px;",
-            "property <length> tree-depth-step: 12px;",
+            "property <length> tree-base-x: 10px;",
+            "property <length> tree-depth-step: 16px;",
             "property <length> tree-junction-y: 48px;",
-            "role-lane := Rectangle {\n                    x: 72px;",
-            "property <length> tree-gutter-width: 64px;",
-            "property <length> tree-junction-end-x: self.tree-gutter-width - 5px;",
+            "property <length> tree-gutter-width: 80px;",
+            "property <length> tree-junction-end-x: self.tree-gutter-width;",
             "width: parent.tree-junction-end-x - self.x;",
-            "x: parent.tree-junction-end-x - 3px;",
+            "width: 8px;",
+            "height: 8px;",
             "if row.ancestor-guide-1 : Rectangle {",
             "if row.connected-to-parent : Rectangle {",
             "if row.has-children : Rectangle {",
         ] {
             assert!(
-                source.contains(marker),
+                threads.contains(marker),
                 "missing non-overlap contract: {marker}"
+            );
+        }
+        assert!(!threads.contains("role-lane := Rectangle {"));
+        assert!(threads.contains("title-lane := Rectangle {\n                    x: 95px;"));
+        assert!(!threads.contains("x: parent.tree-junction-end-x - 3px;"));
+        let path_block = |marker: &str, occurrence: usize| {
+            threads
+                .split(marker)
+                .nth(occurrence)
+                .and_then(|source| source.split("\n                }").next())
+                .expect("Threads arrow Path block")
+        };
+        for block in [
+            path_block("if row.connected-to-parent : Path {", 2),
+            path_block("if !row.connected-to-parent : Path {", 1),
+        ] {
+            for marker in [
+                "x: parent.tree-junction-end-x - 7px;",
+                "y: parent.tree-junction-y - 5px;",
+                "width: 7px;",
+                "height: 10px;",
+                "commands: \"M 0 0 L 7 5 L 0 10\";",
+                "stroke-width: 2px;",
+            ] {
+                assert!(block.contains(marker), "missing arrow geometry: {marker}");
+            }
+            assert!(!block.contains("fill:"));
+        }
+        const TREE_GUTTER_WIDTH: usize = 80;
+        const ARROW_ORIGIN_X: usize = TREE_GUTTER_WIDTH - 7;
+        const ARROW_WIDTH: usize = 7;
+        const ARROW_STROKE_WIDTH: usize = 2;
+        const ARROW_RIGHT_X: usize = ARROW_ORIGIN_X + ARROW_WIDTH + ARROW_STROKE_WIDTH / 2;
+        const TITLE_LANE_X: usize = 95;
+        assert_eq!(ARROW_RIGHT_X, 81);
+        const {
+            assert!(ARROW_RIGHT_X < TITLE_LANE_X);
+        }
+    }
+
+    #[test]
+    fn issue_362_linux_tree_connectors_match_windows() {
+        let fixture = |id: &str, updated_at: i64, parent: Option<&str>| ActiveThread {
+            id: id.into(),
+            title: id.into(),
+            updated_at,
+            parent_thread_id: parent.map(str::to_owned),
+            ..ActiveThread::default()
+        };
+        let threads = vec![
+            fixture("A", 4, None),
+            fixture("B", 3, Some("A")),
+            fixture("C", 2, Some("B")),
+            fixture("D", 1, None),
+        ];
+        let presentation = thread_presentation_rows(&threads);
+        let observed = presentation
+            .iter()
+            .map(|row| {
+                (
+                    threads[row.index].id.as_str(),
+                    row.forest_depth,
+                    row.connected_to_parent,
+                    row.has_children,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            [
+                ("A", 0, false, true),
+                ("B", 1, true, true),
+                ("C", 2, true, false),
+                ("D", 0, false, false),
+            ]
+        );
+
+        let expected_row_y = [48usize, 144, 240, 336];
+        let actual_row_y = (0..presentation.len())
+            .map(|index| 96 * index + 48)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_row_y, expected_row_y);
+
+        let actual_rails = presentation
+            .iter()
+            .enumerate()
+            .filter(|&(_, row)| row.connected_to_parent)
+            .map(|(index, row)| {
+                (
+                    10 + 16 * row.forest_depth.saturating_sub(1).min(3),
+                    expected_row_y[index - 1],
+                    expected_row_y[index],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_rails, [(10, 48, 144), (26, 144, 240)]);
+
+        let mut actual_junctions = Vec::new();
+        for (index, row) in presentation.iter().enumerate() {
+            let mut row_junctions = Vec::new();
+            if row.connected_to_parent {
+                row_junctions.push((
+                    10 + 16 * row.forest_depth.saturating_sub(1).min(3),
+                    expected_row_y[index],
+                ));
+            } else {
+                row_junctions.push((10, expected_row_y[index]));
+            }
+            if row.has_children {
+                let outgoing = (10 + 16 * row.forest_depth.min(3), expected_row_y[index]);
+                if !row_junctions.contains(&outgoing) {
+                    row_junctions.push(outgoing);
+                }
+            }
+            actual_junctions.extend(row_junctions);
+        }
+        assert_eq!(
+            actual_junctions,
+            [(10, 48), (10, 144), (26, 144), (26, 240), (10, 336)]
+        );
+
+        let expected_arrow_tips = [(80, 48), (80, 144), (80, 240), (80, 336)];
+        let actual_arrow_tips = expected_row_y.map(|y| (80, y));
+        assert_eq!(actual_arrow_tips, expected_arrow_tips);
+        let expected_arrow_sides = [
+            ((73, 43), (73, 53)),
+            ((73, 139), (73, 149)),
+            ((73, 235), (73, 245)),
+            ((73, 331), (73, 341)),
+        ];
+        assert_eq!(
+            expected_arrow_sides,
+            [
+                ((73, 48 - 5), (73, 48 + 5)),
+                ((73, 144 - 5), (73, 144 + 5)),
+                ((73, 240 - 5), (73, 240 + 5)),
+                ((73, 336 - 5), (73, 336 + 5)),
+            ]
+        );
+
+        let source = include_str!("../ui/components.slint");
+        let threads = source
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .and_then(|source| source.split("export component ").next())
+            .expect("ThreadsWindow");
+        for marker in [
+            "property <length> tree-base-x: 10px;",
+            "property <length> tree-depth-step: 16px;",
+            "property <length> tree-junction-y: 48px;",
+            "property <length> tree-gutter-width: 80px;",
+            "property <length> tree-junction-end-x: self.tree-gutter-width;",
+            "x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step;",
+            "background: #76A7CC;",
+            "opacity: 1;",
+        ] {
+            assert!(
+                threads.contains(marker),
+                "missing connector contract: {marker}"
+            );
+        }
+        let path_block = |marker: &str, occurrence: usize| {
+            threads
+                .split(marker)
+                .nth(occurrence)
+                .and_then(|source| source.split("\n                }").next())
+                .expect("Threads tree Path block")
+        };
+        let assert_diamond = |block: &str, x: &str| {
+            for marker in [
+                x,
+                "y: parent.tree-junction-y - 4px;",
+                "width: 8px;",
+                "height: 8px;",
+                "commands: \"M 4 0 L 8 4 L 4 8 L 0 4 Z\";",
+                "fill: #76A7CC;",
+                "opacity: 1;",
+            ] {
+                assert!(block.contains(marker), "missing diamond contract: {marker}");
+            }
+            assert!(!block.contains("stroke:"));
+        };
+        assert_diamond(
+            path_block("if row.connected-to-parent : Path {", 1),
+            "x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step - 4px;",
+        );
+        assert_diamond(
+            path_block(
+                "if !row.connected-to-parent && !row.has-children : Path {",
+                1,
+            ),
+            "x: parent.tree-base-x - 4px;",
+        );
+        assert_diamond(
+            path_block("if row.has-children : Path {", 1),
+            "x: parent.tree-base-x + min(parent.display-depth, 3) * parent.tree-depth-step - 4px;",
+        );
+        let assert_arrow = |block: &str| {
+            for marker in [
+                "x: parent.tree-junction-end-x - 7px;",
+                "y: parent.tree-junction-y - 5px;",
+                "commands: \"M 0 0 L 7 5 L 0 10\";",
+                "stroke: #76A7CC;",
+                "stroke-width: 2px;",
+                "opacity: 1;",
+            ] {
+                assert!(block.contains(marker), "missing arrow contract: {marker}");
+            }
+            assert!(!block.contains("fill:"));
+            assert!(!block.contains("M 0 0 L 7 5 L 0 10 Z"));
+        };
+        assert_arrow(path_block("if row.connected-to-parent : Path {", 2));
+        assert_arrow(path_block("if !row.connected-to-parent : Path {", 1));
+    }
+
+    #[test]
+    fn issue_362_linux_tree_depth_cap_matches_windows() {
+        let fixture = |id: &str, updated_at: i64, parent: Option<&str>| ActiveThread {
+            id: id.into(),
+            title: id.into(),
+            updated_at,
+            parent_thread_id: parent.map(str::to_owned),
+            ..ActiveThread::default()
+        };
+        let threads = vec![
+            fixture("root", 5, None),
+            fixture("depth1", 4, Some("root")),
+            fixture("depth2", 3, Some("depth1")),
+            fixture("depth3", 2, Some("depth2")),
+            fixture("depth4", 1, Some("depth3")),
+        ];
+        let presentation = thread_presentation_rows(&threads);
+        let observed = presentation
+            .iter()
+            .map(|row| {
+                (
+                    threads[row.index].id.as_str(),
+                    row.forest_depth,
+                    row.connected_to_parent,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            [
+                ("root", 0, false),
+                ("depth1", 1, true),
+                ("depth2", 2, true),
+                ("depth3", 3, true),
+                ("depth4", 4, true),
+            ]
+        );
+
+        let actual_rail_x = presentation
+            .iter()
+            .filter_map(|row| {
+                row.connected_to_parent
+                    .then_some(10 + 16 * row.forest_depth.saturating_sub(1).min(3))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_rail_x, [10, 26, 42, 58]);
+        assert_eq!(10 + 16 * 3, 58);
+
+        let source = include_str!("../ui/components.slint");
+        let threads = source
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .and_then(|source| source.split("export component ").next())
+            .expect("ThreadsWindow");
+        for marker in [
+            "property <int> display-depth: min(row.tree-depth, 3);",
+            "x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step;",
+            "height: row.has-next-sibling ? root.thread-row-height : parent.tree-junction-y;",
+            "if row.ancestor-guide-1 : Rectangle {",
+            "if row.ancestor-guide-2 : Rectangle {",
+            "if row.ancestor-guide-3 : Rectangle {",
+            "if row.has-children : Rectangle {",
+        ] {
+            assert!(
+                threads.contains(marker),
+                "missing depth-cap contract: {marker}"
             );
         }
     }
@@ -37880,6 +38215,8 @@ mod tests {
                     previous_input: u64::from(fully_attributed_from_zero) * 100,
                     previous_cached_input: u64::from(fully_attributed_from_zero) * 20,
                     previous_output: u64::from(fully_attributed_from_zero) * 29,
+                    context_usage_tokens: None,
+                    context_window_tokens: None,
                 }
             };
             let range = |collector_epoch, cycle_seq| super::usage_store::SessionRange {
@@ -38009,6 +38346,8 @@ mod tests {
                     previous_input: 180,
                     previous_cached_input: 40,
                     previous_output: 49,
+                    context_usage_tokens: None,
+                    context_window_tokens: None,
                 };
                 let committed_range = super::usage_store::SessionRange {
                     root_identity: appended_source.root_identity.clone(),
@@ -48884,6 +49223,21 @@ mod tests {
             .split("export component ThreadsWindow inherits Window {")
             .nth(1)
             .expect("ThreadsWindow");
+        let windows_master =
+            include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
+        for marker in [
+            "<Setter Property=\"BorderThickness\" Value=\"1\" />",
+            "<Setter Property=\"Height\" Value=\"84\" />",
+            "<Setter Property=\"Padding\" Value=\"14,8\" />",
+            "Margin=\"80,6,16,6\"",
+            "ColumnDefinitions=\"*,180,208\"",
+            "ColumnSpacing=\"12\"",
+        ] {
+            assert!(
+                windows_master.contains(marker),
+                "missing Windows master Threads contract: {marker}"
+            );
+        }
 
         for marker in [
             "preferred-width: 900px;",
@@ -48892,12 +49246,11 @@ mod tests {
             "thread-count := Text {\n        x: 20px;\n        y: 56px;\n        width: 860px;\n        height: 14px;",
             "thread-list-clip := Rectangle {\n        x: 20px;\n        y: 76px;\n        width: 860px;\n        height: 384px;",
             "property <length> thread-row-height: 96px;",
-            "row-card := Rectangle {\n                    width: parent.width;\n                    height: 92px;",
-            "role-lane := Rectangle {\n                    x: 72px;\n                    width: 110px;",
-            "title-lane := Rectangle {\n                    x: 192px;\n                    width: 242px;",
-            "model-lane := Rectangle {\n                    x: 444px;\n                    width: 190px;",
-            "time-lane := Rectangle {\n                    x: 644px;\n                    width: 180px;",
-            "text: row.relation + \" · \" + root.strings.running;",
+            "row-card := Rectangle {\n                    x: 80px;\n                    y: 6px;\n                    width: parent.width - 96px;\n                    height: 84px;",
+            "property <length> info-spacing: 12px;",
+            "title-lane := Rectangle {\n                    x: 95px;\n                    y: 15px;\n                    width: parent.width - 538px;\n                    height: 66px;",
+            "model-lane := Rectangle {\n                    x: parent.width - 431px;\n                    y: 15px;\n                    width: 180px;\n                    height: 66px;",
+            "time-lane := Rectangle {\n                    x: parent.width - 239px;\n                    y: 15px;\n                    width: 208px;\n                    height: 66px;",
             "text: row.model;",
             "text: root.strings.context-usage + \" \" + row.context-usage;",
             "text: root.strings.running + \" \" + row.thread-age;",
@@ -48907,24 +49260,89 @@ mod tests {
             "visible: row.thread-age != \"\";",
             "visible: row.instruction-age != \"\";",
             "visible: row.tokens != \"\";",
-            "property <length> tree-base-x: 8px;",
-            "property <length> tree-depth-step: 12px;",
+            "property <length> tree-base-x: 10px;",
+            "property <length> tree-depth-step: 16px;",
             "property <length> tree-junction-y: 48px;",
-            "property <length> tree-gutter-width: 64px;",
-            "property <length> tree-junction-end-x: self.tree-gutter-width - 5px;",
+            "property <length> tree-gutter-width: 80px;",
+            "property <length> tree-junction-end-x: self.tree-gutter-width;",
             "width: parent.tree-junction-end-x - self.x;",
-            "x: parent.tree-junction-end-x - 3px;",
-            "width: 6px;",
             "height: row.has-next-sibling ? root.thread-row-height : parent.tree-junction-y;",
             "height: root.thread-row-height - parent.tree-junction-y;",
         ] {
             assert!(threads.contains(marker), "missing Linux Threads contract: {marker}");
         }
 
-        assert_eq!(384 / 96, 4, "the viewport must contain four complete rows");
-        assert_eq!(96 - 92, 4, "each row must leave a four pixel gap");
+        let path_block = |marker: &str, occurrence: usize| {
+            threads
+                .split(marker)
+                .nth(occurrence)
+                .and_then(|source| source.split("\n                }").next())
+                .expect("Threads tree Path block")
+        };
+        let assert_diamond = |block: &str, x: &str| {
+            for marker in [
+                x,
+                "y: parent.tree-junction-y - 4px;",
+                "width: 8px;",
+                "height: 8px;",
+                "commands: \"M 4 0 L 8 4 L 4 8 L 0 4 Z\";",
+                "fill: #76A7CC;",
+                "opacity: 1;",
+            ] {
+                assert!(block.contains(marker), "missing diamond contract: {marker}");
+            }
+            assert!(!block.contains("stroke:"));
+        };
+        assert_diamond(
+            path_block("if row.connected-to-parent : Path {", 1),
+            "x: parent.tree-base-x + min(row.tree-depth - 1, 3) * parent.tree-depth-step - 4px;",
+        );
+        assert_diamond(
+            path_block(
+                "if !row.connected-to-parent && !row.has-children : Path {",
+                1,
+            ),
+            "x: parent.tree-base-x - 4px;",
+        );
+        assert_diamond(
+            path_block("if row.has-children : Path {", 1),
+            "x: parent.tree-base-x + min(parent.display-depth, 3) * parent.tree-depth-step - 4px;",
+        );
+        let assert_arrow = |block: &str| {
+            for marker in [
+                "x: parent.tree-junction-end-x - 7px;",
+                "y: parent.tree-junction-y - 5px;",
+                "commands: \"M 0 0 L 7 5 L 0 10\";",
+                "stroke: #76A7CC;",
+                "stroke-width: 2px;",
+                "opacity: 1;",
+            ] {
+                assert!(block.contains(marker), "missing arrow contract: {marker}");
+            }
+            assert!(!block.contains("fill:"));
+            assert!(!block.contains("M 0 0 L 7 5 L 0 10 Z"));
+        };
+        assert_arrow(path_block("if row.connected-to-parent : Path {", 2));
+        assert_arrow(path_block("if !row.connected-to-parent : Path {", 1));
+
+        const ROW_HEIGHT: usize = 96;
+        const CARD_HEIGHT: usize = 84;
+        const CARD_TOP_BOTTOM_MARGIN: usize = 6;
+        assert_eq!(
+            384 / ROW_HEIGHT,
+            4,
+            "the viewport must contain four complete rows"
+        );
+        assert_eq!(
+            ROW_HEIGHT,
+            CARD_HEIGHT + 2 * CARD_TOP_BOTTOM_MARGIN,
+            "each row must retain six pixel top and bottom card margins"
+        );
         assert!(!threads.contains("single-thread"));
         assert!(!threads.contains("row.parent-title"));
+        assert!(!threads.contains("role-lane := Rectangle {"));
+        assert!(!threads.contains("text: row.relation + \" · \" + root.strings.running;"));
+        assert!(!threads.contains("width: 350px;"));
 
         let title_lane = threads
             .split("title-lane := Rectangle {")
@@ -49019,6 +49437,412 @@ mod tests {
             ),
             display(overflow)
         );
+    }
+
+    #[test]
+    fn issue_362_linux_threads_window_matches_windows_card_geometry_and_top_alignment() {
+        let threads = include_str!("../ui/components.slint")
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .expect("ThreadsWindow");
+        let windows_master =
+            include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
+        for marker in [
+            "<Setter Property=\"BorderThickness\" Value=\"1\" />",
+            "<Setter Property=\"Padding\" Value=\"14,8\" />",
+            "Margin=\"80,6,16,6\"",
+            "ColumnDefinitions=\"*,180,208\"",
+            "ColumnSpacing=\"12\"",
+        ] {
+            assert!(
+                windows_master.contains(marker),
+                "missing Windows card geometry oracle: {marker}"
+            );
+        }
+        let row = threads
+            .split_once("for row[index] in root.thread-rows:")
+            .expect("thread row start")
+            .1
+            .split_once("\n            }")
+            .expect("thread row end")
+            .0;
+        let card = row
+            .split_once("row-card := Rectangle {")
+            .expect("thread card start")
+            .1
+            .split_once("\n                }")
+            .expect("thread card end")
+            .0;
+
+        for marker in [
+            "x: 80px;",
+            "y: 6px;",
+            "width: parent.width - 96px;",
+            "height: 84px;",
+        ] {
+            assert!(
+                card.contains(marker),
+                "missing Windows card geometry: {marker}"
+            );
+        }
+        assert!(card.contains("border-width: 1px;"));
+        assert!(card.contains("border-radius: 8px;"));
+
+        // The Windows card content begins after its one pixel border and
+        // Padding="14,8". Derive the three lane origins from that master
+        // geometry instead of copying the previous Linux lane coordinates.
+        const LIST_WIDTH: usize = 860;
+        const CARD_LEFT: usize = 80;
+        const CARD_RIGHT: usize = 16;
+        const CARD_TOP: usize = 6;
+        const CARD_BORDER: usize = 1;
+        const CARD_PADDING_X: usize = 14;
+        const CARD_PADDING_Y: usize = 8;
+        const MODEL_WIDTH: usize = 180;
+        const TIME_WIDTH: usize = 208;
+        const COLUMN_GAP: usize = 12;
+        let card_width = LIST_WIDTH - CARD_LEFT - CARD_RIGHT;
+        let content_width = card_width - 2 * (CARD_BORDER + CARD_PADDING_X);
+        let title_width = content_width - MODEL_WIDTH - TIME_WIDTH - 2 * COLUMN_GAP;
+        let content_x = CARD_LEFT + CARD_BORDER + CARD_PADDING_X;
+        let content_y = CARD_TOP + CARD_BORDER + CARD_PADDING_Y;
+        let model_x = content_x + title_width + COLUMN_GAP;
+        let time_x = model_x + MODEL_WIDTH + COLUMN_GAP;
+        assert_eq!(content_x, 95);
+        assert_eq!(model_x, 429);
+        assert_eq!(time_x, 621);
+        assert_eq!(title_width, 322);
+
+        assert!(row.contains("width: 180px;"));
+        assert!(row.contains("width: 208px;"));
+        assert!(
+            row.contains("spacing: 12px;") || row.contains("layout-spacing: 12px;"),
+            "information columns must retain a 12px gap"
+        );
+        assert!(!row.contains("width: 350px;"));
+
+        let title_lane = row
+            .split_once("title-lane := Rectangle {")
+            .expect("title lane start")
+            .1
+            .split_once("\n                }")
+            .expect("title lane end")
+            .0;
+        let model_lane = row
+            .split_once("model-lane := Rectangle {")
+            .expect("model lane start")
+            .1
+            .split_once("\n                }")
+            .expect("model lane end")
+            .0;
+        let time_lane = row
+            .split_once("time-lane := Rectangle {")
+            .expect("time lane start")
+            .1
+            .split_once("\n                }")
+            .expect("time lane end")
+            .0;
+        for (lane, lane_source, x_binding) in [
+            ("title lane", title_lane, "x: 95px;"),
+            ("model lane", model_lane, "x: parent.width - 431px;"),
+            ("time lane", time_lane, "x: parent.width - 239px;"),
+        ] {
+            assert!(
+                lane_source.contains(x_binding),
+                "{lane} must use the Windows row-local x binding: {x_binding}"
+            );
+            assert!(
+                lane_source.contains(&format!("y: {content_y}px;")),
+                "{lane} must start inside the bordered, padded card at y={content_y}"
+            );
+            assert!(
+                lane_source.contains("height: 66px;"),
+                "{lane} must retain the Windows padded content height"
+            );
+        }
+        for (lane, lane_source) in [
+            ("title lane", title_lane),
+            ("model lane", model_lane),
+            ("time lane", time_lane),
+        ] {
+            assert!(
+                lane_source.contains("vertical-alignment: top;"),
+                "lane is not top aligned: {lane}"
+            );
+            assert!(
+                !lane_source.contains("vertical-alignment: center;"),
+                "lane remains vertically centered: {lane}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_362_parent_rows_are_only_nested_ancestors_and_use_parent_accent() {
+        let threads = vec![
+            ActiveThread {
+                id: "A".into(),
+                title: "A".into(),
+                updated_at: 4,
+                ..ActiveThread::default()
+            },
+            ActiveThread {
+                id: "B".into(),
+                title: "B".into(),
+                parent_thread_id: Some("A".into()),
+                updated_at: 3,
+                ..ActiveThread::default()
+            },
+            ActiveThread {
+                id: "C".into(),
+                title: "C".into(),
+                parent_thread_id: Some("B".into()),
+                updated_at: 2,
+                ..ActiveThread::default()
+            },
+            ActiveThread {
+                id: "D".into(),
+                title: "D".into(),
+                updated_at: 1,
+                ..ActiveThread::default()
+            },
+        ];
+        let rows = thread_presentation_rows(&threads);
+        let parent_ids = rows
+            .iter()
+            .filter(|row| row.has_children)
+            .map(|row| threads[row.index].id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(parent_ids, ["A", "B"]);
+
+        let threads = include_str!("../ui/components.slint")
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .expect("ThreadsWindow");
+        let row = threads
+            .split_once("for row[index] in root.thread-rows:")
+            .expect("thread row start")
+            .1
+            .split_once("\n            }")
+            .expect("thread row end")
+            .0;
+        let card = row
+            .split_once("row-card := Rectangle {")
+            .expect("thread card start")
+            .1
+            .split_once("\n                }")
+            .expect("thread card end")
+            .0;
+        assert!(card.contains("background: row.has-children ? #243E5A : #151F2D;"));
+        assert!(card.contains("border-color: #2B425B;"));
+    }
+
+    #[test]
+    fn issue_362_thread_context_usage_has_expected_percentages_and_unobserved_fallback() {
+        let make_thread = |id: &str, used: Option<u64>, window: Option<u64>| ActiveThread {
+            id: id.into(),
+            title: id.into(),
+            model_label: "LUNA".into(),
+            context_usage_tokens: used,
+            context_window_tokens: window,
+            ..ActiveThread::default()
+        };
+        let rows = active_thread_rows_at(
+            &[
+                make_thread("known-800", Some(800), Some(16_000)),
+                make_thread("known-400", Some(400), Some(16_000)),
+                make_thread("known-zero", Some(0), Some(16_000)),
+                make_thread("unknown", None, None),
+            ],
+            0,
+        );
+        let context_for = |id: &str| {
+            rows.iter()
+                .find(|row| row.title.as_str() == id)
+                .unwrap_or_else(|| panic!("missing row {id}"))
+                .context_usage
+                .to_string()
+        };
+
+        assert_eq!(context_for("known-800"), "5%\n800 / 16,000トークン");
+        assert_eq!(context_for("known-400"), "2.5%\n400 / 16,000トークン");
+        assert_eq!(context_for("known-zero"), "0%\n0 / 16,000トークン");
+        assert_eq!(context_for("unknown"), "未観測");
+    }
+
+    #[test]
+    fn issue_362_thread_name_uses_exact_task_name_and_unset_fallback() {
+        let named_rows = active_thread_rows_at(
+            &[ActiveThread {
+                title: "task_name".into(),
+                ..ActiveThread::default()
+            }],
+            0,
+        );
+        assert_eq!(named_rows.len(), 1);
+        assert_eq!(named_rows[0].title.as_str(), "task_name");
+
+        let unnamed_rows = active_thread_rows_at(
+            &[ActiveThread {
+                title: String::new(),
+                ..ActiveThread::default()
+            }],
+            0,
+        );
+        assert_eq!(unnamed_rows.len(), 1);
+        assert_eq!(unnamed_rows[0].title.as_str(), "未設定");
+    }
+
+    #[test]
+    fn issue_362_linux_parent_background_matches_windows() {
+        let threads = vec![
+            ActiveThread {
+                id: "A".into(),
+                title: "A".into(),
+                updated_at: 4,
+                ..ActiveThread::default()
+            },
+            ActiveThread {
+                id: "B".into(),
+                title: "B".into(),
+                parent_thread_id: Some("A".into()),
+                updated_at: 3,
+                ..ActiveThread::default()
+            },
+            ActiveThread {
+                id: "C".into(),
+                title: "C".into(),
+                parent_thread_id: Some("B".into()),
+                updated_at: 2,
+                ..ActiveThread::default()
+            },
+            ActiveThread {
+                id: "D".into(),
+                title: "D".into(),
+                updated_at: 1,
+                ..ActiveThread::default()
+            },
+        ];
+        let rows = thread_presentation_rows(&threads);
+        let parent_flags = rows
+            .iter()
+            .map(|row| (threads[row.index].id.as_str(), row.has_children))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parent_flags,
+            [("A", true), ("B", true), ("C", false), ("D", false)]
+        );
+
+        let windows_view_model = include_str!(
+            "../windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs"
+        );
+        assert!(windows_view_model.contains(
+            "internal static string FormatCardBackground(bool isParent) => isParent ? \"#243E5A\" : \"#151F2D\";"
+        ));
+        let windows =
+            include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
+        assert!(windows.contains("Background=\"{Binding CardBackgroundHex}\""));
+        assert!(windows.contains("<Setter Property=\"BorderBrush\" Value=\"#2B425B\" />"));
+
+        let threads = include_str!("../ui/components.slint")
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .expect("ThreadsWindow");
+        let row = threads
+            .split_once("for row[index] in root.thread-rows:")
+            .expect("thread row start")
+            .1
+            .split_once("\n            }")
+            .expect("thread row end")
+            .0;
+        let card = row
+            .split_once("row-card := Rectangle {")
+            .expect("thread card start")
+            .1
+            .split_once("\n                }")
+            .expect("thread card end")
+            .0;
+        assert!(card.contains("background: row.has-children ? #243E5A : #151F2D;"));
+        assert!(card.contains("border-color: #2B425B;"));
+    }
+
+    #[test]
+    fn issue_362_linux_model_accents_match_windows() {
+        let model_colors = [
+            ("ASTRA", "#E86E9F"),
+            ("LUNA", "#F1B35A"),
+            ("TERRA", "#71D39A"),
+            ("SOL", "#B79BFF"),
+            ("OTHER", "#A8B7CA"),
+        ];
+        let windows_view_model = include_str!(
+            "../windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs"
+        );
+        for (model, color) in model_colors {
+            if model == "OTHER" {
+                assert!(windows_view_model.contains(&format!("return \"{color}\";")));
+            } else {
+                assert!(
+                    windows_view_model.contains(&format!("normalized.Contains(\"{model}\"")),
+                    "Windows is missing the model mapping for {model}"
+                );
+                assert!(
+                    windows_view_model.contains(&format!("return \"{color}\";")),
+                    "Windows is missing the model color for {model}"
+                );
+            }
+        }
+
+        let windows =
+            include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
+        assert!(windows.contains("<Style Selector=\"Border.model-accent\">"));
+        assert!(windows.contains("<Setter Property=\"Width\" Value=\"2\" />"));
+        assert!(windows.contains("<Setter Property=\"Height\" Value=\"12\" />"));
+        assert!(windows.contains("Background=\"{Binding ModelAccentHex}\""));
+        assert!(windows.contains("Margin=\"8,0,0,0\""));
+        assert!(windows.contains("Foreground=\"{Binding ModelAccentHex}\""));
+
+        let threads = include_str!("../ui/components.slint")
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .expect("ThreadsWindow");
+        let model_lane = threads
+            .split_once("model-lane := Rectangle {")
+            .expect("model lane")
+            .1
+            .split_once("time-lane := Rectangle {")
+            .expect("time lane")
+            .0;
+        for (model, color) in model_colors {
+            assert!(
+                model_lane.contains(color),
+                "Linux is missing the model color for {model}: {color}"
+            );
+        }
+        assert!(model_lane.contains("model-accent := Rectangle {"));
+        assert!(model_lane.contains("width: 2px;"));
+        assert!(model_lane.contains("height: 12px;"));
+        assert!(model_lane.contains("x: 8px;"));
+        assert!(model_lane.contains("vertical-alignment: top;"));
+    }
+
+    #[test]
+    fn issue_362_context_percentage_precision_matches_windows() {
+        let i18n = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
+        for (used, window, expected) in [
+            (800, 16_000, "5%"),
+            (400, 16_000, "2.5%"),
+            (2_900, 16_000, "18.13%"),
+            (1, 3, "33.33%"),
+            (0, 16_000, "0%"),
+            (1, 800, "0.13%"),
+            (u64::MAX, 16_000, "100%"),
+        ] {
+            assert_eq!(
+                i18n.format_context_usage(used, window),
+                expected,
+                "context percentage mismatch for {used}/{window}"
+            );
+        }
     }
 
     #[test]

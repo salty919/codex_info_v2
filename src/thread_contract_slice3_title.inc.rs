@@ -16,19 +16,19 @@
         let mut item = full_thread();
         item["name"] = Value::Null;
         item["preview"] = json!("preview");
-        assert_eq!(title(&item), "preview", "title.null_name_fallback");
+        assert_eq!(title(&item), "未設定", "title.null_name_is_unset");
     }
     {
         let mut item = full_thread();
         item["name"] = json!("");
         item["preview"] = json!("preview");
-        assert_eq!(title(&item), "preview", "title.empty_name_fallback");
+        assert_eq!(title(&item), "未設定", "title.empty_name_is_unset");
     }
     {
         let mut item = full_thread();
         item.as_object_mut().unwrap().remove("name");
         item["preview"] = json!("preview");
-        assert_eq!(title(&item), "preview", "title.absent_name_fallback");
+        assert_eq!(title(&item), "未設定", "title.absent_name_is_unset");
     }
     {
         let mut item = full_thread();
@@ -39,7 +39,7 @@
         let mut item = full_thread();
         item["name"] = Value::Null;
         item["preview"] = json!("p\n\u{2066}  q");
-        assert_eq!(title(&item), "p q", "title.preview_normalized");
+        assert_eq!(title(&item), "未設定", "title.preview_ignored");
     }
     {
         let mut item = full_thread();
@@ -51,7 +51,7 @@
         item["id"] = json!("different-valid-id");
         assert_eq!(
             title(&item),
-            "アクティブなスレッド",
+            "未設定",
             "title.aliases_do_not_override"
         );
     }
@@ -82,20 +82,16 @@
         item["name"] = Value::Null;
         item["preview"] = json!(input.clone());
         let output = title(&item);
-        assert_eq!(output, input, "title.preview_512_preserved");
-        assert_eq!(output.chars().count(), 512);
+        assert_eq!(output, "未設定", "title.preview_512_ignored");
     }
     {
         let input = "語".repeat(513);
-        let expected = format!("{}…", "語".repeat(511));
         assert_eq!(input.chars().count(), 513);
-        assert_eq!(expected.chars().count(), 512);
         let mut item = full_thread();
         item["name"] = Value::Null;
         item["preview"] = json!(input);
         let output = title(&item);
-        assert_eq!(output, expected, "title.preview_513_elided");
-        assert_eq!(output.chars().count(), 512);
+        assert_eq!(output, "未設定", "title.preview_513_ignored");
     }
 
     let errors = [

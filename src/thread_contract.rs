@@ -978,12 +978,11 @@ pub fn validate_thread_item(item: &Value) -> Result<ValidatedThreadCandidate, Th
         .unwrap_or_default();
     let normalized_preview =
         security::bounded_thread_title(preview).map_err(|_| ThreadContractError::InvalidItem)?;
+    let _ = normalized_preview;
     let title = if !normalized_name.is_empty() {
         normalized_name
-    } else if !normalized_preview.is_empty() {
-        normalized_preview
     } else {
-        "アクティブなスレッド".to_owned()
+        "未設定".to_owned()
     };
     let active = object
         .get("status")
@@ -1234,11 +1233,28 @@ impl RolloutAccumulator {
         previous_total: u64,
         last_task_running: Option<bool>,
     ) -> Self {
+        Self::seeded_with_context(last_model, previous_total, last_task_running, None, None)
+    }
+
+    pub fn seeded_with_context(
+        last_model: Option<String>,
+        previous_total: u64,
+        last_task_running: Option<bool>,
+        context_usage_tokens: Option<u64>,
+        context_window_tokens: Option<u64>,
+    ) -> Self {
+        let (context_usage_tokens, context_window_tokens) =
+            match (context_usage_tokens, context_window_tokens) {
+                (Some(usage), Some(window)) => (Some(usage), Some(window)),
+                _ => (None, None),
+            };
         Self {
             state: RolloutState {
                 last_task_running,
                 last_model,
                 last_total_tokens: Some(previous_total),
+                last_context_usage_tokens: context_usage_tokens,
+                last_context_window_tokens: context_window_tokens,
                 ..RolloutState::default()
             },
         }
@@ -1563,8 +1579,7 @@ fn apply_known_rollout_event(
                 .and_then(|usage| usage.get("total_tokens"))
                 .and_then(Value::as_u64)
                 .ok_or(RolloutError::InvalidKnownEvent)?;
-            state.last_total_tokens = Some(total_tokens);
-            state.last_context_usage_tokens = match info.get("last_token_usage") {
+            let context_usage_tokens = match info.get("last_token_usage") {
                 Some(last_usage) => Some(
                     last_usage
                         .as_object()
@@ -1574,14 +1589,20 @@ fn apply_known_rollout_event(
                 ),
                 None => None,
             };
-            if let Some(context_window) = info.get("model_context_window") {
-                state.last_context_window_tokens = Some(
+            let context_window_tokens = info
+                .get("model_context_window")
+                .map(|context_window| {
                     context_window
                         .as_u64()
-                        .ok_or(RolloutError::InvalidKnownEvent)?,
-                );
-            } else {
-                state.last_context_window_tokens = None;
+                        .ok_or(RolloutError::InvalidKnownEvent)
+                })
+                .transpose()?;
+            state.last_total_tokens = Some(total_tokens);
+            if let (Some(context_usage_tokens), Some(context_window_tokens)) =
+                (context_usage_tokens, context_window_tokens)
+            {
+                state.last_context_usage_tokens = Some(context_usage_tokens);
+                state.last_context_window_tokens = Some(context_window_tokens);
             }
         }
         _ => {}
@@ -3447,6 +3468,7 @@ mod tests {
         let without_field = parse_rollout(&rollout_bytes(&[
             json!({"type":"event_msg","payload":{"type":"token_count","info":{
                 "total_token_usage":{"total_tokens":25},
+                "last_token_usage":{"total_tokens":24},
                 "model_context_window":128000
             }}}),
             json!({"type":"event_msg","payload":{"type":"token_count","info":{
@@ -3455,8 +3477,88 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(without_field.total_tokens(), Some(30));
-        assert_eq!(without_field.context_usage_tokens(), None);
-        assert_eq!(without_field.context_window_tokens(), None);
+        assert_eq!(without_field.context_usage_tokens(), Some(24));
+        assert_eq!(without_field.context_window_tokens(), Some(128_000));
+    }
+
+    #[test]
+    fn issue_362_context_pair_updates_atomically() {
+        let parsed = parse_rollout(&rollout_bytes(&[
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":10},
+                "last_token_usage":{"total_tokens":8},
+                "model_context_window":128000
+            }}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":20},
+                "last_token_usage":{"total_tokens":0},
+                "model_context_window":16000
+            }}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":30},
+                "last_token_usage":{"total_tokens":40},
+                "model_context_window":0
+            }}}),
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.context_usage_tokens(), Some(40));
+        assert_eq!(parsed.context_window_tokens(), Some(0));
+    }
+
+    #[test]
+    fn issue_362_context_partial_fields_preserve_last_complete_pair() {
+        let parsed = parse_rollout(&rollout_bytes(&[
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":10},
+                "last_token_usage":{"total_tokens":400},
+                "model_context_window":16000
+            }}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":20},
+                "last_token_usage":{"total_tokens":500}
+            }}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":30},
+                "model_context_window":32000
+            }}}),
+            json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.context_usage_tokens(), Some(400));
+        assert_eq!(parsed.context_window_tokens(), Some(16_000));
+
+        let initial_one_sided = parse_rollout(&rollout_bytes(&[
+            json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":1},
+                "model_context_window":16000
+            }}}),
+        ]))
+        .unwrap();
+        assert_eq!(initial_one_sided.context_usage_tokens(), None);
+        assert_eq!(initial_one_sided.context_window_tokens(), None);
+    }
+
+    #[test]
+    fn issue_362_context_invalid_event_does_not_partially_update() {
+        let mut parser = RolloutAccumulator::seeded_with_context(
+            Some("model".to_owned()),
+            10,
+            Some(true),
+            Some(400),
+            Some(16_000),
+        );
+        let bytes = rollout_raw_lines(&[
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":11},"last_token_usage":{"total_tokens":500},"model_context_window":-1}}}"#,
+        ]);
+        let result = parser.apply_reader(&mut Cursor::new(bytes.as_slice()), bytes.len() as u64);
+        assert_eq!(result, Err(RolloutError::InvalidKnownEvent));
+
+        let snapshot = parser.snapshot().unwrap();
+        assert_eq!(snapshot.total_tokens(), Some(10));
+        assert_eq!(snapshot.context_usage_tokens(), Some(400));
+        assert_eq!(snapshot.context_window_tokens(), Some(16_000));
     }
 
     #[test]
@@ -3994,6 +4096,36 @@ mod tests {
         include!("thread_contract_slice3_title.inc.rs");
         include!("thread_contract_slice3_schema.inc.rs");
         include!("thread_contract_slice3_numeric.inc.rs");
+    }
+
+    #[test]
+    fn issue_362_thread_name_is_unset_when_saved_name_is_missing() {
+        let mut item = full_thread();
+        item["name"] = Value::Null;
+        item["preview"] = json!("preview-must-not-be-used");
+        item["agentNickname"] = json!("nickname-must-not-be-used");
+
+        assert_eq!(validate_thread_item(&item).unwrap().title(), "未設定");
+    }
+
+    #[test]
+    fn issue_362_seeded_context_survives_null_token_info() {
+        let mut parser = RolloutAccumulator::seeded_with_context(
+            Some("model".to_owned()),
+            400,
+            Some(true),
+            Some(400),
+            Some(16_000),
+        );
+        let bytes = rollout_raw_lines(&[
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+        ]);
+        parser
+            .apply_reader(&mut Cursor::new(bytes.as_slice()), bytes.len() as u64)
+            .unwrap();
+        let snapshot = parser.snapshot().unwrap();
+        assert_eq!(snapshot.context_usage_tokens(), Some(400));
+        assert_eq!(snapshot.context_window_tokens(), Some(16_000));
     }
 
     #[test]
