@@ -1745,19 +1745,6 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string DetailsStatusText => main.DetailsStatusText;
 
-    public string ThreadRole(ApiThreadDetails thread)
-    {
-        if (thread.IsOrphan)
-        {
-            return thread.IsSubAgent ? $"{Texts.SubThread} ({Texts.UnavailableValue})" : $"{Texts.MainThread} ({Texts.UnavailableValue})";
-        }
-
-        var prefix = thread.Depth is { } depth && depth > 0 ? new string('│', Math.Min(depth, 3)) + " " : string.Empty;
-        return prefix + (thread.IsSubAgent
-            ? thread.Depth is { } nestedDepth ? $"{Texts.SubThread} D{nestedDepth}" : Texts.SubThread
-            : Texts.MainThread);
-    }
-
     public string ParentText(ApiThreadDetails thread) => thread.ParentId is { } parent
         ? $"{Texts.Parent}: {parent}"
         : thread.IsOrphan && thread.IsSubAgent
@@ -1962,6 +1949,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             var rowById = ordered
                 .Select((thread, row) => (thread.Id, row))
                 .ToDictionary(item => item.Id, item => item.row, StringComparer.Ordinal);
+            var acceptedParentIds = AcceptedParentIds(source);
             var displayDepthById = new Dictionary<string, int>(StringComparer.Ordinal);
             for (var index = 0; index < ordered.Count; index++)
             {
@@ -1983,7 +1971,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
                     ? parent.Title
                     : string.Empty;
                 threads.Add(new ThreadItemViewModel(this, thread, Math.Min(displayDepth, 3), parentExists && !thread.IsOrphan,
-                    parentTitle));
+                    parentTitle, acceptedParentIds.Contains(thread.Id)));
             }
         }
 
@@ -2016,6 +2004,15 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         return result;
     }
 
+    private static IReadOnlySet<string> AcceptedParentIds(IReadOnlyList<ApiThreadDetails> source)
+    {
+        var ids = source.Select(thread => thread.Id).ToHashSet(StringComparer.Ordinal);
+        return source
+            .Where(thread => thread.ParentId is { } parentId && !thread.IsOrphan && ids.Contains(parentId))
+            .Select(thread => thread.ParentId!)
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
     private void Notify([CallerMemberName] string? propertyName = null)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
@@ -2025,13 +2022,14 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 public sealed class ThreadItemViewModel
 {
     public ThreadItemViewModel(ThreadsWindowViewModel owner, ApiThreadDetails thread, int treeDepth,
-        bool connectedToParent, string parentTitle)
+        bool connectedToParent, string parentTitle, bool isParent)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         Id = thread.Id;
-        Title = thread.Title;
-        RoleText = owner.ThreadRole(thread);
-        RoleStatusText = FormatRoleStatus(owner.Texts, thread);
+        Title = FormatThreadTitle(owner.Texts, thread);
+        // Kept for non-rendered compatibility with existing presentation
+        // coverage. ThreadsWindow no longer binds this diagnostic role value.
+        RoleText = thread.IsSubAgent ? owner.Texts.SubThread : owner.Texts.MainThread;
         ParentText = string.IsNullOrWhiteSpace(parentTitle)
             ? owner.ParentText(thread)
             : $"{owner.ParentText(thread)} / {parentTitle}";
@@ -2049,13 +2047,14 @@ public sealed class ThreadItemViewModel
         TreeDepth = treeDepth;
         ConnectedToParent = connectedToParent;
         ParentTitle = parentTitle;
+        IsParent = isParent;
+        CardBackgroundHex = FormatCardBackground(isParent);
         IsRootThread = !connectedToParent && !thread.IsOrphan;
     }
 
     public string Id { get; }
     public string Title { get; }
     public string RoleText { get; }
-    public string RoleStatusText { get; }
     public string ParentText { get; }
     public string ModelText { get; }
     public string ModelAccentHex { get; }
@@ -2075,27 +2074,14 @@ public sealed class ThreadItemViewModel
     public int TreeDepth { get; }
     public bool ConnectedToParent { get; }
     public string ParentTitle { get; }
+    public bool IsParent { get; }
+    public string CardBackgroundHex { get; }
     public bool IsRootThread { get; }
 
-    internal static string FormatRoleStatus(UiText texts, ApiThreadDetails thread)
-    {
-        var role = thread.IsSubAgent ? texts.SubThread : texts.MainThread;
-        return $"{role} · {FormatActiveStatus(texts)}";
-    }
+    internal static string FormatThreadTitle(UiText texts, ApiThreadDetails thread) =>
+        string.IsNullOrWhiteSpace(thread.Title) ? texts.ThreadNameUnset : thread.Title;
 
-    internal static string FormatActiveStatus(UiText texts) => texts.LanguageCode switch
-    {
-        "ja" => "実行中",
-        "zh-Hans" => "活跃",
-        "ko" => "활성",
-        "es" => "Activo",
-        "fr" => "Actif",
-        "de" => "Aktiv",
-        "pt" => "Ativo",
-        "it" => "Attivo",
-        "ru" => "Активен",
-        _ => "Active",
-    };
+    internal static string FormatCardBackground(bool isParent) => isParent ? "#243E5A" : "#151F2D";
 
     internal static string FormatModelAccent(string model)
     {
@@ -2125,17 +2111,20 @@ public sealed class ThreadItemViewModel
 
     internal static string FormatContextUsage(UiText texts, ApiThreadDetails thread)
     {
-        if (thread.ContextPercent is not { } percent ||
-            thread.ContextTokens is not { } used ||
+        if (thread.ContextTokens is not { } used ||
             thread.ContextLimit is not { } limit ||
             limit == 0)
         {
-            return string.Empty;
+            return $"{texts.Context} {texts.ContextUnobserved}";
         }
+
+        var percent = thread.ContextPercent is { } observed && double.IsFinite(observed)
+            ? observed
+            : (double)used / limit * 100d;
 
         return string.Create(
             CultureInfo.CurrentCulture,
-            $"{texts.Context} {percent:0.#}%\n{used:N0} / {limit:N0} {texts.Tokens}");
+            $"{texts.Context} {percent:0.##}%\n{used:N0} / {limit:N0} {texts.Tokens}");
     }
 
     internal static string FormatMinuteAge(UiText texts, long? timestamp, string label, long now)

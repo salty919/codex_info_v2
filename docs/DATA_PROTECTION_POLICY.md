@@ -406,6 +406,17 @@ transaction commit前はrow/checkpoint/generationの全てが旧値、commit後�
 `(root identity,relative path,device,inode,prefix generation,start offset,end offset,record SHA-256)`はuniqueで、
 同一CollectorEpoch内の再読込はno-op、partial rowとcursor先行を0件にする。
 
+### 8.7.1 SESSION-129 / DB-129 — thread context観測値の保持
+
+`session_checkpoints`の`context_usage_tokens`と`context_window_tokens`はnullableな観測値である。旧checkpointや
+まだauthority pairを得ていないcheckpointのNULLはUIの`未観測`へ投影し、0へ変換したり、累積total・model値・別sourceの
+windowから推測したりしない。usage=0かつ正のwindowという観測済みpairは有効な0%として保持する。
+
+同じthreadのusage/window pairを次の観測で得た場合だけ、usage rowとcheckpointを同一transactionへ保存する。以後の
+appendやrestartで新しいpairが欠けても、既存の観測値をNULLへ戻さず保持する。旧checkpointのNULLは新しいauthority
+観測が得られるまでNULLのままとし、context補完だけを目的に旧履歴全体を再読込しない。追加pollやbackfillも行わず、
+更新範囲は通常のbounded appendと、そのcommitで得たauthorityへ限定する。
+
 ### 8.8 DP-REST-007 / RC-145 — typed generation namespace
 
 bare integerを異なるnamespace間で比較しない。採用型は次のとおりである。

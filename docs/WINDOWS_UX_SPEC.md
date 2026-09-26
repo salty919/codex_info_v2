@@ -81,15 +81,15 @@ Linux timezone設定だけは有限scopeの実装・直接評価対象とする�
 - Setup: 現在の手順、入力、検証結果、次へ/戻る/キャンセルを同一viewportに置く。
 - Settings: 編集対象、現在値、保存、取消、復旧、戻るを同一viewportに置く。
 - Graph: 期間、metric、系列操作、plot、現在値を同一viewportに置く。
-- Threads: Windowを900×480から拡大せず、空状態または先頭6件の2行カードと閉じる操作を
-  同一viewportに置く。7件目以降だけ一覧内の縦スクロールを許可し、画面全体はスクロールしない。
+- Threads: Windowを900×480から拡大せず、空状態または先頭4件の固定行カードと閉じる操作を
+  同一viewportに置く。5件目以降だけ一覧内の縦スクロールを許可し、画面全体はスクロールしない。
 - Legal: 本文を分割表示できる章/ページとし、戻る・閉じるを常時表示する。長文を理由にアプリ全体の
   ナビゲーションをスクロールの下へ追いやらない。
 
 スクロールバー、マウスホイール、トラックパッドによる画面移動を、主要画面の到達手段として
 採用しない。長い一覧・本文はページング、章切替、選択詳細、折りたたみで分割し、現在位置と
-次の操作を固定表示する。例外はThreadsの7件目以降だけであり、先頭6件を完全表示した同じ一覧内
-`ScrollViewer`で追加行へ到達してよい。画面全体のスクロールや6件以下でのscrollbarはFAILとする。
+次の操作を固定表示する。例外はThreadsの5件目以降だけであり、先頭4件を完全表示した同じ一覧内
+`ScrollViewer`で追加行へ到達してよい。画面全体のスクロールや4件以下でのscrollbarはFAILとする。
   ページングや折りたたみでも主要情報を同時に比較できない場合は、レイアウトを再設計する。
 
 ### 2.1.1 Window geometry、DPI、topologyの正本
@@ -169,7 +169,7 @@ rootまたは内部`ScrollViewer`だけを到達手段にする旧要求は、�
 `UX-20260822-UX-002`により明示的にsupersedeする。Main、Setup、Settings、Legalは、
 page/step/detail/chapter/collapseで全主要情報、primary action、Back、Closeを同一viewportへ
 置く。Graphもperiod/metric/series/plot/現在値とBack/Closeを同一viewportへ置く。Threadsは
-先頭6件とWindow操作を同一viewportへ置き、7件目以降に限って一覧内scrollを使う。既存のX版
+先頭4件とWindow操作を同一viewportへ置き、5件目以降に限って一覧内scrollを使う。既存のX版
 データを削除・要約・再順序化しない。
 
 ### 2.2 一目で分かる情報階層
@@ -411,13 +411,34 @@ component順や表示所有者を変更しない。
 
 ### 4.3 Threads
 
-- 900×480 logical clientを拡大せず、カードの余白と行高を抑えて先頭6件を完全表示する。
-- 各カードは高56px・間隔4pxの2行構造とし、title/model/context/経過とparent/role/depth/token/指示年齢を配置する。1件だけでもカードを拡大しない。
-- 6件以下では縦scrollbarを表示せず、7件目以降だけ同じ一覧内で縦scrollを許可する。
-- 親子関係、role、model、context、token、経過、指示年齢を同じ行または選択詳細で追跡できる。
-- 64pxのtree gutterと本文開始位置を分離し、rail・junction・title・parent textの重なりを0pxにする。
+- Linux/Windows共通のWindows masterは900×480 logical client、viewport 384px、96pxの固定行4件とする。
+  縦方向は上詰めで、画面中央への自動配置を行わない。5件目以降だけ同じ一覧内で縦scrollを許可し、
+  画面全体はscrollしない。
+- 各cardは左80px、右16px、上下6px、height84pxとし、情報laneは`*,180,208`、lane間隔は12pxとする。
+  title、model/context、経過時間・指示年齢・tokenを各laneの上端から配置し、1行タイトルと2行タイトルで
+  laneを縦方向にcenterしない。
+- treeはbase x=10px、depth step=16px、表示depthの上限3、connectorのy=48pxとする。
+  tree gutterは情報cardの開始位置と分離し、rail・junction・titleの重なりを0pxにする。
+- treeのrow中心は`y=96*i+48`、cardは`x=80`、情報laneの開始は`x=95`とする。railは
+  `x=10+16*min(parentDepth,3)`で求め、2pxの実線`#76A7CC`、opacity 1、round cap/joinとする。
+  junctionは半径4pxの塗りつぶしdiamond、arrowはtip `(80,y)`、side `(73,y-5)`/`(73,y+5)`とする。
+  有効な親を持たない全root row（独立nodeを含む）は`(10,y)`から`(80,y)`のroot segment、x=10のjunction、
+  x=80のarrowを持つ。親子railは最後の直接childまで延長し、各childにもsegment、diamond、arrowを描く。
+  parentDepthをrail計算前に3へcapするため、depth3 parentからdepth4 childへのrailはx=58となり、兄弟がある場合も最後のchildまで継続する。
+- 子を持つrowだけを`row.has-children`で親と判定し、親cardのbackgroundは`#243E5A`、独立nodeとleafのbackgroundは
+  `#151F2D`、全cardのborderは`#2B425B`とする。入れ子の親も対象にし、独立nodeとleafは親色にしない。
+- model accentはASTRA=`#E86E9F`、LUNA=`#F1B35A`、TERRA=`#71D39A`、SOL=`#B79BFF`、その他=`#A8B7CA`とし、
+  2px×12px、model文字の開始位置はaccent基準から8px後、laneは上詰めとする。
+- 子threadの表示名は`THREAD-TITLE-362`に従い、`thread/read`で取得する上流保存名をそのまま使う。生成元がtask_nameを
+  外部の`thread/name/set`で保存している場合はその値を表示し、保存名が空なら`未設定`とする。
+  「アクティブなスレッド」などの汎用名やpreview値へfallbackしない。
+- contextは同じthreadの観測済みusage/window pairだけを表示し、usage=0は有効な0%として表示する。
+  pairがない、windowが0以下、または旧checkpointのNULLは`未観測`とし、累積値や別sourceから推測・合成しない。
+  割合は整数比をround-half-upで小数点以下最大2桁へ丸め、末尾0を除去し、100%を上限とする。次の観測で得たpairは
+  checkpointへ保存し、後続append/restartで未観測へ戻さない。
 - stale、停止済みchild、orphan、cycle、部分snapshotは誤って実行中として表示しない。
-- 一覧件数が増えても本文fontを縮小せず、Window拡大や空疎なcardで情報密度を下げない。
+- 一覧件数が増えても本文fontを縮小せず、Window拡大や空疎なcardで情報密度を下げない。contextを埋めるための
+  full old-history reread、追加poll、backfillを行わない。
 
 ### 4.4 Setup / Settings
 

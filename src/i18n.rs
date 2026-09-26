@@ -958,18 +958,55 @@ impl I18n {
         if context_window == 0 {
             return "—".to_owned();
         }
-        let tenths = (u128::from(used_tokens)
-            .saturating_mul(1_000)
+        let hundredths = (u128::from(used_tokens)
+            .saturating_mul(10_000)
             .saturating_add(u128::from(context_window / 2)))
             / u128::from(context_window);
-        let tenths = tenths.min(1_000);
-        let whole = tenths / 10;
-        let fraction = tenths % 10;
+        let hundredths = hundredths.min(10_000);
+        let whole = hundredths / 100;
+        let fraction = hundredths % 100;
         let whole = self.format_grouped_unsigned(whole);
         if fraction == 0 {
             format!("{whole}%")
+        } else if fraction % 10 == 0 {
+            let single_fraction = fraction / 10;
+            format!("{whole}{}{single_fraction}%", self.decimal_separator())
         } else {
-            format!("{whole}{}{fraction}%", self.decimal_separator())
+            format!("{whole}{}{fraction:02}%", self.decimal_separator())
+        }
+    }
+
+    pub fn format_thread_name(&self, name: &str) -> String {
+        if !name.trim().is_empty() {
+            return name.to_owned();
+        }
+        match self.language {
+            Language::Japanese => "未設定",
+            Language::SimplifiedChinese => "未设置",
+            Language::Korean => "설정되지 않음",
+            Language::Spanish => "Sin configurar",
+            Language::French => "Non défini",
+            Language::German => "Nicht festgelegt",
+            Language::Portuguese => "Não definido",
+            Language::Italian => "Non impostato",
+            Language::Russian => "Не задано",
+            Language::English => "Unset",
+        }
+        .to_owned()
+    }
+
+    pub fn context_unobserved(&self) -> &'static str {
+        match self.language {
+            Language::Japanese => "未観測",
+            Language::SimplifiedChinese => "未观测",
+            Language::Korean => "미관측",
+            Language::Spanish => "No observado",
+            Language::French => "Non observé",
+            Language::German => "Unbeobachtet",
+            Language::Portuguese => "Não observado",
+            Language::Italian => "Non osservato",
+            Language::Russian => "Не наблюдалось",
+            Language::English => "Unobserved",
         }
     }
 
@@ -2365,12 +2402,12 @@ mod tests {
         let english = I18n::from_parts(Language::English, Tz::UTC);
         assert_eq!(english.format_context_usage(0, 100), "0%");
         assert_eq!(english.format_context_usage(50, 100), "50%");
-        assert_eq!(english.format_context_usage(1, 3), "33.3%");
+        assert_eq!(english.format_context_usage(1, 3), "33.33%");
         assert_eq!(english.format_context_usage(u64::MAX, 100), "100%");
         assert_eq!(english.format_context_usage(1, 0), "—");
 
         let french = I18n::from_parts(Language::French, Tz::UTC);
-        assert_eq!(french.format_context_usage(1, 3), "33,3%");
+        assert_eq!(french.format_context_usage(1, 3), "33,33%");
     }
 
     #[test]

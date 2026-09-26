@@ -2416,7 +2416,7 @@ function Assert-E2EFixtureV3PreflightResponses {
         [string]$json['current'].state -ceq 'ready' -and
         [bool]$json['current'].authenticated -and
         @($json['current'].models).Count -eq 3 -and
-        [Int64]$json['current'].active_thread_count -eq 3) 'Fixture current resource does not contain the intended ready generation.'
+        [Int64]$json['current'].active_thread_count -eq 4) 'Fixture current resource does not contain the intended ready generation.'
     Assert-E2EFixtureJsonKeys -Json $json['periods'] `
         -Expected @('api_version', 'history_periods') -Endpoint 'Fixture history periods'
     Assert-E2E ([string]$json['periods'].api_version -ceq 'v3' -and
@@ -2473,7 +2473,7 @@ function Assert-E2EFixtureV3PreflightResponses {
     Assert-E2EFixtureJsonKeys -Json $json['threads'] `
         -Expected @('api_version', 'threads') -Endpoint 'Fixture threads'
     Assert-E2E ([string]$json['threads'].api_version -ceq 'v3' -and
-        @($json['threads'].threads).Count -eq 3) 'Fixture threads resource must contain three rows.'
+        @($json['threads'].threads).Count -eq 4) 'Fixture threads resource must contain four rows.'
     return $true
 }
 
@@ -2524,6 +2524,12 @@ function New-E2EFixtureDocuments {
 "@
     # Keep the explicit sample values above while enforcing the wire order
     # independently of PowerShell object serialization: past -> current.
+    $details = $details.Replace('"active_thread_count":3', '"active_thread_count":4')
+    $details = $details.Replace('"title":"E2E root task"', '"title":"task-A"')
+    $details = $details.Replace('"title":"E2E child task"', '"title":"task-B"')
+    $details = $details.Replace('"title":"E2E orphan task","parent_thread_id":"missing-parent"', '"title":"task-D","parent_thread_id":null')
+    $grandchild = '{"id":"e2e-grandchild","title":"task-C","parent_thread_id":"e2e-child","model":"LUNA","model_label":"LUNA","total_tokens":600,"context_usage_tokens":0,"context_window_tokens":16000,"created_at":' + ($now - 1800) + ',"last_user_message_at":' + ($now - 900) + ',"is_subagent":true,"depth":2}'
+    $details = $details.Replace('],"estimated_cost_label"', ',' + $grandchild + '],"estimated_cost_label"')
     $details = $details.Replace(',"history_samples":[', ',"history_gaps":[],"history_samples":[')
     $historySamplesMarker = '"history_samples":['
     $historySamplesStart = $details.IndexOf($historySamplesMarker)
@@ -2551,6 +2557,7 @@ function New-E2EFixtureDocuments {
     $current = @"
 {"api_version":"v3","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"model":"SOL","total_tokens":1200,"input_tokens":800,"cached_input_tokens":200,"cache_write_input_tokens":0,"output_tokens":400,"estimated_cost":{"price_version":"E2E-SOL","ordinary_input_dollars":0.70,"cached_input_dollars":0.20,"cache_write_input_dollars":0.0,"output_dollars":0.30,"total_dollars":1.20}},{"model":"TERRA","total_tokens":2400,"input_tokens":1600,"cached_input_tokens":500,"cache_write_input_tokens":0,"output_tokens":800,"estimated_cost":{"price_version":"E2E-TERRA","ordinary_input_dollars":1.40,"cached_input_dollars":0.50,"cache_write_input_dollars":0.0,"output_dollars":0.50,"total_dollars":2.40}},{"model":"LUNA","total_tokens":3600,"input_tokens":2500,"cached_input_tokens":700,"cache_write_input_tokens":0,"output_tokens":1100,"estimated_cost":{"price_version":"E2E-LUNA","ordinary_input_dollars":2.00,"cached_input_dollars":0.70,"cache_write_input_dollars":0.0,"output_dollars":0.90,"total_dollars":3.60}}],"active_thread_count":3}
 "@
+    $current = $current.Replace('"active_thread_count":3', '"active_thread_count":4')
     $periods = @"
 {"api_version":"v3","history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$v3PastStart,"end_at":$v3PastReset,"reset_at":$v3PastReset,"label":"Past period","current":false}]}
 "@
@@ -2565,6 +2572,10 @@ function New-E2EFixtureDocuments {
     $threads = @"
 {"api_version":"v3","threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}]}
 "@
+    $threads = $threads.Replace('"title":"E2E root task"', '"title":"task-A"')
+    $threads = $threads.Replace('"title":"E2E child task"', '"title":"task-B"')
+    $threads = $threads.Replace('"title":"E2E orphan task","parent_thread_id":"missing-parent"', '"title":"task-D","parent_thread_id":null')
+    $threads = $threads.Replace(',"depth":null}]}', ',"depth":null},' + $grandchild + ']}')
     return [pscustomobject]@{
         Details = $details.Trim()
         Accounts = $accounts.Trim()
@@ -2622,7 +2633,7 @@ function Enter-E2EFixture {
     $script:e2eFixturePort = [CodexInfoWindowsE2EFixtureServer]::BoundPort()
     Assert-E2E ($script:e2eFixturePort -ge 1 -and $script:e2eFixturePort -le 65535) 'Fixture did not report a valid bound port.'
     $script:e2eFixtureRunning = $true
-    Write-E2E "fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:$script:e2eFixturePort"
+    Write-E2E "fixture: PASS periods=2 threads=4 endpoint=http://127.0.0.1:$script:e2eFixturePort"
 }
 
 function Exit-E2EFixture {
@@ -3313,7 +3324,7 @@ try {
         return (Find-E2EWindow $clientPid 'Codex Info Graph') -eq [IntPtr]::Zero
     } | Out-Null
 
-    Write-E2E 'case-5: open active-thread Details and assert root/child/orphan rows and columns'
+    Write-E2E 'case-5: open thread Details and assert nested rows, independent row, and columns'
     $threads = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Details' -ButtonAutomationId 'Main.OpenThreadDetails' -Title 'Codex Info Threads' -Role 'Threads' -ProcessId $clientPid
     $threadsRoot = $threads.Root
     Assert-E2ENoChildProductVersion $threadsRoot 'Threads'
@@ -3323,9 +3334,10 @@ try {
         return $false
     }
     $fixtureRows = @(
-        @{ Title = 'E2E root task'; Id = 'e2e-root'; Model = 'TERRA' },
-        @{ Title = 'E2E child task'; Id = 'e2e-child'; Model = 'LUNA' },
-        @{ Title = 'E2E orphan task'; Id = 'e2e-orphan'; Model = 'SOL' }
+        @{ Title = 'task-A'; Id = 'e2e-root'; Model = 'TERRA' },
+        @{ Title = 'task-B'; Id = 'e2e-child'; Model = 'LUNA' },
+        @{ Title = 'task-C'; Id = 'e2e-grandchild'; Model = 'LUNA' },
+        @{ Title = 'task-D'; Id = 'e2e-orphan'; Model = 'SOL' }
     )
     if ($Fixture) {
         foreach ($row in $fixtureRows) {
@@ -3342,18 +3354,21 @@ try {
         $flattenedFixtureRows = $threadTexts -join "`n"
         foreach ($contextCase in @(
                 @{ Id = 'e2e-root'; Percent = 'Context 5%'; Usage = '800 / 16,000 Tokens' },
-                @{ Id = 'e2e-child'; Percent = 'Context 2.5%'; Usage = '400 / 16,000 Tokens' })) {
+                @{ Id = 'e2e-child'; Percent = 'Context 2.5%'; Usage = '400 / 16,000 Tokens' },
+                @{ Id = 'e2e-grandchild'; Percent = 'Context 0%'; Usage = '0 / 16,000 Tokens' })) {
             Assert-E2E ($flattenedFixtureRows.IndexOf($contextCase.Percent, [StringComparison]::Ordinal) -ge 0) `
                 "Threads context percent missing: $($contextCase.Id)"
             Assert-E2E ($flattenedFixtureRows.IndexOf($contextCase.Usage, [StringComparison]::Ordinal) -ge 0) `
                 "Threads context usage/limit missing: $($contextCase.Id)"
         }
-        Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Context [0-9]+(?:\.[0-9]+)?%$').Count -eq 2) `
-            'Orphan row must hide missing context.'
-        Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Elapsed [0-9][0-9,]* min$').Count -eq 3) `
+        Assert-E2E ($flattenedFixtureRows.IndexOf('未観測', [StringComparison]::Ordinal) -ge 0) `
+            'Missing context must be rendered as 未観測.'
+        Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Context [0-9]+(?:\.[0-9]+)?%$').Count -eq 3) `
+            'Known context percentages must be rendered for every observed row.'
+        Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Elapsed [0-9][0-9,]* min$').Count -eq 4) `
             'Threads elapsed values must use minute text.'
-        Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Instruction [0-9][0-9,]* min$').Count -eq 2) `
-            'Root/child instruction values must use minute text and the orphan value must be hidden.'
+        Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Instruction [0-9][0-9,]* min$').Count -eq 3) `
+            'Observed instruction values must use minute text.'
         foreach ($forbidden in @(
                 @{ Pattern = '(?m)^(?:Main|Sub)\s+.\s+Active$'; Label = 'role/active label' },
                 @{ Pattern = '\bDepth\s+[0-9]+\b'; Label = 'Depth <n>' },

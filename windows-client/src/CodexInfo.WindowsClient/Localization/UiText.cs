@@ -312,6 +312,8 @@ public sealed record UiText(
     public string MainThread => LanguageCode switch { "ja" => "メイン", "zh-Hans" => "主线程", "ko" => "메인", "es" => "Principal", "fr" => "Principal", "de" => "Haupt", "pt" => "Principal", "it" => "Principale", "ru" => "Основной", _ => "Main" };
     public string SubThread => LanguageCode switch { "ja" => "サブ", "zh-Hans" => "子线程", "ko" => "하위", "es" => "Sub", "fr" => "Secondaire", "de" => "Untergeordnet", "pt" => "Sub", "it" => "Secondario", "ru" => "Подчинённый", _ => "Sub" };
     public string Context => LanguageCode switch { "ja" => "コンテキスト", "zh-Hans" => "上下文", "ko" => "컨텍스트", "es" => "Contexto", "fr" => "Contexte", "de" => "Kontext", "pt" => "Contexto", "it" => "Contesto", "ru" => "Контекст", _ => "Context" };
+    public string ThreadNameUnset => "未設定";
+    public string ContextUnobserved => "未観測";
     public string Depth => LanguageCode switch { "ja" => "深さ", "zh-Hans" => "深度", "ko" => "깊이", "es" => "Profundidad", "fr" => "Profondeur", "de" => "Tiefe", "pt" => "Profundidade", "it" => "Profondità", "ru" => "Глубина", _ => "Depth" };
     public string Elapsed => LanguageCode switch { "ja" => "経過", "zh-Hans" => "已过", "ko" => "경과", "es" => "Transcurrido", "fr" => "Écoulé", "de" => "Vergangen", "pt" => "Decorrido", "it" => "Trascorso", "ru" => "Прошло", _ => "Elapsed" };
     public string Instruction => LanguageCode switch { "ja" => "指示", "zh-Hans" => "指令", "ko" => "지시", "es" => "Instrucción", "fr" => "Instruction", "de" => "Anweisung", "pt" => "Instrução", "it" => "Istruzione", "ru" => "Инструкция", _ => "Instruction" };
