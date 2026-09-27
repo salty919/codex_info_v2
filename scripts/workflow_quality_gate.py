@@ -516,11 +516,25 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             _step(linux_ui_job, name="Run graph UI image acceptance").get("if"),
             None,
         )
-        expect(
-            "windows.unit.if",
-            _step(windows_job, name="Run Windows unit tests").get("if"),
-            None,
-        )
+        windows_unit = _step(windows_job, name="Run Windows unit tests")
+        expect("windows.unit.if", windows_unit.get("if"), None)
+        windows_run = windows_unit.get("run")
+        if not isinstance(windows_run, str):
+            errors.append("windows.unit.run: missing script")
+        else:
+            commands = [line.strip() for line in windows_run.splitlines() if line.strip()]
+            format_command = (
+                "dotnet format windows-client/CodexInfo.WindowsClient.sln "
+                "--no-restore --verify-no-changes"
+            )
+            guard = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+            test_command = "dotnet test windows-client/CodexInfo.WindowsClient.sln `"
+            if not any(
+                commands[index : index + 3]
+                == [format_command, guard, test_command]
+                for index in range(len(commands) - 2)
+            ):
+                errors.append("windows.unit.run: formatter exit is not checked before tests")
         for step_name in (
             "Install locked Inno Setup compiler",
             "Build standard Windows setup wizard",
