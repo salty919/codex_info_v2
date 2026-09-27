@@ -8,7 +8,7 @@
 #![deny(unsafe_code)]
 
 use chrono::{DateTime, Months, Utc};
-use codex_info::{security, thread_contract};
+use codex_info::{app_server_sqlite::PreparedGeneration, security, thread_contract};
 use codex_info_db_writer::{
     classify_quota_transition, finalize_session_timeline_recovery, session_event_is_replay,
     ActiveThreadRecord, ActiveThreadSnapshot, PreviousQuotaState, QuotaCandidate, QuotaTransition,
@@ -26,10 +26,10 @@ use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -469,20 +469,24 @@ pub struct QuotaPoller {
 }
 
 impl QuotaPoller {
-    pub fn start() -> Self {
-        Self::start_with_interval(DEFAULT_INTERVAL_SECS)
+    pub fn start(codex_home: PathBuf, data_root: PathBuf) -> Self {
+        Self::start_with_interval(DEFAULT_INTERVAL_SECS, codex_home, data_root)
     }
 
     /// Start the quota lane with the caller's polling cadence. The worker
     /// never waits on the Session recorder; a full result queue only drops a
     /// stale observation and does not stop the lane.
-    pub fn start_with_interval(interval_secs: u64) -> Self {
+    pub fn start_with_interval(
+        interval_secs: u64,
+        codex_home: PathBuf,
+        data_root: PathBuf,
+    ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(2);
         let interval_secs = interval_secs.max(1);
         let worker = thread::spawn(move || {
             let mut schedule = FixedRateSchedule::new(Duration::from_secs(interval_secs));
             loop {
-                let result = fetch_quota_snapshot();
+                let result = fetch_quota_snapshot(&codex_home, &data_root);
                 match sender.try_send(result) {
                     Ok(()) | Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => break,
@@ -565,12 +569,17 @@ pub struct ThreadPoller {
 }
 
 impl ThreadPoller {
-    pub fn start(sessions_root: PathBuf) -> Self {
+    pub fn start(codex_home: PathBuf, data_root: PathBuf, sessions_root: PathBuf) -> Self {
         let (sender, commands) = mpsc::sync_channel(1);
         let (results, receiver) = mpsc::sync_channel(2);
         let worker = thread::spawn(move || {
             while let Ok(ActiveThreadPollCommand::Probe { checkpoints }) = commands.recv() {
-                let result = collect_active_thread_snapshot(&sessions_root, &checkpoints);
+                let result = collect_active_thread_snapshot(
+                    &codex_home,
+                    &data_root,
+                    &sessions_root,
+                    &checkpoints,
+                );
                 // Never let an app-server result block or back up the Session
                 // loop. A later cycle will request a fresh snapshot.
                 let _ = results.try_send(result);
@@ -648,31 +657,255 @@ fn decode_codex_authentication_state(value: &Value) -> Result<CodexAuthenticatio
 /// Confirm the current Codex authentication state through two reads from one
 /// app-server process. A missing local auth file is never enough to claim
 /// logout: both reads must independently report the auth-required shape.
-pub fn probe_codex_authentication_state() -> Result<CodexAuthenticationState, String> {
+pub fn probe_codex_authentication_state(
+    codex_home: &Path,
+    data_root: &Path,
+) -> Result<CodexAuthenticationState, String> {
     let executable = resolve_codex_executable()?;
-    let mut child = Command::new(executable)
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "Codex app-server could not be started".to_owned())?;
-    let Some(mut input) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex app-server stdin is unavailable".to_owned());
-    };
-    let Some(stdout) = child.stdout.take() else {
+    match authentication_probe_attempt(&executable, codex_home, data_root, true) {
+        Ok(state) => Ok(state),
+        Err(failure) if failure.global_fallback_allowed => {
+            eprintln!("recorder auth probe isolated app-server failed before account read; trying one global fallback");
+            authentication_probe_attempt(&executable, codex_home, data_root, false)
+                .map_err(|failure| failure.message)
+        }
+        Err(failure) => Err(failure.message),
+    }
+}
+
+struct PendingAppServerReap {
+    child: security::ChildGuard,
+    generation: Option<PreparedGeneration>,
+}
+
+#[derive(Default)]
+struct AppServerReapQueue {
+    pending: Mutex<Vec<PendingAppServerReap>>,
+}
+
+impl AppServerReapQueue {
+    fn finish_with<F>(
+        &self,
+        mut child: security::ChildGuard,
+        generation: Option<PreparedGeneration>,
+        reap: F,
+    ) where
+        F: FnOnce(&mut security::ChildGuard) -> bool,
+    {
+        if reap(&mut child) {
+            if let Some(generation) = generation {
+                let _ = generation.cleanup();
+            }
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(PendingAppServerReap { child, generation });
+    }
+
+    fn retry(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.retain_mut(|server| {
+            if server.child.kill_and_reap().is_err() {
+                return true;
+            }
+            if let Some(generation) = server.generation.take() {
+                let _ = generation.cleanup();
+            }
+            false
+        });
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+fn pending_app_server_reaps() -> &'static AppServerReapQueue {
+    static PENDING: OnceLock<AppServerReapQueue> = OnceLock::new();
+    PENDING.get_or_init(AppServerReapQueue::default)
+}
+
+fn prepare_app_server_generation(
+    data_root: &Path,
+    codex_home: &Path,
+) -> Result<PreparedGeneration, String> {
+    pending_app_server_reaps().retry();
+    PreparedGeneration::prepare(&data_root.join("app-server-sqlite"), codex_home).map_err(|error| {
+        format!("Codex private app-server SQLite home could not be prepared: {error}")
+    })
+}
+
+fn spawn_isolated_app_server(
+    executable: &Path,
+    data_root: &Path,
+    codex_home: &Path,
+) -> Result<RecorderAppServer, String> {
+    let generation = prepare_app_server_generation(data_root, codex_home)?;
+    RecorderAppServer::spawn(executable, Some(generation))
+}
+
+struct RecorderAppServer {
+    child: security::ChildGuard,
+    generation: Option<PreparedGeneration>,
+    input: ChildStdin,
+    output: Receiver<Result<String, String>>,
+}
+
+impl RecorderAppServer {
+    fn spawn(executable: &Path, generation: Option<PreparedGeneration>) -> Result<Self, String> {
+        let mut command = Command::new(executable);
+        command.arg("app-server");
+        if let Some(generation) = generation.as_ref() {
+            command.arg("-c").arg(generation.sqlite_home_override());
+        }
+        let child = match command
+            .arg("--stdio")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => {
+                if let Some(generation) = generation {
+                    let _ = generation.cleanup();
+                }
+                return Err("Codex app-server could not be started".to_owned());
+            }
+        };
+        let mut child = security::ChildGuard::new(child);
+        let Some(input) = child.child_mut().ok().and_then(|child| child.stdin.take()) else {
+            pending_app_server_reaps()
+                .finish_with(child, generation, |child| child.kill_and_reap().is_ok());
+            return Err("Codex app-server stdin is unavailable".to_owned());
+        };
+        let Some(stdout) = child.child_mut().ok().and_then(|child| child.stdout.take()) else {
+            drop(input);
+            pending_app_server_reaps()
+                .finish_with(child, generation, |child| child.kill_and_reap().is_ok());
+            return Err("Codex app-server stdout is unavailable".to_owned());
+        };
+        Ok(Self {
+            child,
+            generation,
+            input,
+            output: app_server_reader(stdout),
+        })
+    }
+
+    fn shutdown(self) {
+        let Self {
+            child,
+            generation,
+            input,
+            output,
+        } = self;
         drop(input);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex app-server stdout is unavailable".to_owned());
+        drop(output);
+        pending_app_server_reaps()
+            .finish_with(child, generation, |child| child.kill_and_reap().is_ok());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod issue182_app_server_reap_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn failed_reap_retains_generation_until_child_is_reaped() {
+        let temporary = tempfile::tempdir().expect("create reaper fixture root");
+        let root = temporary.path();
+        let codex_home = root.join("codex-home");
+        let data_root = root.join("data");
+        fs::create_dir(&codex_home).expect("create Codex home");
+        fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700))
+            .expect("protect Codex home");
+        fs::create_dir(&data_root).expect("create data root");
+        fs::set_permissions(&data_root, fs::Permissions::from_mode(0o700))
+            .expect("protect data root");
+        let state = codex_home.join("state_5.sqlite");
+        Connection::open(&state)
+            .expect("create Codex state fixture")
+            .execute_batch("CREATE TABLE fixture (value INTEGER); INSERT INTO fixture VALUES (1);")
+            .expect("seed Codex state fixture");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o600))
+            .expect("protect Codex state fixture");
+
+        let generation = prepare_app_server_generation(&data_root, &codex_home)
+            .expect("prepare isolated generation");
+        let generation_path = generation.path().to_owned();
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start child fixture");
+        let queue = AppServerReapQueue::default();
+        queue.finish_with(security::ChildGuard::new(child), Some(generation), |_| {
+            false
+        });
+
+        assert_eq!(queue.len(), 1);
+        assert!(
+            generation_path.is_dir(),
+            "generation remains while reap is pending"
+        );
+        queue.retry();
+        assert_eq!(queue.len(), 0);
+        assert!(
+            !generation_path.exists(),
+            "generation is cleaned only after the child is reaped"
+        );
+    }
+}
+
+struct AuthProbeFailure {
+    global_fallback_allowed: bool,
+    message: String,
+}
+
+fn authentication_probe_attempt(
+    executable: &Path,
+    codex_home: &Path,
+    data_root: &Path,
+    isolated: bool,
+) -> Result<CodexAuthenticationState, AuthProbeFailure> {
+    let mut server = if isolated {
+        let generation =
+            prepare_app_server_generation(data_root, codex_home).map_err(|message| {
+                AuthProbeFailure {
+                    global_fallback_allowed: true,
+                    message,
+                }
+            })?;
+        RecorderAppServer::spawn(executable, Some(generation)).map_err(|message| {
+            AuthProbeFailure {
+                global_fallback_allowed: true,
+                message,
+            }
+        })?
+    } else {
+        RecorderAppServer::spawn(executable, None).map_err(|message| AuthProbeFailure {
+            global_fallback_allowed: false,
+            message,
+        })?
     };
-    let output = app_server_reader(stdout);
     let result = (|| {
         request_app_server(
-            &mut input,
-            &output,
+            &mut server.input,
+            &server.output,
             1,
             "initialize",
             json!({
@@ -682,29 +915,54 @@ pub fn probe_codex_authentication_state() -> Result<CodexAuthenticationState, St
                 },
                 "capabilities": {"experimentalApi": true}
             }),
-        )?;
-        let before = decode_codex_authentication_state(&request_app_server(
-            &mut input,
-            &output,
-            2,
-            "account/read",
-            json!({}),
-        )?)?;
-        let after = decode_codex_authentication_state(&request_app_server(
-            &mut input,
-            &output,
-            3,
-            "account/read",
-            json!({}),
-        )?)?;
+        )
+        .map_err(|message| AuthProbeFailure {
+            global_fallback_allowed: isolated,
+            message,
+        })?;
+        let before = decode_codex_authentication_state(
+            &request_app_server(
+                &mut server.input,
+                &server.output,
+                2,
+                "account/read",
+                json!({}),
+            )
+            .map_err(|message| AuthProbeFailure {
+                global_fallback_allowed: false,
+                message,
+            })?,
+        )
+        .map_err(|message| AuthProbeFailure {
+            global_fallback_allowed: false,
+            message,
+        })?;
+        let after = decode_codex_authentication_state(
+            &request_app_server(
+                &mut server.input,
+                &server.output,
+                3,
+                "account/read",
+                json!({}),
+            )
+            .map_err(|message| AuthProbeFailure {
+                global_fallback_allowed: false,
+                message,
+            })?,
+        )
+        .map_err(|message| AuthProbeFailure {
+            global_fallback_allowed: false,
+            message,
+        })?;
         if before != after {
-            return Err("Codex account identity changed during auth probe".to_owned());
+            return Err(AuthProbeFailure {
+                global_fallback_allowed: false,
+                message: "Codex account identity changed during auth probe".to_owned(),
+            });
         }
         Ok(before)
     })();
-    drop(input);
-    let _ = child.kill();
-    let _ = child.wait();
+    server.shutdown();
     result
 }
 
@@ -732,13 +990,6 @@ impl AccountIdentityWindow {
     fn is_stable(&self, authority: &AccountAuthority, account: &AppServerAccount) -> bool {
         self.authority == *authority && self.account == *account
     }
-}
-
-fn default_codex_home() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
 fn read_account_authority(codex_home: &Path) -> Result<AccountAuthority, String> {
@@ -1011,32 +1262,14 @@ fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), ()> {
     .scan()
 }
 
-fn fetch_quota_snapshot() -> QuotaPollResult {
-    let authority_before = read_account_authority(&default_codex_home())?;
+fn fetch_quota_snapshot(codex_home: &Path, data_root: &Path) -> QuotaPollResult {
+    let authority_before = read_account_authority(codex_home)?;
     let executable = resolve_codex_executable()?;
-    let mut child = Command::new(executable)
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "Codex app-server could not be started".to_owned())?;
-    let Some(mut input) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex app-server stdin is unavailable".to_owned());
-    };
-    let Some(stdout) = child.stdout.take() else {
-        drop(input);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex app-server stdout is unavailable".to_owned());
-    };
-    let output = app_server_reader(stdout);
+    let mut server = spawn_isolated_app_server(&executable, data_root, codex_home)?;
     let result = (|| {
         request_app_server(
-            &mut input,
-            &output,
+            &mut server.input,
+            &server.output,
             1,
             "initialize",
             json!({
@@ -1047,21 +1280,32 @@ fn fetch_quota_snapshot() -> QuotaPollResult {
                 "capabilities": {"experimentalApi": true}
             }),
         )?;
-        let account_value = request_app_server(&mut input, &output, 2, "account/read", json!({}))?;
+        let account_value = request_app_server(
+            &mut server.input,
+            &server.output,
+            2,
+            "account/read",
+            json!({}),
+        )?;
         let account = decode_app_server_account(&account_value)?;
         let identity = AccountIdentityWindow::new(authority_before.clone(), account.clone());
         let rate_limits = request_app_server(
-            &mut input,
-            &output,
+            &mut server.input,
+            &server.output,
             3,
             "account/rateLimits/read",
             Value::Null,
         )?;
         let snapshot = parse_app_server_quota(&rate_limits, &account.plan_type)?;
-        let account_recheck =
-            request_app_server(&mut input, &output, 4, "account/read", json!({}))?;
+        let account_recheck = request_app_server(
+            &mut server.input,
+            &server.output,
+            4,
+            "account/read",
+            json!({}),
+        )?;
         let account_after = decode_app_server_account(&account_recheck)?;
-        let authority_after = read_account_authority(&default_codex_home())
+        let authority_after = read_account_authority(codex_home)
             .map_err(|_| "Codex account identity changed during quota read".to_owned())?;
         if authority_after != authority_before {
             signal_account_boundary_changed();
@@ -1077,11 +1321,8 @@ fn fetch_quota_snapshot() -> QuotaPollResult {
             epoch,
         })
     })();
-    drop(input);
-    // The recorder owns this short-lived app-server connection. Reap it on
-    // every path so a quota outage cannot leak one process per cycle.
-    let _ = child.kill();
-    let _ = child.wait();
+    // The private generation remains locked until this child is reaped.
+    server.shutdown();
     result
 }
 
@@ -1251,6 +1492,8 @@ fn request_app_server_before_deadline(
 }
 
 fn collect_active_thread_snapshot(
+    codex_home: &Path,
+    data_root: &Path,
     sessions_root: &Path,
     checkpoints: &[SessionCheckpoint],
 ) -> ActiveThreadPollResult {
@@ -1259,7 +1502,7 @@ fn collect_active_thread_snapshot(
         Err(error) => return ActiveThreadPollResult::Failed(error),
     };
     if active_paths.is_empty() {
-        return match AccountEpochProof::capture(&default_codex_home()) {
+        return match AccountEpochProof::capture(codex_home) {
             Ok(epoch) => ActiveThreadPollResult::Empty { epoch },
             Err(error) => ActiveThreadPollResult::Failed(error),
         };
@@ -1315,38 +1558,18 @@ fn collect_active_thread_snapshot(
             )
         }
     };
-    let authority_before = match read_account_authority(&default_codex_home()) {
+    let authority_before = match read_account_authority(codex_home) {
         Ok(authority) => authority,
         Err(error) => return ActiveThreadPollResult::Failed(error),
     };
-    let mut child = match Command::new(executable)
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => {
-            return ActiveThreadPollResult::Failed("Codex app-server start failed".to_owned())
-        }
+    let mut server = match spawn_isolated_app_server(&executable, data_root, codex_home) {
+        Ok(server) => server,
+        Err(error) => return ActiveThreadPollResult::Failed(error),
     };
-    let Some(mut input) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return ActiveThreadPollResult::Failed("Codex app-server stdin unavailable".to_owned());
-    };
-    let Some(stdout) = child.stdout.take() else {
-        drop(input);
-        let _ = child.kill();
-        let _ = child.wait();
-        return ActiveThreadPollResult::Failed("Codex app-server stdout unavailable".to_owned());
-    };
-    let output = app_server_reader(stdout);
     let result = (|| {
         request_app_server_before_deadline(
-            &mut input,
-            &output,
+            &mut server.input,
+            &server.output,
             1,
             "initialize",
             json!({
@@ -1359,8 +1582,8 @@ fn collect_active_thread_snapshot(
             deadline,
         )?;
         let account_value = request_app_server_before_deadline(
-            &mut input,
-            &output,
+            &mut server.input,
+            &server.output,
             2,
             "account/read",
             json!({}),
@@ -1379,8 +1602,8 @@ fn collect_active_thread_snapshot(
                 .checked_add(1)
                 .ok_or_else(|| "thread request id exhausted".to_owned())?;
             let result = request_app_server_before_deadline(
-                &mut input,
-                &output,
+                &mut server.input,
+                &server.output,
                 request_id,
                 "thread/read",
                 json!({"threadId": thread_id, "includeTurns": false}),
@@ -1411,15 +1634,15 @@ fn collect_active_thread_snapshot(
             thread_items.push(thread_item.clone());
         }
         let account_recheck = request_app_server_before_deadline(
-            &mut input,
-            &output,
+            &mut server.input,
+            &server.output,
             next_request_id,
             "account/read",
             json!({}),
             deadline,
         )?;
         let account_after = decode_app_server_account(&account_recheck)?;
-        let authority_after = read_account_authority(&default_codex_home())
+        let authority_after = read_account_authority(codex_home)
             .map_err(|_| "Codex account identity changed during thread read".to_owned())?;
         if authority_after != authority_before {
             signal_account_boundary_changed();
@@ -1480,9 +1703,7 @@ fn collect_active_thread_snapshot(
             epoch,
         ))
     })();
-    drop(input);
-    let _ = child.kill();
-    let _ = child.wait();
+    server.shutdown();
     match result {
         Ok((threads, epoch)) if threads.is_empty() => ActiveThreadPollResult::Empty { epoch },
         Ok((threads, epoch)) => ActiveThreadPollResult::Snapshot {
