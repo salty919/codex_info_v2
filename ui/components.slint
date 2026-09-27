@@ -1652,7 +1652,7 @@ export component ModelUsage inherits Rectangle {
     property <length> group-gap: 4px;
     property <length> group-width: (root.width - 24px - root.model-column-width - 3 * root.group-gap) / 3;
     property <length> dollar-width: 50px;
-    height: 102px;
+    height: 120px;
     border-radius: 8px;
     border-width: 1px;
     border-color: DesignTokens.main-section-border;
@@ -1679,32 +1679,32 @@ export component ModelUsage inherits Rectangle {
     Text { x: 12px + root.model-column-width + 3 * root.group-gap + 3 * root.group-width - root.dollar-width; y: 7px; width: root.dollar-width; height: 18px;
         text: "$"; color: DesignTokens.main-label; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
-    Text { x: 12px; y: 28px; width: root.model-column-width; height: 66px;
+    Text { x: 12px; y: 28px; width: root.model-column-width; height: 88px;
         visible: root.has-data; text: root.model-names; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; vertical-alignment: top; overflow: elide; }
-    Text { x: 12px + root.model-column-width + root.group-gap; y: 28px; width: root.group-width - root.dollar-width; height: 66px;
+    Text { x: 12px + root.model-column-width + root.group-gap; y: 28px; width: root.group-width - root.dollar-width; height: 88px;
         visible: root.has-data; text: root.input-token-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 12px + root.model-column-width + root.group-gap + root.group-width - root.dollar-width; y: 28px; width: root.dollar-width; height: 66px;
+    Text { x: 12px + root.model-column-width + root.group-gap + root.group-width - root.dollar-width; y: 28px; width: root.dollar-width; height: 88px;
         visible: root.has-data; text: root.input-cost-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 12px + root.model-column-width + 2 * root.group-gap + root.group-width; y: 28px; width: root.group-width - root.dollar-width; height: 66px;
+    Text { x: 12px + root.model-column-width + 2 * root.group-gap + root.group-width; y: 28px; width: root.group-width - root.dollar-width; height: 88px;
         visible: root.has-data; text: root.cached-token-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 12px + root.model-column-width + 2 * root.group-gap + 2 * root.group-width - root.dollar-width; y: 28px; width: root.dollar-width; height: 66px;
+    Text { x: 12px + root.model-column-width + 2 * root.group-gap + 2 * root.group-width - root.dollar-width; y: 28px; width: root.dollar-width; height: 88px;
         visible: root.has-data; text: root.cached-cost-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 12px + root.model-column-width + 3 * root.group-gap + 2 * root.group-width; y: 28px; width: root.group-width - root.dollar-width; height: 66px;
+    Text { x: 12px + root.model-column-width + 3 * root.group-gap + 2 * root.group-width; y: 28px; width: root.group-width - root.dollar-width; height: 88px;
         visible: root.has-data; text: root.output-token-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 12px + root.model-column-width + 3 * root.group-gap + 3 * root.group-width - root.dollar-width; y: 28px; width: root.dollar-width; height: 66px;
+    Text { x: 12px + root.model-column-width + 3 * root.group-gap + 3 * root.group-width - root.dollar-width; y: 28px; width: root.dollar-width; height: 88px;
         visible: root.has-data; text: root.output-cost-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
     if !root.has-data : Text {
         x: 12px;
         y: 28px;
         width: parent.width - 24px;
-        height: 66px;
+        height: 88px;
         text: root.strings.no-records;
         color: DesignTokens.main-label;
         font-size: 12px;
@@ -1765,7 +1765,7 @@ export component StatusBanner inherits Rectangle {
     }
     Text {
         x: parent.width - 222px;
-        y: 3px;
+        y: 12px;
         width: 210px;
         height: 17px;
         text: root.last-received;

@@ -844,6 +844,7 @@ const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
 #[cfg(test)]
 const GRAPH_METRIC_OPTIONS: [&str; 2] = ["ドル", "トークン"];
 const FIXED_WINDOW_WIDTH: u32 = 900;
+#[cfg(test)]
 const FIXED_WINDOW_HEIGHT: u32 = 480;
 const GRAPH_WINDOW_WIDTH: u32 = 940;
 const GRAPH_WINDOW_HEIGHT: u32 = 640;
@@ -928,8 +929,8 @@ fn fixed_resize_decision_for_scale(
     fixed_resize_decision_for_size(width, height, expected_width, expected_height)
 }
 
-fn install_fixed_window_guard(window: &slint::Window) {
-    install_window_size_guard(window, FIXED_WINDOW_WIDTH, FIXED_WINDOW_HEIGHT);
+fn install_fixed_window_guard(window: &slint::Window, height: u32) {
+    install_window_size_guard(window, FIXED_WINDOW_WIDTH, height);
 }
 
 fn visible_window_position(
@@ -19145,7 +19146,7 @@ fn native_main_labels(
             "残量不足",
             "リセット警告",
             "リセット時刻",
-            "Linux の観測時刻",
+            "観測時刻",
         ),
         "zh-Hans" => (
             "设置",
@@ -19157,7 +19158,7 @@ fn native_main_labels(
             "配额不足",
             "即将重置",
             "重置时间",
-            "Linux 观测时间",
+            "观测时间",
         ),
         "ko" => (
             "설정",
@@ -19169,7 +19170,7 @@ fn native_main_labels(
             "잔여량 부족",
             "곧 재설정",
             "재설정 시각",
-            "Linux 관측 시각",
+            "관측 시각",
         ),
         "es" => (
             "Configuración",
@@ -19181,7 +19182,7 @@ fn native_main_labels(
             "Cuota crítica",
             "Restablecimiento próximo",
             "Hora de restablecimiento",
-            "Observación de Linux",
+            "Observación",
         ),
         "fr" => (
             "Paramètres",
@@ -19193,7 +19194,7 @@ fn native_main_labels(
             "Quota critique",
             "Réinitialisation imminente",
             "Heure de réinitialisation",
-            "Observation Linux",
+            "Observation",
         ),
         "de" => (
             "Einstellungen",
@@ -19205,7 +19206,7 @@ fn native_main_labels(
             "Kontingent kritisch",
             "Zurücksetzung steht bevor",
             "Zurücksetzzeit",
-            "Linux-Beobachtung",
+            "Beobachtung",
         ),
         "pt" => (
             "Configurações",
@@ -19217,7 +19218,7 @@ fn native_main_labels(
             "Cota crítica",
             "Redefinição próxima",
             "Hora de redefinição",
-            "Observação do Linux",
+            "Observação",
         ),
         "it" => (
             "Impostazioni",
@@ -19229,7 +19230,7 @@ fn native_main_labels(
             "Quota critica",
             "Ripristino imminente",
             "Ora di ripristino",
-            "Osservazione Linux",
+            "Osservazione",
         ),
         "ru" => (
             "Настройки",
@@ -19241,7 +19242,7 @@ fn native_main_labels(
             "Критическая квота",
             "Скорый сброс",
             "Время сброса",
-            "Наблюдение Linux",
+            "Наблюдение",
         ),
         _ => (
             "Settings",
@@ -19253,7 +19254,7 @@ fn native_main_labels(
             "Quota critical",
             "Reset soon",
             "Reset time",
-            "Linux observation",
+            "Observation",
         ),
     }
 }
@@ -22681,8 +22682,6 @@ where
     });
     if let Err(error) = result {
         state.service_threads_error = Some(error);
-        state.thread_error = true;
-        state.refresh_partial_failure_status();
     }
 }
 
@@ -23133,7 +23132,7 @@ fn run_ui(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
     let service_endpoint = service_config.listen_addr();
-    install_fixed_window_guard(ui.window());
+    install_fixed_window_guard(ui.window(), 498);
     place_main_window_on_primary_monitor(ui.window());
     let preview_size = std::env::var("CODEX_INFO_PREVIEW_SIZE")
         .ok()
@@ -23426,7 +23425,7 @@ fn run_ui(
             let mut threads_window = threads_window.borrow_mut();
             if threads_window.is_none() {
                 if let Ok(window) = ThreadsWindow::new() {
-                    install_fixed_window_guard(window.window());
+                    install_fixed_window_guard(window.window(), 480);
                     let weak_window = window.as_weak();
                     window.on_begin_window_drag(move || {
                         if let Some(window) = weak_window.upgrade() {
@@ -24072,17 +24071,17 @@ mod tests {
 
         for marker in [
             "preferred-width: 900px;",
-            "preferred-height: 480px;",
+            "preferred-height: 498px;",
             "private property <length> main-content-x: 22px;",
             "private property <length> main-content-y: 14px;",
             "private property <length> main-content-width: 856px;",
-            "private property <length> main-content-height: 452px;",
+            "private property <length> main-content-height: 470px;",
             "private property <length> main-header-y: 0px;",
             "private property <length> main-quota-y: 60px;",
             "private property <length> main-week-y: 150px;",
             "private property <length> main-activity-y: 236px;",
             "private property <length> main-model-y: 300px;",
-            "private property <length> main-status-y: 410px;",
+            "private property <length> main-status-y: 428px;",
         ] {
             assert!(
                 app.contains(marker),
@@ -24166,7 +24165,7 @@ mod tests {
             (
                 "export component ModelUsage inherits Rectangle {",
                 "export component StatusBanner inherits Rectangle {",
-                "height: 102px;",
+                "height: 120px;",
             ),
         ];
         for (start, end, height) in sections {
@@ -24248,8 +24247,8 @@ mod tests {
         assert!(!startup_gate.contains("121 - failure_attempt"));
         for marker in [
             "failure_frame_ready=0\nfor _ in $(seq 1 120); do",
-            "status_bounds = (22, 424, 878, 466)",
-            "retry_bounds = (778, 431, 870, 459)",
+            "status_bounds = (22, 442, 878, 484)",
+            "retry_bounds = (778, 449, 870, 477)",
             "error_background = (58, 29, 36)",
             "error_border = (142, 61, 77)",
             "error_accent = (224, 107, 122)",
@@ -24263,6 +24262,40 @@ mod tests {
                 "startup failure-state gate drifted from fixed Main layout: {marker}"
             );
         }
+    }
+
+    #[test]
+    fn issue_394_four_model_rows_fit_main_viewport() {
+        let app = include_str!("../ui/app.slint");
+        let components = include_str!("../ui/components.slint");
+        for marker in [
+            "preferred-height: 498px;",
+            "private property <length> main-content-y: 14px;",
+            "private property <length> main-content-height: 470px;",
+            "private property <length> main-model-y: 300px;",
+            "private property <length> main-status-y: 428px;",
+            "height: 120px;",
+        ] {
+            assert!(app.contains(marker), "Main geometry marker: {marker}");
+        }
+
+        let model = components
+            .split("export component ModelUsage inherits Rectangle {")
+            .nth(1)
+            .and_then(|body| {
+                body.split("export component StatusBanner inherits Rectangle {")
+                    .next()
+            })
+            .expect("ModelUsage component");
+        assert!(model.contains("height: 120px;"), "model card height");
+        assert_eq!(model.matches("height: 88px;").count(), 8);
+        assert_eq!(4 * 22, 88);
+
+        let footer_y = 14 + 428;
+        let footer_bottom = footer_y + 42;
+        assert_eq!(footer_y, 442);
+        assert_eq!(footer_bottom, 484);
+        assert_eq!(498 - footer_bottom, 14);
     }
 
     #[derive(Deserialize)]
@@ -35518,13 +35551,13 @@ mod tests {
         assert!(rust_source.contains("request_inner_size"));
         assert_eq!(
             rust_source
-                .matches("install_fixed_window_guard(ui.window())")
+                .matches("install_fixed_window_guard(ui.window(), 498)")
                 .count(),
             1
         );
         assert_eq!(
             rust_source
-                .matches("install_fixed_window_guard(window.window())")
+                .matches("install_fixed_window_guard(window.window(), 480)")
                 .count(),
             1
         );
@@ -36042,9 +36075,9 @@ mod tests {
         assert!(main.contains("min-width: 900px;"));
         assert!(main.contains("max-width: 900px;"));
         assert!(main.contains("preferred-width: 900px;"));
-        assert!(main.contains("min-height: 480px;"));
-        assert!(main.contains("max-height: 480px;"));
-        assert!(main.contains("preferred-height: 480px;"));
+        assert!(main.contains("min-height: 498px;"));
+        assert!(main.contains("max-height: 498px;"));
+        assert!(main.contains("preferred-height: 498px;"));
         for marker in [
             "changed maximized =>",
             "changed full-screen =>",
@@ -36584,7 +36617,75 @@ mod tests {
             }
         }
 
-        let japanese = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
+        use codex_info::i18n::Language;
+        let expected_copy = [
+            (
+                Language::Japanese,
+                "観測時刻",
+                "最新スナップショットを表示しています。",
+            ),
+            (
+                Language::English,
+                "Observation",
+                "Showing the latest snapshot.",
+            ),
+            (
+                Language::SimplifiedChinese,
+                "观测时间",
+                "正在显示最新快照。",
+            ),
+            (Language::Korean, "관측 시각", "최신 스냅샷을 표시합니다."),
+            (
+                Language::Spanish,
+                "Observación",
+                "Mostrando la instantánea más reciente.",
+            ),
+            (
+                Language::French,
+                "Observation",
+                "Dernier instantané affiché.",
+            ),
+            (
+                Language::German,
+                "Beobachtung",
+                "Der aktuelle Snapshot wird angezeigt.",
+            ),
+            (
+                Language::Portuguese,
+                "Observação",
+                "Exibindo o instantâneo mais recente.",
+            ),
+            (
+                Language::Italian,
+                "Osservazione",
+                "Visualizzazione dell’istantanea più recente.",
+            ),
+            (Language::Russian, "Наблюдение", "Показан последний снимок."),
+        ];
+        assert_eq!(expected_copy.map(|entry| entry.0), Language::ALL);
+        for (language, expected_label, expected_detail) in expected_copy {
+            let localized = I18n::from_parts(language, chrono_tz::Tz::UTC);
+            let observed_label = super::native_main_labels(&localized).9;
+            if observed_label != expected_label {
+                mismatches.push(format!(
+                    "{} Main observation label: {observed_label:?}",
+                    language.code()
+                ));
+            }
+            let detail = localized.main_ready_status_detail();
+            if detail != expected_detail {
+                mismatches.push(format!("{} Main ready detail: {detail:?}", language.code()));
+            }
+        }
+        for unsupported in ["C", "POSIX", "zz_ZZ"] {
+            let fallback = Language::detect_from_values(
+                Some(unsupported),
+                Some("ja_JP.UTF-8"),
+                Some("ja_JP.UTF-8"),
+            );
+            assert_eq!(fallback, Language::English, "{unsupported}");
+        }
+        let japanese = I18n::from_parts(Language::Japanese, chrono_tz::Tz::UTC);
         let countdown = japanese
             .format_period_remaining(86_400 + 3_600 + 60, codex_info::i18n::PeriodKind::Weekly);
         if countdown != "残り 1日 1時間 1分" {
@@ -36594,7 +36695,7 @@ mod tests {
         ready.i18n = japanese;
         ready.status = ready.i18n.format_last_updated(ready.last_success_at);
         let detail = ready.display_status_detail();
-        if detail != "Linux 側の最新スナップショットを表示しています。" {
+        if detail != "最新スナップショットを表示しています。" {
             mismatches.push(format!("normal status detail: {detail:?}"));
         }
 
@@ -36630,10 +36731,10 @@ mod tests {
             "private property <length> main-content-x: 22px;",
             "private property <length> main-content-y: 14px;",
             "private property <length> main-content-width: 856px;",
-            "private property <length> main-content-height: 452px;",
+            "private property <length> main-content-height: 470px;",
             "private property <length> main-quota-y: 60px;",
             "private property <length> main-week-y: 150px;",
-            "private property <length> main-status-y: 410px;",
+            "private property <length> main-status-y: 428px;",
         ] {
             assert!(app.contains(marker), "Main geometry marker: {marker}");
         }
@@ -36679,7 +36780,7 @@ mod tests {
             "x: 10px;\n        y: 17px;\n        width: 8px;\n        height: 8px;",
             "x: 28px;\n        y: 3px;\n        width: root.show-action ? parent.width - root.action-width - 48px : parent.width - 250px;",
             "x: 28px;\n        y: 20px;",
-            "x: parent.width - 222px;\n        y: 3px;\n        width: 210px;",
+            "x: parent.width - 222px;\n        y: 12px;\n        width: 210px;\n        height: 17px;",
             "DesignTokens.main-status-error-background",
             "DesignTokens.main-status-warning-background",
             "DesignTokens.main-status-normal-background",
@@ -41744,6 +41845,101 @@ mod tests {
         });
         assert_eq!(thread_requests, 1);
         assert!(!state.service_current_bundle_retry_pending);
+    }
+
+    #[test]
+    fn linux_open_threads_poll_failure_isolated_from_main_footer() {
+        let pair = published_pair(15, 1);
+        let mut state = seeded_split_service_client(&pair);
+
+        let snapshot = state
+            .service_current_snapshot
+            .as_ref()
+            .expect("accepted current bundle snapshot");
+        assert_eq!(snapshot.state, codex_info::server::PublicState::Ready);
+        assert!(snapshot.authenticated);
+        let current_pair = state
+            .service_current_pair
+            .clone()
+            .expect("accepted current bundle pair");
+        assert_eq!(current_pair, pair);
+        assert_eq!(
+            state.service_threads_pair.as_deref(),
+            Some(current_pair.as_str())
+        );
+        assert!(state.service_endpoint_error.is_none());
+        assert!(state.account_error.is_none());
+        assert!(!state.local_usage_error);
+        assert!(!state.recorder_store_error);
+        assert!(!state.thread_error);
+
+        state.i18n = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
+        state.error = None;
+        state.status = state.i18n.format_last_updated(state.last_success_at);
+        assert_eq!(native_status_title(&state), "正常");
+        assert_eq!(
+            state.display_status_detail(),
+            state.i18n.main_ready_status_detail()
+        );
+        assert_eq!(state.status_level(), "info");
+        assert_eq!(state.error, None);
+
+        let ready_title = native_status_title(&state).to_owned();
+        let ready_detail = state.display_status_detail();
+        let ready_level = state.status_level();
+        let ready_error = state.error.clone();
+        let quota = (
+            state.has_quota_percent,
+            state.remaining_percent,
+            state.reset_at,
+            state.window_seconds,
+            state.limit_name.clone(),
+            state.quota_title.clone(),
+            state.monthly,
+        );
+        let models = state.model_usage.clone();
+        let thread_summary = super::active_thread_summary(&state.active_threads);
+        let now = Instant::now();
+        state.service_threads_last_poll = now - super::SERVICE_THREADS_POLL_INTERVAL;
+        let mut requests = 0;
+
+        super::poll_service_threads_resources_with(&mut state, now, |route, etag| {
+            requests += 1;
+            assert_eq!(route, "/v3/threads");
+            assert_eq!(etag, Some(current_pair.as_str()));
+            Err("fixture independent threads transport failure".into())
+        });
+
+        assert_eq!(requests, 1);
+        assert_eq!(
+            state.service_threads_error.as_deref(),
+            Some("fixture independent threads transport failure")
+        );
+        assert_eq!(native_status_title(&state), ready_title);
+        assert_eq!(state.display_status_detail(), ready_detail);
+        assert_eq!(state.status_level(), ready_level);
+        assert_eq!(state.error, ready_error);
+        assert_eq!(
+            state.service_current_pair.as_deref(),
+            Some(current_pair.as_str())
+        );
+        assert_eq!(
+            (
+                state.has_quota_percent,
+                state.remaining_percent,
+                state.reset_at,
+                state.window_seconds,
+                state.limit_name.clone(),
+                state.quota_title.clone(),
+                state.monthly,
+            ),
+            quota
+        );
+        assert_eq!(state.model_usage, models);
+        assert_eq!(
+            super::active_thread_summary(&state.active_threads),
+            thread_summary
+        );
     }
 
     #[test]

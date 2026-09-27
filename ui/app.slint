@@ -10,11 +10,11 @@ export { GraphWindow, ThreadsWindow, LegalNoticeWindow, TimeZoneSettingsWindow, 
 
 export component MainWindow inherits Window {
     preferred-width: 900px;
-    preferred-height: 480px;
+    preferred-height: 498px;
     min-width: 900px;
     max-width: 900px;
-    min-height: 480px;
-    max-height: 480px;
+    min-height: 498px;
+    max-height: 498px;
     in-out property <string> window-title;
     in-out property <UiStrings> strings;
     // The application owns the title controls so the native frame never
@@ -82,18 +82,18 @@ export component MainWindow inherits Window {
     in-out property <string> status-level: "info";
     in-out property <float> remaining-percent: 0;
     in-out property <float> remaining-days: 0;
-    // Main shares the Windows client's fixed 900x480 client geometry. State
+    // Main shares the Windows client's fixed 900x498 client geometry. State
     // changes replace content inside these rows and never move a later row.
     private property <length> main-content-x: 22px;
     private property <length> main-content-y: 14px;
     private property <length> main-content-width: 856px;
-    private property <length> main-content-height: 452px;
+    private property <length> main-content-height: 470px;
     private property <length> main-header-y: 0px;
     private property <length> main-quota-y: 60px;
     private property <length> main-week-y: 150px;
     private property <length> main-activity-y: 236px;
     private property <length> main-model-y: 300px;
-    private property <length> main-status-y: 410px;
+    private property <length> main-status-y: 428px;
     private property <bool> show-data-cards: root.authenticated || root.historical-account || root.account-view-loading;
     callback begin-auth();
     callback check-auth();
@@ -209,7 +209,7 @@ export component MainWindow inherits Window {
                 y: root.main-model-y;
                 strings: root.strings;
                 width: root.main-content-width;
-                height: 102px;
+                height: 120px;
                 visible: root.show-data-cards;
                 has-data: root.has-model-usage;
                 model-names: root.model-usage-names;

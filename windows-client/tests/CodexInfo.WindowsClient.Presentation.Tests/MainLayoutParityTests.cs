@@ -58,6 +58,39 @@ public sealed class MainLayoutParityTests
     }
 
     [Fact]
+    public void MainLabelsAndReadyDetailUsePlatformNeutralCopyForEveryLocaleAndFallback()
+    {
+        var expected = new (string Code, string ObservedAt, string ReadyDetail)[]
+        {
+            ("ja", "観測時刻", "最新スナップショットを表示しています。"),
+            ("en", "Observation", "Showing the latest snapshot."),
+            ("zh-Hans", "观测时间", "正在显示最新快照。"),
+            ("ko", "관측 시각", "최신 스냅샷을 표시합니다."),
+            ("es", "Observación", "Mostrando la instantánea más reciente."),
+            ("fr", "Observation", "Dernier instantané affiché."),
+            ("de", "Beobachtung", "Der aktuelle Snapshot wird angezeigt."),
+            ("pt", "Observação", "Exibindo o instantâneo mais recente."),
+            ("it", "Osservazione", "Visualizzazione dell’istantanea più recente."),
+            ("ru", "Наблюдение", "Показан последний снимок.")
+        };
+        var languages = CodexInfo.WindowsClient.Localization.LocalizationService.Languages;
+        Assert.Equal(expected.Length, languages.Count);
+        foreach (var (code, observedAt, readyDetail) in expected)
+        {
+            var localized = languages.Single(text => text.LanguageCode == code);
+            Assert.Equal(observedAt, localized.ObservedAt);
+            Assert.Equal(readyDetail,
+                localized.StatusDetailFor("Ready", authLaunchFailed: false, hasSnapshot: true));
+        }
+
+        foreach (var unsupported in new[] { "C", "POSIX", "zz-ZZ" })
+        {
+            Assert.Equal("en",
+                CodexInfo.WindowsClient.Localization.LocalizationService.NormalizeLanguageCode(unsupported));
+        }
+    }
+
+    [Fact]
     public void MainClosedAccountSelectorMatchesLinuxReference()
     {
         var document = XDocument.Parse(LoadRepositoryFile(
@@ -127,7 +160,7 @@ public sealed class MainLayoutParityTests
         var document = XDocument.Parse(source);
         var surface = document.Descendants()
             .Single(element => element.Name.LocalName == "Grid" &&
-                element.Attribute("RowDefinitions")?.Value == "52,82,78,56,102,42");
+                element.Attribute("RowDefinitions")?.Value == "52,82,78,56,120,42");
 
         Assert.Equal("22,14", surface.Attribute("Margin")?.Value);
         Assert.Equal("8", surface.Attribute("RowSpacing")?.Value);
@@ -214,6 +247,7 @@ public sealed class MainLayoutParityTests
         var showLastReceived = status.Descendants().Single(element =>
             element.Name.LocalName == "StackPanel" &&
             element.Attribute("IsVisible")?.Value == "{Binding ShowLastReceived}");
+        Assert.Equal("2", showLastReceived.Attribute("Grid.RowSpan")?.Value);
         Assert.Equal("0,0,4,0", showLastReceived.Attribute("Margin")?.Value);
 
         var accountStyle = document.Descendants().Single(element =>
