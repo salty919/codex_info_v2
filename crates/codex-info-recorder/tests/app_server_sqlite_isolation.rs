@@ -151,6 +151,9 @@ overrides = [
 sqlite_home = overrides[0] if overrides else os.environ['CODEX_HOME']
 fail_private_initialize = os.environ.get('CODEX_INFO_FAKE_FAIL_PRIVATE_INITIALIZE') == '1'
 fail_private_account_read = os.environ.get('CODEX_INFO_FAKE_FAIL_PRIVATE_ACCOUNT_READ') == '1'
+thread_initialize_delay = float(os.environ.get('CODEX_INFO_FAKE_THREAD_INITIALIZE_DELAY_SECS', '0'))
+thread_read_delay = float(os.environ.get('CODEX_INFO_FAKE_THREAD_READ_DELAY_SECS', '0'))
+thread_read_marker = os.environ.get('CODEX_INFO_FAKE_THREAD_READ_MARKER')
 with sqlite3.connect(os.path.join(sqlite_home, 'logs_2.sqlite')) as connection:
     connection.execute('CREATE TABLE IF NOT EXISTS fixture (value INTEGER)')
 
@@ -173,6 +176,8 @@ for line in sys.stdin:
         name = request.get('params', {}).get('clientInfo', {}).get('name')
         with open(os.environ['CODEX_INFO_FAKE_CALLS'], 'a', encoding='utf-8') as calls:
             calls.write(json.dumps({'client': name, 'args': args}) + '\n')
+        if name == 'codex-info-recorder-thread-poller' and thread_initialize_delay:
+            time.sleep(thread_initialize_delay)
         if overrides and fail_private_initialize:
             print(json.dumps({'jsonrpc': '2.0', 'id': request_id, 'error': {'code': -32000, 'message': 'fixture failure'}}), flush=True)
             continue
@@ -185,6 +190,12 @@ for line in sys.stdin:
     elif method == 'account/rateLimits/read':
         result = quota
     elif method == 'thread/read':
+        if thread_read_marker:
+            with open(thread_read_marker, 'a', encoding='utf-8') as marker:
+                marker.write('thread/read\n')
+                marker.flush()
+        if thread_read_delay:
+            time.sleep(thread_read_delay)
         result = {'thread': {}}
     else:
         result = {}
@@ -287,6 +298,88 @@ fn checkpoint(sessions: &Path, session: &Path, committed_offset: u64) -> Session
         previous_output: 2,
         previous_cache_write_input: Some(0),
     }
+}
+
+#[test]
+fn thread_cycle_uses_one_deadline_across_initialize_and_read() {
+    let _environment_lock = ENVIRONMENT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temporary = tempfile::tempdir().expect("create isolated slow-child fixture root");
+    let root = temporary.path();
+    let codex_home = root.join("codex-home");
+    let data_root = root.join("data");
+    let sessions = codex_home.join("sessions");
+    private_directory(&codex_home);
+    private_directory(&data_root);
+    private_directory(&sessions);
+
+    let auth = codex_home.join("auth.json");
+    fs::write(&auth, br#"{"tokens":{"account_id":"fixture-account"}}"#)
+        .expect("write account fixture");
+    fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("protect account fixture");
+    let state = codex_home.join("state_5.sqlite");
+    {
+        let connection = Connection::open(&state).expect("create source SQLite fixture");
+        connection
+            .execute_batch("CREATE TABLE fixture (value INTEGER); INSERT INTO fixture VALUES (1);")
+            .expect("seed source SQLite fixture");
+    }
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600))
+        .expect("protect source SQLite fixture");
+
+    let app_server = root.join("fake-app-server.py");
+    fake_app_server(&app_server);
+    let calls = root.join("app-server-calls.jsonl");
+    let marker = root.join("thread-read-calls.txt");
+    let initialize_delay = Path::new("9");
+    let thread_read_delay = Path::new("14");
+    let session = sessions.join("one.jsonl");
+    let session_meta = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-1\"}}\n";
+    fs::write(&session, session_meta).expect("write active Session fixture");
+    let _environment = Environment::set(&[
+        ("CODEX_HOME", &codex_home),
+        ("CODEX_INFO_DATA_DIR", &data_root),
+        ("CODEX_INFO_CODEX_BIN", &app_server),
+        ("CODEX_INFO_FAKE_CALLS", &calls),
+        (
+            "CODEX_INFO_FAKE_THREAD_INITIALIZE_DELAY_SECS",
+            initialize_delay,
+        ),
+        ("CODEX_INFO_FAKE_THREAD_READ_DELAY_SECS", thread_read_delay),
+        ("CODEX_INFO_FAKE_THREAD_READ_MARKER", &marker),
+    ]);
+
+    let _live_codex = live_session_process(root, &session);
+    let threads = ThreadPoller::start(codex_home, data_root, sessions.clone());
+    let thread_checkpoint = checkpoint(&sessions, &session, session_meta.len() as u64);
+    assert!(threads.submit(&[thread_checkpoint]));
+
+    let cycle_start = Instant::now();
+    let result = threads
+        .wait_for(Duration::from_secs(20))
+        .expect("one shared 15-second deadline must complete before the 20-second oracle");
+    let elapsed = cycle_start.elapsed();
+    assert!(
+        matches!(result, ActiveThreadPollResult::Failed(_)),
+        "slow thread/read response must fail at the cycle deadline"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "cycle exceeded the 20-second oracle: {elapsed:?}"
+    );
+
+    let marker_records = fs::read_to_string(&marker).expect("thread/read reached fake child");
+    assert_eq!(
+        marker_records.lines().collect::<Vec<_>>(),
+        ["thread/read"],
+        "the cycle must reach thread/read exactly once without retry"
+    );
+    assert_eq!(
+        fake_app_server_launch_count(&calls, "codex-info-recorder-thread-poller"),
+        1,
+        "the slow cycle must launch exactly one isolated app-server child"
+    );
 }
 
 #[test]
