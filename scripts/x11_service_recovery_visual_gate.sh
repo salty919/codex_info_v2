@@ -74,7 +74,8 @@ proc_starttime() {
 }
 
 window_action() {
-    python3 - "$1" "$2" "$3" "$4" <<'PY'
+    local action="$4" status
+    if python3 - "$1" "$2" "$3" "$4" <<'PY'
 import ctypes
 import sys
 import time
@@ -83,36 +84,152 @@ window, x, y = (int(value, 0) for value in sys.argv[1:4])
 action = sys.argv[4]
 x11 = ctypes.CDLL("libX11.so.6")
 xtst = ctypes.CDLL("libXtst.so.6")
+
+class XWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int),
+        ("depth", ctypes.c_int),
+        ("visual", ctypes.c_void_p),
+        ("root", ctypes.c_ulong),
+        ("window_class", ctypes.c_int),
+        ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int),
+        ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong),
+        ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int),
+        ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int),
+        ("map_state", ctypes.c_int),
+        ("all_event_masks", ctypes.c_long),
+        ("your_event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int),
+        ("screen", ctypes.c_void_p),
+    ]
+
 x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
 x11.XOpenDisplay.restype = ctypes.c_void_p
 x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 x11.XWarpPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
                              ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
                              ctypes.c_int, ctypes.c_int]
+x11.XGetWindowAttributes.argtypes = [
+    ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(XWindowAttributes)
+]
+x11.XGetWindowAttributes.restype = ctypes.c_int
+x11.XQueryPointer.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_uint),
+]
+x11.XQueryPointer.restype = ctypes.c_int
+x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+x11.XDefaultScreen.restype = ctypes.c_int
+x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+x11.XRootWindow.restype = ctypes.c_ulong
 x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
 x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+error_handler_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+x11.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+x11.XSetErrorHandler.restype = ctypes.c_void_p
 xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+xtst.XTestFakeButtonEvent.restype = ctypes.c_int
 
 display = x11.XOpenDisplay(None)
 if not display:
-    raise SystemExit("X display is unavailable")
+    raise SystemExit(1)
+errors = []
+
+@error_handler_type
+def record_x_error(_display, _error):
+    errors.append(True)
+    return 0
+
+x11.XSetErrorHandler(ctypes.cast(record_x_error, ctypes.c_void_p))
+
 try:
     x11.XRaiseWindow(display, window)
     x11.XSync(display, 0)
-    if action == "click":
-        x11.XWarpPointer(display, 0, window, 0, 0, 0, 0, x, y)
-        x11.XSync(display, 0)
-        time.sleep(0.05)
-        if not xtst.XTestFakeButtonEvent(display, 1, 1, 0):
-            raise SystemExit("X button press failed")
-        if not xtst.XTestFakeButtonEvent(display, 1, 0, 0):
-            raise SystemExit("X button release failed")
-        x11.XSync(display, 0)
-    elif action != "raise":
+    if errors:
+        raise SystemExit(1)
+    if action == "raise":
+        raise SystemExit(0)
+    if action != "click":
         raise SystemExit(f"unknown X11 window action: {action}")
+
+    attributes = XWindowAttributes()
+    if (not x11.XGetWindowAttributes(display, window, ctypes.byref(attributes))
+            or errors or attributes.map_state != 2):  # IsViewable
+        raise SystemExit(1)
+
+    x11.XWarpPointer(display, 0, window, 0, 0, 0, 0, x, y)
+    x11.XSync(display, 0)
+    if errors:
+        raise SystemExit(1)
+    time.sleep(0.05)
+    if (not x11.XGetWindowAttributes(display, window, ctypes.byref(attributes))
+            or errors or attributes.map_state != 2):
+        raise SystemExit(1)
+
+    root = x11.XRootWindow(display, x11.XDefaultScreen(display))
+    current = root
+    root_return = ctypes.c_ulong()
+    child_return = ctypes.c_ulong()
+    root_x = ctypes.c_int()
+    root_y = ctypes.c_int()
+    window_x = ctypes.c_int()
+    window_y = ctypes.c_int()
+    mask = ctypes.c_uint()
+    for _ in range(8):  # match the product's maximum parent walk
+        if current == window:
+            break
+        child_return.value = 0
+        if (not x11.XQueryPointer(
+                display, current, ctypes.byref(root_return), ctypes.byref(child_return),
+                ctypes.byref(root_x), ctypes.byref(root_y), ctypes.byref(window_x),
+                ctypes.byref(window_y), ctypes.byref(mask)) or errors or not child_return.value):
+            raise SystemExit(1)
+        current = child_return.value
+    if current != window:
+        raise SystemExit(1)
+    child_return.value = 0
+    if (not x11.XQueryPointer(
+            display, window, ctypes.byref(root_return), ctypes.byref(child_return),
+            ctypes.byref(root_x), ctypes.byref(root_y), ctypes.byref(window_x),
+            ctypes.byref(window_y), ctypes.byref(mask)) or errors or child_return.value):
+        raise SystemExit(1)
+
+    if not xtst.XTestFakeButtonEvent(display, 1, 1, 0):
+        raise SystemExit(1)
+    x11.XSync(display, 0)
+    press_error = bool(errors)
+    release_sent = xtst.XTestFakeButtonEvent(display, 1, 0, 0)
+    x11.XSync(display, 0)
+    if not release_sent or press_error or errors:
+        raise SystemExit(1)
 finally:
     x11.XCloseDisplay(display)
 PY
+    then
+        return 0
+    else
+        status=$?
+        if [[ "$action" == "click" ]]; then
+            hold 'click target not established'
+        fi
+        return "$status"
+    fi
 }
 
 write_thread_summary_reference() {
