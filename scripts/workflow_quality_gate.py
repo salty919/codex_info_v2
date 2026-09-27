@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 from typing import Mapping, Sequence
@@ -1073,6 +1074,148 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
     finally:
         changes.unlink(missing_ok=True)
     return cases
+
+
+def _workflow_requirements_authority_dispatch_tests(selective_workflow: str) -> int:
+    """Run the actual workflow step against bounded command stubs."""
+    script = _step_script(selective_workflow, "Validate workflow contracts")
+    base_sha = "a" * 40
+    source_sha = "b" * 40
+
+    with tempfile.TemporaryDirectory(prefix="codex-info-authority-dispatch-") as raw_root:
+        root = Path(raw_root)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        git_output = root / "git-output.z"
+        git_args = root / "git-args.z"
+        authority_log = root / "authority.log"
+
+        stubs = {
+            "git": """#!/bin/sh
+set -eu
+printf '%s\\0' "$@" > "$GIT_ARGS_FILE"
+if [ "${GIT_EXIT_CODE:-0}" -ne 0 ]; then
+    exit "$GIT_EXIT_CODE"
+fi
+cat "$GIT_OUTPUT_FILE"
+""",
+            "go": "#!/bin/sh\nexit 0\n",
+            "python3": """#!/bin/sh
+set -eu
+case "${1:-}" in
+    -) exec "$REAL_PYTHON3" - ;;
+    scripts/workflow_inno_acquisition_gate.py)
+        [ "$#" -eq 2 ] && [ "$2" = --self-test ] || exit 91
+        exit 0
+        ;;
+    scripts/workflow_quality_gate.py)
+        [ "$#" -eq 2 ] && [ "$2" = --self-test ] || exit 92
+        exit 0
+        ;;
+    scripts/test_requirements_authority.py)
+        [ "$#" -eq 1 ] || exit 93
+        printf 'authority\\n' >> "$AUTHORITY_LOG"
+        exit 0
+        ;;
+    *)
+        printf 'unexpected python3 command: %s\\n' "$*" >&2
+        exit 94
+        ;;
+esac
+""",
+        }
+        for name, contents in stubs.items():
+            path = bin_dir / name
+            path.write_text(contents, encoding="utf-8")
+            path.chmod(0o755)
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{bin_dir}{os.pathsep}{environment.get('PATH', '')}",
+                "RELEASE_CANDIDATE": "true",
+                "BASE_SHA": base_sha,
+                "SOURCE_SHA": source_sha,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "REAL_PYTHON3": sys.executable,
+                "GIT_OUTPUT_FILE": str(git_output),
+                "GIT_ARGS_FILE": str(git_args),
+                "GIT_EXIT_CODE": "0",
+                "AUTHORITY_LOG": str(authority_log),
+            }
+        )
+
+        def execute_case(number: int, diff: bytes, expected_authority: int, *, git_exit: int = 0) -> None:
+            git_output.write_bytes(diff)
+            git_args.unlink(missing_ok=True)
+            authority_log.unlink(missing_ok=True)
+            environment["GIT_EXIT_CODE"] = str(git_exit)
+            result = subprocess.run(
+                ("bash", "-c", script),
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            authority_count = (
+                sum(line == "authority" for line in authority_log.read_text(encoding="utf-8").splitlines())
+                if authority_log.exists()
+                else 0
+            )
+            if git_exit == 0 and result.returncode != 0:
+                raise AssertionError(
+                    f"workflow authority dispatch case {number}: expected exit 0, "
+                    f"got {result.returncode}; stderr={result.stderr.strip()!r}"
+                )
+            if git_exit != 0 and result.returncode == 0:
+                raise AssertionError(
+                    f"workflow authority dispatch case {number}: expected nonzero exit, got 0"
+                )
+            if authority_count != expected_authority:
+                raise AssertionError(
+                    f"workflow authority dispatch case {number}: "
+                    f"expected authority={expected_authority} got {authority_count}"
+                )
+
+            if git_exit == 0:
+                args = git_args.read_bytes().split(b"\0")[:-1] if git_args.exists() else []
+                args = [argument.decode("utf-8") for argument in args]
+                expected_flags = (
+                    "--name-status",
+                    "-z",
+                    "-M",
+                    "-C",
+                    "--find-copies-harder",
+                )
+                position = 0
+                for argument in args:
+                    if position < len(expected_flags) and argument == expected_flags[position]:
+                        position += 1
+                if (
+                    position != len(expected_flags)
+                    or base_sha not in args
+                    or source_sha not in args
+                    or args.index(base_sha) > args.index(source_sha)
+                ):
+                    raise AssertionError(
+                        f"workflow authority dispatch case {number}: wrong git diff args {args!r}"
+                    )
+
+        execute_case(
+            1,
+            b"M\0scripts/requirements_authority.py\0",
+            1,
+        )
+        execute_case(
+            2,
+            b"M\0scripts/requirements_authority.py\0M\0docs/PRODUCT_REQUIREMENTS.md\0",
+            1,
+        )
+        execute_case(3, b"M\0scripts/ci_change_scope.py\0", 0)
+        execute_case(4, b"", 0, git_exit=37)
+    return 4
 
 
 def _command(
@@ -3399,6 +3542,9 @@ def workflow_selection_self_test() -> int:
     errors = validate(baseline)
     if errors:
         raise AssertionError("production workflow contract failed: " + "; ".join(errors))
+    authority_dispatch_cases = _workflow_requirements_authority_dispatch_tests(
+        baseline["selective-quality.yml"]
+    )
     mutations = (
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
@@ -3446,10 +3592,11 @@ def workflow_selection_self_test() -> int:
         baseline["selective-quality.yml"]
     )
     copy_cases = _git_copy_detection_test()
-    total_cases = cases + release_candidate_cases + copy_cases
+    total_cases = cases + release_candidate_cases + copy_cases + authority_dispatch_cases
     print(
         "workflow-quality-gate: PASS scope=owner-selection "
         f"total_cases={total_cases} static_cases={cases} "
+        f"authority_dispatch_cases={authority_dispatch_cases} "
         f"release_non_narrowing_cases={release_candidate_cases} "
         f"copy_cases={copy_cases}"
     )
