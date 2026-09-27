@@ -51,7 +51,6 @@ export component MainWindow inherits Window {
     in property <int> selected-account-index: 0;
     in-out property <string> quota-title;
     in-out property <bool> has-quota-percent: true;
-    in-out property <bool> has-active-thread: false;
     in-out property <int> active-thread-count: 0;
     in-out property <string> active-thread-count-label;
     in-out property <int> active-thread-sol-count: 0;
@@ -195,7 +194,6 @@ export component MainWindow inherits Window {
                 height: 56px;
                 visible: root.show-data-cards;
                 show-content: root.authenticated && !root.historical-account && !root.account-view-loading;
-                has-active-thread: root.has-active-thread;
                 active-thread-count: root.active-thread-count;
                 sol-count: root.active-thread-sol-count;
                 terra-count: root.active-thread-terra-count;

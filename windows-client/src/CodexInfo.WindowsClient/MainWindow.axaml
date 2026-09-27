@@ -361,19 +361,15 @@
           <TextBlock Classes="metric-label" Text="{Binding Texts.RunningThreads}" />
           <TextBlock FontSize="22"
                      FontWeight="SemiBold"
-                     IsVisible="{Binding HasActiveThreads}"
+                     IsVisible="{Binding HasLiveThreadSummary}"
                      Text="{Binding ActiveThreadCountLabel}"
-                     TextWrapping="NoWrap" />
-          <TextBlock Classes="label"
-                     IsVisible="{Binding HasNoActiveThreads}"
-                     Text="{Binding Texts.NoRunningThreads}"
                      TextWrapping="NoWrap" />
           <TextBlock Classes="label"
                      IsVisible="{Binding HasHistoricalThreadNotice}"
                      Text="{Binding Texts.HistoricalThreadsUnavailable}"
                      TextWrapping="NoWrap" />
         </StackPanel>
-        <UniformGrid Grid.Column="1" Columns="5" HorizontalAlignment="Stretch" VerticalAlignment="Center" IsVisible="{Binding HasActiveThreads}">
+        <UniformGrid Grid.Column="1" Columns="5" HorizontalAlignment="Stretch" VerticalAlignment="Center" IsVisible="{Binding HasLiveThreadSummary}">
           <StackPanel Spacing="1" HorizontalAlignment="Center">
             <TextBlock Classes="metric-label" Foreground="#B79BFF" HorizontalAlignment="Center" Text="SOL" />
             <TextBlock Classes="metric-value" Foreground="#B79BFF" HorizontalAlignment="Center" Text="{Binding ActiveSolCount}" />
@@ -401,7 +397,7 @@
                 Height="30"
                 Padding="5,2"
                 Click="OnOpenThreads"
-                IsVisible="{Binding HasActiveThreads}"
+                IsVisible="{Binding HasLiveThreadSummary}"
                 AutomationProperties.AutomationId="Main.OpenThreadDetails"
                 AutomationProperties.Name="{Binding Texts.Details}"
                 ToolTip.Tip="{Binding Texts.Details}"

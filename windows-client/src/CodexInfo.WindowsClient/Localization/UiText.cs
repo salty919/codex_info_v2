@@ -73,6 +73,27 @@ public sealed record UiText(
 {
     public string Format(string template, params object[] values) => string.Format(CultureInfo.CurrentCulture, template, values);
 
+    public string ThreadRunning => LanguageCode switch
+    {
+        "ja" => "動作中", "zh-Hans" => "运行中", "ko" => "실행 중", "es" => "En ejecución",
+        "fr" => "En cours", "de" => "Läuft", "pt" => "Em execução", "it" => "In esecuzione",
+        "ru" => "Выполняется", _ => "Running"
+    };
+
+    public string ThreadStopped => LanguageCode switch
+    {
+        "ja" => "停止中", "zh-Hans" => "已停止", "ko" => "중지됨", "es" => "Detenido",
+        "fr" => "Arrêté", "de" => "Gestoppt", "pt" => "Parado", "it" => "Arrestato",
+        "ru" => "Остановлен", _ => "Stopped"
+    };
+
+    public string ThreadUnknown => LanguageCode switch
+    {
+        "ja" => "未観測", "zh-Hans" => "状态未观测", "ko" => "상태 미확인", "es" => "Estado no observado",
+        "fr" => "État non observé", "de" => "Status nicht beobachtet", "pt" => "Estado não observado",
+        "it" => "Stato non osservato", "ru" => "Состояние не наблюдалось", _ => "Status unobserved"
+    };
+
     public string GraphWindowTitle => LanguageCode switch
     {
         "ja" => "利用状況の推移",
@@ -761,7 +782,7 @@ public static class LocalizationService
 {
     private static readonly UiText Japanese = new(
         "ja", "日本語", "Codex Info Monitor", "Windows 監視クライアント", "利用状況", "推移", "Threads", "法的通知", "設定", "更新", "更新中…",
-        "残り利用枠", "アカウント", "認証", "プラン", "リセット時刻", "観測時刻", "前回受信", "実行中のスレッド", "実行中のスレッドはありません", "詳細",
+        "残り利用枠", "アカウント", "認証", "プラン", "リセット時刻", "観測時刻", "前回受信", "生成済みスレッド", "対象のスレッドはありません", "詳細",
         "モデル別利用量", "入力", "キャッシュ入力", "出力", "トークン", "概算ドル", "接続", "接続先: 127.0.0.1:8787（SSH ローカルポート転送専用）", "初期設定",
         "Codex Infoへようこそ", "Linux側のAPIとSSHローカル転送を確認して、安全に監視を始めます。認証情報やトークンは保存しません。", "接続ガイド",
         "SSHユーザー名とLinuxホスト名/IPまたはSSH configのHost aliasを入力し、「SSH転送を開始」を押してください。Linux側ではCodex InfoをUIなしのAPIモードで起動します。記録daemonも自動起動し、UIを閉じても履歴を保護します。", "ssh -N -L 8787:127.0.0.1:8787 user@linux-host", "codex_info --port 8787", "コピー", "コピーしました", "続行", "設定を開く", "保存", "キャンセル", "閉じる", "最小化", "最大化", "言語", "外観", "接続済み", "接続中", "正常", "Linux 側の取得エラー", "接続エラー", "Linux 側で準備中", "Linux 側で認証が必要です", "残量不足", "残量警告", "リセット警告", "未取得", "認証を開始", "認証を確認", "再試行", "最新", "詳細データは未取得");
@@ -786,8 +807,8 @@ public static class LocalizationService
         ResetTime = "Reset time",
         ObservedAt = "Observation",
         LastReceived = "Last received",
-        RunningThreads = "Running threads",
-        NoRunningThreads = "No running threads",
+        RunningThreads = "Threads in open sessions",
+        NoRunningThreads = "No threads in open sessions",
         Details = "Details",
         ModelUsage = "Usage by model",
         Input = "Input",
@@ -853,8 +874,8 @@ public static class LocalizationService
             ResetTime = "重置时间",
             ObservedAt = "观测时间",
             LastReceived = "上次接收",
-            RunningThreads = "运行中的线程",
-            NoRunningThreads = "没有运行中的线程",
+            RunningThreads = "已创建的线程",
+            NoRunningThreads = "当前会话中没有线程",
             Details = "详细信息",
             ModelUsage = "按模型用量",
             Input = "输入",
@@ -903,8 +924,8 @@ public static class LocalizationService
             ResetTime = "재설정 시각",
             ObservedAt = "관측 시각",
             LastReceived = "마지막 수신",
-            RunningThreads = "실행 중인 스레드",
-            NoRunningThreads = "실행 중인 스레드가 없습니다",
+            RunningThreads = "생성된 스레드",
+            NoRunningThreads = "열린 세션에 스레드가 없습니다",
             Details = "세부 정보",
             ModelUsage = "모델별 사용량",
             Input = "입력",
@@ -953,8 +974,8 @@ public static class LocalizationService
             ResetTime = "Hora de restablecimiento",
             ObservedAt = "Observación",
             LastReceived = "Última recepción",
-            RunningThreads = "Hilos activos",
-            NoRunningThreads = "No hay hilos activos",
+            RunningThreads = "Hilos en sesiones abiertas",
+            NoRunningThreads = "No hay hilos en sesiones abiertas",
             Details = "Detalles",
             ModelUsage = "Uso por modelo",
             Input = "Entrada",
@@ -1003,8 +1024,8 @@ public static class LocalizationService
             ResetTime = "Heure de réinitialisation",
             ObservedAt = "Observation",
             LastReceived = "Dernière réception",
-            RunningThreads = "Threads actifs",
-            NoRunningThreads = "Aucun thread actif",
+            RunningThreads = "Threads des sessions ouvertes",
+            NoRunningThreads = "Aucun thread dans les sessions ouvertes",
             Details = "Détails",
             ModelUsage = "Utilisation par modèle",
             Input = "Entrée",
@@ -1053,8 +1074,8 @@ public static class LocalizationService
             ResetTime = "Zurücksetzzeit",
             ObservedAt = "Beobachtung",
             LastReceived = "Letzter Empfang",
-            RunningThreads = "Aktive Threads",
-            NoRunningThreads = "Keine aktiven Threads",
+            RunningThreads = "Threads in offenen Sitzungen",
+            NoRunningThreads = "Keine Threads in offenen Sitzungen",
             Details = "Details",
             ModelUsage = "Nutzung nach Modell",
             Input = "Eingabe",
@@ -1103,8 +1124,8 @@ public static class LocalizationService
             ResetTime = "Hora de redefinição",
             ObservedAt = "Observação",
             LastReceived = "Último recebimento",
-            RunningThreads = "Threads em execução",
-            NoRunningThreads = "Nenhuma thread em execução",
+            RunningThreads = "Threads em sessões abertas",
+            NoRunningThreads = "Nenhuma thread em sessões abertas",
             Details = "Detalhes",
             ModelUsage = "Uso por modelo",
             Input = "Entrada",
@@ -1153,8 +1174,8 @@ public static class LocalizationService
             ResetTime = "Ora di ripristino",
             ObservedAt = "Osservazione",
             LastReceived = "Ultima ricezione",
-            RunningThreads = "Thread in esecuzione",
-            NoRunningThreads = "Nessun thread in esecuzione",
+            RunningThreads = "Thread nelle sessioni aperte",
+            NoRunningThreads = "Nessun thread nelle sessioni aperte",
             Details = "Dettagli",
             ModelUsage = "Utilizzo per modello",
             Input = "Input",
@@ -1203,8 +1224,8 @@ public static class LocalizationService
             ResetTime = "Время сброса",
             ObservedAt = "Наблюдение",
             LastReceived = "Последнее получение",
-            RunningThreads = "Активные потоки",
-            NoRunningThreads = "Нет активных потоков",
+            RunningThreads = "Потоки в открытых сеансах",
+            NoRunningThreads = "Нет потоков в открытых сеансах",
             Details = "Подробности",
             ModelUsage = "Использование по моделям",
             Input = "Ввод",

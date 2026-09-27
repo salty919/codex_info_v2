@@ -361,7 +361,9 @@ formattingを含まない。parentは`null`または1..512のID、3つのtoken�
 または整数0..1024である。Windowsのorphan表示は、完全に受理した同一threads集合に
 `parent_thread_id`が存在しない場合だけ派生し、API fieldとして受け取らない。
 
-`threads`配列はserver側canonical active snapshotの`updatedAt desc, id desc`順でpublishする。
+v3の`/v3/current`と`/v3/details`には、現在openのcanonical Session thread ID数を示す非負整数`open_session_thread_count`を追加する。v3の`/v3/threads`と`/v3/details`の各thread行には必須の`activity_status`=`running|stopped|unknown`を追加する。`running`は動作中、`stopped`は停止中、`unknown`は状態未観測であり、`active_thread_count`は`running`行数だけを表す。`open_session_thread_count`は全v3行数で、同一IDの重複を許さない。v1/v2は従来の12キー行と`active_thread_count`を維持し、停止中・未観測行を含めない。旧形式の保存済みactive行だけは当時のrunning-only writer契約に従い動作中と解釈する。
+
+`threads`配列はserver側canonical open-session snapshotの`updatedAt desc, id desc`順でpublishする。
 `updatedAt`自体はwire fieldへ追加しない。Windowsは受理した配列indexをcanonical rankとして使い、
 rootとsiblingの相対rankを保ったまま親先行depth-first・subtree-contiguousへpresentation投影する。
 存在しない`updatedAt`をclientで推測したり、title・受信時刻・IDだけで別順へ再sortしたりしない。
@@ -514,10 +516,11 @@ product syscall traceを検査する。同一request再入で副作用countが�
 
 ### Surface-scoped client admission
 
-Main cycleはhealth readiness受理後にcurrentを1回取得する。Linux / Windows Mainは表示中のmodel別実行件数を確定するため、
-`active_thread_count>0`のときだけ同じcycleでthreadsを1回取得し、currentと同一published pairかつ件数一致の場合だけ
-一括commitする。`active_thread_count=0`ではthreads requestを行わず、同じcurrent pairのthread行を空として一括commitする。
+Main cycleはhealth readiness受理後にcurrentを1回取得する。Linux / Windows Mainは表示中のmodel別open Session件数を確定するため、
+`open_session_thread_count>0`のときだけ同じcycleでthreadsを1回取得し、currentと同一published pair、open件数と行数、active件数とrunning行数の一致を確認して
+一括commitする。`open_session_thread_count=0`ではthreads requestを行わず、同じcurrent pairのthread行を空として一括commitする。
 Mainの合計と`SOL/TERRA/LUNA/ASTRA/その他`はその一つの受理済み行集合だけから導出し、合計は常にbucket和と一致させる。
+開いているThreads詳細はMainが受理した同じbundleのthread行を同じUI更新で反映する。0件では行とtreeを空にし、追加requestを行わない。Main更新前に開始した独立Threads取得の古い応答は、この更新を上書きしない。
 threads失敗・pair不一致・件数不一致ではcurrent単独をcommitせず直前の完全表示を保持する。positive bundle失敗後は、
 10秒後にcurrentを`If-None-Match`なしで1回だけ再取得する。そのbundle成功までforce pollを優先せず、Graphと独立Threads pollを
 0件にし、last-good root、各surfaceのstateとerrorを保持する。bundle成功時だけretry markerとerrorを解除する。

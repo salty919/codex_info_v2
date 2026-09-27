@@ -49,9 +49,14 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal(expectedWindowHeight.ToString(), window.Attribute("MaxHeight")?.Value);
 
         var surface = Assert.Single(window.Elements(Avalonia + "Grid"));
-        Assert.Equal("30,14,384", surface.Attribute("RowDefinitions")?.Value);
+        Assert.Equal("30,384", surface.Attribute("RowDefinitions")?.Value);
         Assert.Equal("6", surface.Attribute("RowSpacing")?.Value);
         var viewport = Assert.Single(document.Descendants(Avalonia + "ScrollViewer"));
+        Assert.Equal("1", viewport.Attribute("Grid.Row")?.Value);
+        Assert.DoesNotContain(document.Descendants(Avalonia + "TextBlock"),
+            element => element.Attribute("Text")?.Value == "{Binding DetailsStatusText}");
+        var viewportContent = Assert.Single(viewport.Elements(Avalonia + "Grid"));
+        Assert.Equal("Top", viewportContent.Attribute("VerticalAlignment")?.Value);
         var viewportHeight = int.Parse(Assert.IsType<XAttribute>(viewport.Attribute("Height")).Value);
         Assert.Equal(expectedRowHeight * expectedVisibleRows, viewportHeight);
 
@@ -80,6 +85,7 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal("{Binding TreeSurfaceHeight}", treeControl.Attribute("Height")?.Value);
         Assert.Equal("{Binding TreeConnections}", treeControl.Attribute("Connections")?.Value);
         Assert.Equal("{Binding TreeRootRows}", treeControl.Attribute("RootRows")?.Value);
+        Assert.Equal("{Binding HasThreads}", treeControl.Attribute("IsVisible")?.Value);
 
         var title = BoundText(row, "{Binding Title}");
         Assert.Equal("0", title.Attribute("Grid.Column")?.Value);

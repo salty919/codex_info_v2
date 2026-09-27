@@ -608,6 +608,32 @@ fn number_at_least(instance: &Value, minimum: &Value) -> Result<bool, Validation
  * below.
  */
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThreadReadStatus {
+    Active,
+    Idle,
+    NotLoaded,
+    SystemError,
+}
+
+/// State supported by the same validated thread/read and rollout candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadActivityStatus {
+    Running,
+    Stopped,
+    Unknown,
+}
+
+impl ThreadActivityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Immutable, schema-first representation of a Thread item.  The complete
 /// validated JSON is retained privately for exact deduplication in C2; only
 /// bounded identity, timing, relation, and title fields are exposed here.
@@ -619,7 +645,7 @@ pub struct ValidatedThreadCandidate {
     updated_at: i64,
     path: Option<String>,
     title: String,
-    active: bool,
+    status: ThreadReadStatus,
     is_subagent: bool,
     parent_thread_id: Option<String>,
     depth: Option<i32>,
@@ -647,7 +673,7 @@ impl ValidatedThreadCandidate {
     }
 
     pub fn is_active(&self) -> bool {
-        self.active
+        self.status == ThreadReadStatus::Active
     }
 
     pub fn is_subagent(&self) -> bool {
@@ -676,7 +702,7 @@ impl ValidatedThreadCandidate {
             && self.updated_at == other.updated_at
             && self.path == other.path
             && self.title == other.title
-            && self.active == other.active
+            && self.status == other.status
             && self.is_subagent == other.is_subagent
             && self.parent_thread_id == other.parent_thread_id
             && self.depth == other.depth
@@ -984,12 +1010,19 @@ pub fn validate_thread_item(item: &Value) -> Result<ValidatedThreadCandidate, Th
     } else {
         "未設定".to_owned()
     };
-    let active = object
+    let status = object
         .get("status")
         .and_then(Value::as_object)
         .and_then(|status| status.get("type"))
         .and_then(Value::as_str)
-        == Some("active");
+        .and_then(|value| match value {
+            "active" => Some(ThreadReadStatus::Active),
+            "idle" => Some(ThreadReadStatus::Idle),
+            "notLoaded" => Some(ThreadReadStatus::NotLoaded),
+            "systemError" => Some(ThreadReadStatus::SystemError),
+            _ => None,
+        })
+        .ok_or(ThreadContractError::InvalidItem)?;
     let (is_subagent, parent_thread_id, depth) = thread_relation(object);
 
     Ok(ValidatedThreadCandidate {
@@ -999,7 +1032,7 @@ pub fn validate_thread_item(item: &Value) -> Result<ValidatedThreadCandidate, Th
         updated_at,
         path,
         title,
-        active,
+        status,
         is_subagent,
         parent_thread_id,
         depth,
@@ -1158,7 +1191,7 @@ impl std::error::Error for RolloutError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedRollout {
-    running: bool,
+    last_task_running: Option<bool>,
     model: String,
     model_label: String,
     total_tokens: Option<u64>,
@@ -1169,12 +1202,11 @@ pub struct ValidatedRollout {
 
 impl ValidatedRollout {
     pub fn is_running(&self) -> bool {
-        self.running
+        self.last_task_running == Some(true)
     }
 
-    pub fn with_running_override(mut self, running: bool) -> Self {
-        self.running = running;
-        self
+    pub fn last_task_running(&self) -> Option<bool> {
+        self.last_task_running
     }
 
     pub fn model(&self) -> &str {
@@ -1334,7 +1366,7 @@ fn finish_rollout(state: RolloutState) -> Result<ValidatedRollout, RolloutError>
     let model_label =
         security::bounded_model_label(&model).map_err(|_| RolloutError::InvalidKnownEvent)?;
     Ok(ValidatedRollout {
-        running: state.last_task_running == Some(true),
+        last_task_running: state.last_task_running,
         model,
         model_label,
         total_tokens: state.last_total_tokens,
@@ -1647,6 +1679,7 @@ pub struct ActiveThreadSnapshot {
     pub created_at: i64,
     pub updated_at: i64,
     pub title: String,
+    pub activity_status: ThreadActivityStatus,
     pub model: String,
     pub model_label: String,
     pub total_tokens: Option<u64>,
@@ -1724,7 +1757,7 @@ pub fn validate_selected_thread_topology(
     Ok(())
 }
 
-/// Consume a terminal page cycle and collect every running candidate.
+/// Consume a terminal page cycle and collect every admitted open-Session candidate.
 /// The reader adapter owns secure-open and metadata checks; any adapter or
 /// rollout failure rejects that candidate without publishing partial fields.
 pub fn select_active_threads<F, E>(
@@ -1738,7 +1771,7 @@ where
 }
 
 /// As [`select_active_threads`], but candidates outside the current-process
-/// set are ignored rather than treated as broken rollout files.
+/// open-Session set are ignored rather than treated as broken rollout files.
 pub fn select_active_threads_where<P, F, E>(
     accumulator: ThreadCycleAccumulator,
     is_current: P,
@@ -1789,21 +1822,22 @@ where
                 continue;
             }
         };
-        // The schema-validated thread/read status is the live app-server
-        // authority. A restart can leave the durable rollout prefix without
-        // a task_started event, so an explicitly active candidate promotes
-        // the parsed rollout while preserving the existing rollout signal
-        // for older app-server status variants.
-        let running = rollout.is_running() || candidate.is_active();
-        let rollout = rollout.with_running_override(running);
-        if !rollout.is_running() {
-            continue;
-        }
+        let activity_status = match candidate.status {
+            ThreadReadStatus::Active => ThreadActivityStatus::Running,
+            ThreadReadStatus::Idle => ThreadActivityStatus::Stopped,
+            ThreadReadStatus::NotLoaded => match rollout.last_task_running() {
+                Some(true) => ThreadActivityStatus::Running,
+                Some(false) => ThreadActivityStatus::Stopped,
+                None => ThreadActivityStatus::Unknown,
+            },
+            ThreadReadStatus::SystemError => ThreadActivityStatus::Unknown,
+        };
         snapshots.push(ActiveThreadSnapshot {
             thread_id: candidate.id().to_owned(),
             created_at: candidate.created_at(),
             updated_at: candidate.updated_at(),
             title: candidate.title().to_owned(),
+            activity_status,
             model: rollout.model().to_owned(),
             model_label: rollout.model_label().to_owned(),
             total_tokens: rollout.total_tokens(),
@@ -3365,6 +3399,57 @@ mod tests {
     }
 
     #[test]
+    fn issue_362_open_session_idle_remains_visible() {
+        let idle = thread_fixture("open-idle", 20, "saved name");
+        let outcome =
+            select_active_threads(terminal_cycle(vec![idle]), |_| -> Result<Vec<u8>, ()> {
+                Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
+            });
+        assert!(matches!(
+            outcome,
+            ThreadCycleOutcome::Snapshots(rows)
+                if rows.len() == 1 && rows[0].thread_id == "open-idle"
+        ));
+    }
+
+    #[test]
+    fn issue_362_open_session_activity_status_uses_explicit_authority() {
+        let cases = [
+            ("active", Some(false), ThreadActivityStatus::Running),
+            ("idle", Some(true), ThreadActivityStatus::Stopped),
+            ("notLoaded", Some(true), ThreadActivityStatus::Running),
+            ("notLoaded", Some(false), ThreadActivityStatus::Stopped),
+            ("notLoaded", None, ThreadActivityStatus::Unknown),
+            ("systemError", Some(true), ThreadActivityStatus::Unknown),
+        ];
+        for (index, (read_status, rollout_status, expected)) in cases.into_iter().enumerate() {
+            let mut item = thread_fixture(&format!("status-{index}"), 20, "saved name");
+            item["status"] = if read_status == "active" {
+                json!({"type":"active","activeFlags":[]})
+            } else {
+                json!({"type":read_status})
+            };
+            let events = match rollout_status {
+                Some(true) => vec![json!({"type":"task_started"})],
+                Some(false) => vec![json!({"type":"task_complete"})],
+                None => Vec::new(),
+            };
+            let outcome =
+                select_active_threads(terminal_cycle(vec![item]), |_| -> Result<Vec<u8>, ()> {
+                    Ok(rollout_bytes(&events))
+                });
+            assert!(
+                matches!(
+                    outcome,
+                    ThreadCycleOutcome::Snapshots(rows)
+                        if rows.len() == 1 && rows[0].activity_status == expected
+                ),
+                "case {index}"
+            );
+        }
+    }
+
+    #[test]
     fn thread_c_model_scalar_and_label_complete_matrix() {
         let started = json!({"type":"task_started"});
         let no_model = parse_rollout(&rollout_bytes(std::slice::from_ref(&started))).unwrap();
@@ -3640,7 +3725,7 @@ mod tests {
         assert_eq!(
             parse_rollout(b""),
             Ok(ValidatedRollout {
-                running: false,
+                last_task_running: None,
                 model: "不明".to_owned(),
                 model_label: "不明".to_owned(),
                 total_tokens: None,
@@ -3892,7 +3977,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_c_valid_running_without_token_keeps_thread_with_none() {
+    fn thread_c_open_without_token_keeps_both_threads_with_none() {
         let cycle = terminal_cycle(vec![
             thread_fixture("without-token", 20, "without-token"),
             thread_fixture("older-with-token", 10, "older-with-token"),
@@ -3907,28 +3992,21 @@ mod tests {
                 rollout_bytes(&[json!({"type":"task_complete"})])
             })
         });
-        assert_eq!(
-            outcome,
-            ThreadCycleOutcome::Snapshots(vec![ActiveThreadSnapshot {
-                thread_id: "without-token".to_owned(),
-                created_at: 1,
-                updated_at: 20,
-                title: "without-token".to_owned(),
-                model: "model-only".to_owned(),
-                model_label: "model-only".to_owned(),
-                total_tokens: None,
-                context_usage_tokens: None,
-                context_window_tokens: None,
-                last_user_message_at: None,
-                is_subagent: false,
-                parent_thread_id: None,
-                depth: None,
-            }])
-        );
+        let ThreadCycleOutcome::Snapshots(rows) = outcome else {
+            panic!("both open sessions remain visible");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].thread_id, "without-token");
+        assert_eq!(rows[0].model, "model-only");
+        assert_eq!(rows[0].total_tokens, None);
+        assert_eq!(rows[0].activity_status, ThreadActivityStatus::Stopped);
+        assert_eq!(rows[1].thread_id, "older-with-token");
+        assert_eq!(rows[1].total_tokens, None);
+        assert_eq!(rows[1].activity_status, ThreadActivityStatus::Stopped);
     }
 
     #[test]
-    fn thread_c_no_thread_and_all_candidate_failure_are_distinct() {
+    fn thread_c_empty_open_set_and_candidate_failure_are_distinct() {
         let empty = terminal_cycle(vec![]);
         assert_eq!(
             select_active_threads(empty, |_| -> Result<Vec<u8>, ()> { unreachable!() }),
@@ -3936,12 +4014,13 @@ mod tests {
         );
 
         let inactive = terminal_cycle(vec![thread_fixture("inactive", 1, "inactive")]);
-        assert_eq!(
+        assert!(matches!(
             select_active_threads(inactive, |_| -> Result<Vec<u8>, ()> {
                 Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
             }),
-            ThreadCycleOutcome::NoThread
-        );
+            ThreadCycleOutcome::Snapshots(rows)
+                if rows.len() == 1 && rows[0].activity_status == ThreadActivityStatus::Stopped
+        ));
 
         let mut invalid_item = full_thread();
         invalid_item["id"] = json!(null);
@@ -4004,14 +4083,21 @@ mod tests {
         assert!(matches!(
             child_complete,
             ThreadCycleOutcome::Snapshots(threads)
-                if threads.len() == 1 && threads[0].thread_id == "parent"
+                if threads.len() == 2 && threads[0].thread_id == "child"
+                    && threads[0].activity_status == ThreadActivityStatus::Stopped
+                    && threads[1].thread_id == "parent"
         ));
 
         let all_complete =
             select_active_threads(terminal_cycle(rows), |_| -> Result<Vec<u8>, ()> {
                 Ok(rollout_bytes(&[json!({"type":"turn_aborted"})]))
             });
-        assert_eq!(all_complete, ThreadCycleOutcome::NoThread);
+        assert!(matches!(
+            all_complete,
+            ThreadCycleOutcome::Snapshots(threads)
+                if threads.len() == 2 && threads.iter().all(|thread|
+                    thread.activity_status == ThreadActivityStatus::Stopped)
+        ));
     }
 
     #[test]

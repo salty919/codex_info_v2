@@ -461,6 +461,41 @@ impl I18n {
         }
     }
 
+    pub fn thread_activity_text(&self, running: Option<bool>) -> &'static str {
+        match (self.language, running) {
+            (Language::Japanese, Some(true)) => "動作中",
+            (Language::Japanese, Some(false)) => "停止中",
+            (Language::Japanese, None) => "未観測",
+            (Language::English, Some(true)) => "Running",
+            (Language::English, Some(false)) => "Stopped",
+            (Language::English, None) => "Unknown",
+            (Language::SimplifiedChinese, Some(true)) => "运行中",
+            (Language::SimplifiedChinese, Some(false)) => "已停止",
+            (Language::SimplifiedChinese, None) => "未观测",
+            (Language::Korean, Some(true)) => "실행 중",
+            (Language::Korean, Some(false)) => "중지됨",
+            (Language::Korean, None) => "미관측",
+            (Language::Spanish, Some(true)) => "En ejecución",
+            (Language::Spanish, Some(false)) => "Detenido",
+            (Language::Spanish, None) => "No observado",
+            (Language::French, Some(true)) => "En cours",
+            (Language::French, Some(false)) => "Arrêté",
+            (Language::French, None) => "Non observé",
+            (Language::German, Some(true)) => "Läuft",
+            (Language::German, Some(false)) => "Gestoppt",
+            (Language::German, None) => "Nicht beobachtet",
+            (Language::Portuguese, Some(true)) => "Em execução",
+            (Language::Portuguese, Some(false)) => "Parado",
+            (Language::Portuguese, None) => "Não observado",
+            (Language::Italian, Some(true)) => "In esecuzione",
+            (Language::Italian, Some(false)) => "Fermo",
+            (Language::Italian, None) => "Non osservato",
+            (Language::Russian, Some(true)) => "Выполняется",
+            (Language::Russian, Some(false)) => "Остановлен",
+            (Language::Russian, None) => "Не наблюдалось",
+        }
+    }
+
     pub fn text(&self, key: TextKey) -> &'static str {
         use TextKey::*;
         match self.language {
@@ -478,7 +513,7 @@ impl I18n {
                 ModelThreads => "モデル別スレッド",
                 Other => "その他",
                 Details => "詳細",
-                NoRunningThreads => "実行中のスレッドはありません",
+                NoRunningThreads => "対象のスレッドはありません",
                 LegalCode => "Codex Info の独自コードと文書: GPL-3.0-only",
                 LegalWarranty => {
                     "本ソフトウェアは無保証です。GPL-3.0-only の条件で再配布できます。"
@@ -492,7 +527,7 @@ impl I18n {
                 LegalDetails => "詳細: THIRD_PARTY_NOTICES.md と LICENSES/",
                 LegalDistribution => "バイナリ配布時は各依存の LICENSE/NOTICE を同梱してください。",
                 Close => "閉じる",
-                ActiveThreads => "実行中のスレッド",
+                ActiveThreads => "生成済みスレッド",
                 Context => "コンテキスト使用率",
                 Instruction => "指示",
                 Tokens => "トークン",
@@ -1551,7 +1586,7 @@ fn basic_text(key: TextKey, language: &str) -> &'static str {
         ("en", ModelThreads) => "Threads by model",
         ("en", Other) => "Other",
         ("en", Details) => "Details",
-        ("en", NoRunningThreads) => "No running threads",
+        ("en", NoRunningThreads) => "No open session threads",
         ("en", LegalCode) => "Codex Info code and documents: GPL-3.0-only",
         ("en", LegalWarranty) => {
             "This software comes without warranty. Redistribution is allowed under GPL-3.0-only."
@@ -1569,7 +1604,7 @@ fn basic_text(key: TextKey, language: &str) -> &'static str {
             "Include each dependency's LICENSE/NOTICE when distributing binaries."
         }
         ("en", Close) => "Close",
-        ("en", ActiveThreads) => "Running threads",
+        ("en", ActiveThreads) => "Open session threads",
         ("en", Context) => "Context usage",
         ("en", Instruction) => "Instruction",
         ("en", Tokens) => "tokens",
@@ -1644,7 +1679,7 @@ fn basic_text(key: TextKey, language: &str) -> &'static str {
         ("zh", ModelThreads) => "按模型统计的线程",
         ("zh", Other) => "其他",
         ("zh", Details) => "详情",
-        ("zh", NoRunningThreads) => "没有运行中的线程",
+        ("zh", NoRunningThreads) => "没有当前会话线程",
         ("zh", LegalCode) => "Codex Info 代码和文档：GPL-3.0-only",
         ("zh", LegalWarranty) => "本软件不提供保证，可按 GPL-3.0-only 条款再分发。",
         ("zh", LegalLicense) => "许可证文本：LICENSE",
@@ -1656,7 +1691,7 @@ fn basic_text(key: TextKey, language: &str) -> &'static str {
         ("zh", LegalDetails) => "详情：THIRD_PARTY_NOTICES.md 和 LICENSES/",
         ("zh", LegalDistribution) => "分发二进制文件时请附带各依赖的 LICENSE/NOTICE。",
         ("zh", Close) => "关闭",
-        ("zh", ActiveThreads) => "运行中的线程",
+        ("zh", ActiveThreads) => "当前会话线程",
         ("zh", Context) => "上下文使用率",
         ("zh", Instruction) => "指令",
         ("zh", Tokens) => "令牌",
@@ -1748,7 +1783,7 @@ const KO_CATALOG: [&str; 81] = [
     "모델별 스레드",
     "기타",
     "세부 정보",
-    "실행 중인 스레드 없음",
+    "열린 세션의 스레드 없음",
     "Codex Info 코드 및 문서: GPL-3.0-only",
     "이 소프트웨어는 보증 없이 제공되며 GPL-3.0-only로 재배포할 수 있습니다.",
     "라이선스 본문: LICENSE",
@@ -1760,7 +1795,7 @@ const KO_CATALOG: [&str; 81] = [
     "세부 정보: THIRD_PARTY_NOTICES.md 및 LICENSES/",
     "바이너리 배포 시 각 의존성의 LICENSE/NOTICE를 포함하세요.",
     "닫기",
-    "실행 중인 스레드",
+    "열린 세션의 스레드",
     "컨텍스트 사용률",
     "지시",
     "토큰",
@@ -1832,7 +1867,7 @@ const ES_CATALOG: [&str; 81] = [
     "Hilos por modelo",
     "Otros",
     "Detalles",
-    "No hay hilos en ejecución",
+    "No hay hilos en sesiones abiertas",
     "Código y documentos de Codex Info: GPL-3.0-only",
     "Este software se ofrece sin garantía. Se permite redistribuirlo bajo GPL-3.0-only.",
     "Texto de licencia: LICENSE",
@@ -1844,7 +1879,7 @@ const ES_CATALOG: [&str; 81] = [
     "Detalles: THIRD_PARTY_NOTICES.md y LICENSES/",
     "Incluye las licencias LICENSE/NOTICE al distribuir binarios.",
     "Cerrar",
-    "Hilos en ejecución",
+    "Hilos de sesiones abiertas",
     "Uso del contexto",
     "Instrucción",
     "tokens",
@@ -1916,7 +1951,7 @@ const FR_CATALOG: [&str; 81] = [
     "Fils par modèle",
     "Autre",
     "Détails",
-    "Aucun fil en cours",
+    "Aucun fil de session ouverte",
     "Code et documents Codex Info : GPL-3.0-only",
     "Ce logiciel est fourni sans garantie. La redistribution est autorisée sous GPL-3.0-only.",
     "Texte de licence : LICENSE",
@@ -1928,7 +1963,7 @@ const FR_CATALOG: [&str; 81] = [
     "Détails : THIRD_PARTY_NOTICES.md et LICENSES/",
     "Joignez les fichiers LICENSE/NOTICE des dépendances lors de la distribution.",
     "Fermer",
-    "Fils en cours",
+    "Fils de sessions ouvertes",
     "Utilisation du contexte",
     "Instruction",
     "jetons",
@@ -1987,7 +2022,7 @@ const FR_CATALOG: [&str; 81] = [
 ];
 
 const DE_CATALOG: [&str; 81] = [
-    "Noto Sans JP", "Konto nicht verbunden — Tarif nicht festgelegt", "Tarif nicht festgelegt", "Kostenlos", "Unternehmen", "Bildung", "Nutzung", "Verlauf", "Rechtliche Hinweise", "Läuft", "Threads nach Modell", "Sonstige", "Details", "Keine laufenden Threads", "Codex-Info-Code und Dokumente: GPL-3.0-only", "Diese Software wird ohne Gewährleistung bereitgestellt. Weitergabe unter GPL-3.0-only ist erlaubt.", "Lizenztext: LICENSE", "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021", "Protokoll und API: Apache-2.0 / Copyright 2025 OpenAI", "Von Codex erzeugtes Schema: Apache-2.0 / Copyright 2025 OpenAI", "Slint und Rust-Abhängigkeiten behalten ihre ursprünglichen Lizenzen.", "Lizenzen Dritter: MIT / BSD-3-Clause / weitere", "Details: THIRD_PARTY_NOTICES.md und LICENSES/", "Beim Verteilen von Binärdateien die LICENSE/NOTICE-Dateien beilegen.", "Schließen", "Laufende Threads", "Kontextnutzung", "Anweisung", "Tokens", "Modell", "Eingabe", "Cache", "Ausgabe", "Erneut versuchen", "Nutzungsverlauf", "Verbleibend", "Stündliche Token-Nutzung (nach Modell) / verbleibend %", "Kumulierte stündliche Ausgaben (nach Modell) / verbleibend %", "Keine Aufzeichnungen", "Codex-Konto verbinden", "Schließe die Authentifizierung im Browser ab. Sie wird automatisch geprüft.", "Die Authentifizierung wird von Codex verwaltet; diese App speichert keine Zugangsdaten.", "Authentifizierungsseite öffnen", "Authentifizierung starten", "Wird geprüft…", "Authentifizierung prüfen", "Verwendet den Authentifizierungsstatus der Codex CLI.", "Kein Verlauf", "AN", "AUS", "Verbindung mit Codex app-server…", "Nutzung wird aktualisiert…", "Authentifizierung wird geprüft…", "Authentifiziert. Nutzung wird geladen…", "Nicht authentifiziert. Authentifizierung starten.", "Authentifizierungs-URL erstellt. «Authentifizierungsseite öffnen» wählen.", "Authentifizierungs-URL wird erstellt…", "Authentifizierungs-URL konnte nicht geöffnet werden.", "Nutzung konnte nicht abgerufen werden. Codex-app-server-Verbindung prüfen.", "Status kann nicht angezeigt werden.", "Das verbleibende Kontingent beträgt höchstens 2 %.", "Das verbleibende Kontingent beträgt höchstens 10 %.", "Das Kontingent wird innerhalb von 24 Stunden zurückgesetzt.", "Letzter Empfang", "Nutzung aktualisiert. Vorheriger Verlauf und Threads bleiben erhalten.", "Nutzung aktualisiert. Vorheriger Verlauf bleibt erhalten.", "Nutzung aktualisiert. Vorherige Thread-Anzeige bleibt erhalten.", "Haupt", "Unter", "Übergeordneter Thread läuft nicht", "Übergeordnet", " (aktuell)", "Frist", "Schätzung", "Wird bald zurückgesetzt", "Keine feste Grenze", "Verbleibende Nutzung", "Verbleibende Monatsnutzung", "Nutzungsgrenze", "Dollar", "Token",
+    "Noto Sans JP", "Konto nicht verbunden — Tarif nicht festgelegt", "Tarif nicht festgelegt", "Kostenlos", "Unternehmen", "Bildung", "Nutzung", "Verlauf", "Rechtliche Hinweise", "Läuft", "Threads nach Modell", "Sonstige", "Details", "Keine Threads in offenen Sitzungen", "Codex-Info-Code und Dokumente: GPL-3.0-only", "Diese Software wird ohne Gewährleistung bereitgestellt. Weitergabe unter GPL-3.0-only ist erlaubt.", "Lizenztext: LICENSE", "Noto Sans JP / Noto Sans CJK KR: OFL-1.1 / Adobe 2014-2021", "Protokoll und API: Apache-2.0 / Copyright 2025 OpenAI", "Von Codex erzeugtes Schema: Apache-2.0 / Copyright 2025 OpenAI", "Slint und Rust-Abhängigkeiten behalten ihre ursprünglichen Lizenzen.", "Lizenzen Dritter: MIT / BSD-3-Clause / weitere", "Details: THIRD_PARTY_NOTICES.md und LICENSES/", "Beim Verteilen von Binärdateien die LICENSE/NOTICE-Dateien beilegen.", "Schließen", "Threads in offenen Sitzungen", "Kontextnutzung", "Anweisung", "Tokens", "Modell", "Eingabe", "Cache", "Ausgabe", "Erneut versuchen", "Nutzungsverlauf", "Verbleibend", "Stündliche Token-Nutzung (nach Modell) / verbleibend %", "Kumulierte stündliche Ausgaben (nach Modell) / verbleibend %", "Keine Aufzeichnungen", "Codex-Konto verbinden", "Schließe die Authentifizierung im Browser ab. Sie wird automatisch geprüft.", "Die Authentifizierung wird von Codex verwaltet; diese App speichert keine Zugangsdaten.", "Authentifizierungsseite öffnen", "Authentifizierung starten", "Wird geprüft…", "Authentifizierung prüfen", "Verwendet den Authentifizierungsstatus der Codex CLI.", "Kein Verlauf", "AN", "AUS", "Verbindung mit Codex app-server…", "Nutzung wird aktualisiert…", "Authentifizierung wird geprüft…", "Authentifiziert. Nutzung wird geladen…", "Nicht authentifiziert. Authentifizierung starten.", "Authentifizierungs-URL erstellt. «Authentifizierungsseite öffnen» wählen.", "Authentifizierungs-URL wird erstellt…", "Authentifizierungs-URL konnte nicht geöffnet werden.", "Nutzung konnte nicht abgerufen werden. Codex-app-server-Verbindung prüfen.", "Status kann nicht angezeigt werden.", "Das verbleibende Kontingent beträgt höchstens 2 %.", "Das verbleibende Kontingent beträgt höchstens 10 %.", "Das Kontingent wird innerhalb von 24 Stunden zurückgesetzt.", "Letzter Empfang", "Nutzung aktualisiert. Vorheriger Verlauf und Threads bleiben erhalten.", "Nutzung aktualisiert. Vorheriger Verlauf bleibt erhalten.", "Nutzung aktualisiert. Vorherige Thread-Anzeige bleibt erhalten.", "Haupt", "Unter", "Übergeordneter Thread läuft nicht", "Übergeordnet", " (aktuell)", "Frist", "Schätzung", "Wird bald zurückgesetzt", "Keine feste Grenze", "Verbleibende Nutzung", "Verbleibende Monatsnutzung", "Nutzungsgrenze", "Dollar", "Token",
 ];
 
 const PT_CATALOG: [&str; 81] = [
@@ -2004,7 +2039,7 @@ const PT_CATALOG: [&str; 81] = [
     "Threads por modelo",
     "Outros",
     "Detalhes",
-    "Nenhuma thread em execução",
+    "Nenhuma thread de sessão aberta",
     "Código e documentos do Codex Info: GPL-3.0-only",
     "Este software é fornecido sem garantia. A redistribuição sob GPL-3.0-only é permitida.",
     "Texto da licença: LICENSE",
@@ -2016,7 +2051,7 @@ const PT_CATALOG: [&str; 81] = [
     "Detalhes: THIRD_PARTY_NOTICES.md e LICENSES/",
     "Inclua LICENSE/NOTICE de cada dependência ao distribuir binários.",
     "Fechar",
-    "Threads em execução",
+    "Threads de sessões abertas",
     "Uso do contexto",
     "Instrução",
     "tokens",
@@ -2088,7 +2123,7 @@ const IT_CATALOG: [&str; 81] = [
     "Thread per modello",
     "Altro",
     "Dettagli",
-    "Nessun thread in esecuzione",
+    "Nessun thread di sessione aperta",
     "Codice e documenti Codex Info: GPL-3.0-only",
     "Questo software è fornito senza garanzia. La ridistribuzione è consentita con GPL-3.0-only.",
     "Testo della licenza: LICENSE",
@@ -2100,7 +2135,7 @@ const IT_CATALOG: [&str; 81] = [
     "Dettagli: THIRD_PARTY_NOTICES.md e LICENSES/",
     "Includi LICENSE/NOTICE di ogni dipendenza nella distribuzione dei binari.",
     "Chiudi",
-    "Thread in esecuzione",
+    "Thread di sessioni aperte",
     "Utilizzo del contesto",
     "Istruzione",
     "token",
@@ -2172,7 +2207,7 @@ const RU_CATALOG: [&str; 81] = [
     "Потоки по модели",
     "Другое",
     "Подробнее",
-    "Нет выполняющихся потоков",
+    "Нет потоков открытых сеансов",
     "Код и документы Codex Info: GPL-3.0-only",
     "Программа предоставляется без гарантий. Распространение разрешено по GPL-3.0-only.",
     "Текст лицензии: LICENSE",
@@ -2184,7 +2219,7 @@ const RU_CATALOG: [&str; 81] = [
     "Подробнее: THIRD_PARTY_NOTICES.md и LICENSES/",
     "При распространении бинарных файлов приложите LICENSE/NOTICE зависимостей.",
     "Закрыть",
-    "Выполняющиеся потоки",
+    "Потоки открытых сеансов",
     "Использование контекста",
     "Инструкция",
     "токены",

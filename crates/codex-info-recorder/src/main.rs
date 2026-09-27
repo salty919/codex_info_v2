@@ -926,6 +926,7 @@ mod tests {
                 id: "issue-362-thread".to_owned(),
                 updated_at: observed_at,
                 title: title.to_owned(),
+                activity_status: "running".to_owned(),
                 parent_thread_id: None,
                 model: "gpt-5".to_owned(),
                 model_label: "gpt-5".to_owned(),

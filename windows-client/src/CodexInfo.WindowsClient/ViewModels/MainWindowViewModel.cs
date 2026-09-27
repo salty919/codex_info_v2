@@ -367,16 +367,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool HasActiveThreads => !historicalActivitySuppressed && ActiveThreadCount > 0;
 
+    public bool HasLiveThreadSummary => !historicalActivitySuppressed &&
+        detailsSnapshot is { State: ApiState.Ready, Authenticated: true };
+
     public bool HasNoActiveThreads => !historicalActivitySuppressed && !HasActiveThreads;
 
     public bool HasHistoricalThreadNotice => historicalActivitySuppressed;
 
     /// <summary>
-    /// The scalar generation count is authoritative even when the details
-    /// endpoint returns only a bounded row sample. Details rows are still used
-    /// for the model breakdown and the child window.
+    /// V3 publishes the complete open-session set, so its summary total and
+    /// model breakdown use the same accepted rows. Legacy details retain their
+    /// running-only scalar contract.
     /// </summary>
-    public ulong ActiveThreadCount => detailsSnapshot?.ActiveThreadCount ?? 0;
+    public ulong ActiveThreadCount => detailsSnapshot is { ApiVersion: "v3" } v3
+        ? (ulong)v3.Threads.Count
+        : detailsSnapshot?.ActiveThreadCount ?? 0;
 
     public string ActiveThreadCountLabel => historicalActivitySuppressed
         ? Texts.UnavailableValue
@@ -1220,7 +1225,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                     }
 
                     IReadOnlyList<ApiThreadDetails> threads = Array.Empty<ApiThreadDetails>();
-                    if (current.ActiveThreadCount > 0 && !IsSelectedAccountHistorical)
+                    if (current.OpenSessionThreadCount > 0 && !IsSelectedAccountHistorical)
                     {
                         ThreadsFetchResult threadsResult;
                         try
@@ -1288,7 +1293,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                             return;
                         }
 
-                        if ((ulong)threadSnapshot.Threads.Count != current.ActiveThreadCount)
+                        if ((ulong)threadSnapshot.Threads.Count != current.OpenSessionThreadCount ||
+                            (ulong)threadSnapshot.Threads.Count(thread =>
+                                thread.ActivityStatus == ApiThreadActivityStatus.Running) != current.ActiveThreadCount ||
+                            threadSnapshot.Threads.Select(thread => thread.Id).Distinct(StringComparer.Ordinal).Count() !=
+                                threadSnapshot.Threads.Count)
                         {
                             MutateIfCurrent(context, () =>
                             {
@@ -1646,6 +1655,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             "概算 —")
         {
             ApiVersion = current.ApiVersion,
+            OpenSessionThreadCount = historical ? 0 : current.OpenSessionThreadCount,
             PublishedPair = current.PublishedPair,
             AccountId = current.AccountId,
             HistoryGaps = Array.Empty<ApiHistoryGap>(),
@@ -1772,6 +1782,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private void NotifyActiveThreadProperties()
     {
         Notify(nameof(HasActiveThreads));
+        Notify(nameof(HasLiveThreadSummary));
         Notify(nameof(HasNoActiveThreads));
         Notify(nameof(HasHistoricalThreadNotice));
         Notify(nameof(ActiveThreadCount));

@@ -1062,7 +1062,7 @@ for preview_kind in idle auth full; do
         idle)
             preview_frame="$idle_frame"
             expected_layout=normal
-            expected_activity=empty
+            expected_activity=active
             expected_detail=''
             ;;
         auth)
