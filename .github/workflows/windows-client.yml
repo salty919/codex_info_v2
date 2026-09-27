@@ -38,6 +38,7 @@ jobs:
         run: |
           dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
           dotnet format windows-client/CodexInfo.WindowsClient.sln --no-restore --verify-no-changes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet test windows-client/CodexInfo.WindowsClient.sln `
             --no-restore `
             --configuration Release `
