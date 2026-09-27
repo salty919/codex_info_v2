@@ -146,6 +146,8 @@ public sealed class WindowsUpdateCoordinator : IWindowsUpdateCoordinator
                 return UpdateStartStatus.DownloadFailed;
             }
 
+            PruneObsoleteSetups(release.Version, cancellationToken);
+
             var finalPath = Path.Combine(versionDirectory, InstallerName);
             partialPath = finalPath + ".download";
             DeleteIfPresent(partialPath);
@@ -218,6 +220,71 @@ public sealed class WindowsUpdateCoordinator : IWindowsUpdateCoordinator
 
     private static string FormatVersion(Version version) =>
         $"{version.Major}.{version.Minor}.{version.Build}";
+
+    private void PruneObsoleteSetups(Version targetVersion, CancellationToken cancellationToken)
+    {
+        foreach (var versionDirectory in Directory.EnumerateFileSystemEntries(updateRoot))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var name = Path.GetFileName(versionDirectory);
+            if (!Version.TryParse(name, out var version) ||
+                version.Build < 0 ||
+                !string.Equals(name, FormatVersion(version), StringComparison.Ordinal) ||
+                version.CompareTo(targetVersion) >= 0)
+            {
+                continue;
+            }
+
+            try
+            {
+                var directoryAttributes = File.GetAttributes(versionDirectory);
+                if ((directoryAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) !=
+                        FileAttributes.Directory ||
+                    WindowsPathSafety.ContainsReparsePoint(versionDirectory))
+                {
+                    continue;
+                }
+
+                var entries = Directory.GetFileSystemEntries(versionDirectory);
+                if (entries.Length != 1 ||
+                    !string.Equals(Path.GetFileName(entries[0]), InstallerName, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var setupPath = entries[0];
+                var setupAttributes = File.GetAttributes(setupPath);
+                if ((setupAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0 ||
+                    WindowsPathSafety.ContainsReparsePoint(setupPath))
+                {
+                    continue;
+                }
+
+                // An active Setup cannot grant this exclusive open. Deletion is
+                // bound to the opened file, so a later path replacement is not
+                // removed through a separate File.Delete call.
+                using (new FileStream(
+                           setupPath, FileMode.Open, FileAccess.ReadWrite,
+                           FileShare.None, 1, FileOptions.DeleteOnClose))
+                {
+                }
+
+                if (!WindowsPathSafety.ContainsReparsePoint(versionDirectory) &&
+                    Directory.GetFileSystemEntries(versionDirectory).Length == 0)
+                {
+                    Directory.Delete(versionDirectory);
+                }
+            }
+            catch (IOException)
+            {
+                // Unclear, active, or changed entries are not cleanup targets.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Keep entries that this updater cannot prove it may mutate.
+            }
+        }
+    }
 
     private static void DeleteIfPresent(string? path)
     {

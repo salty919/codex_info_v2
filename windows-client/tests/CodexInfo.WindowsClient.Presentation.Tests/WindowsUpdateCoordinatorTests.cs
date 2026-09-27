@@ -58,6 +58,46 @@ public sealed class WindowsUpdateCoordinatorTests
     }
 
     [Fact]
+    public async Task ObsoleteOwnedSetupIsPrunedBeforeDownload()
+    {
+        using var directory = new TemporaryDirectory();
+        var obsoleteDirectory = Path.Combine(directory.Path, "1.0.76");
+        Directory.CreateDirectory(obsoleteDirectory);
+        var obsoleteSetup = Path.Combine(obsoleteDirectory, "CodexInfo.WindowsClient.Setup.exe");
+        await File.WriteAllBytesAsync(obsoleteSetup, [7, 6, 5]);
+
+        var targetDirectory = Path.Combine(directory.Path, "1.2.3");
+        Directory.CreateDirectory(targetDirectory);
+        var targetSentinel = Path.Combine(targetDirectory, "keep.txt");
+        await File.WriteAllTextAsync(targetSentinel, "target remains");
+
+        var payload = new byte[] { 1, 3, 5, 7 };
+        var release = ReleaseFor(payload);
+        var obsoletePresentAtDownload = false;
+        var client = new FakeUpdateClient(
+            WindowsUpdateCheckResult.Success(release),
+            async (destination, cancellationToken) =>
+            {
+                obsoletePresentAtDownload = File.Exists(obsoleteSetup);
+                await destination.WriteAsync(payload, cancellationToken);
+                return WindowsUpdateDownloadResult.Success();
+            });
+        var launcher = new RecordingLauncher();
+        using var coordinator = new WindowsUpdateCoordinator(
+            client, launcher, new Version(1, 0, 76), directory.Path);
+
+        await coordinator.CheckAsync(CancellationToken.None);
+        Assert.True(File.Exists(obsoleteSetup));
+        var result = await coordinator.StartAvailableUpdateAsync(CancellationToken.None);
+
+        Assert.False(obsoletePresentAtDownload, "obsolete updater Setup still existed when DownloadAsync began");
+        Assert.False(File.Exists(obsoleteSetup));
+        Assert.Equal("target remains", await File.ReadAllTextAsync(targetSentinel));
+        Assert.Equal(UpdateStartStatus.Started, result);
+        Assert.Single(launcher.Paths);
+    }
+
+    [Fact]
     public async Task StartWithoutAvailableReleaseHasNoFilesystemOrLauncherMutation()
     {
         using var directory = new TemporaryDirectory();
