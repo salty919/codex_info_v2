@@ -100,18 +100,18 @@ surfaceとして扱う。
 
 | surface | registered top-level surface | runtime open HWND | logical client initial | logical client min | logical client max | resize | native controls |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Main | yes | 1 | 900×480 | 900×480 | 900×480 | fixed | minimize, close |
+| Main | yes | 1 | 900×498 | 900×498 | 900×498 | fixed | minimize, close |
 | Setup | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | minimize, close |
 | Settings | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | minimize, close |
 | Graph | yes | 0..1 (singleton) | 940×640 | 700×480 | unbounded | resizable | minimize, maximize/restore, close |
 | Threads | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | minimize, close |
 | Legal | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | minimize, close |
-| Main内 Help | no (owner=Main) | 0 additional | Main client 900×480内 | Main client 900×480内 | Main client 900×480内 | Mainに従う | 独自Window controlsなし |
+| Main内 Help | no (owner=Main) | 0 additional | Main client 900×498内 | Main client 900×498内 | Main client 900×498内 | Mainに従う | 独自Window controlsなし |
 
 registered top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確に6個で
 固定し、Helpを第7 Windowへ分離しない。runtime open HWNDはMain=1＋open child subset=0..5、合計1..6で、
-5 childを全て開いた時だけ6となる。各childはsingletonで、runtime cardinalityを6へ固定しない。`700×480`はGraphのminimumだけに属する。Main、Setup、Settings、
-Threads、Legalのsupported work areaは少なくとも`900×480 logical`、Graphのsupported
+5 childを全て開いた時だけ6となる。各childはsingletonで、runtime cardinalityを6へ固定しない。`700×480`はGraphのminimumだけに属する。Mainのsupported work areaは少なくとも`900×498 logical`、Setup、Settings、
+Threads、Legalは少なくとも`900×480 logical`、Graphのsupported
 work-area minimumは少なくとも`700×480 logical`である。各境界未満はsupported matrix外として
 `unsupported_scope` manifestへ記録し、font縮小、clip、scroll、PASS値の捏造で回避しない。
 この境界は新しいproduct failure classや第7 Windowを追加する根拠ではない。
@@ -120,7 +120,8 @@ surface/monitor/DPI/sizeのsupported predicateは次のANDで固定する。
 
 ```text
 supported = client_threshold AND frame_fit
-client_threshold(fixed Main/Setup/Settings/Threads/Legal) = logical >= 900×480
+client_threshold(fixed Main) = logical >= 900×498
+client_threshold(fixed Setup/Settings/Threads/Legal) = logical >= 900×480
 client_threshold(Graph) = logical >= 700×480
 frame_fit = DPI変換後のDWM.visible_frame全体が対象MONITORINFO.rcWork内へ完全包含
 ```
@@ -263,9 +264,9 @@ component順や表示所有者を変更しない。
   `Header→RemainingQuota→WeekGauge→AccountActivity→ModelUsage→StatusBanner`で固定する。
   残量を最初の主値とし、状態は常時viewport内のStatusBannerだけが所有する。状態を上段の
   duplicate cardへ増やさず、StatusBannerが末尾でもBack/Close/復旧CTAを隠さない。
-- 両platformのMain clientは`900×480 logical`、外周は左右`22px`・上下`14px`、内容幅は
+- 両platformのMain clientは`900×498 logical`、外周は左右`22px`・上下`14px`、内容幅は
   `856px`とする。6行の`y/height`はclient座標で順に`14/52`、`74/82`、`164/78`、
-  `250/56`、`314/102`、`424/42`とし、行間は全て`8px`、末尾余白は`14px`とする。
+  `250/56`、`314/120`、`442/42`とし、行間は全て`8px`、末尾余白は`14px`とする。
   current/historical account、thread/model/quotaの0件・未取得、warning/error、last-good保持で
   行またはcardを脱着・再flowせず、各固定行の内容だけを状態に応じて表示する。startup loadingは
   Headerを同じ位置に保持し、2行目から6行目までを単一surfaceで覆う。
@@ -294,7 +295,7 @@ component順や表示所有者を変更しない。
   上段の残り時間と下段のobserved時刻は右端を揃え、その列は両値の自然幅の大きい方で決める。
   Windowsでは横間隔`8px`の`Auto,*,Auto,Auto,*,Auto`の6列を使い、下段の4項目を
   0・2・3・5列へ置く。上段の期間名は0～4列、残り時間は5列、中央barは全6列を使う。
-  下段はcard内`y=45px`から表示し、日本語・900×480の参照画面ではreset時刻の文字左端が
+  下段はcard内`y=45px`から表示し、日本語・900×498の参照画面ではreset時刻の文字左端が
   約`318px`、observed labelの文字左端が約`445px`、observed時刻の文字右端が約`865px`となる。
   Mainの時刻表記は`PROC-I18N-01`に従い、quota値、期間境界、
   reset/observed epochをUIで再計算しない。
@@ -302,9 +303,10 @@ component順や表示所有者を変更しない。
   `Details`を表示せず、1件以上でだけ`68×30px`の`Details`を表示する。historical accountでは
   live件数を表示しないが、`56px`の固定card自体は保持する。
 - ModelUsageはLinuxの単一table構成を使い、各modelのInput/Cached input/Outputについてtokenと
-  隣接する概算ドルを同じrowに置く。0件でも`102px`の固定cardと見出しを保持してemptyを明示する。
+  隣接する概算ドルを同じrowに置く。4 model×22pxをcard内に表示し、0件でも`120px`の固定cardと見出しを保持してemptyを明示する。
   値の意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
 - StatusBannerはWindowsのstate title、detail、該当する単一CTA、最終受信表示の構成を使う。
+  Mainの「前回受信」はLinux/Windows各StatusBannerの高さ方向中央に配置する。platform間で他の座標・寸法を一致させない。
   選択accountのID/labelをtitleまたはdetailへ重複表示しない。
 - 0%、中間、100%、未取得、警告、危険、APIエラーで同じcard構造を保つ。認証要求では同じ
   Header・6行の割当・末尾Statusを保ち、中央4 data cardの非表示だけを切り替える。
@@ -496,7 +498,7 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
 - UIなしsilent RESTはSlint component/window/event-loop生成0、`DISPLAY`/Wayland/X11依存0、Slint HWND=0
   （visible/hidden HWNDとも0）、headless snapshot builder+read-only publisherだけとする。実装・host・artifact
   証拠未取得のためこのGUI依存ゼロ契約は`PRODUCT_PENDING`である。
-- Help/Connection guideはMain client `900×480 logical`内の情報surfaceであり、独立Window/HWNDを
+- Help/Connection guideはMain client `900×498 logical`内の情報surfaceであり、独立Window/HWNDを
   作らない（additional HWND=0）。registered top-level surface inventoryはMain、Setup、Settings、
   Graph、Threads、Legalの正確な6個で、runtime HWNDはMain=1＋open child subset 0..5（合計1..6）である。
 
@@ -546,7 +548,7 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
   一度だけの`topology_recovery center`だけを例外とする。
 - 最小幅、高DPI、最大化/復元、画面端、same/different-DPI crossing、negative/nonzero origin、
   taskbar-shrunk work areaで、supported boundary以上のmonitorに主要情報を表示する。fixed Window
-  は少なくとも900×480 logical、Graphは少なくとも700×480 logicalを必要とし、未満は
+  はMainで少なくとも900×498 logical、Setup/Settings/Threads/Legalで少なくとも900×480 logical、Graphで少なくとも700×480 logicalを必要とし、未満は
   `unsupported_scope` manifestに記録する。DPI後DWM visible_frameのrcWork完全包含も必要条件とし、
   client thresholdだけでsupportedにしない。client thresholdとframe-fitのANDがsupportedの十分条件で、
   どのmonitorもpredicate不成立ならunsupported_scopeとする。

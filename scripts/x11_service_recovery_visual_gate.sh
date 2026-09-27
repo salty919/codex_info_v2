@@ -128,7 +128,7 @@ header = struct.unpack(">25I", data[:100])
 header_size, width, height, bytes_per_line, colors = (
     header[0], header[4], header[5], header[12], header[19]
 )
-if (width, height) != (900, 480):
+if (width, height) != (900, 498):
     raise SystemExit(f"unexpected reference image size: {width}x{height}")
 offset = header_size + colors * 12
 stride = bytes_per_line // width
@@ -180,7 +180,7 @@ header = struct.unpack(">25I", data[:100])
 header_size, width, height, bytes_per_line, colors = (
     header[0], header[4], header[5], header[12], header[19]
 )
-if (width, height) != (900, 480):
+if (width, height) != (900, 498):
     raise SystemExit(f"unexpected real-service image size: {width}x{height}")
 offset = header_size + colors * 12
 stride = bytes_per_line // width
@@ -238,7 +238,7 @@ header = struct.unpack(">25I", data[:100])
 header_size, width, height, bytes_per_line, colors = (
     header[0], header[4], header[5], header[12], header[19]
 )
-if (width, height) != (900, 480):
+if (width, height) != (900, 498):
     raise SystemExit(f"fixed Main size differs: {width}x{height}")
 offset = header_size + colors * 12
 stride = bytes_per_line // width
@@ -260,7 +260,7 @@ def require_pixel(x, y, color, label):
 canvas = (14, 20, 30)
 section = (21, 31, 45)
 section_border = (38, 53, 72)
-for x, y in ((5, 5), (450, 69), (450, 159), (450, 245), (450, 309), (450, 419), (450, 470)):
+for x, y in ((5, 5), (450, 69), (450, 159), (450, 245), (450, 309), (450, 437), (450, 488)):
     require_pixel(x, y, canvas, "Main canvas/gap")
 
 # AuthRequired matches the Windows fixed Grid: the four data cards are hidden,
@@ -269,7 +269,7 @@ content_rows = (
     ("quota", 74, 155),
     ("week", 164, 241),
     ("activity", 250, 305),
-    ("model", 314, 415),
+    ("model", 314, 433),
 )
 if status_kind == "auth":
     for name, top, bottom in content_rows:
@@ -302,9 +302,9 @@ elif status_kind == "error":
     status_border = (142, 61, 77)
 else:
     raise SystemExit(f"unknown fixed Main status kind: {status_kind}")
-require_pixel(450, 424, status_border, "status top border")
-require_pixel(450, 425, status_background, "status interior")
-require_pixel(450, 465, status_border, "status bottom border")
+require_pixel(450, 442, status_border, "status top border")
+require_pixel(450, 443, status_background, "status interior")
+require_pixel(450, 483, status_border, "status bottom border")
 print(f"x11-service-recovery-visual-gate: fixed layout {status_kind} PASS")
 PY
 }
@@ -357,7 +357,7 @@ from math import sqrt
 def image(path):
     data = pathlib.Path(path).read_bytes()
     header = struct.unpack(">25I", data[:100])
-    if (header[4], header[5]) != (900, 480):
+    if (header[4], header[5]) != (900, 498):
         raise SystemExit("account Main image size differs")
     offset = header[0] + header[19] * 12
     stride = header[12] // header[4]
@@ -408,7 +408,7 @@ from math import sqrt
 data = pathlib.Path(sys.argv[1]).read_bytes()
 fixture_kind = sys.argv[2]
 header = struct.unpack(">25I", data[:100])
-if (header[4], header[5]) != (900, 480):
+if (header[4], header[5]) != (900, 498):
     raise SystemExit(f"{fixture_kind} Main image size differs")
 offset = header[0] + header[19] * 12
 bytes_per_line = header[12]
@@ -449,7 +449,7 @@ if fixture_kind == "normal":
     )
     model_pixels = sum(
         near(rgb(x, y), (242, 246, 252), 48)
-        for y in range(342, 410)
+        for y in range(342, 430)
         for x in range(34, 866)
     )
     if reset_pixels < 20 or observed_pixels < 20 or model_pixels < 50:
@@ -460,7 +460,7 @@ if fixture_kind == "normal":
 elif fixture_kind == "auth":
     action_pixels = sum(
         near(rgb(x, y), (41, 73, 104))
-        for y in range(431, 459)
+        for y in range(449, 477)
         for x in range(758, 870)
     )
     if action_pixels < 1000:
@@ -984,7 +984,7 @@ PY
 # display, dimensions, locale, and font stack. The direct Rust oracle fixes
 # this preview to [total, SOL, TERRA, LUNA, ASTRA, other] = [1,1,0,0,0,0].
 env "${common_env[@]}" CODEX_INFO_UI_CLIENT_ONLY=1 CODEX_INFO_PREVIEW=normal \
-    CODEX_INFO_PREVIEW_SIZE=900x480 "$binary" --ui --port "$port" \
+    CODEX_INFO_PREVIEW_SIZE=900x498 "$binary" --ui --port "$port" \
     >"$temp_root/reference-ui.log" 2>&1 &
 reference_ui_pid="$!"
 reference_ui_starttime="$(proc_starttime "$reference_ui_pid")"
@@ -1031,7 +1031,7 @@ assert_main_fixture_detail "$reference_frame" normal \
 
 # MainAccountSelect is the Linux identity authority. Capture both its closed
 # Header marker and its open one-row menu from the same current-account
-# fixture; opening the popup must not resize or move the 900x480 Main client.
+# fixture; opening the popup must not resize or move the 900x498 Main client.
 window_action "$reference_window_id" 367 40 click
 account_ready=0
 for _ in $(seq 1 40); do
@@ -1080,7 +1080,7 @@ for preview_kind in idle auth full; do
     esac
     preview_log="$temp_root/$preview_kind-ui.log"
     env "${common_env[@]}" CODEX_INFO_UI_CLIENT_ONLY=1 CODEX_INFO_PREVIEW="$preview_kind" \
-        CODEX_INFO_PREVIEW_SIZE=900x480 "$binary" --ui --port "$port" \
+        CODEX_INFO_PREVIEW_SIZE=900x498 "$binary" --ui --port "$port" \
         >"$preview_log" 2>&1 &
     reference_ui_pid="$!"
     reference_ui_starttime="$(proc_starttime "$reference_ui_pid")"
@@ -1173,7 +1173,7 @@ expected = sys.argv[2]
 baseline_path = sys.argv[3]
 header = struct.unpack(">25I", data[:100])
 header_size, width, height, bytes_per_line, colors = header[0], header[4], header[5], header[12], header[19]
-if (width, height) != (900, 480):
+if (width, height) != (900, 498):
     raise SystemExit(f"unexpected real-service image size: {width}x{height}")
 offset = header_size + colors * 12
 stride = bytes_per_line // width
@@ -1184,12 +1184,12 @@ def near(value, target, tolerance=24):
     return sqrt(sum((value[i] - target[i]) ** 2 for i in range(3))) <= tolerance
 # Restrict danger-color detection to the fixed StatusBanner region. ASTRA uses
 # the same color in the normal model summary and must not make a ready frame fail.
-red = sum(near(rgb(x, y), (224, 107, 122)) for y in range(424, 466) for x in range(22, 878))
+red = sum(near(rgb(x, y), (224, 107, 122)) for y in range(442, 484) for x in range(22, 878))
 # The quota fill is at a fixed y on the authenticated main surface. The
 # auth panel's primary button is lower, so this rejects a false-ready
 # frame.
 blue = sum(near(rgb(x, y), (86, 178, 245), 18) for y in range(140, 154) for x in range(22, 878))
-model_text = sum(near(rgb(x, y), (242, 246, 252), 48) for y in range(336, 410) for x in range(22, 878))
+model_text = sum(near(rgb(x, y), (242, 246, 252), 48) for y in range(336, 430) for x in range(22, 878))
 if expected == "error":
     if red < 20 or blue < 500:
         raise SystemExit(f"error frame missing retained payload/status: red={red} blue={blue}")
@@ -1215,7 +1215,7 @@ if baseline_path:
         (22, 74, 878, 156),
         (22, 164, 878, 242),
         (22, 250, 878, 306),
-        (22, 314, 878, 416),
+        (22, 314, 878, 434),
     )
     changed = total = 0
     for left, top, right, bottom in payload_rects:

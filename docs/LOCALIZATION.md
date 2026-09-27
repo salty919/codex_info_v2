@@ -64,6 +64,24 @@ UTCの順で解決し、非空で不正な`TZ`はUTCへfail closedします。`T
 通常時のStatusBannerは状態名・説明・前回受信時刻を別欄に置きます。thread title、email、モデル名、製品名、
 ライセンス名、ログ生値は原文を表示し、数値とepoch秒だけを表示時のlocale・timezoneへ変換します。
 
+Linux/Windows Mainの観測時刻ラベルと正常時の最新snapshot説明は、観測元OS名を付けず、
+全対応localeで次の固定文言を使います。接続・認証・障害の説明でLinux側を指す文言はこの契約の対象外です。
+
+| locale | 観測時刻ラベル | 正常時の説明 |
+| --- | --- | --- |
+| `ja` | 観測時刻 | 最新スナップショットを表示しています。 |
+| `en` | Observation | Showing the latest snapshot. |
+| `zh-Hans` | 观测时间 | 正在显示最新快照。 |
+| `ko` | 관측 시각 | 최신 스냅샷을 표시합니다. |
+| `es` | Observación | Mostrando la instantánea más reciente. |
+| `fr` | Observation | Dernier instantané affiché. |
+| `de` | Beobachtung | Der aktuelle Snapshot wird angezeigt. |
+| `pt` | Observação | Exibindo o instantâneo mais recente. |
+| `it` | Osservazione | Visualizzazione dell’istantanea più recente. |
+| `ru` | Наблюдение | Показан последний снимок. |
+
+`C`、`POSIX`、未対応localeは既存の英語fallbackを維持します。
+
 日本語・韓国語フォントは`assets/NotoSansJP.ttf`と`assets/NotoSansKR.otf`をSlintへ埋め込み、起動時localeのフォントを各Windowへ適用します。フォントのOFL-1.1通知は[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)と[assets/NOTICE.txt](../assets/NOTICE.txt)に記載します。
 
 ネイティブタイトルバーは使用しません。各Windowのボタン以外の画面領域を移動用に使い、画面内タイトル領域、操作記号、固定文言は埋め込みフォントでlocale表示します。Graphだけは四隅の広い対角領域と辺から枠をリサイズし、最大化／復元も提供します。

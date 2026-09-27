@@ -8,6 +8,7 @@ param(
     [int]$GraphPoints = 3,
     [ValidateRange(0, 5000)][int]$GraphBuildDelayMilliseconds = 0,
     [ValidateRange(0, 7)][int]$ThreadCount = 6,
+    [switch]$ConfiguredService,
     [switch]$OpenGraphPeriodMenu,
     [switch]$OpenGraphMetricMenu
 )
@@ -38,18 +39,35 @@ public static class CodexInfoCaptureWin32 {
 '@
 [CodexInfoCaptureWin32]::SetProcessDPIAware() | Out-Null
 
-$env:CODEX_INFO_WINDOWS_PREVIEW = $Preview
-$env:CODEX_INFO_WINDOWS_PREVIEW_SIZE = $PreviewSize
-$env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS = $GraphPoints
-$env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_BUILD_DELAY_MS = $GraphBuildDelayMilliseconds
-$env:CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT = $ThreadCount
-$expectedTitle = switch ($Preview) {
-    { $_ -in @('normal', 'auth', 'error', 'warning', 'danger', 'zero', 'full', 'update') } { 'Codex Info Monitor' }
-    'graph' { 'Codex Info Graph' }
-    { $_ -in @('threads', 'threads-tree', 'threads-branches') } { 'Codex Info Threads' }
-    'legal' { 'Codex Info Legal' }
-    'settings' { 'Codex Info Settings' }
-    default { 'Codex Info Setup' }
+if ($ConfiguredService) {
+    if ($PSBoundParameters.ContainsKey('Preview') -or $OpenGraphPeriodMenu -or $OpenGraphMetricMenu) {
+        throw 'ConfiguredService captures only the live Main window without preview or Graph menu options'
+    }
+    # The launched client must use its persisted service settings and real
+    # account state, even when this shell previously ran a preview capture.
+    foreach ($previewVariable in @(
+        'CODEX_INFO_WINDOWS_PREVIEW',
+        'CODEX_INFO_WINDOWS_PREVIEW_SIZE',
+        'CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS',
+        'CODEX_INFO_WINDOWS_PREVIEW_GRAPH_BUILD_DELAY_MS',
+        'CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT')) {
+        Remove-Item "Env:$previewVariable" -ErrorAction SilentlyContinue
+    }
+    $expectedTitle = 'Codex Info Monitor'
+} else {
+    $env:CODEX_INFO_WINDOWS_PREVIEW = $Preview
+    $env:CODEX_INFO_WINDOWS_PREVIEW_SIZE = $PreviewSize
+    $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS = $GraphPoints
+    $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_BUILD_DELAY_MS = $GraphBuildDelayMilliseconds
+    $env:CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT = $ThreadCount
+    $expectedTitle = switch ($Preview) {
+        { $_ -in @('normal', 'auth', 'error', 'warning', 'danger', 'zero', 'full', 'update') } { 'Codex Info Monitor' }
+        'graph' { 'Codex Info Graph' }
+        { $_ -in @('threads', 'threads-tree', 'threads-branches') } { 'Codex Info Threads' }
+        'legal' { 'Codex Info Legal' }
+        'settings' { 'Codex Info Settings' }
+        default { 'Codex Info Setup' }
+    }
 }
 $script:codexInfoCaptureTitle = $expectedTitle
 $exe = if ([string]::IsNullOrWhiteSpace($ClientPath)) {
@@ -81,7 +99,7 @@ try {
         [CodexInfoCaptureWin32]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
         $window = $script:codexInfoCaptureWindow
     }
-    if ($window -eq [IntPtr]::Zero) { throw "Fresh $Preview window ($expectedTitle) did not open" }
+    if ($window -eq [IntPtr]::Zero) { throw "Fresh $expectedTitle window did not open" }
     [CodexInfoCaptureWin32]::ShowWindow($window, 9) | Out-Null
     # Acceptance capture must not silently photograph an unrelated window if
     # foreground activation is denied. Keep only this fresh test HWND topmost
@@ -90,6 +108,39 @@ try {
     [CodexInfoCaptureWin32]::BringWindowToTop($window) | Out-Null
     [CodexInfoCaptureWin32]::SetForegroundWindow($window) | Out-Null
     Start-Sleep -Milliseconds 500
+    if ($ConfiguredService) {
+        # Read only the accepted Main generation on this process's HWND.
+        # A Setup window, preview, pending generation, or failure is not live
+        # authenticated Main evidence.
+        $automationRoot = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $condition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+            'Main.DetailsGenerationContract')
+        $authenticatedContentCondition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+            'Main.QuotaObservedAt')
+        $generationState = 'missing'
+        $authenticatedContentVisible = $false
+        for ($readyAttempt = 0; $readyAttempt -lt 40; $readyAttempt++) {
+            $generation = $automationRoot.FindFirst(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $condition)
+            if ($null -ne $generation) {
+                $generationState = $generation.Current.Name
+            }
+            $observedAt = $automationRoot.FindFirst(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $authenticatedContentCondition)
+            $authenticatedContentVisible = $null -ne $observedAt -and -not $observedAt.Current.IsOffscreen
+            if ($generationState -eq 'ready' -and $authenticatedContentVisible) {
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if ($generationState -ne 'ready' -or -not $authenticatedContentVisible) {
+            throw "Configured authenticated Main is not ready: generation=$generationState authenticatedContentVisible=$authenticatedContentVisible"
+        }
+    }
     if ($OpenGraphPeriodMenu -or $OpenGraphMetricMenu) {
         # Locate the semantic control instead of scaling stale pixel
         # coordinates. This remains correct across DPI and responsive widths.
@@ -123,7 +174,8 @@ try {
     $bitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
     $graphics.Dispose()
     $bitmap.Dispose()
-    Write-Output "capture: PASS pid=$($process.Id) size=${width}x${height} path=$OutputPath"
+    $captureMode = if ($ConfiguredService) { 'configured-service' } else { "preview:$Preview" }
+    Write-Output "capture: PASS mode=$captureMode pid=$($process.Id) hwnd=$window size=${width}x${height} path=$OutputPath"
 }
 finally {
     if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
