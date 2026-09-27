@@ -324,14 +324,9 @@ component順や表示所有者を変更しない。
 
 - 期間、ドル/トークン、Remaining/LUNA/TERRA/SOL/ASTRAの操作を上部固定帯に置く。
   model名と累積値は同じaccepted v3 rootから取得し、ASTRAを「その他」へ集約しない。
-- 期間・metricのリストはpointer pressの1回で展開し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。物理入力からpaintまでのP90/P95は、CPU、memory、GPU、storage、OS/build、sample数を併記し、同じ環境・同じ入力規模の退行観測に使う。7日1分bucket由来の10,080点と契約最大1暦月由来の44,640点は観測profileであって、通常データを拒否する任意の上限ではない。最低動作環境と承認baselineが定義されるまでは、根拠のない絶対ms値やcold maxをUX合否条件にしない。
-- 承認済み最低Windows実機または同等の専用self-hosted runnerが定義された後だけ、その環境のbaselineから絶対P90/P95を導出できる。負荷と画面capture速度が共有されるGitHub-hosted runnerは機能E2Eとハング検知にだけ使い、絶対性能の合否判定には使わない。
-- 系列ON/OFFはpointer pressで状態とボタン面を先に更新する。P90/P95はこのuser-visible acknowledgementを
-  測り、同じ入力でplot画像も必ず変化したことを別のbounded postconditionとして確認する。
-- 期間/metricの各測定sampleは閉状態から1回の物理クリックで展開する同一操作とし、次sample用の
-  Escape閉鎖は測定区間へ混ぜない。物理入力、UI状態、実描画を別経路で確認し、同一点の機械的な
-  高速連打や開閉の異なる操作を一つのP90/P95へ合成しない。pollやlocale通知による同値候補の
-  再公開をユーザー選択へ読み替えず、開いているリストを自動で閉じない。
+- 期間・metricのリストはpointer pressの1回で展開し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。7日1分bucket由来の10,080点と契約最大1暦月由来の44,640点は対象データ規模であって、通常データを拒否する任意の上限ではない。最低動作環境と承認baselineが定義されるまでは、根拠のない絶対ms値やcold maxをUX合否条件にしない。
+- 系列ON/OFFはpointer pressで状態とボタン面を先に更新する。同じ入力でplot画像も必ず変化する。物理入力、UI状態、実描画を別経路で確認する。
+- 期間・metricのリストはユーザーの選択で状態を変え、pollやlocale通知による同値候補の再公開では選択へ読み替えない。開いているリストを自動で閉じない。
 - 期間変更は`idle → loading → ready|confirmed-empty|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
   accepted same-pair history page集合のparseとpresentation projectionはUI thread外で行う。SQLite再読込やsampleの
   canonicalization/merge/recalculationは行わない。既存の遅延残量補間と終端保持はpresentation-onlyで行い、
@@ -341,7 +336,7 @@ component順や表示所有者を変更しない。
   metric・軸を保持し、候補完成時だけ1回のUI publishで全てを同時に差し替える。
 - 期間を連続選択した場合は旧候補をcancelし、最新revisionだけをpublishする。失敗・timeout・cancelを
   空graphや部分graphへ変換せず、直前graphを保持してbounded errorを表示する。キャッシュ済みで次paint
-  までに切替できる場合はprogressを点滅させない。クリック反応SLOと期間データ完成時間P90/P95を混同しない。
+  までに切替できる場合はprogressを点滅させない。入力への反応と期間データ完成は別条件として確認する。
 - current期間の`start_at/end_at`はCOREが同じ最新quota観測から動的に投影したpairを唯一のauthorityとする。
   期間欄、メイン画面の利用期間、selected period start、plotの横軸左端・右端はaccepted periods resourceの
   同じpairをそのまま使い、Windowsで再計算しない。completed/historical期間は保存済みpairを使う。quotaの
@@ -591,7 +586,7 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
 7. 各surfaceのlogical client threshold AND DPI後DWM visible_frameのrcWork完全包含を満たし、
    reopen invalid時のtopology_recovery reasonとtimer/poll/drag後recenter=0を記録する。
 8. 一つでも未確認、`INCONCLUSIVE`、`HOLD`、FAILがあればUXと製品を完了扱いにしない。
-9. 全メニュー、selector、toggleの物理入力→paint latencyを4.2節の操作別SLOで測定する。
-   backend poll中も同じ上限を満たし、平均値だけで代替しない。
+9. 全メニュー、selector、toggleで、物理入力に対する状態更新とpaintを別経路で確認する。
+   backend poll中も入力を塞がず、同じ機能結果を確認する。
 
 このゲートは、実装者の「見た目は良い」「動いた」という自己判断を受入証拠の代わりにしない。

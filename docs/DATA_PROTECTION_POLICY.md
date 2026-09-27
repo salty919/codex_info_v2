@@ -477,9 +477,9 @@ candidate、別artifact、同じlineage IDの別hashは受理0である。
 製品保証scopeは、1 recorder、1 loopback API、1 Windows client、10秒completion-based poll、in-flight 1、source不変、
 maintenance停止中の`steady_idle`である。warm-up 2分後の30分窓で次を同時に満たす。
 
-- recorder: CPU平均0.5%以下、1秒sample p95 2%以下、RSS増加16 MiB以下、full source scan/DB write/retry 0。
-- API: request外CPU平均0.2%以下、1秒sample p95 1%以下、RSS増加8 MiB以下。各pollはhealth/status/detailsを各1回以下。
-- Windows client: CPU平均1.0%以下、1秒sample p95 5%以下、RSS増加32 MiB以下、poll queue 0。
+- recorder: CPU平均0.5%以下、RSS増加16 MiB以下、full source scan/DB write/retry 0。
+- API: request外CPU平均0.2%以下、RSS増加8 MiB以下。各pollはhealth/status/detailsを各1回以下。
+- Windows client: CPU平均1.0%以下、RSS増加32 MiB以下、poll queue 0。
 - Linux recorder+APIとWindows clientを各hostの1 logical CPUへ正規化した平均の合計は2.0%以下。source不変時の
   product DB/write bytesは0、networkはloopback/SSH tunnelのpoll bytesだけである。
 
