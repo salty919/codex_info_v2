@@ -79,6 +79,32 @@ jobs:
             bash scripts/pre_pr_gate.sh --base "$BASE_SHA" \
               --requested-check governance-contract
           else
+            authority_changed="$(
+              python3 - <<'PY'
+          import os
+          import subprocess
+
+          from scripts.ci_change_scope import paths_from_name_status
+
+          changed = paths_from_name_status(
+              subprocess.check_output(
+                  [
+                      "git", "diff", "--name-status", "-z", "-M", "-C",
+                      "--find-copies-harder", os.environ["BASE_SHA"], os.environ["SOURCE_SHA"],
+                  ]
+              )
+          )
+          authority_paths = {
+              "scripts/requirements_authority.py",
+              "scripts/test_requirements_authority.py",
+              "scripts/requirements_ledger_gate.sh",
+          }
+          print("true" if authority_paths.intersection(changed) else "false")
+          PY
+            )"
+            if [[ "$authority_changed" == true ]]; then
+              python3 scripts/test_requirements_authority.py
+            fi
             go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
             python3 scripts/workflow_inno_acquisition_gate.py --self-test
             python3 scripts/workflow_quality_gate.py --self-test
