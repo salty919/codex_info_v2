@@ -422,8 +422,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut state_writer =
         RecorderStateWriter::new(&options.data_root, &options.identity, &_profile_lease)?;
-    let mut quota_poller = QuotaPoller::start_with_interval(options.interval_secs);
-    let thread_poller = ThreadPoller::start(options.sessions_root.clone());
+    let mut quota_poller = QuotaPoller::start_with_interval(
+        options.interval_secs,
+        options.codex_home.clone(),
+        options.data_root.clone(),
+    );
+    let thread_poller = ThreadPoller::start(
+        options.codex_home.clone(),
+        options.data_root.clone(),
+        options.sessions_root.clone(),
+    );
     let mut schedule = FixedRateSchedule::new(Duration::from_secs(options.interval_secs));
     let mut quota_health = LaneHealth::Unknown;
     let mut thread_health = LaneHealth::Unknown;
@@ -557,39 +565,129 @@ fn run_without_account(
     options: &Options,
     profile_lease: &ProfileLease,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match probe_codex_authentication_state()
-        .map_err(|error| RecorderError::Invalid(format!("confirm Codex logout: {error}")))?
-    {
-        CodexAuthenticationState::AuthRequired => {}
-        CodexAuthenticationState::Authenticated => {
-            return Err(RecorderError::Invalid(
-                "Codex is authenticated but the local account authority is unavailable".to_owned(),
-            )
-            .into())
-        }
-    }
-    let mut state_writer = RecorderStateWriter::new_idle(&options.data_root, profile_lease)?;
-    state_writer.write_idle_no_account()?;
-    if options.once {
-        return Ok(());
-    }
+    let started_at = Instant::now();
+    let mut probe_schedule =
+        NoAccountProbeSchedule::new(started_at, Duration::from_secs(options.interval_secs));
+    let mut state_writer = None;
+    let mut probe = |codex_home: &std::path::Path, data_root: &std::path::Path| {
+        probe_codex_authentication_state(codex_home, data_root)
+    };
+    let mut clock = Instant::now;
     let heartbeat = Duration::from_secs(options.interval_secs.clamp(1, 5));
     loop {
+        let outcome = attempt_no_account_probe_cycle(
+            options,
+            profile_lease,
+            &mut state_writer,
+            &mut probe_schedule,
+            &mut probe,
+            &mut clock,
+        )?;
+        if options.once && outcome == NoAccountProbeOutcome::Confirmed {
+            return Ok(());
+        }
+        if outcome != NoAccountProbeOutcome::Confirmed {
+            let auth_path = options.codex_home.join("auth.json");
+            match fs::symlink_metadata(&auth_path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) if AccountEpochProof::capture(&options.codex_home).is_ok() => {
+                    return Err(RecorderError::AccountBoundaryChanged.into())
+                }
+                _ => {
+                    return Err(RecorderError::Invalid(
+                        "Codex account authority appeared but is invalid".to_owned(),
+                    )
+                    .into())
+                }
+            }
+        }
         std::thread::sleep(heartbeat);
-        let auth_path = options.codex_home.join("auth.json");
-        match fs::symlink_metadata(&auth_path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                state_writer.write_idle_no_account()?;
-            }
-            Ok(_) if AccountEpochProof::capture(&options.codex_home).is_ok() => {
-                return Err(RecorderError::AccountBoundaryChanged.into())
-            }
-            _ => {
-                return Err(RecorderError::Invalid(
-                    "Codex account authority appeared but is invalid".to_owned(),
-                )
-                .into())
-            }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoAccountProbeOutcome {
+    NotDue,
+    RetryScheduled,
+    Confirmed,
+}
+
+struct NoAccountProbeSchedule {
+    probe: FixedRateSchedule,
+    next_probe_at: Instant,
+    next_idle_state_at: Option<Instant>,
+}
+
+impl NoAccountProbeSchedule {
+    fn new(started_at: Instant, interval: Duration) -> Self {
+        Self {
+            probe: FixedRateSchedule::anchored(started_at, interval),
+            next_probe_at: started_at,
+            next_idle_state_at: None,
+        }
+    }
+}
+
+fn attempt_no_account_probe_cycle<P, C>(
+    options: &Options,
+    profile_lease: &ProfileLease,
+    state_writer: &mut Option<RecorderStateWriter>,
+    schedule: &mut NoAccountProbeSchedule,
+    probe: &mut P,
+    clock: &mut C,
+) -> Result<NoAccountProbeOutcome, Box<dyn std::error::Error>>
+where
+    P: FnMut(&std::path::Path, &std::path::Path) -> Result<CodexAuthenticationState, String>,
+    C: FnMut() -> Instant,
+{
+    let now = clock();
+    let idle_state_heartbeat = Duration::from_secs(options.interval_secs.min(60));
+    if let Some(state_writer) = state_writer.as_mut() {
+        if schedule
+            .next_idle_state_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            state_writer.write_idle_no_account()?;
+            let completed_at = clock();
+            schedule.next_idle_state_at = Some(
+                completed_at
+                    .checked_add(idle_state_heartbeat)
+                    .unwrap_or(completed_at),
+            );
+        }
+        return Ok(NoAccountProbeOutcome::NotDue);
+    }
+    if now < schedule.next_probe_at {
+        return Ok(NoAccountProbeOutcome::NotDue);
+    }
+    match probe(&options.codex_home, &options.data_root) {
+        Ok(CodexAuthenticationState::AuthRequired) => {
+            let mut writer = RecorderStateWriter::new_idle(&options.data_root, profile_lease)?;
+            writer.write_idle_no_account()?;
+            *state_writer = Some(writer);
+            let confirmed_at = clock();
+            schedule.next_idle_state_at = Some(
+                confirmed_at
+                    .checked_add(idle_state_heartbeat)
+                    .unwrap_or(confirmed_at),
+            );
+            Ok(NoAccountProbeOutcome::Confirmed)
+        }
+        Ok(CodexAuthenticationState::Authenticated) => Err(RecorderError::Invalid(
+            "Codex is authenticated but the local account authority is unavailable".to_owned(),
+        )
+        .into()),
+        Err(error) if options.once => {
+            Err(RecorderError::Invalid(format!("confirm Codex logout: {error}")).into())
+        }
+        Err(_) => {
+            eprintln!("codex-info-recorder degraded authentication probe failed");
+            let completed_at = clock();
+            let wait = schedule.probe.complete_cycle(completed_at);
+            schedule.next_probe_at = completed_at
+                .checked_add(wait.sleep_for)
+                .unwrap_or(completed_at);
+            Ok(NoAccountProbeOutcome::RetryScheduled)
         }
     }
 }
@@ -732,7 +830,7 @@ mod tests {
     use codex_info_db_writer::ActiveThreadRecord;
     use serde_json::Value;
     use std::cell::Cell;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn version_is_the_recorder_package_version() {
@@ -1269,5 +1367,218 @@ mod tests {
             Some(RecorderError::AccountBoundaryChanged)
         ));
         after_commit.cleanup();
+    }
+
+    fn no_account_test_options(root: &std::path::Path, once: bool) -> Options {
+        let codex_home = root.join("codex-home");
+        let sessions_root = root.join("sessions");
+        let data_root = root.join("data");
+        fs::create_dir(&codex_home).expect("Codex home");
+        fs::create_dir(&sessions_root).expect("sessions root");
+        fs::create_dir(&data_root).expect("data root");
+        prepare_recorder_data_root(&data_root).expect("recorder data root");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 1,
+            partition_id: "33".repeat(32),
+        };
+        let database = data_root.join("usage.sqlite3");
+        let partition = AccountPartition {
+            profile_scope_id: identity.profile_scope_id.clone(),
+            account_scope_id: identity.account_scope_id.clone(),
+            storage_epoch: identity.storage_epoch,
+            partition_id: identity.partition_id.clone(),
+            database_path: database.clone(),
+            login_id: None,
+            activation_timestamp: None,
+            lifecycle_intervals: Vec::new(),
+            current_interval_start: None,
+            current_interval_end: None,
+        };
+        Options {
+            codex_home,
+            sessions_root,
+            data_root,
+            database,
+            identity,
+            partition,
+            chunk_bytes: 4096,
+            interval_secs: 60,
+            once,
+            activation_timestamp: None,
+        }
+    }
+
+    #[test]
+    fn unconfirmed_probe_error_waits_for_next_cycle_without_idle_state() {
+        let temporary = tempfile::tempdir().expect("create no-account test root");
+        let options = no_account_test_options(temporary.path(), false);
+        let lease = ProfileLease::acquire(&options.data_root).expect("profile lease");
+        let anchor = Instant::now();
+        let mut schedule = NoAccountProbeSchedule::new(anchor, Duration::from_secs(60));
+        let mut state_writer = None;
+        let now = Cell::new(anchor);
+        let calls = Cell::new(0);
+        let mut probe = |_: &std::path::Path, _: &std::path::Path| {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                1 => Err("fixture transport failure".to_owned()),
+                2 => Ok(CodexAuthenticationState::AuthRequired),
+                _ => panic!("unexpected no-account probe"),
+            }
+        };
+        let mut clock = || now.get();
+
+        assert_eq!(
+            attempt_no_account_probe_cycle(
+                &options,
+                &lease,
+                &mut state_writer,
+                &mut schedule,
+                &mut probe,
+                &mut clock,
+            )
+            .expect("initial failure is retried by the owner"),
+            NoAccountProbeOutcome::RetryScheduled
+        );
+        let state_path = options.data_root.join("history/recorder-state.json");
+        assert!(
+            !state_path.exists(),
+            "unknown auth state is not published as idle"
+        );
+        assert!(
+            !options.database.exists(),
+            "unknown auth state does not create a cursor DB"
+        );
+        assert_eq!(calls.get(), 1);
+
+        now.set(anchor + Duration::from_secs(5));
+        assert_eq!(
+            attempt_no_account_probe_cycle(
+                &options,
+                &lease,
+                &mut state_writer,
+                &mut schedule,
+                &mut probe,
+                &mut clock,
+            )
+            .expect("five-second heartbeat does not probe app-server"),
+            NoAccountProbeOutcome::NotDue
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(!state_path.exists());
+        assert!(!options.database.exists());
+
+        now.set(anchor + Duration::from_secs(60));
+        assert_eq!(
+            attempt_no_account_probe_cycle(
+                &options,
+                &lease,
+                &mut state_writer,
+                &mut schedule,
+                &mut probe,
+                &mut clock,
+            )
+            .expect("next regular cycle confirms logout"),
+            NoAccountProbeOutcome::Confirmed
+        );
+        assert_eq!(calls.get(), 2);
+        let state: Value = serde_json::from_slice(&fs::read(&state_path).expect("idle state"))
+            .expect("idle state JSON");
+        assert_eq!(state["write_state"], "idle_no_account");
+        let confirmed_inode = fs::metadata(&state_path)
+            .expect("confirmed idle state")
+            .ino();
+        let confirmed_bytes = fs::read(&state_path).expect("confirmed idle bytes");
+        now.set(anchor + Duration::from_secs(65));
+        assert_eq!(
+            attempt_no_account_probe_cycle(
+                &options,
+                &lease,
+                &mut state_writer,
+                &mut schedule,
+                &mut probe,
+                &mut clock,
+            )
+            .expect("five-second heartbeat leaves confirmed idle state unchanged"),
+            NoAccountProbeOutcome::NotDue
+        );
+        assert_eq!(
+            fs::metadata(&state_path).expect("idle state").ino(),
+            confirmed_inode
+        );
+        assert_eq!(fs::read(&state_path).expect("idle bytes"), confirmed_bytes);
+
+        now.set(anchor + Duration::from_secs(120));
+        assert_eq!(
+            attempt_no_account_probe_cycle(
+                &options,
+                &lease,
+                &mut state_writer,
+                &mut schedule,
+                &mut probe,
+                &mut clock,
+            )
+            .expect("regular idle heartbeat refreshes recorder state"),
+            NoAccountProbeOutcome::NotDue
+        );
+        assert_ne!(
+            fs::metadata(&state_path)
+                .expect("refreshed idle state")
+                .ino(),
+            confirmed_inode
+        );
+        let refreshed: Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("refreshed idle bytes"))
+                .expect("refreshed idle JSON");
+        let updated_at = refreshed["updated_at_unix"]
+            .as_i64()
+            .expect("REST freshness timestamp");
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs() as i64;
+        assert!(updated_at <= now_unix + 5);
+        assert!(
+            now_unix - updated_at <= 150,
+            "idle state must satisfy REST freshness"
+        );
+        assert!(
+            !options.database.exists(),
+            "idle confirmation advances no cursor"
+        );
+
+        let once_root = tempfile::tempdir().expect("create one-shot test root");
+        let once_options = no_account_test_options(once_root.path(), true);
+        let once_lease = ProfileLease::acquire(&once_options.data_root).expect("one-shot lease");
+        let once_anchor = Instant::now();
+        let mut once_schedule = NoAccountProbeSchedule::new(once_anchor, Duration::from_secs(60));
+        let mut once_state_writer = None;
+        let once_calls = Cell::new(0);
+        let mut failing_probe = |_: &std::path::Path, _: &std::path::Path| {
+            once_calls.set(once_calls.get() + 1);
+            Err("fixture transport failure".to_owned())
+        };
+        let mut once_clock = || once_anchor;
+        assert!(attempt_no_account_probe_cycle(
+            &once_options,
+            &once_lease,
+            &mut once_state_writer,
+            &mut once_schedule,
+            &mut failing_probe,
+            &mut once_clock,
+        )
+        .is_err());
+        assert_eq!(once_calls.get(), 1);
+        assert!(
+            !once_options
+                .data_root
+                .join("history/recorder-state.json")
+                .exists(),
+            "one-shot failure remains unconfirmed"
+        );
+        assert!(!once_options.database.exists());
     }
 }
