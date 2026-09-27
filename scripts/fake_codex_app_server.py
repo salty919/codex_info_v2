@@ -25,7 +25,7 @@ if thread_id and thread_path and thread_title:
         "preview": thread_title,
         "sessionId": f"session-{thread_id}",
         "source": "cli",
-        "status": {"type": "idle"},
+        "status": {"type": "active", "activeFlags": []},
         "turns": [],
         "updatedAt": now,
         "name": thread_title,
