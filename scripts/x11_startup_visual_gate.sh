@@ -32,7 +32,7 @@ chmod 700 "$temp_root/runtime"
 # reject the failure-port client while the server is resetting.
 xprop -root -spy _NET_CLIENT_LIST >"$temp_root/display-guard.log" 2>&1 &
 display_guard_pid="$!"
-env HOME="$temp_root/home" XDG_CONFIG_HOME="$temp_root/config" XDG_DATA_HOME="$temp_root/data" XDG_CACHE_HOME="$temp_root/cache" XDG_STATE_HOME="$temp_root/state" XDG_RUNTIME_DIR="$temp_root/runtime" CODEX_INFO_PREVIEW=startup-loading CODEX_INFO_PREVIEW_SIZE=900x480 "$binary" --ui >"$temp_root/client.log" 2>&1 &
+env HOME="$temp_root/home" XDG_CONFIG_HOME="$temp_root/config" XDG_DATA_HOME="$temp_root/data" XDG_CACHE_HOME="$temp_root/cache" XDG_STATE_HOME="$temp_root/state" XDG_RUNTIME_DIR="$temp_root/runtime" CODEX_INFO_PREVIEW=startup-loading CODEX_INFO_PREVIEW_SIZE=900x498 "$binary" --ui >"$temp_root/client.log" 2>&1 &
 preview_pid="$!"
 window_id=""
 for startup_attempt in $(seq 1 80); do
@@ -62,7 +62,7 @@ from math import sqrt
 data = open(sys.argv[1], 'rb').read()
 h = struct.unpack('>25I', data[:100])
 header_size, width, height, bytes_per_line, colors = h[0], h[4], h[5], h[12], h[19]
-if (width, height) != (900, 480):
+if (width, height) != (900, 498):
     raise SystemExit(f'unexpected startup image size: {width}x{height}')
 offset = header_size + colors * 12
 stride = bytes_per_line // width
@@ -109,7 +109,7 @@ for start in quota_blue:
         largest = shape
 if largest[1] >= 100 and largest[0] >= 100:
     raise SystemExit(f'partial quota payload leaked: component area={largest[0]} width={largest[1]} height={largest[2]}')
-print('x11-startup-visual-gate: PASS (900x480, header/version visible, centered spinner visible, partial payload hidden)')
+print('x11-startup-visual-gate: PASS (900x498, header/version visible, centered spinner visible, partial payload hidden)')
 PY
 }
 startup_frame_ready=0
@@ -170,7 +170,7 @@ from math import sqrt
 data = open(sys.argv[1], 'rb').read()
 h = struct.unpack('>25I', data[:100])
 header_size, width, height, bytes_per_line, colors = h[0], h[4], h[5], h[12], h[19]
-if (width, height) != (900, 480):
+if (width, height) != (900, 498):
     raise SystemExit(f'unexpected failure image size: {width}x{height}')
 offset = header_size + colors * 12
 stride = bytes_per_line // width
@@ -186,11 +186,11 @@ def count_near(bounds, color, tolerance=8):
         for y in range(y0, y1)
         for x in range(x0, x1)
     )
-status_bounds = (22, 424, 878, 466)
-title_bounds = (50, 427, 766, 444)
-detail_bounds = (50, 444, 766, 462)
-accent_bounds = (32, 441, 40, 449)
-retry_bounds = (778, 431, 870, 459)
+status_bounds = (22, 442, 878, 484)
+title_bounds = (50, 445, 766, 462)
+detail_bounds = (50, 462, 766, 480)
+accent_bounds = (32, 459, 40, 467)
+retry_bounds = (778, 449, 870, 477)
 error_background = (58, 29, 36)
 error_border = (142, 61, 77)
 error_accent = (224, 107, 122)

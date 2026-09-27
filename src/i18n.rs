@@ -724,16 +724,16 @@ impl I18n {
 
     pub fn main_ready_status_detail(&self) -> &'static str {
         match self.language {
-            Language::Japanese => "Linux 側の最新スナップショットを表示しています。",
-            Language::SimplifiedChinese => "正在显示最新的 Linux 快照。",
-            Language::Korean => "최신 Linux 스냅샷을 표시합니다.",
-            Language::Spanish => "Mostrando la instantánea más reciente de Linux.",
-            Language::French => "Dernier instantané Linux affiché.",
-            Language::German => "Der aktuelle Linux-Snapshot wird angezeigt.",
-            Language::Portuguese => "Exibindo o instantâneo mais recente do Linux.",
-            Language::Italian => "Visualizzazione dell’istantanea Linux più recente.",
-            Language::Russian => "Показан последний снимок Linux.",
-            Language::English => "Showing the latest Linux snapshot.",
+            Language::Japanese => "最新スナップショットを表示しています。",
+            Language::SimplifiedChinese => "正在显示最新快照。",
+            Language::Korean => "최신 스냅샷을 표시합니다.",
+            Language::Spanish => "Mostrando la instantánea más reciente.",
+            Language::French => "Dernier instantané affiché.",
+            Language::German => "Der aktuelle Snapshot wird angezeigt.",
+            Language::Portuguese => "Exibindo o instantâneo mais recente.",
+            Language::Italian => "Visualizzazione dell’istantanea più recente.",
+            Language::Russian => "Показан последний снимок.",
+            Language::English => "Showing the latest snapshot.",
         }
     }
 

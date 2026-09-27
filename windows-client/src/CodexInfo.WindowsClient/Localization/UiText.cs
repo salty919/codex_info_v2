@@ -554,7 +554,7 @@ public sealed record UiText(
             return state switch
             {
                 "Connecting" => "SSH ローカルポート転送経由で Linux 側を確認しています。",
-                "Ready" => "Linux 側の最新スナップショットを表示しています。",
+                "Ready" => "最新スナップショットを表示しています。",
                 "QuotaDanger" => "残量は 2% 以下です。",
                 "QuotaWarning" => "残量は 10% 以下です。",
                 "ResetWarning" => "24 時間以内に利用枠がリセットされます。",
@@ -572,7 +572,7 @@ public sealed record UiText(
         if (LanguageCode == "zh-Hans") return state switch
         {
             "Connecting" => "正在通过 SSH 本地转发检查 Linux。",
-            "Ready" => "正在显示最新的 Linux 快照。",
+            "Ready" => "正在显示最新快照。",
             "QuotaDanger" => "剩余配额不超过 2%。",
             "QuotaWarning" => "剩余配额不超过 10%。",
             "ResetWarning" => "配额将在 24 小时内重置。",
@@ -586,7 +586,7 @@ public sealed record UiText(
         if (LanguageCode == "ko") return state switch
         {
             "Connecting" => "SSH 로컬 전달을 통해 Linux를 확인하는 중입니다.",
-            "Ready" => "최신 Linux 스냅샷을 표시합니다.",
+            "Ready" => "최신 스냅샷을 표시합니다.",
             "QuotaDanger" => "남은 사용량이 2% 이하입니다.",
             "QuotaWarning" => "남은 사용량이 10% 이하입니다.",
             "ResetWarning" => "24시간 이내에 사용량이 재설정됩니다.",
@@ -597,16 +597,16 @@ public sealed record UiText(
             "ResponseError" => "Linux에서 유효한 응답을 받지 못했습니다.",
             _ => "SSH 로컬 전달을 확인하세요."
         };
-        if (LanguageCode == "es") return state switch { "Connecting" => "Comprobando Linux mediante el túnel SSH.", "Ready" => "Mostrando la instantánea más reciente de Linux.", "QuotaDanger" => "La cuota restante es del 2% o menos.", "QuotaWarning" => "La cuota restante es del 10% o menos.", "ResetWarning" => "La cuota se restablece en 24 horas.", "Initializing" => "Se actualizará cuando Linux esté listo.", "AuthRequired" => "Inicia la autenticación de Linux para actualizar.", "ApiError" => "La ruta está disponible; comprueba Linux.", "TransportError" => "El túnel SSH o la aplicación Linux no están disponibles.", "ResponseError" => "Linux no devolvió una respuesta válida.", _ => "Comprueba el túnel SSH." };
-        if (LanguageCode == "fr") return state switch { "Connecting" => "Vérification de Linux via le tunnel SSH.", "Ready" => "Dernier instantané Linux affiché.", "QuotaDanger" => "Le quota restant est inférieur ou égal à 2 %.", "QuotaWarning" => "Le quota restant est inférieur ou égal à 10 %.", "ResetWarning" => "Le quota sera réinitialisé sous 24 heures.", "Initializing" => "Actualisation dès que Linux est prêt.", "AuthRequired" => "Démarrez l’authentification Linux pour actualiser.", "ApiError" => "La route est disponible ; vérifiez Linux.", "TransportError" => "Le tunnel SSH ou l’application Linux est indisponible.", "ResponseError" => "Linux n’a pas renvoyé de réponse valide.", _ => "Vérifiez le tunnel SSH." };
-        if (LanguageCode == "de") return state switch { "Connecting" => "Linux über den SSH-Tunnel wird geprüft.", "Ready" => "Der aktuelle Linux-Snapshot wird angezeigt.", "QuotaDanger" => "Das verbleibende Kontingent beträgt höchstens 2 %.", "QuotaWarning" => "Das verbleibende Kontingent beträgt höchstens 10 %.", "ResetWarning" => "Das Kontingent wird innerhalb von 24 Stunden zurückgesetzt.", "Initializing" => "Aktualisierung, sobald Linux bereit ist.", "AuthRequired" => "Linux-Authentifizierung starten, um zu aktualisieren.", "ApiError" => "Die Route ist verfügbar; Linux prüfen.", "TransportError" => "SSH-Tunnel oder Linux-App nicht verfügbar.", "ResponseError" => "Linux hat keine gültige Antwort geliefert.", _ => "SSH-Tunnel prüfen." };
-        if (LanguageCode == "pt") return state switch { "Connecting" => "Verificando o Linux pelo túnel SSH.", "Ready" => "Exibindo o instantâneo mais recente do Linux.", "QuotaDanger" => "A cota restante é de 2% ou menos.", "QuotaWarning" => "A cota restante é de 10% ou menos.", "ResetWarning" => "A cota será redefinida em 24 horas.", "Initializing" => "Atualizará quando o Linux estiver pronto.", "AuthRequired" => "Inicie a autenticação do Linux para atualizar.", "ApiError" => "A rota está disponível; verifique o Linux.", "TransportError" => "O túnel SSH ou o app Linux está indisponível.", "ResponseError" => "O Linux não retornou uma resposta válida.", _ => "Verifique o túnel SSH." };
-        if (LanguageCode == "it") return state switch { "Connecting" => "Controllo di Linux tramite tunnel SSH.", "Ready" => "Visualizzazione dell’istantanea Linux più recente.", "QuotaDanger" => "La quota residua è pari o inferiore al 2%.", "QuotaWarning" => "La quota residua è pari o inferiore al 10%.", "ResetWarning" => "La quota verrà ripristinata entro 24 ore.", "Initializing" => "Aggiornamento quando Linux sarà pronto.", "AuthRequired" => "Avvia l’autenticazione Linux per aggiornare.", "ApiError" => "Il percorso è disponibile; controlla Linux.", "TransportError" => "Il tunnel SSH o l’app Linux non è disponibile.", "ResponseError" => "Linux non ha restituito una risposta valida.", _ => "Controlla il tunnel SSH." };
-        if (LanguageCode == "ru") return state switch { "Connecting" => "Проверка Linux через туннель SSH.", "Ready" => "Показан последний снимок Linux.", "QuotaDanger" => "Остаток квоты не превышает 2%.", "QuotaWarning" => "Остаток квоты не превышает 10%.", "ResetWarning" => "Квота будет сброшена в течение 24 часов.", "Initializing" => "Обновление после готовности Linux.", "AuthRequired" => "Запустите аутентификацию Linux для обновления.", "ApiError" => "Маршрут доступен; проверьте Linux.", "TransportError" => "Туннель SSH или приложение Linux недоступны.", "ResponseError" => "Linux не вернул корректный ответ.", _ => "Проверьте туннель SSH." };
+        if (LanguageCode == "es") return state switch { "Connecting" => "Comprobando Linux mediante el túnel SSH.", "Ready" => "Mostrando la instantánea más reciente.", "QuotaDanger" => "La cuota restante es del 2% o menos.", "QuotaWarning" => "La cuota restante es del 10% o menos.", "ResetWarning" => "La cuota se restablece en 24 horas.", "Initializing" => "Se actualizará cuando Linux esté listo.", "AuthRequired" => "Inicia la autenticación de Linux para actualizar.", "ApiError" => "La ruta está disponible; comprueba Linux.", "TransportError" => "El túnel SSH o la aplicación Linux no están disponibles.", "ResponseError" => "Linux no devolvió una respuesta válida.", _ => "Comprueba el túnel SSH." };
+        if (LanguageCode == "fr") return state switch { "Connecting" => "Vérification de Linux via le tunnel SSH.", "Ready" => "Dernier instantané affiché.", "QuotaDanger" => "Le quota restant est inférieur ou égal à 2 %.", "QuotaWarning" => "Le quota restant est inférieur ou égal à 10 %.", "ResetWarning" => "Le quota sera réinitialisé sous 24 heures.", "Initializing" => "Actualisation dès que Linux est prêt.", "AuthRequired" => "Démarrez l’authentification Linux pour actualiser.", "ApiError" => "La route est disponible ; vérifiez Linux.", "TransportError" => "Le tunnel SSH ou l’application Linux est indisponible.", "ResponseError" => "Linux n’a pas renvoyé de réponse valide.", _ => "Vérifiez le tunnel SSH." };
+        if (LanguageCode == "de") return state switch { "Connecting" => "Linux über den SSH-Tunnel wird geprüft.", "Ready" => "Der aktuelle Snapshot wird angezeigt.", "QuotaDanger" => "Das verbleibende Kontingent beträgt höchstens 2 %.", "QuotaWarning" => "Das verbleibende Kontingent beträgt höchstens 10 %.", "ResetWarning" => "Das Kontingent wird innerhalb von 24 Stunden zurückgesetzt.", "Initializing" => "Aktualisierung, sobald Linux bereit ist.", "AuthRequired" => "Linux-Authentifizierung starten, um zu aktualisieren.", "ApiError" => "Die Route ist verfügbar; Linux prüfen.", "TransportError" => "SSH-Tunnel oder Linux-App nicht verfügbar.", "ResponseError" => "Linux hat keine gültige Antwort geliefert.", _ => "SSH-Tunnel prüfen." };
+        if (LanguageCode == "pt") return state switch { "Connecting" => "Verificando o Linux pelo túnel SSH.", "Ready" => "Exibindo o instantâneo mais recente.", "QuotaDanger" => "A cota restante é de 2% ou menos.", "QuotaWarning" => "A cota restante é de 10% ou menos.", "ResetWarning" => "A cota será redefinida em 24 horas.", "Initializing" => "Atualizará quando o Linux estiver pronto.", "AuthRequired" => "Inicie a autenticação do Linux para atualizar.", "ApiError" => "A rota está disponível; verifique o Linux.", "TransportError" => "O túnel SSH ou o app Linux está indisponível.", "ResponseError" => "O Linux não retornou uma resposta válida.", _ => "Verifique o túnel SSH." };
+        if (LanguageCode == "it") return state switch { "Connecting" => "Controllo di Linux tramite tunnel SSH.", "Ready" => "Visualizzazione dell’istantanea più recente.", "QuotaDanger" => "La quota residua è pari o inferiore al 2%.", "QuotaWarning" => "La quota residua è pari o inferiore al 10%.", "ResetWarning" => "La quota verrà ripristinata entro 24 ore.", "Initializing" => "Aggiornamento quando Linux sarà pronto.", "AuthRequired" => "Avvia l’autenticazione Linux per aggiornare.", "ApiError" => "Il percorso è disponibile; controlla Linux.", "TransportError" => "Il tunnel SSH o l’app Linux non è disponibile.", "ResponseError" => "Linux non ha restituito una risposta valida.", _ => "Controlla il tunnel SSH." };
+        if (LanguageCode == "ru") return state switch { "Connecting" => "Проверка Linux через туннель SSH.", "Ready" => "Показан последний снимок.", "QuotaDanger" => "Остаток квоты не превышает 2%.", "QuotaWarning" => "Остаток квоты не превышает 10%.", "ResetWarning" => "Квота будет сброшена в течение 24 часов.", "Initializing" => "Обновление после готовности Linux.", "AuthRequired" => "Запустите аутентификацию Linux для обновления.", "ApiError" => "Маршрут доступен; проверьте Linux.", "TransportError" => "Туннель SSH или приложение Linux недоступны.", "ResponseError" => "Linux не вернул корректный ответ.", _ => "Проверьте туннель SSH." };
         return state switch
         {
             "Connecting" => "Checking Linux through the SSH local forward.",
-            "Ready" => "Showing the latest Linux snapshot.",
+            "Ready" => "Showing the latest snapshot.",
             "QuotaDanger" => "Remaining quota is 2% or less.",
             "QuotaWarning" => "Remaining quota is 10% or less.",
             "ResetWarning" => "The quota resets within 24 hours.",
@@ -761,7 +761,7 @@ public static class LocalizationService
 {
     private static readonly UiText Japanese = new(
         "ja", "日本語", "Codex Info Monitor", "Windows 監視クライアント", "利用状況", "推移", "Threads", "法的通知", "設定", "更新", "更新中…",
-        "残り利用枠", "アカウント", "認証", "プラン", "リセット時刻", "Linux の観測時刻", "前回受信", "実行中のスレッド", "実行中のスレッドはありません", "詳細",
+        "残り利用枠", "アカウント", "認証", "プラン", "リセット時刻", "観測時刻", "前回受信", "実行中のスレッド", "実行中のスレッドはありません", "詳細",
         "モデル別利用量", "入力", "キャッシュ入力", "出力", "トークン", "概算ドル", "接続", "接続先: 127.0.0.1:8787（SSH ローカルポート転送専用）", "初期設定",
         "Codex Infoへようこそ", "Linux側のAPIとSSHローカル転送を確認して、安全に監視を始めます。認証情報やトークンは保存しません。", "接続ガイド",
         "SSHユーザー名とLinuxホスト名/IPまたはSSH configのHost aliasを入力し、「SSH転送を開始」を押してください。Linux側ではCodex InfoをUIなしのAPIモードで起動します。記録daemonも自動起動し、UIを閉じても履歴を保護します。", "ssh -N -L 8787:127.0.0.1:8787 user@linux-host", "codex_info --port 8787", "コピー", "コピーしました", "続行", "設定を開く", "保存", "キャンセル", "閉じる", "最小化", "最大化", "言語", "外観", "接続済み", "接続中", "正常", "Linux 側の取得エラー", "接続エラー", "Linux 側で準備中", "Linux 側で認証が必要です", "残量不足", "残量警告", "リセット警告", "未取得", "認証を開始", "認証を確認", "再試行", "最新", "詳細データは未取得");
@@ -784,7 +784,7 @@ public static class LocalizationService
         Authentication = "Authentication",
         Plan = "Plan",
         ResetTime = "Reset time",
-        ObservedAt = "Linux observation",
+        ObservedAt = "Observation",
         LastReceived = "Last received",
         RunningThreads = "Running threads",
         NoRunningThreads = "No running threads",
@@ -851,7 +851,7 @@ public static class LocalizationService
             Authentication = "认证",
             Plan = "套餐",
             ResetTime = "重置时间",
-            ObservedAt = "Linux 观测时间",
+            ObservedAt = "观测时间",
             LastReceived = "上次接收",
             RunningThreads = "运行中的线程",
             NoRunningThreads = "没有运行中的线程",
@@ -901,7 +901,7 @@ public static class LocalizationService
             Authentication = "인증",
             Plan = "플랜",
             ResetTime = "재설정 시각",
-            ObservedAt = "Linux 관측 시각",
+            ObservedAt = "관측 시각",
             LastReceived = "마지막 수신",
             RunningThreads = "실행 중인 스레드",
             NoRunningThreads = "실행 중인 스레드가 없습니다",
@@ -951,7 +951,7 @@ public static class LocalizationService
             Authentication = "Autenticación",
             Plan = "Plan",
             ResetTime = "Hora de restablecimiento",
-            ObservedAt = "Observación de Linux",
+            ObservedAt = "Observación",
             LastReceived = "Última recepción",
             RunningThreads = "Hilos activos",
             NoRunningThreads = "No hay hilos activos",
@@ -1001,7 +1001,7 @@ public static class LocalizationService
             Authentication = "Authentification",
             Plan = "Forfait",
             ResetTime = "Heure de réinitialisation",
-            ObservedAt = "Observation Linux",
+            ObservedAt = "Observation",
             LastReceived = "Dernière réception",
             RunningThreads = "Threads actifs",
             NoRunningThreads = "Aucun thread actif",
@@ -1051,7 +1051,7 @@ public static class LocalizationService
             Authentication = "Authentifizierung",
             Plan = "Tarif",
             ResetTime = "Zurücksetzzeit",
-            ObservedAt = "Linux-Beobachtung",
+            ObservedAt = "Beobachtung",
             LastReceived = "Letzter Empfang",
             RunningThreads = "Aktive Threads",
             NoRunningThreads = "Keine aktiven Threads",
@@ -1101,7 +1101,7 @@ public static class LocalizationService
             Authentication = "Autenticação",
             Plan = "Plano",
             ResetTime = "Hora de redefinição",
-            ObservedAt = "Observação do Linux",
+            ObservedAt = "Observação",
             LastReceived = "Último recebimento",
             RunningThreads = "Threads em execução",
             NoRunningThreads = "Nenhuma thread em execução",
@@ -1151,7 +1151,7 @@ public static class LocalizationService
             Authentication = "Autenticazione",
             Plan = "Piano",
             ResetTime = "Ora di ripristino",
-            ObservedAt = "Osservazione Linux",
+            ObservedAt = "Osservazione",
             LastReceived = "Ultima ricezione",
             RunningThreads = "Thread in esecuzione",
             NoRunningThreads = "Nessun thread in esecuzione",
@@ -1201,7 +1201,7 @@ public static class LocalizationService
             Authentication = "Аутентификация",
             Plan = "Тариф",
             ResetTime = "Время сброса",
-            ObservedAt = "Наблюдение Linux",
+            ObservedAt = "Наблюдение",
             LastReceived = "Последнее получение",
             RunningThreads = "Активные потоки",
             NoRunningThreads = "Нет активных потоков",

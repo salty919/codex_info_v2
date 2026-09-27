@@ -113,21 +113,22 @@ Help is an in-Main information surface, not a Window or HWND.
 
 | Surface | Registered top-level surface | Runtime open HWND | Logical client initial | Logical client min | Logical client max | Resize | Native controls |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Main | yes | 1 | 900×480 | 900×480 | 900×480 | fixed | Minimize, Close |
+| Main | yes | 1 | 900×498 | 900×498 | 900×498 | fixed | Minimize, Close |
 | Setup | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | Minimize, Close |
 | Settings | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | Minimize, Close |
 | Graph | yes | 0..1 (singleton) | 940×640 | 700×480 | unbounded | resizable | Minimize, Maximize/Restore, Close |
 | Threads | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | Minimize, Close |
 | Legal | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | Minimize, Close |
-| Main-internal Help | no (owner=Main) | 0 additional | Main client 900×480 | Main client 900×480 | Main client 900×480 | follows Main | no independent controls |
+| Main-internal Help | no (owner=Main) | 0 additional | Main client 900×498 | Main client 900×498 | Main client 900×498 | follows Main | no independent controls |
 
 The registered top-level surface inventory is exactly Main, Setup, Settings,
 Graph, Threads, and Legal (six). Runtime open HWND is Main=1 plus an open child
 subset of 0..5, total 1..6; each child is a singleton and only all five open
 children produce six runtime HWND. Help remains Main-internal with 0 additional
 HWND; the inventory count is not a runtime always-open count. `700×480` belongs
-only to Graph's minimum. Fixed surfaces require a supported work area of at
-least `900×480 logical`; Graph requires at least `700×480 logical`. A smaller
+only to Graph's minimum. Main requires a supported work area of at least
+`900×498 logical`; Setup, Settings, Threads, and Legal require at least
+`900×480 logical`; Graph requires at least `700×480 logical`. A smaller
 work area is outside the supported matrix and is recorded in the topology
 manifest as `unsupported_scope`; it is not passed by shrinking fonts, clipping,
 using scroll, or fabricating a PASS value. This boundary does not introduce a
@@ -151,7 +152,8 @@ following AND:
 
 ```text
 supported = client_threshold AND frame_fit
-client_threshold(fixed Main/Setup/Settings/Threads/Legal) = logical >= 900×480
+client_threshold(fixed Main) = logical >= 900×498
+client_threshold(fixed Setup/Settings/Threads/Legal) = logical >= 900×480
 client_threshold(Graph) = logical >= 700×480
 frame_fit = DPI変換後のDWM.visible_frame全体が対象MONITORINFO.rcWork内へ完全包含
 ```
@@ -310,7 +312,7 @@ Graph/historyの外部契約と有限oracleは本表へ複製せず、UX owner�
 | WIN-PAR-11 | Preserve strict transport/API safety. | Fixed endpoint policy, size/type/schema validation, no redirects/cookies/proxy/decompression, redacted failures. | REST contract | Existing security tests plus expanded endpoint tests, contract gate | verified |
 | WIN-PAR-12 | Preserve information ownership and avoid semantic duplicates. | Countdown appears in the period gauge; main summary owns remaining quota; model table owns token/dollar totals; graph owns historical trends; status owns transport/backend state. | Native DESIGN.md ownership table | DESIGN ownership matrix, static text inventory, and fresh state images | verified |
 | WIN-PAR-13 | Preserve persistence and acquisition semantics. | History is minute-bucketed; same admitted scope/cycle/minute is accepted only through the unique-quota plus existing componentwise-dominant-vector rule. Conflict/non-comparability/unknown boundary rejects the candidate, raw SQLite remains non-destructive, and DB/API/UI reload does not fabricate values. | Resident `HistoryCanonicalizer`, native SQLite store, details endpoint | Shared rollover `100% / $1 → 41% / $323.674247`, three-month retention, one-month range/capacity, DB protection and restart/reload tests | open |
-| WIN-DES-01 | New request: Windows-native polished design. | Fluent visual hierarchy, icon affordances, keyboard/focus states, exact logical client matrix (fixed surfaces 900×480; Graph 940×640 initial/700×480 minimum/unbounded max), high-DPI layout, no clipped text or accidental empty space; no feature or state is removed. | Windows geometry/DPI/non-scroll reference, common theme and all windows | Fresh normal/minimum/high-DPI/topology images plus OS rect/DPI measurement and Start-menu/keyboard focus smoke | unverified |
+| WIN-DES-01 | New request: Windows-native polished design. | Fluent visual hierarchy, icon affordances, keyboard/focus states, exact logical client matrix (Main 900×498; other fixed surfaces 900×480; Graph 940×640 initial/700×480 minimum/unbounded max), high-DPI layout, no clipped text or accidental empty space; no feature or state is removed. | Windows geometry/DPI/non-scroll reference, common theme and all windows | Fresh normal/minimum/high-DPI/topology images plus OS rect/DPI measurement and Start-menu/keyboard focus smoke | unverified |
 | WIN-DES-02 | New request: icons and free libraries permitted. | Every icon asset is redistributable, has a recorded license, and has a text tooltip/accessible name; missing glyphs have a safe fallback. | Assets and third-party notices | Contract gate, embedded notices, Legal image, tooltip/AutomationProperties inventory | verified |
 | WIN-I18N-01 | New request: multilingual support. | Language selection covers the native catalog choices, persists locally without credentials, falls back deterministically, and updates every Windows view including status/error/setup/legal copy. | Localization catalog and settings | Catalog tests, persisted settings normalization, en/de/unknown images, all-view bindings | verified |
 | WIN-I18N-02 | New request: locale-aware presentation. | Dates, numbers, durations, decimal separators, and direction/line wrapping follow the selected locale without changing protocol values or quota semantics. | Existing validated timestamps and numeric values | Culture/timezone tests, settings image, and locale-aware view models | verified |

@@ -7,11 +7,11 @@
         x:Class="CodexInfo.WindowsClient.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Width="900"
-        Height="480"
+        Height="498"
         MinWidth="900"
-        MinHeight="480"
+        MinHeight="498"
         MaxWidth="900"
-        MaxHeight="480"
+        MaxHeight="498"
         WindowStartupLocation="CenterScreen"
         CanResize="False"
         WindowDecorations="None"
@@ -136,7 +136,7 @@
   <!-- The six rows keep the complete overview on one surface without
        compressing labels or table rows below the product typography scale. -->
   <Grid Margin="22,14"
-        RowDefinitions="52,82,78,56,102,42"
+        RowDefinitions="52,82,78,56,120,42"
         RowSpacing="8">
     <!-- Header owns the application heading, endpoint, and navigation. -->
     <Grid Grid.Row="0"
@@ -410,7 +410,7 @@
     </Border>
 
     <!-- ModelUsage is a compact table rather than one card per model.  The
-         fixed row budget displays the expected three model rows without a
+         fixed row budget displays the expected four model rows without a
          nested scroll surface. -->
     <Border Grid.Row="4" Classes="section" Padding="12,5" IsVisible="{Binding ShowAuthenticatedContent}" AutomationProperties.AutomationId="Main.ModelUsageTable">
       <Grid RowDefinitions="20,*">
@@ -527,7 +527,7 @@
                   ToolTip.Tip="{Binding UpdateButtonText}"
                   Content="{Binding UpdateButtonText}" />
         </StackPanel>
-        <StackPanel Grid.Column="2" Margin="0,0,4,0" Spacing="1" VerticalAlignment="Center" IsVisible="{Binding ShowLastReceived}">
+        <StackPanel Grid.Column="2" Grid.RowSpan="2" Margin="0,0,4,0" Spacing="1" VerticalAlignment="Center" IsVisible="{Binding ShowLastReceived}">
           <TextBlock Classes="label" FontSize="11" HorizontalAlignment="Right" Text="{Binding LastReceivedText}" TextWrapping="NoWrap" />
         </StackPanel>
       </Grid>
@@ -568,7 +568,7 @@
     </Border>
 
     <!-- The account list is measured at its final width before it is opened,
-         so selecting an account does not resize the 900x480 monitor surface. -->
+         so selecting an account does not resize the 900x498 monitor surface. -->
     <Border x:Name="AccountMenu"
             Grid.RowSpan="6"
             ZIndex="100"
