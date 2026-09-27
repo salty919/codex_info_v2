@@ -467,12 +467,21 @@ public sealed class DetailsPresentationCoverageTests
             ApiVersion = "v3",
             OpenSessionThreadCount = 3,
         };
-        using var main = await StartMainAsync(snapshot);
-        using var threads = new ThreadsWindowViewModel(main);
+        var previousLanguage = LocalizationService.Current.LanguageCode;
+        try
+        {
+            LocalizationService.SetLanguage("ja");
+            using var main = await StartMainAsync(snapshot);
+            using var threads = new ThreadsWindowViewModel(main);
 
-        Assert.Equal(threads.Texts.ThreadRunning, threads.Threads.Single(item => item.Id == "running").ActivityStatusText);
-        Assert.Equal(threads.Texts.ThreadStopped, threads.Threads.Single(item => item.Id == "stopped").ActivityStatusText);
-        Assert.Equal(threads.Texts.ThreadUnknown, threads.Threads.Single(item => item.Id == "unknown").ActivityStatusText);
+            Assert.Equal("動作中", threads.Threads.Single(item => item.Id == "running").ActivityStatusText);
+            Assert.Equal("停止中", threads.Threads.Single(item => item.Id == "stopped").ActivityStatusText);
+            Assert.Equal("未観測", threads.Threads.Single(item => item.Id == "unknown").ActivityStatusText);
+        }
+        finally
+        {
+            LocalizationService.SetLanguage(previousLanguage);
+        }
     }
 
     [Fact]

@@ -24967,6 +24967,7 @@ mod tests {
         auth_required.quota = None;
         auth_required.models.clear();
         auth_required.active_thread_count = 0;
+        auth_required.open_session_thread_count = 0;
         state
             .apply_service_current_v3(published_pair(29, 1), auth_required)
             .expect("auth-required current root admitted");
@@ -26364,6 +26365,7 @@ mod tests {
         current.history_gaps.clear();
         current.threads.clear();
         current.active_thread_count = 0;
+        current.open_session_thread_count = 0;
         let pair = format!("v1:{:032x}{:032x}", 1_u128, 1_u128);
         let wrong_pair = format!("v1:{:032x}{:032x}", 1_u128, 2_u128);
         let mut client = CodexInfoState::service_client();
@@ -29368,6 +29370,7 @@ mod tests {
         current.history_gaps.clear();
         current.threads.clear();
         current.active_thread_count = 0;
+        current.open_session_thread_count = 0;
         let pair = format!("v1:{:032x}{:032x}", 3_u128, 1_u128);
         let mut client = CodexInfoState::service_client();
         client
@@ -34689,14 +34692,17 @@ mod tests {
         }
 
         let mut child_item = thread_list_item("running-a", 20, &running_a_path);
+        child_item["status"] = json!({"type":"active","activeFlags":[]});
         child_item["source"] = json!({"subAgent":{"thread_spawn":{
             "parent_thread_id":"running-z","depth":1
         }}});
+        let mut parent_item = thread_list_item("running-z", 20, &running_z_path);
+        parent_item["status"] = json!({"type":"active","activeFlags":[]});
         let (sender, receiver) = mpsc::channel();
         for (id, item) in [
             (70, thread_list_item("completed", 30, &completed_path)),
             (71, child_item),
-            (72, thread_list_item("running-z", 20, &running_z_path)),
+            (72, parent_item),
         ] {
             sender
                 .send(RpcReadEvent::Line(
@@ -34725,6 +34731,22 @@ mod tests {
         assert_eq!(
             update,
             ActiveThreadUpdate::Snapshot(vec![
+                ActiveThread {
+                    activity_status: PublicThreadActivityStatus::Stopped,
+                    id: "completed".into(),
+                    created_at: Some(1),
+                    updated_at: 30,
+                    title: "title-completed".into(),
+                    model: "不明".into(),
+                    model_label: "不明".into(),
+                    total_tokens: None,
+                    context_usage_tokens: None,
+                    context_window_tokens: None,
+                    last_user_message_at: None,
+                    is_subagent: false,
+                    parent_thread_id: None,
+                    depth: None,
+                },
                 ActiveThread {
                     activity_status: PublicThreadActivityStatus::Running,
                     id: "running-z".into(),
@@ -36623,7 +36645,7 @@ mod tests {
         let japanese = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
         assert_eq!(
             japanese.text(codex_info::i18n::TextKey::NoRunningThreads),
-            "実行中のスレッドはありません"
+            "対象のスレッドはありません"
         );
     }
 
@@ -41667,6 +41689,7 @@ mod tests {
         assert_eq!(state.active_threads.len(), 1);
         let (mut current, _) = split_current_fixture();
         current.active_thread_count = 0;
+        current.open_session_thread_count = 0;
         let current_body = split_current_body(&current);
         let now = Instant::now();
         state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
@@ -49613,7 +49636,7 @@ mod tests {
             .split("thread-list-clip := Rectangle {")
             .nth(1)
             .expect("thread-list clip rectangle");
-        assert!(thread_list_clip.contains("y: 76px;"));
+        assert!(thread_list_clip.contains("y: 56px;"));
         assert!(thread_list_clip.contains("width: 860px;"));
         assert!(thread_list_clip.contains("height: 384px;"));
         assert!(thread_list_clip.contains("clip: true;"));
@@ -49657,11 +49680,11 @@ mod tests {
             "time-lane := Rectangle {\n                    x: parent.width - 239px;\n                    y: 15px;\n                    width: 208px;\n                    height: 66px;",
             "text: row.model;",
             "text: root.strings.context-usage + \" \" + row.context-usage;",
-            "text: root.strings.running + \" \" + row.thread-age;",
+            "text: row.activity-status + (row.thread-age != \"\" ? \" · \" + row.thread-age : \"\");",
             "text: root.strings.instruction + \" \" + row.instruction-age;",
             "text: row.tokens;",
             "visible: row.context-usage != \"\";",
-            "visible: row.thread-age != \"\";",
+            "visible: true;",
             "visible: row.instruction-age != \"\";",
             "visible: row.tokens != \"\";",
             "property <length> tree-base-x: 10px;",
@@ -49675,6 +49698,7 @@ mod tests {
         ] {
             assert!(threads.contains(marker), "missing Linux Threads contract: {marker}");
         }
+        assert!(!threads.contains("visible: row.thread-age != \"\";"));
 
         let path_block = |marker: &str, occurrence: usize| {
             threads
@@ -50295,7 +50319,6 @@ mod tests {
         assert!(header.contains("height: 30px;"));
         assert!(header.contains("background: DesignTokens.canvas;"));
         assert!(header.contains("font-size: 22px;"));
-        assert!(header.contains("font-size: 12px;"));
         assert!(header.contains("z: 2;"));
     }
 

@@ -89,7 +89,7 @@ public sealed record UiText(
 
     public string ThreadUnknown => LanguageCode switch
     {
-        "ja" => "状態未観測", "zh-Hans" => "状态未观测", "ko" => "상태 미확인", "es" => "Estado no observado",
+        "ja" => "未観測", "zh-Hans" => "状态未观测", "ko" => "상태 미확인", "es" => "Estado no observado",
         "fr" => "État non observé", "de" => "Status nicht beobachtet", "pt" => "Estado não observado",
         "it" => "Stato non osservato", "ru" => "Состояние не наблюдалось", _ => "Status unobserved"
     };
