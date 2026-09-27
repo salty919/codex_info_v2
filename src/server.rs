@@ -9,6 +9,7 @@
 
 use crate::security;
 use codex_info_rest_contract::current_period_bounds;
+pub use codex_info_rest_contract::PublicThreadActivityStatus;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -155,6 +156,8 @@ pub struct PublicHistoryGap {
 pub struct PublicThread {
     pub id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_status: Option<PublicThreadActivityStatus>,
     pub parent_thread_id: Option<String>,
     pub model: String,
     pub model_label: String,
@@ -522,6 +525,7 @@ pub struct PublicDetailsV3 {
     pub quota: Option<PublicQuota>,
     pub models: Vec<PublicModelUsageV3>,
     pub active_thread_count: u64,
+    pub open_session_thread_count: u64,
     pub history_periods: Vec<PublicHistoryPeriod>,
     pub history_samples: Vec<PublicHistoryObservationV3>,
     pub history_gaps: Vec<PublicHistoryGap>,
@@ -704,6 +708,7 @@ impl Default for PublicDetailsV3 {
             quota: None,
             models: Vec::new(),
             active_thread_count: 0,
+            open_session_thread_count: 0,
             history_periods: Vec::new(),
             history_samples: Vec::new(),
             history_gaps: Vec::new(),
@@ -756,6 +761,7 @@ impl PublicDetailsV3 {
                 })
                 .collect(),
             active_thread_count: details.active_thread_count,
+            open_session_thread_count: details.threads.len() as u64,
             history_periods: details.history_periods.clone(),
             history_samples: details
                 .history_samples
@@ -779,7 +785,17 @@ impl PublicDetailsV3 {
                 })
                 .collect(),
             history_gaps: details.history_gaps.clone(),
-            threads: details.threads.clone(),
+            threads: details
+                .threads
+                .iter()
+                .cloned()
+                .map(|mut thread| {
+                    thread
+                        .activity_status
+                        .get_or_insert(PublicThreadActivityStatus::Running);
+                    thread
+                })
+                .collect(),
         }
     }
 
@@ -1071,6 +1087,7 @@ struct CurrentV3Response<'a> {
     quota: &'a Option<PublicQuota>,
     models: &'a [PublicModelUsageV3],
     active_thread_count: u64,
+    open_session_thread_count: u64,
 }
 
 #[derive(Serialize)]
@@ -1104,6 +1121,7 @@ fn serialize_current_v3(details: &PublicDetailsV3) -> Result<Vec<u8>, ApiSnapsho
         quota: &details.quota,
         models: &details.models,
         active_thread_count: details.active_thread_count,
+        open_session_thread_count: details.open_session_thread_count,
     })
     .map_err(|_| ApiSnapshotError::Serialization)
 }
@@ -3327,6 +3345,7 @@ mod tests {
             threads: vec![PublicThread {
                 id: "thread-1".into(),
                 title: "安全な読み取り確認".into(),
+                activity_status: None,
                 parent_thread_id: None,
                 model: "gpt-5.6-sol".into(),
                 model_label: "gpt-5.6-sol".into(),

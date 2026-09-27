@@ -197,6 +197,7 @@ export struct ActiveThreadRow {
     is-main: bool,
     title: string,
     full-title: string,
+    activity-status: string,
     model: string,
     model-class: string,
     tokens: string,
@@ -1005,7 +1006,6 @@ export component AccountActivity inherits Rectangle {
     in property <UiStrings> strings;
     in property <string> active-thread-count-label;
     in property <bool> show-content: true;
-    in property <bool> has-active-thread: false;
     in property <int> active-thread-count: 0;
     in property <int> sol-count: 0;
     in property <int> terra-count: 0;
@@ -1033,7 +1033,7 @@ export component AccountActivity inherits Rectangle {
         font-weight: 600;
         vertical-alignment: center;
     }
-    if root.show-content && root.has-active-thread : Text {
+    if root.show-content : Text {
         x: 12px;
         y: 18px;
         width: 240px;
@@ -1044,7 +1044,7 @@ export component AccountActivity inherits Rectangle {
         font-weight: 700;
         vertical-alignment: center;
     }
-    if root.show-content && root.has-active-thread : ThreadModelStat {
+    if root.show-content : ThreadModelStat {
         x: root.model-area-x;
         y: 7px;
         width: root.model-stat-width;
@@ -1052,7 +1052,7 @@ export component AccountActivity inherits Rectangle {
         count: root.sol-count;
         indicator-color: DesignTokens.main-thread-sol;
     }
-    if root.show-content && root.has-active-thread : ThreadModelStat {
+    if root.show-content : ThreadModelStat {
         x: root.model-area-x + root.model-stat-width;
         y: 7px;
         width: root.model-stat-width;
@@ -1060,7 +1060,7 @@ export component AccountActivity inherits Rectangle {
         count: root.terra-count;
         indicator-color: DesignTokens.main-thread-terra;
     }
-    if root.show-content && root.has-active-thread : ThreadModelStat {
+    if root.show-content : ThreadModelStat {
         x: root.model-area-x + 2 * root.model-stat-width;
         y: 7px;
         width: root.model-stat-width;
@@ -1068,7 +1068,7 @@ export component AccountActivity inherits Rectangle {
         count: root.luna-count;
         indicator-color: DesignTokens.main-thread-luna;
     }
-    if root.show-content && root.has-active-thread : ThreadModelStat {
+    if root.show-content : ThreadModelStat {
         x: root.model-area-x + 3 * root.model-stat-width;
         y: 7px;
         width: root.model-stat-width;
@@ -1076,7 +1076,7 @@ export component AccountActivity inherits Rectangle {
         count: root.astra-count;
         indicator-color: DesignTokens.main-thread-astra;
     }
-    if root.show-content && root.has-active-thread : ThreadModelStat {
+    if root.show-content : ThreadModelStat {
         x: root.model-area-x + 4 * root.model-stat-width;
         y: 7px;
         width: root.model-stat-width;
@@ -1084,7 +1084,7 @@ export component AccountActivity inherits Rectangle {
         count: root.other-count;
         indicator-color: DesignTokens.main-label;
     }
-    if root.show-content && root.has-active-thread : ActionButton {
+    if root.show-content : ActionButton {
         x: parent.width - 80px;
         y: 13px;
         width: 68px;
@@ -1093,16 +1093,6 @@ export component AccountActivity inherits Rectangle {
         primary: false;
         refresh-style: true;
         clicked => { root.open-threads(); }
-    }
-    if root.show-content && !root.has-active-thread : Text {
-        x: 12px;
-        y: 24px;
-        width: parent.width - 24px;
-        height: 20px;
-        text: root.strings.no-running-threads;
-        color: DesignTokens.main-label;
-        font-size: 12px;
-        vertical-alignment: center;
     }
 }
 
@@ -1274,7 +1264,6 @@ export component ThreadsWindow inherits Window {
     max-height: 480px;
     in-out property <string> window-title;
     in property <UiStrings> strings;
-    in property <string> thread-count-label;
     in-out property <bool> reset-close-buttons: false;
     no-frame: true;
     resize-border-width: 0px;
@@ -1355,20 +1344,9 @@ export component ThreadsWindow inherits Window {
         }
     }
 
-    thread-count := Text {
-        x: 20px;
-        y: 56px;
-        width: 860px;
-        height: 14px;
-        text: root.thread-count-label;
-        color: DesignTokens.text-secondary;
-        font-size: 12px;
-        vertical-alignment: center;
-    }
-
     thread-list-clip := Rectangle {
         x: 20px;
-        y: 76px;
+        y: 56px;
         width: 860px;
         height: 384px;
         clip: true;
@@ -1597,13 +1575,13 @@ export component ThreadsWindow inherits Window {
                         y: 0px;
                         width: parent.width;
                         height: 18px;
-                        text: root.strings.running + " " + row.thread-age;
+                        text: row.activity-status + (row.thread-age != "" ? " · " + row.thread-age : "");
                         color: DesignTokens.text-secondary;
                         font-size: 12px;
                         horizontal-alignment: right;
                         vertical-alignment: top;
                         overflow: elide;
-                        visible: row.thread-age != "";
+                        visible: true;
                     }
                     Text {
                         x: 0px;

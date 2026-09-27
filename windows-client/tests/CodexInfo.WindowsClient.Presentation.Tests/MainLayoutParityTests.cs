@@ -138,7 +138,16 @@ public sealed class MainLayoutParityTests
 
         var details = document.Descendants().Single(element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.OpenThreadDetails");
-        Assert.Equal("{Binding HasActiveThreads}", details.Attribute("IsVisible")?.Value);
+        Assert.Equal("{Binding HasLiveThreadSummary}", details.Attribute("IsVisible")?.Value);
+        var activity = details.Parent ?? throw new InvalidOperationException("Details has no activity card");
+        Assert.Contains(activity.Descendants(), element =>
+            element.Attribute("Text")?.Value == "{Binding ActiveThreadCountLabel}" &&
+            element.Attribute("IsVisible")?.Value == "{Binding HasLiveThreadSummary}");
+        Assert.Contains(activity.Descendants(), element =>
+            element.Name.LocalName == "UniformGrid" &&
+            element.Attribute("IsVisible")?.Value == "{Binding HasLiveThreadSummary}");
+        Assert.DoesNotContain(activity.Descendants(), element =>
+            element.Attribute("Text")?.Value == "{Binding Texts.NoRunningThreads}");
 
         var modelSection = document.Descendants().Single(element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.ModelUsageTable");

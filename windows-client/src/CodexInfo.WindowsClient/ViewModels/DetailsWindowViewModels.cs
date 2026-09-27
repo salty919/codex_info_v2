@@ -1692,11 +1692,9 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         accountResourceClient = main.AccountResourceClient;
         Threads = new ReadOnlyObservableCollection<ThreadItemViewModel>(threads);
         main.PropertyChanged += OnMainPropertyChanged;
-        if (resourceClient is null)
-        {
-            Rebuild();
-        }
-        else
+        resourceThreads = main.DetailsSnapshot?.Threads ?? Array.Empty<ApiThreadDetails>();
+        Rebuild();
+        if (resourceClient is not null)
         {
             resourcePollingCancellation = new CancellationTokenSource();
             _ = RunSplitResourcePollingAsync(resourcePollingCancellation.Token);
@@ -1828,7 +1826,14 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.DetailsSnapshot) or
             nameof(MainWindowViewModel.DetailsStatusText) or nameof(MainWindowViewModel.Texts))
         {
-            if (resourceClient is null)
+            if (eventArgs.PropertyName == nameof(MainWindowViewModel.DetailsSnapshot))
+            {
+                resourceThreads = main.DetailsSnapshot?.Threads ?? Array.Empty<ApiThreadDetails>();
+                hasLoadError = false;
+                Notify(nameof(HasLoadError));
+                Rebuild();
+            }
+            else if (resourceClient is null)
             {
                 Rebuild();
             }
@@ -1863,6 +1868,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
         var accountId = main.SelectedAccountId;
         var accountGeneration = main.AccountSelectionGeneration;
+        var mainGeneration = main.DetailsSnapshot;
         if (main.IsSelectedAccountHistorical)
         {
             // Inactive accounts expose only a point-in-time current snapshot;
@@ -1906,7 +1912,8 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         postToUi(() =>
         {
             if (disposed ||
-                accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
+                accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration) ||
+                !ReferenceEquals(main.DetailsSnapshot, mainGeneration))
             {
                 return;
             }
@@ -1922,6 +1929,16 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 hasLoadError = true;
                 Notify(nameof(HasLoadError));
+                return;
+            }
+
+            if (mainGeneration is null || snapshot.PublishedPair != mainGeneration.PublishedPair ||
+                (ulong)snapshot.Threads.Count != mainGeneration.OpenSessionThreadCount ||
+                (ulong)snapshot.Threads.Count(thread =>
+                    thread.ActivityStatus == ApiThreadActivityStatus.Running) != mainGeneration.ActiveThreadCount)
+            {
+                // Only Main's accepted pair can replace the visible detail rows.
+                // A newer independent response waits for Main's next atomic update.
                 return;
             }
 
@@ -2034,6 +2051,12 @@ public sealed class ThreadItemViewModel
             ? owner.ParentText(thread)
             : $"{owner.ParentText(thread)} / {parentTitle}";
         ModelText = owner.ModelText(thread);
+        ActivityStatusText = thread.ActivityStatus switch
+        {
+            ApiThreadActivityStatus.Running => owner.Texts.ThreadRunning,
+            ApiThreadActivityStatus.Stopped => owner.Texts.ThreadStopped,
+            _ => owner.Texts.ThreadUnknown,
+        };
         ModelAccentHex = FormatModelAccent(ModelText);
         ContextText = owner.ContextText(thread);
         ContextUsageText = FormatContextUsage(owner.Texts, thread);
@@ -2057,6 +2080,7 @@ public sealed class ThreadItemViewModel
     public string RoleText { get; }
     public string ParentText { get; }
     public string ModelText { get; }
+    public string ActivityStatusText { get; }
     public string ModelAccentHex { get; }
     public string ContextText { get; }
     public string ContextUsageText { get; }

@@ -22,7 +22,7 @@ use codex_info::server::{
     validate_public_threads, ApiServerConfig, PublicDetails, PublicDetailsV2, PublicDetailsV3,
     PublicHistoryGap, PublicHistoryModelUsageV3, PublicHistoryObservation,
     PublicHistoryObservationV3, PublicHistoryPeriod, PublicModelUsageV3, PublicQuota, PublicState,
-    PublicThread,
+    PublicThread, PublicThreadActivityStatus,
 };
 use codex_info::thread_contract::{self, ThreadTopologyNode};
 #[cfg(test)]
@@ -1604,6 +1604,7 @@ struct RateLimitSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ActiveThread {
     id: String,
+    activity_status: PublicThreadActivityStatus,
     created_at: Option<i64>,
     updated_at: i64,
     title: String,
@@ -1624,6 +1625,7 @@ impl ActiveThread {
         PublicThread {
             id: self.id.clone(),
             title: self.title.clone(),
+            activity_status: Some(self.activity_status),
             parent_thread_id: self.parent_thread_id.clone(),
             model: self.model.clone(),
             model_label: self.model_label.clone(),
@@ -1635,6 +1637,17 @@ impl ActiveThread {
             is_subagent: self.is_subagent,
             depth: self.depth,
         }
+    }
+}
+
+#[cfg(test)]
+fn public_activity_status(
+    status: thread_contract::ThreadActivityStatus,
+) -> PublicThreadActivityStatus {
+    match status {
+        thread_contract::ThreadActivityStatus::Running => PublicThreadActivityStatus::Running,
+        thread_contract::ThreadActivityStatus::Stopped => PublicThreadActivityStatus::Stopped,
+        thread_contract::ThreadActivityStatus::Unknown => PublicThreadActivityStatus::Unknown,
     }
 }
 
@@ -2675,6 +2688,7 @@ fn fetch_active_thread_update_before_deadline_with_cache<W: Write>(
     let mut threads = root_snapshots
         .into_iter()
         .map(|snapshot| ActiveThread {
+            activity_status: public_activity_status(snapshot.activity_status),
             id: snapshot.thread_id,
             created_at: Some(snapshot.created_at),
             updated_at: snapshot.updated_at,
@@ -13529,6 +13543,18 @@ struct CodexInfoState {
     acknowledged_recorder_commit: Option<AcknowledgedRecorderCommit>,
 }
 
+fn validation_active_count(threads: &[PublicThread]) -> u64 {
+    threads
+        .iter()
+        .filter(|thread| {
+            matches!(
+                thread.activity_status,
+                None | Some(PublicThreadActivityStatus::Running)
+            )
+        })
+        .count() as u64
+}
+
 fn stage_service_current_bundle(
     previous_pair: Option<&str>,
     published_pair: String,
@@ -13539,10 +13565,14 @@ fn stage_service_current_bundle(
         return Ok(None);
     }
     current.validate().map_err(|error| error.to_string())?;
+    if current.active_thread_count > current.open_session_thread_count {
+        return Err("current active count exceeds open count".into());
+    }
     if !current.authenticated
         && (current.quota.is_some()
             || !current.models.is_empty()
-            || current.active_thread_count != 0)
+            || current.active_thread_count != 0
+            || current.open_session_thread_count != 0)
     {
         return Err("unauthenticated current contains visible account data".into());
     }
@@ -13552,7 +13582,7 @@ fn stage_service_current_bundle(
         return Err("ready current is incomplete".into());
     }
 
-    let public_threads = match (current.active_thread_count, threads_resource) {
+    let public_threads = match (current.open_session_thread_count, threads_resource) {
         (0, None) => Vec::new(),
         (0, Some(_)) => {
             return Err("zero-thread current must not materialize the threads resource".into());
@@ -13563,8 +13593,18 @@ fn stage_service_current_bundle(
         (expected, Some((response_count, threads))) => {
             if response_count.is_some_and(|count| count != threads.len() as u64)
                 || expected != threads.len() as u64
+                || current.active_thread_count
+                    != threads
+                        .iter()
+                        .filter(|thread| {
+                            matches!(
+                                thread.activity_status,
+                                None | Some(PublicThreadActivityStatus::Running)
+                            )
+                        })
+                        .count() as u64
             {
-                return Err("threads count does not match current resource".into());
+                return Err("threads open/active counts do not match current resource".into());
             }
             threads
         }
@@ -13585,6 +13625,9 @@ fn stage_service_current_bundle(
     let active_threads = public_threads
         .iter()
         .map(|thread| ActiveThread {
+            activity_status: thread
+                .activity_status
+                .unwrap_or(PublicThreadActivityStatus::Running),
             id: thread.id.clone(),
             created_at: thread.created_at,
             updated_at: thread
@@ -13807,10 +13850,20 @@ impl CodexInfoState {
             quota: v2.quota,
             models,
             active_thread_count: v2.active_thread_count,
+            open_session_thread_count: v2.threads.len() as u64,
             history_periods: v2.history_periods,
             history_samples,
             history_gaps: v2.history_gaps,
-            threads: v2.threads,
+            threads: v2
+                .threads
+                .into_iter()
+                .map(|mut thread| {
+                    thread
+                        .activity_status
+                        .get_or_insert(PublicThreadActivityStatus::Running);
+                    thread
+                })
+                .collect(),
         }
     }
 
@@ -14366,6 +14419,7 @@ impl CodexInfoState {
             pending_quota_source_rescan_complete: false,
             model_usage,
             active_threads: vec![ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "preview-thread".into(),
                 created_at: Some(now - 600),
                 updated_at: now,
@@ -14506,6 +14560,7 @@ impl CodexInfoState {
                 let model = "gpt-5.6-sol-subagent-review".to_owned();
                 state.active_threads = vec![
                     ActiveThread {
+                        activity_status: PublicThreadActivityStatus::Running,
                         id: "thread-child-tests".into(),
                         created_at: Some(now - 1_800),
                         updated_at: now - 1,
@@ -14521,6 +14576,7 @@ impl CodexInfoState {
                         depth: Some(1),
                     },
                     ActiveThread {
+                        activity_status: PublicThreadActivityStatus::Running,
                         id: "thread-orphan".into(),
                         created_at: Some(now - 7_200),
                         updated_at: now - 30,
@@ -14536,6 +14592,7 @@ impl CodexInfoState {
                         depth: Some(1),
                     },
                     ActiveThread {
+                        activity_status: PublicThreadActivityStatus::Running,
                         id: "thread-grandchild-security".into(),
                         created_at: Some(now - 3_600),
                         updated_at: now + 1,
@@ -14551,6 +14608,7 @@ impl CodexInfoState {
                         depth: Some(2),
                     },
                     ActiveThread {
+                        activity_status: PublicThreadActivityStatus::Running,
                         id: "thread-second-child".into(),
                         created_at: Some(now - 5_400),
                         updated_at: now - 5,
@@ -14566,6 +14624,7 @@ impl CodexInfoState {
                         depth: Some(1),
                     },
                     ActiveThread {
+                        activity_status: PublicThreadActivityStatus::Running,
                         id: "thread-z".into(),
                         created_at: Some(now - 14_400),
                         updated_at: now - 10,
@@ -14582,6 +14641,7 @@ impl CodexInfoState {
                         depth: None,
                     },
                     ActiveThread {
+                        activity_status: PublicThreadActivityStatus::Running,
                         id: "thread-review-source".into(),
                         created_at: Some(now - 9_000),
                         updated_at: now - 40,
@@ -14597,6 +14657,7 @@ impl CodexInfoState {
                         depth: None,
                     },
                     ActiveThread {
+                        activity_status: PublicThreadActivityStatus::Running,
                         id: "thread-second-parent".into(),
                         created_at: Some(now - 10_800),
                         updated_at: now - 20,
@@ -14612,6 +14673,7 @@ impl CodexInfoState {
                         depth: None,
                     },
                     ActiveThread {
+                        activity_status: PublicThreadActivityStatus::Running,
                         id: "thread-child-review".into(),
                         created_at: Some(now - 2_400),
                         updated_at: now,
@@ -15316,6 +15378,9 @@ impl CodexInfoState {
             .threads
             .iter()
             .map(|thread| ActiveThread {
+                activity_status: thread
+                    .activity_status
+                    .unwrap_or(PublicThreadActivityStatus::Running),
                 id: thread.id.clone(),
                 created_at: thread.created_at,
                 updated_at: thread
@@ -15470,6 +15535,9 @@ impl CodexInfoState {
             .threads
             .iter()
             .map(|thread| ActiveThread {
+                activity_status: thread
+                    .activity_status
+                    .unwrap_or(PublicThreadActivityStatus::Running),
                 id: thread.id.clone(),
                 created_at: thread.created_at,
                 updated_at: thread
@@ -15714,7 +15782,7 @@ impl CodexInfoState {
         self.service_published_pair = Some(published_pair.clone());
         self.service_v3_published_pair = Some(published_pair.clone());
         self.service_current_snapshot = Some(current.clone());
-        self.service_current_active_thread_count = Some(current.active_thread_count);
+        self.service_current_active_thread_count = Some(current.open_session_thread_count);
         self.service_current_pair = Some(published_pair.clone());
         self.service_split_capable = true;
         self.active_threads = active_threads;
@@ -15850,6 +15918,11 @@ impl CodexInfoState {
             .ok_or_else(|| "threads resource has no current count".to_owned())?;
         if active_thread_count.is_some_and(|count| count != threads.len() as u64)
             || current_count != threads.len() as u64
+            || validation_active_count(&threads)
+                != self
+                    .service_current_snapshot
+                    .as_ref()
+                    .map_or(0, |current| current.active_thread_count)
         {
             return Err("threads count does not match current resource".into());
         }
@@ -15861,6 +15934,9 @@ impl CodexInfoState {
         let next_threads = threads
             .iter()
             .map(|thread| ActiveThread {
+                activity_status: thread
+                    .activity_status
+                    .unwrap_or(PublicThreadActivityStatus::Running),
                 id: thread.id.clone(),
                 created_at: thread.created_at,
                 updated_at: thread
@@ -18930,6 +19006,13 @@ fn active_thread_rows_at_with_i18n(
                 is_main: !thread.is_subagent,
                 title: format_thread_title_for_display(&display_title).into(),
                 full_title: display_title.into(),
+                activity_status: i18n
+                    .thread_activity_text(match thread.activity_status {
+                        PublicThreadActivityStatus::Running => Some(true),
+                        PublicThreadActivityStatus::Stopped => Some(false),
+                        PublicThreadActivityStatus::Unknown => None,
+                    })
+                    .into(),
                 model: security::shorten_unicode(
                     &thread.model_label,
                     security::MAX_ACCOUNT_ACTIVITY_LABEL_SCALARS,
@@ -18982,12 +19065,6 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
 
 fn sync_threads_window(state: &CodexInfoState, threads_window: &ThreadsWindow) {
     threads_window.set_strings(ui_strings(&state.i18n));
-    threads_window.set_thread_count_label(
-        state
-            .i18n
-            .format_thread_count(state.active_threads.len())
-            .into(),
-    );
     threads_window.set_window_title(
         native_detail_window_title(
             &state.i18n,
@@ -19873,7 +19950,6 @@ impl CodexInfoState {
         // wire count remains an admission check, never a second UI authority.
         let thread_summary = active_thread_summary(&self.active_threads);
         if thread_summary.total > 0 {
-            ui.set_has_active_thread(true);
             ui.set_active_thread_count(thread_summary.total);
             ui.set_active_thread_count_label(
                 self.i18n
@@ -19888,7 +19964,6 @@ impl CodexInfoState {
             ui.set_active_thread_astra_count(thread_summary.astra);
             ui.set_active_thread_other_count(thread_summary.other);
         } else {
-            ui.set_has_active_thread(false);
             ui.set_active_thread_count(0);
             ui.set_active_thread_sol_count(0);
             ui.set_active_thread_terra_count(0);
@@ -20824,8 +20899,21 @@ fn parse_details_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
         "threads",
     ]);
     let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
-    if actual != expected {
+    let mut with_open_count = expected.clone();
+    with_open_count.insert("open_session_thread_count");
+    if actual != expected && actual != with_open_count {
         return Err("details document fields differ from v3".into());
+    }
+    let open_count = object.get("open_session_thread_count").cloned();
+    if open_count.as_ref().is_some_and(|value| !value.is_u64()) {
+        return Err("details document open count is invalid".into());
+    }
+    if open_count.is_none() {
+        let active = object
+            .get("active_thread_count")
+            .cloned()
+            .ok_or("details active count missing")?;
+        object.insert("open_session_thread_count".to_owned(), active);
     }
     if object
         .remove("api_version")
@@ -20842,8 +20930,20 @@ fn parse_details_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
         serde_json::from_value(document).map_err(|error| error.to_string())?;
     sanitize_untrusted_history_v3(&mut details.history_samples);
     details.validate().map_err(|error| error.to_string())?;
-    if details.active_thread_count != details.threads.len() as u64 {
-        return Err("details thread count does not match rows".into());
+    if details.open_session_thread_count != details.threads.len() as u64
+        || details.active_thread_count
+            != details
+                .threads
+                .iter()
+                .filter(|thread| {
+                    matches!(
+                        thread.activity_status,
+                        None | Some(PublicThreadActivityStatus::Running)
+                    )
+                })
+                .count() as u64
+    {
+        return Err("details open/active thread counts do not match rows".into());
     }
     let topology = details
         .threads
@@ -21181,6 +21281,8 @@ struct ServiceCurrentV3Document {
     quota: Option<PublicQuota>,
     models: Vec<PublicModelUsageV3>,
     active_thread_count: u64,
+    #[serde(default)]
+    open_session_thread_count: Option<u64>,
 }
 
 fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
@@ -21199,8 +21301,16 @@ fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, St
         "state",
     ]);
     let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
-    if actual != expected {
+    let mut with_open_count = expected.clone();
+    with_open_count.insert("open_session_thread_count");
+    if actual != expected && actual != with_open_count {
         return Err("current document fields differ from v3".into());
+    }
+    if object
+        .get("open_session_thread_count")
+        .is_some_and(|value| !value.is_u64())
+    {
+        return Err("current document open count is invalid".into());
     }
     if object
         .remove("api_version")
@@ -21212,6 +21322,12 @@ fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, St
     }
     let current: ServiceCurrentV3Document =
         serde_json::from_value(document).map_err(|error| error.to_string())?;
+    let open_session_thread_count = current
+        .open_session_thread_count
+        .unwrap_or(current.active_thread_count);
+    if open_session_thread_count < current.active_thread_count {
+        return Err("current open count is smaller than active count".into());
+    }
     let details = PublicDetailsV3 {
         state: current.state,
         observed_at: current.observed_at,
@@ -21220,6 +21336,7 @@ fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, St
         quota: current.quota,
         models: current.models,
         active_thread_count: current.active_thread_count,
+        open_session_thread_count,
         history_periods: Vec::new(),
         history_samples: Vec::new(),
         history_gaps: Vec::new(),
@@ -21229,7 +21346,8 @@ fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, St
     if !details.authenticated
         && (details.quota.is_some()
             || !details.models.is_empty()
-            || details.active_thread_count != 0)
+            || details.active_thread_count != 0
+            || details.open_session_thread_count != 0)
     {
         return Err("unauthenticated current contains visible account data".into());
     }
@@ -22228,7 +22346,7 @@ where
                 }
                 return Ok(false);
             }
-            let changed = if current.active_thread_count == 0 {
+            let changed = if current.open_session_thread_count == 0 {
                 state.apply_service_current_v3(pair, current)?
             } else {
                 positive_bundle_attempted = true;
@@ -23864,12 +23982,13 @@ mod tests {
         LocalUsageCache, LocalUsageCandidate, LocalUsageResult, ManualX11Geometry,
         ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
         ModelUsageTotals, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
-        PublicHistoryPeriod, RpcReadEvent, ServiceEndpointState, ServiceHealthVersion,
-        SessionFileCandidate, SessionTraversalBudget, ThreadRolloutCache, TimedModelUsage,
-        TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample,
-        UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
-        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
-        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        PublicHistoryPeriod, PublicThreadActivityStatus, RpcReadEvent, ServiceEndpointState,
+        ServiceHealthVersion, SessionFileCandidate, SessionTraversalBudget, ThreadRolloutCache,
+        TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
+        UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
+        FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
+        LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
+        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use codex_info::usage_store;
     use serde::Deserialize;
@@ -24200,10 +24319,15 @@ mod tests {
             "export component LegalNoticeWindow inherits Window {",
         );
         assert!(activity.contains("width: 68px;\n        height: 30px;"));
-        assert!(
-            activity.contains("if root.show-content && root.has-active-thread : ActionButton {")
+        assert!(activity.contains("if root.show-content : ActionButton {"));
+        assert_eq!(
+            activity
+                .matches("if root.show-content : ThreadModelStat {")
+                .count(),
+            5
         );
-        assert!(activity.contains("if root.show-content && !root.has-active-thread : Text {"));
+        assert!(!activity.contains("if root.show-content && root.has-active-thread"));
+        assert!(!activity.contains("if root.show-content && !root.has-active-thread"));
 
         let status = component(
             "export component StatusBanner inherits Rectangle {",
@@ -24515,6 +24639,7 @@ mod tests {
     fn active_thread_fixture(index: usize, updated_at: i64) -> ActiveThread {
         let parent_thread_id = (index % 3 == 2).then(|| format!("parent-{index:03}"));
         ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: format!("thread-{index:03}"),
             created_at: Some(1_000 + index as i64),
             updated_at,
@@ -24553,6 +24678,7 @@ mod tests {
             "quota": current.quota,
             "models": current.models,
             "active_thread_count": current.active_thread_count,
+            "open_session_thread_count": current.open_session_thread_count,
         }))
         .expect("current fixture serializes")
     }
@@ -24642,6 +24768,7 @@ mod tests {
             }),
             models: Vec::new(),
             active_thread_count: 0,
+            open_session_thread_count: 0,
             history_periods: Vec::new(),
             history_samples: Vec::new(),
             history_gaps: Vec::new(),
@@ -24840,6 +24967,7 @@ mod tests {
         auth_required.quota = None;
         auth_required.models.clear();
         auth_required.active_thread_count = 0;
+        auth_required.open_session_thread_count = 0;
         state
             .apply_service_current_v3(published_pair(29, 1), auth_required)
             .expect("auth-required current root admitted");
@@ -24896,6 +25024,7 @@ mod tests {
         state.service_history_error = Some("old history error".into());
         state.service_threads_pair = Some("account-7:v1:0001".into());
         state.active_threads.push(ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: "thread-7".into(),
             ..ActiveThread::default()
         });
@@ -24974,6 +25103,7 @@ mod tests {
             ModelDollarTotals::default(),
         ));
         automatic.active_threads.push(ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: "account-7-thread".into(),
             ..ActiveThread::default()
         });
@@ -26235,6 +26365,7 @@ mod tests {
         current.history_gaps.clear();
         current.threads.clear();
         current.active_thread_count = 0;
+        current.open_session_thread_count = 0;
         let pair = format!("v1:{:032x}{:032x}", 1_u128, 1_u128);
         let wrong_pair = format!("v1:{:032x}{:032x}", 1_u128, 2_u128);
         let mut client = CodexInfoState::service_client();
@@ -26710,6 +26841,7 @@ mod tests {
             }),
             models: Vec::new(),
             active_thread_count: 0,
+            open_session_thread_count: 0,
             history_periods: Vec::new(),
             history_samples: Vec::new(),
             history_gaps: Vec::new(),
@@ -27074,6 +27206,7 @@ mod tests {
             }),
             models: Vec::new(),
             active_thread_count: 0,
+            open_session_thread_count: 0,
             history_periods: Vec::new(),
             history_samples: Vec::new(),
             history_gaps: Vec::new(),
@@ -27747,6 +27880,7 @@ mod tests {
             }),
             models: Vec::new(),
             active_thread_count: 0,
+            open_session_thread_count: 0,
             history_periods: Vec::new(),
             history_samples: Vec::new(),
             history_gaps: Vec::new(),
@@ -27905,6 +28039,7 @@ mod tests {
             }),
             models: Vec::new(),
             active_thread_count: 0,
+            open_session_thread_count: 0,
             history_periods: Vec::new(),
             history_samples: Vec::new(),
             history_gaps: Vec::new(),
@@ -29235,6 +29370,7 @@ mod tests {
         current.history_gaps.clear();
         current.threads.clear();
         current.active_thread_count = 0;
+        current.open_session_thread_count = 0;
         let pair = format!("v1:{:032x}{:032x}", 3_u128, 1_u128);
         let mut client = CodexInfoState::service_client();
         client
@@ -30471,6 +30607,7 @@ mod tests {
         );
 
         let replacement = ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: "replacement".into(),
             created_at: Some(60),
             updated_at: 123,
@@ -32973,6 +33110,7 @@ mod tests {
         state.apply_thread_result(
             8,
             ActiveThreadUpdate::Snapshot(vec![ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "stale".into(),
                 ..ActiveThread::default()
             }]),
@@ -33870,6 +34008,7 @@ mod tests {
     fn active_thread_rows_preserve_all_threads_and_expose_parent_relationships() {
         let threads = vec![
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "parent".into(),
                 created_at: Some(10),
                 updated_at: 20,
@@ -33887,6 +34026,7 @@ mod tests {
                 depth: None,
             },
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "child".into(),
                 created_at: Some(10),
                 updated_at: 19,
@@ -33902,6 +34042,7 @@ mod tests {
                 depth: Some(1),
             },
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "orphan".into(),
                 created_at: None,
                 updated_at: 18,
@@ -33956,6 +34097,7 @@ mod tests {
                       is_subagent: bool,
                       parent: Option<&str>,
                       depth: Option<i32>| ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: id.into(),
             created_at: Some(updated_at.saturating_sub(10)),
             updated_at,
@@ -34055,6 +34197,7 @@ mod tests {
     #[test]
     fn thread_presentation_keeps_capped_ancestor_guide_through_deeper_rows() {
         let thread = |id: &str, updated_at: i64, parent: Option<&str>| ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: id.into(),
             created_at: Some(updated_at.saturating_sub(10)),
             updated_at,
@@ -34096,6 +34239,7 @@ mod tests {
     #[test]
     fn active_thread_model_counts_use_exact_known_tokens_and_keep_named_zeroes() {
         let thread = |id: &str, model_label: &str| ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: id.into(),
             created_at: Some(1),
             updated_at: 1,
@@ -34548,14 +34692,17 @@ mod tests {
         }
 
         let mut child_item = thread_list_item("running-a", 20, &running_a_path);
+        child_item["status"] = json!({"type":"active","activeFlags":[]});
         child_item["source"] = json!({"subAgent":{"thread_spawn":{
             "parent_thread_id":"running-z","depth":1
         }}});
+        let mut parent_item = thread_list_item("running-z", 20, &running_z_path);
+        parent_item["status"] = json!({"type":"active","activeFlags":[]});
         let (sender, receiver) = mpsc::channel();
         for (id, item) in [
             (70, thread_list_item("completed", 30, &completed_path)),
             (71, child_item),
-            (72, thread_list_item("running-z", 20, &running_z_path)),
+            (72, parent_item),
         ] {
             sender
                 .send(RpcReadEvent::Line(
@@ -34585,6 +34732,23 @@ mod tests {
             update,
             ActiveThreadUpdate::Snapshot(vec![
                 ActiveThread {
+                    activity_status: PublicThreadActivityStatus::Stopped,
+                    id: "completed".into(),
+                    created_at: Some(1),
+                    updated_at: 30,
+                    title: "title-completed".into(),
+                    model: "不明".into(),
+                    model_label: "不明".into(),
+                    total_tokens: None,
+                    context_usage_tokens: None,
+                    context_window_tokens: None,
+                    last_user_message_at: None,
+                    is_subagent: false,
+                    parent_thread_id: None,
+                    depth: None,
+                },
+                ActiveThread {
+                    activity_status: PublicThreadActivityStatus::Running,
                     id: "running-z".into(),
                     created_at: Some(1),
                     updated_at: 20,
@@ -34600,6 +34764,7 @@ mod tests {
                     depth: None,
                 },
                 ActiveThread {
+                    activity_status: PublicThreadActivityStatus::Running,
                     id: "running-a".into(),
                     created_at: Some(1),
                     updated_at: 20,
@@ -35791,6 +35956,7 @@ mod tests {
     #[test]
     fn issue_362_linux_tree_connectors_match_windows() {
         let fixture = |id: &str, updated_at: i64, parent: Option<&str>| ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: id.into(),
             title: id.into(),
             updated_at,
@@ -35966,6 +36132,7 @@ mod tests {
     #[test]
     fn issue_362_linux_tree_depth_cap_matches_windows() {
         let fixture = |id: &str, updated_at: i64, parent: Option<&str>| ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: id.into(),
             title: id.into(),
             updated_at,
@@ -36464,15 +36631,21 @@ mod tests {
         assert!(account.contains("label: \"TERRA\";"));
         assert!(account.contains("label: \"LUNA\";"));
         assert!(account.contains("label: root.strings.other;"));
-        assert!(account.contains("if root.show-content && root.has-active-thread : ActionButton {"));
-        assert!(account.contains("if root.show-content && !root.has-active-thread : Text {"));
-        assert!(account.contains("text: root.strings.no-running-threads;"));
+        assert!(account.contains("if root.show-content : ActionButton {"));
+        assert_eq!(
+            account
+                .matches("if root.show-content : ThreadModelStat {")
+                .count(),
+            5
+        );
+        assert!(!account.contains("if root.show-content && root.has-active-thread"));
+        assert!(!account.contains("text: root.strings.no-running-threads;"));
         assert!(account.contains("x: parent.width - 80px;"));
         assert!(account.contains("width: 68px;\n        height: 30px;"));
         let japanese = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
         assert_eq!(
             japanese.text(codex_info::i18n::TextKey::NoRunningThreads),
-            "実行中のスレッドはありません"
+            "対象のスレッドはありません"
         );
     }
 
@@ -41453,6 +41626,62 @@ mod tests {
     }
 
     #[test]
+    fn issue_362_linux_stopped_open_session_counts_and_fetches_in_main_cycle() {
+        let (mut current, mut threads) = split_current_fixture();
+        current.active_thread_count = 0;
+        current.open_session_thread_count = 1;
+        threads[0].activity_status = Some(PublicThreadActivityStatus::Stopped);
+        let pair = published_pair(17, 1);
+        let current_body = split_current_body(&current);
+        let threads_body = split_threads_body(&threads);
+        let now = Instant::now();
+        let mut state = CodexInfoState::service_client();
+        state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+        let accounts_body = ACCOUNTS_A_CURRENT.to_vec();
+        let mut requested_threads = 0;
+        let outcome = super::poll_service_current_resources_with(&mut state, now, |route, _| {
+            Ok(match route {
+                "/v3/accounts" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: None,
+                    body: accounts_body.clone(),
+                },
+                "/v3/current?account=account-7" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(pair.clone()),
+                    body: current_body.clone(),
+                },
+                "/v3/threads?account=account-7" => {
+                    requested_threads += 1;
+                    super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: threads_body.clone(),
+                    }
+                }
+                _ => panic!("unexpected route {route}"),
+            })
+        });
+        assert_eq!(outcome, super::ServiceCurrentPollOutcome::Success);
+        assert_eq!(requested_threads, 1);
+        assert_eq!(state.active_threads.len(), 1);
+        assert_eq!(
+            state.active_threads[0].activity_status,
+            PublicThreadActivityStatus::Stopped
+        );
+        assert_eq!(super::active_thread_summary(&state.active_threads).total, 1);
+    }
+
+    #[test]
+    fn issue_362_linux_detail_row_shows_observed_activity_state() {
+        let mut stopped = active_thread_fixture(0, 1_800_000_000);
+        stopped.activity_status = PublicThreadActivityStatus::Stopped;
+        let rows = active_thread_rows_at(&[stopped], 1_800_000_060);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].activity_status.as_str(), "停止中");
+    }
+
+    #[test]
     fn linux_zero_current_clears_old_rows_without_requesting_threads() {
         let old_pair = published_pair(8, 1);
         let new_pair = published_pair(8, 2);
@@ -41460,6 +41689,7 @@ mod tests {
         assert_eq!(state.active_threads.len(), 1);
         let (mut current, _) = split_current_fixture();
         current.active_thread_count = 0;
+        current.open_session_thread_count = 0;
         let current_body = split_current_body(&current);
         let now = Instant::now();
         state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
@@ -49406,7 +49636,7 @@ mod tests {
             .split("thread-list-clip := Rectangle {")
             .nth(1)
             .expect("thread-list clip rectangle");
-        assert!(thread_list_clip.contains("y: 76px;"));
+        assert!(thread_list_clip.contains("y: 56px;"));
         assert!(thread_list_clip.contains("width: 860px;"));
         assert!(thread_list_clip.contains("height: 384px;"));
         assert!(thread_list_clip.contains("clip: true;"));
@@ -49419,6 +49649,8 @@ mod tests {
             .split("export component ThreadsWindow inherits Window {")
             .nth(1)
             .expect("ThreadsWindow");
+        assert!(!threads.contains("thread-count-label"));
+        assert!(!threads.contains("thread-count := Text {"));
         let windows_master =
             include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
         for marker in [
@@ -49439,8 +49671,7 @@ mod tests {
             "preferred-width: 900px;",
             "preferred-height: 480px;",
             "header-panel := Rectangle {\n        x: 20px;\n        y: 20px;\n        width: 860px;\n        height: 30px;",
-            "thread-count := Text {\n        x: 20px;\n        y: 56px;\n        width: 860px;\n        height: 14px;",
-            "thread-list-clip := Rectangle {\n        x: 20px;\n        y: 76px;\n        width: 860px;\n        height: 384px;",
+            "thread-list-clip := Rectangle {\n        x: 20px;\n        y: 56px;\n        width: 860px;\n        height: 384px;",
             "property <length> thread-row-height: 96px;",
             "row-card := Rectangle {\n                    x: 80px;\n                    y: 6px;\n                    width: parent.width - 96px;\n                    height: 84px;",
             "property <length> info-spacing: 12px;",
@@ -49449,11 +49680,11 @@ mod tests {
             "time-lane := Rectangle {\n                    x: parent.width - 239px;\n                    y: 15px;\n                    width: 208px;\n                    height: 66px;",
             "text: row.model;",
             "text: root.strings.context-usage + \" \" + row.context-usage;",
-            "text: root.strings.running + \" \" + row.thread-age;",
+            "text: row.activity-status + (row.thread-age != \"\" ? \" · \" + row.thread-age : \"\");",
             "text: root.strings.instruction + \" \" + row.instruction-age;",
             "text: row.tokens;",
             "visible: row.context-usage != \"\";",
-            "visible: row.thread-age != \"\";",
+            "visible: true;",
             "visible: row.instruction-age != \"\";",
             "visible: row.tokens != \"\";",
             "property <length> tree-base-x: 10px;",
@@ -49467,6 +49698,7 @@ mod tests {
         ] {
             assert!(threads.contains(marker), "missing Linux Threads contract: {marker}");
         }
+        assert!(!threads.contains("visible: row.thread-age != \"\";"));
 
         let path_block = |marker: &str, occurrence: usize| {
             threads
@@ -49585,6 +49817,7 @@ mod tests {
         let display = |title: String| {
             let rows = active_thread_rows_at(
                 &[ActiveThread {
+                    activity_status: PublicThreadActivityStatus::Running,
                     id: "title-fixture".into(),
                     title: title.clone(),
                     model: "gpt-5.6-luna".into(),
@@ -49776,12 +50009,14 @@ mod tests {
     fn issue_362_parent_rows_are_only_nested_ancestors_and_use_parent_accent() {
         let threads = vec![
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "A".into(),
                 title: "A".into(),
                 updated_at: 4,
                 ..ActiveThread::default()
             },
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "B".into(),
                 title: "B".into(),
                 parent_thread_id: Some("A".into()),
@@ -49789,6 +50024,7 @@ mod tests {
                 ..ActiveThread::default()
             },
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "C".into(),
                 title: "C".into(),
                 parent_thread_id: Some("B".into()),
@@ -49796,6 +50032,7 @@ mod tests {
                 ..ActiveThread::default()
             },
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "D".into(),
                 title: "D".into(),
                 updated_at: 1,
@@ -49835,6 +50072,7 @@ mod tests {
     #[test]
     fn issue_362_thread_context_usage_has_expected_percentages_and_unobserved_fallback() {
         let make_thread = |id: &str, used: Option<u64>, window: Option<u64>| ActiveThread {
+            activity_status: PublicThreadActivityStatus::Running,
             id: id.into(),
             title: id.into(),
             model_label: "LUNA".into(),
@@ -49869,6 +50107,7 @@ mod tests {
     fn issue_362_thread_name_uses_exact_task_name_and_unset_fallback() {
         let named_rows = active_thread_rows_at(
             &[ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 title: "task_name".into(),
                 ..ActiveThread::default()
             }],
@@ -49879,6 +50118,7 @@ mod tests {
 
         let unnamed_rows = active_thread_rows_at(
             &[ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 title: String::new(),
                 ..ActiveThread::default()
             }],
@@ -49892,12 +50132,14 @@ mod tests {
     fn issue_362_linux_parent_background_matches_windows() {
         let threads = vec![
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "A".into(),
                 title: "A".into(),
                 updated_at: 4,
                 ..ActiveThread::default()
             },
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "B".into(),
                 title: "B".into(),
                 parent_thread_id: Some("A".into()),
@@ -49905,6 +50147,7 @@ mod tests {
                 ..ActiveThread::default()
             },
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "C".into(),
                 title: "C".into(),
                 parent_thread_id: Some("B".into()),
@@ -49912,6 +50155,7 @@ mod tests {
                 ..ActiveThread::default()
             },
             ActiveThread {
+                activity_status: PublicThreadActivityStatus::Running,
                 id: "D".into(),
                 title: "D".into(),
                 updated_at: 1,
@@ -50075,7 +50319,6 @@ mod tests {
         assert!(header.contains("height: 30px;"));
         assert!(header.contains("background: DesignTokens.canvas;"));
         assert!(header.contains("font-size: 22px;"));
-        assert!(header.contains("font-size: 12px;"));
         assert!(header.contains("z: 2;"));
     }
 

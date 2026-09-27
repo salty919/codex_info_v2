@@ -27,6 +27,9 @@ public sealed record ApiDetailsSnapshot(
     IReadOnlyList<ApiThreadDetails> Threads,
     string EstimatedCostLabel)
 {
+    /// <summary>Distinct threads whose canonical Session is currently open.</summary>
+    public ulong OpenSessionThreadCount { get; init; } = ActiveThreadCount;
+
     /// <summary>The wire contract version of this accepted details document.</summary>
     public string ApiVersion { get; init; } = "v1";
 
@@ -226,7 +229,15 @@ public sealed record ApiHistoryModelSample(
     public double? TotalDollars => Dollars;
 }
 
-/// <summary>A currently running thread and its validated tree metadata.</summary>
+/// <summary>Activity observed for a thread in a currently open Session.</summary>
+public enum ApiThreadActivityStatus
+{
+    Running,
+    Stopped,
+    Unknown,
+}
+
+/// <summary>A thread in a currently open Session and its validated tree metadata.</summary>
 public sealed record ApiThreadDetails(
     string Id,
     string Title,
@@ -242,6 +253,8 @@ public sealed record ApiThreadDetails(
     int? Depth,
     bool IsOrphan)
 {
+    public ApiThreadActivityStatus ActivityStatus { get; init; } = ApiThreadActivityStatus.Running;
+
     public double? ContextPercent => ContextTokens is { } used && ContextLimit is { } limit && limit > 0
         ? Math.Clamp(used * 100.0 / limit, 0, 100)
         : null;
@@ -456,6 +469,8 @@ public sealed record ApiCurrentSnapshot(
     ulong ActiveThreadCount,
     PublishedPairIdentity PublishedPair)
 {
+    public ulong OpenSessionThreadCount { get; init; } = ActiveThreadCount;
+
     public string ApiVersion { get; init; } = "v3";
 
     /// <summary>Explicit account used for this resource, when scoped.</summary>
@@ -475,6 +490,7 @@ public sealed record ApiCurrentSnapshot(
             details.PublishedPair ?? default)
         {
             ApiVersion = details.ApiVersion,
+            OpenSessionThreadCount = details.OpenSessionThreadCount,
         };
     }
 }

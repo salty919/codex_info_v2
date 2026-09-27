@@ -436,7 +436,6 @@ public sealed class DetailsPresentationCoverageTests
         Assert.False(threads.HasThreads);
         Assert.True(threads.HasNoThreads);
         Assert.Equal(threads.Texts.NoRunningThreads, threads.EmptyText);
-        Assert.Equal(main.DetailsStatusText, threads.DetailsStatusText);
 
         var previousLanguage = LocalizationService.Current.LanguageCode;
         var nextLanguage = previousLanguage.Equals("en", StringComparison.OrdinalIgnoreCase) ? "ja" : "en";
@@ -444,7 +443,40 @@ public sealed class DetailsPresentationCoverageTests
         {
             LocalizationService.SetLanguage(nextLanguage);
             Assert.Equal(threads.Texts.NoRunningThreads, threads.EmptyText);
-            Assert.NotEqual(string.Empty, threads.DetailsStatusText);
+        }
+        finally
+        {
+            LocalizationService.SetLanguage(previousLanguage);
+        }
+    }
+
+    [Fact]
+    public async Task Issue362ThreadsWindowShowsObservedActivityStatus()
+    {
+        var source = new[]
+        {
+            new ApiThreadDetails("running", "Running", null, "SOL", "SOL", null, null, null, 1, 1, false, 0, false)
+                { ActivityStatus = ApiThreadActivityStatus.Running },
+            new ApiThreadDetails("stopped", "Stopped", null, "LUNA", "LUNA", null, null, null, 1, 1, false, 0, false)
+                { ActivityStatus = ApiThreadActivityStatus.Stopped },
+            new ApiThreadDetails("unknown", "Unknown", null, "TERRA", "TERRA", null, null, null, 1, 1, false, 0, false)
+                { ActivityStatus = ApiThreadActivityStatus.Unknown },
+        };
+        var snapshot = CreateDetails([], source) with
+        {
+            ApiVersion = "v3",
+            OpenSessionThreadCount = 3,
+        };
+        var previousLanguage = LocalizationService.Current.LanguageCode;
+        try
+        {
+            LocalizationService.SetLanguage("ja");
+            using var main = await StartMainAsync(snapshot);
+            using var threads = new ThreadsWindowViewModel(main);
+
+            Assert.Equal("動作中", threads.Threads.Single(item => item.Id == "running").ActivityStatusText);
+            Assert.Equal("停止中", threads.Threads.Single(item => item.Id == "stopped").ActivityStatusText);
+            Assert.Equal("未観測", threads.Threads.Single(item => item.Id == "unknown").ActivityStatusText);
         }
         finally
         {
@@ -480,7 +512,7 @@ public sealed class DetailsPresentationCoverageTests
         const int viewportHeight = (cardHeight + cardTopAndBottom) * visibleCardCount;
 
         var listScrollViewer = Assert.Single(document.Descendants(), element => element.Name.LocalName == "ScrollViewer");
-        Assert.Equal("2", listScrollViewer.Attribute("Grid.Row")?.Value);
+        Assert.Equal("1", listScrollViewer.Attribute("Grid.Row")?.Value);
         Assert.Equal(viewportHeight.ToString(CultureInfo.InvariantCulture), listScrollViewer.Attribute("Height")?.Value);
         Assert.Equal("Top", listScrollViewer.Attribute("VerticalAlignment")?.Value);
         Assert.Equal("Disabled", listScrollViewer.Attribute("HorizontalScrollBarVisibility")?.Value);

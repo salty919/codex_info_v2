@@ -1174,6 +1174,7 @@ fn serialize_route(
                 "quota": details.quota,
                 "models": snapshot.models_v3,
                 "active_thread_count": details.active_thread_count,
+                "open_session_thread_count": details.threads.len(),
             }))
         }
         Route::HistoryPeriodsV3 => serialize_json(&json!({
@@ -1206,6 +1207,8 @@ fn details_v3(snapshot: &PublishedSnapshot, degraded: bool) -> PublicDetailsV3 {
 
 fn details_v1(snapshot: &PublishedSnapshot, degraded: bool) -> PublicDetails {
     let mut details = snapshot.details.clone();
+    details.threads = legacy_running_rows(&details.threads);
+    details.active_thread_count = details.threads.len() as u64;
     if degraded {
         details.state = PublicState::Error;
     }
@@ -1220,10 +1223,31 @@ fn details_v2(snapshot: &PublishedSnapshot) -> PublicDetailsV2 {
 
 fn details_v2_for_wire(snapshot: &PublishedSnapshot, degraded: bool) -> PublicDetailsV2 {
     let mut details = details_v2(snapshot);
+    details.threads = legacy_running_rows(&details.threads);
+    details.active_thread_count = details.threads.len() as u64;
     if degraded {
         details.state = PublicState::Error;
     }
     details
+}
+
+fn legacy_running_rows(
+    threads: &[codex_info_rest_contract::PublicThread],
+) -> Vec<codex_info_rest_contract::PublicThread> {
+    threads
+        .iter()
+        .filter(|thread| {
+            matches!(
+                thread.activity_status,
+                None | Some(codex_info_rest_contract::PublicThreadActivityStatus::Running)
+            )
+        })
+        .cloned()
+        .map(|mut thread| {
+            thread.activity_status = None;
+            thread
+        })
+        .collect()
 }
 
 fn flatten_with_version<T: serde::Serialize>(
@@ -1369,6 +1393,69 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn issue_362_v3_open_rows_preserve_legacy_active_projection() {
+        let make_thread = |id: &str, status| codex_info_rest_contract::PublicThread {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            activity_status: Some(status),
+            parent_thread_id: None,
+            model: "gpt-5".to_owned(),
+            model_label: "SOL".to_owned(),
+            total_tokens: None,
+            context_usage_tokens: None,
+            context_window_tokens: None,
+            created_at: Some(1_800_000_000),
+            last_user_message_at: None,
+            is_subagent: false,
+            depth: Some(0),
+        };
+        let details = PublicDetails {
+            active_thread_count: 1,
+            threads: vec![
+                make_thread(
+                    "running",
+                    codex_info_rest_contract::PublicThreadActivityStatus::Running,
+                ),
+                make_thread(
+                    "stopped",
+                    codex_info_rest_contract::PublicThreadActivityStatus::Stopped,
+                ),
+            ],
+            ..PublicDetails::default()
+        };
+        let snapshot = PublishedSnapshot {
+            generation: 1,
+            data_hash: "hash".to_owned(),
+            pair: "pair".to_owned(),
+            has_pending_ranges: false,
+            details,
+            models_v3: Vec::new(),
+            history_samples_v2: Vec::new(),
+            history_samples_v3: Vec::new(),
+        };
+        let json = |route| -> serde_json::Value {
+            serde_json::from_slice(&serialize_route(&snapshot, route, None, None, false).unwrap())
+                .unwrap()
+        };
+        let current = json(Route::CurrentV3);
+        assert_eq!(current["active_thread_count"], 1);
+        assert_eq!(current["open_session_thread_count"], 2);
+        let open_rows = json(Route::ThreadsV3);
+        assert_eq!(open_rows["threads"].as_array().unwrap().len(), 2);
+        assert_eq!(open_rows["threads"][1]["activity_status"], "stopped");
+        let legacy = json(Route::Details);
+        assert_eq!(legacy["active_thread_count"], 1);
+        assert_eq!(legacy["threads"].as_array().unwrap().len(), 1);
+        assert!(legacy["threads"][0].get("activity_status").is_none());
+        let legacy_v2 = json(Route::DetailsV2);
+        assert_eq!(legacy_v2["threads"].as_array().unwrap().len(), 1);
+        assert!(legacy_v2["threads"][0].get("activity_status").is_none());
+        let v3_details = json(Route::DetailsV3);
+        assert_eq!(v3_details["open_session_thread_count"], 2);
+        assert_eq!(v3_details["threads"][1]["activity_status"], "stopped");
+    }
 
     fn temp_db(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
