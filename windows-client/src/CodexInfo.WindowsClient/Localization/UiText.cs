@@ -75,23 +75,44 @@ public sealed record UiText(
 
     public string ThreadRunning => LanguageCode switch
     {
-        "ja" => "動作中", "zh-Hans" => "运行中", "ko" => "실행 중", "es" => "En ejecución",
-        "fr" => "En cours", "de" => "Läuft", "pt" => "Em execução", "it" => "In esecuzione",
-        "ru" => "Выполняется", _ => "Running"
+        "ja" => "動作中",
+        "zh-Hans" => "运行中",
+        "ko" => "실행 중",
+        "es" => "En ejecución",
+        "fr" => "En cours",
+        "de" => "Läuft",
+        "pt" => "Em execução",
+        "it" => "In esecuzione",
+        "ru" => "Выполняется",
+        _ => "Running"
     };
 
     public string ThreadStopped => LanguageCode switch
     {
-        "ja" => "停止中", "zh-Hans" => "已停止", "ko" => "중지됨", "es" => "Detenido",
-        "fr" => "Arrêté", "de" => "Gestoppt", "pt" => "Parado", "it" => "Arrestato",
-        "ru" => "Остановлен", _ => "Stopped"
+        "ja" => "停止中",
+        "zh-Hans" => "已停止",
+        "ko" => "중지됨",
+        "es" => "Detenido",
+        "fr" => "Arrêté",
+        "de" => "Gestoppt",
+        "pt" => "Parado",
+        "it" => "Arrestato",
+        "ru" => "Остановлен",
+        _ => "Stopped"
     };
 
     public string ThreadUnknown => LanguageCode switch
     {
-        "ja" => "未観測", "zh-Hans" => "状态未观测", "ko" => "상태 미확인", "es" => "Estado no observado",
-        "fr" => "État non observé", "de" => "Status nicht beobachtet", "pt" => "Estado não observado",
-        "it" => "Stato non osservato", "ru" => "Состояние не наблюдалось", _ => "Status unobserved"
+        "ja" => "未観測",
+        "zh-Hans" => "状态未观测",
+        "ko" => "상태 미확인",
+        "es" => "Estado no observado",
+        "fr" => "État non observé",
+        "de" => "Status nicht beobachtet",
+        "pt" => "Estado não observado",
+        "it" => "Stato non osservato",
+        "ru" => "Состояние не наблюдалось",
+        _ => "Status unobserved"
     };
 
     public string GraphWindowTitle => LanguageCode switch
