@@ -31773,6 +31773,66 @@ mod tests {
     }
 
     #[test]
+    fn linux_graph_recovers_after_owner_ready() {
+        let observed_at = Utc::now().timestamp();
+        let producer = CodexInfoState::preview("normal");
+        let (v1, v2, v3) = producer.public_details_candidates_at(observed_at);
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        server.publisher().publish_details_v3(v1, v2, v3).unwrap();
+
+        let mut state = CodexInfoState::service_client();
+        state.service_accounts.clear();
+        state.service_default_account_id = None;
+        state.service_selected_account_id = None;
+        state.service_accounts_known = true;
+        state.service_accounts_supported = false;
+        state.service_accounts_force_poll = false;
+        state.service_accounts_last_poll = Instant::now();
+        state.service_current_last_poll = Instant::now();
+        state.service_history_last_poll = Instant::now();
+        state.service_current_force_poll = false;
+        state.service_history_force_poll = true;
+
+        super::run_ui_service_timer_cycle_with_owner_check(
+            &mut state,
+            server.local_addr(),
+            false,
+            false,
+            |_| false,
+        );
+        assert!(state.service_owner_probe_failed);
+        assert!(state.service_history_periods.is_empty());
+        assert!(state.service_history_samples.is_empty());
+
+        super::run_ui_service_timer_cycle_with_owner_check(
+            &mut state,
+            server.local_addr(),
+            true,
+            false,
+            |_| true,
+        );
+
+        let current_pair = state
+            .service_current_pair
+            .as_deref()
+            .expect("current is read immediately after the owner becomes ready");
+        assert!(!state.service_owner_probe_failed);
+        assert_eq!(
+            state.service_history_periods_pair.as_deref(),
+            Some(current_pair)
+        );
+        assert_eq!(state.service_history_pair.as_deref(), Some(current_pair));
+        assert!(!state.service_history_periods.is_empty());
+        assert!(!state.service_history_samples.is_empty());
+
+        let graph = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
+        assert!(graph.has_data, "the same Graph recovers published history");
+        server.shutdown();
+    }
+
+    #[test]
     fn resident_scheduler_requests_one_account_refresh_and_retries_next_interval() {
         let now = Instant::now();
         let mut state = CodexInfoState::preview("normal");

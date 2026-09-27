@@ -908,6 +908,47 @@ wait_service_ready() {
     curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" >&2 || true
     return 1
 }
+
+# Start the real UI while the isolated service endpoint is still unavailable.
+# Keep this process alive when the recorder and REST service are brought up so
+# the later ready and Graph captures prove recovery in the same UI instance.
+env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" "$binary" --ui --port "$port" \
+    >"$temp_root/ui.log" 2>&1 &
+ui_pid="$!"
+ui_starttime="$(proc_starttime "$ui_pid")"
+[[ "$ui_starttime" =~ ^[0-9]+$ ]] || fail 'UI starttime could not be recorded'
+for _ in $(seq 1 100); do
+    kill -0 "$ui_pid" 2>/dev/null || {
+        sed -n '1,160p' "$temp_root/ui.log" >&2 || true
+        fail 'real-service UI exited before rendering'
+    }
+    while read -r candidate; do
+        candidate_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
+        if [[ "$candidate_pid" == "$ui_pid" ]]; then
+            window_id="$candidate"
+            break
+        fi
+    done < <(xwininfo -root -tree 2>/dev/null | awk '/^ +0x[0-9a-f]+/ { print $1 }')
+    [[ -n "$window_id" ]] && break
+    sleep 0.1
+done
+[[ -n "$window_id" ]] || fail 'real-service UI window did not render'
+assert_threads_window_closed "$ui_pid" "$window_id"
+assert_ui_instance() {
+    local actual_window_pid
+    kill -0 "$ui_pid" 2>/dev/null \
+        && [[ "$(proc_starttime "$ui_pid")" == "$ui_starttime" ]] \
+        || fail 'the original UI process did not remain alive'
+    actual_window_pid="$(xprop -id "$window_id" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
+    [[ "$actual_window_pid" == "$ui_pid" ]] \
+        || fail 'the original UI window owner changed'
+}
+assert_ui_instance
+if service_ready; then
+    fail 'isolated REST service was already ready when the UI startup state was checked'
+fi
+echo "x11-service-recovery-visual-gate: UI is alive before service readiness (pid=$ui_pid)"
+
 append_verified_usage() {
     python3 - "$session_fixture" <<'PY'
 import datetime
@@ -1252,29 +1293,6 @@ for preview_kind in idle auth full; do
     reference_window_id=''
 done
 
-env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" "$binary" --ui --port "$port" \
-    >"$temp_root/ui.log" 2>&1 &
-ui_pid="$!"
-ui_starttime="$(proc_starttime "$ui_pid")"
-[[ "$ui_starttime" =~ ^[0-9]+$ ]] || fail 'UI starttime could not be recorded'
-for _ in $(seq 1 100); do
-    kill -0 "$ui_pid" 2>/dev/null || {
-        sed -n '1,160p' "$temp_root/ui.log" >&2 || true
-        fail 'real-service UI exited before rendering'
-    }
-    while read -r candidate; do
-        candidate_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
-        if [[ "$candidate_pid" == "$ui_pid" ]]; then
-            window_id="$candidate"
-            break
-        fi
-    done < <(xwininfo -root -tree 2>/dev/null | awk '/^ +0x[0-9a-f]+/ { print $1 }')
-    [[ -n "$window_id" ]] && break
-    sleep 0.1
-done
-[[ -n "$window_id" ]] || fail 'real-service UI window did not render'
-assert_threads_window_closed "$ui_pid" "$window_id"
-
 capture_state() {
     local expected="$1" baseline="${2:-}"
     local status_kind="$expected"
@@ -1347,6 +1365,7 @@ print(f"x11-service-recovery-visual-gate: {expected} frame PASS (red={red}, blue
 PY
 }
 
+assert_ui_instance
 ready_capture=0
 for _ in $(seq 1 60); do
     if capture_state ready >/dev/null 2>/dev/null; then ready_capture=1; break; fi
@@ -1363,6 +1382,7 @@ assert_thread_summary_components "$ready_frame" \
 # Exercise the actual lazy boundary: the authenticated main window has already
 # rendered with period metadata, and only this user action may materialize the
 # selected history page and graph window.
+assert_ui_instance
 # At 900px the Main content begins at x=22, and Header graph-x=548 with
 # width=70, so x=605 targets the fixed center of the rendered Graph button.
 window_action "$window_id" 605 40 click
