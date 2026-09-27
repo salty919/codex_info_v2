@@ -1463,6 +1463,7 @@ fn collect_active_thread_snapshot(
                 .map(|snapshot| ActiveThreadRecord {
                     id: snapshot.thread_id,
                     title: snapshot.title,
+                    activity_status: snapshot.activity_status.as_str().to_owned(),
                     model: snapshot.model,
                     model_label: snapshot.model_label,
                     created_at: Some(snapshot.created_at),

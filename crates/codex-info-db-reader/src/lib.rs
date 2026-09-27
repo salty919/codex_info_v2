@@ -10,7 +10,7 @@ use codex_info_rest_contract::{
     PublicDetailedModelUsage, PublicDetails, PublicHistoryGap, PublicHistoryModelUsageV3,
     PublicHistoryObservation, PublicHistoryObservationV3, PublicHistoryPeriod, PublicHistorySample,
     PublicModelCostV3, PublicModelUsageV3, PublicQuota, PublicState, PublicThread,
-    MAX_PUBLIC_MODELS_V3,
+    PublicThreadActivityStatus, MAX_PUBLIC_MODELS_V3,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
@@ -606,6 +606,7 @@ struct StoredActiveThread {
     id: String,
     updated_at: i64,
     title: String,
+    activity_status: PublicThreadActivityStatus,
     parent_thread_id: Option<String>,
     model: String,
     model_label: String,
@@ -635,6 +636,7 @@ impl<'de> Deserialize<'de> for StoredActiveThread {
             "id",
             "updated_at",
             "title",
+            "activity_status",
             "parent_thread_id",
             "model",
             "model_label",
@@ -661,6 +663,7 @@ impl<'de> Deserialize<'de> for StoredActiveThread {
                 let mut id = None;
                 let mut updated_at = None;
                 let mut title = None;
+                let mut activity_status = None;
                 let mut parent_thread_id = None;
                 let mut model = None;
                 let mut model_label = None;
@@ -690,6 +693,12 @@ impl<'de> Deserialize<'de> for StoredActiveThread {
                                 return Err(de::Error::duplicate_field("title"));
                             }
                             title = Some(map.next_value()?);
+                        }
+                        "activity_status" => {
+                            if activity_status.is_some() {
+                                return Err(de::Error::duplicate_field("activity_status"));
+                            }
+                            activity_status = Some(map.next_value()?);
                         }
                         "parent_thread_id" => {
                             if parent_thread_id.is_some() {
@@ -758,6 +767,8 @@ impl<'de> Deserialize<'de> for StoredActiveThread {
                     id: id.ok_or_else(|| de::Error::missing_field("id"))?,
                     updated_at: updated_at.ok_or_else(|| de::Error::missing_field("updated_at"))?,
                     title: title.ok_or_else(|| de::Error::missing_field("title"))?,
+                    // Old writer snapshots contained running rows only.
+                    activity_status: activity_status.unwrap_or(PublicThreadActivityStatus::Running),
                     parent_thread_id: parent_thread_id
                         .ok_or_else(|| de::Error::missing_field("parent_thread_id"))?,
                     model: model.ok_or_else(|| de::Error::missing_field("model"))?,
@@ -911,6 +922,7 @@ fn read_active_thread_snapshot_for_intervals(
         .map(|thread| PublicThread {
             id: thread.id,
             title: thread.title,
+            activity_status: Some(thread.activity_status),
             parent_thread_id: thread.parent_thread_id,
             model: thread.model,
             model_label: thread.model_label,
@@ -924,7 +936,10 @@ fn read_active_thread_snapshot_for_intervals(
         })
         .collect::<Vec<_>>();
     let validation = PublicDetails {
-        active_thread_count: threads.len() as u64,
+        active_thread_count: threads
+            .iter()
+            .filter(|thread| thread.activity_status == Some(PublicThreadActivityStatus::Running))
+            .count() as u64,
         threads: threads.clone(),
         ..PublicDetails::default()
     };
@@ -1201,7 +1216,12 @@ fn build_details_for_intervals(
 ) -> Result<DetailsBuild, ReaderError> {
     if raw.is_empty() {
         let details = PublicDetails {
-            active_thread_count: threads.len() as u64,
+            active_thread_count: threads
+                .iter()
+                .filter(|thread| {
+                    thread.activity_status == Some(PublicThreadActivityStatus::Running)
+                })
+                .count() as u64,
             threads: threads.to_vec(),
             ..PublicDetails::default()
         };
@@ -1354,7 +1374,12 @@ fn build_details_for_intervals(
             plan_label: None,
             quota,
             models,
-            active_thread_count: threads.len() as u64,
+            active_thread_count: threads
+                .iter()
+                .filter(|thread| {
+                    thread.activity_status == Some(PublicThreadActivityStatus::Running)
+                })
+                .count() as u64,
             history_periods: periods,
             // v1 has no nullable model fields or provenance field, so it
             // cannot truthfully carry metadata-only rows. Publish only exact
@@ -4764,6 +4789,23 @@ mod tests {
         assert_eq!(snapshot.details.threads.len(), 1);
         assert_eq!(snapshot.details.threads[0].id, "thread-sol");
         assert_eq!(snapshot.details.threads[0].model_label, "SOL");
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn issue_362_stopped_open_session_is_retained_without_active_count() {
+        let path = temp_db("open-session-stopped");
+        make_db(&path);
+        let mut row = active_thread_value("thread-stopped", 1_800_000_000);
+        row["activity_status"] = serde_json::json!("stopped");
+        add_active_thread_table(&path, &serde_json::json!([row]).to_string(), 0);
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("snapshot");
+        assert_eq!(snapshot.details.active_thread_count, 0);
+        assert_eq!(snapshot.details.threads.len(), 1);
+        assert_eq!(snapshot.details.threads[0].id, "thread-stopped");
         fs::remove_file(path).expect("cleanup");
     }
 

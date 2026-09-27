@@ -764,6 +764,7 @@ pub struct ActiveThreadRecord {
     pub id: String,
     pub updated_at: i64,
     pub title: String,
+    pub activity_status: String,
     pub parent_thread_id: Option<String>,
     pub model: String,
     pub model_label: String,
@@ -813,6 +814,10 @@ fn validate_active_thread_record(record: &ActiveThreadRecord) -> Result<()> {
         || record.updated_at > MAX_PUBLIC_UNIX_SECONDS
         || !active_thread_text_valid(&record.id, MAX_ACTIVE_THREAD_ID_SCALARS)
         || !active_thread_text_valid(&record.title, MAX_ACTIVE_THREAD_TITLE_SCALARS)
+        || !matches!(
+            record.activity_status.as_str(),
+            "running" | "stopped" | "unknown"
+        )
         || !active_thread_text_valid(&record.model, MAX_ACTIVE_THREAD_MODEL_SCALARS)
         || !active_thread_text_valid(&record.model_label, MAX_ACTIVE_THREAD_MODEL_LABEL_SCALARS)
         || record
@@ -874,6 +879,7 @@ fn canonical_active_thread_snapshot(snapshot: &ActiveThreadSnapshot) -> Result<(
                 "id": &thread.id,
                 "updated_at": thread.updated_at,
                 "title": &thread.title,
+                "activity_status": &thread.activity_status,
                 "parent_thread_id": &thread.parent_thread_id,
                 "model": &thread.model,
                 "model_label": &thread.model_label,
@@ -13234,6 +13240,7 @@ mod tests {
             id: id.into(),
             updated_at,
             title: format!("thread {id}"),
+            activity_status: "running".into(),
             parent_thread_id: None,
             model: "gpt-5".into(),
             model_label: "SOL".into(),
@@ -13271,6 +13278,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&row.1).unwrap();
         assert_eq!(json[0]["id"], "thread-a");
         assert_eq!(json[0]["updated_at"], 1_800_000_000_i64);
+        assert_eq!(json[0]["activity_status"], "running");
 
         // Exact canonical replay is a no-op, including generation.
         assert_eq!(store.commit_active_thread_snapshot(&snapshot).unwrap(), 1);
@@ -13298,6 +13306,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(empty_json, "[]");
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue_362_stopped_open_session_status_is_durable() {
+        let path = database_path("open-session-stopped-status");
+        let identity = partition_identity('a', 1);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let mut stopped = active_thread("thread-stopped", 1_800_000_000);
+        stopped.activity_status = "stopped".to_owned();
+        store
+            .commit_active_thread_snapshot(&ActiveThreadSnapshot {
+                observed_at: 1_800_000_060,
+                threads: vec![stopped],
+            })
+            .unwrap();
+        let encoded: String = store
+            .connection
+            .query_row(
+                "SELECT threads_json FROM active_thread_snapshot WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(json[0]["activity_status"], "stopped");
         remove_database(&path);
     }
 

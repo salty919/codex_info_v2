@@ -186,6 +186,159 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task OpenThreadsFollowsMainAcceptedPairInTheSameRefreshWithoutExtraRequest()
+    {
+        var first = CurrentSnapshot(activeThreadCount: 1);
+        var second = CurrentSnapshot(activeThreadCount: 1, observedAt: 2) with
+        {
+            PublishedPair = PublishedPair(OtherPublishedPair),
+        };
+        var sol = ThreadDetails("gpt-5.6-sol", "same-thread");
+        var luna = ThreadDetails("gpt-5.6-luna", "same-thread");
+        var client = new SequencedSplitClient(
+            [first, second],
+            [
+                ThreadsFetchResult.Success(new ApiThreadsSnapshot([sol], first.PublishedPair)),
+                ThreadsFetchResult.Success(new ApiThreadsSnapshot([sol], first.PublishedPair)),
+                ThreadsFetchResult.Success(new ApiThreadsSnapshot([luna], second.PublishedPair)),
+            ]);
+        using var main = new MainWindowViewModel(client);
+        main.Start();
+        await EventuallyAsync(() => main.DetailsSnapshot?.ObservedAt == 1);
+        using var details = new ThreadsWindowViewModel(main, action => action());
+        await EventuallyAsync(() => client.ThreadsCallCount == 2 && details.Threads.Count == 1);
+        Assert.Equal("gpt-5.6-sol", Assert.Single(details.Threads).ModelText);
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot?.ObservedAt == 2);
+
+        Assert.Equal(3, client.ThreadsCallCount);
+        Assert.Equal("same-thread", Assert.Single(details.Threads).Id);
+        Assert.Equal("gpt-5.6-luna", Assert.Single(details.Threads).ModelText);
+    }
+
+    [Fact]
+    public async Task OpenThreadsClearsOnMainAcceptedZeroWithoutFetchingThreads()
+    {
+        var first = CurrentSnapshot(activeThreadCount: 1);
+        var zero = CurrentSnapshot(activeThreadCount: 0, observedAt: 2) with
+        {
+            PublishedPair = PublishedPair(OtherPublishedPair),
+        };
+        var sol = ThreadDetails("gpt-5.6-sol", "same-thread");
+        var firstThreads = ThreadsFetchResult.Success(
+            new ApiThreadsSnapshot([sol], first.PublishedPair));
+        var client = new SequencedSplitClient(
+            [first, zero],
+            [firstThreads, firstThreads]);
+        using var main = new MainWindowViewModel(client);
+        main.Start();
+        await EventuallyAsync(() => main.DetailsSnapshot?.ObservedAt == 1);
+        using var details = new ThreadsWindowViewModel(main, action => action());
+        await EventuallyAsync(() => client.ThreadsCallCount == 2 && details.Threads.Count == 1);
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot?.ObservedAt == 2);
+
+        Assert.Equal(2, client.ThreadsCallCount);
+        Assert.Empty(details.Threads);
+        Assert.Empty(details.TreeConnections);
+        Assert.Empty(details.TreeRootRows);
+    }
+
+    [Fact]
+    public async Task EarlierIndependentThreadsReplyCannotUndoMainAcceptedPair()
+    {
+        var first = CurrentSnapshot(activeThreadCount: 1);
+        var second = CurrentSnapshot(activeThreadCount: 1, observedAt: 2) with
+        {
+            PublishedPair = PublishedPair(OtherPublishedPair),
+        };
+        var sol = ThreadDetails("gpt-5.6-sol", "same-thread");
+        var luna = ThreadDetails("gpt-5.6-luna", "same-thread");
+        var firstThreads = ThreadsFetchResult.Success(
+            new ApiThreadsSnapshot([sol], first.PublishedPair));
+        var delayedReply = new TaskCompletionSource<ThreadsFetchResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var callbackCompleted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new SequencedSplitClient(
+            [first, second],
+            [
+                firstThreads,
+                firstThreads,
+                ThreadsFetchResult.Success(new ApiThreadsSnapshot([luna], second.PublishedPair)),
+            ],
+            delayedReply.Task);
+        using var main = new MainWindowViewModel(client);
+        main.Start();
+        await EventuallyAsync(() => main.DetailsSnapshot?.ObservedAt == 1);
+        using var details = new ThreadsWindowViewModel(main, action =>
+        {
+            action();
+            callbackCompleted.TrySetResult(true);
+        });
+        await EventuallyAsync(() => client.ThreadsCallCount == 2);
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot?.ObservedAt == 2);
+        Assert.Equal("gpt-5.6-luna", Assert.Single(details.Threads).ModelText);
+
+        delayedReply.SetResult(firstThreads);
+        await callbackCompleted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(3, client.ThreadsCallCount);
+        Assert.Equal("gpt-5.6-luna", Assert.Single(details.Threads).ModelText);
+    }
+
+    [Fact]
+    public async Task AcceptedZeroCurrentKeepsLiveThreadSummaryWithoutFetchingThreads()
+    {
+        using var viewModel = new MainWindowViewModel(
+            new SingleCurrentClient(CurrentSnapshot(activeThreadCount: 0)));
+
+        Assert.False(viewModel.HasLiveThreadSummary);
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.HasLiveThreadSummary);
+
+        Assert.Equal(0UL, viewModel.ActiveThreadCount);
+        Assert.False(viewModel.HasActiveThreads);
+        Assert.True(viewModel.HasNoActiveThreads);
+        Assert.Equal(0, viewModel.ActiveSolCount);
+        Assert.Equal(0, viewModel.ActiveTerraCount);
+        Assert.Equal(0, viewModel.ActiveLunaCount);
+        Assert.Equal(0, viewModel.ActiveAstraCount);
+        Assert.Equal(0, viewModel.ActiveOtherCount);
+        Assert.StartsWith("0", viewModel.ActiveThreadCountLabel, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Issue362StoppedOpenSessionCountsInSameMainCycle()
+    {
+        var current = CurrentSnapshot(activeThreadCount: 0) with
+        {
+            OpenSessionThreadCount = 1,
+        };
+        var stopped = ThreadDetails("gpt-5.6-sol") with
+        {
+            ActivityStatus = ApiThreadActivityStatus.Stopped,
+        };
+        var client = new SplitCurrentThreadsClient(
+            current,
+            ThreadsFetchResult.Success(new ApiThreadsSnapshot([stopped], current.PublishedPair)));
+        using var main = new MainWindowViewModel(client);
+
+        main.Start();
+        await EventuallyAsync(() => main.DetailsSnapshot?.Threads.Count == 1);
+
+        Assert.Equal(1, client.ThreadsCallCount);
+        Assert.Equal(1UL, main.ActiveThreadCount);
+        Assert.Equal(1, main.ActiveSolCount);
+        Assert.Equal(1, main.ActiveSolCount + main.ActiveTerraCount + main.ActiveLunaCount +
+            main.ActiveAstraCount + main.ActiveOtherCount);
+        Assert.Equal(ApiThreadActivityStatus.Stopped, Assert.Single(main.DetailsSnapshot!.Threads).ActivityStatus);
+    }
+
+    [Fact]
     public async Task AccountSelectionDefaultsToCurrentAndClearsThePreviousGeneration()
     {
         var client = new AccountScopedClient();
@@ -2045,7 +2198,8 @@ public sealed class MainWindowViewModelTests
 
     private sealed class SequencedSplitClient(
         ApiCurrentSnapshot[] current,
-        ThreadsFetchResult[] threads) : HealthyDetailsClientBase, ILoopbackResourceClient
+        ThreadsFetchResult[] threads,
+        Task<ThreadsFetchResult>? secondThreadsReply = null) : HealthyDetailsClientBase, ILoopbackResourceClient
     {
         private int currentIndex;
         private int threadsIndex;
@@ -2076,7 +2230,9 @@ public sealed class MainWindowViewModelTests
         public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default)
         {
             var index = Math.Min(Interlocked.Increment(ref threadsIndex) - 1, threads.Length - 1);
-            return Task.FromResult(threads[index]);
+            return index == 1 && secondThreadsReply is not null
+                ? secondThreadsReply
+                : Task.FromResult(threads[index]);
         }
     }
 

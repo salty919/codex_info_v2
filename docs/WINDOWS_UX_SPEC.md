@@ -190,7 +190,8 @@ page/step/detail/chapter/collapseで全主要情報、primary action、Back、Cl
 - 最上位の移動先はメニューまたは一貫したナビゲーション領域から開く。
 - メニュー項目はアイコンだけでなく文字名、ショートカット、アクセシブル名を持つ。
 - Main上部は`Monitor / Account / Trends / Legal / Settings`の順で両platformを一致させる。
-  Threadsは上部に置かず、実行中threadが1件以上あるMain概要の`Details`からだけ開く。
+  Threadsは上部に置かず、受理済みの現在accountのMain概要にある`Details`から開く。
+  実行中threadが0件でも同じ導線を表示する。
 - 現在位置、戻る、閉じる、処理中、無効、エラーを同じ視覚規則で表す。
 - ネイティブタイトルバーを置き換える場合は、全Windowの移動・最小化・閉じると、Graphだけの
   最大化/復元・リサイズを明示し、OSの作法を欠落させない。画面中央の見出しをタイトルバーの
@@ -213,7 +214,7 @@ X版から必ず継承するのは、値の正本、期間境界、欠測/重複
  ├─ 設定済み/未接続 ─ Main（disconnected） → Settings recovery / Setup
  ├─ 設定済み/接続済み ─ Main（saved selectorで次回自動再接続）
  │    ├─ Trends（Graph）
- │    ├─ 実行中threadがある時だけDetails（Threads）
+ │    ├─ 現在accountの実行中thread概要 → Details（0件を含むThreads）
  │    ├─ Legal
  │    ├─ Settings
  │    └─ Help / Connection guide
@@ -239,6 +240,7 @@ Mainはstrict validation済み`/v3/current`、Graphは`/v3/history/periods`と�
 exact 404でlegacy details modeへ入った接続は、一つの受理済みdetails rootをMain、Graph、Threadsへ同時投影し、split routeを追加要求しない。再接続時に`/v3/current`から能力判定をやり直す。
 Mainは10秒、Graph差分はopen中60秒、Threadsはopen中5秒で確認し、Graph/Threadsを閉じている間は対応requestを送らない。SQLite、別pair、認証control応答でfieldを補完せず、quota/history/threadの再収集、
 値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は該当surfaceだけが同じlast-good rootを保持し、他surfaceやrecorderを変更しない。
+Mainが新しいcurrent/threads bundleを受理した周期には、開いたThreads詳細も同じthread行と0件状態へ直ちに追従する。独立5秒取得を追加せず、Main受理前に始めた独立応答で追従結果を戻さない。
 
 ### 3.3 詳細・設定・法的情報
 
@@ -299,9 +301,10 @@ component順や表示所有者を変更しない。
   約`318px`、observed labelの文字左端が約`445px`、observed時刻の文字右端が約`865px`となる。
   Mainの時刻表記は`PROC-I18N-01`に従い、quota値、期間境界、
   reset/observed epochをUIで再計算しない。
-- AccountActivityはWindowsのtotal＋model別件数構成を使う。0件ではempty表示だけを出して
-  `Details`を表示せず、1件以上でだけ`68×30px`の`Details`を表示する。historical accountでは
-  live件数を表示しないが、`56px`の固定card自体は保持する。
+- AccountActivityはWindowsのtotal＋model別件数構成を使い、件数は`THREAD-OPEN-362`の現在openのSession thread集合とする。受理済みの現在accountの
+  `open_session_thread_count=0`でも同じ`56px` cardに`0件`、5 modelの`0`、`68×30px`の
+  `Details`を表示し、Detailsから空のThreads画面へ進める。未受理のcurrentやhistorical
+  accountを0件とみなさず、historical accountではlive件数を表示しないが固定cardは保持する。
 - ModelUsageはLinuxの単一table構成を使い、各modelのInput/Cached input/Outputについてtokenと
   隣接する概算ドルを同じrowに置く。4 model×22pxをcard内に表示し、0件でも`120px`の固定cardと見出しを保持してemptyを明示する。
   値の意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
@@ -414,8 +417,8 @@ component順や表示所有者を変更しない。
 ### 4.3 Threads
 
 - Linux/Windows共通のWindows masterは900×480 logical client、viewport 384px、96pxの固定行4件とする。
-  縦方向は上詰めで、画面中央への自動配置を行わない。5件目以降だけ同じ一覧内で縦scrollを許可し、
-  画面全体はscrollしない。
+  見出しの直下で一覧を`y=56px`から上詰めにし、件数行と詳細データ鮮度行は表示しない。
+  画面中央への自動配置を行わない。5件目以降だけ同じ一覧内で縦scrollを許可し、画面全体はscrollしない。
 - 各cardは左80px、右16px、上下6px、height84pxとし、情報laneは`*,180,208`、lane間隔は12pxとする。
   title、model/context、経過時間・指示年齢・tokenを各laneの上端から配置し、1行タイトルと2行タイトルで
   laneを縦方向にcenterしない。
@@ -427,6 +430,7 @@ component順や表示所有者を変更しない。
   有効な親を持たない全root row（独立nodeを含む）は`(10,y)`から`(80,y)`のroot segment、x=10のjunction、
   x=80のarrowを持つ。親子railは最後の直接childまで延長し、各childにもsegment、diamond、arrowを描く。
   parentDepthをrail計算前に3へcapするため、depth3 parentからdepth4 childへのrailはx=58となり、兄弟がある場合も最後のchildまで継続する。
+- 0件ではtreeのsegment、rail、junction、arrowを描かず、同一windowで親子行を表示した後に0件へ戻っても線を残さない。
 - 子を持つrowだけを`row.has-children`で親と判定し、親cardのbackgroundは`#243E5A`、独立nodeとleafのbackgroundは
   `#151F2D`、全cardのborderは`#2B425B`とする。入れ子の親も対象にし、独立nodeとleafは親色にしない。
 - model accentはASTRA=`#E86E9F`、LUNA=`#F1B35A`、TERRA=`#71D39A`、SOL=`#B79BFF`、その他=`#A8B7CA`とし、
@@ -434,11 +438,12 @@ component順や表示所有者を変更しない。
 - 子threadの表示名は`THREAD-TITLE-362`に従い、`thread/read`で取得する上流保存名をそのまま使う。生成元がtask_nameを
   外部の`thread/name/set`で保存している場合はその値を表示し、保存名が空なら`未設定`とする。
   「アクティブなスレッド」などの汎用名やpreview値へfallbackしない。
+- 一覧は`THREAD-OPEN-362`の現在openのSession threadを含み、各行の明示状態を「動作中」「停止中」「未観測」で表示する。未観測を推測で置換しない。
 - contextは同じthreadの観測済みusage/window pairだけを表示し、usage=0は有効な0%として表示する。
   pairがない、windowが0以下、または旧checkpointのNULLは`未観測`とし、累積値や別sourceから推測・合成しない。
   割合は整数比をround-half-upで小数点以下最大2桁へ丸め、末尾0を除去し、100%を上限とする。次の観測で得たpairは
   checkpointへ保存し、後続append/restartで未観測へ戻さない。
-- stale、停止済みchild、orphan、cycle、部分snapshotは誤って実行中として表示しない。
+- stale Session、orphan、cycle、部分snapshotは誤って現在openとして表示しない。現在openの停止済みchildは停止中として表示する。
 - 一覧件数が増えても本文fontを縮小せず、Window拡大や空疎なcardで情報密度を下げない。contextを埋めるための
   full old-history reread、追加poll、backfillを行わない。
 

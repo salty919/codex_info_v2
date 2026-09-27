@@ -119,6 +119,9 @@ public sealed class LoopbackStatusClient :
         "history_gaps",
         "threads");
 
+    private static readonly HashSet<string> DetailsV3TopLevelPropertiesWithOpenCount =
+        new(DetailsV3TopLevelProperties, StringComparer.Ordinal) { "open_session_thread_count" };
+
     private static readonly HashSet<string> CurrentTopLevelProperties = CreatePropertySet(
         "api_version",
         "state",
@@ -128,6 +131,9 @@ public sealed class LoopbackStatusClient :
         "quota",
         "models",
         "active_thread_count");
+
+    private static readonly HashSet<string> CurrentTopLevelPropertiesWithOpenCount =
+        new(CurrentTopLevelProperties, StringComparer.Ordinal) { "open_session_thread_count" };
 
     private static readonly HashSet<string> HistoryPeriodsTopLevelProperties = CreatePropertySet(
         "api_version",
@@ -273,6 +279,9 @@ public sealed class LoopbackStatusClient :
         "last_user_message_at",
         "is_subagent",
         "depth");
+
+    private static readonly HashSet<string> ThreadPropertiesWithActivityStatus =
+        new(ThreadProperties, StringComparer.Ordinal) { "activity_status" };
 
     private readonly HttpClient _httpClient;
     private readonly object _v3CacheGate = new();
@@ -1875,7 +1884,8 @@ public sealed class LoopbackStatusClient :
                     MaxDepth = 24,
                 });
             var root = document.RootElement;
-            if (!HasExactlyProperties(root, CurrentTopLevelProperties, 8) ||
+            var hasOpenCount = HasExactlyProperties(root, CurrentTopLevelPropertiesWithOpenCount, 9);
+            if ((!hasOpenCount && !HasExactlyProperties(root, CurrentTopLevelProperties, 8)) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
                 apiVersion != "v3" ||
                 !TryGetState(root, out var state) ||
@@ -1886,6 +1896,14 @@ public sealed class LoopbackStatusClient :
                 !HasValidDetailsRootDomain(state, authenticated, planLabel, quota) ||
                 !TryGetDetailsModelsV3(root, out var models) ||
                 !TryGetUInt64(root, "active_thread_count", out var activeThreadCount))
+            {
+                return null;
+            }
+
+            var openCount = activeThreadCount;
+            if (hasOpenCount &&
+                (!TryGetUInt64(root, "open_session_thread_count", out openCount) ||
+                 openCount < activeThreadCount))
             {
                 return null;
             }
@@ -1901,6 +1919,7 @@ public sealed class LoopbackStatusClient :
                 publishedPair)
             {
                 ApiVersion = apiVersion,
+                OpenSessionThreadCount = openCount,
             };
         }
         catch (Exception)
@@ -2008,7 +2027,7 @@ public sealed class LoopbackStatusClient :
             if (!HasExactlyProperties(root, ThreadsTopLevelProperties, 2) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
                 apiVersion != "v3" ||
-                !TryGetThreads(root, out var threads))
+                !TryGetThreads(root, out var threads, allowActivityStatus: true))
             {
                 return null;
             }
@@ -2044,7 +2063,8 @@ public sealed class LoopbackStatusClient :
                 });
 
             var root = document.RootElement;
-            if (!HasExactlyProperties(root, DetailsV3TopLevelProperties, 12) ||
+            var hasOpenCount = HasExactlyProperties(root, DetailsV3TopLevelPropertiesWithOpenCount, 13);
+            if ((!hasOpenCount && !HasExactlyProperties(root, DetailsV3TopLevelProperties, 12)) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
                 apiVersion != "v3" ||
                 !TryGetState(root, out var state) ||
@@ -2058,7 +2078,17 @@ public sealed class LoopbackStatusClient :
                 !TryGetHistoryPeriods(root, observedAt, out var historyPeriods) ||
                 !TryGetHistorySamplesV3(root, historyPeriods, out var historySamples) ||
                 !TryGetHistoryGaps(root, historyPeriods, out var historyGaps) ||
-                !TryGetThreads(root, out var threads))
+                !TryGetThreads(root, out var threads, allowActivityStatus: true))
+            {
+                return false;
+            }
+
+            var openCount = activeThreadCount;
+            if (hasOpenCount &&
+                (!TryGetUInt64(root, "open_session_thread_count", out openCount) ||
+                 openCount != (ulong)threads.Count ||
+                 activeThreadCount != (ulong)threads.Count(thread =>
+                     thread.ActivityStatus == ApiThreadActivityStatus.Running)))
             {
                 return false;
             }
@@ -2085,6 +2115,7 @@ public sealed class LoopbackStatusClient :
                 "概算 —")
             {
                 ApiVersion = apiVersion,
+                OpenSessionThreadCount = openCount,
                 HistoryGaps = new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryGap>(historyGaps),
             };
             return true;
@@ -2765,7 +2796,8 @@ public sealed class LoopbackStatusClient :
 
     private static bool TryGetThreads(
         JsonElement parent,
-        out List<ApiThreadDetails> threads)
+        out List<ApiThreadDetails> threads,
+        bool allowActivityStatus = false)
     {
         threads = new List<ApiThreadDetails>();
         if (!parent.TryGetProperty("threads", out var property) ||
@@ -2776,10 +2808,12 @@ public sealed class LoopbackStatusClient :
         }
 
         var ids = new HashSet<string>(StringComparer.Ordinal);
-        var pending = new List<(string Id, string Title, string? ParentId, string Model, string ModelLabel, ulong? TotalTokens, ulong? ContextTokens, ulong? ContextLimit, long? CreatedAt, long? LastUserMessageAt, bool IsSubAgent, int? Depth)>();
+        var pending = new List<(string Id, string Title, string? ParentId, string Model, string ModelLabel, ulong? TotalTokens, ulong? ContextTokens, ulong? ContextLimit, long? CreatedAt, long? LastUserMessageAt, bool IsSubAgent, int? Depth, ApiThreadActivityStatus ActivityStatus)>();
         foreach (var thread in property.EnumerateArray())
         {
-            if (!HasExactlyProperties(thread, ThreadProperties, 12) ||
+            var hasActivityStatus = allowActivityStatus &&
+                HasExactlyProperties(thread, ThreadPropertiesWithActivityStatus, 13);
+            if ((!hasActivityStatus && !HasExactlyProperties(thread, ThreadProperties, 12)) ||
                 !TryGetBoundedString(thread, "id", 1, 512, out var id) ||
                 !ids.Add(id) ||
                 !TryGetBoundedString(thread, "title", 1, 512, out var title) ||
@@ -2797,7 +2831,15 @@ public sealed class LoopbackStatusClient :
                 return false;
             }
 
-            pending.Add((id, title, parentId, model, modelLabel, totalTokens, contextTokens, contextLimit, createdAt, lastUserMessageAt, isSubAgent, depth));
+            var activityStatus = ApiThreadActivityStatus.Running;
+            if (hasActivityStatus &&
+                (!TryGetString(thread, "activity_status", out var statusText) ||
+                 !TryParseThreadActivityStatus(statusText, out activityStatus)))
+            {
+                return false;
+            }
+
+            pending.Add((id, title, parentId, model, modelLabel, totalTokens, contextTokens, contextLimit, createdAt, lastUserMessageAt, isSubAgent, depth, activityStatus));
         }
 
         foreach (var item in pending)
@@ -2805,7 +2847,10 @@ public sealed class LoopbackStatusClient :
             var isOrphan = item.ParentId is { } parentId && !ids.Contains(parentId);
             threads.Add(new ApiThreadDetails(item.Id, item.Title, item.ParentId, item.Model, item.ModelLabel,
                 item.TotalTokens, item.ContextTokens, item.ContextLimit, item.CreatedAt,
-                item.LastUserMessageAt, item.IsSubAgent, item.Depth, isOrphan));
+                item.LastUserMessageAt, item.IsSubAgent, item.Depth, isOrphan)
+            {
+                ActivityStatus = item.ActivityStatus,
+            });
         }
 
         // A cycle has no valid parent-first projection and must reject the
@@ -2829,6 +2874,20 @@ public sealed class LoopbackStatusClient :
         }
 
         return true;
+    }
+
+    private static bool TryParseThreadActivityStatus(
+        string value,
+        out ApiThreadActivityStatus status)
+    {
+        status = value switch
+        {
+            "running" => ApiThreadActivityStatus.Running,
+            "stopped" => ApiThreadActivityStatus.Stopped,
+            "unknown" => ApiThreadActivityStatus.Unknown,
+            _ => ApiThreadActivityStatus.Unknown,
+        };
+        return value is "running" or "stopped" or "unknown";
     }
 
     private static bool HasExactlyProperties(

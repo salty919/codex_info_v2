@@ -136,11 +136,23 @@ pub struct PublicHistoryGap {
     pub reason: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicThreadActivityStatus {
+    Running,
+    Stopped,
+    #[default]
+    Unknown,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicThread {
     pub id: String,
     pub title: String,
+    /// Present only on the v3 wire. Legacy v1/v2 active rows omit this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_status: Option<PublicThreadActivityStatus>,
     pub parent_thread_id: Option<String>,
     pub model: String,
     pub model_label: String,
@@ -731,6 +743,7 @@ pub struct PublicDetailsV3 {
     pub quota: Option<PublicQuota>,
     pub models: Vec<PublicModelUsageV3>,
     pub active_thread_count: u64,
+    pub open_session_thread_count: u64,
     pub history_periods: Vec<PublicHistoryPeriod>,
     pub history_samples: Vec<PublicHistoryObservationV3>,
     pub history_gaps: Vec<PublicHistoryGap>,
@@ -806,10 +819,21 @@ impl PublicDetailsV3 {
             quota: details.quota.clone(),
             models: models.to_vec(),
             active_thread_count: details.active_thread_count,
+            open_session_thread_count: details.threads.len() as u64,
             history_periods: details.history_periods.clone(),
             history_samples,
             history_gaps: details.history_gaps.clone(),
-            threads: details.threads.clone(),
+            threads: details
+                .threads
+                .iter()
+                .cloned()
+                .map(|mut thread| {
+                    thread
+                        .activity_status
+                        .get_or_insert(PublicThreadActivityStatus::Running);
+                    thread
+                })
+                .collect(),
         }
     }
 

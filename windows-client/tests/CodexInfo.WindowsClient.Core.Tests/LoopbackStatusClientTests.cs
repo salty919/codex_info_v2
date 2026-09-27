@@ -295,6 +295,38 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task Issue362CurrentAndThreadsPreserveStoppedOpenSession()
+    {
+        var currentJson = ValidCurrentJson().Replace(
+            "\"active_thread_count\":1}",
+            "\"active_thread_count\":0,\"open_session_thread_count\":1}",
+            StringComparison.Ordinal);
+        var threadsJson = "{\"api_version\":\"v3\",\"threads\":[" +
+            "{\"id\":\"thread-1\",\"title\":\"Task\",\"parent_thread_id\":null," +
+            "\"model\":\"SOL\",\"model_label\":\"SOL\",\"total_tokens\":20," +
+            "\"context_usage_tokens\":null,\"context_window_tokens\":null," +
+            "\"created_at\":1,\"last_user_message_at\":1,\"is_subagent\":false," +
+            "\"depth\":0,\"activity_status\":\"stopped\"}]}";
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri!.AbsolutePath switch
+            {
+                "/v3/current" => JsonResponse(currentJson, includePublishedPair: true),
+                "/v3/threads" => JsonResponse(threadsJson, includePublishedPair: true),
+                _ => throw new InvalidOperationException("unexpected route"),
+            }));
+
+        var current = await client.FetchCurrentAsync(CancellationToken.None);
+        var threads = await client.FetchThreadsAsync(CancellationToken.None);
+
+        Assert.True(current.IsSuccess);
+        Assert.True(threads.IsSuccess);
+        Assert.Equal(0UL, current.Snapshot!.ActiveThreadCount);
+        Assert.Equal(1UL, current.Snapshot.OpenSessionThreadCount);
+        Assert.Equal("thread-1", Assert.Single(threads.Snapshot!.Threads).Id);
+        Assert.Equal(ApiThreadActivityStatus.Stopped, threads.Snapshot.Threads[0].ActivityStatus);
+    }
+
+    [Fact]
     public async Task AccountsReadsTheDirectoryWithUnknownLabelsWithoutLifecycleText()
     {
         using var client = new LoopbackStatusClient(new StubHandler(request =>

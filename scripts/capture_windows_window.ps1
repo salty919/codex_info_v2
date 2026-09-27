@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$OutputPath,
+    [string]$ThreadsOutputPath = '',
     [string]$Preview = 'setup',
     [string]$PreviewSize = '760x680',
     [string]$ClientPath = '',
@@ -55,6 +56,9 @@ if ($ConfiguredService) {
     }
     $expectedTitle = 'Codex Info Monitor'
 } else {
+    if (-not [string]::IsNullOrWhiteSpace($ThreadsOutputPath)) {
+        throw 'ThreadsOutputPath requires ConfiguredService'
+    }
     $env:CODEX_INFO_WINDOWS_PREVIEW = $Preview
     $env:CODEX_INFO_WINDOWS_PREVIEW_SIZE = $PreviewSize
     $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS = $GraphPoints
@@ -176,6 +180,55 @@ try {
     $bitmap.Dispose()
     $captureMode = if ($ConfiguredService) { 'configured-service' } else { "preview:$Preview" }
     Write-Output "capture: PASS mode=$captureMode pid=$($process.Id) hwnd=$window size=${width}x${height} path=$OutputPath"
+    if (-not [string]::IsNullOrWhiteSpace($ThreadsOutputPath)) {
+        $automationRoot = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $openCondition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+            'Main.OpenThreadDetails')
+        $openButton = $automationRoot.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $openCondition)
+        if ($null -eq $openButton -or $openButton.Current.IsOffscreen) {
+            throw 'Accepted Main has no visible Threads detail action'
+        }
+        $invoke = $null
+        if (-not $openButton.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
+            throw 'Threads detail action has no InvokePattern'
+        }
+        $invoke.Invoke()
+        $script:codexInfoCaptureTitle = 'Codex Info Threads'
+        $threadsWindow = [IntPtr]::Zero
+        for ($attempt = 0; $attempt -lt 30 -and $threadsWindow -eq [IntPtr]::Zero; $attempt++) {
+            Start-Sleep -Milliseconds 500
+            $script:codexInfoCaptureWindow = [IntPtr]::Zero
+            [CodexInfoCaptureWin32]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+            $threadsWindow = $script:codexInfoCaptureWindow
+        }
+        if ($threadsWindow -eq [IntPtr]::Zero) { throw 'Fresh Threads window did not open from accepted Main' }
+        [CodexInfoCaptureWin32]::ShowWindow($threadsWindow, 9) | Out-Null
+        [CodexInfoCaptureWin32]::SetWindowPos($threadsWindow, [IntPtr](-1), 80, 80, 0, 0, 0x0001) | Out-Null
+        [CodexInfoCaptureWin32]::BringWindowToTop($threadsWindow) | Out-Null
+        [CodexInfoCaptureWin32]::SetForegroundWindow($threadsWindow) | Out-Null
+        Start-Sleep -Milliseconds 500
+        $threadRect = New-Object CodexInfoCaptureWin32+RECT
+        [CodexInfoCaptureWin32]::GetWindowRect($threadsWindow, [ref]$threadRect) | Out-Null
+        $threadWidth = $threadRect.Right - $threadRect.Left
+        $threadHeight = $threadRect.Bottom - $threadRect.Top
+        if ($threadWidth -le 0 -or $threadHeight -le 0) {
+            throw "Invalid Threads window bounds: ${threadWidth}x${threadHeight}"
+        }
+        $threadBitmap = New-Object System.Drawing.Bitmap($threadWidth, $threadHeight)
+        $threadGraphics = [System.Drawing.Graphics]::FromImage($threadBitmap)
+        try {
+            $threadGraphics.CopyFromScreen($threadRect.Left, $threadRect.Top, 0, 0, $threadBitmap.Size)
+            $threadBitmap.Save($ThreadsOutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        }
+        finally {
+            $threadGraphics.Dispose()
+            $threadBitmap.Dispose()
+        }
+        Write-Output "capture: PASS mode=configured-service:threads pid=$($process.Id) hwnd=$threadsWindow size=${threadWidth}x${threadHeight} path=$ThreadsOutputPath"
+    }
 }
 finally {
     if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
