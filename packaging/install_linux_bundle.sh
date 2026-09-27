@@ -43,6 +43,7 @@ legacy_combined_enabled=0
 legacy_combined_active=0
 legacy_combined_generation=0
 recorder_reused=0
+transaction_recovered=0
 operation_deadline=0
 readiness_deadline=0
 requested_deadline="${CODEX_INFO_DEADLINE:-}"
@@ -1009,6 +1010,472 @@ for name, digest in records.items():
     if hashlib.sha256(member.read_bytes()).hexdigest() != digest:
         raise SystemExit("generation checksum digest differs")
 PY
+}
+generation_prune_failed() {
+    printf 'GENERATION_PRUNE_FAILED: %s\n' "$*" >&2
+}
+prune_obsolete_generations() {
+    local legacy_rollback_id=
+    read_journal
+    if [[ -n "$journal_previous_id" ]] &&
+        ! verify_generation_files "$generations_dir/$journal_previous_id" >/dev/null 2>&1; then
+        [[ -d "$generations_dir/$journal_previous_id" && ! -L "$generations_dir/$journal_previous_id" &&
+           "$(stat -c '%u' -- "$generations_dir/$journal_previous_id" 2>/dev/null || true)" == "$(id -u)" &&
+           "$(stat -c '%a' -- "$generations_dir/$journal_previous_id" 2>/dev/null || true)" == 700 ]] ||
+            { generation_prune_failed 'rollback generation is not a trusted legacy directory'; return 1; }
+        python3 - "$generations_dir/$journal_previous_id/manifest.json" <<'PY_LEGACY_SCHEMA' ||
+import json, pathlib, sys
+try:
+    document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    entries = document["files"]
+    expected = {"codex_info", "install.sh", "codex-info.service",
+                "codex-info-update.service", "codex-info-update.timer"}
+    if not isinstance(entries, list) or {entry["path"] for entry in entries} != expected:
+        raise ValueError
+    if any(set(entry) != {"path", "size", "sha256"} for entry in entries):
+        raise ValueError
+except Exception:
+    raise SystemExit(1)
+PY_LEGACY_SCHEMA
+            { generation_prune_failed 'rollback generation is not the exact legacy combined format'; return 1; }
+        [[ ! -e "$generations_dir/$journal_previous_id/SHA256SUMS" &&
+           ! -L "$generations_dir/$journal_previous_id/SHA256SUMS" ]] ||
+            { generation_prune_failed 'legacy rollback unexpectedly has a modern checksum list'; return 1; }
+        legacy_combined_record_at "$generations_dir/$journal_previous_id/manifest.json" \
+            "$generations_dir/$journal_previous_id/codex_info" "$generations_dir/$journal_previous_id/install.sh" \
+            "$generations_dir/$journal_previous_id/codex-info.service" \
+            "$generations_dir/$journal_previous_id/codex-info-update.service" \
+            "$generations_dir/$journal_previous_id/codex-info-update.timer" >/dev/null ||
+            { generation_prune_failed 'legacy rollback generation failed its installed contract'; return 1; }
+        legacy_rollback_id="$journal_previous_id"
+    fi
+    if python3 - "$generations_dir" "$current_link" "$transaction" "$unit_dir" "$proc_root" \
+        "$legacy_rollback_id" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+generations_path, current_path, journal_path, unit_dir, proc_root, legacy_rollback_name, schema, product, target, compatibility = sys.argv[1:]
+uid = os.getuid()
+generation_pattern = re.compile(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64}")
+journal_generation_pattern = re.compile(r"(?:|(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64})")
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+class Unsafe(Exception):
+    pass
+
+def require(condition, message):
+    if not condition:
+        raise Unsafe(message)
+
+def pairs(items):
+    result = {}
+    for key, value in items:
+        require(key not in result, "duplicate JSON key")
+        result[key] = value
+    return result
+
+def identity(st):
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+def directory_identity(st):
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid)
+
+def read_regular(parent_fd, name, expected_mode):
+    fd = os.open(name, file_flags, dir_fd=parent_fd)
+    try:
+        st = os.fstat(fd)
+        require(stat.S_ISREG(st.st_mode) and st.st_uid == uid and stat.S_IMODE(st.st_mode) == expected_mode,
+                "generation member owner or mode differs")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks), identity(st)
+    finally:
+        os.close(fd)
+
+def open_member(root_fd, path):
+    pieces = path.split("/")
+    parent = os.dup(root_fd)
+    try:
+        for part in pieces[:-1]:
+            child = os.open(part, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        fd = os.open(pieces[-1], file_flags, dir_fd=parent)
+        return parent, fd
+    except BaseException:
+        os.close(parent)
+        raise
+
+def validate_generation(name, root_fd):
+    require(generation_pattern.fullmatch(name) is not None, "generation directory name is malformed")
+    generation_fd = os.open(name, directory_flags, dir_fd=root_fd)
+    try:
+        root_st = os.fstat(generation_fd)
+        require(root_st.st_uid == uid and stat.S_IMODE(root_st.st_mode) == 0o700,
+                "generation directory owner or mode differs")
+        manifest_bytes, manifest_identity = read_regular(generation_fd, "manifest.json", 0o644)
+        try:
+            document = json.loads(manifest_bytes.decode("utf-8"), object_pairs_hook=pairs)
+        except Exception as error:
+            raise Unsafe("generation manifest is invalid") from error
+        required = {"schema", "product", "version", "source_sha", "run_id", "run_attempt",
+                    "target", "compatibility", "glibc_minimum", "files"}
+        require(isinstance(document, dict) and set(document) == required, "generation manifest keys differ")
+        require(document["schema"] == schema and document["product"] == product and
+                document["target"] == target and document["compatibility"] == compatibility,
+                "generation manifest authority differs")
+        require(isinstance(document["version"], str) and
+                re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)", document["version"]) is not None and
+                isinstance(document["source_sha"], str) and re.fullmatch(r"[0-9a-f]{40}", document["source_sha"]) is not None,
+                "generation version identity differs")
+        require(isinstance(document["run_id"], str) and re.fullmatch(r"[1-9][0-9]*", document["run_id"]) is not None and
+                type(document["run_attempt"]) is int and document["run_attempt"] > 0,
+                "generation workflow identity differs")
+        require(isinstance(document["glibc_minimum"], str) and
+                re.fullmatch(r"[0-9]+(?:[.][0-9]+)+", document["glibc_minimum"]) is not None,
+                "generation platform identity differs")
+        require(name == document["version"] + "-" + document["source_sha"] + "-" + hashlib.sha256(manifest_bytes).hexdigest(),
+                "generation directory identity differs")
+        entries = document["files"]
+        require(isinstance(entries, list), "generation file list is invalid")
+        expected = {}
+        for entry in entries:
+            require(isinstance(entry, dict) and set(entry) == {"path", "size", "sha256", "mode"},
+                    "generation file entry keys differ")
+            path = entry["path"]
+            require(isinstance(path, str) and path and not path.startswith("/") and "\\" not in path and
+                    all(part not in {"", ".", ".."} for part in path.split("/")),
+                    "generation member path is unsafe")
+            require(path not in expected and path not in {"manifest.json", "SHA256SUMS"},
+                    "generation member path is duplicated")
+            require(type(entry["size"]) is int and entry["size"] >= 0 and
+                    isinstance(entry["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is not None and
+                    type(entry["mode"]) is int and entry["mode"] in {0o644, 0o755},
+                    "generation member identity is malformed")
+            expected[path] = entry
+        require(list(expected) == sorted(expected), "generation members are not sorted")
+        expected_dirs = set()
+        for path in expected:
+            pieces = path.split("/")
+            for index in range(1, len(pieces)):
+                expected_dirs.add("/".join(pieces[:index]))
+        expected_files = set(expected) | {"manifest.json", "SHA256SUMS"}
+        seen_files = set()
+        seen_dirs = {"": directory_identity(root_st)}
+        file_identities = {"manifest.json": manifest_identity}
+
+        def walk(directory_fd, prefix):
+            for child_name in os.listdir(directory_fd):
+                child_path = prefix + child_name if not prefix else prefix + "/" + child_name
+                child_st = os.stat(child_name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISDIR(child_st.st_mode):
+                    require(child_path in expected_dirs and child_st.st_uid == uid and
+                            stat.S_IMODE(child_st.st_mode) == 0o700,
+                            "generation contains an unexpected directory")
+                    child_fd = os.open(child_name, directory_flags, dir_fd=directory_fd)
+                    try:
+                        opened_st = os.fstat(child_fd)
+                        require(directory_identity(opened_st) == directory_identity(child_st),
+                                "generation directory changed during verification")
+                        seen_dirs[child_path] = directory_identity(opened_st)
+                        walk(child_fd, child_path)
+                    finally:
+                        os.close(child_fd)
+                else:
+                    require(stat.S_ISREG(child_st.st_mode) and child_path in expected_files,
+                            "generation contains an unsafe or unexpected member")
+                    seen_files.add(child_path)
+                    expected_mode = expected[child_path]["mode"] if child_path in expected else 0o644
+                    data, member_identity = read_regular(directory_fd, child_name, expected_mode)
+                    require(identity(os.stat(child_name, dir_fd=directory_fd, follow_symlinks=False)) == member_identity,
+                            "generation member changed during verification")
+                    file_identities[child_path] = member_identity
+                    if child_path in expected:
+                        entry = expected[child_path]
+                        require(len(data) == entry["size"] and hashlib.sha256(data).hexdigest() == entry["sha256"],
+                                "generation payload digest differs")
+        walk(generation_fd, "")
+        require(seen_files == expected_files and seen_dirs.keys() == expected_dirs | {""},
+                "generation member set differs")
+        sums_bytes, sums_identity = read_regular(generation_fd, "SHA256SUMS", 0o644)
+        require(file_identities["SHA256SUMS"] == sums_identity,
+                "generation checksum list changed during verification")
+        file_identities["SHA256SUMS"] = sums_identity
+        records = {}
+        try:
+            lines = sums_bytes.decode("utf-8").splitlines()
+        except UnicodeDecodeError as error:
+            raise Unsafe("generation checksum list is invalid") from error
+        for line in lines:
+            fields = line.split()
+            require(len(fields) == 2 and re.fullmatch(r"[0-9a-f]{64}", fields[0]) is not None,
+                    "generation checksum record is malformed")
+            member = fields[1].removeprefix("*")
+            require(member not in records, "generation checksum member is duplicated")
+            records[member] = fields[0]
+        require(set(records) == set(expected) | {"manifest.json"}, "generation checksum coverage differs")
+        require(records["manifest.json"] == hashlib.sha256(manifest_bytes).hexdigest(),
+                "generation manifest checksum differs")
+        for path, entry in expected.items():
+            require(records[path] == entry["sha256"], "generation payload checksum differs")
+        return {"root": directory_identity(root_st), "dirs": seen_dirs, "files": file_identities}
+    finally:
+        os.close(generation_fd)
+
+def read_committed_state(root_fd):
+    current_target = os.readlink(current_path)
+    require(current_target.startswith("generations/") and current_target.count("/") == 1,
+            "current generation link is not canonical")
+    current_name = current_target.split("/", 1)[1]
+    require(generation_pattern.fullmatch(current_name) is not None, "current generation name is invalid")
+    journal_fd = os.open(journal_path, file_flags)
+    try:
+        journal_stat = os.fstat(journal_fd)
+        require(stat.S_ISREG(journal_stat.st_mode) and journal_stat.st_uid == uid and
+                stat.S_IMODE(journal_stat.st_mode) == 0o600, "transaction journal owner or mode differs")
+        chunks = []
+        while True:
+            chunk = os.read(journal_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        journal_bytes = b"".join(chunks)
+    finally:
+        os.close(journal_fd)
+    try:
+        journal = json.loads(journal_bytes.decode("utf-8"), object_pairs_hook=pairs)
+    except Exception as error:
+        raise Unsafe("transaction journal is invalid") from error
+    required = {"schema", "operation_id", "owner_pid", "owner_starttime", "boot_id", "phase",
+                "old_generation", "new_generation", "desired_state", "updated_at_unix"}
+    require(isinstance(journal, dict) and set(journal) == required and
+            journal["schema"] == "codex-info-install-transaction-v1" and journal["phase"] == "committed",
+            "transaction journal is not committed and exact")
+    require(isinstance(journal["operation_id"], str) and journal["operation_id"] and
+            type(journal["owner_pid"]) is int and journal["owner_pid"] > 0 and
+            type(journal["owner_starttime"]) is int and journal["owner_starttime"] > 0 and
+            isinstance(journal["boot_id"], str) and journal["boot_id"] and
+            journal["desired_state"] in {"running", "stopped", "disabled", "removed"} and
+            type(journal["updated_at_unix"]) is int and journal["updated_at_unix"] > 0,
+            "transaction journal fields are invalid")
+    require(isinstance(journal["old_generation"], str) and journal_generation_pattern.fullmatch(journal["old_generation"]) is not None and
+            isinstance(journal["new_generation"], str) and journal_generation_pattern.fullmatch(journal["new_generation"]) is not None,
+            "committed journal generation fields are invalid")
+    install_commit = journal["new_generation"] == current_name
+    rollback_commit = journal["old_generation"] == current_name
+    require(install_commit or rollback_commit, "current and committed journal disagree")
+    require(not legacy_rollback_name or legacy_rollback_name in {journal["old_generation"], current_name},
+            "legacy rollback does not match the committed journal")
+    if current_name == legacy_rollback_name:
+        legacy_fd = os.open(current_name, directory_flags, dir_fd=root_fd)
+        try:
+            legacy_stat = os.fstat(legacy_fd)
+            require(legacy_stat.st_uid == uid and stat.S_IMODE(legacy_stat.st_mode) == 0o700,
+                    "legacy current directory owner or mode differs")
+        finally:
+            os.close(legacy_fd)
+    else:
+        validate_generation(current_name, root_fd)
+    rollback_name = journal["old_generation"] if install_commit and journal["old_generation"] != current_name else ""
+    journal_candidate_name = journal["new_generation"] if rollback_commit and not install_commit else ""
+    if rollback_name and rollback_name != current_name:
+        if rollback_name == legacy_rollback_name:
+            legacy_fd = os.open(legacy_rollback_name, directory_flags, dir_fd=root_fd)
+            try:
+                legacy_stat = os.fstat(legacy_fd)
+                require(legacy_stat.st_uid == uid and stat.S_IMODE(legacy_stat.st_mode) == 0o700,
+                        "legacy rollback directory owner or mode differs")
+            finally:
+                os.close(legacy_fd)
+        else:
+            validate_generation(rollback_name, root_fd)
+    return current_name, rollback_name, journal_candidate_name
+
+def generation_from_path(path, known_names):
+    normalized = os.path.normpath(path)
+    prefix = generations_path.rstrip("/") + "/"
+    if not normalized.startswith(prefix):
+        return None
+    remainder = normalized[len(prefix):]
+    name = remainder.split("/", 1)[0]
+    require(name in known_names, "reference names an unknown generation")
+    return name
+
+def collect_references(known_names):
+    protected = set()
+    managed_units = ("codex-info-recorder.service", "codex-info-rest.service", "codex-info.service",
+                     "codex-info-update.service", "codex-info-update.timer")
+    enable_dirs = ("default.target.wants", "timers.target.wants")
+    reference_paths = [os.path.join(unit_dir, name) for name in managed_units]
+    for directory in enable_dirs:
+        enable_dir = os.path.join(unit_dir, directory)
+        for name in ("codex-info-recorder.service", "codex-info-rest.service", "codex-info.service",
+                     "codex-info-update.timer"):
+            reference_paths.append(os.path.join(enable_dir, name))
+        try:
+            extra_names = os.listdir(enable_dir)
+        except FileNotFoundError:
+            extra_names = []
+        for name in extra_names:
+            if name.startswith("codex-info") and (name.endswith(".service") or name.endswith(".timer")):
+                path = os.path.join(enable_dir, name)
+                if path not in reference_paths:
+                    reference_paths.append(path)
+    for path in reference_paths:
+        if not os.path.lexists(path):
+            continue
+        try:
+            resolved = os.path.realpath(path, strict=True)
+        except OSError as error:
+            raise Unsafe("managed unit or enable reference cannot be resolved") from error
+        generation = generation_from_path(resolved, known_names)
+        require(generation is not None, "managed unit or enable reference is outside a verified generation")
+        protected.add(generation)
+    try:
+        process_names = os.listdir(proc_root)
+    except OSError as error:
+        raise Unsafe("process references cannot be enumerated") from error
+    for pid in process_names:
+        if not pid.isdecimal():
+            continue
+        process_path = os.path.join(proc_root, pid)
+        try:
+            process_stat = os.stat(process_path)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise Unsafe("process owner cannot be inspected") from error
+        if process_stat.st_uid != uid:
+            continue
+        try:
+            executable = os.readlink(os.path.join(process_path, "exe"))
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise Unsafe("owned process executable cannot be inspected") from error
+        if executable.endswith(" (deleted)"):
+            executable = executable[:-10]
+        generation = generation_from_path(executable, known_names)
+        if generation is not None:
+            protected.add(generation)
+    return protected
+
+def safe_open_parent(generation_fd, path, directory_snapshot):
+    pieces = path.split("/")
+    parent_fd = os.dup(generation_fd)
+    prefix = ""
+    try:
+        for part in pieces[:-1]:
+            prefix = part if not prefix else prefix + "/" + part
+            next_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            opened = os.fstat(next_fd)
+            require(directory_identity(opened) == directory_snapshot[prefix],
+                    "generation directory identity changed before unlink")
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return parent_fd, pieces[-1]
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+def delete_generation(name, root_fd, snapshot):
+    generation_fd = os.open(name, directory_flags, dir_fd=root_fd)
+    try:
+        require(directory_identity(os.fstat(generation_fd)) == snapshot["root"],
+                "obsolete generation directory identity changed before unlink")
+        current_snapshot = validate_generation(name, root_fd)
+        require(current_snapshot == snapshot, "obsolete generation identity changed before unlink")
+        for path in sorted(snapshot["files"], key=lambda value: (value in {"manifest.json", "SHA256SUMS"}, value)):
+            parent_fd, leaf = safe_open_parent(generation_fd, path, snapshot["dirs"])
+            try:
+                member_stat = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                require(identity(member_stat) == snapshot["files"][path] and stat.S_ISREG(member_stat.st_mode),
+                        "generation member identity changed before unlink")
+                os.unlink(leaf, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        directories = [path for path in snapshot["dirs"] if path]
+        for path in sorted(directories, key=lambda value: (-value.count("/"), value)):
+            parent_fd, leaf = safe_open_parent(generation_fd, path, snapshot["dirs"])
+            try:
+                directory_stat = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                require(directory_identity(directory_stat) == snapshot["dirs"][path] and stat.S_ISDIR(directory_stat.st_mode),
+                        "generation directory identity changed before rmdir")
+                child_fd = os.open(leaf, directory_flags, dir_fd=parent_fd)
+                try:
+                    require(not os.listdir(child_fd), "generation subdirectory is no longer empty")
+                finally:
+                    os.close(child_fd)
+                os.rmdir(leaf, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        generation_stat = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        require(directory_identity(generation_stat) == snapshot["root"] and stat.S_ISDIR(generation_stat.st_mode),
+                "generation directory identity changed before final rmdir")
+    finally:
+        os.close(generation_fd)
+    os.rmdir(name, dir_fd=root_fd)
+    os.fsync(root_fd)
+    require(not os.path.lexists(os.path.join(generations_path, name)), "removed generation remains present")
+
+def main():
+    root_fd = os.open(generations_path, directory_flags)
+    try:
+        root_stat = os.fstat(root_fd)
+        require(root_stat.st_uid == uid and stat.S_IMODE(root_stat.st_mode) == 0o700,
+                "generations root owner or mode differs")
+        current, rollback, journal_candidate = read_committed_state(root_fd)
+        known_names = set()
+        valid = {}
+        for name in os.listdir(root_fd):
+            entry_stat = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(entry_stat.st_mode) or not generation_pattern.fullmatch(name):
+                continue
+            known_names.add(name)
+        require(current in known_names and (not rollback or rollback in known_names),
+                "committed current or rollback generation is absent")
+        for name in sorted(known_names):
+            if name == legacy_rollback_name or name == journal_candidate:
+                continue
+            try:
+                valid[name] = validate_generation(name, root_fd)
+            except (Unsafe, OSError):
+                if name in {current, rollback}:
+                    raise Unsafe("committed current or rollback generation failed verification")
+        protected_names = {name for name in (current, rollback, journal_candidate, legacy_rollback_name) if name}
+        reference_names = set(valid) | protected_names
+        references = collect_references(reference_names)
+        for name in sorted(valid):
+            latest_current, latest_rollback, latest_candidate = read_committed_state(root_fd)
+            references = collect_references(reference_names)
+            if name in {latest_current, latest_rollback, latest_candidate} or name in references:
+                continue
+            delete_generation(name, root_fd, valid[name])
+    finally:
+        os.close(root_fd)
+
+try:
+    main()
+except Exception as error:
+    print(str(error) or error.__class__.__name__, file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
+        return 0
+    fi
+    generation_prune_failed 'verified obsolete generation cleanup did not complete'
+    return 1
 }
 verify_fixed_links() {
     local destination expected
@@ -2161,6 +2628,7 @@ rollback_transaction() {
 resume_transaction() {
     [[ -f "$transaction" ]] || return 0
     read_journal; [[ "$journal_phase" != committed ]] || return 0
+    transaction_recovered=1
     journal_owner_stale || safe_blocked 'transaction journal owner is still live'
     operation_id="$journal_operation_id"; candidate_id="$journal_candidate_id"; previous_id="$journal_previous_id"; desired_state="$journal_desired"
     candidate_quarantine="$backup_dir/$operation_id-generation-$candidate_id"
@@ -2280,7 +2748,15 @@ perform_install() {
         rollback_transaction "$previous_id" 'control state publication failed'
         die 'control state publication failed; previous generation restored'
     fi
+    if [[ "$desired_state" == stopped || "$desired_state" == disabled ]] &&
+        ! verify_nonrunning_terminal "$desired_state"; then
+        rollback_transaction "$previous_id" 'candidate non-running terminal verification failed'
+        die 'candidate non-running terminal verification failed; previous generation restored'
+    fi
     write_journal candidate_verified; write_journal committed installed
+    if [[ "$TRIGGER" != startup && "$desired_state" != removed ]]; then
+        prune_obsolete_generations || exit 73
+    fi
     ((QUIET)) || printf 'installed generation=%s\n' "$candidate_id"
 }
 update_failure_with_fallback() {
@@ -2391,6 +2867,14 @@ run_update() {
         if [[ "$desired_state" != disabled && "$desired_state" != removed ]]; then
             rearm_update_timer || safe_blocked 'update timer could not be rearmed'
         fi
+        if [[ "$TRIGGER" != startup && "$desired_state" != removed ]] && (( ! transaction_recovered )); then
+            if [[ "$desired_state" != running ]]; then
+                verify_nonrunning_terminal "$desired_state" || safe_blocked 'no-update non-running terminal is not healthy'
+            fi
+            if ! prune_obsolete_generations; then
+                update_failure_with_fallback 'GENERATION_PRUNE_FAILED after verified no-update'
+            fi
+        fi
         rm -r -- "$update_root"; update_root=; ((QUIET)) || printf 'no update current=%s newest=%s\n' "$installed_version" "$newest"; return
     fi
     [[ "$state" == update ]] || die 'release selection returned unknown state'
@@ -2406,8 +2890,15 @@ run_update() {
     (( $(now_unix) <= update_deadline )) || update_failure_with_fallback 'update overall timeout exceeded before candidate installation'
     local child_limit
     child_limit="$(deadline_timeout "$MANUAL_TIMEOUT")" || update_failure_with_fallback 'update overall timeout exceeded before candidate installation'
-    if ! CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
+    local child_status=0
+    if CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
         timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" --sha256 "$checksum_path"; then
+        child_status=0
+    else
+        child_status="$?"
+        if [[ "$child_status" == 73 ]]; then
+            update_failure_with_fallback 'candidate committed but GENERATION_PRUNE_FAILED'
+        fi
         update_failure_with_fallback 'candidate installation failed'
     fi
     (( $(now_unix) <= update_deadline )) || update_failure_with_fallback 'update overall timeout exceeded after candidate installation'

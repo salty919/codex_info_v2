@@ -160,6 +160,8 @@ mkdir -p -- "$fake_bin" "$fake_home" "$fake_proc/net" "$fixture_root" "$output_r
 cat > "$fake_bin/systemctl" <<'FAKE_SYSTEMCTL'
 #!/usr/bin/env bash
 set -euo pipefail
+FAKE_TIMER_ACTIVE="$(printenv FAKE_TIMER_ACTIVE || true)"
+FAKE_TIMER_ACTIVE_FILE="$(printenv FAKE_TIMER_ACTIVE_FILE || true)"
 printf 'systemctl %s\n' "$*" >> "$FAKE_LOG"
 [[ "${1-}" == --user ]] && shift
 case "${1-}" in
@@ -195,6 +197,11 @@ case "${1-}" in
         exit 4
         ;;
     is-active)
+        if [[ "$*" == *codex-info-update.timer ]]; then
+            [[ "$FAKE_TIMER_ACTIVE" == 1 ]] && exit 0
+            [[ -n "$FAKE_TIMER_ACTIVE_FILE" && -f "$FAKE_TIMER_ACTIVE_FILE" ]] && exit 0
+            exit 3
+        fi
         unit="${*: -1}"
         case "$unit" in
             codex-info-recorder.service)
@@ -237,6 +244,12 @@ case "${1-}" in
         exit 0
         ;;
     daemon-reload|enable|disable|start|stop|restart)
+        if [[ "$*" == *codex-info-update.timer && -n "$FAKE_TIMER_ACTIVE_FILE" ]]; then
+            case "$1" in
+                start|restart) : > "$FAKE_TIMER_ACTIVE_FILE" ;;
+                stop) rm -f -- "$FAKE_TIMER_ACTIVE_FILE" ;;
+            esac
+        fi
         unit="${*: -1}"
         if [[ "$unit" == codex-info-recorder.service && -n "${FAKE_MAIN_ACTIVE_FILE:-}" ]]; then
             if [[ ("$1" == start || "$1" == restart) && "${FAKE_FAIL_START_UNIT:-}" == "$unit" &&
@@ -499,6 +512,7 @@ run_install() {
     local archive="$1" home="$2" script
     script="$(extract_installer "$archive")"
     HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_TIMER_ACTIVE_FILE="$home/.timer-active" \
         CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
         bash "$script" --bundle "$archive"
 }
@@ -524,6 +538,7 @@ run_install_glibc() {
     local archive="$1" home="$2" version="$3" script
     script="$(extract_installer "$archive")"
     HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_TIMER_ACTIVE_FILE="$home/.timer-active" \
         FAKE_GLIBC_VERSION="$version" GETCONF_BIN="$fake_bin/getconf" LDD_BIN="$fake_bin/ldd" \
         CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
         bash "$script" --bundle "$archive"
@@ -532,6 +547,7 @@ run_install_with_manifest() {
     local archive="$1" home="$2" manifest="$3" script
     script="$(extract_installer "$archive")"
     HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_TIMER_ACTIVE_FILE="$home/.timer-active" \
         CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
         bash "$script" --bundle "$archive" --manifest "$manifest"
 }
@@ -539,6 +555,7 @@ run_install_with_manifest() {
 run_update() {
     local home="$1"
     HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_TIMER_ACTIVE_FILE="$home/.timer-active" \
         FAKE_STARTUP_CONDITION=1 FAKE_INSTALLER="$home/.local/libexec/codex-info-install.sh" \
         FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" \
         TMPDIR="$update_tmp" CODEX_INFO_PROC_ROOT="$fake_proc" \
@@ -905,7 +922,233 @@ assert value["generation_id"] == sys.argv[2]
 PY
 [[ "$(sha256sum "$fake_home/.codex/session.jsonl" "$fake_home/.config/codex-info/settings.json")" == "$profile_hash" ]] ||
     fail 'profile sentinels changed during install'
-printf 'case initial generation/retention: PASS\n'
+printf 'case initial generation install: PASS\n'
+
+retention_home="$TEST_ROOT/retention-home"
+mkdir -p -- "$retention_home/.codex" "$retention_home/.config/codex-info"
+printf 'retention session sentinel\n' > "$retention_home/.codex/session.jsonl"
+printf 'retention settings sentinel\n' > "$retention_home/.config/codex-info/settings.json"
+retention_profile_hash="$(sha256sum "$retention_home/.codex/session.jsonl" "$retention_home/.config/codex-info/settings.json")"
+write_stopped_state "$retention_home"
+run_install "$archive_v1" "$retention_home" >/dev/null
+retention_generations="$retention_home/.local/share/codex-info/generations"
+retention_v1="$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")"
+retention_stale_copy="$TEST_ROOT/$retention_v1"
+cp -a -- "$retention_generations/$retention_v1" "$retention_stale_copy"
+retention_archive_v2="$(build_bundle 2222222222222222222222222222222222222222 1.0.20)"
+retention_archive_v3="$(build_bundle 2222222222222222222222222222222222222222 1.0.21)"
+run_install "$retention_archive_v2" "$retention_home" >/dev/null
+retention_v2="$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")"
+run_install "$retention_archive_v3" "$retention_home" >/dev/null
+python3 - "$retention_home/.local/share/codex-info/generations" \
+    "$retention_home/.local/share/codex-info/current" \
+    "$retention_home/.local/share/codex-info/install-transaction.json" <<'PY'
+import json, pathlib, sys
+generations, current_link, journal_path = map(pathlib.Path, sys.argv[1:])
+current = (generations.parent / current_link.readlink()).resolve()
+journal = json.loads(journal_path.read_text(encoding="utf-8"))
+assert journal["phase"] == "committed"
+assert journal["new_generation"] == current.name
+rollback = journal["old_generation"]
+assert rollback and rollback.startswith("1.0.20-")
+assert current.name.startswith("1.0.21-")
+retained = {path.name for path in generations.iterdir() if path.is_dir() and not path.name.startswith(".")}
+assert retained == {current.name, rollback}, retained
+assert not any(name.startswith("1.0.19-") for name in retained), retained
+assert (generations / rollback).is_dir()
+sizes = {
+    name: sum(path.stat().st_size for path in (generations / name).rglob("*")
+              if path.is_file() and not path.is_symlink())
+    for name in retained
+}
+assert sum(sizes.values()) <= 2 * max(sizes.values()), sizes
+print("linux-bundle-test: current and one committed rollback generation retained")
+PY
+[[ "$(sha256sum "$retention_home/.codex/session.jsonl" "$retention_home/.config/codex-info/settings.json")" == "$retention_profile_hash" ]] ||
+    fail 'generation retention changed profile sentinels'
+printf 'case finite current/rollback retention: PASS\n'
+
+retention_v2_dir="$retention_generations/$retention_v2"
+retention_enable_link="$retention_home/.config/systemd/user/default.target.wants/codex-info-recorder.service"
+mkdir -p -- "$(dirname -- "$retention_enable_link")"
+for process in '991101:codex_info_recorder' '991102:codex_info_rest' '991103:codex_info'; do
+    IFS=: read -r process_id executable <<<"$process"
+    [[ ! -e "$fake_proc/$process_id" && ! -L "$fake_proc/$process_id" ]] ||
+        fail "retention process fixture collides with fake proc pid $process_id"
+    mkdir -p -- "$fake_proc/$process_id"
+    ln -s -- "$retention_v2_dir/$executable" "$fake_proc/$process_id/exe"
+done
+rm -- "$retention_enable_link"
+ln -s -- "$retention_v2_dir/codex-info-recorder.service" "$retention_enable_link"
+retention_archive_v4="$(build_bundle 2222222222222222222222222222222222222222 1.0.22)"
+run_install "$retention_archive_v4" "$retention_home" >/dev/null
+python3 - "$retention_generations" "$retention_home/.local/share/codex-info/current" \
+    "$retention_home/.local/share/codex-info/install-transaction.json" "$retention_v2" <<'PY'
+import json, pathlib, sys
+generations, current_link, journal_path = map(pathlib.Path, sys.argv[1:4])
+pinned = sys.argv[4]
+current = (generations.parent / current_link.readlink()).resolve()
+journal = json.loads(journal_path.read_text(encoding="utf-8"))
+rollback = journal["old_generation"]
+retained = {path.name for path in generations.iterdir() if path.is_dir() and not path.name.startswith(".")}
+assert journal["phase"] == "committed" and journal["new_generation"] == current.name
+assert current.name.startswith("1.0.22-") and rollback.startswith("1.0.21-")
+assert retained == {current.name, rollback, pinned}, retained
+sizes = {
+    name: sum(path.stat().st_size for path in (generations / name).rglob("*")
+              if path.is_file() and not path.is_symlink())
+    for name in retained
+}
+assert sum(sizes.values()) <= 3 * max(sizes.values()), sizes
+print("linux-bundle-test: recorder, REST, UI, and enabled-unit generation references retained")
+PY
+for process_id in 991101 991102 991103; do
+    rm -- "$fake_proc/$process_id/exe"
+    rmdir -- "$fake_proc/$process_id"
+done
+rm -- "$retention_enable_link"
+ln -s -- "$retention_v2_dir/codex-info-recorder.service" "$retention_enable_link"
+write_release "$retention_archive_v4"
+run_update "$retention_home" >/dev/null
+[[ -d "$retention_v2_dir" ]] || fail 'enable-unit-only reference did not retain its generation'
+[[ "$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")" == 1.0.22-* ]] ||
+    fail 'enable-unit-only no-update changed current generation'
+[[ "$(sha256sum "$retention_home/.codex/session.jsonl" "$retention_home/.config/codex-info/settings.json")" == "$retention_profile_hash" ]] ||
+    fail 'enable-unit-only retention changed profile sentinels'
+printf 'case enabled-unit-only generation reference: PASS\n'
+rm -- "$retention_enable_link"
+
+retention_foreign_target="$TEST_ROOT/foreign-generation-target"
+printf 'foreign sentinel\n' > "$retention_foreign_target"
+retention_foreign_link="$retention_generations/foreign-entry"
+ln -s -- "$retention_foreign_target" "$retention_foreign_link"
+retention_malformed="$retention_generations/9.9.9-3333333333333333333333333333333333333333-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+mkdir -m 700 -- "$retention_malformed"
+printf '{}\n' > "$retention_malformed/manifest.json"
+chmod 644 -- "$retention_malformed/manifest.json"
+retention_bad_mode="$retention_generations/8.8.8-4444444444444444444444444444444444444444-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+mkdir -m 755 -- "$retention_bad_mode"
+retention_archive_v5="$(build_bundle 2222222222222222222222222222222222222222 1.0.23)"
+run_install "$retention_archive_v5" "$retention_home" >/dev/null
+retention_v4="$(python3 - "$retention_home/.local/share/codex-info/install-transaction.json" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["old_generation"])
+PY
+)"
+python3 - "$retention_generations" "$retention_home/.local/share/codex-info/current" \
+    "$retention_home/.local/share/codex-info/install-transaction.json" "$retention_v2" <<'PY'
+import json, pathlib, sys
+generations, current_link, journal_path = map(pathlib.Path, sys.argv[1:4])
+stale, = sys.argv[4:]
+current = (generations.parent / current_link.readlink()).resolve()
+journal = json.loads(journal_path.read_text(encoding="utf-8"))
+retained = {path.name for path in generations.iterdir() if path.is_dir() and not path.name.startswith(".")}
+assert journal["phase"] == "committed" and journal["new_generation"] == current.name
+assert current.name.startswith("1.0.23-") and journal["old_generation"].startswith("1.0.22-")
+assert stale not in retained
+assert any(name.startswith("1.0.22-") for name in retained)
+assert not (generations / stale).exists()
+assert (generations / "foreign-entry").is_symlink()
+assert (generations / "9.9.9-3333333333333333333333333333333333333333-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_dir()
+assert (generations / "8.8.8-4444444444444444444444444444444444444444-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").is_dir()
+print("linux-bundle-test: foreign, malformed, and wrong-mode entries preserved")
+PY
+[[ "$(cat "$retention_foreign_target")" == 'foreign sentinel' ]] || fail 'prune followed a foreign symlink'
+
+cp -a -- "$retention_stale_copy" "$retention_generations/"
+write_release "$retention_archive_v5"
+run_update "$retention_home" >/dev/null
+[[ ! -e "$retention_generations/$retention_v1" ]] || fail 'no-update did not prune a verified obsolete generation'
+[[ "$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")" == 1.0.23-* ]] ||
+    fail 'no-update cleanup changed current generation'
+printf 'case no-update stale-generation cleanup: PASS\n'
+
+retention_archive_v6="$(build_bundle 2222222222222222222222222222222222222222 1.0.24)"
+retention_failure_target="$retention_generations/$retention_v4"
+retention_failure_hash_before="$(find "$retention_failure_target" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum)"
+retention_fault_python="$TEST_ROOT/prune-fault-python"
+mkdir -p -- "$retention_fault_python"
+cat > "$retention_fault_python/sitecustomize.py" <<'PY'
+import os
+target = os.environ.get("CODEX_INFO_TEST_FAIL_UNLINK")
+fail_after = int(os.environ.get("CODEX_INFO_TEST_FAIL_AFTER_UNLINKS", "0"))
+counter_path = os.environ.get("CODEX_INFO_TEST_UNLINK_COUNTER")
+if target:
+    original_unlink = os.unlink
+    def injected_unlink(path, *, dir_fd=None):
+        name = os.fsdecode(path)
+        if dir_fd is None:
+            candidate = os.path.abspath(name)
+        else:
+            candidate = os.path.join(os.readlink(f"/proc/self/fd/{dir_fd}"), name)
+        if candidate == target or candidate.startswith(target + os.sep):
+            count = int(open(counter_path, encoding="utf-8").read()) if counter_path and os.path.exists(counter_path) else 0
+            if count >= fail_after:
+                raise PermissionError(13, "injected unlink failure for exact obsolete generation", candidate)
+            if counter_path:
+                with open(counter_path, "w", encoding="utf-8") as output:
+                    output.write(str(count + 1))
+        return original_unlink(path, dir_fd=dir_fd)
+    os.unlink = injected_unlink
+PY
+if PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_FAIL_UNLINK="$retention_failure_target" \
+    run_install "$retention_archive_v6" "$retention_home" >/dev/null 2>"$TEST_ROOT/prune-failure.log"; then
+    fail 'post-commit prune failure returned success'
+fi
+grep -Fq 'GENERATION_PRUNE_FAILED' "$TEST_ROOT/prune-failure.log" ||
+    fail 'prune failure was hidden by a generic install result'
+[[ "$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")" == 1.0.24-* ]] ||
+    fail 'prune failure rolled back the committed current generation'
+[[ "$(find "$retention_failure_target" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum)" == "$retention_failure_hash_before" ]] ||
+    fail 'injected first-unlink failure changed the obsolete generation'
+[[ "$(sha256sum "$retention_home/.codex/session.jsonl" "$retention_home/.config/codex-info/settings.json")" == "$retention_profile_hash" ]] ||
+    fail 'prune failure changed profile sentinels'
+
+write_release "$retention_archive_v6"
+run_update "$retention_home" >/dev/null
+[[ ! -e "$retention_failure_target" ]] || fail 'later no-update did not retry the preserved obsolete generation'
+[[ "$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")" == 1.0.24-* ]] ||
+    fail 'no-update cleanup after failure changed current generation'
+[[ "$(sha256sum "$retention_home/.codex/session.jsonl" "$retention_home/.config/codex-info/settings.json")" == "$retention_profile_hash" ]] ||
+    fail 'no-update cleanup after failure changed profile sentinels'
+[[ -L "$retention_foreign_link" && -d "$retention_malformed" && -d "$retention_bad_mode" ]] ||
+    fail 'prune retry removed an unsafe generation entry'
+printf 'case prune failure and no-update recovery: PASS\n'
+
+cp -a -- "$retention_stale_copy" "$retention_generations/"
+retention_archive_v7="$(build_bundle 2222222222222222222222222222222222222222 1.0.25)"
+retention_partial_target="$retention_generations/$retention_v1"
+retention_partial_counter="$TEST_ROOT/prune-unlink-counter"
+rm -f -- "$retention_partial_counter"
+if PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_FAIL_UNLINK="$retention_partial_target" \
+    CODEX_INFO_TEST_FAIL_AFTER_UNLINKS=1 CODEX_INFO_TEST_UNLINK_COUNTER="$retention_partial_counter" \
+    run_install "$retention_archive_v7" "$retention_home" >/dev/null 2>"$TEST_ROOT/prune-partial-failure.log"; then
+    fail 'prune failure after one unlink returned success'
+fi
+grep -Fq 'GENERATION_PRUNE_FAILED' "$TEST_ROOT/prune-partial-failure.log" ||
+    fail 'partial prune failure was hidden by a generic install result'
+[[ "$(cat "$retention_partial_counter")" == 1 ]] || fail 'partial prune injection did not unlink one member first'
+[[ "$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")" == 1.0.25-* ]] ||
+    fail 'partial prune failure rolled back the committed current generation'
+python3 - "$retention_partial_target" <<'PY'
+import json, pathlib, sys
+generation = pathlib.Path(sys.argv[1])
+manifest = json.loads((generation / "manifest.json").read_text(encoding="utf-8"))
+missing = [entry["path"] for entry in manifest["files"] if not (generation / entry["path"]).is_file()]
+assert len(missing) == 1, missing
+print("linux-bundle-test: injected prune failed after one verified member unlink")
+PY
+[[ "$(sha256sum "$retention_home/.codex/session.jsonl" "$retention_home/.config/codex-info/settings.json")" == "$retention_profile_hash" ]] ||
+    fail 'partial prune failure changed profile sentinels'
+write_release "$retention_archive_v7"
+run_update "$retention_home" >/dev/null
+[[ -d "$retention_partial_target" && -f "$retention_partial_target/manifest.json" ]] ||
+    fail 'no-update removed an incomplete obsolete generation without exact verification'
+[[ "$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")" == 1.0.25-* ]] ||
+    fail 'no-update after partial prune changed current generation'
+[[ "$(sha256sum "$retention_home/.codex/session.jsonl" "$retention_home/.config/codex-info/settings.json")" == "$retention_profile_hash" ]] ||
+    fail 'no-update after partial prune changed profile sentinels'
+printf 'case partial prune failure and safe no-update preservation: PASS\n'
 
 write_release "$archive_v1"
 run_update "$fake_home" >/dev/null
@@ -1289,6 +1532,30 @@ grep -Fq '"phase": "committed"' "$fake_home/.local/share/codex-info/install-tran
 [[ "$(readlink -- "$fake_home/.config/systemd/user/timers.target.wants/codex-info-update.timer")" == '../codex-info-update.timer' ]] ||
     fail 'rollback resume retained a generation-pinned timer link'
 printf 'case rollback journal stable-link resume: PASS\n'
+
+rollback_current_id="$(basename -- "$(readlink -- "$fake_home/.local/share/codex-info/current")")"
+write_release "$archive_v2"
+run_update "$fake_home" >/dev/null
+rollback_candidate_source="$(readlink -f -- "$retention_home/.local/share/codex-info/current")"
+rollback_candidate_id="$(basename -- "$rollback_candidate_source")"
+rollback_candidate_path="$fake_home/.local/share/codex-info/generations/$rollback_candidate_id"
+[[ ! -e "$rollback_candidate_path" && ! -L "$rollback_candidate_path" ]] ||
+    fail 'rollback no-update fixture candidate already exists'
+cp -a -- "$rollback_candidate_source" "$rollback_candidate_path"
+python3 - "$fake_home/.local/share/codex-info/install-transaction.json" "$rollback_current_id" "$rollback_candidate_id" <<'PY'
+import json, pathlib, sys
+path, current, candidate = sys.argv[1:]
+document = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+assert document["phase"] == "committed"
+document["old_generation"] = current
+document["new_generation"] = candidate
+pathlib.Path(path).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+PY
+run_update "$fake_home" >/dev/null
+[[ -d "$rollback_candidate_path" ]] || fail 'rollback journal candidate reference was pruned'
+[[ "$(basename -- "$(readlink -- "$fake_home/.local/share/codex-info/current")")" == "$rollback_current_id" ]] ||
+    fail 'rollback journal candidate readback changed current generation'
+printf 'case rollback journal failed-candidate reference: PASS\n'
 
 # A live installer may let systemd activate only the exact switched
 # generation while it still owns descriptor-9.  Rollback uses the exact
