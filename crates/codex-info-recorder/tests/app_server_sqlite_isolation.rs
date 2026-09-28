@@ -351,7 +351,7 @@ fn thread_cycle_uses_one_deadline_across_initialize_and_read() {
     ]);
 
     let _live_codex = live_session_process(root, &session);
-    let threads = ThreadPoller::start(codex_home, data_root, sessions.clone());
+    let threads = ThreadPoller::start(sessions.clone());
     let thread_checkpoint = checkpoint(&sessions, &session, session_meta.len() as u64);
     assert!(threads.submit(&[thread_checkpoint]));
 
@@ -378,12 +378,12 @@ fn thread_cycle_uses_one_deadline_across_initialize_and_read() {
     assert_eq!(
         fake_app_server_launch_count(&calls, "codex-info-recorder-thread-poller"),
         1,
-        "the slow cycle must launch exactly one isolated app-server child"
+        "the slow cycle must launch exactly one app-server child"
     );
 }
 
 #[test]
-fn split_app_server_paths_use_private_sqlite_home() {
+fn recorder_app_server_paths_match_v197_launch() {
     let _environment_lock = ENVIRONMENT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -422,12 +422,11 @@ fn split_app_server_paths_use_private_sqlite_home() {
     ]);
 
     assert_eq!(
-        probe_codex_authentication_state(&codex_home, &data_root)
-            .expect("auth probe must reach app-server"),
+        probe_codex_authentication_state().expect("auth probe must reach app-server"),
         CodexAuthenticationState::Authenticated
     );
 
-    let mut quota = QuotaPoller::start_with_interval(3600, codex_home.clone(), data_root.clone());
+    let mut quota = QuotaPoller::start_with_interval(3600);
     let quota_deadline = Instant::now() + Duration::from_secs(5);
     while quota.latest().is_none() {
         assert!(
@@ -441,7 +440,7 @@ fn split_app_server_paths_use_private_sqlite_home() {
     let session_meta = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-1\"}}\n";
     fs::write(&session, session_meta).expect("write Session fixture");
     let live_codex = live_session_process(root, &session);
-    let threads = ThreadPoller::start(codex_home.clone(), data_root.clone(), sessions.clone());
+    let threads = ThreadPoller::start(sessions.clone());
     let thread_checkpoint = checkpoint(&sessions, &session, session_meta.len() as u64);
     eprintln!(
         "issue182 before thread probe: {}; thread_app_server_launches={}",
@@ -499,166 +498,24 @@ fn split_app_server_paths_use_private_sqlite_home() {
         "fixture setup: unexpected app-server launch"
     );
 
-    let private_root = data_root.join("app-server-sqlite");
-    let missing: Vec<_> = observed
-        .iter()
-        .filter_map(|record| {
-            let args = record["args"]
-                .as_array()
-                .expect("recorded argv is an array");
-            let arguments: Vec<_> = args.iter().map(|arg| arg.as_str().unwrap()).collect();
-            let overrides: Vec<_> = arguments
-                .windows(2)
-                .filter_map(|pair| {
-                    (pair[0] == "-c")
-                        .then(|| pair[1].strip_prefix("sqlite_home="))
-                        .flatten()
-                })
-                .collect();
-            let valid = overrides.len() == 1
-                && arguments
-                    .iter()
-                    .filter(|arg| arg.starts_with("sqlite_home="))
-                    .count()
-                    == 1
-                && Path::new(overrides[0]).parent() == Some(private_root.as_path())
-                && Path::new(overrides[0])
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with("generation-"));
-            (!valid).then(|| record["client"].as_str().unwrap().to_owned())
-        })
-        .collect();
-    let shared_sqlite_created = codex_home.join("logs_2.sqlite").exists();
+    for record in &observed {
+        let args = record["args"]
+            .as_array()
+            .expect("recorded argv is an array");
+        let arguments: Vec<_> = args.iter().map(|arg| arg.as_str().unwrap()).collect();
+        assert_eq!(
+            arguments,
+            ["app-server", "--stdio"],
+            "v1.0.97 launch argv for {}",
+            record["client"]
+        );
+    }
     assert!(
-        missing.is_empty() && !shared_sqlite_created,
-        "missing isolation in {missing:?}; shared logs_2.sqlite created={shared_sqlite_created}"
+        codex_home.join("logs_2.sqlite").exists(),
+        "v1.0.97 app-server uses the shared Codex SQLite home"
     );
     assert_eq!(
         fs::read(state).expect("read source after probes"),
         state_before
     );
-}
-
-fn authentication_probe_fixture(
-    name: &str,
-) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
-    let temporary = tempfile::Builder::new()
-        .prefix(&format!("issue182-auth-{name}-"))
-        .tempdir()
-        .expect("create authentication probe fixture");
-    let root = temporary.path();
-    let codex_home = root.join("codex-home");
-    let data_root = root.join("data");
-    private_directory(&codex_home);
-    private_directory(&data_root);
-    let state = codex_home.join("state_5.sqlite");
-    {
-        let connection = Connection::open(&state).expect("create source SQLite fixture");
-        connection
-            .execute_batch("CREATE TABLE fixture (value INTEGER); INSERT INTO fixture VALUES (1);")
-            .expect("seed source SQLite fixture");
-    }
-    fs::set_permissions(&state, fs::Permissions::from_mode(0o600))
-        .expect("protect source SQLite fixture");
-    let app_server = root.join("fake-app-server.py");
-    fake_app_server(&app_server);
-    let calls = root.join("app-server-calls.jsonl");
-    (temporary, codex_home, data_root, app_server, calls)
-}
-
-#[test]
-fn auth_probe_fallback_is_limited_to_one_pre_account_failure() {
-    let _environment_lock = ENVIRONMENT_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    {
-        let (_temporary, codex_home, data_root, app_server, calls) =
-            authentication_probe_fixture("initialize-fallback");
-        let fail_initialize = Path::new("1");
-        let disabled = Path::new("0");
-        let _environment = Environment::set(&[
-            ("CODEX_HOME", &codex_home),
-            ("CODEX_INFO_DATA_DIR", &data_root),
-            ("CODEX_INFO_CODEX_BIN", &app_server),
-            ("CODEX_INFO_FAKE_CALLS", &calls),
-            ("CODEX_INFO_FAKE_FAIL_PRIVATE_INITIALIZE", fail_initialize),
-            ("CODEX_INFO_FAKE_FAIL_PRIVATE_ACCOUNT_READ", disabled),
-        ]);
-        assert_eq!(
-            probe_codex_authentication_state(&codex_home, &data_root)
-                .expect("one global fallback confirms the account response"),
-            codex_info_recorder::CodexAuthenticationState::Authenticated
-        );
-        let records = fs::read_to_string(&calls).expect("read app-server launch records");
-        let observed: Vec<Value> = records
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("parse launch record"))
-            .collect();
-        assert_eq!(
-            observed.len(),
-            2,
-            "private initialize gets one global fallback"
-        );
-        let overrides = |record: &Value| {
-            let args = record["args"].as_array().expect("recorded argv");
-            args.windows(2)
-                .filter(|pair| {
-                    pair[0].as_str() == Some("-c")
-                        && pair[1]
-                            .as_str()
-                            .is_some_and(|argument| argument.starts_with("sqlite_home="))
-                })
-                .count()
-        };
-        assert_eq!(overrides(&observed[0]), 1, "first launch is isolated");
-        assert_eq!(
-            overrides(&observed[1]),
-            0,
-            "fallback launches globally once"
-        );
-        assert!(codex_home.join("logs_2.sqlite").is_file());
-    }
-
-    {
-        let (_temporary, codex_home, data_root, app_server, calls) =
-            authentication_probe_fixture("account-read-no-fallback");
-        let disabled = Path::new("0");
-        let fail_account_read = Path::new("1");
-        let _environment = Environment::set(&[
-            ("CODEX_HOME", &codex_home),
-            ("CODEX_INFO_DATA_DIR", &data_root),
-            ("CODEX_INFO_CODEX_BIN", &app_server),
-            ("CODEX_INFO_FAKE_CALLS", &calls),
-            ("CODEX_INFO_FAKE_FAIL_PRIVATE_INITIALIZE", disabled),
-            (
-                "CODEX_INFO_FAKE_FAIL_PRIVATE_ACCOUNT_READ",
-                fail_account_read,
-            ),
-        ]);
-        assert!(probe_codex_authentication_state(&codex_home, &data_root).is_err());
-        let records = fs::read_to_string(&calls).expect("read app-server launch records");
-        let observed: Vec<Value> = records
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("parse launch record"))
-            .collect();
-        assert_eq!(
-            observed.len(),
-            1,
-            "account/read failure has no global fallback"
-        );
-        let args = observed[0]["args"].as_array().expect("recorded argv");
-        assert_eq!(
-            args.windows(2)
-                .filter(|pair| {
-                    pair[0].as_str() == Some("-c")
-                        && pair[1]
-                            .as_str()
-                            .is_some_and(|argument| argument.starts_with("sqlite_home="))
-                })
-                .count(),
-            1,
-            "the only launch uses its private generation"
-        );
-        assert!(!codex_home.join("logs_2.sqlite").exists());
-    }
 }
