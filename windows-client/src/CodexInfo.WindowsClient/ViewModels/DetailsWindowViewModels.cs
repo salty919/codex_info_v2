@@ -2016,7 +2016,9 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             if (children.TryGetValue(item.Id, out var nested))
                 foreach (var child in nested) Visit(child);
         }
-        foreach (var root in source.Where(thread => thread.ParentId is null || !byId.ContainsKey(thread.ParentId))) Visit(root);
+        var roots = source.Where(thread => thread.ParentId is null || !byId.ContainsKey(thread.ParentId)).ToArray();
+        foreach (var root in roots.Where(thread => thread.ActivityStatus == ApiThreadActivityStatus.Running)) Visit(root);
+        foreach (var root in roots.Where(thread => thread.ActivityStatus != ApiThreadActivityStatus.Running)) Visit(root);
         foreach (var item in source) Visit(item);
         return result;
     }
@@ -2057,6 +2059,9 @@ public sealed class ThreadItemViewModel
             ApiThreadActivityStatus.Stopped => owner.Texts.ThreadStopped,
             _ => owner.Texts.ThreadUnknown,
         };
+        ActivityStatusHex = thread.ActivityStatus == ApiThreadActivityStatus.Running
+            ? "#EF6A6A"
+            : "#A8B7CA";
         ModelAccentHex = FormatModelAccent(ModelText);
         ContextText = owner.ContextText(thread);
         ContextUsageText = FormatContextUsage(owner.Texts, thread);
@@ -2081,6 +2086,7 @@ public sealed class ThreadItemViewModel
     public string ParentText { get; }
     public string ModelText { get; }
     public string ActivityStatusText { get; }
+    public string ActivityStatusHex { get; }
     public string ModelAccentHex { get; }
     public string ContextText { get; }
     public string ContextUsageText { get; }

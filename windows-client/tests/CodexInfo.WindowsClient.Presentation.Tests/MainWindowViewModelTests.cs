@@ -339,6 +339,49 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task MainWindowModelCountsPairRunningAndOpen()
+    {
+        var current = CurrentSnapshot(activeThreadCount: 1) with
+        {
+            OpenSessionThreadCount = 3,
+        };
+        var stoppedSol = ThreadDetails("gpt-5.6-sol", "stopped-sol") with
+        {
+            ActivityStatus = ApiThreadActivityStatus.Stopped,
+        };
+        var runningLuna = ThreadDetails("gpt-5.6-luna", "running-luna") with
+        {
+            ActivityStatus = ApiThreadActivityStatus.Running,
+        };
+        var unknownLuna = ThreadDetails("gpt-5.6-luna", "unknown-luna") with
+        {
+            ActivityStatus = ApiThreadActivityStatus.Unknown,
+        };
+        var client = new SplitCurrentThreadsClient(
+            current,
+            ThreadsFetchResult.Success(new ApiThreadsSnapshot(
+                [stoppedSol, runningLuna, unknownLuna],
+                current.PublishedPair)));
+        using var main = new MainWindowViewModel(client);
+
+        main.Start();
+        await EventuallyAsync(() => main.DetailsSnapshot?.Threads.Count == 3);
+
+        Assert.Equal(3UL, main.DetailsSnapshot!.OpenSessionThreadCount);
+        Assert.Equal(3UL, main.ActiveThreadCount);
+        Assert.Equal(1, main.ActiveSolCount);
+        Assert.Equal(0, main.ActiveTerraCount);
+        Assert.Equal(2, main.ActiveLunaCount);
+        Assert.Equal(0, main.ActiveAstraCount);
+        Assert.Equal(0, main.ActiveOtherCount);
+        Assert.Equal("0（1）", typeof(MainWindowViewModel).GetProperty("ActiveSolCountLabel")?.GetValue(main));
+        Assert.Equal("0", typeof(MainWindowViewModel).GetProperty("ActiveTerraCountLabel")?.GetValue(main));
+        Assert.Equal("1（2）", typeof(MainWindowViewModel).GetProperty("ActiveLunaCountLabel")?.GetValue(main));
+        Assert.Equal("0", typeof(MainWindowViewModel).GetProperty("ActiveAstraCountLabel")?.GetValue(main));
+        Assert.Equal("0", typeof(MainWindowViewModel).GetProperty("ActiveOtherCountLabel")?.GetValue(main));
+    }
+
+    [Fact]
     public async Task AccountSelectionDefaultsToCurrentAndClearsThePreviousGeneration()
     {
         var client = new AccountScopedClient();

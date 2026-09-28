@@ -477,11 +477,49 @@ public sealed class DetailsPresentationCoverageTests
             Assert.Equal("動作中", threads.Threads.Single(item => item.Id == "running").ActivityStatusText);
             Assert.Equal("停止中", threads.Threads.Single(item => item.Id == "stopped").ActivityStatusText);
             Assert.Equal("未観測", threads.Threads.Single(item => item.Id == "unknown").ActivityStatusText);
+
+            var window = XDocument.Parse(LoadRepositoryFile(
+                "windows-client", "src", "CodexInfo.WindowsClient", "ThreadsWindow.axaml"));
+            var activityStatus = window.Descendants()
+                .Single(element => element.Name.LocalName == "TextBlock" &&
+                    element.Attribute("Text")?.Value == "{Binding ActivityStatusText}");
+            Assert.Equal("{Binding ActivityStatusHex}", activityStatus.Attribute("Foreground")?.Value);
+            var foreground = typeof(ThreadItemViewModel).GetProperty("ActivityStatusHex");
+            Assert.NotNull(foreground);
+            Assert.Equal("#EF6A6A", foreground.GetValue(threads.Threads.Single(item => item.Id == "running")));
+            Assert.Equal("#A8B7CA", foreground.GetValue(threads.Threads.Single(item => item.Id == "stopped")));
+            Assert.Equal("#A8B7CA", foreground.GetValue(threads.Threads.Single(item => item.Id == "unknown")));
         }
         finally
         {
             LocalizationService.SetLanguage(previousLanguage);
         }
+    }
+
+    [Fact]
+    public async Task ThreadsWindowPrioritizesRunningRootsAndKeepsSubtrees()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var source = new[]
+        {
+            new ApiThreadDetails("stopped-root", "Stopped root", null, "model-stopped", "SOL", null, null, null,
+                now, now, false, 0, false)
+                { ActivityStatus = ApiThreadActivityStatus.Stopped },
+            new ApiThreadDetails("running-root", "Running root", null, "model-running", "LUNA", null, null, null,
+                now - 10, now - 10, false, 0, false)
+                { ActivityStatus = ApiThreadActivityStatus.Running },
+            new ApiThreadDetails("running-child", "Running child", "running-root", "model-child", "TERRA", null,
+                null, null, now - 20, now - 20, true, 1, false)
+                { ActivityStatus = ApiThreadActivityStatus.Running },
+        };
+
+        using var main = await StartMainAsync(CreateDetails(Array.Empty<ApiHistoryPeriod>(), source));
+        using var threads = new ThreadsWindowViewModel(main);
+
+        Assert.Equal(
+            new[] { "running-root", "running-child", "stopped-root" },
+            threads.Threads.Select(item => item.Id));
+        Assert.Equal([new ThreadTreeConnection(0, 1, 0)], threads.TreeConnections);
     }
 
     [Fact]
