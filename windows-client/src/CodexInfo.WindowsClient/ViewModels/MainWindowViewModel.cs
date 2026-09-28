@@ -397,6 +397,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public int ActiveOtherCount => Math.Max(0, (int)ActiveThreadCount - ActiveSolCount - ActiveTerraCount - ActiveLunaCount - ActiveAstraCount);
 
+    public string ActiveSolCountLabel => FormatThreadModelCount("SOL", ActiveSolCount);
+
+    public string ActiveTerraCountLabel => FormatThreadModelCount("TERRA", ActiveTerraCount);
+
+    public string ActiveLunaCountLabel => FormatThreadModelCount("LUNA", ActiveLunaCount);
+
+    public string ActiveAstraCountLabel => FormatThreadModelCount("ASTRA", ActiveAstraCount);
+
+    public string ActiveOtherCountLabel => FormatThreadModelCount("その他", ActiveOtherCount);
+
     /// <summary>Whether an authenticated details generation is visible.</summary>
     public bool HasDetails => detailsSnapshot is { Authenticated: true, State: not ApiState.AuthRequired };
 
@@ -1793,6 +1803,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(ActiveLunaCount));
         Notify(nameof(ActiveAstraCount));
         Notify(nameof(ActiveOtherCount));
+        Notify(nameof(ActiveSolCountLabel));
+        Notify(nameof(ActiveTerraCountLabel));
+        Notify(nameof(ActiveLunaCountLabel));
+        Notify(nameof(ActiveAstraCountLabel));
+        Notify(nameof(ActiveOtherCountLabel));
     }
 
     private void ClearModels()
@@ -1871,6 +1886,19 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         return detailsSnapshot.Threads.Count(thread => ClassifyThreadModel(thread.Model, thread.ModelLabel) == model);
+    }
+
+    private string FormatThreadModelCount(string model, int generated)
+    {
+        if (generated == 0 || detailsSnapshot is not { ApiVersion: "v3" } snapshot)
+        {
+            return generated.ToString(CultureInfo.CurrentCulture);
+        }
+
+        var running = snapshot.Threads.Count(thread =>
+            thread.ActivityStatus == ApiThreadActivityStatus.Running &&
+            ClassifyThreadModel(thread.Model, thread.ModelLabel) == model);
+        return string.Create(CultureInfo.CurrentCulture, $"{running}（{generated}）");
     }
 
     private static string ClassifyThreadModel(string model, string label)

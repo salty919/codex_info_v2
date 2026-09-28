@@ -198,6 +198,7 @@ export struct ActiveThreadRow {
     title: string,
     full-title: string,
     activity-status: string,
+    is-running: bool,
     model: string,
     model-class: string,
     tokens: string,
@@ -969,7 +970,7 @@ export component WeekGauge inherits Rectangle {
 
 component ThreadModelStat inherits Rectangle {
     in property <string> label;
-    in property <int> count;
+    in property <string> count;
     in property <color> indicator-color;
     width: 80px;
     height: 42px;
@@ -1007,11 +1008,11 @@ export component AccountActivity inherits Rectangle {
     in property <string> active-thread-count-label;
     in property <bool> show-content: true;
     in property <int> active-thread-count: 0;
-    in property <int> sol-count: 0;
-    in property <int> terra-count: 0;
-    in property <int> luna-count: 0;
-    in property <int> astra-count: 0;
-    in property <int> other-count: 0;
+    in property <string> sol-count: "0";
+    in property <string> terra-count: "0";
+    in property <string> luna-count: "0";
+    in property <string> astra-count: "0";
+    in property <string> other-count: "0";
     callback open-threads();
     private property <length> model-area-x: 260px;
     private property <length> model-stat-width: (root.width - 348px) / 5;
@@ -1576,7 +1577,7 @@ export component ThreadsWindow inherits Window {
                         width: parent.width;
                         height: 18px;
                         text: row.activity-status + (row.thread-age != "" ? " · " + row.thread-age : "");
-                        color: DesignTokens.text-secondary;
+                        color: row.is-running ? DesignTokens.danger : DesignTokens.text-secondary;
                         font-size: 12px;
                         horizontal-alignment: right;
                         vertical-alignment: top;

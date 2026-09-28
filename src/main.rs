@@ -18729,18 +18729,27 @@ fn active_thread_model_counts(threads: &[ActiveThread]) -> String {
     if threads.is_empty() {
         return String::new();
     }
-    let ActiveThreadSummary {
-        sol,
-        terra,
-        luna,
-        astra,
-        other,
-        ..
-    } = active_thread_summary(threads);
-    if astra > 0 {
-        format!("SOL {sol}  TERRA {terra}  LUNA {luna}  ASTRA {astra}  その他 {other}")
+    let generated = active_thread_summary(threads);
+    let running = active_thread_summary(
+        threads
+            .iter()
+            .filter(|thread| thread.activity_status == PublicThreadActivityStatus::Running),
+    );
+    format!(
+        "SOL {}  TERRA {}  LUNA {}  ASTRA {}  その他 {}",
+        format_thread_model_count(running.sol, generated.sol),
+        format_thread_model_count(running.terra, generated.terra),
+        format_thread_model_count(running.luna, generated.luna),
+        format_thread_model_count(running.astra, generated.astra),
+        format_thread_model_count(running.other, generated.other),
+    )
+}
+
+fn format_thread_model_count(running: i32, generated: i32) -> String {
+    if generated == 0 {
+        "0".into()
     } else {
-        format!("SOL {sol}  TERRA {terra}  LUNA {luna}  その他 {other}")
+        format!("{running}（{generated}）")
     }
 }
 
@@ -18754,7 +18763,9 @@ struct ActiveThreadSummary {
     other: i32,
 }
 
-fn active_thread_summary(threads: &[ActiveThread]) -> ActiveThreadSummary {
+fn active_thread_summary<'a>(
+    threads: impl IntoIterator<Item = &'a ActiveThread>,
+) -> ActiveThreadSummary {
     let mut summary = ActiveThreadSummary::default();
     for thread in threads {
         let bucket = match classify_active_thread_model(&thread.model_label) {
@@ -18892,6 +18903,9 @@ fn thread_presentation_rows(threads: &[ActiveThread]) -> Vec<ThreadPresentationR
         }
     }
     sort_thread_indices(&mut roots, threads);
+    roots.sort_by_key(|index| {
+        threads[*index].activity_status != PublicThreadActivityStatus::Running
+    });
     for siblings in &mut children {
         sort_thread_indices(siblings, threads);
     }
@@ -19013,6 +19027,7 @@ fn active_thread_rows_at_with_i18n(
                         PublicThreadActivityStatus::Unknown => None,
                     })
                     .into(),
+                is_running: thread.activity_status == PublicThreadActivityStatus::Running,
                 model: security::shorten_unicode(
                     &thread.model_label,
                     security::MAX_ACCOUNT_ACTIVITY_LABEL_SCALARS,
@@ -19949,6 +19964,20 @@ impl CodexInfoState {
         // Main is one presentation projection over one admitted row set. The
         // wire count remains an admission check, never a second UI authority.
         let thread_summary = active_thread_summary(&self.active_threads);
+        let running_summary = active_thread_summary(
+            self.active_threads
+                .iter()
+                .filter(|thread| thread.activity_status == PublicThreadActivityStatus::Running),
+        );
+        let show_generated =
+            self.service_published_pair.is_none() || self.service_v3_published_pair.is_some();
+        let model_count = |running, generated| {
+            if show_generated {
+                format_thread_model_count(running, generated)
+            } else {
+                generated.to_string()
+            }
+        };
         if thread_summary.total > 0 {
             ui.set_active_thread_count(thread_summary.total);
             ui.set_active_thread_count_label(
@@ -19958,18 +19987,28 @@ impl CodexInfoState {
                     )
                     .into(),
             );
-            ui.set_active_thread_sol_count(thread_summary.sol);
-            ui.set_active_thread_terra_count(thread_summary.terra);
-            ui.set_active_thread_luna_count(thread_summary.luna);
-            ui.set_active_thread_astra_count(thread_summary.astra);
-            ui.set_active_thread_other_count(thread_summary.other);
+            ui.set_active_thread_sol_count(
+                model_count(running_summary.sol, thread_summary.sol).into(),
+            );
+            ui.set_active_thread_terra_count(
+                model_count(running_summary.terra, thread_summary.terra).into(),
+            );
+            ui.set_active_thread_luna_count(
+                model_count(running_summary.luna, thread_summary.luna).into(),
+            );
+            ui.set_active_thread_astra_count(
+                model_count(running_summary.astra, thread_summary.astra).into(),
+            );
+            ui.set_active_thread_other_count(
+                model_count(running_summary.other, thread_summary.other).into(),
+            );
         } else {
             ui.set_active_thread_count(0);
-            ui.set_active_thread_sol_count(0);
-            ui.set_active_thread_terra_count(0);
-            ui.set_active_thread_luna_count(0);
-            ui.set_active_thread_astra_count(0);
-            ui.set_active_thread_other_count(0);
+            ui.set_active_thread_sol_count("0".into());
+            ui.set_active_thread_terra_count("0".into());
+            ui.set_active_thread_luna_count("0".into());
+            ui.set_active_thread_astra_count("0".into());
+            ui.set_active_thread_other_count("0".into());
             ui.set_active_thread_count_label(self.i18n.format_thread_count(0).into());
         }
     }
@@ -34151,6 +34190,64 @@ mod tests {
     }
 
     #[test]
+    fn thread_presentation_prioritizes_running_root_subtrees() {
+        let thread = |id: &str,
+                      activity_status: PublicThreadActivityStatus,
+                      updated_at: i64,
+                      parent: Option<&str>| ActiveThread {
+            activity_status,
+            id: id.into(),
+            title: id.into(),
+            updated_at,
+            parent_thread_id: parent.map(str::to_owned),
+            is_subagent: parent.is_some(),
+            ..ActiveThread::default()
+        };
+        let threads = vec![
+            thread(
+                "stopped-root",
+                PublicThreadActivityStatus::Stopped,
+                30,
+                None,
+            ),
+            thread(
+                "running-root",
+                PublicThreadActivityStatus::Running,
+                10,
+                None,
+            ),
+            thread(
+                "running-child",
+                PublicThreadActivityStatus::Running,
+                20,
+                Some("running-root"),
+            ),
+        ];
+
+        let presentation = thread_presentation_rows(&threads);
+        let displayed_ids = presentation
+            .iter()
+            .map(|row| threads[row.index].id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            displayed_ids,
+            ["running-root", "running-child", "stopped-root"]
+        );
+        assert_eq!(presentation[1].forest_depth, 1);
+        assert!(presentation[1].connected_to_parent);
+        let connections = presentation
+            .iter()
+            .enumerate()
+            .filter_map(|(row, presentation)| {
+                presentation
+                    .connected_to_parent
+                    .then_some((row.saturating_sub(1), row))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(connections, [(0, 1)]);
+    }
+
+    #[test]
     fn thread_presentation_is_parent_first_subtree_contiguous_and_total() {
         let thread = |id: &str,
                       updated_at: i64,
@@ -34297,6 +34394,52 @@ mod tests {
     }
 
     #[test]
+    fn main_thread_model_counts_pair_running_and_open() {
+        let thread = |id: &str, model_label: &str, activity_status: PublicThreadActivityStatus| {
+            ActiveThread {
+                activity_status,
+                id: id.into(),
+                model_label: model_label.into(),
+                ..ActiveThread::default()
+            }
+        };
+        let open_session_rows = vec![
+            thread(
+                "stopped-sol",
+                "gpt-5.6-sol",
+                PublicThreadActivityStatus::Stopped,
+            ),
+            thread(
+                "running-luna",
+                "gpt-5.6-luna",
+                PublicThreadActivityStatus::Running,
+            ),
+            thread(
+                "unknown-luna",
+                "gpt-5.6-luna",
+                PublicThreadActivityStatus::Unknown,
+            ),
+        ];
+
+        assert_eq!(open_session_rows.len(), 3);
+        assert_eq!(
+            super::active_thread_summary(&open_session_rows),
+            super::ActiveThreadSummary {
+                total: 3,
+                sol: 1,
+                terra: 0,
+                luna: 2,
+                astra: 0,
+                other: 0,
+            }
+        );
+        assert_eq!(
+            active_thread_model_counts(&open_session_rows),
+            "SOL 0（1）  TERRA 0  LUNA 1（2）  ASTRA 0  その他 0"
+        );
+    }
+
+    #[test]
     fn active_thread_model_counts_use_exact_known_tokens_and_keep_named_zeroes() {
         let thread = |id: &str, model_label: &str| ActiveThread {
             activity_status: PublicThreadActivityStatus::Running,
@@ -34323,7 +34466,7 @@ mod tests {
                 thread("luna", "gpt-5.6-luna"),
                 thread("unknown", "gpt-5.6-sol-terra"),
             ]),
-            "SOL 1  TERRA 1  LUNA 1  その他 1"
+            "SOL 1（1）  TERRA 1（1）  LUNA 1（1）  ASTRA 0  その他 1（1）"
         );
     }
 
@@ -41734,11 +41877,30 @@ mod tests {
 
     #[test]
     fn issue_362_linux_detail_row_shows_observed_activity_state() {
-        let mut stopped = active_thread_fixture(0, 1_800_000_000);
+        let mut running = active_thread_fixture(0, 1_800_000_000);
+        running.activity_status = PublicThreadActivityStatus::Running;
+        let mut stopped = active_thread_fixture(1, 1_800_000_000);
         stopped.activity_status = PublicThreadActivityStatus::Stopped;
-        let rows = active_thread_rows_at(&[stopped], 1_800_000_060);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].activity_status.as_str(), "停止中");
+        let mut unknown = active_thread_fixture(2, 1_800_000_000);
+        unknown.activity_status = PublicThreadActivityStatus::Unknown;
+        let rows = active_thread_rows_at(&[running, stopped, unknown], 1_800_000_060);
+        assert_eq!(rows.len(), 3);
+        let by_title = rows
+            .iter()
+            .map(|row| (row.full_title.as_str(), row.activity_status.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_title["title-000"], "動作中");
+        assert_eq!(by_title["title-001"], "停止中");
+        assert_eq!(by_title["title-002"], "未観測");
+
+        let components = include_str!("../ui/components.slint");
+        let status_line = components
+            .split("text: row.activity-status +")
+            .nth(1)
+            .and_then(|tail| tail.split("visible: true;").next())
+            .expect("Threads status text");
+        assert!(status_line.contains("DesignTokens.danger"));
+        assert!(status_line.contains("DesignTokens.text-secondary"));
     }
 
     #[test]

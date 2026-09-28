@@ -305,6 +305,7 @@ component順や表示所有者を変更しない。
   `open_session_thread_count=0`でも同じ`56px` cardに`0件`、5 modelの`0`、`68×30px`の
   `Details`を表示し、Detailsから空のThreads画面へ進める。未受理のcurrentやhistorical
   accountを0件とみなさず、historical accountではlive件数を表示しないが固定cardは保持する。
+  v3のmodel別表示は`動作中（生成済み）`の順とし、SOL 0件動作中/1件openなら`0（1）`、LUNA 1件動作中/2件openなら`1（2）`と表示する。openが0件なら`0`と表示する。総数は従来どおりopen全件数とする。
 - ModelUsageはLinuxの単一table構成を使い、各modelのInput/Cached input/Outputについてtokenと
   隣接する概算ドルを同じrowに置く。4 model×22pxをcard内に表示し、0件でも`120px`の固定cardと見出しを保持してemptyを明示する。
   値の意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
@@ -434,6 +435,8 @@ component順や表示所有者を変更しない。
   外部の`thread/name/set`で保存している場合はその値を表示し、保存名が空なら`未設定`とする。
   「アクティブなスレッド」などの汎用名やpreview値へfallbackしない。
 - 一覧は`THREAD-OPEN-362`の現在openのSession threadを含み、各行の明示状態を「動作中」「停止中」「未観測」で表示する。未観測を推測で置換しない。
+  動作中の状態文字はdanger赤`#EF6A6A`、停止中と未観測は従来のsecondary文字色とする。親card背景とmodel accent色は変更しない。
+- 動作中のrootを停止中・未観測のrootより先に表示し、同じ状態のrootと兄弟の既存順を維持する。各rootの直後に子孫をdepth-firstで連続表示し、子だけを親から切り離して並べ替えない。
 - contextは同じthreadの観測済みusage/window pairだけを表示し、usage=0は有効な0%として表示する。
   pairがない、windowが0以下、または旧checkpointのNULLは`未観測`とし、累積値や別sourceから推測・合成しない。
   割合は整数比をround-half-upで小数点以下最大2桁へ丸め、末尾0を除去し、100%を上限とする。次の観測で得たpairは

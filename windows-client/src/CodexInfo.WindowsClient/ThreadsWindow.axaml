@@ -118,6 +118,7 @@
                       <TextBlock Classes="label"
                                  HorizontalAlignment="Right"
                                  Text="{Binding ActivityStatusText}"
+                                 Foreground="{Binding ActivityStatusHex}"
                                  AutomationProperties.Name="{Binding ActivityStatusText}" />
                       <TextBlock Classes="label"
                                  HorizontalAlignment="Right"
