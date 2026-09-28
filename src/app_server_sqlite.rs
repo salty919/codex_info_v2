@@ -1047,9 +1047,23 @@ mod tests {
         initialize_root_lock_file(&fixture.cache);
         let foreign = fixture.cache.join("not-managed");
         fs::write(&foreign, b"keep").unwrap();
+        let entries_before = fs::read_dir(&fixture.cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
         let error = PreparedGeneration::prepare(&fixture.cache, &fixture.codex).unwrap_err();
+
         assert_eq!(error.kind(), GenerationErrorKind::UnsafeGeneration);
         assert_eq!(fs::read(foreign).unwrap(), b"keep");
+        let entries_after = fs::read_dir(&fixture.cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(entries_after, entries_before);
+        assert!(!entries_after
+            .iter()
+            .any(|name| name.to_string_lossy().starts_with(GENERATION_PREFIX)));
     }
 
     #[test]
