@@ -19969,8 +19969,8 @@ impl CodexInfoState {
                 .iter()
                 .filter(|thread| thread.activity_status == PublicThreadActivityStatus::Running),
         );
-        let show_generated = self.service_published_pair.is_none()
-            || self.service_v3_published_pair.is_some();
+        let show_generated =
+            self.service_published_pair.is_none() || self.service_v3_published_pair.is_some();
         let model_count = |running, generated| {
             if show_generated {
                 format_thread_model_count(running, generated)
@@ -19987,11 +19987,21 @@ impl CodexInfoState {
                     )
                     .into(),
             );
-            ui.set_active_thread_sol_count(model_count(running_summary.sol, thread_summary.sol).into());
-            ui.set_active_thread_terra_count(model_count(running_summary.terra, thread_summary.terra).into());
-            ui.set_active_thread_luna_count(model_count(running_summary.luna, thread_summary.luna).into());
-            ui.set_active_thread_astra_count(model_count(running_summary.astra, thread_summary.astra).into());
-            ui.set_active_thread_other_count(model_count(running_summary.other, thread_summary.other).into());
+            ui.set_active_thread_sol_count(
+                model_count(running_summary.sol, thread_summary.sol).into(),
+            );
+            ui.set_active_thread_terra_count(
+                model_count(running_summary.terra, thread_summary.terra).into(),
+            );
+            ui.set_active_thread_luna_count(
+                model_count(running_summary.luna, thread_summary.luna).into(),
+            );
+            ui.set_active_thread_astra_count(
+                model_count(running_summary.astra, thread_summary.astra).into(),
+            );
+            ui.set_active_thread_other_count(
+                model_count(running_summary.other, thread_summary.other).into(),
+            );
         } else {
             ui.set_active_thread_count(0);
             ui.set_active_thread_sol_count("0".into());
@@ -34219,7 +34229,10 @@ mod tests {
             .iter()
             .map(|row| threads[row.index].id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(displayed_ids, ["running-root", "running-child", "stopped-root"]);
+        assert_eq!(
+            displayed_ids,
+            ["running-root", "running-child", "stopped-root"]
+        );
         assert_eq!(presentation[1].forest_depth, 1);
         assert!(presentation[1].connected_to_parent);
         let connections = presentation
@@ -34382,15 +34395,14 @@ mod tests {
 
     #[test]
     fn main_thread_model_counts_pair_running_and_open() {
-        let thread =
-            |id: &str, model_label: &str, activity_status: PublicThreadActivityStatus| {
-                ActiveThread {
-                    activity_status,
-                    id: id.into(),
-                    model_label: model_label.into(),
-                    ..ActiveThread::default()
-                }
-            };
+        let thread = |id: &str, model_label: &str, activity_status: PublicThreadActivityStatus| {
+            ActiveThread {
+                activity_status,
+                id: id.into(),
+                model_label: model_label.into(),
+                ..ActiveThread::default()
+            }
+        };
         let open_session_rows = vec![
             thread(
                 "stopped-sol",
