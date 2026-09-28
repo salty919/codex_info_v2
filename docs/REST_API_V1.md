@@ -173,14 +173,12 @@ SQLiteの保持期間は過去3暦月である。一方、1回のDB取得と`det
 最長1暦月の半開区間 `(one_month_before(observed_at), observed_at]` に限定する。history samples上限は
 31日分の1分bucketに相当する`44,640`、history periods `128`、confirmed history gaps `4,096`、threads `256`である。v3 history pageのrow数は固定せず、選択期間の残件数と上記OOM境界から決まる。v1/v2のmodels上限は固定3件、v3のtop-levelおよび各history rowのmodels上限はOOM/DoS境界として`1,024`件である。
 
-### 応答時間SLOと容量条件
+### 容量条件とfailure isolation
 
-Release buildを用い、warm loopback、in-flight 1で3回のwarm-up後、request送信開始からresponse body全受信までを各profile 30回測る。
-値を昇順に並べnearest-rankのP90を27番目、P95を29番目とする。profileはhealth、current、periods、選択期間history初回、同cursor差分、threads、固定4xxの到達経路に限定する。各結果にはCPU、memory、storage、OS、build、実際のwire bytes、sample数、model数、thread数を併記し、異なる環境または入力規模を同じprofileとして比較しない。
 
-応答時間はDBを置くmachine、storage、同時負荷、入力規模で変わる非固定値である。従って、最低動作環境と承認済みbaselineを定義するまでは、根拠のない絶対ms値、固定row数、任意の全直積をRelease拒否条件にしない。P90/P95は同じ環境・同じ入力規模に対する退行検出値として保存し、currentが履歴保持量に、history deltaが既取得prefixに比例して増大していないことを確認する。client hard timeoutは外部停止をUIへ閉じ込めるfailure-containment境界であり、serverの性能保証値ではない。timeout・欠測・安全境界超過を測定PASSへ丸めず、該当surfaceのlast-goodを保持してrecorderを継続する。
+応答時間はDBを置くmachine、storage、同時負荷、入力規模で変わる非固定値である。従って、最低動作環境と承認済みbaselineを定義するまでは、根拠のない絶対ms値、固定row数、任意の全直積をRelease拒否条件にしない。client hard timeoutは外部停止をUIへ閉じ込めるfailure-containment境界であり、serverの性能保証値ではない。timeout・欠測・安全境界超過を成功扱いせず、該当surfaceのlast-goodを保持してrecorderを継続する。
 
-固定できる値はschema、整合性、保持期間、取得範囲、処理量の次数、failure isolationおよびOOM/DoS安全境界である。CPU時間、I/O時間、1 pageのrow数、通常時payload bytesは固定しない。最低動作環境が製品authorityとして定義された後だけ、その環境と規定datasetから絶対P90/P95のRelease閾値を導出できる。DB読出しはtimestamp/reset複合indexを使い、
+固定できる値はschema、整合性、保持期間、取得範囲、処理量の次数、failure isolationおよびOOM/DoS安全境界である。CPU時間、I/O時間、1 pageのrow数、通常時payload bytesは固定しない。DB読出しはtimestamp/reset複合indexを使い、
 3暦月を保持したDBから1暦月窓のraw候補を一度materializeし、同一分のreset aliasをcanonicalizeした公開sampleだけを44,640点以下にする。raw alias行数を44,640で打ち切ったり取得失敗にしたりせず、full table scan、保持3暦月全体の読出し、UI threadでの
 行単位publishを禁止し、candidate失敗時はlast-good publicationを保持する。
 ここで扱うpublic REST resourceは、`DATA_PROTECTION_POLICY.md`が別の入力境界に定義するinternal validated snapshotのOOM/DoS安全境界とは別物であり、その`1 MiB`をpublic response cap、通常件数、性能gateへ流用しない。どの安全境界もdecode後の推測値へ

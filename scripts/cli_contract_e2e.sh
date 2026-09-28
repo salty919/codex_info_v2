@@ -127,6 +127,8 @@ auth_file="$codex_root/auth.json"
 printf '%s\n' '{"auth_mode":"chatgpt","tokens":{"account_id":"fixture-account-129"}}' \
     >"$auth_file"
 chmod 600 "$auth_file"
+sqlite3 -batch -bail "$codex_root/state_5.sqlite" 'VACUUM;'
+chmod 600 "$codex_root/state_5.sqlite"
 
 common_env=(
     "HOME=$profile_root/home"
