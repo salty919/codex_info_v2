@@ -3072,12 +3072,19 @@ function Get-E2EThemeSelector {
 function Get-E2EThemeSelectionLabel {
     param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Selector)
 
-    $pattern = $null
-    Assert-E2E ($Selector.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$pattern)) `
-        'Settings theme ComboBox does not expose SelectionPattern.'
-    $selected = @($pattern.Current.GetSelection())
-    Assert-E2E ($selected.Count -eq 1) "Settings theme ComboBox has $($selected.Count) selections."
-    return [string]$selected[0].Current.Name
+    # Avalonia's ComboBox UIA SelectionPattern may return zero elements while
+    # the selected DataTemplate TextBlock is visibly rendered. Read that one
+    # on-screen text peer, rather than treating the empty pattern as a choice.
+    $expand = $null
+    Assert-E2E ($Selector.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) `
+        'Settings theme ComboBox has no ExpandCollapsePattern.'
+    Assert-E2E ($expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) `
+        'Settings theme ComboBox must be collapsed before its selected label is read.'
+    $labels = @('Classic Dark', 'Graphite Dark', 'Light')
+    $visible = @(Get-E2EVisibleControlElements $Selector ([System.Windows.Automation.ControlType]::Text) |
+        ForEach-Object { [string]$_.Current.Name } | Where-Object { $labels -ccontains $_ })
+    Assert-E2E ($visible.Count -eq 1) "Settings theme ComboBox must render one selected label; observed: $($visible -join ',')."
+    return [string]$visible[0]
 }
 
 function Select-E2ETheme {
@@ -3101,6 +3108,9 @@ function Select-E2ETheme {
     $actualLabels = @($items | ForEach-Object { [string]$_.Current.Name })
     Assert-E2E (($actualLabels -join '|') -ceq ($labels -join '|')) "Theme preset order differs: $($actualLabels -join ',')."
     Select-E2EListItem $SettingsRoot $Label
+    if ($expand.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+        $expand.Collapse()
+    }
     Wait-E2E -Description "theme UIA selection '$Label'" -Probe {
         return (Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $SettingsRoot)) -ceq $Label
     } | Out-Null
@@ -3288,6 +3298,7 @@ function Invoke-E2EThemePresets {
         -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
     $windows.Setup = Open-E2ESetupFromSettings $windows.Settings.Root $ProcessId
 
+    $null = Capture-E2EWindow $windows.Settings.Handle 'theme-settings-initial-selection'
     $selector = Get-E2EThemeSelector $windows.Settings.Root
     Assert-E2E ((Get-E2EThemeSelectionLabel $selector) -ceq 'Classic Dark') 'Legacy six-key settings did not select Classic Dark.'
     Assert-E2EThemeSurfaces $windows 'classic-dark'
@@ -3963,6 +3974,10 @@ finally {
                 else {
                     Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction SilentlyContinue
                 }
+            }
+            if ($ThemePresets) {
+                Assert-E2E $script:e2eProcess.HasExited 'Themed client remained running during cleanup.'
+                Write-E2E "theme-process-cleanup: PASS pid=$($script:e2eProcess.Id) exited=True"
             }
         }
         catch {
