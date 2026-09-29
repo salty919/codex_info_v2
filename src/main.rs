@@ -50403,7 +50403,9 @@ mod tests {
         let windows =
             include_str!("../windows-client/src/CodexInfo.WindowsClient/ThreadsWindow.axaml");
         assert!(windows.contains("Background=\"{Binding CardBackgroundHex}\""));
-        assert!(windows.contains("<Setter Property=\"BorderBrush\" Value=\"#2B425B\" />"));
+        assert!(windows.contains(
+            "<Setter Property=\"BorderBrush\" Value=\"{DynamicResource Theme2B425B}\" />"
+        ));
 
         let threads = include_str!("../ui/components.slint")
             .split("export component ThreadsWindow inherits Window {")

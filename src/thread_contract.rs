@@ -1855,11 +1855,42 @@ where
     // candidates would create a partial snapshot and hide data loss.  Keep
     // the previous complete snapshot at the caller instead.
     if saw_candidate_failure {
-        ThreadCycleOutcome::CycleError
-    } else if !snapshots.is_empty() {
-        ThreadCycleOutcome::Snapshots(snapshots)
-    } else {
+        return ThreadCycleOutcome::CycleError;
+    }
+
+    let candidate_ids: HashSet<&str> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.thread_id.as_str())
+        .collect();
+    let mut excluded_ids: HashSet<String> = snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            let parent_id = snapshot.parent_thread_id.as_deref()?;
+            (!parent_id.is_empty() && !candidate_ids.contains(parent_id))
+                .then(|| snapshot.thread_id.clone())
+        })
+        .collect();
+    loop {
+        let excluded_children: Vec<String> = snapshots
+            .iter()
+            .filter_map(|snapshot| {
+                let parent_id = snapshot.parent_thread_id.as_deref()?;
+                (excluded_ids.contains(parent_id)
+                    && !excluded_ids.contains(snapshot.thread_id.as_str()))
+                .then(|| snapshot.thread_id.clone())
+            })
+            .collect();
+        if excluded_children.is_empty() {
+            break;
+        }
+        excluded_ids.extend(excluded_children);
+    }
+    snapshots.retain(|snapshot| !excluded_ids.contains(snapshot.thread_id.as_str()));
+
+    if snapshots.is_empty() {
         ThreadCycleOutcome::NoThread
+    } else {
+        ThreadCycleOutcome::Snapshots(snapshots)
     }
 }
 
@@ -4098,6 +4129,106 @@ mod tests {
                 if threads.len() == 2 && threads.iter().all(|thread|
                     thread.activity_status == ThreadActivityStatus::Stopped)
         ));
+    }
+
+    #[test]
+    fn thread_c_complete_cycle_reaches_state_validation() {
+        let mut parent = thread_fixture("cycle-parent", 20, "cycle-parent");
+        parent["source"] = json!({"subAgent":{"thread_spawn":{
+            "parent_thread_id":"cycle-child",
+            "depth":1
+        }}});
+        let mut child = thread_fixture("cycle-child", 10, "cycle-child");
+        child["source"] = json!({"subAgent":{"thread_spawn":{
+            "parent_thread_id":"cycle-parent",
+            "depth":1
+        }}});
+
+        let outcome = select_active_threads(
+            terminal_cycle(vec![parent, child]),
+            |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"task_started"})])) },
+        );
+        assert!(matches!(
+            outcome,
+            ThreadCycleOutcome::Snapshots(rows)
+                if rows.iter().map(|row| row.thread_id.as_str()).collect::<Vec<_>>()
+                    == ["cycle-parent", "cycle-child"]
+        ));
+    }
+
+    #[test]
+    fn thread_c_missing_open_parent_excludes_descendants_but_keeps_valid_subtrees() {
+        let subagent = |id: &str, updated_at: i64, parent_id: &str, depth: i64| {
+            let mut thread = thread_fixture(id, updated_at, id);
+            thread["source"] = json!({"subAgent":{"thread_spawn":{
+                "parent_thread_id":parent_id,
+                "depth":depth
+            }}});
+            thread
+        };
+        let mut valid_parent = thread_fixture("valid-parent", 50, "valid-parent");
+        valid_parent["source"] = json!("cli");
+        let valid_child = subagent("valid-child", 40, "valid-parent", 1);
+        let mut independent_root = thread_fixture("independent-root", 30, "independent-root");
+        independent_root["source"] = json!("cli");
+        let mut stopped_open_parent =
+            thread_fixture("stopped-open-parent", 20, "stopped-open-parent");
+        stopped_open_parent["source"] = json!("cli");
+        stopped_open_parent["status"] = json!({"type":"idle"});
+        let stopped_open_child = subagent("stopped-open-child", 10, "stopped-open-parent", 1);
+        let candidates = vec![
+            subagent("orphan-child", 90, "missing-parent", 1),
+            subagent("orphan-grandchild", 80, "orphan-child", 2),
+            subagent("unknown-parent", 25, "", 1),
+            valid_child,
+            valid_parent,
+            independent_root,
+            stopped_open_child,
+            stopped_open_parent,
+        ];
+
+        let outcome = select_active_threads(
+            terminal_cycle(candidates.clone()),
+            |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"task_started"})])) },
+        );
+        let ThreadCycleOutcome::Snapshots(rows) = outcome else {
+            panic!("a complete open-Session cycle publishes valid thread membership");
+        };
+        let published_ids: std::collections::HashSet<_> =
+            rows.iter().map(|row| row.thread_id.as_str()).collect();
+        assert_eq!(
+            published_ids,
+            [
+                "valid-parent",
+                "valid-child",
+                "independent-root",
+                "unknown-parent",
+                "stopped-open-parent",
+                "stopped-open-child",
+            ]
+            .into_iter()
+            .collect()
+        );
+        let stopped_parent = rows
+            .iter()
+            .find(|row| row.thread_id == "stopped-open-parent")
+            .expect("stopped parent remains open");
+        assert_eq!(
+            stopped_parent.activity_status,
+            ThreadActivityStatus::Stopped
+        );
+
+        let failed = select_active_threads(
+            terminal_cycle(candidates),
+            |candidate| -> Result<Vec<u8>, ()> {
+                if candidate.id() == "valid-child" {
+                    Err(())
+                } else {
+                    Ok(rollout_bytes(&[json!({"type":"task_started"})]))
+                }
+            },
+        );
+        assert_eq!(failed, ThreadCycleOutcome::CycleError);
     }
 
     #[test]
