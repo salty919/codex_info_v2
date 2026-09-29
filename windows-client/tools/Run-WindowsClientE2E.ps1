@@ -3317,7 +3317,7 @@ function Invoke-E2EThemePresets {
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     Assert-E2E ($pastDisplayLabels.Count -eq 1) `
         "Fixture past period has no unique rendered label: $($pastDisplayLabels -join ', ')."
-    $pastDisplay = "$([string]$period.Current.Name)｜$($pastDisplayLabels[0])"
+    $pastDisplay = ([string]$period.Current.Name) + [char]0xFF5C + ([string]$pastDisplayLabels[0])
     Select-E2EListItem $graphRoot $pastLabel
     Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastDisplay
     Wait-E2EGraphLoadSettled $graphRoot
