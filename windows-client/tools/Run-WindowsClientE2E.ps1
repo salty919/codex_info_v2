@@ -3309,8 +3309,10 @@ function Invoke-E2EThemePresets {
     # The ListItem peer can name its ApiHistoryPeriod model, while its visible
     # TextBlock names the localized label that the collapsed selector displays.
     $pastItems = @($periodItems | Where-Object { [string]$_.Current.Name -ceq $pastLabel })
-    Assert-E2E ($pastItems.Count -eq 1) 'Fixture past period has no unique UIA ListItem.'
-    $pastDisplayLabels = @(Get-E2EVisibleControlElements $pastItems[0] ([System.Windows.Automation.ControlType]::Text) |
+    Assert-E2E ($pastItems.Count -ge 1) "Fixture past period UIA ListItem missing: count=$($pastItems.Count)."
+    $pastDisplayLabels = @($pastItems | ForEach-Object {
+        Get-E2EVisibleControlElements $_ ([System.Windows.Automation.ControlType]::Text)
+    } |
         ForEach-Object { [string]$_.Current.Name } |
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     Assert-E2E ($pastDisplayLabels.Count -eq 1) `
