@@ -3010,6 +3010,55 @@ $script:e2eThemeColors = @{
         ParentCard = '#DDEAF5'; ChildCard = '#FFFFFF'; ThreadBorder = '#B6C5D4'; ThreadRail = '#6B839A'; Running = '#B23553'
         Remaining = '#176AAB'; Popup = '#EEF3F8'; PopupSelected = '#D9EBF8'; Focus = '#176AAB'
     }
+    'paper-light' = @{
+        Window = '#F7F6F2'; Card = '#FFFFFC'; Primary = '#252B31'; Secondary = '#59636B'; Accent = '#356C91'
+        Plot = '#FFFFFC'; Grid = '#D8E0E5'; Idle = '#ECEFEB'; QuotaEmpty = '#B7CDD8'; QuotaFilled = '#356C91'
+        ReadyBackground = '#E6F3EB'; ReadyBorder = '#5C9976'; ReadyAccent = '#216543'
+        ParentCard = '#E2EDF2'; ChildCard = '#FFFFFC'; ThreadBorder = '#B7C7D0'; ThreadRail = '#708D9E'; Running = '#B23553'
+        Remaining = '#356C91'; Popup = '#F1F4F1'; PopupSelected = '#DAE9EE'; Focus = '#276A91'
+    }
+    'sand-light' = @{
+        Window = '#FDF6E3'; Card = '#FFFBEF'; Primary = '#334650'; Secondary = '#5D6B6F'; Accent = '#1B748A'
+        Plot = '#FFFBEF'; Grid = '#C9D6D2'; Idle = '#EBE4D2'; QuotaEmpty = '#B3C9C5'; QuotaFilled = '#1B748A'
+        ReadyBackground = '#E3F0E2'; ReadyBorder = '#6D9B72'; ReadyAccent = '#2B714A'
+        ParentCard = '#E1E9D9'; ChildCard = '#FFFBEF'; ThreadBorder = '#BCCBBC'; ThreadRail = '#728D84'; Running = '#A83D48'
+        Remaining = '#1B748A'; Popup = '#F5EDDA'; PopupSelected = '#DCE8DB'; Focus = '#126A7F'
+    }
+    'steel-light' = @{
+        Window = '#F3F5F8'; Card = '#FFFFFF'; Primary = '#202B38'; Secondary = '#586978'; Accent = '#275FA8'
+        Plot = '#FFFFFF'; Grid = '#D5DEE9'; Idle = '#E8EEF5'; QuotaEmpty = '#A9C4E1'; QuotaFilled = '#275FA8'
+        ReadyBackground = '#E5F2EA'; ReadyBorder = '#6EAA83'; ReadyAccent = '#1E7047'
+        ParentCard = '#DDE9F6'; ChildCard = '#FFFFFF'; ThreadBorder = '#BACBDD'; ThreadRail = '#728BA9'; Running = '#B42F49'
+        Remaining = '#275FA8'; Popup = '#EDF2F8'; PopupSelected = '#D7E5F7'; Focus = '#275FA8'
+    }
+    'ocean-dark' = @{
+        Window = '#10182A'; Card = '#18263D'; Primary = '#EAF3FF'; Secondary = '#ACBED3'; Accent = '#56B8F2'
+        Plot = '#111D33'; Grid = '#304968'; Idle = '#1E304B'; QuotaEmpty = '#3D668B'; QuotaFilled = '#56B8F2'
+        ReadyBackground = '#16372F'; ReadyBorder = '#3A8266'; ReadyAccent = '#72CDA3'
+        ParentCard = '#213958'; ChildCard = '#18263D'; ThreadBorder = '#45617F'; ThreadRail = '#82A9C5'; Running = '#F28B9B'
+        Remaining = '#56B8F2'; Popup = '#192B45'; PopupSelected = '#284B70'; Focus = '#7CD2FF'
+    }
+    'teal-dark' = @{
+        Window = '#002B36'; Card = '#073642'; Primary = '#E6F0E9'; Secondary = '#A8C0BC'; Accent = '#4FB3C3'
+        Plot = '#073642'; Grid = '#3C6570'; Idle = '#174550'; QuotaEmpty = '#3C7583'; QuotaFilled = '#4FB3C3'
+        ReadyBackground = '#124B40'; ReadyBorder = '#47866A'; ReadyAccent = '#79CAA3'
+        ParentCard = '#174956'; ChildCard = '#073642'; ThreadBorder = '#3D6C75'; ThreadRail = '#76AEB3'; Running = '#F47D88'
+        Remaining = '#4FB3C3'; Popup = '#0B3D49'; PopupSelected = '#1E5B67'; Focus = '#74D2DB'
+    }
+    'ember-dark' = @{
+        Window = '#202126'; Card = '#2B2D32'; Primary = '#F4F0E9'; Secondary = '#BCBDB7'; Accent = '#E7BC62'
+        Plot = '#26272C'; Grid = '#505258'; Idle = '#35373D'; QuotaEmpty = '#77725F'; QuotaFilled = '#E7BC62'
+        ReadyBackground = '#244437'; ReadyBorder = '#5D9974'; ReadyAccent = '#9FDC9E'
+        ParentCard = '#3D3D47'; ChildCard = '#2B2D32'; ThreadBorder = '#686973'; ThreadRail = '#A5A3A0'; Running = '#F58A94'
+        Remaining = '#E7BC62'; Popup = '#303238'; PopupSelected = '#555147'; Focus = '#F2CB78'
+    }
+    'ink-dark' = @{
+        Window = '#000000'; Card = '#121212'; Primary = '#FFFFFF'; Secondary = '#D8D8D8'; Accent = '#6DD3FF'
+        Plot = '#050505'; Grid = '#787878'; Idle = '#242424'; QuotaEmpty = '#808080'; QuotaFilled = '#6DD3FF'
+        ReadyBackground = '#002B17'; ReadyBorder = '#78E8A4'; ReadyAccent = '#78E8A4'
+        ParentCard = '#202A34'; ChildCard = '#121212'; ThreadBorder = '#FFFFFF'; ThreadRail = '#FFFFFF'; Running = '#FF8BA1'
+        Remaining = '#6DD3FF'; Popup = '#101010'; PopupSelected = '#174A66'; Focus = '#FFFFFF'
+    }
 }
 
 function Assert-E2EThemePixel {
@@ -3088,7 +3137,7 @@ function Get-E2EThemeSelectionLabel {
         'Settings theme ComboBox has no ExpandCollapsePattern.'
     Assert-E2E ($expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) `
         'Settings theme ComboBox must be collapsed before its selected label is read.'
-    $labels = @('Classic Dark', 'Graphite Dark', 'Light')
+    $labels = @('Classic Dark', 'Graphite Dark', 'Light', 'Paper Light', 'Sand Light', 'Steel Light', 'Ocean Dark', 'Teal Dark', 'Ember Dark', 'Ink Dark')
     $visible = @(Get-E2EVisibleControlElements $Selector ([System.Windows.Automation.ControlType]::Text) |
         ForEach-Object { [string]$_.Current.Name } | Where-Object { $labels -ccontains $_ })
     Assert-E2E ($visible.Count -eq 1) "Settings theme ComboBox must render one selected label; observed: $($visible -join ',')."
@@ -3106,11 +3155,11 @@ function Select-E2ETheme {
     Assert-E2E ($selector.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) `
         'Settings theme ComboBox does not expose ExpandCollapsePattern.'
     $expand.Expand()
-    $labels = @('Classic Dark', 'Graphite Dark', 'Light')
-    $items = Wait-E2E -Description 'three theme preset UIA options' -Probe {
+    $labels = @('Classic Dark', 'Graphite Dark', 'Light', 'Paper Light', 'Sand Light', 'Steel Light', 'Ocean Dark', 'Teal Dark', 'Ember Dark', 'Ink Dark')
+    $items = Wait-E2E -Description 'ten theme preset UIA options' -Probe {
         $visible = @(Get-E2EVisibleControlElements $SettingsRoot ([System.Windows.Automation.ControlType]::ListItem))
         $themeItems = @($visible | Where-Object { $labels -ccontains [string]$_.Current.Name })
-        if ($themeItems.Count -eq 3) { return $themeItems }
+        if ($themeItems.Count -eq 10) { return $themeItems }
         return $false
     }
     $actualLabels = @($items | ForEach-Object { [string]$_.Current.Name })
@@ -3122,7 +3171,7 @@ function Select-E2ETheme {
     Wait-E2E -Description "theme UIA selection '$Label'" -Probe {
         return (Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $SettingsRoot)) -ceq $Label
     } | Out-Null
-    Write-E2E "theme-selector: PASS options=3 selected=$Label"
+    Write-E2E "theme-selector: PASS options=10 selected=$Label"
 }
 
 function Open-E2ESetupFromSettings {
@@ -3248,6 +3297,7 @@ function Assert-E2EThemeSurfaces {
     # a visible in-window menu and a selected row.
     $metric = Find-E2EElementByAutomationId $graph.Root 'Graph.MetricSelector'
     Assert-E2E ($null -ne $metric) 'Graph metric selector is missing.'
+    Bring-E2EWindowToFront $graph.Handle
     Toggle-E2EElement $metric
     $menu = Wait-E2E -Description 'Graph metric popup UIA' -Probe {
         $candidate = Find-E2EElementByAutomationId $graph.Root 'Graph.MetricMenu'
@@ -3285,8 +3335,13 @@ function Invoke-E2EThemePresets {
         -ButtonAutomationId 'Main.OpenGraph' -Title 'Codex Info Graph' -Role 'Graph' -ProcessId $ProcessId
     $graphRoot = $windows.Graph.Root
     Wait-E2EGraphLoadSettled $graphRoot
-    $period = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
-    Assert-E2E ($null -ne $period) 'Graph period selector is missing.'
+    $period = Wait-E2E -Description 'enabled Graph period selector' -Probe {
+        $candidate = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
+        if ($null -ne $candidate -and $candidate.Current.IsEnabled -and -not $candidate.Current.IsOffscreen) {
+            return $candidate
+        }
+        return $false
+    }
     Toggle-E2EElement $period
     $periodItems = Wait-E2E -Description 'two rendered Graph period options' -Probe {
         $items = @(Get-E2EVisibleControlElements $graphRoot ([System.Windows.Automation.ControlType]::ListItem))
@@ -3342,7 +3397,7 @@ function Invoke-E2EThemePresets {
     Assert-E2E ((Get-E2EThemeSelectionLabel $selector) -ceq 'Classic Dark') 'Legacy six-key settings did not select Classic Dark.'
     Assert-E2EThemeSurfaces $windows 'classic-dark'
     $legacyBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
-    Select-E2ETheme $windows.Settings.Root 'Light'
+    Select-E2ETheme $windows.Settings.Root 'Paper Light'
     $preSave = Capture-E2EWindow $MainHandle 'theme-before-save-main'
     Assert-E2EThemePixel $preSave $MainHandle $script:e2eThemeColors['classic-dark'].Window 'before-save/Main/window' -MinimumPixels 32
     $close = Find-E2EElementByAutomationId $windows.Settings.Root 'Settings.Window.Close'
@@ -3367,6 +3422,13 @@ function Invoke-E2EThemePresets {
     }
     foreach ($choice in @(
             @{ Id = 'graphite-dark'; Label = 'Graphite Dark' },
+            @{ Id = 'paper-light'; Label = 'Paper Light' },
+            @{ Id = 'sand-light'; Label = 'Sand Light' },
+            @{ Id = 'steel-light'; Label = 'Steel Light' },
+            @{ Id = 'ocean-dark'; Label = 'Ocean Dark' },
+            @{ Id = 'teal-dark'; Label = 'Teal Dark' },
+            @{ Id = 'ember-dark'; Label = 'Ember Dark' },
+            @{ Id = 'ink-dark'; Label = 'Ink Dark' },
             @{ Id = 'light'; Label = 'Light' })) {
         Select-E2ETheme $windows.Settings.Root $choice.Label
         $save = Find-E2EButtonByName $windows.Settings.Root 'Save'
