@@ -14,6 +14,7 @@ X-START-05
 X-START-06
 X-THREAD-01
 WIN-VERSION-01
+WIN-THEME-422
 -->
 
 # Windowsクライアント UX設計仕様
@@ -35,8 +36,40 @@ X版はデータ意味論、状態、所有権の参照元であり、Windows版
 要求抽出が `EXTRACTION_COMPLETE` になるまで、未確定の契約は文書化に限定し、実装、テスト、
 ビルド、インストール、画面評価、成果物差し替えを行わない。Issue #349で利用者が確定した
 `WIN-PARITY-UX`、`ACCOUNT-UX-134`およびI18N ownerの`PROC-I18N-01`に属する下記Main構成と
-Linux timezone設定だけは有限scopeの実装・直接評価対象とする。この限定決定は本書全体の
+Linux timezone設定、Issue #422で利用者が選択したWindows版の`WIN-THEME-422`だけは有限scopeの実装・直接評価対象とする。この限定決定は本書全体の
 `PRODUCT_PENDING`を解除せず、他の未確定契約を`EXTRACTION_COMPLETE`として扱う根拠にしない。
+
+## WIN-THEME-422 — Windows版の組込みカラーテーマ
+
+Windows Settingsの外観欄は`classic-dark`（従来配色・既定）、`graphite-dark`、`light`の順に3つの組込みpresetを選択できる。VS Codeのように利用者がpresetを切り替える操作を提供し、外部themeの取込みや任意色編集は含めない。選択中は現在表示を変えず、既存の保存操作がDATA ownerの`WIN-THEME-PREF-422`に従って成功した後に、開いているMain、Settings、Setup、Graph、Threads、Legalの全Windowへ反映する。取消または保存失敗時は表示中の色と永続設定を変えない。次回起動時は保存したpresetをMain表示前に適用する。theme変更によってquota、Graph系列データ、Threadsの状態、接続、取得要求を変更しない。
+
+| preset | window背景 | card面 | 主要文字 | 補助文字 | accent | Graph背景 | grid | idle band |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `classic-dark` | `#0E141E` | `#151F2D` | `#E9EFF8` | `#A8B7CA` | `#56B2F5` | `#121C2C` | `#263850` | `#1A2838` |
+| `graphite-dark` | `#181A1F` | `#242830` | `#F1F3F5` | `#B5BEC9` | `#69B5F7` | `#20242B` | `#3C4652` | `#303944` |
+| `light` | `#F4F7FB` | `#FFFFFF` | `#1C2834` | `#526579` | `#176AAB` | `#FFFFFF` | `#CFD9E4` | `#E4EDF5` |
+
+E2Eで画面内の色を判定する追加roleは次のexact値とする。`status`はfixtureの正常時に見えるMainのready状態を指す。Graphの線色は描画系列、Threadsの色はカードと接続線へ適用し、文字や面の存在だけを色判定の代用にしない。
+
+| role | `classic-dark` | `graphite-dark` | `light` |
+| --- | --- | --- | --- |
+| quota gaugeの未充填面 | `#326799` | `#4A6B89` | `#A9CDE8` |
+| quota gaugeの充填面・Graph Remaining線 | `#56B2F5` | `#69B5F7` | `#176AAB` |
+| Main ready status背景 | `#143426` | `#18362A` | `#E5F5EC` |
+| Main ready status枠 | `#276C49` | `#327653` | `#4A9469` |
+| Main ready status強調 | `#4FB878` | `#5CC88A` | `#176E42` |
+| Threads親card背景 | `#243E5A` | `#343E4B` | `#DDEAF5` |
+| Threads子・独立card背景 | `#151F2D` | `#242830` | `#FFFFFF` |
+| Threads card枠 | `#2B425B` | `#4B5A6B` | `#B6C5D4` |
+| Threads接続線・junction | `#76A7CC` | `#8CACBF` | `#6B839A` |
+| Threads動作中の状態文字 | `#EF6A6A` | `#EF8585` | `#B23553` |
+| Graph selector popup面 | `#111B2C` | `#222730` | `#EEF3F8` |
+| Graph selector popup選択行 | `#244D74` | `#344D63` | `#D9EBF8` |
+| キーボードfocus枠 | `#8BD4FF` | `#9AD7F8` | `#176AAB` |
+
+`classic-dark`の既存固定色、状態色、model色は維持する。他のpresetは同じ状態・modelの識別を色相と状態文の組で保ち、明色面では読める濃色を使う。Graphの線・grid・idle band、Mainのquota/status、Threadsの親card・接続線・動作状態、focus・selector・popupも選択paletteから描画し、一部だけ旧暗色を残さない。画面geometry、情報と状態の意味、Linux版の色は変更しない。preset名と選択操作は対応言語のcatalogとUI Automationで識別できるようにする。実Windowsの同一最終buildで選択、保存、再起動復元、6 Windowの表示色を確認する。
+
+以下の既存節にあるWindows固定HEXのpixel oracleは`classic-dark`へ適用する。`graphite-dark`と`light`では、同じ情報・状態・描画geometryを保持しつつ、この節のpaletteへ変換した色を照合する。Linuxの固定HEXとpixel oracleは従来どおりとする。
 
 ## 1. UXの目的、利用者、主要タスク
 
@@ -67,8 +100,8 @@ Linux timezone設定だけは有限scopeの実装・直接評価対象とする�
 - 1画面に情報を詰め込んで、文字を小さくしたりページスクロールで隠したりすること。
 - 成立しているだけの仮アイコン、飾りのカード、意味の重複する説明文を増やすこと。
 - password/token/key/path、OpenSSH展開値、raw manual host/user、API URL、argv、stderrを保存すること。
-  再接続に必要な非秘密selector（`connectionProfile`と`connectionSelector`）だけは、6-key設定へ
-  atomic保存する。
+  再接続に必要な非秘密selector（`connectionProfile`と`connectionSelector`）は、旧6-keyまたは
+  `WIN-THEME-PREF-422`の新7-key設定へatomic保存する。
 
 ## 2. 絶対UX原則
 
@@ -224,8 +257,8 @@ X版から必ず継承するのは、値の正本、期間境界、欠測/重複
 ### 3.1 初回導入
 
 Setupはウィザード型の段階表示とする。各段階は「現在地」「入力/結果」「次の操作」を持ち、
-無効な入力では次へ進めない。保存schemaは`language/setupCompleted/connectionConfigured/timeZoneId/connectionProfile/connectionSelector`
-の6-keyに固定し、`connectionProfile=none|wsl|sshConfigAlias`、WSL selectorはinstalled distributionの
+無効な入力では次へ進めない。旧6-key schemaは`language/setupCompleted/connectionConfigured/timeZoneId/connectionProfile/connectionSelector`
+とし、新規保存は`WIN-THEME-PREF-422`の`themeId`を加えた7-keyとする。`connectionProfile=none|wsl|sshConfigAlias`、WSL selectorはinstalled distributionの
 exact token、SSH selectorはliteral Host alias（`^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`）とする。
 raw manual host/userはone-session raw recoveryだけで、durable settings・完了状態・再接続selectorにしない。
 SSH/WSL childはshell、cmd、PowerShellを介さず、実行ファイルと個別tokenのArgumentListで起動する。
@@ -452,9 +485,10 @@ component順や表示所有者を変更しない。
   同一directory内のatomic renameを完了してから開いているMain/Graphの時刻表示へ即時反映し、Windowを閉じる。
   成功した保存値は通常のprocess再起動後に復元する。
   保存失敗時はactive timezoneと既存表示を保持し、Settingsを開いたまま失敗を表示する。
-  Windows Settingsの項目、6-key schemaおよび動作は変更しない。
+  このLinux timezone変更自体はWindows Settingsを変更しない。Windowsの後続theme設定と7-key保存は`WIN-THEME-422` / `WIN-THEME-PREF-422`に従う。
 - profile/selector、API到達性、readiness health、details state、auth-start、auth-checkを別概念として表示する。
-- exact settings keysは`language/setupCompleted/connectionConfigured/timeZoneId/connectionProfile/connectionSelector`。
+- 旧exact settings keysは`language/setupCompleted/connectionConfigured/timeZoneId/connectionProfile/connectionSelector`。
+  新規保存の7番目の`themeId`は`WIN-THEME-PREF-422`が所有する。
   profile enumは`none|wsl|sshConfigAlias`、selectorは`none`、installed distribution exact token、または
   literal Host aliasだけとする。
 - password/token/key/path、OpenSSH展開値、raw manual host/user、API URL、argv、stderrは保存0。SSH自動経路は

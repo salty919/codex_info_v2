@@ -9,21 +9,21 @@
         WindowStartupLocation="CenterOwner" CanResize="False"
         WindowDecorations="None" ExtendClientAreaToDecorationsHint="True" ExtendClientAreaTitleBarHeightHint="0"
         Title="Codex Info Setup" FontFamily="{StaticResource JapaneseFont}"
-        Background="#0E141E" Foreground="#E9EFF8">
+        Background="{DynamicResource Theme0E141E}" Foreground="{DynamicResource ThemeE9EFF8}">
   <Window.Styles>
-    <Style Selector="TextBlock.label"><Setter Property="FontSize" Value="13" /><Setter Property="Foreground" Value="#A8B7CA" /></Style>
-    <Style Selector="Border.surface"><Setter Property="Background" Value="#151F2D" /><Setter Property="BorderBrush" Value="#2C4258" /><Setter Property="BorderThickness" Value="1" /><Setter Property="CornerRadius" Value="14" /></Style>
-    <Style Selector="Button.primary"><Setter Property="Background" Value="#236B9E" /><Setter Property="BorderBrush" Value="#61B4EB" /><Setter Property="Foreground" Value="#F5FAFF" /><Setter Property="Padding" Value="16,8" /></Style>
-    <Style Selector="Button.primary:disabled"><Setter Property="Background" Value="#1B2735" /><Setter Property="BorderBrush" Value="#304052" /><Setter Property="Foreground" Value="#8EA1B5" /></Style>
-    <Style Selector="Button.secondary"><Setter Property="Background" Value="#1B2A3A" /><Setter Property="BorderBrush" Value="#36516B" /><Setter Property="Foreground" Value="#E9EFF8" /><Setter Property="Padding" Value="16,8" /></Style>
+    <Style Selector="TextBlock.label"><Setter Property="FontSize" Value="13" /><Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" /></Style>
+    <Style Selector="Border.surface"><Setter Property="Background" Value="{DynamicResource Theme151F2D}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme2C4258}" /><Setter Property="BorderThickness" Value="1" /><Setter Property="CornerRadius" Value="14" /></Style>
+    <Style Selector="Button.primary"><Setter Property="Background" Value="{DynamicResource Theme236B9E}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme61B4EB}" /><Setter Property="Foreground" Value="{DynamicResource ThemeF5FAFF}" /><Setter Property="Padding" Value="16,8" /></Style>
+    <Style Selector="Button.primary:disabled"><Setter Property="Background" Value="{DynamicResource Theme1B2735}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme304052}" /><Setter Property="Foreground" Value="{DynamicResource Theme8EA1B5}" /></Style>
+    <Style Selector="Button.secondary"><Setter Property="Background" Value="{DynamicResource Theme1B2A3A}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme36516B}" /><Setter Property="Foreground" Value="{DynamicResource ThemeE9EFF8}" /><Setter Property="Padding" Value="16,8" /></Style>
   </Window.Styles>
   <Grid Margin="28" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="18">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel Orientation="Horizontal" Spacing="12"><Border Width="42" Height="42" CornerRadius="12" Background="#1C5D91" BorderBrush="#5EA7E5" BorderThickness="1"><TextBlock FontSize="22" Text="◈" HorizontalAlignment="Center" VerticalAlignment="Center" /></Border><StackPanel VerticalAlignment="Center"><TextBlock FontSize="25" FontWeight="SemiBold" Text="{Binding Texts.SetupTitle}" /><TextBlock Classes="label" Text="{Binding Texts.Setup}" /></StackPanel></StackPanel>
-      <Button Grid.Column="1" Background="Transparent" BorderBrush="Transparent" Foreground="#A8B7CA" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Setup.Window.Close" Content="×" FontSize="22" ToolTip.Tip="{Binding Texts.Close}" />
+      <StackPanel Orientation="Horizontal" Spacing="12"><Border Width="42" Height="42" CornerRadius="12" Background="{DynamicResource Theme1C5D91}" BorderBrush="{DynamicResource Theme5EA7E5}" BorderThickness="1"><TextBlock FontSize="22" Text="◈" HorizontalAlignment="Center" VerticalAlignment="Center" /></Border><StackPanel VerticalAlignment="Center"><TextBlock FontSize="25" FontWeight="SemiBold" Text="{Binding Texts.SetupTitle}" /><TextBlock Classes="label" Text="{Binding Texts.Setup}" /></StackPanel></StackPanel>
+      <Button Grid.Column="1" Background="Transparent" BorderBrush="Transparent" Foreground="{DynamicResource ThemeA8B7CA}" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Setup.Window.Close" Content="×" FontSize="22" ToolTip.Tip="{Binding Texts.Close}" />
     </Grid>
     <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8">
-      <Border Width="10" Height="10" CornerRadius="5" Background="#5EA7E5" /><TextBlock Classes="label" Text="{Binding Texts.StepConnection}" /><Border Width="10" Height="10" CornerRadius="5" Background="#36516B" Margin="14,0,0,0" /><TextBlock Classes="label" Text="{Binding Texts.StepAuth}" /><Border Width="10" Height="10" CornerRadius="5" Background="#36516B" Margin="14,0,0,0" /><TextBlock Classes="label" Text="{Binding Texts.StepDone}" />
+      <Border Width="10" Height="10" CornerRadius="5" Background="{DynamicResource Theme5EA7E5}" /><TextBlock Classes="label" Text="{Binding Texts.StepConnection}" /><Border Width="10" Height="10" CornerRadius="5" Background="{DynamicResource Theme36516B}" Margin="14,0,0,0" /><TextBlock Classes="label" Text="{Binding Texts.StepAuth}" /><Border Width="10" Height="10" CornerRadius="5" Background="{DynamicResource Theme36516B}" Margin="14,0,0,0" /><TextBlock Classes="label" Text="{Binding Texts.StepDone}" />
     </StackPanel>
     <Border Grid.Row="2" Classes="surface" Padding="22">
       <!-- Keep a real content gutter for the vertical scrollbar.  Avalonia's
@@ -69,21 +69,21 @@
               <TextBox Text="{Binding SshHost, Mode=TwoWay}" PlaceholderText="{Binding Texts.SshHostPlaceholder}" AutomationProperties.Name="{Binding Texts.SshHostLabel}" />
             </StackPanel>
           </Grid>
-          <Border Background="#0A111A" CornerRadius="8" Padding="12">
+          <Border Background="{DynamicResource Theme0A111A}" CornerRadius="8" Padding="12">
             <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="8">
               <TextBlock FontFamily="Consolas" MinWidth="0" Text="{Binding SshCommand}" TextWrapping="Wrap" />
-              <TextBlock Grid.Row="1" Classes="label" Foreground="#E7C26A" Text="{Binding SshStatusText}" TextWrapping="Wrap" />
+              <TextBlock Grid.Row="1" Classes="label" Foreground="{DynamicResource ThemeE7C26A}" Text="{Binding SshStatusText}" TextWrapping="Wrap" />
               <Button Grid.Row="2" HorizontalAlignment="Right" Classes="secondary" Click="OnCopySsh" AutomationProperties.Name="{Binding Texts.Copy}" ToolTip.Tip="{Binding Texts.Copy}" Content="{Binding Texts.Copy}" />
             </Grid>
           </Border>
           <TextBlock Classes="label" Text="Linux / WSL" />
-          <Border Background="#0A111A" CornerRadius="8" Padding="12">
+          <Border Background="{DynamicResource Theme0A111A}" CornerRadius="8" Padding="12">
             <Grid RowDefinitions="Auto,Auto" RowSpacing="8">
               <TextBlock FontFamily="Consolas" MinWidth="0" Text="{Binding ApiCommand}" TextWrapping="Wrap" />
               <Button Grid.Row="1" HorizontalAlignment="Right" Classes="secondary" Click="OnCopyApi" AutomationProperties.Name="{Binding Texts.Copy}" ToolTip.Tip="{Binding Texts.Copy}" Content="{Binding Texts.Copy}" />
             </Grid>
           </Border>
-          <Border Background="#101F2D" CornerRadius="8" Padding="14"><Grid ColumnDefinitions="Auto,*" ColumnSpacing="10"><TextBlock Text="●" Foreground="#71C7FF" VerticalAlignment="Top" Margin="0,3,0,0" /><StackPanel Grid.Column="1"><TextBlock FontWeight="SemiBold" Text="{Binding StatusTitle}" /><TextBlock Classes="label" Text="{Binding StatusDetail}" TextWrapping="Wrap" /></StackPanel></Grid></Border>
+          <Border Background="{DynamicResource Theme101F2D}" CornerRadius="8" Padding="14"><Grid ColumnDefinitions="Auto,*" ColumnSpacing="10"><TextBlock Text="●" Foreground="{DynamicResource Theme71C7FF}" VerticalAlignment="Top" Margin="0,3,0,0" /><StackPanel Grid.Column="1"><TextBlock FontWeight="SemiBold" Text="{Binding StatusTitle}" /><TextBlock Classes="label" Text="{Binding StatusDetail}" TextWrapping="Wrap" /></StackPanel></Grid></Border>
         </StackPanel>
       </ScrollViewer>
     </Border>

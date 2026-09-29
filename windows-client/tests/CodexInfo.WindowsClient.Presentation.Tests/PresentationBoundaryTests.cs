@@ -346,14 +346,19 @@ public sealed class PresentationBoundaryTests
             .Single(element => element.Name.LocalName == "TextBlock" && element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.QuotaPeriodGauge");
         var gaugeItems = document.Descendants()
             .Single(element => element.Name.LocalName == "ItemsControl" && element.Attribute("ItemsSource")?.Value == "{Binding QuotaSegments}");
-        var colors = gaugeStyle.Descendants()
+        var resourceValues = gaugeStyle.Descendants()
             .Attributes("Value")
             .Select(attribute => attribute.Value)
-            .Where(value => value.StartsWith("#", StringComparison.Ordinal))
+            .Where(value => value.StartsWith("{DynamicResource Theme", StringComparison.Ordinal))
             .Concat(gaugeItems.Descendants()
                 .Attributes("Background")
                 .Select(attribute => attribute.Value)
-                .Where(value => value.StartsWith("#", StringComparison.Ordinal)))
+                .Where(value => value.StartsWith("{DynamicResource Theme", StringComparison.Ordinal)))
+            .ToArray();
+        Assert.All(resourceValues, value =>
+            Assert.Matches(@"^\{DynamicResource Theme[0-9A-Fa-f]{6}\}$", value));
+        var colors = resourceValues
+            .Select(value => "#" + value[22..^1].ToUpperInvariant())
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var xAccentPrimary = ReadSlintColor("accent-primary");

@@ -9,12 +9,20 @@ param(
     [string]$OutputDirectory = '',
     [switch]$Fixture,
     [switch]$FixtureContractTest,
+    [switch]$ThemePresets,
     [switch]$CompatibilitySmoke,
     [switch]$RequireCurrentPresentation,
     [string]$SourceSha = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($ThemePresets -and -not $Fixture) {
+    throw '-ThemePresets requires -Fixture.'
+}
+if ($ThemePresets -and ($FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation)) {
+    throw '-ThemePresets cannot be combined with another E2E mode.'
+}
 
 function Resolve-E2EOutputDirectory {
     param([string]$Requested)
@@ -71,6 +79,7 @@ $script:e2ePreviewEnabled = -not [string]::IsNullOrWhiteSpace($env:CODEX_INFO_WI
 $script:e2eSettingsPath = Join-Path $env:LOCALAPPDATA 'CodexInfo\settings.json'
 $script:e2eSettingsBackup = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-e2e-settings-" + [Guid]::NewGuid().ToString('N') + '.json')
 $script:e2eSettingsWasPresent = $false
+$script:e2eThemePresetsComplete = $false
 
 function Write-E2E {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -2504,7 +2513,9 @@ function New-E2EFixtureDocuments {
     $rawNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $now = $rawNow - ($rawNow % 60)
     $currentStart = $now - 60
-    $currentReset = $now + 7200
+    # Theme mode needs a genuinely ready status for the UX-spec ready-color
+    # oracle. The normal fixture retains its original reset-warning timing.
+    $currentReset = if ($ThemePresets) { $now + 172800 } else { $now + 7200 }
     $pastStart = $now - 360
     $pastReset = $now - 180
     # The current graph contract admits an unused band only after 10 minutes
@@ -2558,6 +2569,12 @@ function New-E2EFixtureDocuments {
 {"api_version":"v3","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"model":"SOL","total_tokens":1200,"input_tokens":800,"cached_input_tokens":200,"cache_write_input_tokens":0,"output_tokens":400,"estimated_cost":{"price_version":"E2E-SOL","ordinary_input_dollars":0.70,"cached_input_dollars":0.20,"cache_write_input_dollars":0.0,"output_dollars":0.30,"total_dollars":1.20}},{"model":"TERRA","total_tokens":2400,"input_tokens":1600,"cached_input_tokens":500,"cache_write_input_tokens":0,"output_tokens":800,"estimated_cost":{"price_version":"E2E-TERRA","ordinary_input_dollars":1.40,"cached_input_dollars":0.50,"cache_write_input_dollars":0.0,"output_dollars":0.50,"total_dollars":2.40}},{"model":"LUNA","total_tokens":3600,"input_tokens":2500,"cached_input_tokens":700,"cache_write_input_tokens":0,"output_tokens":1100,"estimated_cost":{"price_version":"E2E-LUNA","ordinary_input_dollars":2.00,"cached_input_dollars":0.70,"cache_write_input_dollars":0.0,"output_dollars":0.90,"total_dollars":3.60}}],"active_thread_count":3}
 "@
     $current = $current.Replace('"active_thread_count":3', '"active_thread_count":4')
+    if ($ThemePresets) {
+        # A 7-day quota window with 48 hours remaining keeps both filled and
+        # unfilled gauge cells visible while avoiding the 24-hour reset warning.
+        $details = $details.Replace('"window_seconds":14400', '"window_seconds":604800')
+        $current = $current.Replace('"window_seconds":14400', '"window_seconds":604800')
+    }
     $periods = @"
 {"api_version":"v3","history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$v3PastStart,"end_at":$v3PastReset,"reset_at":$v3PastReset,"label":"Past period","current":false}]}
 "@
@@ -2646,6 +2663,18 @@ function Exit-E2EFixture {
     }
     elseif (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) {
         Remove-Item -LiteralPath $script:e2eSettingsPath -Force
+    }
+    if ($ThemePresets) {
+        if ($script:e2eSettingsWasPresent) {
+            Assert-E2E (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) 'Original settings.json was not restored.'
+            $restoredBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
+            $backupBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsBackup))
+            Assert-E2E ($restoredBytes -ceq $backupBytes) 'Restored settings.json does not match its original bytes.'
+        }
+        else {
+            Assert-E2E (-not (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf)) 'Temporary settings.json remains after restoration.'
+        }
+        Write-E2E 'fixture-settings-restore: PASS'
     }
     if (Test-Path -LiteralPath $script:e2eSettingsBackup -PathType Leaf) {
         Remove-Item -LiteralPath $script:e2eSettingsBackup -Force
@@ -2957,6 +2986,455 @@ function Find-E2ECloseButton {
     return $candidates | Sort-Object { $_.Current.BoundingRectangle.Right } -Descending | Select-Object -First 1
 }
 
+# Independent literal oracle from WIN-THEME-422 in docs/WINDOWS_UX_SPEC.md.
+# Keep these values separate from ThemePalette and the running application's resources.
+$script:e2eThemeColors = @{
+    'classic-dark' = @{
+        Window = '#0E141E'; Card = '#151F2D'; Primary = '#E9EFF8'; Secondary = '#A8B7CA'; Accent = '#56B2F5'
+        Plot = '#121C2C'; Grid = '#263850'; Idle = '#1A2838'; QuotaEmpty = '#326799'; QuotaFilled = '#56B2F5'
+        ReadyBackground = '#143426'; ReadyBorder = '#276C49'; ReadyAccent = '#4FB878'
+        ParentCard = '#243E5A'; ChildCard = '#151F2D'; ThreadBorder = '#2B425B'; ThreadRail = '#76A7CC'; Running = '#EF6A6A'
+        Remaining = '#56B2F5'; Popup = '#111B2C'; PopupSelected = '#244D74'; Focus = '#8BD4FF'
+    }
+    'graphite-dark' = @{
+        Window = '#181A1F'; Card = '#242830'; Primary = '#F1F3F5'; Secondary = '#B5BEC9'; Accent = '#69B5F7'
+        Plot = '#20242B'; Grid = '#3C4652'; Idle = '#303944'; QuotaEmpty = '#4A6B89'; QuotaFilled = '#69B5F7'
+        ReadyBackground = '#18362A'; ReadyBorder = '#327653'; ReadyAccent = '#5CC88A'
+        ParentCard = '#343E4B'; ChildCard = '#242830'; ThreadBorder = '#4B5A6B'; ThreadRail = '#8CACBF'; Running = '#EF8585'
+        Remaining = '#69B5F7'; Popup = '#222730'; PopupSelected = '#344D63'; Focus = '#9AD7F8'
+    }
+    'light' = @{
+        Window = '#F4F7FB'; Card = '#FFFFFF'; Primary = '#1C2834'; Secondary = '#526579'; Accent = '#176AAB'
+        Plot = '#FFFFFF'; Grid = '#CFD9E4'; Idle = '#E4EDF5'; QuotaEmpty = '#A9CDE8'; QuotaFilled = '#176AAB'
+        ReadyBackground = '#E5F5EC'; ReadyBorder = '#4A9469'; ReadyAccent = '#176E42'
+        ParentCard = '#DDEAF5'; ChildCard = '#FFFFFF'; ThreadBorder = '#B6C5D4'; ThreadRail = '#6B839A'; Running = '#B23553'
+        Remaining = '#176AAB'; Popup = '#EEF3F8'; PopupSelected = '#D9EBF8'; Focus = '#176AAB'
+    }
+}
+
+function Assert-E2EThemePixel {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Capture,
+        [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
+        [Parameter(Mandatory = $true)][string]$Hex,
+        [Parameter(Mandatory = $true)][string]$Role,
+        [System.Windows.Automation.AutomationElement]$Element = $null,
+        [psobject]$ScreenBounds = $null,
+        [int]$Tolerance = 8,
+        [int]$MinimumPixels = 1
+    )
+
+    $target = [System.Drawing.ColorTranslator]::FromHtml($Hex)
+    $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
+    try {
+        $window = Get-E2EWindowBounds $WindowHandle
+        $left = 0; $top = 0; $right = $bitmap.Width; $bottom = $bitmap.Height
+        if ($null -ne $Element -or $null -ne $ScreenBounds) {
+            $rect = $ScreenBounds
+            if ($null -ne $Element) { $rect = $Element.Current.BoundingRectangle }
+            if ($null -ne $Element) {
+                Assert-E2E (-not $Element.Current.IsOffscreen -and $rect.Width -gt 0 -and $rect.Height -gt 0) "$Role UIA region is not visible."
+            }
+            $left = [Math]::Max(0, [int][Math]::Floor($rect.Left - $window.Left))
+            $top = [Math]::Max(0, [int][Math]::Floor($rect.Top - $window.Top))
+            $right = [Math]::Min($bitmap.Width, [int][Math]::Ceiling($rect.Right - $window.Left))
+            $bottom = [Math]::Min($bitmap.Height, [int][Math]::Ceiling($rect.Bottom - $window.Top))
+        }
+        Assert-E2E ($left -lt $right -and $top -lt $bottom) "$Role pixel region is empty."
+        $matches = 0
+        for ($y = $top; $y -lt $bottom -and $matches -lt $MinimumPixels; $y++) {
+            for ($x = $left; $x -lt $right -and $matches -lt $MinimumPixels; $x++) {
+                $actual = $bitmap.GetPixel($x, $y)
+                if ([Math]::Abs([int]$actual.R - [int]$target.R) -le $Tolerance -and
+                    [Math]::Abs([int]$actual.G - [int]$target.G) -le $Tolerance -and
+                    [Math]::Abs([int]$actual.B - [int]$target.B) -le $Tolerance) { $matches++ }
+            }
+        }
+        Assert-E2E ($matches -ge $MinimumPixels) "$Role has no rendered $Hex pixels in $($Capture.Path)."
+        Write-E2E "theme-pixel: PASS role=$Role expected=$Hex capture=$($Capture.Path)"
+    }
+    finally { $bitmap.Dispose() }
+}
+
+function Assert-E2EThemeSettings {
+    param([Parameter(Mandatory = $true)][string]$ThemeId)
+
+    Assert-E2E (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) 'Saved settings.json is missing.'
+    $settings = Get-Content -LiteralPath $script:e2eSettingsPath -Raw | ConvertFrom-Json
+    $keys = @($settings.PSObject.Properties.Name | Sort-Object)
+    $expectedKeys = @('connectionConfigured', 'connectionProfile', 'connectionSelector', 'language', 'setupCompleted', 'themeId', 'timeZoneId')
+    Assert-E2E (($keys -join '|') -ceq ($expectedKeys -join '|')) "Saved settings keys differ: $($keys -join ',')."
+    Assert-E2E ([string]$settings.themeId -ceq $ThemeId) "Saved themeId is '$($settings.themeId)', expected '$ThemeId'."
+    Write-E2E "theme-settings: PASS theme=$ThemeId keys=7"
+}
+
+function Get-E2EThemeSelector {
+    param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot)
+
+    $selector = Find-E2EElementByAutomationId $SettingsRoot 'Settings.ThemeSelector'
+    Assert-E2E ($null -ne $selector -and $selector.Current.ControlType -eq [System.Windows.Automation.ControlType]::ComboBox) `
+        'Settings theme ComboBox is missing from UI Automation.'
+    return $selector
+}
+
+function Get-E2EThemeSelectionLabel {
+    param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Selector)
+
+    # Avalonia's ComboBox UIA SelectionPattern may return zero elements while
+    # the selected DataTemplate TextBlock is visibly rendered. Read that one
+    # on-screen text peer, rather than treating the empty pattern as a choice.
+    $expand = $null
+    Assert-E2E ($Selector.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) `
+        'Settings theme ComboBox has no ExpandCollapsePattern.'
+    Assert-E2E ($expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) `
+        'Settings theme ComboBox must be collapsed before its selected label is read.'
+    $labels = @('Classic Dark', 'Graphite Dark', 'Light')
+    $visible = @(Get-E2EVisibleControlElements $Selector ([System.Windows.Automation.ControlType]::Text) |
+        ForEach-Object { [string]$_.Current.Name } | Where-Object { $labels -ccontains $_ })
+    Assert-E2E ($visible.Count -eq 1) "Settings theme ComboBox must render one selected label; observed: $($visible -join ',')."
+    return [string]$visible[0]
+}
+
+function Select-E2ETheme {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $selector = Get-E2EThemeSelector $SettingsRoot
+    $expand = $null
+    Assert-E2E ($selector.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) `
+        'Settings theme ComboBox does not expose ExpandCollapsePattern.'
+    $expand.Expand()
+    $labels = @('Classic Dark', 'Graphite Dark', 'Light')
+    $items = Wait-E2E -Description 'three theme preset UIA options' -Probe {
+        $visible = @(Get-E2EVisibleControlElements $SettingsRoot ([System.Windows.Automation.ControlType]::ListItem))
+        $themeItems = @($visible | Where-Object { $labels -ccontains [string]$_.Current.Name })
+        if ($themeItems.Count -eq 3) { return $themeItems }
+        return $false
+    }
+    $actualLabels = @($items | ForEach-Object { [string]$_.Current.Name })
+    Assert-E2E (($actualLabels -join '|') -ceq ($labels -join '|')) "Theme preset order differs: $($actualLabels -join ',')."
+    Select-E2EListItem $SettingsRoot $Label
+    if ($expand.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+        $expand.Collapse()
+    }
+    Wait-E2E -Description "theme UIA selection '$Label'" -Probe {
+        return (Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $SettingsRoot)) -ceq $Label
+    } | Out-Null
+    Write-E2E "theme-selector: PASS options=3 selected=$Label"
+}
+
+function Open-E2ESetupFromSettings {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
+        [Parameter(Mandatory = $true)][int]$ProcessId
+    )
+
+    $button = Find-E2EButtonByName $SettingsRoot 'Setup'
+    Assert-E2E ($null -ne $button) 'Settings Setup button is missing.'
+    Invoke-E2EElement $button
+    $handle = Wait-E2E -Description 'Setup window' -Probe {
+        $found = Find-E2EWindow $ProcessId 'Codex Info Setup'
+        if ($found -ne [IntPtr]::Zero) { return $found }
+        return $false
+    }
+    Bring-E2EWindowToFront $handle
+    $record = Record-E2EWindow 'Setup' $ProcessId $handle
+    return [pscustomobject]@{ Handle = $handle; Root = Get-E2EUiaRoot $handle; Record = $record }
+}
+
+function Assert-E2EThemeWindow {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Windows,
+        [Parameter(Mandatory = $true)][string]$ThemeId,
+        [Parameter(Mandatory = $true)][string]$Role
+    )
+
+    $window = $Windows[$Role]
+    Assert-E2E ($null -ne $window) "Missing $Role window for theme capture."
+    $capture = Capture-E2EWindow $window.Handle "theme-$ThemeId-$($Role.ToLowerInvariant())"
+    Assert-E2EThemePixel $capture $window.Handle $script:e2eThemeColors[$ThemeId].Window "$ThemeId/$Role/window" -MinimumPixels 32
+    return $capture
+}
+
+function Assert-E2EThemeSurfaces {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Windows,
+        [Parameter(Mandatory = $true)][string]$ThemeId
+    )
+
+    $colors = $script:e2eThemeColors[$ThemeId]
+    $captures = @{}
+    foreach ($role in @('Main', 'Graph', 'Threads', 'Legal', 'Settings', 'Setup')) {
+        $captures[$role] = Assert-E2EThemeWindow $Windows $ThemeId $role
+    }
+    $main = $Windows.Main
+    $mainGauge = Find-E2EElementByAutomationId $main.Root 'Main.QuotaPeriodGauge'
+    Assert-E2E ($null -ne $mainGauge -and -not $mainGauge.Current.IsOffscreen) 'Main quota gauge UIA region is missing.'
+    # Avalonia does not expose the StatusBanner Border as a UIA peer. Its
+    # fixed footer rectangle is specified independently by WINDOWS_UX_SPEC.
+    $mainBounds = Get-E2EWindowBounds $main.Handle
+    $mainScaleX = $mainBounds.Width / 900.0
+    $mainScaleY = $mainBounds.Height / 498.0
+    Assert-E2E ([Math]::Abs($mainScaleX - $mainScaleY) -le 0.02) 'Main window has no single logical-to-physical scale.'
+    $statusBounds = [pscustomobject]@{
+        Left = $mainBounds.Left + [int][Math]::Round(22 * $mainScaleX)
+        Top = $mainBounds.Top + [int][Math]::Round(442 * $mainScaleY)
+        Right = $mainBounds.Left + [int][Math]::Round(878 * $mainScaleX)
+        Bottom = $mainBounds.Top + [int][Math]::Round(484 * $mainScaleY)
+    }
+    Assert-E2E (@(Get-E2ETextValues $main.Root | Where-Object { $_ -ceq 'Ready' }).Count -eq 1) `
+        'Theme fixture Main status is not visibly Ready.'
+    foreach ($entry in @(
+            @{ Hex = $colors.QuotaEmpty; Role = 'quota-unfilled' },
+            @{ Hex = $colors.QuotaFilled; Role = 'quota-filled' })) {
+        Assert-E2EThemePixel $captures.Main $main.Handle $entry.Hex "$ThemeId/Main/$($entry.Role)" -Element $mainGauge
+    }
+    foreach ($entry in @(
+            @{ Hex = $colors.ReadyBackground; Role = 'ready-background' },
+            @{ Hex = $colors.ReadyBorder; Role = 'ready-border' },
+            @{ Hex = $colors.ReadyAccent; Role = 'ready-accent' })) {
+        Assert-E2EThemePixel $captures.Main $main.Handle $entry.Hex "$ThemeId/Main/$($entry.Role)" -ScreenBounds $statusBounds
+    }
+    foreach ($entry in @(
+            @{ Hex = $colors.Card; Role = 'card' },
+            @{ Hex = $colors.Primary; Role = 'primary-text' },
+            @{ Hex = $colors.Secondary; Role = 'secondary-text' },
+            @{ Hex = $colors.Accent; Role = 'accent' })) {
+        Assert-E2EThemePixel $captures.Main $main.Handle $entry.Hex "$ThemeId/Main/$($entry.Role)"
+    }
+    $graph = $Windows.Graph
+    $plot = Find-E2EElementByAutomationId $graph.Root 'Graph.Plot'
+    Assert-E2E ($null -ne $plot) 'Graph plot UIA region is missing.'
+    foreach ($entry in @(
+            @{ Hex = $colors.Plot; Role = 'plot-background' },
+            @{ Hex = $colors.Grid; Role = 'grid' },
+            @{ Hex = $colors.Idle; Role = 'idle-band' },
+            @{ Hex = $colors.Remaining; Role = 'remaining-line' })) {
+        Assert-E2EThemePixel $captures.Graph $graph.Handle $entry.Hex "$ThemeId/Graph/$($entry.Role)" -Element $plot
+    }
+    $threads = $Windows.Threads
+    $rootTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-root'
+    $childTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-child'
+    $leafTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-grandchild'
+    Assert-E2E ($null -ne $rootTitle -and $null -ne $childTitle -and $null -ne $leafTitle) `
+        'Fixture parent/child/leaf Threads UIA rows are missing.'
+    $rootRect = $rootTitle.Current.BoundingRectangle
+    $childRect = $childTitle.Current.BoundingRectangle
+    $leafRect = $leafTitle.Current.BoundingRectangle
+    $threadWindowBounds = Get-E2EWindowBounds $threads.Handle
+    $parentRegion = [pscustomobject]@{
+        Left = $rootRect.Left - 18; Top = $rootRect.Top - 10
+        Right = $threadWindowBounds.Left + $threadWindowBounds.Width - 20; Bottom = $rootRect.Top + 74
+    }
+    $childRegion = [pscustomobject]@{
+        Left = $leafRect.Left - 18; Top = $leafRect.Top - 10
+        Right = $threadWindowBounds.Left + $threadWindowBounds.Width - 20; Bottom = $leafRect.Top + 74
+    }
+    $railRegion = [pscustomobject]@{
+        Left = $threadWindowBounds.Left + 20; Top = $rootRect.Top - 10
+        Right = $rootRect.Left - 18; Bottom = $childRect.Top + 74
+    }
+    foreach ($entry in @(
+            @{ Hex = $colors.ParentCard; Role = 'parent-card'; Region = $parentRegion },
+            @{ Hex = $colors.ChildCard; Role = 'child-card'; Region = $childRegion },
+            @{ Hex = $colors.ThreadBorder; Role = 'card-border'; Region = $parentRegion },
+            @{ Hex = $colors.ThreadRail; Role = 'connection-rail'; Region = $railRegion },
+            @{ Hex = $colors.Running; Role = 'running-text'; Region = $parentRegion })) {
+        Assert-E2EThemePixel $captures.Threads $threads.Handle $entry.Hex "$ThemeId/Threads/$($entry.Role)" -ScreenBounds $entry.Region
+    }
+    # The popup is an overlay in the Graph HWND; capture it while UIA reports
+    # a visible in-window menu and a selected row.
+    $metric = Find-E2EElementByAutomationId $graph.Root 'Graph.MetricSelector'
+    Assert-E2E ($null -ne $metric) 'Graph metric selector is missing.'
+    Toggle-E2EElement $metric
+    $menu = Wait-E2E -Description 'Graph metric popup UIA' -Probe {
+        $candidate = Find-E2EElementByAutomationId $graph.Root 'Graph.MetricMenu'
+        if ($null -ne $candidate -and -not $candidate.Current.IsOffscreen) { return $candidate }
+        return $false
+    }
+    $menuItems = @(Get-E2EVisibleControlElements $menu ([System.Windows.Automation.ControlType]::ListItem))
+    $selected = Get-E2ESelectedListItemLabel $menuItems
+    Assert-E2E (-not [string]::IsNullOrWhiteSpace($selected)) 'Graph metric popup has no selected row.'
+    $selectedItem = $menuItems | Where-Object { [string]$_.Current.Name -eq $selected } | Select-Object -First 1
+    $popupCapture = Capture-E2EWindow $graph.Handle "theme-$ThemeId-graph-popup"
+    Assert-E2EThemePixel $popupCapture $graph.Handle $colors.Popup "$ThemeId/Graph/popup-surface" -Element $menu
+    Assert-E2EThemePixel $popupCapture $graph.Handle $colors.PopupSelected "$ThemeId/Graph/popup-selected" -Element $selectedItem
+    Toggle-E2EElement $metric
+    Bring-E2EWindowToFront $Windows.Settings.Handle
+    $selector = Get-E2EThemeSelector $Windows.Settings.Root
+    $selector.SetFocus()
+    $focusCapture = Capture-E2EWindow $Windows.Settings.Handle "theme-$ThemeId-settings-focus"
+    Assert-E2EThemePixel $focusCapture $Windows.Settings.Handle $colors.Focus "$ThemeId/Settings/focus-border" -Element $selector
+    Write-E2E "theme-surfaces: PASS theme=$ThemeId windows=6"
+}
+
+function Invoke-E2EThemePresets {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$MainRoot,
+        [Parameter(Mandatory = $true)][IntPtr]$MainHandle,
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string]$ClientPath
+    )
+
+    $windows = @{
+        Main = [pscustomobject]@{ Handle = $MainHandle; Root = $MainRoot }
+    }
+    $windows.Graph = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Graph' `
+        -ButtonAutomationId 'Main.OpenGraph' -Title 'Codex Info Graph' -Role 'Graph' -ProcessId $ProcessId
+    $graphRoot = $windows.Graph.Root
+    Wait-E2EGraphLoadSettled $graphRoot
+    $period = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
+    Assert-E2E ($null -ne $period) 'Graph period selector is missing.'
+    Toggle-E2EElement $period
+    $periodItems = Wait-E2E -Description 'two rendered Graph period options' -Probe {
+        $items = @(Get-E2EVisibleControlElements $graphRoot ([System.Windows.Automation.ControlType]::ListItem))
+        if ($items.Count -ge 2) { return $items }
+        return $false
+    }
+    $periodLabels = @($periodItems | ForEach-Object { [string]$_.Current.Name } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    Assert-E2E ($periodLabels.Count -eq 2) "Fixture Graph must render two periods: $($periodLabels -join ', ')."
+    $currentLabel = Get-E2ESelectedListItemLabel $periodItems
+    if ([string]::IsNullOrWhiteSpace($currentLabel)) {
+        $displayed = Get-E2ESelectorLabel $period
+        $matches = @($periodLabels | Where-Object { $displayed.Contains($_) })
+        Assert-E2E ($matches.Count -eq 1) "Current period UIA selection is ambiguous: '$displayed'."
+        $currentLabel = [string]$matches[0]
+    }
+    Assert-E2E ($periodLabels -contains $currentLabel) 'Selected Graph period is not one of the fixture options.'
+    $pastLabel = [string]($periodLabels | Where-Object { $_ -ne $currentLabel } | Select-Object -First 1)
+    Assert-E2E (-not [string]::IsNullOrWhiteSpace($pastLabel)) 'Fixture past period is missing from Graph UIA.'
+    # The ListItem peer can name its ApiHistoryPeriod model, while its visible
+    # TextBlock names the localized label that the collapsed selector displays.
+    $pastItems = @($periodItems | Where-Object { [string]$_.Current.Name -ceq $pastLabel })
+    Assert-E2E ($pastItems.Count -ge 1) "Fixture past period UIA ListItem missing: count=$($pastItems.Count)."
+    $pastDisplayLabels = @($pastItems | ForEach-Object {
+        Get-E2EVisibleControlElements $_ ([System.Windows.Automation.ControlType]::Text)
+    } |
+        ForEach-Object { [string]$_.Current.Name } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    Assert-E2E ($pastDisplayLabels.Count -eq 1) `
+        "Fixture past period has no unique rendered label: $($pastDisplayLabels -join ', ')."
+    $pastDisplay = ([string]$period.Current.Name) + [char]0xFF5C + ([string]$pastDisplayLabels[0])
+    Select-E2EListItem $graphRoot $pastLabel
+    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastDisplay
+    Wait-E2EGraphLoadSettled $graphRoot
+    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $windows.Graph.Handle -Description 'theme-past-period'
+    $windows.Threads = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Details' `
+        -ButtonAutomationId 'Main.OpenThreadDetails' -Title 'Codex Info Threads' -Role 'Threads' -ProcessId $ProcessId
+    foreach ($row in @('e2e-root', 'e2e-child')) {
+        $null = Wait-E2E -Description "fixture Threads row $row" -Probe {
+            $item = Find-E2EElementByAutomationId $windows.Threads.Root $row
+            if ($null -ne $item) { return $item }
+            return $false
+        }
+    }
+    $windows.Legal = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Legal' `
+        -ButtonAutomationId 'Main.OpenLegal' -Title 'Codex Info Legal' -Role 'Legal' -ProcessId $ProcessId
+    $windows.Settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
+        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+    $windows.Setup = Open-E2ESetupFromSettings $windows.Settings.Root $ProcessId
+
+    $null = Capture-E2EWindow $windows.Settings.Handle 'theme-settings-initial-selection'
+    $selector = Get-E2EThemeSelector $windows.Settings.Root
+    Assert-E2E ((Get-E2EThemeSelectionLabel $selector) -ceq 'Classic Dark') 'Legacy six-key settings did not select Classic Dark.'
+    Assert-E2EThemeSurfaces $windows 'classic-dark'
+    $legacyBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
+    Select-E2ETheme $windows.Settings.Root 'Light'
+    $preSave = Capture-E2EWindow $MainHandle 'theme-before-save-main'
+    Assert-E2EThemePixel $preSave $MainHandle $script:e2eThemeColors['classic-dark'].Window 'before-save/Main/window' -MinimumPixels 32
+    $close = Find-E2EElementByAutomationId $windows.Settings.Root 'Settings.Window.Close'
+    Assert-E2E ($null -ne $close) 'Settings Cancel/Close control is missing.'
+    Invoke-E2EElement $close
+    Wait-E2E -Description 'Settings closes without Save' -Probe {
+        return (Find-E2EWindow $ProcessId 'Codex Info Settings') -eq [IntPtr]::Zero
+    } | Out-Null
+    Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $legacyBytes) `
+        'Closing Settings without Save changed the six-key file.'
+    $windows.Settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
+        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+    Assert-E2E ((Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $windows.Settings.Root)) -ceq 'Classic Dark') `
+        'Cancelled theme selection remained in Settings.'
+    $afterCancel = Capture-E2EWindow $MainHandle 'theme-after-cancel-main'
+    Assert-E2EThemePixel $afterCancel $MainHandle $script:e2eThemeColors['classic-dark'].Window 'after-cancel/Main/window' -MinimumPixels 32
+    Write-E2E 'theme-cancel: PASS unchanged settings and display'
+
+    $originalHandles = @{}
+    foreach ($role in @('Main', 'Graph', 'Threads', 'Legal', 'Setup')) {
+        $originalHandles[$role] = $windows[$role].Handle
+    }
+    foreach ($choice in @(
+            @{ Id = 'graphite-dark'; Label = 'Graphite Dark' },
+            @{ Id = 'light'; Label = 'Light' })) {
+        Select-E2ETheme $windows.Settings.Root $choice.Label
+        $save = Find-E2EButtonByName $windows.Settings.Root 'Save'
+        Assert-E2E ($null -ne $save) 'Settings Save button is missing.'
+        Invoke-E2EElement $save
+        Wait-E2E -Description "Settings closes after saving $($choice.Id)" -Probe {
+            return (Find-E2EWindow $ProcessId 'Codex Info Settings') -eq [IntPtr]::Zero
+        } | Out-Null
+        Assert-E2EThemeSettings $choice.Id
+        foreach ($entry in @(
+                @{ Role = 'Main'; Title = 'Codex Info Monitor' },
+                @{ Role = 'Graph'; Title = 'Codex Info Graph' },
+                @{ Role = 'Threads'; Title = 'Codex Info Threads' },
+                @{ Role = 'Legal'; Title = 'Codex Info Legal' },
+                @{ Role = 'Setup'; Title = 'Codex Info Setup' })) {
+            $current = Find-E2EWindow $ProcessId $entry.Title
+            Assert-E2E ($current -eq $originalHandles[$entry.Role]) `
+                "$($entry.Role) HWND changed or closed while applying $($choice.Id)."
+        }
+        $windows.Settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
+            -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+        Assert-E2E ((Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $windows.Settings.Root)) -ceq $choice.Label) `
+            "Settings UIA did not reopen with saved $($choice.Id)."
+        Assert-E2EThemeSurfaces $windows $choice.Id
+        Write-E2E "theme-save: PASS theme=$($choice.Id) existing-hwnd=5"
+    }
+
+    Stop-Process -Id $ProcessId -Force
+    Wait-E2E -Description 'first themed client exits' -Probe { return $script:e2eProcess.HasExited } | Out-Null
+    $fixturePortWasPresent = Test-Path -LiteralPath "Env:$($script:e2eFixturePortVariable)"
+    $previousFixturePort = [Environment]::GetEnvironmentVariable($script:e2eFixturePortVariable, 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable(
+            $script:e2eFixturePortVariable,
+            $script:e2eFixturePort.ToString([Globalization.CultureInfo]::InvariantCulture),
+            'Process')
+        $script:e2eProcess = Start-Process -FilePath $ClientPath -PassThru
+    }
+    finally {
+        if ($fixturePortWasPresent) {
+            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $previousFixturePort, 'Process')
+        }
+        else {
+            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $null, 'Process')
+        }
+    }
+    $restartedPid = $script:e2eProcess.Id
+    $restartedMainHandle = Wait-E2E -Description 'restarted Main window' -Probe {
+        $found = Find-E2EWindow $restartedPid 'Codex Info Monitor'
+        if ($found -ne [IntPtr]::Zero) { return $found }
+        return $false
+    }
+    Bring-E2EWindowToFront $restartedMainHandle
+    $restartedMain = [pscustomobject]@{ Handle = $restartedMainHandle; Root = Get-E2EUiaRoot $restartedMainHandle }
+    $restartCapture = Capture-E2EWindow $restartedMainHandle 'theme-light-restart-main'
+    Assert-E2EThemePixel $restartCapture $restartedMainHandle $script:e2eThemeColors.light.Window `
+        'restart/Main/window' -MinimumPixels 32
+    $restartedSettings = Open-E2EChildWindow -MainRoot $restartedMain.Root -ButtonName 'Settings' `
+        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $restartedPid
+    $restartSettingsCapture = Capture-E2EWindow $restartedSettings.Handle 'theme-light-restart-settings'
+    Assert-E2EThemePixel $restartSettingsCapture $restartedSettings.Handle $script:e2eThemeColors.light.Window `
+        'restart/Settings/window' -MinimumPixels 32
+    Assert-E2E ((Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $restartedSettings.Root)) -ceq 'Light') `
+        'Restarted Settings did not restore the Light selection.'
+    Assert-E2EThemeSettings 'light'
+    Write-E2E 'theme-restart: PASS light restored before Main display'
+}
+
 try {
     if ($FixtureContractTest) {
         Write-E2E 'fixture-contract-test: start'
@@ -3075,6 +3553,12 @@ try {
         Write-E2E 'main-estimated-cost: PASS (numeric aggregate is rendered)'
     }
 
+    if ($ThemePresets) {
+        Invoke-E2EThemePresets -MainRoot $mainRoot -MainHandle $mainHandle `
+            -ProcessId $clientPid -ClientPath $resolvedClientPath
+        $script:e2eThemePresetsComplete = $true
+    }
+    else {
     # Finite path: one Graph window, one period round-trip, two metrics, then
     # one OFF/ON cycle for each of four independent series.  No combinations
     # of these controls are generated.
@@ -3108,7 +3592,8 @@ try {
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
     $metricSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector'
     Assert-E2E ($null -ne $periodSelector -and $null -ne $metricSelector) 'Graph selectors are missing.'
-    $currentLabel = Get-E2ESelectorLabel $periodSelector
+    $currentDisplay = Get-E2ESelectorLabel $periodSelector
+    $currentLabel = $currentDisplay
     $graphCurrent = Capture-E2EWindow $graph.Handle '02-graph-current'
 
     Write-E2E 'case-2: period current -> past -> current and display-value assertions'
@@ -3129,8 +3614,18 @@ try {
     Assert-E2E ($periodLabels -contains $currentLabel) 'Current period display value is not represented by a selected menu item.'
     $pastLabel = [string]($periodLabels | Where-Object { $_ -ne $currentLabel } | Select-Object -First 1)
     Assert-E2E (-not [string]::IsNullOrWhiteSpace($pastLabel)) 'Past period option is missing.'
+    $pastItems = @($periodItems | Where-Object { [string]$_.Current.Name -ceq $pastLabel })
+    Assert-E2E ($pastItems.Count -ge 1) "Past period UIA ListItem missing: count=$($pastItems.Count)."
+    $pastDisplayLabels = @($pastItems | ForEach-Object {
+        Get-E2EVisibleControlElements $_ ([System.Windows.Automation.ControlType]::Text)
+    } |
+        ForEach-Object { [string]$_.Current.Name } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    Assert-E2E ($pastDisplayLabels.Count -eq 1) `
+        "Past period has no unique rendered label: $($pastDisplayLabels -join ', ')."
+    $pastDisplay = ([string]$periodSelector.Current.Name) + [char]0xFF5C + ([string]$pastDisplayLabels[0])
     Select-E2EListItem $graphRoot $pastLabel
-    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
+    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastDisplay
     Wait-E2EGraphLoadSettled $graphRoot
     $pastMeasurement = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle `
         -Description 'past-period'
@@ -3145,7 +3640,7 @@ try {
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
     Toggle-E2EElement $periodSelector
     Select-E2EListItem $graphRoot $currentLabel
-    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $currentLabel
+    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $currentDisplay
     Wait-E2EGraphLoadSettled $graphRoot
     $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'current-period-restored'
     $graphCurrentAgain = Capture-E2EWindow $graph.Handle '04-graph-current-again'
@@ -3361,8 +3856,9 @@ try {
             Assert-E2E ($flattenedFixtureRows.IndexOf($contextCase.Usage, [StringComparison]::Ordinal) -ge 0) `
                 "Threads context usage/limit missing: $($contextCase.Id)"
         }
-        Assert-E2E ($flattenedFixtureRows.IndexOf('未観測', [StringComparison]::Ordinal) -ge 0) `
-            'Missing context must be rendered as 未観測.'
+        $missingContextText = ([string][char]0x672A) + [char]0x89B3 + [char]0x6E2C
+        Assert-E2E ($flattenedFixtureRows.IndexOf($missingContextText, [StringComparison]::Ordinal) -ge 0) `
+            "Missing context must be rendered as $($missingContextText)."
         Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Context [0-9]+(?:\.[0-9]+)?%$').Count -eq 3) `
             'Known context percentages must be rendered for every observed row.'
         Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Elapsed [0-9][0-9,]* min$').Count -eq 4) `
@@ -3499,6 +3995,7 @@ try {
     $graphEvidence = if ($Fixture) { 'past-period model and idle-band pixels' } else { 'past-period model pixels' }
     Write-E2E ("windows-client-e2e: PASS (Graph open, {0}, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, Legal plain text, PID/HWND records)" -f $graphEvidence)
     $script:e2eSuccess = $true
+    }
 }
 catch {
     if ($null -ne $script:e2eProcess -and $null -ne $mainRoot) {
@@ -3515,17 +4012,43 @@ catch {
     throw
 }
 finally {
+    $themeProcessCleanupFailure = $null
     if ($null -ne $script:e2eProcess) {
         try {
             if (-not $script:e2eProcess.HasExited) {
-                Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction SilentlyContinue
+                if ($ThemePresets) {
+                    Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction Stop
+                    Wait-E2E -Description 'themed client cleanup exit' -Probe {
+                        return $script:e2eProcess.HasExited
+                    } | Out-Null
+                }
+                else {
+                    Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+            if ($ThemePresets) {
+                Assert-E2E $script:e2eProcess.HasExited 'Themed client remained running during cleanup.'
+                Write-E2E "theme-process-cleanup: PASS pid=$($script:e2eProcess.Id) exited=True"
             }
         }
-        catch { }
+        catch {
+            if ($ThemePresets) { $themeProcessCleanupFailure = $_.Exception.Message }
+        }
     }
     if ($Fixture) {
-        try { Exit-E2EFixture } catch { Write-E2E "fixture-cleanup: FAIL $($_.Exception.Message)" }
+        try { Exit-E2EFixture }
+        catch {
+            Write-E2E "fixture-cleanup: FAIL $($_.Exception.Message)"
+            if ($ThemePresets) { throw }
+        }
     }
+    if ($ThemePresets -and $null -ne $themeProcessCleanupFailure) {
+        throw "ASSERT: themed client cleanup failed: $themeProcessCleanupFailure"
+    }
+}
+
+if ($ThemePresets -and $script:e2eThemePresetsComplete) {
+    Write-E2E 'windows-client-theme-e2e: PASS'
 }
 
 # A successful script invocation returns naturally.  Failures are thrown from

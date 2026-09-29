@@ -8,6 +8,7 @@ using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
+using CodexInfo.WindowsClient.Theme;
 
 namespace CodexInfo.WindowsClient.ViewModels;
 
@@ -17,6 +18,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private readonly MainWindowViewModel? main;
     private string selectedLanguageCode;
     private string selectedTimeZoneId;
+    private string selectedThemeId;
     private bool saveFailed;
 
     public SettingsViewModel(ClientSettingsStore store, MainWindowViewModel? main = null)
@@ -25,6 +27,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         this.main = main;
         selectedLanguageCode = LocalizationService.Current.LanguageCode;
         selectedTimeZoneId = App.CurrentSettings.TimeZoneId;
+        selectedThemeId = App.CurrentSettings.ThemeId;
         LanguageOptions = new ReadOnlyCollection<UiText>(LocalizationService.Languages.ToList());
         LocalizationService.LanguageChanged += OnLanguageChanged;
         if (main is not null) main.PropertyChanged += OnMainPropertyChanged;
@@ -34,7 +37,23 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public event EventHandler? Saved;
 
     public ReadOnlyCollection<UiText> LanguageOptions { get; }
+    public IReadOnlyList<ThemeOption> ThemeOptions =>
+    [
+        new(ThemePalette.ClassicDark, Texts.ThemeClassicDark),
+        new(ThemePalette.GraphiteDark, Texts.ThemeGraphiteDark),
+        new(ThemePalette.Light, Texts.ThemeLight),
+    ];
     public UiText Texts => LocalizationService.Current;
+    public string SelectedThemeId
+    {
+        get => selectedThemeId;
+        set
+        {
+            if (selectedThemeId == value) return;
+            selectedThemeId = value;
+            Notify();
+        }
+    }
     public string SelectedLanguageCode
     {
         get => selectedLanguageCode;
@@ -84,6 +103,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         {
             Language = language,
             TimeZoneId = timeZone,
+            ThemeId = selectedThemeId,
             // SettingsCorrupt is an in-memory recovery marker only. A
             // successful durable rewrite closes that recovery generation.
             SettingsCorrupt = false,
@@ -123,6 +143,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Notify(nameof(CurrentEndpoint));
         Notify(nameof(SelectedTimeZone));
         Notify(nameof(TimeZoneOptions));
+        Notify(nameof(ThemeOptions));
         Notify(nameof(StatusTitle));
         Notify(nameof(StatusDetail));
         Notify(nameof(CanAuthenticate));
@@ -141,6 +162,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 }
 
 public sealed record TimeZoneOption(string Id, string Label);
+public sealed record ThemeOption(string Id, string Label);
 
 public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 {

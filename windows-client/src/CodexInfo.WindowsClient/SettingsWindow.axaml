@@ -9,17 +9,17 @@
         WindowStartupLocation="CenterOwner" CanResize="False"
         WindowDecorations="None" ExtendClientAreaToDecorationsHint="True" ExtendClientAreaTitleBarHeightHint="0"
         Title="Codex Info Settings" FontFamily="{StaticResource JapaneseFont}"
-        Background="#0E141E" Foreground="#E9EFF8">
+        Background="{DynamicResource Theme0E141E}" Foreground="{DynamicResource ThemeE9EFF8}">
   <Window.Styles>
-    <Style Selector="TextBlock.label"><Setter Property="FontSize" Value="13" /><Setter Property="Foreground" Value="#A8B7CA" /></Style>
-    <Style Selector="Border.surface"><Setter Property="Background" Value="#151F2D" /><Setter Property="BorderBrush" Value="#2C4258" /><Setter Property="BorderThickness" Value="1" /><Setter Property="CornerRadius" Value="14" /></Style>
-    <Style Selector="Button.primary"><Setter Property="Background" Value="#236B9E" /><Setter Property="BorderBrush" Value="#61B4EB" /><Setter Property="Foreground" Value="#F5FAFF" /><Setter Property="Padding" Value="16,8" /></Style>
-    <Style Selector="Button.secondary"><Setter Property="Background" Value="#1B2A3A" /><Setter Property="BorderBrush" Value="#36516B" /><Setter Property="Foreground" Value="#E9EFF8" /><Setter Property="Padding" Value="16,8" /></Style>
+    <Style Selector="TextBlock.label"><Setter Property="FontSize" Value="13" /><Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" /></Style>
+    <Style Selector="Border.surface"><Setter Property="Background" Value="{DynamicResource Theme151F2D}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme2C4258}" /><Setter Property="BorderThickness" Value="1" /><Setter Property="CornerRadius" Value="14" /></Style>
+    <Style Selector="Button.primary"><Setter Property="Background" Value="{DynamicResource Theme236B9E}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme61B4EB}" /><Setter Property="Foreground" Value="{DynamicResource ThemeF5FAFF}" /><Setter Property="Padding" Value="16,8" /></Style>
+    <Style Selector="Button.secondary"><Setter Property="Background" Value="{DynamicResource Theme1B2A3A}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme36516B}" /><Setter Property="Foreground" Value="{DynamicResource ThemeE9EFF8}" /><Setter Property="Padding" Value="16,8" /></Style>
   </Window.Styles>
   <Grid Margin="24" RowDefinitions="Auto,*,Auto" RowSpacing="18">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel Orientation="Horizontal" Spacing="10"><TextBlock FontSize="20" Text="⚙" Foreground="#71C7FF" /><StackPanel><TextBlock FontSize="23" FontWeight="SemiBold" Text="{Binding Texts.Settings}" /><TextBlock Classes="label" Text="{Binding Texts.ConnectionEndpoint}" /></StackPanel></StackPanel>
-      <Button Grid.Column="1" Background="Transparent" BorderBrush="Transparent" Foreground="#A8B7CA" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Settings.Window.Close" Content="×" FontSize="22" ToolTip.Tip="{Binding Texts.Close}" />
+      <StackPanel Orientation="Horizontal" Spacing="10"><TextBlock FontSize="20" Text="⚙" Foreground="{DynamicResource Theme71C7FF}" /><StackPanel><TextBlock FontSize="23" FontWeight="SemiBold" Text="{Binding Texts.Settings}" /><TextBlock Classes="label" Text="{Binding Texts.ConnectionEndpoint}" /></StackPanel></StackPanel>
+      <Button Grid.Column="1" Background="Transparent" BorderBrush="Transparent" Foreground="{DynamicResource ThemeA8B7CA}" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Settings.Window.Close" Content="×" FontSize="22" ToolTip.Tip="{Binding Texts.Close}" />
     </Grid>
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <Border Classes="surface" Padding="22">
@@ -33,13 +33,16 @@
           <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
         </ComboBox>
         <TextBlock Classes="label" Text="{Binding Texts.Appearance}" />
-        <Border Background="#101925" CornerRadius="10" Padding="14">
+        <ComboBox ItemsSource="{Binding ThemeOptions}" SelectedValue="{Binding SelectedThemeId}" SelectedValueBinding="{Binding Id}" HorizontalAlignment="Stretch" AutomationProperties.Name="{Binding Texts.Appearance}" AutomationProperties.AutomationId="Settings.ThemeSelector" ToolTip.Tip="{Binding Texts.Appearance}">
+          <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
+        </ComboBox>
+        <Border Background="{DynamicResource Theme101925}" CornerRadius="10" Padding="14">
           <Grid ColumnDefinitions="Auto,*" ColumnSpacing="10">
-            <TextBlock Text="✦" Foreground="#71C7FF" />
+            <TextBlock Text="✦" Foreground="{DynamicResource Theme71C7FF}" />
             <TextBlock Grid.Column="1" Classes="label" Text="{Binding Texts.AppearanceDescription}" TextWrapping="Wrap" />
           </Grid>
         </Border>
-        <Border Background="#101F2D" CornerRadius="10" Padding="14">
+        <Border Background="{DynamicResource Theme101F2D}" CornerRadius="10" Padding="14">
           <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" RowSpacing="4" ColumnSpacing="12">
             <StackPanel><TextBlock FontWeight="SemiBold" Text="{Binding StatusTitle}" /><TextBlock Grid.Row="1" Classes="label" Text="{Binding StatusDetail}" TextWrapping="Wrap" /></StackPanel>
             <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
