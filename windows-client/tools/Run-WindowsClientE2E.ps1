@@ -2513,7 +2513,9 @@ function New-E2EFixtureDocuments {
     $rawNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $now = $rawNow - ($rawNow % 60)
     $currentStart = $now - 60
-    $currentReset = $now + 7200
+    # Theme mode needs a genuinely ready status for the UX-spec ready-color
+    # oracle. The normal fixture retains its original reset-warning timing.
+    $currentReset = if ($ThemePresets) { $now + 172800 } else { $now + 7200 }
     $pastStart = $now - 360
     $pastReset = $now - 180
     # The current graph contract admits an unused band only after 10 minutes
@@ -2567,6 +2569,12 @@ function New-E2EFixtureDocuments {
 {"api_version":"v3","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"model":"SOL","total_tokens":1200,"input_tokens":800,"cached_input_tokens":200,"cache_write_input_tokens":0,"output_tokens":400,"estimated_cost":{"price_version":"E2E-SOL","ordinary_input_dollars":0.70,"cached_input_dollars":0.20,"cache_write_input_dollars":0.0,"output_dollars":0.30,"total_dollars":1.20}},{"model":"TERRA","total_tokens":2400,"input_tokens":1600,"cached_input_tokens":500,"cache_write_input_tokens":0,"output_tokens":800,"estimated_cost":{"price_version":"E2E-TERRA","ordinary_input_dollars":1.40,"cached_input_dollars":0.50,"cache_write_input_dollars":0.0,"output_dollars":0.50,"total_dollars":2.40}},{"model":"LUNA","total_tokens":3600,"input_tokens":2500,"cached_input_tokens":700,"cache_write_input_tokens":0,"output_tokens":1100,"estimated_cost":{"price_version":"E2E-LUNA","ordinary_input_dollars":2.00,"cached_input_dollars":0.70,"cache_write_input_dollars":0.0,"output_dollars":0.90,"total_dollars":3.60}}],"active_thread_count":3}
 "@
     $current = $current.Replace('"active_thread_count":3', '"active_thread_count":4')
+    if ($ThemePresets) {
+        # A 7-day quota window with 48 hours remaining keeps both filled and
+        # unfilled gauge cells visible while avoiding the 24-hour reset warning.
+        $details = $details.Replace('"window_seconds":14400', '"window_seconds":604800')
+        $current = $current.Replace('"window_seconds":14400', '"window_seconds":604800')
+    }
     $periods = @"
 {"api_version":"v3","history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$v3PastStart,"end_at":$v3PastReset,"reset_at":$v3PastReset,"label":"Past period","current":false}]}
 "@
@@ -3163,15 +3171,31 @@ function Assert-E2EThemeSurfaces {
     }
     $main = $Windows.Main
     $mainGauge = Find-E2EElementByAutomationId $main.Root 'Main.QuotaPeriodGauge'
-    $mainStatus = Find-E2EElementByAutomationId $main.Root 'Main.StatusBanner'
-    Assert-E2E ($null -ne $mainGauge -and $null -ne $mainStatus) 'Main quota/status UIA regions are missing.'
+    Assert-E2E ($null -ne $mainGauge -and -not $mainGauge.Current.IsOffscreen) 'Main quota gauge UIA region is missing.'
+    # Avalonia does not expose the StatusBanner Border as a UIA peer. Its
+    # fixed footer rectangle is specified independently by WINDOWS_UX_SPEC.
+    $mainBounds = Get-E2EWindowBounds $main.Handle
+    $mainScaleX = $mainBounds.Width / 900.0
+    $mainScaleY = $mainBounds.Height / 498.0
+    Assert-E2E ([Math]::Abs($mainScaleX - $mainScaleY) -le 0.02) 'Main window has no single logical-to-physical scale.'
+    $statusBounds = [pscustomobject]@{
+        Left = $mainBounds.Left + [int][Math]::Round(22 * $mainScaleX)
+        Top = $mainBounds.Top + [int][Math]::Round(442 * $mainScaleY)
+        Right = $mainBounds.Left + [int][Math]::Round(878 * $mainScaleX)
+        Bottom = $mainBounds.Top + [int][Math]::Round(484 * $mainScaleY)
+    }
+    Assert-E2E (@(Get-E2ETextValues $main.Root | Where-Object { $_ -ceq 'Ready' }).Count -eq 1) `
+        'Theme fixture Main status is not visibly Ready.'
     foreach ($entry in @(
-            @{ Hex = $colors.QuotaEmpty; Role = 'quota-unfilled'; Element = $mainGauge },
-            @{ Hex = $colors.QuotaFilled; Role = 'quota-filled'; Element = $mainGauge },
-            @{ Hex = $colors.ReadyBackground; Role = 'ready-background'; Element = $mainStatus },
-            @{ Hex = $colors.ReadyBorder; Role = 'ready-border'; Element = $mainStatus },
-            @{ Hex = $colors.ReadyAccent; Role = 'ready-accent'; Element = $mainStatus })) {
-        Assert-E2EThemePixel $captures.Main $main.Handle $entry.Hex "$ThemeId/Main/$($entry.Role)" -Element $entry.Element
+            @{ Hex = $colors.QuotaEmpty; Role = 'quota-unfilled' },
+            @{ Hex = $colors.QuotaFilled; Role = 'quota-filled' })) {
+        Assert-E2EThemePixel $captures.Main $main.Handle $entry.Hex "$ThemeId/Main/$($entry.Role)" -Element $mainGauge
+    }
+    foreach ($entry in @(
+            @{ Hex = $colors.ReadyBackground; Role = 'ready-background' },
+            @{ Hex = $colors.ReadyBorder; Role = 'ready-border' },
+            @{ Hex = $colors.ReadyAccent; Role = 'ready-accent' })) {
+        Assert-E2EThemePixel $captures.Main $main.Handle $entry.Hex "$ThemeId/Main/$($entry.Role)" -ScreenBounds $statusBounds
     }
     foreach ($entry in @(
             @{ Hex = $colors.Card; Role = 'card' },
