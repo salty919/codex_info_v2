@@ -3592,7 +3592,8 @@ try {
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
     $metricSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector'
     Assert-E2E ($null -ne $periodSelector -and $null -ne $metricSelector) 'Graph selectors are missing.'
-    $currentLabel = Get-E2ESelectorLabel $periodSelector
+    $currentDisplay = Get-E2ESelectorLabel $periodSelector
+    $currentLabel = $currentDisplay
     $graphCurrent = Capture-E2EWindow $graph.Handle '02-graph-current'
 
     Write-E2E 'case-2: period current -> past -> current and display-value assertions'
@@ -3613,8 +3614,18 @@ try {
     Assert-E2E ($periodLabels -contains $currentLabel) 'Current period display value is not represented by a selected menu item.'
     $pastLabel = [string]($periodLabels | Where-Object { $_ -ne $currentLabel } | Select-Object -First 1)
     Assert-E2E (-not [string]::IsNullOrWhiteSpace($pastLabel)) 'Past period option is missing.'
+    $pastItems = @($periodItems | Where-Object { [string]$_.Current.Name -ceq $pastLabel })
+    Assert-E2E ($pastItems.Count -ge 1) "Past period UIA ListItem missing: count=$($pastItems.Count)."
+    $pastDisplayLabels = @($pastItems | ForEach-Object {
+        Get-E2EVisibleControlElements $_ ([System.Windows.Automation.ControlType]::Text)
+    } |
+        ForEach-Object { [string]$_.Current.Name } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    Assert-E2E ($pastDisplayLabels.Count -eq 1) `
+        "Past period has no unique rendered label: $($pastDisplayLabels -join ', ')."
+    $pastDisplay = ([string]$periodSelector.Current.Name) + [char]0xFF5C + ([string]$pastDisplayLabels[0])
     Select-E2EListItem $graphRoot $pastLabel
-    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
+    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastDisplay
     Wait-E2EGraphLoadSettled $graphRoot
     $pastMeasurement = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle `
         -Description 'past-period'
@@ -3629,7 +3640,7 @@ try {
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
     Toggle-E2EElement $periodSelector
     Select-E2EListItem $graphRoot $currentLabel
-    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $currentLabel
+    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $currentDisplay
     Wait-E2EGraphLoadSettled $graphRoot
     $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'current-period-restored'
     $graphCurrentAgain = Capture-E2EWindow $graph.Handle '04-graph-current-again'
@@ -3845,8 +3856,9 @@ try {
             Assert-E2E ($flattenedFixtureRows.IndexOf($contextCase.Usage, [StringComparison]::Ordinal) -ge 0) `
                 "Threads context usage/limit missing: $($contextCase.Id)"
         }
-        Assert-E2E ($flattenedFixtureRows.IndexOf('未観測', [StringComparison]::Ordinal) -ge 0) `
-            'Missing context must be rendered as 未観測.'
+        $missingContextText = ([string][char]0x672A) + [char]0x89B3 + [char]0x6E2C
+        Assert-E2E ($flattenedFixtureRows.IndexOf($missingContextText, [StringComparison]::Ordinal) -ge 0) `
+            "Missing context must be rendered as $($missingContextText)."
         Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Context [0-9]+(?:\.[0-9]+)?%$').Count -eq 3) `
             'Known context percentages must be rendered for every observed row.'
         Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Elapsed [0-9][0-9,]* min$').Count -eq 4) `
