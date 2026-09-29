@@ -3251,16 +3251,28 @@ function Invoke-E2EThemePresets {
     $period = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
     Assert-E2E ($null -ne $period) 'Graph period selector is missing.'
     Toggle-E2EElement $period
-    $periodItems = Wait-E2E -Description 'fixture current/past Graph periods' -Probe {
+    $periodItems = Wait-E2E -Description 'two rendered Graph period options' -Probe {
         $items = @(Get-E2EVisibleControlElements $graphRoot ([System.Windows.Automation.ControlType]::ListItem))
-        if (@($items | Where-Object { [string]$_.Current.Name -eq 'Past period' }).Count -eq 1) { return $items }
+        if ($items.Count -ge 2) { return $items }
         return $false
     }
-    Assert-E2E (@($periodItems | Where-Object { [string]$_.Current.Name -eq 'Current period' }).Count -eq 1) `
-        'Fixture current period is missing from Graph UIA.'
-    Select-E2EListItem $graphRoot 'Past period'
-    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' 'Past period'
+    $periodLabels = @($periodItems | ForEach-Object { [string]$_.Current.Name } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    Assert-E2E ($periodLabels.Count -eq 2) "Fixture Graph must render two periods: $($periodLabels -join ', ')."
+    $currentLabel = Get-E2ESelectedListItemLabel $periodItems
+    if ([string]::IsNullOrWhiteSpace($currentLabel)) {
+        $displayed = Get-E2ESelectorLabel $period
+        $matches = @($periodLabels | Where-Object { $displayed.Contains($_) })
+        Assert-E2E ($matches.Count -eq 1) "Current period UIA selection is ambiguous: '$displayed'."
+        $currentLabel = [string]$matches[0]
+    }
+    Assert-E2E ($periodLabels -contains $currentLabel) 'Selected Graph period is not one of the fixture options.'
+    $pastLabel = [string]($periodLabels | Where-Object { $_ -ne $currentLabel } | Select-Object -First 1)
+    Assert-E2E (-not [string]::IsNullOrWhiteSpace($pastLabel)) 'Fixture past period is missing from Graph UIA.'
+    Select-E2EListItem $graphRoot $pastLabel
+    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
     Wait-E2EGraphLoadSettled $graphRoot
+    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $windows.Graph.Handle -Description 'theme-past-period'
     $windows.Threads = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Details' `
         -ButtonAutomationId 'Main.OpenThreadDetails' -Title 'Codex Info Threads' -Role 'Threads' -ProcessId $ProcessId
     foreach ($row in @('e2e-root', 'e2e-child')) {
