@@ -30,20 +30,20 @@ public sealed class GraphWindowSelectorParityTests
         var fieldStyle = graph.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
             element.Attribute("Selector")?.Value == "controls|GraphSelect.graph-select-field");
-        Assert.Equal("#111B2C", fieldStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme111B2C}", fieldStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Background")
             .Attribute("Value")?.Value);
-        Assert.Equal("#405779", fieldStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme405779}", fieldStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "BorderBrush")
             .Attribute("Value")?.Value);
 
         var openFieldStyle = graph.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
             element.Attribute("Selector")?.Value == "controls|GraphSelect.graph-select-field:checked");
-        Assert.Equal("#244D74", openFieldStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme244D74}", openFieldStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Background")
             .Attribute("Value")?.Value);
-        Assert.Equal("#56B2F5", openFieldStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme56B2F5}", openFieldStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "BorderBrush")
             .Attribute("Value")?.Value);
 

@@ -4,6 +4,7 @@
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Media;
+using CodexInfo.WindowsClient.Theme;
 
 namespace CodexInfo.WindowsClient.Controls;
 
@@ -32,6 +33,13 @@ internal sealed record ThreadTreeGeometry(
 /// </summary>
 public sealed class ThreadTreeControl : Control
 {
+    public ThreadTreeControl()
+    {
+        AttachedToVisualTree += (_, _) => ThemePalette.Changed += OnThemeChanged;
+        DetachedFromVisualTree += (_, _) => ThemePalette.Changed -= OnThemeChanged;
+    }
+
+    private void OnThemeChanged(object? sender, EventArgs eventArgs) => InvalidateVisual();
     public static readonly StyledProperty<IReadOnlyList<ThreadTreeConnection>> ConnectionsProperty =
         AvaloniaProperty.Register<ThreadTreeControl, IReadOnlyList<ThreadTreeConnection>>(
             nameof(Connections), Array.Empty<ThreadTreeConnection>());
@@ -55,7 +63,7 @@ public sealed class ThreadTreeControl : Control
     public override void Render(DrawingContext context)
     {
         base.Render(context);
-        var rail = new Pen(new SolidColorBrush(Color.Parse("#76A7CC")), 2)
+        var rail = new Pen(ThemePalette.Brush("#76A7CC"), 2)
         {
             LineCap = PenLineCap.Round,
             LineJoin = PenLineJoin.Round,
@@ -85,7 +93,7 @@ public sealed class ThreadTreeControl : Control
             context.DrawLine(rail, segment.Start, segment.End);
         }
 
-        var junctionBrush = new SolidColorBrush(Color.Parse("#76A7CC"));
+        var junctionBrush = ThemePalette.Brush("#76A7CC");
         foreach (var junction in geometry.Junctions)
         {
             const double radius = 4;

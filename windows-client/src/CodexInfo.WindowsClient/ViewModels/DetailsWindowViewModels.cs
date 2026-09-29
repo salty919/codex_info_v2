@@ -11,6 +11,7 @@ using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
+using CodexInfo.WindowsClient.Theme;
 
 namespace CodexInfo.WindowsClient.ViewModels;
 
@@ -1692,6 +1693,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         accountResourceClient = main.AccountResourceClient;
         Threads = new ReadOnlyObservableCollection<ThreadItemViewModel>(threads);
         main.PropertyChanged += OnMainPropertyChanged;
+        ThemePalette.Changed += OnThemeChanged;
         resourceThreads = main.DetailsSnapshot?.Threads ?? Array.Empty<ApiThreadDetails>();
         Rebuild();
         if (resourceClient is not null)
@@ -1782,6 +1784,12 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             resourcePollingCancellation.Dispose();
         }
         main.PropertyChanged -= OnMainPropertyChanged;
+        ThemePalette.Changed -= OnThemeChanged;
+    }
+
+    private void OnThemeChanged(object? sender, EventArgs eventArgs)
+    {
+        if (!disposed) Rebuild();
     }
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
@@ -2059,10 +2067,10 @@ public sealed class ThreadItemViewModel
             ApiThreadActivityStatus.Stopped => owner.Texts.ThreadStopped,
             _ => owner.Texts.ThreadUnknown,
         };
-        ActivityStatusHex = thread.ActivityStatus == ApiThreadActivityStatus.Running
+        ActivityStatusHex = ThemePalette.Resolve(thread.ActivityStatus == ApiThreadActivityStatus.Running
             ? "#EF6A6A"
-            : "#A8B7CA";
-        ModelAccentHex = FormatModelAccent(ModelText);
+            : "#A8B7CA");
+        ModelAccentHex = ThemePalette.Resolve(FormatModelAccent(ModelText));
         ContextText = owner.ContextText(thread);
         ContextUsageText = FormatContextUsage(owner.Texts, thread);
         TokenText = owner.TokenText(thread);
@@ -2076,7 +2084,7 @@ public sealed class ThreadItemViewModel
         ConnectedToParent = connectedToParent;
         ParentTitle = parentTitle;
         IsParent = isParent;
-        CardBackgroundHex = FormatCardBackground(isParent);
+        CardBackgroundHex = ThemePalette.Resolve(FormatCardBackground(isParent));
         IsRootThread = !connectedToParent && !thread.IsOrphan;
     }
 

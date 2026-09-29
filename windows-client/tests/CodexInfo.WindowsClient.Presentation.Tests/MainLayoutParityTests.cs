@@ -262,10 +262,10 @@ public sealed class MainLayoutParityTests
         var accountStyle = document.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
             element.Attribute("Selector")?.Value == "ToggleButton.account-selector");
-        Assert.Equal("#18283A", accountStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme18283A}", accountStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" &&
             element.Attribute("Property")?.Value == "Background").Attribute("Value")?.Value);
-        Assert.Equal("#304A63", accountStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme304A63}", accountStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" &&
             element.Attribute("Property")?.Value == "BorderBrush").Attribute("Value")?.Value);
         Assert.Equal("6", accountStyle.Descendants().Single(element =>
@@ -324,7 +324,7 @@ public sealed class MainLayoutParityTests
         var marker = document.Descendants().Single(element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == automationId);
         Assert.Equal("●", marker.Attribute("Text")?.Value);
-        Assert.Equal("#5DC98A", marker.Attribute("Foreground")?.Value);
+        Assert.Equal("{DynamicResource Theme5DC98A}", marker.Attribute("Foreground")?.Value);
         Assert.Equal(visibility, marker.Attribute("IsVisible")?.Value);
     }
 

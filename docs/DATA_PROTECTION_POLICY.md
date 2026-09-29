@@ -14,12 +14,17 @@ DB-129
 SESSION-129
 LEGACY-129
 WIN-PARITY-HISTORY-01
+WIN-THEME-PREF-422
 U128-15
 U128-18
 U128-19
 -->
 
 # Codex Info データ保護規約
+
+## WIN-THEME-PREF-422 — Windows theme preference
+
+Windows clientの設定JSONは従来のexact 6 keyを有効な旧形式として読み、theme未指定時は`classic-dark`をメモリ内の既定値にする。読込みだけで既存fileを書き換えない。新しい保存は従来6 keyに`themeId`を加えたexact 7 keyをatomic replaceし、値は`classic-dark`、`graphite-dark`、`light`だけを許す。重複・未知keyまたは不正theme IDを含む新形式は既存の設定破損経路で拒否し、接続資格情報を推測しない。保存失敗は永続fileと実行中の設定generationを保持し、成功した保存だけをUIへ公開する。旧形式のconnection profile/selectorとsetup状態はtheme移行で失わない。
 
 ## RECORDER-MODEL-01 — モデル追加・source障害時の記録継続
 
@@ -120,10 +125,10 @@ Codex app-server / session JSONL / thread rollout
     fail-closedにし、旧完全snapshot＋未確認を保持する。完全受理済みREST PublicThread集合内のmissing parentだけは
     presentation orphanでありnative DB danglingの救済ではない。`docs/LIVE_STATE_DECISION_MATRIX.md`は
     このDATA契約から導出した非規範的な判定表とする。
-12. Windows clientの設定永続化は`language`、`setupCompleted`、`connectionConfigured`、`timeZoneId`、
-    `connectionProfile`、`connectionSelector`の6 keyだけを許可する。`connectionProfile`は`none|wsl|sshConfigAlias`のexact enum、
+12. Windows clientの設定永続化は`WIN-THEME-PREF-422`に従い、従来の`language`、`setupCompleted`、`connectionConfigured`、`timeZoneId`、
+    `connectionProfile`、`connectionSelector`の6 keyを旧形式として読み、新規保存には`themeId`を加える。`connectionProfile`は`none|wsl|sshConfigAlias`のexact enum、
     `connectionSelector`はWSLのexact distribution tokenまたはliteral OpenSSH Host alias grammarだけを許可し、秘密、展開済み値、raw host/user/pathを0件とする。
-    saved selectorによるauto reconnectはこの6 keyを再検証して行い、remote自動起動は`ArgumentList`と`BatchMode=yes`を使う。
+    saved selectorによるauto reconnectはconnection値を再検証して行い、remote自動起動は`ArgumentList`と`BatchMode=yes`を使う。
     auth argvもsaved profileから構築するが、起動成功とstatus再確認を別stateに分ける。4-key recoveryはMain disconnectedとSettingsだけに残し、
     設定不正・接続失敗時は保存値とDBを破壊せずSettings recoveryへ戻す。この設定経路の製品判定は`PRODUCT_PENDING`であり、RESTへselector/secretを送らない。
 

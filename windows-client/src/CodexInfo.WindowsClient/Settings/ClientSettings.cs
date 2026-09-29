@@ -6,6 +6,7 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Localization;
+using CodexInfo.WindowsClient.Theme;
 
 namespace CodexInfo.WindowsClient.Settings;
 
@@ -28,6 +29,8 @@ public sealed record ClientSettings(string Language, bool SetupCompleted)
     public string ConnectionProfile { get; init; } = ConnectionProfiles.None;
     /// <summary>A WSL distribution token or literal OpenSSH Host alias.</summary>
     public string ConnectionSelector { get; init; } = ConnectionSelectors.None;
+    /// <summary>Windows presentation palette; old six-key files use the original dark palette.</summary>
+    public string ThemeId { get; init; } = ThemePalette.ClassicDark;
     public static ClientSettings Default { get; } = new("ja", false);
 }
 
@@ -152,7 +155,7 @@ public sealed class ClientSettingsStore
                     ? "UTC"
                     : "local",
             };
-            return ConnectionSelectors.IsValid(normalized)
+            return ConnectionSelectors.IsValid(normalized) && ThemePalette.IsValid(normalized.ThemeId)
                 ? normalized
                 : ClientSettings.Default with { SettingsCorrupt = true };
         }
@@ -175,9 +178,9 @@ public sealed class ClientSettingsStore
                 ? "UTC"
                 : "local",
         };
-        if (!ConnectionSelectors.IsValid(normalized))
+        if (!ConnectionSelectors.IsValid(normalized) || !ThemePalette.IsValid(normalized.ThemeId))
         {
-            throw new ArgumentException("Connection profile and selector are invalid.", nameof(settings));
+            throw new ArgumentException("Settings contain an invalid connection or theme selection.", nameof(settings));
         }
 
         var directory = Path.GetDirectoryName(path)!;
@@ -245,12 +248,17 @@ public sealed class ClientSettingsStore
             var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var property in document.RootElement.EnumerateObject())
             {
-                if (!seen.Add(property.Name) || !expected.Contains(property.Name))
+                if (!seen.Add(property.Name) ||
+                    (!expected.Contains(property.Name) && property.Name != "themeId"))
                 {
                     return false;
                 }
             }
 
+            // An existing six-key file remains valid. Save always emits the
+            // seven-key form because ThemeId has a classic-dark default.
+            if (seen.SetEquals(expected)) return true;
+            expected.Add("themeId");
             return seen.SetEquals(expected);
         }
         catch (JsonException)

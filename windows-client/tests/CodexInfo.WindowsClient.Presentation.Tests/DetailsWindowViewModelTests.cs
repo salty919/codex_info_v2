@@ -58,7 +58,7 @@ public sealed class DetailsWindowViewModelTests
     }
 
     [Fact]
-    public void SettingsPersist_exactly_six_non_secret_keys_and_reject_invalid_profiles()
+    public void SettingsPersist_exactly_seven_non_secret_keys_and_reject_invalid_profiles()
     {
         var root = Directory.CreateTempSubdirectory("codex-info-settings-shape-test");
         try
@@ -75,8 +75,11 @@ public sealed class DetailsWindowViewModelTests
 
             using var document = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
             Assert.Equal(
-                ["connectionConfigured", "connectionProfile", "connectionSelector", "language", "setupCompleted", "timeZoneId"],
-                document.RootElement.EnumerateObject().Select(property => property.Name).OrderBy(name => name));
+                ["connectionConfigured", "connectionProfile", "connectionSelector", "language", "setupCompleted", "themeId", "timeZoneId"],
+                document.RootElement.EnumerateObject()
+                    .Select(property => property.Name)
+                    .OrderBy(name => name, StringComparer.Ordinal));
+            Assert.Equal("classic-dark", document.RootElement.GetProperty("themeId").GetString());
             Assert.DoesNotContain("host", File.ReadAllText(path), StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("password", File.ReadAllText(path), StringComparison.OrdinalIgnoreCase);
             Assert.Equal("work.example", store.Load().ConnectionSelector);
