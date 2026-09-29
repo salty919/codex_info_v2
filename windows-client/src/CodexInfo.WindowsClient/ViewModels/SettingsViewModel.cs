@@ -42,6 +42,13 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         new(ThemePalette.ClassicDark, Texts.ThemeClassicDark),
         new(ThemePalette.GraphiteDark, Texts.ThemeGraphiteDark),
         new(ThemePalette.Light, Texts.ThemeLight),
+        new(ThemePalette.PaperLight, Texts.ThemePaperLight),
+        new(ThemePalette.SandLight, Texts.ThemeSandLight),
+        new(ThemePalette.SteelLight, Texts.ThemeSteelLight),
+        new(ThemePalette.OceanDark, Texts.ThemeOceanDark),
+        new(ThemePalette.TealDark, Texts.ThemeTealDark),
+        new(ThemePalette.EmberDark, Texts.ThemeEmberDark),
+        new(ThemePalette.InkDark, Texts.ThemeInkDark),
     ];
     public UiText Texts => LocalizationService.Current;
     public string SelectedThemeId

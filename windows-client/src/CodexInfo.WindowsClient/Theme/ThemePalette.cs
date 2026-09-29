@@ -7,14 +7,25 @@ using Avalonia.Styling;
 
 namespace CodexInfo.WindowsClient.Theme;
 
-/// <summary>The three built-in Windows palettes. Keys are the existing dark colors.</summary>
+/// <summary>Built-in Windows palettes. Keys are the existing dark colors.</summary>
 public static class ThemePalette
 {
     public const string ClassicDark = "classic-dark";
     public const string GraphiteDark = "graphite-dark";
     public const string Light = "light";
+    public const string PaperLight = "paper-light";
+    public const string SandLight = "sand-light";
+    public const string SteelLight = "steel-light";
+    public const string OceanDark = "ocean-dark";
+    public const string TealDark = "teal-dark";
+    public const string EmberDark = "ember-dark";
+    public const string InkDark = "ink-dark";
 
-    public static IReadOnlyList<string> PresetIds { get; } = [ClassicDark, GraphiteDark, Light];
+    public static IReadOnlyList<string> PresetIds { get; } =
+    [
+        ClassicDark, GraphiteDark, Light, PaperLight, SandLight, SteelLight,
+        OceanDark, TealDark, EmberDark, InkDark,
+    ];
 
     // A one-to-one mapping keeps the existing dark appearance exact, including
     // semantic status and model colors, while changing every direct consumer.
@@ -95,24 +106,82 @@ public static class ThemePalette
             ["#F5FAFF"] = ("#F8FBFF", "#FFFFFF"),
         };
 
+    private static readonly string[] RoleKeys =
+    [
+        "#0E141E", "#151F2D", "#E9EFF8", "#A8B7CA", "#56B2F5", "#121C2C", "#263850", "#1A2838",
+        "#326799", "#143426", "#276C49", "#4FB878", "#243E5A", "#2B425B", "#76A7CC", "#EF6A6A",
+        "#111B2C", "#244D74", "#8BD4FF",
+    ];
+
+    private sealed record AdditionalPreset(
+        bool UsesLightBase,
+        int RedDelta,
+        int GreenDelta,
+        int BlueDelta,
+        IReadOnlyDictionary<string, string> Overrides);
+
+    private static readonly IReadOnlyDictionary<string, AdditionalPreset> AdditionalPresets =
+        new Dictionary<string, AdditionalPreset>(StringComparer.Ordinal)
+        {
+            [PaperLight] = CreatePreset(true, 3, 1, -5,
+                ["#F7F6F2", "#FFFFFC", "#252B31", "#59636B", "#356C91", "#FFFFFC", "#D8E0E5", "#ECEFEB", "#B7CDD8", "#E6F3EB", "#5C9976", "#216543", "#E2EDF2", "#B7C7D0", "#708D9E", "#B23553", "#F1F4F1", "#DAE9EE", "#276A91"]),
+            [SandLight] = CreatePreset(true, 10, 3, -22,
+                ["#FDF6E3", "#FFFBEF", "#334650", "#5D6B6F", "#1B748A", "#FFFBEF", "#C9D6D2", "#EBE4D2", "#B3C9C5", "#E3F0E2", "#6D9B72", "#2B714A", "#E1E9D9", "#BCCBBC", "#728D84", "#A83D48", "#F5EDDA", "#DCE8DB", "#126A7F"]),
+            [SteelLight] = CreatePreset(true, -3, -1, 3,
+                ["#F3F5F8", "#FFFFFF", "#202B38", "#586978", "#275FA8", "#FFFFFF", "#D5DEE9", "#E8EEF5", "#A9C4E1", "#E5F2EA", "#6EAA83", "#1E7047", "#DDE9F6", "#BACBDD", "#728BA9", "#B42F49", "#EDF2F8", "#D7E5F7", "#275FA8"]),
+            [OceanDark] = CreatePreset(false, -8, 0, 14,
+                ["#10182A", "#18263D", "#EAF3FF", "#ACBED3", "#56B8F2", "#111D33", "#304968", "#1E304B", "#3D668B", "#16372F", "#3A8266", "#72CDA3", "#213958", "#45617F", "#82A9C5", "#F28B9B", "#192B45", "#284B70", "#7CD2FF"]),
+            [TealDark] = CreatePreset(false, -22, 14, 13,
+                ["#002B36", "#073642", "#E6F0E9", "#A8C0BC", "#4FB3C3", "#073642", "#3C6570", "#174550", "#3C7583", "#124B40", "#47866A", "#79CAA3", "#174956", "#3D6C75", "#76AEB3", "#F47D88", "#0B3D49", "#1E5B67", "#74D2DB"]),
+            [EmberDark] = CreatePreset(false, 11, 5, -6,
+                ["#202126", "#2B2D32", "#F4F0E9", "#BCBDB7", "#E7BC62", "#26272C", "#505258", "#35373D", "#77725F", "#244437", "#5D9974", "#9FDC9E", "#3D3D47", "#686973", "#A5A3A0", "#F58A94", "#303238", "#555147", "#F2CB78"]),
+            [InkDark] = CreatePreset(false, 0, 0, 0,
+                ["#000000", "#121212", "#FFFFFF", "#D8D8D8", "#6DD3FF", "#050505", "#787878", "#242424", "#808080", "#002B17", "#78E8A4", "#78E8A4", "#202A34", "#FFFFFF", "#FFFFFF", "#FF8BA1", "#101010", "#174A66", "#FFFFFF"]),
+        };
+
+    private static AdditionalPreset CreatePreset(
+        bool usesLightBase, int redDelta, int greenDelta, int blueDelta, string[] roleColors) =>
+        new(usesLightBase, redDelta, greenDelta, blueDelta,
+            RoleKeys.Select((key, index) => (key, value: roleColors[index]))
+                .ToDictionary(pair => pair.key, pair => pair.value, StringComparer.OrdinalIgnoreCase));
+
     private static IReadOnlyDictionary<string, IBrush> brushes = CreateBrushes(ClassicDark);
     public static string CurrentId { get; private set; } = ClassicDark;
     public static event EventHandler? Changed;
 
-    public static bool IsValid(string? id) => id is ClassicDark or GraphiteDark or Light;
+    public static bool IsValid(string? id) => id is ClassicDark or GraphiteDark or Light
+        or PaperLight or SandLight or SteelLight or OceanDark or TealDark or EmberDark or InkDark;
 
-    public static string Resolve(string classicColor)
+    public static string Resolve(string classicColor) => ResolveFor(CurrentId, classicColor);
+
+    private static string ResolveFor(string id, string classicColor)
     {
         if (!Colors.TryGetValue(classicColor, out var alternatives))
         {
             throw new ArgumentOutOfRangeException(nameof(classicColor), classicColor, "Unregistered theme color.");
         }
-        return CurrentId switch
+        if (id == ClassicDark) return classicColor;
+        if (id == GraphiteDark) return alternatives.Graphite;
+        if (id == Light) return alternatives.Light;
+        if (!AdditionalPresets.TryGetValue(id, out var preset))
         {
-            GraphiteDark => alternatives.Graphite,
-            Light => alternatives.Light,
-            _ => classicColor,
-        };
+            throw new ArgumentOutOfRangeException(nameof(id), id, "Unknown theme.");
+        }
+        if (preset.Overrides.TryGetValue(classicColor, out var exact)) return exact;
+        var source = preset.UsesLightBase ? alternatives.Light : alternatives.Graphite;
+        var red = Convert.ToInt32(source.Substring(1, 2), 16);
+        var green = Convert.ToInt32(source.Substring(3, 2), 16);
+        var blue = Convert.ToInt32(source.Substring(5, 2), 16);
+        if (id == InkDark)
+        {
+            static int Contrast(int channel) => channel < 128
+                ? 3 * channel / 4
+                : Math.Min(255, 5 * channel / 4);
+            return $"#{Contrast(red):X2}{Contrast(green):X2}{Contrast(blue):X2}";
+        }
+        return $"#{Math.Clamp(red + preset.RedDelta, 0, 255):X2}" +
+            $"{Math.Clamp(green + preset.GreenDelta, 0, 255):X2}" +
+            $"{Math.Clamp(blue + preset.BlueDelta, 0, 255):X2}";
     }
 
     public static IBrush Brush(string classicColor) =>
@@ -121,14 +190,9 @@ public static class ThemePalette
             : throw new ArgumentOutOfRangeException(nameof(classicColor), classicColor, "Unregistered theme color.");
 
     private static IReadOnlyDictionary<string, IBrush> CreateBrushes(string id) =>
-        Colors.ToDictionary(
-            entry => entry.Key,
-            entry => (IBrush)new SolidColorBrush(Color.Parse(id switch
-            {
-                GraphiteDark => entry.Value.Graphite,
-                Light => entry.Value.Light,
-                _ => entry.Key,
-            })),
+        Colors.Keys.ToDictionary(
+            key => key,
+            key => (IBrush)new SolidColorBrush(Color.Parse(ResolveFor(id, key))),
             StringComparer.OrdinalIgnoreCase);
 
     public static void Apply(string id)
@@ -139,7 +203,9 @@ public static class ThemePalette
         CurrentId = id;
         if (Application.Current is { } app)
         {
-            app.RequestedThemeVariant = id == Light ? ThemeVariant.Light : ThemeVariant.Dark;
+            app.RequestedThemeVariant = id is Light or PaperLight or SandLight or SteelLight
+                ? ThemeVariant.Light
+                : ThemeVariant.Dark;
             foreach (var (classic, brush) in brushes)
             {
                 app.Resources["Theme" + classic[1..].ToUpperInvariant()] = brush;

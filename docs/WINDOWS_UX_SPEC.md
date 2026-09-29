@@ -41,13 +41,20 @@ Linux timezone設定、Issue #422で利用者が選択したWindows版の`WIN-TH
 
 ## WIN-THEME-422 — Windows版の組込みカラーテーマ
 
-Windows Settingsの外観欄は`classic-dark`（従来配色・既定）、`graphite-dark`、`light`の順に3つの組込みpresetを選択できる。VS Codeのように利用者がpresetを切り替える操作を提供し、外部themeの取込みや任意色編集は含めない。選択中は現在表示を変えず、既存の保存操作がDATA ownerの`WIN-THEME-PREF-422`に従って成功した後に、開いているMain、Settings、Setup、Graph、Threads、Legalの全Windowへ反映する。取消または保存失敗時は表示中の色と永続設定を変えない。次回起動時は保存したpresetをMain表示前に適用する。theme変更によってquota、Graph系列データ、Threadsの状態、接続、取得要求を変更しない。
+Windows Settingsの外観欄は`classic-dark`（従来配色・既定）、`graphite-dark`、`light`、`paper-light`、`sand-light`、`steel-light`、`ocean-dark`、`teal-dark`、`ember-dark`、`ink-dark`の順に10種類の組込みpresetを選択できる。新規presetの表示名は順にPaper Light、Sand Light、Steel Light、Ocean Dark、Teal Dark、Ember Dark、Ink Darkとし、日本語では順にペーパー ライト、サンド ライト、スチール ライト、オーシャン ダーク、ティール ダーク、エンバー ダーク、インク ダークとする。これらは独自の配色であり、他製品の同名themeとの色互換を表明しない。VS Codeのように利用者がpresetを切り替える操作を提供し、外部themeの取込みや任意色編集は含めない。選択中は現在表示を変えず、既存の保存操作がDATA ownerの`WIN-THEME-PREF-422`に従って成功した後に、開いているMain、Settings、Setup、Graph、Threads、Legalの全Windowへ反映する。取消または保存失敗時は表示中の色と永続設定を変えない。次回起動時は保存したpresetをMain表示前に適用する。theme変更によってquota、Graph系列データ、Threadsの状態、接続、取得要求を変更しない。
 
 | preset | window背景 | card面 | 主要文字 | 補助文字 | accent | Graph背景 | grid | idle band |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `classic-dark` | `#0E141E` | `#151F2D` | `#E9EFF8` | `#A8B7CA` | `#56B2F5` | `#121C2C` | `#263850` | `#1A2838` |
 | `graphite-dark` | `#181A1F` | `#242830` | `#F1F3F5` | `#B5BEC9` | `#69B5F7` | `#20242B` | `#3C4652` | `#303944` |
 | `light` | `#F4F7FB` | `#FFFFFF` | `#1C2834` | `#526579` | `#176AAB` | `#FFFFFF` | `#CFD9E4` | `#E4EDF5` |
+| `paper-light` | `#F7F6F2` | `#FFFFFC` | `#252B31` | `#59636B` | `#356C91` | `#FFFFFC` | `#D8E0E5` | `#ECEFEB` |
+| `sand-light` | `#FDF6E3` | `#FFFBEF` | `#334650` | `#5D6B6F` | `#1B748A` | `#FFFBEF` | `#C9D6D2` | `#EBE4D2` |
+| `steel-light` | `#F3F5F8` | `#FFFFFF` | `#202B38` | `#586978` | `#275FA8` | `#FFFFFF` | `#D5DEE9` | `#E8EEF5` |
+| `ocean-dark` | `#10182A` | `#18263D` | `#EAF3FF` | `#ACBED3` | `#56B8F2` | `#111D33` | `#304968` | `#1E304B` |
+| `teal-dark` | `#002B36` | `#073642` | `#E6F0E9` | `#A8C0BC` | `#4FB3C3` | `#073642` | `#3C6570` | `#174550` |
+| `ember-dark` | `#202126` | `#2B2D32` | `#F4F0E9` | `#BCBDB7` | `#E7BC62` | `#26272C` | `#505258` | `#35373D` |
+| `ink-dark` | `#000000` | `#121212` | `#FFFFFF` | `#D8D8D8` | `#6DD3FF` | `#050505` | `#787878` | `#242424` |
 
 E2Eで画面内の色を判定する追加roleは次のexact値とする。`status`はfixtureの正常時に見えるMainのready状態を指す。Graphの線色は描画系列、Threadsの色はカードと接続線へ適用し、文字や面の存在だけを色判定の代用にしない。
 
@@ -67,9 +74,39 @@ E2Eで画面内の色を判定する追加roleは次のexact値とする。`stat
 | Graph selector popup選択行 | `#244D74` | `#344D63` | `#D9EBF8` |
 | キーボードfocus枠 | `#8BD4FF` | `#9AD7F8` | `#176AAB` |
 
+新規presetの同じ追加roleは次のexact値とする。
+
+| role | `paper-light` | `sand-light` | `steel-light` | `ocean-dark` | `teal-dark` | `ember-dark` | `ink-dark` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| quota gaugeの未充填面 | `#B7CDD8` | `#B3C9C5` | `#A9C4E1` | `#3D668B` | `#3C7583` | `#77725F` | `#808080` |
+| quota gaugeの充填面・Graph Remaining線 | `#356C91` | `#1B748A` | `#275FA8` | `#56B8F2` | `#4FB3C3` | `#E7BC62` | `#6DD3FF` |
+| Main ready status背景 | `#E6F3EB` | `#E3F0E2` | `#E5F2EA` | `#16372F` | `#124B40` | `#244437` | `#002B17` |
+| Main ready status枠 | `#5C9976` | `#6D9B72` | `#6EAA83` | `#3A8266` | `#47866A` | `#5D9974` | `#78E8A4` |
+| Main ready status強調 | `#216543` | `#2B714A` | `#1E7047` | `#72CDA3` | `#79CAA3` | `#9FDC9E` | `#78E8A4` |
+| Threads親card背景 | `#E2EDF2` | `#E1E9D9` | `#DDE9F6` | `#213958` | `#174956` | `#3D3D47` | `#202A34` |
+| Threads子・独立card背景 | `#FFFFFC` | `#FFFBEF` | `#FFFFFF` | `#18263D` | `#073642` | `#2B2D32` | `#121212` |
+| Threads card枠 | `#B7C7D0` | `#BCCBBC` | `#BACBDD` | `#45617F` | `#3D6C75` | `#686973` | `#FFFFFF` |
+| Threads接続線・junction | `#708D9E` | `#728D84` | `#728BA9` | `#82A9C5` | `#76AEB3` | `#A5A3A0` | `#FFFFFF` |
+| Threads動作中の状態文字 | `#B23553` | `#A83D48` | `#B42F49` | `#F28B9B` | `#F47D88` | `#F58A94` | `#FF8BA1` |
+| Graph selector popup面 | `#F1F4F1` | `#F5EDDA` | `#EDF2F8` | `#192B45` | `#0B3D49` | `#303238` | `#101010` |
+| Graph selector popup選択行 | `#DAE9EE` | `#DCE8DB` | `#D7E5F7` | `#284B70` | `#1E5B67` | `#555147` | `#174A66` |
+| キーボードfocus枠 | `#276A91` | `#126A7F` | `#275FA8` | `#7CD2FF` | `#74D2DB` | `#F2CB78` | `#FFFFFF` |
+
+上の2表に記した21表示roleは、同じclassic色を共有するcard面／Threads子cardとaccent／quota充填／Graph Remainingをまとめると19個のclassic色キーになる。既存paletteの72キー全件について、新規presetの色は次の決定的な規則で定める。19キーは上表のexact値を優先する。残り53キーは現行`ThemePalette.Colors`の`light`列または`graphite-dark`列のRGB 8-bit値へ、下表の符号付き差分を各channelに加えて0..255へclampし、大文字`#RRGGBB`にする。`ink-dark`だけは各channel `c`に対して`c < 128`なら`floor(3c/4)`、それ以外なら`min(255, floor(5c/4))`とする。未知のclassic色キーは例外で拒否し、元の暗色へのfallbackを行わない。
+
+| preset | 基準列 | R差分 | G差分 | B差分 |
+| --- | --- | ---: | ---: | ---: |
+| `paper-light` | `light` | +3 | +1 | -5 |
+| `sand-light` | `light` | +10 | +3 | -22 |
+| `steel-light` | `light` | -3 | -1 | +3 |
+| `ocean-dark` | `graphite-dark` | -8 | 0 | +14 |
+| `teal-dark` | `graphite-dark` | -22 | +14 | +13 |
+| `ember-dark` | `graphite-dark` | +11 | +5 | -6 |
+| `ink-dark` | `graphite-dark` | 上記の段階式 | 同左 | 同左 |
+
 `classic-dark`の既存固定色、状態色、model色は維持する。他のpresetは同じ状態・modelの識別を色相と状態文の組で保ち、明色面では読める濃色を使う。Graphの線・grid・idle band、Mainのquota/status、Threadsの親card・接続線・動作状態、focus・selector・popupも選択paletteから描画し、一部だけ旧暗色を残さない。画面geometry、情報と状態の意味、Linux版の色は変更しない。preset名と選択操作は対応言語のcatalogとUI Automationで識別できるようにする。実Windowsの同一最終buildで選択、保存、再起動復元、6 Windowの表示色を確認する。
 
-以下の既存節にあるWindows固定HEXのpixel oracleは`classic-dark`へ適用する。`graphite-dark`と`light`では、同じ情報・状態・描画geometryを保持しつつ、この節のpaletteへ変換した色を照合する。Linuxの固定HEXとpixel oracleは従来どおりとする。
+以下の既存節にあるWindows固定HEXのpixel oracleは`classic-dark`へ適用する。他の9 presetでは、同じ情報・状態・描画geometryを保持しつつ、この節のpaletteへ変換した色を照合する。Linuxの固定HEXとpixel oracleは従来どおりとする。
 
 ## 1. UXの目的、利用者、主要タスク
 
