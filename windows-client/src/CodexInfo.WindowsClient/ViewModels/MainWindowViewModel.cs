@@ -13,6 +13,7 @@ using Avalonia.Media;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
+using CodexInfo.WindowsClient.Theme;
 using CodexInfo.WindowsClient.Updates;
 
 namespace CodexInfo.WindowsClient.ViewModels;
@@ -24,18 +25,18 @@ namespace CodexInfo.WindowsClient.ViewModels;
 public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 {
     private const int MaxSplitGenerationAlignmentAttempts = 2;
-    private static readonly IBrush NormalBackground = new SolidColorBrush(Color.Parse("#143426"));
-    private static readonly IBrush NormalBorder = new SolidColorBrush(Color.Parse("#276C49"));
-    private static readonly IBrush NormalAccent = new SolidColorBrush(Color.Parse("#4FB878"));
-    private static readonly IBrush NoticeBackground = new SolidColorBrush(Color.Parse("#172C42"));
-    private static readonly IBrush NoticeBorder = new SolidColorBrush(Color.Parse("#2D6193"));
-    private static readonly IBrush NoticeAccent = new SolidColorBrush(Color.Parse("#5EA7E5"));
-    private static readonly IBrush WarningBackground = new SolidColorBrush(Color.Parse("#3A2A13"));
-    private static readonly IBrush WarningBorder = new SolidColorBrush(Color.Parse("#8A651F"));
-    private static readonly IBrush WarningAccent = new SolidColorBrush(Color.Parse("#D5A43A"));
-    private static readonly IBrush ErrorBackground = new SolidColorBrush(Color.Parse("#3A1D24"));
-    private static readonly IBrush ErrorBorder = new SolidColorBrush(Color.Parse("#8E3D4D"));
-    private static readonly IBrush ErrorAccent = new SolidColorBrush(Color.Parse("#E06B7A"));
+    private static IBrush NormalBackground => ThemePalette.Brush("#143426");
+    private static IBrush NormalBorder => ThemePalette.Brush("#276C49");
+    private static IBrush NormalAccent => ThemePalette.Brush("#4FB878");
+    private static IBrush NoticeBackground => ThemePalette.Brush("#172C42");
+    private static IBrush NoticeBorder => ThemePalette.Brush("#2D6193");
+    private static IBrush NoticeAccent => ThemePalette.Brush("#5EA7E5");
+    private static IBrush WarningBackground => ThemePalette.Brush("#3A2A13");
+    private static IBrush WarningBorder => ThemePalette.Brush("#8A651F");
+    private static IBrush WarningAccent => ThemePalette.Brush("#D5A43A");
+    private static IBrush ErrorBackground => ThemePalette.Brush("#3A1D24");
+    private static IBrush ErrorBorder => ThemePalette.Brush("#8E3D4D");
+    private static IBrush ErrorAccent => ThemePalette.Brush("#E06B7A");
 
     private readonly ILoopbackHealthClient healthClient;
     private readonly ILoopbackDetailsClient detailsClient;
@@ -117,6 +118,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         QuotaSegments = new ReadOnlyObservableCollection<QuotaSegmentViewModel>(quotaSegments);
         Accounts = new ReadOnlyObservableCollection<ApiAccount>(accounts);
         LocalizationService.LanguageChanged += OnLanguageChanged;
+        ThemePalette.Changed += OnThemeChanged;
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -849,6 +851,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             retirement = RetireContextLocked(currentContext);
             currentContext = null;
             LocalizationService.LanguageChanged -= OnLanguageChanged;
+            ThemePalette.Changed -= OnThemeChanged;
             if (update is not null)
             {
                 update.PropertyChanged -= OnUpdatePropertyChanged;
@@ -956,6 +959,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             });
         }
         return Task.CompletedTask;
+    }
+
+    private void OnThemeChanged(object? sender, EventArgs eventArgs)
+    {
+        if (disposed) return;
+        Notify(nameof(StatusBackground));
+        Notify(nameof(StatusBorder));
+        Notify(nameof(StatusAccent));
     }
 
     private void OnLanguageChanged(object? sender, EventArgs eventArgs)

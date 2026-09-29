@@ -7,6 +7,7 @@ using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
+using CodexInfo.WindowsClient.Theme;
 using CodexInfo.WindowsClient.Updates;
 using CodexInfo.WindowsClient.ViewModels;
 
@@ -16,7 +17,19 @@ public partial class App : Application
 {
     public static ClientSettingsStore SettingsStore { get; } = new();
 
-    public static ClientSettings CurrentSettings { get; internal set; } = ClientSettings.Default;
+    private static ClientSettings currentSettings = ClientSettings.Default;
+    public static ClientSettings CurrentSettings
+    {
+        get => currentSettings;
+        internal set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            if (!ThemePalette.IsValid(value.ThemeId))
+                throw new ArgumentOutOfRangeException(nameof(value), "Invalid theme selection.");
+            currentSettings = value;
+            ThemePalette.Apply(value.ThemeId);
+        }
+    }
 
     public static IClientSettingsSession SettingsSession { get; } = new ClientSettingsSession(
         SettingsStore,
@@ -25,6 +38,8 @@ public partial class App : Application
 
     public override void OnFrameworkInitializationCompleted()
     {
+        // Install the palette resources before any top-level Window is created.
+        ThemePalette.Apply(CurrentSettings.ThemeId);
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             var settings = SettingsStore.Load();

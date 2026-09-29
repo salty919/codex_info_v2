@@ -15,15 +15,15 @@
       <Setter Property="FontWeight" Value="Medium" />
     </Style>
     <Style Selector="Button:focus">
-      <Setter Property="BorderBrush" Value="#8BD4FF" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme8BD4FF}" />
       <Setter Property="BorderThickness" Value="2" />
     </Style>
     <Style Selector="ComboBox:focus">
-      <Setter Property="BorderBrush" Value="#8BD4FF" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme8BD4FF}" />
       <Setter Property="BorderThickness" Value="2" />
     </Style>
     <Style Selector="CheckBox:focus">
-      <Setter Property="BorderBrush" Value="#8BD4FF" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme8BD4FF}" />
       <Setter Property="BorderThickness" Value="2" />
     </Style>
   </Application.Styles>

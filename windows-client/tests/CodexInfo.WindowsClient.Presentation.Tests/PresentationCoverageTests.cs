@@ -180,6 +180,28 @@ public sealed class PresentationCoverageTests
             ConnectionSelector = ConnectionSelectors.None,
         }));
         Assert.True(ConnectionSelectors.IsValid(ClientSettings.Default));
+
+        var root = Directory.CreateTempSubdirectory("codex-info-unknown-theme-test");
+        try
+        {
+            var path = Path.Combine(root.FullName, "settings.json");
+            var store = new ClientSettingsStore(path);
+            Assert.Throws<ArgumentException>(() => store.Save(new ClientSettings("ja", true)
+            {
+                ThemeId = "unknown-theme",
+            }));
+
+            File.WriteAllText(
+                path,
+                "{\"language\":\"ja\",\"setupCompleted\":true,\"connectionConfigured\":false,\"timeZoneId\":\"local\",\"connectionProfile\":\"none\",\"connectionSelector\":\"none\",\"themeId\":\"unknown-theme\"}");
+            var invalidTheme = store.Load();
+            Assert.True(invalidTheme.SettingsCorrupt);
+            Assert.Equal(ClientSettings.Default, invalidTheme with { SettingsCorrupt = false });
+        }
+        finally
+        {
+            root.Delete(recursive: true);
+        }
     }
 
     [Fact]

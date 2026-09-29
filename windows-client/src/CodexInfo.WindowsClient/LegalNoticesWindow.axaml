@@ -18,16 +18,16 @@
         ExtendClientAreaTitleBarHeightHint="0"
         Title="Codex Info Legal"
         FontFamily="{StaticResource JapaneseFont}"
-        Background="#0E141E"
-        Foreground="#E9EFF8">
+        Background="{DynamicResource Theme0E141E}"
+        Foreground="{DynamicResource ThemeE9EFF8}">
   <Window.Styles>
     <Style Selector="TextBlock.label">
       <Setter Property="FontSize" Value="13" />
-      <Setter Property="Foreground" Value="#A8B7CA" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
     </Style>
     <Style Selector="Border.notice-card">
-      <Setter Property="Background" Value="#151F2D" />
-      <Setter Property="BorderBrush" Value="#263548" />
+      <Setter Property="Background" Value="{DynamicResource Theme151F2D}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme263548}" />
       <Setter Property="BorderThickness" Value="1" />
       <Setter Property="CornerRadius" Value="8" />
       <Setter Property="Padding" Value="14" />
@@ -39,27 +39,27 @@
       <Setter Property="FontSize" Value="17" />
       <Setter Property="Background" Value="Transparent" />
       <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="Foreground" Value="#A8B7CA" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
     </Style>
     <Style Selector="Button.window-control:pointerover">
-      <Setter Property="Background" Value="#263548" />
-      <Setter Property="Foreground" Value="#F2F6FC" />
+      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
     </Style>
     <Style Selector="Button.page-nav">
       <Setter Property="MinWidth" Value="76" />
       <Setter Property="Padding" Value="14,7" />
-      <Setter Property="Background" Value="#1B2A3A" />
-      <Setter Property="BorderBrush" Value="#36516B" />
-      <Setter Property="Foreground" Value="#E9EFF8" />
+      <Setter Property="Background" Value="{DynamicResource Theme1B2A3A}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme36516B}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeE9EFF8}" />
     </Style>
     <Style Selector="Button.page-nav:pointerover">
-      <Setter Property="Background" Value="#294968" />
-      <Setter Property="BorderBrush" Value="#5EA7E5" />
+      <Setter Property="Background" Value="{DynamicResource Theme294968}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
     </Style>
     <Style Selector="Button.page-nav:disabled">
-      <Setter Property="Background" Value="#111A27" />
-      <Setter Property="BorderBrush" Value="#263548" />
-      <Setter Property="Foreground" Value="#718196" />
+      <Setter Property="Background" Value="{DynamicResource Theme111A27}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme263548}" />
+      <Setter Property="Foreground" Value="{DynamicResource Theme718196}" />
     </Style>
   </Window.Styles>
   <Grid Margin="24" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="12">

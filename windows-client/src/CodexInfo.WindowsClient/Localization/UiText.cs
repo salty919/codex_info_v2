@@ -324,17 +324,21 @@ public sealed record UiText(
 
     public string AppearanceDescription => LanguageCode switch
     {
-        "ja" => "Windows向けの高コントラストなFluent配色、キーボードフォーカス、ツールチップを使用します。",
-        "zh-Hans" => "使用适合 Windows 的高对比度 Fluent 配色、键盘焦点和工具提示。",
-        "ko" => "Windows에 맞춘 고대비 Fluent 색상, 키보드 포커스 및 도구 설명을 사용합니다.",
-        "es" => "Usa colores Fluent de alto contraste, foco de teclado y sugerencias para Windows.",
-        "fr" => "Utilise une palette Fluent à contraste élevé, le focus clavier et des info-bulles Windows.",
-        "de" => "Verwendet kontrastreiche Fluent-Farben, Tastaturfokus und Tooltips für Windows.",
-        "pt" => "Usa cores Fluent de alto contraste, foco do teclado e dicas para Windows.",
-        "it" => "Usa colori Fluent ad alto contrasto, focus da tastiera e suggerimenti per Windows.",
-        "ru" => "Используются контрастная палитра Fluent, фокус клавиатуры и подсказки Windows.",
-        _ => "Uses high-contrast Fluent colors, keyboard focus, and tooltips for Windows."
+        "ja" => "保存すると、選択した配色を開いているすべての画面に適用します。",
+        "zh-Hans" => "保存后，所选配色将应用于所有打开的窗口。",
+        "ko" => "저장하면 선택한 색상 테마가 열려 있는 모든 창에 적용됩니다.",
+        "es" => "Al guardar, el tema elegido se aplica a todas las ventanas abiertas.",
+        "fr" => "Après l'enregistrement, le thème choisi s'applique à toutes les fenêtres ouvertes.",
+        "de" => "Nach dem Speichern gilt das gewählte Farbschema für alle geöffneten Fenster.",
+        "pt" => "Ao salvar, o tema escolhido é aplicado a todas as janelas abertas.",
+        "it" => "Dopo il salvataggio, il tema scelto si applica a tutte le finestre aperte.",
+        "ru" => "После сохранения выбранная тема применяется ко всем открытым окнам.",
+        _ => "Save to apply the selected theme to all open windows."
     };
+
+    public string ThemeClassicDark => LanguageCode switch { "ja" => "クラシック ダーク", "zh-Hans" => "经典深色", "ko" => "클래식 다크", "es" => "Oscuro clásico", "fr" => "Sombre classique", "de" => "Klassisch dunkel", "pt" => "Escuro clássico", "it" => "Scuro classico", "ru" => "Классическая тёмная", _ => "Classic Dark" };
+    public string ThemeGraphiteDark => LanguageCode switch { "ja" => "グラファイト ダーク", "zh-Hans" => "石墨深色", "ko" => "그래파이트 다크", "es" => "Grafito oscuro", "fr" => "Graphite sombre", "de" => "Graphit dunkel", "pt" => "Grafite escuro", "it" => "Grafite scuro", "ru" => "Графитовая тёмная", _ => "Graphite Dark" };
+    public string ThemeLight => LanguageCode switch { "ja" => "ライト", "zh-Hans" => "浅色", "ko" => "라이트", "es" => "Claro", "fr" => "Clair", "de" => "Hell", "pt" => "Claro", "it" => "Chiaro", "ru" => "Светлая", _ => "Light" };
 
     public string Other => LanguageCode switch { "ja" => "その他", "zh-Hans" => "其他", "ko" => "기타", "es" => "Otros", "fr" => "Autres", "de" => "Andere", "pt" => "Outros", "it" => "Altro", "ru" => "Другие", _ => "Other" };
     public string Parent => LanguageCode switch { "ja" => "親", "zh-Hans" => "父线程", "ko" => "상위", "es" => "Padre", "fr" => "Parent", "de" => "Übergeordnet", "pt" => "Pai", "it" => "Padre", "ru" => "Родитель", _ => "Parent" };

@@ -19,16 +19,16 @@
         ExtendClientAreaTitleBarHeightHint="0"
         Title="Codex Info Threads"
         FontFamily="{StaticResource JapaneseFont}"
-        Background="#0E141E"
-        Foreground="#E9EFF8">
+        Background="{DynamicResource Theme0E141E}"
+        Foreground="{DynamicResource ThemeE9EFF8}">
   <Window.Styles>
     <Style Selector="TextBlock.label">
       <Setter Property="FontSize" Value="12" />
-      <Setter Property="Foreground" Value="#A8B7CA" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
     </Style>
     <Style Selector="Border.thread-card">
-      <Setter Property="Background" Value="#151F2D" />
-      <Setter Property="BorderBrush" Value="#2B425B" />
+      <Setter Property="Background" Value="{DynamicResource Theme151F2D}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme2B425B}" />
       <Setter Property="BorderThickness" Value="1" />
       <Setter Property="CornerRadius" Value="8" />
       <Setter Property="Height" Value="84" />
@@ -48,11 +48,11 @@
       <Setter Property="FontSize" Value="17" />
       <Setter Property="Background" Value="Transparent" />
       <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="Foreground" Value="#A8B7CA" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
     </Style>
     <Style Selector="Button.window-control:pointerover">
-      <Setter Property="Background" Value="#263548" />
-      <Setter Property="Foreground" Value="#F2F6FC" />
+      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
     </Style>
   </Window.Styles>
   <Grid Margin="20" RowDefinitions="30,384" RowSpacing="6">

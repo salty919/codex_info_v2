@@ -30,20 +30,20 @@ public sealed class GraphWindowSelectorParityTests
         var fieldStyle = graph.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
             element.Attribute("Selector")?.Value == "controls|GraphSelect.graph-select-field");
-        Assert.Equal("#111B2C", fieldStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme111B2C}", fieldStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Background")
             .Attribute("Value")?.Value);
-        Assert.Equal("#405779", fieldStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme405779}", fieldStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "BorderBrush")
             .Attribute("Value")?.Value);
 
         var openFieldStyle = graph.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
             element.Attribute("Selector")?.Value == "controls|GraphSelect.graph-select-field:checked");
-        Assert.Equal("#244D74", openFieldStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme244D74}", openFieldStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Background")
             .Attribute("Value")?.Value);
-        Assert.Equal("#56B2F5", openFieldStyle.Descendants().Single(element =>
+        Assert.Equal("{DynamicResource Theme56B2F5}", openFieldStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "BorderBrush")
             .Attribute("Value")?.Value);
 
@@ -67,7 +67,7 @@ public sealed class GraphWindowSelectorParityTests
             field.Root?.Attribute(XName.Get("Class", xamlName.NamespaceName))?.Value);
         Assert.DoesNotContain(field.Root!.Descendants(), element => element.Name.LocalName == "ToggleButton");
 
-        var presenter = field.Descendants().Single(element => element.Name.LocalName == "ContentPresenter");
+        var presenter = field.Root!.Elements().Single(element => element.Name.LocalName == "ToggleButton.Template").Descendants().Single(element => element.Name.LocalName == "ContentPresenter");
         Assert.Equal("Stretch", presenter.Attribute("HorizontalAlignment")?.Value);
         Assert.Equal("Stretch", presenter.Attribute("VerticalAlignment")?.Value);
 

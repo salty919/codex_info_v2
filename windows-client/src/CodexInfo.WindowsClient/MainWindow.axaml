@@ -19,35 +19,35 @@
         ExtendClientAreaTitleBarHeightHint="0"
         Title="Codex Info Monitor"
         FontFamily="{StaticResource JapaneseFont}"
-        Background="#0E141E"
-        Foreground="#E9EFF8">
+        Background="{DynamicResource Theme0E141E}"
+        Foreground="{DynamicResource ThemeE9EFF8}">
   <Window.Styles>
     <!-- Main uses a single compact surface per component.  The fixed rows
          below are the viewport contract; no component relies on a hidden
          overflow path. -->
     <Style Selector="Border.section">
-      <Setter Property="Background" Value="#151F2D" />
-      <Setter Property="BorderBrush" Value="#263548" />
+      <Setter Property="Background" Value="{DynamicResource Theme151F2D}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme263548}" />
       <Setter Property="BorderThickness" Value="1" />
       <Setter Property="CornerRadius" Value="8" />
     </Style>
     <Style Selector="TextBlock.label">
       <Setter Property="FontSize" Value="12" />
-      <Setter Property="Foreground" Value="#A8B7CA" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
     </Style>
     <Style Selector="TextBlock.value">
       <Setter Property="FontSize" Value="15" />
-      <Setter Property="Foreground" Value="#F2F6FC" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
       <Setter Property="TextWrapping" Value="NoWrap" />
     </Style>
     <Style Selector="TextBlock.metric-label">
       <Setter Property="FontSize" Value="11" />
-      <Setter Property="Foreground" Value="#A8B7CA" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
       <Setter Property="TextWrapping" Value="NoWrap" />
     </Style>
     <Style Selector="TextBlock.metric-value">
       <Setter Property="FontSize" Value="13" />
-      <Setter Property="Foreground" Value="#F2F6FC" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
       <Setter Property="HorizontalAlignment" Value="Right" />
       <Setter Property="TextWrapping" Value="NoWrap" />
     </Style>
@@ -57,17 +57,17 @@
       <Setter Property="FontSize" Value="12" />
       <Setter Property="HorizontalContentAlignment" Value="Center" />
       <Setter Property="VerticalContentAlignment" Value="Center" />
-      <Setter Property="Background" Value="#294968" />
-      <Setter Property="BorderBrush" Value="#47769F" />
-      <Setter Property="Foreground" Value="#F2F6FC" />
+      <Setter Property="Background" Value="{DynamicResource Theme294968}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme47769F}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
     </Style>
     <Style Selector="Button.refresh:pointerover">
-      <Setter Property="Background" Value="#356087" />
+      <Setter Property="Background" Value="{DynamicResource Theme356087}" />
     </Style>
     <Style Selector="Button.refresh:disabled">
-      <Setter Property="Background" Value="#1D2A38" />
-      <Setter Property="BorderBrush" Value="#2A3A4B" />
-      <Setter Property="Foreground" Value="#8EA1B5" />
+      <Setter Property="Background" Value="{DynamicResource Theme1D2A38}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme2A3A4B}" />
+      <Setter Property="Foreground" Value="{DynamicResource Theme8EA1B5}" />
     </Style>
     <Style Selector="Button.command">
       <Setter Property="Padding" Value="8,5" />
@@ -76,35 +76,35 @@
       <Setter Property="FontSize" Value="12" />
       <Setter Property="HorizontalContentAlignment" Value="Center" />
       <Setter Property="VerticalContentAlignment" Value="Center" />
-      <Setter Property="Background" Value="#18283A" />
-      <Setter Property="BorderBrush" Value="#304A63" />
-      <Setter Property="Foreground" Value="#EAF2FB" />
+      <Setter Property="Background" Value="{DynamicResource Theme18283A}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme304A63}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeEAF2FB}" />
     </Style>
     <Style Selector="Button.command:pointerover">
-      <Setter Property="Background" Value="#24415E" />
-      <Setter Property="BorderBrush" Value="#5EA7E5" />
+      <Setter Property="Background" Value="{DynamicResource Theme24415E}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
     </Style>
     <Style Selector="Button.command.legal">
       <Setter Property="Width" Value="84" />
       <Setter Property="MinWidth" Value="84" />
     </Style>
     <Style Selector="ToggleButton.account-selector">
-      <Setter Property="Background" Value="#18283A" />
-      <Setter Property="BorderBrush" Value="#304A63" />
+      <Setter Property="Background" Value="{DynamicResource Theme18283A}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme304A63}" />
       <Setter Property="BorderThickness" Value="1" />
       <Setter Property="CornerRadius" Value="6" />
-      <Setter Property="Foreground" Value="#EAF2FB" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeEAF2FB}" />
       <Setter Property="Padding" Value="10,3" />
     </Style>
     <Style Selector="ToggleButton.account-selector:pointerover">
-      <Setter Property="Background" Value="#24415E" />
-      <Setter Property="BorderBrush" Value="#5EA7E5" />
+      <Setter Property="Background" Value="{DynamicResource Theme24415E}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
     </Style>
     <!-- WeekGauge cells use a fixed two-surface template instead of a themed
          progress control.  This keeps the gauge free of hover, animation, and
          indeterminate layers. -->
     <Style Selector="Border.quota-segment">
-      <Setter Property="Background" Value="#326799" />
+      <Setter Property="Background" Value="{DynamicResource Theme326799}" />
       <Setter Property="Height" Value="20" />
       <Setter Property="Margin" Value="0,0,4,0" />
     </Style>
@@ -112,8 +112,8 @@
       <Setter Property="Width" Value="36" />
       <Setter Property="Height" Value="36" />
       <Setter Property="CornerRadius" Value="10" />
-      <Setter Property="Background" Value="#1C5D91" />
-      <Setter Property="BorderBrush" Value="#5EA7E5" />
+      <Setter Property="Background" Value="{DynamicResource Theme1C5D91}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
       <Setter Property="BorderThickness" Value="1" />
     </Style>
     <Style Selector="Button.window-control">
@@ -125,11 +125,11 @@
       <Setter Property="FontSize" Value="16" />
       <Setter Property="Background" Value="Transparent" />
       <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="Foreground" Value="#A8B7CA" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
     </Style>
     <Style Selector="Button.window-control:pointerover">
-      <Setter Property="Background" Value="#263548" />
-      <Setter Property="Foreground" Value="#F2F6FC" />
+      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
     </Style>
   </Window.Styles>
 
@@ -148,7 +148,7 @@
       <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
         <Border Classes="app-mark">
           <TextBlock FontSize="20"
-                     Foreground="#F2F6FC"
+                     Foreground="{DynamicResource ThemeF2F6FC}"
                      HorizontalAlignment="Center"
                      VerticalAlignment="Center"
                      Text="◈" />
@@ -157,7 +157,7 @@
           <TextBlock Grid.Row="0"
                      FontSize="22"
                      FontWeight="Bold"
-                     Foreground="#E9EFF8"
+                     Foreground="{DynamicResource ThemeE9EFF8}"
                      Text="{Binding Texts.UsageStatus}"
                      VerticalAlignment="Center"
                      AutomationProperties.AutomationId="Main.UsageStatus" />
@@ -185,14 +185,14 @@
                     ToolTip.Tip="{Binding SelectedAccountText}">
         <Grid ColumnDefinitions="18,*,14" ColumnSpacing="0">
           <TextBlock Width="14"
-                     Foreground="#5DC98A"
+                     Foreground="{DynamicResource Theme5DC98A}"
                      Text="●"
                      IsVisible="{Binding SelectedAccount.IsCurrent}"
                      VerticalAlignment="Center"
                      AutomationProperties.AutomationId="Main.SelectedAccountCurrentMarker" />
           <StackPanel Grid.Column="1" Spacing="0" VerticalAlignment="Center">
             <TextBlock FontSize="9"
-                       Foreground="#56B2F5"
+                       Foreground="{DynamicResource Theme56B2F5}"
                        Text="{Binding Texts.Account}" />
             <TextBlock FontSize="11"
                        FontWeight="SemiBold"
@@ -203,7 +203,7 @@
           <TextBlock Grid.Column="2"
                      HorizontalAlignment="Center"
                      VerticalAlignment="Center"
-                     Foreground="#9FB0C5"
+                     Foreground="{DynamicResource Theme9FB0C5}"
                      Text="⌄" />
         </Grid>
       </ToggleButton>
@@ -261,14 +261,14 @@
           <TextBlock Classes="label" Text="{Binding Texts.RemainingQuota}" />
           <TextBlock FontSize="36"
                      FontWeight="SemiBold"
-                     Foreground="#F2F6FC"
+                     Foreground="{DynamicResource ThemeF2F6FC}"
                      Text="{Binding RemainingPercentText}"
                      TextWrapping="NoWrap"
                      Width="604" />
         </StackPanel>
         <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
           <TextBlock FontSize="20"
-                     Foreground="#E6B85C"
+                     Foreground="{DynamicResource ThemeE6B85C}"
                      HorizontalAlignment="Right"
                      Text="{Binding EstimatedCostText}"
                      TextWrapping="NoWrap" />
@@ -317,7 +317,7 @@
             <ItemsControl.ItemTemplate>
               <DataTemplate x:DataType="vm:QuotaSegmentViewModel">
                 <Border x:Name="QuotaSegmentCell" Classes="quota-segment" ClipToBounds="True">
-                  <Border Background="#56B2F5"
+                  <Border Background="{DynamicResource Theme56B2F5}"
                           HorizontalAlignment="Stretch"
                           VerticalAlignment="Stretch"
                           RenderTransformOrigin="0%,50%">
@@ -371,20 +371,20 @@
         </StackPanel>
         <UniformGrid Grid.Column="1" Columns="5" HorizontalAlignment="Stretch" VerticalAlignment="Center" IsVisible="{Binding HasLiveThreadSummary}">
           <StackPanel Spacing="1" HorizontalAlignment="Center">
-            <TextBlock Classes="metric-label" Foreground="#B79BFF" HorizontalAlignment="Center" Text="SOL" />
-            <TextBlock Classes="metric-value" Foreground="#B79BFF" HorizontalAlignment="Center" Text="{Binding ActiveSolCountLabel}" />
+            <TextBlock Classes="metric-label" Foreground="{DynamicResource ThemeB79BFF}" HorizontalAlignment="Center" Text="SOL" />
+            <TextBlock Classes="metric-value" Foreground="{DynamicResource ThemeB79BFF}" HorizontalAlignment="Center" Text="{Binding ActiveSolCountLabel}" />
           </StackPanel>
           <StackPanel Spacing="1" HorizontalAlignment="Center">
-            <TextBlock Classes="metric-label" Foreground="#71D39A" HorizontalAlignment="Center" Text="TERRA" />
-            <TextBlock Classes="metric-value" Foreground="#71D39A" HorizontalAlignment="Center" Text="{Binding ActiveTerraCountLabel}" />
+            <TextBlock Classes="metric-label" Foreground="{DynamicResource Theme71D39A}" HorizontalAlignment="Center" Text="TERRA" />
+            <TextBlock Classes="metric-value" Foreground="{DynamicResource Theme71D39A}" HorizontalAlignment="Center" Text="{Binding ActiveTerraCountLabel}" />
           </StackPanel>
           <StackPanel Spacing="1" HorizontalAlignment="Center">
-            <TextBlock Classes="metric-label" Foreground="#F1B35A" HorizontalAlignment="Center" Text="LUNA" />
-            <TextBlock Classes="metric-value" Foreground="#F1B35A" HorizontalAlignment="Center" Text="{Binding ActiveLunaCountLabel}" />
+            <TextBlock Classes="metric-label" Foreground="{DynamicResource ThemeF1B35A}" HorizontalAlignment="Center" Text="LUNA" />
+            <TextBlock Classes="metric-value" Foreground="{DynamicResource ThemeF1B35A}" HorizontalAlignment="Center" Text="{Binding ActiveLunaCountLabel}" />
           </StackPanel>
           <StackPanel Spacing="1" HorizontalAlignment="Center">
-            <TextBlock Classes="metric-label" Foreground="#E86E9F" HorizontalAlignment="Center" Text="ASTRA" />
-            <TextBlock Classes="metric-value" Foreground="#E86E9F" HorizontalAlignment="Center" Text="{Binding ActiveAstraCountLabel}" />
+            <TextBlock Classes="metric-label" Foreground="{DynamicResource ThemeE86E9F}" HorizontalAlignment="Center" Text="ASTRA" />
+            <TextBlock Classes="metric-value" Foreground="{DynamicResource ThemeE86E9F}" HorizontalAlignment="Center" Text="{Binding ActiveAstraCountLabel}" />
           </StackPanel>
           <StackPanel Spacing="1" HorizontalAlignment="Center">
             <TextBlock Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Other}" />
@@ -438,11 +438,11 @@
                     ColumnSpacing="6">
                 <TextBlock FontSize="13" VerticalAlignment="Center" Text="{Binding Name}" TextWrapping="NoWrap" />
                 <TextBlock Grid.Column="1" Classes="metric-value" VerticalAlignment="Center" Text="{Binding InputTokensText}" />
-                <TextBlock Grid.Column="2" Classes="metric-value" Foreground="#B8C6D7" VerticalAlignment="Center" Text="{Binding InputDollarsText}" />
+                <TextBlock Grid.Column="2" Classes="metric-value" Foreground="{DynamicResource ThemeB8C6D7}" VerticalAlignment="Center" Text="{Binding InputDollarsText}" />
                 <TextBlock Grid.Column="3" Classes="metric-value" VerticalAlignment="Center" Text="{Binding CachedInputTokensText}" />
-                <TextBlock Grid.Column="4" Classes="metric-value" Foreground="#B8C6D7" VerticalAlignment="Center" Text="{Binding CachedInputDollarsText}" />
+                <TextBlock Grid.Column="4" Classes="metric-value" Foreground="{DynamicResource ThemeB8C6D7}" VerticalAlignment="Center" Text="{Binding CachedInputDollarsText}" />
                 <TextBlock Grid.Column="5" Classes="metric-value" VerticalAlignment="Center" Text="{Binding OutputTokensText}" />
-                <TextBlock Grid.Column="6" Classes="metric-value" Foreground="#B8C6D7" VerticalAlignment="Center" Text="{Binding OutputDollarsText}" />
+                <TextBlock Grid.Column="6" Classes="metric-value" Foreground="{DynamicResource ThemeB8C6D7}" VerticalAlignment="Center" Text="{Binding OutputDollarsText}" />
               </Grid>
             </DataTemplate>
           </ItemsControl.ItemTemplate>
@@ -551,7 +551,7 @@
          model, then this spinner is removed once the generation is ready. -->
     <Border Grid.Row="1"
             Grid.RowSpan="5"
-            Background="#0E141E"
+            Background="{DynamicResource Theme0E141E}"
             IsVisible="{Binding IsStartupLoading}"
             AutomationProperties.AutomationId="Main.StartupLoading">
       <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12">
@@ -578,8 +578,8 @@
             MaxWidth="560"
             MaxHeight="320"
             Padding="4"
-            Background="#1B2838"
-            BorderBrush="#47769F"
+            Background="{DynamicResource Theme1B2838}"
+            BorderBrush="{DynamicResource Theme47769F}"
             BorderThickness="1"
             CornerRadius="6">
       <ListBox ItemsSource="{Binding Accounts}"
@@ -589,7 +589,7 @@
         <ListBox.ItemTemplate>
           <DataTemplate x:DataType="core:ApiAccount">
             <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
-              <TextBlock Foreground="#5DC98A"
+              <TextBlock Foreground="{DynamicResource Theme5DC98A}"
                          Text="●"
                          IsVisible="{Binding IsCurrent}"
                          VerticalAlignment="Center"

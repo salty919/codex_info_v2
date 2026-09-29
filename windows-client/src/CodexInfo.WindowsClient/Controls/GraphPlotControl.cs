@@ -8,6 +8,7 @@ using Avalonia.Controls;
 using Avalonia.Threading;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
+using CodexInfo.WindowsClient.Theme;
 using ScottPlot.Avalonia;
 using ScottPlot.TickGenerators;
 
@@ -28,11 +29,11 @@ public sealed class GraphPlotControl : AvaPlot
     internal const string AxisTextColorHex = "#78879c";
     internal const string GridColorHex = "#263850";
     internal const string PlotColorHex = "#121c2c";
-    private static readonly ScottPlot.Color RemainingColor = new(RemainingColorHex);
-    private static readonly ScottPlot.Color SolColor = new(SolColorHex);
-    private static readonly ScottPlot.Color TerraColor = new(TerraColorHex);
-    private static readonly ScottPlot.Color LunaColor = new(LunaColorHex);
-    private static readonly ScottPlot.Color AstraColor = new(AstraColorHex);
+    private ScottPlot.Color RemainingColor => new(ThemePalette.Resolve(RemainingColorHex));
+    private ScottPlot.Color SolColor => new(ThemePalette.Resolve(SolColorHex));
+    private ScottPlot.Color TerraColor => new(ThemePalette.Resolve(TerraColorHex));
+    private ScottPlot.Color LunaColor => new(ThemePalette.Resolve(LunaColorHex));
+    private ScottPlot.Color AstraColor => new(ThemePalette.Resolve(AstraColorHex));
     internal const string IdleBandColorHex = "#1A2838";
     internal const double IdleBandOpacity = 1.0;
     internal const float MeasuredModelLineWidth = 3f;
@@ -40,10 +41,10 @@ public sealed class GraphPlotControl : AvaPlot
     internal const float MeasuredRemainingLineWidth = 3f;
     internal const float IdleLineWidth = 1f;
     internal const float InferredLineWidth = 1f;
-    private static readonly ScottPlot.Color IdleBandColor = new(IdleBandColorHex);
-    private static readonly ScottPlot.Color MutedColor = new(AxisTextColorHex);
-    private static readonly ScottPlot.Color GridColor = new(GridColorHex);
-    private static readonly ScottPlot.Color PlotColor = new(PlotColorHex);
+    private ScottPlot.Color IdleBandColor => new(ThemePalette.Resolve(IdleBandColorHex));
+    private ScottPlot.Color MutedColor => new(ThemePalette.Resolve(AxisTextColorHex));
+    private ScottPlot.Color GridColor => new(ThemePalette.Resolve(GridColorHex));
+    private ScottPlot.Color PlotColor => new(ThemePalette.Resolve(PlotColorHex));
 
     private ScottPlot.Plottables.Scatter? remainingSeries;
     private ScottPlot.Plottables.Scatter? remainingIdleSeries;
@@ -78,8 +79,12 @@ public sealed class GraphPlotControl : AvaPlot
         HandleMouseWheelEvent = false;
         ClipToBounds = true;
         SizeChanged += OnControlSizeChanged;
+        AttachedToVisualTree += (_, _) => ThemePalette.Changed += OnThemeChanged;
+        DetachedFromVisualTree += (_, _) => ThemePalette.Changed -= OnThemeChanged;
         ApplyScene();
     }
+
+    private void OnThemeChanged(object? sender, EventArgs eventArgs) => ApplyScene();
 
     public static readonly StyledProperty<GraphScene> SceneProperty =
         AvaloniaProperty.Register<GraphPlotControl, GraphScene>(nameof(Scene), GraphScene.Empty());
