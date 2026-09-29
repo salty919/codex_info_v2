@@ -3306,8 +3306,18 @@ function Invoke-E2EThemePresets {
     Assert-E2E ($periodLabels -contains $currentLabel) 'Selected Graph period is not one of the fixture options.'
     $pastLabel = [string]($periodLabels | Where-Object { $_ -ne $currentLabel } | Select-Object -First 1)
     Assert-E2E (-not [string]::IsNullOrWhiteSpace($pastLabel)) 'Fixture past period is missing from Graph UIA.'
+    # The ListItem peer can name its ApiHistoryPeriod model, while its visible
+    # TextBlock names the localized label that the collapsed selector displays.
+    $pastItems = @($periodItems | Where-Object { [string]$_.Current.Name -ceq $pastLabel })
+    Assert-E2E ($pastItems.Count -eq 1) 'Fixture past period has no unique UIA ListItem.'
+    $pastDisplayLabels = @(Get-E2EVisibleControlElements $pastItems[0] ([System.Windows.Automation.ControlType]::Text) |
+        ForEach-Object { [string]$_.Current.Name } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    Assert-E2E ($pastDisplayLabels.Count -eq 1) `
+        "Fixture past period has no unique rendered label: $($pastDisplayLabels -join ', ')."
+    $pastDisplay = "$([string]$period.Current.Name)｜$($pastDisplayLabels[0])"
     Select-E2EListItem $graphRoot $pastLabel
-    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
+    Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastDisplay
     Wait-E2EGraphLoadSettled $graphRoot
     $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $windows.Graph.Handle -Description 'theme-past-period'
     $windows.Threads = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Details' `
