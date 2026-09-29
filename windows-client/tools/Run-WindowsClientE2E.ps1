@@ -3217,17 +3217,20 @@ function Assert-E2EThemeSurfaces {
     $threads = $Windows.Threads
     $rootTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-root'
     $childTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-child'
-    Assert-E2E ($null -ne $rootTitle -and $null -ne $childTitle) 'Fixture parent/child Threads UIA rows are missing.'
+    $leafTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-grandchild'
+    Assert-E2E ($null -ne $rootTitle -and $null -ne $childTitle -and $null -ne $leafTitle) `
+        'Fixture parent/child/leaf Threads UIA rows are missing.'
     $rootRect = $rootTitle.Current.BoundingRectangle
     $childRect = $childTitle.Current.BoundingRectangle
+    $leafRect = $leafTitle.Current.BoundingRectangle
     $threadWindowBounds = Get-E2EWindowBounds $threads.Handle
     $parentRegion = [pscustomobject]@{
         Left = $rootRect.Left - 18; Top = $rootRect.Top - 10
         Right = $threadWindowBounds.Left + $threadWindowBounds.Width - 20; Bottom = $rootRect.Top + 74
     }
     $childRegion = [pscustomobject]@{
-        Left = $childRect.Left - 18; Top = $childRect.Top - 10
-        Right = $threadWindowBounds.Left + $threadWindowBounds.Width - 20; Bottom = $childRect.Top + 74
+        Left = $leafRect.Left - 18; Top = $leafRect.Top - 10
+        Right = $threadWindowBounds.Left + $threadWindowBounds.Width - 20; Bottom = $leafRect.Top + 74
     }
     $railRegion = [pscustomobject]@{
         Left = $threadWindowBounds.Left + 20; Top = $rootRect.Top - 10
