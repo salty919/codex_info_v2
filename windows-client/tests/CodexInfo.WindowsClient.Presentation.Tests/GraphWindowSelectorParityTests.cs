@@ -67,7 +67,7 @@ public sealed class GraphWindowSelectorParityTests
             field.Root?.Attribute(XName.Get("Class", xamlName.NamespaceName))?.Value);
         Assert.DoesNotContain(field.Root!.Descendants(), element => element.Name.LocalName == "ToggleButton");
 
-        var presenter = field.Descendants().Single(element => element.Name.LocalName == "ContentPresenter");
+        var presenter = field.Root!.Elements().Single(element => element.Name.LocalName == "ToggleButton.Template").Descendants().Single(element => element.Name.LocalName == "ContentPresenter");
         Assert.Equal("Stretch", presenter.Attribute("HorizontalAlignment")?.Value);
         Assert.Equal("Stretch", presenter.Attribute("VerticalAlignment")?.Value);
 

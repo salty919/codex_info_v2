@@ -47,6 +47,18 @@
               <Setter Property="Height" Value="32" />
               <Setter Property="Padding" Value="11,0" />
               <Setter Property="VerticalContentAlignment" Value="Center" />
+              <Setter Property="Background" Value="Transparent" />
+              <Setter Property="Template">
+                <ControlTemplate>
+                  <Border Background="{TemplateBinding Background}"
+                          Padding="{TemplateBinding Padding}">
+                    <ContentPresenter Content="{TemplateBinding Content}"
+                                      ContentTemplate="{TemplateBinding ContentTemplate}"
+                                      HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                      VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}" />
+                  </Border>
+                </ControlTemplate>
+              </Setter>
             </Style>
             <Style Selector="ListBoxItem:selected">
               <Setter Property="Background" Value="{DynamicResource Theme244D74}" />
