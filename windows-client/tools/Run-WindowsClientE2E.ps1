@@ -3297,6 +3297,7 @@ function Assert-E2EThemeSurfaces {
     # a visible in-window menu and a selected row.
     $metric = Find-E2EElementByAutomationId $graph.Root 'Graph.MetricSelector'
     Assert-E2E ($null -ne $metric) 'Graph metric selector is missing.'
+    Bring-E2EWindowToFront $graph.Handle
     Toggle-E2EElement $metric
     $menu = Wait-E2E -Description 'Graph metric popup UIA' -Probe {
         $candidate = Find-E2EElementByAutomationId $graph.Root 'Graph.MetricMenu'
@@ -3334,8 +3335,13 @@ function Invoke-E2EThemePresets {
         -ButtonAutomationId 'Main.OpenGraph' -Title 'Codex Info Graph' -Role 'Graph' -ProcessId $ProcessId
     $graphRoot = $windows.Graph.Root
     Wait-E2EGraphLoadSettled $graphRoot
-    $period = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
-    Assert-E2E ($null -ne $period) 'Graph period selector is missing.'
+    $period = Wait-E2E -Description 'enabled Graph period selector' -Probe {
+        $candidate = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
+        if ($null -ne $candidate -and $candidate.Current.IsEnabled -and -not $candidate.Current.IsOffscreen) {
+            return $candidate
+        }
+        return $false
+    }
     Toggle-E2EElement $period
     $periodItems = Wait-E2E -Description 'two rendered Graph period options' -Probe {
         $items = @(Get-E2EVisibleControlElements $graphRoot ([System.Windows.Automation.ControlType]::ListItem))
