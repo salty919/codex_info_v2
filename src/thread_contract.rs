@@ -1870,6 +1870,27 @@ where
                 .then(|| snapshot.thread_id.clone())
         })
         .collect();
+    let topology = snapshots
+        .iter()
+        .map(|snapshot| ThreadTopologyNode {
+            id: snapshot.thread_id.as_str(),
+            parent_thread_id: snapshot.parent_thread_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    // Leave cycles intact so the state layer can reject the complete cycle.
+    if validate_selected_thread_topology(&topology).is_ok() {
+        let stopped_ids: HashSet<&str> = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.activity_status == ThreadActivityStatus::Stopped)
+            .map(|snapshot| snapshot.thread_id.as_str())
+            .collect();
+        excluded_ids.extend(snapshots.iter().filter_map(|snapshot| {
+            let parent_id = snapshot.parent_thread_id.as_deref()?;
+            stopped_ids
+                .contains(parent_id)
+                .then(|| snapshot.thread_id.clone())
+        }));
+    }
     loop {
         let excluded_children: Vec<String> = snapshots
             .iter()
@@ -4072,10 +4093,12 @@ mod tests {
     fn thread_c_parent_and_child_are_all_published_with_relation_metadata() {
         let mut parent = thread_fixture("parent", 10, "parent");
         parent["source"] = json!("cli");
+        parent["status"] = json!({"type":"active","activeFlags":[]});
         let mut child = thread_fixture("child", 20, "child");
         child["source"] = json!({"subAgent":{"thread_spawn":{
             "parent_thread_id":"parent","depth":1
         }}});
+        child["status"] = json!({"type":"active","activeFlags":[]});
         let rows = vec![parent, child];
 
         let both_running = select_active_threads(
@@ -4101,8 +4124,10 @@ mod tests {
         assert_eq!(both[0].depth, Some(1));
         assert!(!both[1].is_subagent);
 
+        let mut child_complete_rows = rows.clone();
+        child_complete_rows[1]["status"] = json!({"type":"notLoaded"});
         let child_complete = select_active_threads(
-            terminal_cycle(rows.clone()),
+            terminal_cycle(child_complete_rows),
             |candidate| -> Result<Vec<u8>, ()> {
                 Ok(if candidate.id() == "child" {
                     rollout_bytes(&[json!({"type":"task_complete"})])
@@ -4119,15 +4144,18 @@ mod tests {
                     && threads[1].thread_id == "parent"
         ));
 
-        let all_complete =
-            select_active_threads(terminal_cycle(rows), |_| -> Result<Vec<u8>, ()> {
-                Ok(rollout_bytes(&[json!({"type":"turn_aborted"})]))
-            });
+        let mut all_complete_rows = rows;
+        all_complete_rows[0]["status"] = json!({"type":"idle"});
+        all_complete_rows[1]["status"] = json!({"type":"idle"});
+        let all_complete = select_active_threads(
+            terminal_cycle(all_complete_rows),
+            |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"turn_aborted"})])) },
+        );
         assert!(matches!(
             all_complete,
             ThreadCycleOutcome::Snapshots(threads)
-                if threads.len() == 2 && threads.iter().all(|thread|
-                    thread.activity_status == ThreadActivityStatus::Stopped)
+                if threads.len() == 1 && threads[0].thread_id == "parent"
+                    && threads[0].activity_status == ThreadActivityStatus::Stopped
         ));
     }
 
@@ -4168,6 +4196,7 @@ mod tests {
         };
         let mut valid_parent = thread_fixture("valid-parent", 50, "valid-parent");
         valid_parent["source"] = json!("cli");
+        valid_parent["status"] = json!({"type":"active","activeFlags":[]});
         let valid_child = subagent("valid-child", 40, "valid-parent", 1);
         let mut independent_root = thread_fixture("independent-root", 30, "independent-root");
         independent_root["source"] = json!("cli");
@@ -4175,7 +4204,18 @@ mod tests {
             thread_fixture("stopped-open-parent", 20, "stopped-open-parent");
         stopped_open_parent["source"] = json!("cli");
         stopped_open_parent["status"] = json!({"type":"idle"});
-        let stopped_open_child = subagent("stopped-open-child", 10, "stopped-open-parent", 1);
+        let mut stopped_open_child = subagent("stopped-open-child", 10, "stopped-open-parent", 1);
+        stopped_open_child["status"] = json!({"type":"active","activeFlags":[]});
+        let mut stopped_open_grandchild =
+            subagent("stopped-open-grandchild", 9, "stopped-open-child", 2);
+        stopped_open_grandchild["status"] = json!({"type":"active","activeFlags":[]});
+        let mut unknown_status_parent =
+            thread_fixture("unknown-status-parent", 35, "unknown-status-parent");
+        unknown_status_parent["source"] = json!("cli");
+        unknown_status_parent["status"] = json!({"type":"systemError"});
+        let mut unknown_status_child =
+            subagent("unknown-status-child", 34, "unknown-status-parent", 1);
+        unknown_status_child["status"] = json!({"type":"active","activeFlags":[]});
         let candidates = vec![
             subagent("orphan-child", 90, "missing-parent", 1),
             subagent("orphan-grandchild", 80, "orphan-child", 2),
@@ -4184,7 +4224,10 @@ mod tests {
             valid_parent,
             independent_root,
             stopped_open_child,
+            stopped_open_grandchild,
             stopped_open_parent,
+            unknown_status_child,
+            unknown_status_parent,
         ];
 
         let outcome = select_active_threads(
@@ -4204,10 +4247,18 @@ mod tests {
                 "independent-root",
                 "unknown-parent",
                 "stopped-open-parent",
-                "stopped-open-child",
+                "unknown-status-parent",
+                "unknown-status-child",
             ]
             .into_iter()
             .collect()
+        );
+        assert_eq!(rows.len(), 7);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.activity_status == ThreadActivityStatus::Running)
+                .count(),
+            2
         );
         let stopped_parent = rows
             .iter()
