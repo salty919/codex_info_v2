@@ -50690,8 +50690,10 @@ mod tests {
             item["name"] = json!(id);
             item
         };
-        let accepted_root = named_item("accepted-root", 200, &accepted_root_path);
+        let mut accepted_root = named_item("accepted-root", 200, &accepted_root_path);
+        accepted_root["status"] = json!({"type":"active","activeFlags":[]});
         let mut accepted_child = named_item("accepted-child", 190, &accepted_child_path);
+        accepted_child["status"] = json!({"type":"active","activeFlags":[]});
         accepted_child["source"] = json!({
             "subAgent": {"thread_spawn": {
                 "parent_thread_id": "accepted-root",
@@ -50864,7 +50866,8 @@ mod tests {
             .iter()
             .any(|thread| { thread["id"] == "cycle-a" || thread["id"] == "cycle-b" }));
 
-        let replacement = named_item("replacement", 500, &replacement_path);
+        let mut replacement = named_item("replacement", 500, &replacement_path);
+        replacement["status"] = json!({"type":"active","activeFlags":[]});
         sender
             .send(RpcReadEvent::Line(
                 super::security::RpcLine::new(
