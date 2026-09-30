@@ -13555,6 +13555,34 @@ fn validation_active_count(threads: &[PublicThread]) -> u64 {
         .count() as u64
 }
 
+fn visible_public_threads(threads: &[PublicThread]) -> Vec<&PublicThread> {
+    let by_id = threads
+        .iter()
+        .map(|thread| (thread.id.as_str(), thread))
+        .collect::<BTreeMap<_, _>>();
+    threads
+        .iter()
+        .filter(|thread| {
+            let mut parent = thread.parent_thread_id.as_deref();
+            for _ in 0..threads.len() {
+                let Some(parent_id) = parent else {
+                    return true;
+                };
+                let Some(parent_thread) = by_id.get(parent_id) else {
+                    return true;
+                };
+                if parent_thread.activity_status == Some(PublicThreadActivityStatus::Stopped) {
+                    return false;
+                }
+                parent = parent_thread.parent_thread_id.as_deref();
+            }
+            // The admission boundary rejects cycles. Preserve its failure
+            // decision rather than inventing a different presentation edge.
+            true
+        })
+        .collect()
+}
+
 fn stage_service_current_bundle(
     previous_pair: Option<&str>,
     published_pair: String,
@@ -13622,8 +13650,8 @@ fn stage_service_current_bundle(
         .collect::<Vec<_>>();
     thread_contract::validate_selected_thread_topology(&topology)
         .map_err(|_| "threads topology is invalid".to_owned())?;
-    let active_threads = public_threads
-        .iter()
+    let active_threads = visible_public_threads(&public_threads)
+        .into_iter()
         .map(|thread| ActiveThread {
             activity_status: thread
                 .activity_status
@@ -15481,7 +15509,9 @@ impl CodexInfoState {
             return Ok(false);
         }
         details.validate().map_err(|error| error.to_string())?;
-        if details.active_thread_count != details.threads.len() as u64 {
+        if details.open_session_thread_count != details.threads.len() as u64
+            || details.active_thread_count != validation_active_count(&details.threads)
+        {
             return Err("details thread count does not match rows".into());
         }
         let full_snapshot = details.clone();
@@ -15531,9 +15561,8 @@ impl CodexInfoState {
             #[cfg(test)]
             startup_maintenance_done: false,
         };
-        let next_threads = details
-            .threads
-            .iter()
+        let next_threads = visible_public_threads(&details.threads)
+            .into_iter()
             .map(|thread| ActiveThread {
                 activity_status: thread
                     .activity_status
@@ -15607,7 +15636,7 @@ impl CodexInfoState {
         self.service_endpoint_error = None;
         self.service_published_pair = Some(published_pair.clone());
         self.service_v3_published_pair = Some(published_pair.clone());
-        self.service_current_active_thread_count = Some(self.active_threads.len() as u64);
+        self.service_current_active_thread_count = Some(full_snapshot.open_session_thread_count);
         self.service_current_pair = Some(published_pair.clone());
         self.service_split_capable = false;
         self.service_history_periods = full_snapshot.history_periods.clone();
@@ -15931,8 +15960,8 @@ impl CodexInfoState {
         };
         validation.threads = threads.clone();
         validation.validate().map_err(|error| error.to_string())?;
-        let next_threads = threads
-            .iter()
+        let next_threads = visible_public_threads(&threads)
+            .into_iter()
             .map(|thread| ActiveThread {
                 activity_status: thread
                     .activity_status
@@ -41873,6 +41902,167 @@ mod tests {
             PublicThreadActivityStatus::Stopped
         );
         assert_eq!(super::active_thread_summary(&state.active_threads).total, 1);
+    }
+
+    #[test]
+    fn linux_stopped_parent_descendants_stay_hidden_across_main_and_threads_refresh() {
+        let (mut current, fixture_threads) = split_current_fixture();
+        let template = &fixture_threads[0];
+        let row = |id: &str,
+                   title: &str,
+                   parent: Option<&str>,
+                   model_label: &str,
+                   status: PublicThreadActivityStatus| {
+            let mut thread = template.clone();
+            thread.id = id.into();
+            thread.title = title.into();
+            thread.parent_thread_id = parent.map(str::to_owned);
+            thread.model_label = model_label.into();
+            thread.activity_status = Some(status);
+            thread.is_subagent = parent.is_some();
+            thread.depth = parent.map(|_| if id == "stopped-grandchild" { 2 } else { 1 });
+            thread
+        };
+        let raw_threads = vec![
+            row(
+                "stopped-child",
+                "未設定",
+                Some("stopped-parent"),
+                "TERRA",
+                PublicThreadActivityStatus::Stopped,
+            ),
+            row(
+                "valid-child",
+                "未設定",
+                Some("valid-parent"),
+                "SOL",
+                PublicThreadActivityStatus::Running,
+            ),
+            row(
+                "stopped-grandchild",
+                "Grandchild",
+                Some("stopped-child"),
+                "ASTRA",
+                PublicThreadActivityStatus::Running,
+            ),
+            row(
+                "independent-root",
+                "Independent C",
+                None,
+                "TERRA",
+                PublicThreadActivityStatus::Running,
+            ),
+            row(
+                "stopped-parent",
+                "Stopped A",
+                None,
+                "SOL",
+                PublicThreadActivityStatus::Stopped,
+            ),
+            row(
+                "valid-parent",
+                "Running B",
+                None,
+                "LUNA",
+                PublicThreadActivityStatus::Running,
+            ),
+        ];
+        current.open_session_thread_count = 6;
+        current.active_thread_count = 4;
+        let pair = published_pair(419, 1);
+        let current_body = split_current_body(&current);
+        let threads_body = split_threads_body(&raw_threads);
+        let now = Instant::now();
+        let mut state = CodexInfoState::service_client();
+        state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+        let accounts_body = ACCOUNTS_A_CURRENT.to_vec();
+
+        let outcome = super::poll_service_current_resources_with(&mut state, now, |route, _| {
+            Ok(match route {
+                "/v3/accounts" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: None,
+                    body: accounts_body.clone(),
+                },
+                "/v3/current?account=account-7" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(pair.clone()),
+                    body: current_body.clone(),
+                },
+                "/v3/threads?account=account-7" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(pair.clone()),
+                    body: threads_body.clone(),
+                },
+                _ => panic!("unexpected route {route}"),
+            })
+        });
+        assert_eq!(outcome, super::ServiceCurrentPollOutcome::Success);
+        assert_eq!(state.service_current_pair.as_deref(), Some(pair.as_str()));
+        assert_eq!(
+            state
+                .active_threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "valid-child",
+                "independent-root",
+                "stopped-parent",
+                "valid-parent"
+            ]
+        );
+        assert_eq!(super::active_thread_summary(&state.active_threads).total, 4);
+        assert_eq!(
+            state
+                .active_threads
+                .iter()
+                .filter(|thread| thread.activity_status == PublicThreadActivityStatus::Running)
+                .count(),
+            3
+        );
+        let accepted = state.active_threads.clone();
+
+        state
+            .apply_service_threads_resource(pair, Some(6), raw_threads.clone())
+            .expect("same-pair independent Threads refresh");
+        assert_eq!(state.active_threads, accepted);
+        let presentation = thread_presentation_rows(&state.active_threads);
+        let displayed_ids = presentation
+            .iter()
+            .map(|row| state.active_threads[row.index].id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(displayed_ids.len(), 4);
+        let parent_row = displayed_ids
+            .iter()
+            .position(|id| *id == "valid-parent")
+            .unwrap();
+        let child_row = displayed_ids
+            .iter()
+            .position(|id| *id == "valid-child")
+            .unwrap();
+        assert_eq!(child_row, parent_row + 1);
+        assert_eq!(
+            presentation
+                .iter()
+                .filter(|row| row.connected_to_parent)
+                .count(),
+            1
+        );
+        assert!(presentation[child_row].connected_to_parent);
+        assert_eq!(
+            state.active_threads[presentation[child_row].index]
+                .parent_thread_id
+                .as_deref(),
+            Some("valid-parent")
+        );
+
+        current.threads = raw_threads;
+        let mut combined_fallback = CodexInfoState::service_client();
+        combined_fallback
+            .apply_service_details_v3(published_pair(419, 2), current)
+            .expect("legacy combined v3 accepts separate running and open counts");
+        assert_eq!(combined_fallback.active_threads, accepted);
     }
 
     #[test]

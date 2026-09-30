@@ -6,6 +6,7 @@ using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Globalization;
 using System.Reflection;
+using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
@@ -379,6 +380,88 @@ public sealed class MainWindowViewModelTests
         Assert.Equal("1（2）", typeof(MainWindowViewModel).GetProperty("ActiveLunaCountLabel")?.GetValue(main));
         Assert.Equal("0", typeof(MainWindowViewModel).GetProperty("ActiveAstraCountLabel")?.GetValue(main));
         Assert.Equal("0", typeof(MainWindowViewModel).GetProperty("ActiveOtherCountLabel")?.GetValue(main));
+    }
+
+    [Fact]
+    public async Task StoppedParentDescendantsAreAbsentFromMainAndThreadsWithoutReparenting()
+    {
+        var current = CurrentSnapshot(activeThreadCount: 4) with
+        {
+            OpenSessionThreadCount = 6,
+        };
+        static ApiThreadDetails Row(
+            string id,
+            string title,
+            string? parentId,
+            string model,
+            ApiThreadActivityStatus status) => new(
+                id, title, parentId, model, model, null, null, null,
+                1, 1, parentId is not null, parentId is null ? 0 : 1, false)
+            { ActivityStatus = status };
+        var source = new[]
+        {
+            Row("stopped-child", "未設定", "stopped-parent", "gpt-5.6-terra", ApiThreadActivityStatus.Stopped),
+            Row("valid-child", "未設定", "valid-parent", "gpt-5.6-sol", ApiThreadActivityStatus.Running),
+            Row("stopped-grandchild", "Grandchild", "stopped-child", "gpt-5.6-astra", ApiThreadActivityStatus.Running),
+            Row("independent-root", "Independent C", null, "gpt-5.6-terra", ApiThreadActivityStatus.Running),
+            Row("stopped-parent", "Stopped A", null, "gpt-5.6-sol", ApiThreadActivityStatus.Stopped),
+            Row("valid-parent", "Running B", null, "gpt-5.6-luna", ApiThreadActivityStatus.Running),
+        };
+        var client = new SplitCurrentThreadsClient(
+            current,
+            ThreadsFetchResult.Success(new ApiThreadsSnapshot(source, current.PublishedPair)));
+        using var main = new MainWindowViewModel(client);
+
+        main.Start();
+        await EventuallyAsync(() => main.DetailsSnapshot?.PublishedPair == current.PublishedPair);
+        var detailsFetched = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var threads = new ThreadsWindowViewModel(main, action =>
+        {
+            action();
+            detailsFetched.TrySetResult(true);
+        });
+        await detailsFetched.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.True(client.ThreadsCallCount >= 2);
+        Assert.Equal(
+            ["valid-child", "independent-root", "stopped-parent", "valid-parent"],
+            main.DetailsSnapshot!.Threads.Select(thread => thread.Id));
+        Assert.Equal(4UL, main.ActiveThreadCount);
+        Assert.Equal(2, main.ActiveSolCount);
+        Assert.Equal(1, main.ActiveTerraCount);
+        Assert.Equal(1, main.ActiveLunaCount);
+        Assert.Equal(0, main.ActiveAstraCount);
+        Assert.Equal("1（2）", main.ActiveSolCountLabel);
+        Assert.Equal("1（1）", main.ActiveTerraCountLabel);
+        Assert.Equal("1（1）", main.ActiveLunaCountLabel);
+        Assert.Equal(
+            ["independent-root", "valid-parent", "valid-child", "stopped-parent"],
+            threads.Threads.Select(thread => thread.Id));
+        Assert.Equal([new ThreadTreeConnection(1, 2, 0)], threads.TreeConnections);
+        Assert.Equal("Running B", threads.Threads[2].ParentTitle);
+
+        var combined = new ApiDetailsSnapshot(
+            ApiState.Ready, 1, true, "Pro", new ApiQuota(45, 2, 604800, false),
+            [new ApiDetailsModelUsage("SOL", 1, 0, 0, 1, 0, 0)],
+            4, [], [], source, "概算 —")
+        {
+            ApiVersion = "v3",
+            OpenSessionThreadCount = 6,
+            PublishedPair = current.PublishedPair,
+        };
+        using var combinedMain = new MainWindowViewModel(
+            new SequenceClient(DetailsFetchResult.Success(combined)));
+        combinedMain.Start();
+        await EventuallyAsync(() => combinedMain.HasDetails);
+        using var combinedThreads = new ThreadsWindowViewModel(combinedMain, action => action());
+        Assert.Equal(4UL, combinedMain.ActiveThreadCount);
+        Assert.Equal(
+            ["valid-child", "independent-root", "stopped-parent", "valid-parent"],
+            combinedMain.DetailsSnapshot!.Threads.Select(thread => thread.Id));
+        Assert.Equal(
+            ["independent-root", "valid-parent", "valid-child", "stopped-parent"],
+            combinedThreads.Threads.Select(thread => thread.Id));
+        Assert.Equal([new ThreadTreeConnection(1, 2, 0)], combinedThreads.TreeConnections);
     }
 
     [Fact]
