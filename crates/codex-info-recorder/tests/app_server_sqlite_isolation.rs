@@ -6,7 +6,8 @@ use codex_info_recorder::{
     QuotaPoller, ThreadPoller,
 };
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -154,6 +155,7 @@ fail_private_account_read = os.environ.get('CODEX_INFO_FAKE_FAIL_PRIVATE_ACCOUNT
 thread_initialize_delay = float(os.environ.get('CODEX_INFO_FAKE_THREAD_INITIALIZE_DELAY_SECS', '0'))
 thread_read_delay = float(os.environ.get('CODEX_INFO_FAKE_THREAD_READ_DELAY_SECS', '0'))
 thread_read_marker = os.environ.get('CODEX_INFO_FAKE_THREAD_READ_MARKER')
+thread_items_path = os.environ.get('CODEX_INFO_FAKE_THREAD_ITEMS')
 with sqlite3.connect(os.path.join(sqlite_home, 'logs_2.sqlite')) as connection:
     connection.execute('CREATE TABLE IF NOT EXISTS fixture (value INTEGER)')
 
@@ -196,7 +198,12 @@ for line in sys.stdin:
                 marker.flush()
         if thread_read_delay:
             time.sleep(thread_read_delay)
-        result = {'thread': {}}
+        if thread_items_path:
+            with open(thread_items_path, encoding='utf-8') as fixture:
+                items = json.load(fixture)
+            result = {'thread': items[request['params']['threadId']]}
+        else:
+            result = {'thread': {}}
     else:
         result = {}
     print(json.dumps({'jsonrpc': '2.0', 'id': request_id, 'result': result}), flush=True)
@@ -258,6 +265,57 @@ fn live_session_process(root: &Path, session: &Path) -> ChildGuard {
     }
 }
 
+fn live_session_set_process(root: &Path, sessions: &[PathBuf]) -> ChildGuard {
+    let executable = root.join("codex");
+    fs::copy(
+        env::current_exe().expect("resolve current test executable"),
+        &executable,
+    )
+    .expect("copy test executable under the required process name");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+        .expect("make fixture helper executable");
+    let child = Command::new(&executable)
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("issue419_hold_session_files_open")
+        .env(
+            "CODEX_INFO_ISSUE419_SESSIONS_DIR",
+            sessions[0].parent().expect("Session directory"),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start fixture Codex process");
+    let live = ChildGuard(child);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let process = PathBuf::from(format!("/proc/{}", live.id()));
+        let comm = fs::read_to_string(process.join("comm")).unwrap_or_default();
+        let executable_name = fs::read_link(process.join("exe"))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name.to_owned()));
+        let open_paths = fs::read_dir(process.join("fd"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .collect::<BTreeSet<_>>();
+        if comm.trim_end() == "codex"
+            && executable_name.as_deref() == Some(std::ffi::OsStr::new("codex"))
+            && sessions.iter().all(|session| open_paths.contains(session))
+        {
+            return live;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "FIXTURE_NOT_ADMITTED: Session FDs unavailable"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 #[ignore = "spawned as the synthetic Codex process by the Issue #182 fixture"]
 fn issue182_hold_session_file_open() {
@@ -265,6 +323,22 @@ fn issue182_hold_session_file_open() {
         .map(PathBuf::from)
         .expect("fixture helper receives the Session path");
     let _session = File::open(session).expect("fixture helper opens the Session file");
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
+#[test]
+#[ignore = "spawned as the synthetic Codex process by the Issue #419 fixture"]
+fn issue419_hold_session_files_open() {
+    let sessions = PathBuf::from(
+        env::var_os("CODEX_INFO_ISSUE419_SESSIONS_DIR")
+            .expect("fixture helper receives the Session directory"),
+    );
+    let _open_files = fs::read_dir(sessions)
+        .expect("read Session directory")
+        .map(|entry| File::open(entry.expect("Session entry").path()).expect("open Session"))
+        .collect::<Vec<_>>();
     loop {
         thread::sleep(Duration::from_secs(60));
     }
@@ -298,6 +372,163 @@ fn checkpoint(sessions: &Path, session: &Path, committed_offset: u64) -> Session
         previous_output: 2,
         previous_cache_write_input: Some(0),
     }
+}
+
+#[test]
+fn stopped_parent_descendants_are_absent_after_real_thread_read_cycle() {
+    let _environment_lock = ENVIRONMENT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let temporary = tempfile::tempdir().expect("create isolated fixture root");
+    let root = temporary.path();
+    let codex_home = root.join("codex-home");
+    let data_root = root.join("data");
+    let sessions = codex_home.join("sessions");
+    private_directory(&codex_home);
+    private_directory(&data_root);
+    private_directory(&sessions);
+    let auth = codex_home.join("auth.json");
+    fs::write(&auth, br#"{"tokens":{"account_id":"fixture-account"}}"#)
+        .expect("write account fixture");
+    fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("protect account fixture");
+    let app_server = root.join("fake-app-server.py");
+    fake_app_server(&app_server);
+    let calls = root.join("app-server-calls.jsonl");
+    let marker = root.join("thread-read-calls.txt");
+    let items_path = root.join("thread-items.json");
+    let cases = [
+        (
+            "stopped-child",
+            "未設定",
+            Some(("stopped-parent", 1)),
+            false,
+        ),
+        ("valid-child", "未設定", Some(("valid-parent", 1)), true),
+        (
+            "stopped-grandchild",
+            "Grandchild",
+            Some(("stopped-child", 2)),
+            true,
+        ),
+        ("independent-root", "Independent C", None, true),
+        ("stopped-parent", "Stopped A", None, false),
+        ("valid-parent", "Running B", None, true),
+    ];
+    let mut items = serde_json::Map::new();
+    let mut session_paths = Vec::new();
+    let mut checkpoints = Vec::new();
+    for (id, title, parent, running) in cases {
+        let session = sessions.join(format!("{id}.jsonl"));
+        let mut session_meta = serde_json::to_vec(&json!({
+            "type": "session_meta",
+            "payload": {"id": id},
+        }))
+        .expect("serialize Session metadata");
+        session_meta.push(b'\n');
+        fs::write(&session, &session_meta).expect("write Session fixture");
+        let mut checkpoint = checkpoint(&sessions, &session, session_meta.len() as u64);
+        checkpoint.relative_path = format!("{id}.jsonl");
+        checkpoints.push(checkpoint);
+        let source = match parent {
+            Some((parent_id, depth)) => json!({
+                "subAgent": {"thread_spawn": {"parent_thread_id": parent_id, "depth": depth}}
+            }),
+            None => json!("cli"),
+        };
+        let item = json!({
+            "cliVersion": "0.147.0",
+            "createdAt": 1,
+            "cwd": root,
+            "ephemeral": false,
+            "id": id,
+            "modelProvider": "openai",
+            "preview": "preview",
+            "sessionId": format!("session-{id}"),
+            "source": source,
+            "status": if running {
+                json!({"type": "active", "activeFlags": []})
+            } else {
+                json!({"type": "idle"})
+            },
+            "turns": [],
+            "updatedAt": 1,
+            "name": title,
+            "path": session,
+        });
+        assert!(
+            codex_info::thread_contract::validate_thread_item(&item).is_ok(),
+            "FIXTURE_NOT_ADMITTED: invalid thread/read item for {id}"
+        );
+        items.insert(id.to_owned(), item);
+        session_paths.push(session);
+    }
+    fs::write(
+        &items_path,
+        serde_json::to_vec(&items).expect("serialize thread/read fixture"),
+    )
+    .expect("write thread/read fixture");
+    let _environment = Environment::set(&[
+        ("CODEX_HOME", &codex_home),
+        ("CODEX_INFO_DATA_DIR", &data_root),
+        ("CODEX_INFO_CODEX_BIN", &app_server),
+        ("CODEX_INFO_FAKE_CALLS", &calls),
+        ("CODEX_INFO_FAKE_THREAD_ITEMS", &items_path),
+        ("CODEX_INFO_FAKE_THREAD_READ_MARKER", &marker),
+    ]);
+    let _live_codex = live_session_set_process(root, &session_paths);
+    let threads = ThreadPoller::start(sessions);
+    assert!(threads.submit(&checkpoints));
+    let result = threads
+        .wait_for(Duration::from_secs(10))
+        .expect("one complete thread cycle");
+    let snapshot = match result {
+        ActiveThreadPollResult::Snapshot { snapshot, .. } => snapshot,
+        ActiveThreadPollResult::Failed(error) => {
+            panic!("FIXTURE_NOT_ADMITTED: thread/read cycle failed: {error}")
+        }
+        ActiveThreadPollResult::Empty { .. } => {
+            panic!("FIXTURE_NOT_ADMITTED: thread/read cycle was empty")
+        }
+    };
+    let by_id = snapshot
+        .threads
+        .iter()
+        .map(|thread| (thread.id.as_str(), thread))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        by_id.keys().copied().collect::<Vec<_>>(),
+        [
+            "independent-root",
+            "stopped-parent",
+            "valid-child",
+            "valid-parent"
+        ]
+    );
+    assert_eq!(by_id["stopped-parent"].activity_status, "stopped");
+    assert_eq!(by_id["valid-child"].activity_status, "running");
+    assert_eq!(
+        by_id["valid-child"].parent_thread_id.as_deref(),
+        Some("valid-parent")
+    );
+    assert_eq!(by_id["valid-child"].title, "未設定");
+    assert_eq!(
+        by_id
+            .values()
+            .filter(|thread| thread.activity_status == "running")
+            .count(),
+        3
+    );
+    assert_eq!(
+        fs::read_to_string(marker)
+            .expect("thread/read was called")
+            .lines()
+            .count(),
+        6
+    );
+    assert_eq!(
+        fake_app_server_launch_count(&calls, "codex-info-recorder-thread-poller"),
+        1
+    );
 }
 
 #[test]

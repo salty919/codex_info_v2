@@ -1941,9 +1941,9 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             }
 
             if (mainGeneration is null || snapshot.PublishedPair != mainGeneration.PublishedPair ||
-                (ulong)snapshot.Threads.Count != mainGeneration.OpenSessionThreadCount ||
+                (ulong)snapshot.Threads.Count != main.AcceptedWireOpenSessionThreadCount ||
                 (ulong)snapshot.Threads.Count(thread =>
-                    thread.ActivityStatus == ApiThreadActivityStatus.Running) != mainGeneration.ActiveThreadCount)
+                    thread.ActivityStatus == ApiThreadActivityStatus.Running) != main.AcceptedWireActiveThreadCount)
             {
                 // Only Main's accepted pair can replace the visible detail rows.
                 // A newer independent response waits for Main's next atomic update.
@@ -1967,6 +1967,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             : resourceClient is not null
             ? resourceThreads
             : main.DetailsSnapshot?.Threads ?? Array.Empty<ApiThreadDetails>();
+        source = MainWindowViewModel.WithoutStoppedAncestors(source);
         if (source.Count > 0)
         {
             var ordered = ParentFirst(source);
