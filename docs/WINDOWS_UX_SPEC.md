@@ -371,11 +371,11 @@ component順や表示所有者を変更しない。
   約`318px`、observed labelの文字左端が約`445px`、observed時刻の文字右端が約`865px`となる。
   Mainの時刻表記は`PROC-I18N-01`に従い、quota値、期間境界、
   reset/observed epochをUIで再計算しない。
-- AccountActivityはWindowsのtotal＋model別件数構成を使い、件数は`THREAD-OPEN-362`の現在openのSession thread集合とする。受理済みの現在accountの
+- AccountActivityはWindowsのtotal＋model別件数構成を使い、件数は`THREAD-OPEN-362`の公開対象となった現在openのSession thread集合とする。受理済みの現在accountの
   `open_session_thread_count=0`でも同じ`56px` cardに`0件`、5 modelの`0`、`68×30px`の
   `Details`を表示し、Detailsから空のThreads画面へ進める。未受理のcurrentやhistorical
   accountを0件とみなさず、historical accountではlive件数を表示しないが固定cardは保持する。
-  v3のmodel別表示は`動作中（生成済み）`の順とし、SOL 0件動作中/1件openなら`0（1）`、LUNA 1件動作中/2件openなら`1（2）`と表示する。openが0件なら`0`と表示する。総数は従来どおりopen全件数とする。
+  v3のmodel別表示は`動作中（生成済み）`の順とし、SOL 0件動作中/1件openなら`0（1）`、LUNA 1件動作中/2件openなら`1（2）`と表示する。openが0件なら`0`と表示する。総数は公開対象となったopen行の全件数とする。
 - ModelUsageはLinuxの単一table構成を使い、各modelのInput/Cached input/Outputについてtokenと
   隣接する概算ドルを同じrowに置く。4 model×22pxをcard内に表示し、0件でも`120px`の固定cardと見出しを保持してemptyを明示する。
   値の意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
@@ -504,14 +504,14 @@ component順や表示所有者を変更しない。
 - 子threadの表示名は`THREAD-TITLE-362`に従い、`thread/read`で取得する上流保存名をそのまま使う。生成元がtask_nameを
   外部の`thread/name/set`で保存している場合はその値を表示し、保存名が空なら`未設定`とする。
   「アクティブなスレッド」などの汎用名やpreview値へfallbackしない。
-- 一覧は`THREAD-OPEN-362`の現在openのSession threadを含み、各行の明示状態を「動作中」「停止中」「未観測」で表示する。未観測を推測で置換しない。
+- 一覧は`THREAD-OPEN-362`の公開対象となった現在openのSession threadを含み、各行の明示状態を「動作中」「停止中」「未観測」で表示する。未観測を推測で置換しない。
   動作中の状態文字はdanger赤`#EF6A6A`、停止中と未観測は従来のsecondary文字色とする。親card背景とmodel accent色は変更しない。
-- 動作中のrootを停止中・未観測のrootより先に表示し、同じ状態のrootと兄弟の既存順を維持する。各rootの直後に子孫をdepth-firstで連続表示し、子だけを親から切り離して並べ替えない。
+- 動作中のrootを停止中・未観測のrootより先に表示し、同じ状態のrootと兄弟の既存順を維持する。各rootの直後に公開対象の子孫をdepth-firstで連続表示し、子だけを親から切り離して並べ替えない。
 - contextは同じthreadの観測済みusage/window pairだけを表示し、usage=0は有効な0%として表示する。
   pairがない、windowが0以下、または旧checkpointのNULLは`未観測`とし、累積値や別sourceから推測・合成しない。
   割合は整数比をround-half-upで小数点以下最大2桁へ丸め、末尾0を除去し、100%を上限とする。次の観測で得たpairは
   checkpointへ保存し、後続append/restartで未観測へ戻さない。
-- stale Session、orphan、cycle、部分snapshotは誤って現在openとして表示しない。現在openの停止済みchildは停止中として表示する。
+- stale Session、orphan、cycle、部分snapshotは誤って現在openとして表示しない。現在openの停止済みchildは、停止中の祖先を持たず公開対象なら停止中として表示する。
 - 一覧件数が増えても本文fontを縮小せず、Window拡大や空疎なcardで情報密度を下げない。contextを埋めるための
   full old-history reread、追加poll、backfillを行わない。
 
