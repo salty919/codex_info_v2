@@ -13560,9 +13560,24 @@ fn visible_public_threads(threads: &[PublicThread]) -> Vec<&PublicThread> {
         .iter()
         .map(|thread| (thread.id.as_str(), thread))
         .collect::<BTreeMap<_, _>>();
+    let stopped_parent_ids = threads
+        .iter()
+        .filter_map(|thread| {
+            let parent_id = thread.parent_thread_id.as_deref()?;
+            by_id
+                .get(parent_id)
+                .is_some_and(|parent| {
+                    parent.activity_status == Some(PublicThreadActivityStatus::Stopped)
+                })
+                .then_some(parent_id)
+        })
+        .collect::<BTreeSet<_>>();
     threads
         .iter()
         .filter(|thread| {
+            if stopped_parent_ids.contains(thread.id.as_str()) {
+                return false;
+            }
             let mut parent = thread.parent_thread_id.as_deref();
             for _ in 0..threads.len() {
                 let Some(parent_id) = parent else {
@@ -41905,7 +41920,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_stopped_parent_descendants_stay_hidden_across_main_and_threads_refresh() {
+    fn linux_stopped_parent_and_descendants_stay_hidden_across_main_and_threads_refresh() {
         let (mut current, fixture_threads) = split_current_fixture();
         let template = &fixture_threads[0];
         let row = |id: &str,
@@ -42005,14 +42020,9 @@ mod tests {
                 .iter()
                 .map(|thread| thread.id.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "valid-child",
-                "independent-root",
-                "stopped-parent",
-                "valid-parent"
-            ]
+            ["valid-child", "independent-root", "valid-parent"]
         );
-        assert_eq!(super::active_thread_summary(&state.active_threads).total, 4);
+        assert_eq!(super::active_thread_summary(&state.active_threads).total, 3);
         assert_eq!(
             state
                 .active_threads
@@ -42032,7 +42042,7 @@ mod tests {
             .iter()
             .map(|row| state.active_threads[row.index].id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(displayed_ids.len(), 4);
+        assert_eq!(displayed_ids.len(), 3);
         let parent_row = displayed_ids
             .iter()
             .position(|id| *id == "valid-parent")

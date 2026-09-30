@@ -1967,7 +1967,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             : resourceClient is not null
             ? resourceThreads
             : main.DetailsSnapshot?.Threads ?? Array.Empty<ApiThreadDetails>();
-        source = MainWindowViewModel.WithoutStoppedAncestors(source);
+        source = MainWindowViewModel.WithoutStoppedParentSubtrees(source);
         if (source.Count > 0)
         {
             var ordered = ParentFirst(source);

@@ -376,7 +376,7 @@ component順や表示所有者を変更しない。
   `Details`を表示し、Detailsから空のThreads画面へ進める。未受理のcurrentやhistorical
   accountを0件とみなさず、historical accountではlive件数を表示しないが固定cardは保持する。
   v3のmodel別表示は`動作中（生成済み）`の順とし、SOL 0件動作中/1件openなら`0（1）`、LUNA 1件動作中/2件openなら`1（2）`と表示する。openが0件なら`0`と表示する。総数は公開対象となったopen行の全件数とする。
-  同一pairの元行数・動作中行数を検証した後、停止中の祖先を持つ子孫を画面から除外した行集合だけでMainの合計とmodel別件数を算出する。wireの元件数を表示件数へ流用しない。
+  同一pairの元行数・動作中行数を検証した後、停止中の親自身とその全子孫を画面から除外した行集合だけでMainの合計とmodel別件数を算出する。wireの元件数を表示件数へ流用しない。
 - ModelUsageはLinuxの単一table構成を使い、各modelのInput/Cached input/Outputについてtokenと
   隣接する概算ドルを同じrowに置く。4 model×22pxをcard内に表示し、0件でも`120px`の固定cardと見出しを保持してemptyを明示する。
   値の意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
@@ -506,7 +506,7 @@ component順や表示所有者を変更しない。
   外部の`thread/name/set`で保存している場合はその値を表示し、保存名が空なら`未設定`とする。
   「アクティブなスレッド」などの汎用名やpreview値へfallbackしない。
 - 一覧は`THREAD-OPEN-362`の公開対象となった現在openのSession threadを含み、各行の明示状態を「動作中」「停止中」「未観測」で表示する。未観測を推測で置換しない。
-  初回受理行と同一pairの独立したThreads再取得行のどちらでも、停止中の親を保持してその全子孫を除外する。残る子は元の`parent_thread_id`を持つ親にだけ接続し、同じ表示名の別の子と混同しない。
+  初回受理行と同一pairの独立したThreads再取得行のどちらでも、停止中の親自身とその全子孫を除外する。残る子は元の`parent_thread_id`を持つ親にだけ接続し、同じ表示名の別の子と混同しない。
   動作中の状態文字はdanger赤`#EF6A6A`、停止中と未観測は従来のsecondary文字色とする。親card背景とmodel accent色は変更しない。
 - 動作中のrootを停止中・未観測のrootより先に表示し、同じ状態のrootと兄弟の既存順を維持する。各rootの直後に公開対象の子孫をdepth-firstで連続表示し、子だけを親から切り離して並べ替えない。
 - contextは同じthreadの観測済みusage/window pairだけを表示し、usage=0は有効な0%として表示する。
