@@ -1457,6 +1457,74 @@ mod tests {
         assert_eq!(v3_details["threads"][1]["activity_status"], "stopped");
     }
 
+    #[test]
+    fn issue_419_public_pair_counts_only_the_accepted_parent_subtrees() {
+        let row = |id: &str, parent: Option<&str>, status| codex_info_rest_contract::PublicThread {
+            id: id.to_owned(),
+            title: if id == "valid-child" { "未設定" } else { id }.to_owned(),
+            activity_status: Some(status),
+            parent_thread_id: parent.map(str::to_owned),
+            model: "gpt-5.6-sol".to_owned(),
+            model_label: "SOL".to_owned(),
+            total_tokens: None,
+            context_usage_tokens: None,
+            context_window_tokens: None,
+            created_at: Some(1_800_000_000),
+            last_user_message_at: None,
+            is_subagent: parent.is_some(),
+            depth: parent.map(|_| 1),
+        };
+        use codex_info_rest_contract::PublicThreadActivityStatus::{Running, Stopped};
+        let details = PublicDetails {
+            active_thread_count: 3,
+            threads: vec![
+                row("independent-root", None, Running),
+                row("stopped-parent", None, Stopped),
+                row("valid-child", Some("valid-parent"), Running),
+                row("valid-parent", None, Running),
+            ],
+            ..PublicDetails::default()
+        };
+        let snapshot = PublishedSnapshot {
+            generation: 1,
+            data_hash: "hash".to_owned(),
+            pair: "pair".to_owned(),
+            has_pending_ranges: false,
+            details,
+            models_v3: Vec::new(),
+            history_samples_v2: Vec::new(),
+            history_samples_v3: Vec::new(),
+        };
+        let json = |route| -> serde_json::Value {
+            serde_json::from_slice(&serialize_route(&snapshot, route, None, None, false).unwrap())
+                .unwrap()
+        };
+        let current = json(Route::CurrentV3);
+        assert_eq!(current["open_session_thread_count"], 4);
+        assert_eq!(current["active_thread_count"], 3);
+        let threads = json(Route::ThreadsV3);
+        assert_eq!(
+            threads["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|thread| thread["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "independent-root",
+                "stopped-parent",
+                "valid-child",
+                "valid-parent"
+            ]
+        );
+        assert_eq!(threads["threads"][2]["parent_thread_id"], "valid-parent");
+        assert_eq!(threads["threads"][1]["activity_status"], "stopped");
+        let combined = json(Route::DetailsV3);
+        assert_eq!(combined["open_session_thread_count"], 4);
+        assert_eq!(combined["active_thread_count"], 3);
+        assert_eq!(combined["threads"], threads["threads"]);
+    }
+
     fn temp_db(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -361,6 +361,8 @@ formattingを含まない。parentは`null`または1..512のID、3つのtoken�
 
 v3の`/v3/current`と`/v3/details`には、`THREAD-OPEN-362`で公開対象となった現在openのcanonical Session thread ID数を示す非負整数`open_session_thread_count`を追加する。v3の`/v3/threads`と`/v3/details`の各thread行には必須の`activity_status`=`running|stopped|unknown`を追加する。`running`は動作中、`stopped`は停止中、`unknown`は状態未観測であり、`active_thread_count`は`running`行数だけを表す。`open_session_thread_count`は全v3行数で、同一IDの重複を許さない。v1/v2は従来の12キー行と`active_thread_count`を維持し、停止中・未観測行を含めない。旧形式の保存済みactive行だけは当時のrunning-only writer契約に従い動作中と解釈する。
 
+同一pairのv3 consumerは、受信した元行集合で`open_session_thread_count`と`active_thread_count`を先に照合する。停止中の祖先を持つ子孫が元行に含まれた場合も、Main/Threadsの画面表示前にその子孫を除外し、表示件数を残る行から導出する。この画面側の防御はserverが公開対象のみをpublishする義務やwire件数の意味を変更しない。残る行の`id`・`parent_thread_id`を付け替えない。
+
 `threads`配列はserver側canonical open-session snapshotの`updatedAt desc, id desc`順でpublishする。
 `updatedAt`自体はwire fieldへ追加しない。Windowsは受理した配列indexをcanonical rankとして使い、
 rootとsiblingの相対rankを保ったまま親先行depth-first・subtree-contiguousへpresentation投影する。

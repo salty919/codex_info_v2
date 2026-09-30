@@ -54,6 +54,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private readonly ILoopbackAccountsClient? accountsClient;
     private readonly ILoopbackAccountResourceClient? accountResourceClient;
     private ApiDetailsSnapshot? detailsSnapshot;
+    private ulong acceptedWireOpenSessionThreadCount;
+    private ulong acceptedWireActiveThreadCount;
     private ApiAccount? selectedAccount;
     private long accountSelectionGeneration;
     private DetailsFetchFailure? detailsFailure;
@@ -423,6 +425,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         snapshotAccountId == accountId;
 
     public ApiDetailsSnapshot? DetailsSnapshot => HasDetails ? detailsSnapshot : null;
+
+    internal ulong AcceptedWireOpenSessionThreadCount => acceptedWireOpenSessionThreadCount;
+
+    internal ulong AcceptedWireActiveThreadCount => acceptedWireActiveThreadCount;
 
     public string DetailsStatusText
     {
@@ -1600,6 +1606,19 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         var historical = selectedAccount is { IsCurrent: false, Id: var accountId } &&
             validatedDetails is { State: ApiState.Ready, Authenticated: true } &&
             validatedDetails.AccountId == accountId;
+        acceptedWireOpenSessionThreadCount = validatedDetails.OpenSessionThreadCount;
+        acceptedWireActiveThreadCount = validatedDetails.ActiveThreadCount;
+        if (validatedDetails.ApiVersion == "v3" && !historical)
+        {
+            var visibleThreads = WithoutStoppedAncestors(validatedDetails.Threads);
+            validatedDetails = validatedDetails with
+            {
+                Threads = visibleThreads,
+                OpenSessionThreadCount = (ulong)visibleThreads.Count,
+                ActiveThreadCount = (ulong)visibleThreads.Count(thread =>
+                    thread.ActivityStatus == ApiThreadActivityStatus.Running),
+            };
+        }
         detailsSnapshot = validatedDetails;
         detailsFailure = null;
         historicalActivitySuppressed = historical;
@@ -1647,6 +1666,30 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(IsRefreshingVisible));
         Notify(nameof(IsUpdateNotificationVisible));
         Notify(nameof(IsUpdateActionVisible));
+    }
+
+    internal static IReadOnlyList<ApiThreadDetails> WithoutStoppedAncestors(
+        IReadOnlyList<ApiThreadDetails> source)
+    {
+        var byId = source.ToDictionary(thread => thread.Id, StringComparer.Ordinal);
+        return source.Where(thread =>
+        {
+            var parentId = thread.ParentId;
+            for (var hop = 0; parentId is not null && hop < source.Count; hop++)
+            {
+                if (!byId.TryGetValue(parentId, out var parent))
+                {
+                    return true;
+                }
+                if (parent.ActivityStatus == ApiThreadActivityStatus.Stopped)
+                {
+                    return false;
+                }
+                parentId = parent.ParentId;
+            }
+            // Admission owns cycle rejection. Preserve its existing decision.
+            return true;
+        }).ToArray();
     }
 
     private void ApplyCurrentGeneration(
