@@ -1884,11 +1884,12 @@ where
             .filter(|snapshot| snapshot.activity_status == ThreadActivityStatus::Stopped)
             .map(|snapshot| snapshot.thread_id.as_str())
             .collect();
+        // Seed the stopped parent itself; the descendant pass removes its subtree.
         excluded_ids.extend(snapshots.iter().filter_map(|snapshot| {
             let parent_id = snapshot.parent_thread_id.as_deref()?;
             stopped_ids
                 .contains(parent_id)
-                .then(|| snapshot.thread_id.clone())
+                .then(|| parent_id.to_owned())
         }));
     }
     loop {
@@ -4151,12 +4152,7 @@ mod tests {
             terminal_cycle(all_complete_rows),
             |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"turn_aborted"})])) },
         );
-        assert!(matches!(
-            all_complete,
-            ThreadCycleOutcome::Snapshots(threads)
-                if threads.len() == 1 && threads[0].thread_id == "parent"
-                    && threads[0].activity_status == ThreadActivityStatus::Stopped
-        ));
+        assert_eq!(all_complete, ThreadCycleOutcome::NoThread);
     }
 
     #[test]
@@ -4246,29 +4242,19 @@ mod tests {
                 "valid-child",
                 "independent-root",
                 "unknown-parent",
-                "stopped-open-parent",
                 "unknown-status-parent",
                 "unknown-status-child",
             ]
             .into_iter()
             .collect()
         );
-        assert_eq!(rows.len(), 7);
+        assert_eq!(rows.len(), 6);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.activity_status == ThreadActivityStatus::Running)
                 .count(),
             2
         );
-        let stopped_parent = rows
-            .iter()
-            .find(|row| row.thread_id == "stopped-open-parent")
-            .expect("stopped parent remains open");
-        assert_eq!(
-            stopped_parent.activity_status,
-            ThreadActivityStatus::Stopped
-        );
-
         let failed = select_active_threads(
             terminal_cycle(candidates),
             |candidate| -> Result<Vec<u8>, ()> {
