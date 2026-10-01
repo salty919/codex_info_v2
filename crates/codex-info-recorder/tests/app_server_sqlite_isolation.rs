@@ -375,7 +375,7 @@ fn checkpoint(sessions: &Path, session: &Path, committed_offset: u64) -> Session
 }
 
 #[test]
-fn stopped_parent_descendants_are_absent_after_real_thread_read_cycle() {
+fn stopped_parent_and_descendants_are_absent_after_real_thread_read_cycle() {
     let _environment_lock = ENVIRONMENT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -497,14 +497,8 @@ fn stopped_parent_descendants_are_absent_after_real_thread_read_cycle() {
         .collect::<BTreeMap<_, _>>();
     assert_eq!(
         by_id.keys().copied().collect::<Vec<_>>(),
-        [
-            "independent-root",
-            "stopped-parent",
-            "valid-child",
-            "valid-parent"
-        ]
+        ["independent-root", "valid-child", "valid-parent"]
     );
-    assert_eq!(by_id["stopped-parent"].activity_status, "stopped");
     assert_eq!(by_id["valid-child"].activity_status, "running");
     assert_eq!(
         by_id["valid-child"].parent_thread_id.as_deref(),

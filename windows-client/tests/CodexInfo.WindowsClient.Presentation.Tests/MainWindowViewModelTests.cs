@@ -383,7 +383,7 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task StoppedParentDescendantsAreAbsentFromMainAndThreadsWithoutReparenting()
+    public async Task StoppedParentAndDescendantsAreAbsentFromMainAndThreadsWithoutReparenting()
     {
         var current = CurrentSnapshot(activeThreadCount: 4) with
         {
@@ -424,18 +424,18 @@ public sealed class MainWindowViewModelTests
 
         Assert.True(client.ThreadsCallCount >= 2);
         Assert.Equal(
-            ["valid-child", "independent-root", "stopped-parent", "valid-parent"],
+            ["valid-child", "independent-root", "valid-parent"],
             main.DetailsSnapshot!.Threads.Select(thread => thread.Id));
-        Assert.Equal(4UL, main.ActiveThreadCount);
-        Assert.Equal(2, main.ActiveSolCount);
+        Assert.Equal(3UL, main.ActiveThreadCount);
+        Assert.Equal(1, main.ActiveSolCount);
         Assert.Equal(1, main.ActiveTerraCount);
         Assert.Equal(1, main.ActiveLunaCount);
         Assert.Equal(0, main.ActiveAstraCount);
-        Assert.Equal("1（2）", main.ActiveSolCountLabel);
+        Assert.Equal("1（1）", main.ActiveSolCountLabel);
         Assert.Equal("1（1）", main.ActiveTerraCountLabel);
         Assert.Equal("1（1）", main.ActiveLunaCountLabel);
         Assert.Equal(
-            ["independent-root", "valid-parent", "valid-child", "stopped-parent"],
+            ["independent-root", "valid-parent", "valid-child"],
             threads.Threads.Select(thread => thread.Id));
         Assert.Equal([new ThreadTreeConnection(1, 2, 0)], threads.TreeConnections);
         Assert.Equal("Running B", threads.Threads[2].ParentTitle);
@@ -454,12 +454,12 @@ public sealed class MainWindowViewModelTests
         combinedMain.Start();
         await EventuallyAsync(() => combinedMain.HasDetails);
         using var combinedThreads = new ThreadsWindowViewModel(combinedMain, action => action());
-        Assert.Equal(4UL, combinedMain.ActiveThreadCount);
+        Assert.Equal(3UL, combinedMain.ActiveThreadCount);
         Assert.Equal(
-            ["valid-child", "independent-root", "stopped-parent", "valid-parent"],
+            ["valid-child", "independent-root", "valid-parent"],
             combinedMain.DetailsSnapshot!.Threads.Select(thread => thread.Id));
         Assert.Equal(
-            ["independent-root", "valid-parent", "valid-child", "stopped-parent"],
+            ["independent-root", "valid-parent", "valid-child"],
             combinedThreads.Threads.Select(thread => thread.Id));
         Assert.Equal([new ThreadTreeConnection(1, 2, 0)], combinedThreads.TreeConnections);
     }

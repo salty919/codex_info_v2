@@ -1474,12 +1474,11 @@ mod tests {
             is_subagent: parent.is_some(),
             depth: parent.map(|_| 1),
         };
-        use codex_info_rest_contract::PublicThreadActivityStatus::{Running, Stopped};
+        use codex_info_rest_contract::PublicThreadActivityStatus::Running;
         let details = PublicDetails {
             active_thread_count: 3,
             threads: vec![
                 row("independent-root", None, Running),
-                row("stopped-parent", None, Stopped),
                 row("valid-child", Some("valid-parent"), Running),
                 row("valid-parent", None, Running),
             ],
@@ -1500,7 +1499,7 @@ mod tests {
                 .unwrap()
         };
         let current = json(Route::CurrentV3);
-        assert_eq!(current["open_session_thread_count"], 4);
+        assert_eq!(current["open_session_thread_count"], 3);
         assert_eq!(current["active_thread_count"], 3);
         let threads = json(Route::ThreadsV3);
         assert_eq!(
@@ -1510,17 +1509,11 @@ mod tests {
                 .iter()
                 .map(|thread| thread["id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            [
-                "independent-root",
-                "stopped-parent",
-                "valid-child",
-                "valid-parent"
-            ]
+            ["independent-root", "valid-child", "valid-parent"]
         );
-        assert_eq!(threads["threads"][2]["parent_thread_id"], "valid-parent");
-        assert_eq!(threads["threads"][1]["activity_status"], "stopped");
+        assert_eq!(threads["threads"][1]["parent_thread_id"], "valid-parent");
         let combined = json(Route::DetailsV3);
-        assert_eq!(combined["open_session_thread_count"], 4);
+        assert_eq!(combined["open_session_thread_count"], 3);
         assert_eq!(combined["active_thread_count"], 3);
         assert_eq!(combined["threads"], threads["threads"]);
     }
