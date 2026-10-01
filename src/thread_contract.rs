@@ -4152,12 +4152,7 @@ mod tests {
             terminal_cycle(all_complete_rows),
             |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"turn_aborted"})])) },
         );
-        assert!(matches!(
-            all_complete,
-            ThreadCycleOutcome::Snapshots(threads)
-                if threads.len() == 1 && threads[0].thread_id == "parent"
-                    && threads[0].activity_status == ThreadActivityStatus::Stopped
-        ));
+        assert_eq!(all_complete, ThreadCycleOutcome::NoThread);
     }
 
     #[test]
