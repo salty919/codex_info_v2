@@ -2380,6 +2380,7 @@ capture_legacy_combined_state() {
     probe_legacy_combined_enabled && legacy_combined_enabled=1 || true
     probe_active codex-info.service && legacy_combined_active=1 || true
     [[ -L "$legacy_combined_unit_destination" ]] && legacy_combined_generation=1
+    return 0
 }
 legacy_combined_mixed_split_present() {
     local path
