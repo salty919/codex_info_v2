@@ -21,10 +21,18 @@ public static class ThemePalette
     public const string EmberDark = "ember-dark";
     public const string InkDark = "ink-dark";
 
+    public const string NeonDark = "neon-dark";
+    public const string LavenderLight = "lavender-light";
+    public const string MintLight = "mint-light";
+    public const string ForestDark = "forest-dark";
+    public const string TangerineDark = "tangerine-dark";
+    public const string RoseDark = "rose-dark";
+
     public static IReadOnlyList<string> PresetIds { get; } =
     [
         ClassicDark, GraphiteDark, Light, PaperLight, SandLight, SteelLight,
         OceanDark, TealDark, EmberDark, InkDark,
+        NeonDark, LavenderLight, MintLight, ForestDark, TangerineDark, RoseDark,
     ];
 
     // A one-to-one mapping keeps the existing dark appearance exact, including
@@ -137,6 +145,18 @@ public static class ThemePalette
                 ["#202126", "#2B2D32", "#F4F0E9", "#BCBDB7", "#E7BC62", "#26272C", "#505258", "#35373D", "#77725F", "#244437", "#5D9974", "#9FDC9E", "#3D3D47", "#686973", "#A5A3A0", "#F58A94", "#303238", "#555147", "#F2CB78"]),
             [InkDark] = CreatePreset(false, 0, 0, 0,
                 ["#000000", "#121212", "#FFFFFF", "#D8D8D8", "#6DD3FF", "#050505", "#787878", "#242424", "#808080", "#002B17", "#78E8A4", "#78E8A4", "#202A34", "#FFFFFF", "#FFFFFF", "#FF8BA1", "#101010", "#174A66", "#FFFFFF"]),
+            [NeonDark] = CreatePreset(false, 0, 0, 0,
+                ["#16122A", "#241C3B", "#F2ECFF", "#C4B8E2", "#70CBFF", "#1B1530", "#493B68", "#302448", "#37436A", "#163D33", "#4D8B70", "#8BDEB6", "#33264F", "#63517D", "#AF9AD0", "#FF929F", "#2C2144", "#493369", "#B19BFF"]),
+            [LavenderLight] = CreatePreset(true, 0, 0, 0,
+                ["#F2EAFB", "#FFFAFF", "#29233C", "#615570", "#7046AE", "#FFFAFF", "#D8CBE3", "#EBE0F4", "#DDD4EF", "#E3F3E9", "#5C9571", "#216C44", "#E7DDF5", "#BCAACE", "#78658F", "#AC2853", "#EFE7F8", "#DDD0EF", "#7046AE"]),
+            [MintLight] = CreatePreset(true, 0, 0, 0,
+                ["#E8F7EE", "#F7FFFA", "#19382F", "#3F5F50", "#14765F", "#F7FFFA", "#C8DECF", "#DDEDE3", "#BEDCCD", "#D9F2E1", "#579772", "#207343", "#D7EDE0", "#A8C8B5", "#4D806C", "#AF2D4C", "#E8F6EC", "#C8E8D6", "#11735B"]),
+            [ForestDark] = CreatePreset(false, 0, 0, 0,
+                ["#11231B", "#1B3427", "#EDF8EA", "#ADC9B5", "#94DB75", "#14291E", "#355642", "#263F30", "#40623A", "#193E29", "#508264", "#8CDCAC", "#284833", "#526F5B", "#8BAF90", "#FF949B", "#203F2E", "#31533A", "#B5EA94"]),
+            [TangerineDark] = CreatePreset(false, 0, 0, 0,
+                ["#29180F", "#3B261A", "#FFF3E5", "#DFC1A5", "#FFB46E", "#2C1D13", "#614533", "#453022", "#735035", "#213D28", "#567D59", "#A3D892", "#4D3424", "#876346", "#D3A37A", "#FF9A96", "#3D2B1D", "#68462C", "#FFCA86"]),
+            [RoseDark] = CreatePreset(false, 0, 0, 0,
+                ["#281523", "#3A2233", "#FCECF5", "#DAB9CD", "#F49DC7", "#2D1B29", "#604258", "#482D3F", "#704762", "#1D3D32", "#507E68", "#9CDBBC", "#4C2F44", "#835A75", "#CC94B5", "#FF969F", "#412838", "#67425B", "#FFBDDF"]),
         };
 
     private static AdditionalPreset CreatePreset(
@@ -150,7 +170,8 @@ public static class ThemePalette
     public static event EventHandler? Changed;
 
     public static bool IsValid(string? id) => id is ClassicDark or GraphiteDark or Light
-        or PaperLight or SandLight or SteelLight or OceanDark or TealDark or EmberDark or InkDark;
+        or PaperLight or SandLight or SteelLight or OceanDark or TealDark or EmberDark or InkDark
+        or NeonDark or LavenderLight or MintLight or ForestDark or TangerineDark or RoseDark;
 
     public static string Resolve(string classicColor) => ResolveFor(CurrentId, classicColor);
 
@@ -203,7 +224,7 @@ public static class ThemePalette
         CurrentId = id;
         if (Application.Current is { } app)
         {
-            app.RequestedThemeVariant = id is Light or PaperLight or SandLight or SteelLight
+            app.RequestedThemeVariant = id is Light or PaperLight or SandLight or SteelLight or LavenderLight or MintLight
                 ? ThemeVariant.Light
                 : ThemeVariant.Dark;
             foreach (var (classic, brush) in brushes)

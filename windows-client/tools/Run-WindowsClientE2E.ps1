@@ -3059,6 +3059,54 @@ $script:e2eThemeColors = @{
         ParentCard = '#202A34'; ChildCard = '#121212'; ThreadBorder = '#FFFFFF'; ThreadRail = '#FFFFFF'; Running = '#FF8BA1'
         Remaining = '#6DD3FF'; Popup = '#101010'; PopupSelected = '#174A66'; Focus = '#FFFFFF'
     }
+    'neon-dark' = @{
+        Window = '#16122A'; Card = '#241C3B'; Primary = '#F2ECFF'; Secondary = '#C4B8E2'
+        Accent = '#70CBFF'; Plot = '#1B1530'; Grid = '#493B68'; Idle = '#302448'
+        QuotaEmpty = '#37436A'; QuotaFilled = '#70CBFF'; ReadyBackground = '#163D33'; ReadyBorder = '#4D8B70'
+        ReadyAccent = '#8BDEB6'; ParentCard = '#33264F'; ChildCard = '#241C3B'; ThreadBorder = '#63517D'
+        ThreadRail = '#AF9AD0'; Running = '#FF929F'; Remaining = '#70CBFF'; Popup = '#2C2144'
+        PopupSelected = '#493369'; Focus = '#B19BFF'
+    }
+    'lavender-light' = @{
+        Window = '#F2EAFB'; Card = '#FFFAFF'; Primary = '#29233C'; Secondary = '#615570'
+        Accent = '#7046AE'; Plot = '#FFFAFF'; Grid = '#D8CBE3'; Idle = '#EBE0F4'
+        QuotaEmpty = '#DDD4EF'; QuotaFilled = '#7046AE'; ReadyBackground = '#E3F3E9'; ReadyBorder = '#5C9571'
+        ReadyAccent = '#216C44'; ParentCard = '#E7DDF5'; ChildCard = '#FFFAFF'; ThreadBorder = '#BCAACE'
+        ThreadRail = '#78658F'; Running = '#AC2853'; Remaining = '#7046AE'; Popup = '#EFE7F8'
+        PopupSelected = '#DDD0EF'; Focus = '#7046AE'
+    }
+    'mint-light' = @{
+        Window = '#E8F7EE'; Card = '#F7FFFA'; Primary = '#19382F'; Secondary = '#3F5F50'
+        Accent = '#14765F'; Plot = '#F7FFFA'; Grid = '#C8DECF'; Idle = '#DDEDE3'
+        QuotaEmpty = '#BEDCCD'; QuotaFilled = '#14765F'; ReadyBackground = '#D9F2E1'; ReadyBorder = '#579772'
+        ReadyAccent = '#207343'; ParentCard = '#D7EDE0'; ChildCard = '#F7FFFA'; ThreadBorder = '#A8C8B5'
+        ThreadRail = '#4D806C'; Running = '#AF2D4C'; Remaining = '#14765F'; Popup = '#E8F6EC'
+        PopupSelected = '#C8E8D6'; Focus = '#11735B'
+    }
+    'forest-dark' = @{
+        Window = '#11231B'; Card = '#1B3427'; Primary = '#EDF8EA'; Secondary = '#ADC9B5'
+        Accent = '#94DB75'; Plot = '#14291E'; Grid = '#355642'; Idle = '#263F30'
+        QuotaEmpty = '#40623A'; QuotaFilled = '#94DB75'; ReadyBackground = '#193E29'; ReadyBorder = '#508264'
+        ReadyAccent = '#8CDCAC'; ParentCard = '#284833'; ChildCard = '#1B3427'; ThreadBorder = '#526F5B'
+        ThreadRail = '#8BAF90'; Running = '#FF949B'; Remaining = '#94DB75'; Popup = '#203F2E'
+        PopupSelected = '#31533A'; Focus = '#B5EA94'
+    }
+    'tangerine-dark' = @{
+        Window = '#29180F'; Card = '#3B261A'; Primary = '#FFF3E5'; Secondary = '#DFC1A5'
+        Accent = '#FFB46E'; Plot = '#2C1D13'; Grid = '#614533'; Idle = '#453022'
+        QuotaEmpty = '#735035'; QuotaFilled = '#FFB46E'; ReadyBackground = '#213D28'; ReadyBorder = '#567D59'
+        ReadyAccent = '#A3D892'; ParentCard = '#4D3424'; ChildCard = '#3B261A'; ThreadBorder = '#876346'
+        ThreadRail = '#D3A37A'; Running = '#FF9A96'; Remaining = '#FFB46E'; Popup = '#3D2B1D'
+        PopupSelected = '#68462C'; Focus = '#FFCA86'
+    }
+    'rose-dark' = @{
+        Window = '#281523'; Card = '#3A2233'; Primary = '#FCECF5'; Secondary = '#DAB9CD'
+        Accent = '#F49DC7'; Plot = '#2D1B29'; Grid = '#604258'; Idle = '#482D3F'
+        QuotaEmpty = '#704762'; QuotaFilled = '#F49DC7'; ReadyBackground = '#1D3D32'; ReadyBorder = '#507E68'
+        ReadyAccent = '#9CDBBC'; ParentCard = '#4C2F44'; ChildCard = '#3A2233'; ThreadBorder = '#835A75'
+        ThreadRail = '#CC94B5'; Running = '#FF969F'; Remaining = '#F49DC7'; Popup = '#412838'
+        PopupSelected = '#67425B'; Focus = '#FFBDDF'
+    }
 }
 
 function Assert-E2EThemePixel {
@@ -3137,7 +3185,7 @@ function Get-E2EThemeSelectionLabel {
         'Settings theme ComboBox has no ExpandCollapsePattern.'
     Assert-E2E ($expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) `
         'Settings theme ComboBox must be collapsed before its selected label is read.'
-    $labels = @('Classic Dark', 'Graphite Dark', 'Light', 'Paper Light', 'Sand Light', 'Steel Light', 'Ocean Dark', 'Teal Dark', 'Ember Dark', 'Ink Dark')
+    $labels = @('Classic Dark', 'Graphite Dark', 'Light', 'Paper Light', 'Sand Light', 'Steel Light', 'Ocean Dark', 'Teal Dark', 'Ember Dark', 'Ink Dark', 'Neon Dark', 'Lavender Light', 'Mint Light', 'Forest Dark', 'Tangerine Dark', 'Rose Dark')
     $visible = @(Get-E2EVisibleControlElements $Selector ([System.Windows.Automation.ControlType]::Text) |
         ForEach-Object { [string]$_.Current.Name } | Where-Object { $labels -ccontains $_ })
     Assert-E2E ($visible.Count -eq 1) "Settings theme ComboBox must render one selected label; observed: $($visible -join ',')."
@@ -3155,11 +3203,11 @@ function Select-E2ETheme {
     Assert-E2E ($selector.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) `
         'Settings theme ComboBox does not expose ExpandCollapsePattern.'
     $expand.Expand()
-    $labels = @('Classic Dark', 'Graphite Dark', 'Light', 'Paper Light', 'Sand Light', 'Steel Light', 'Ocean Dark', 'Teal Dark', 'Ember Dark', 'Ink Dark')
-    $items = Wait-E2E -Description 'ten theme preset UIA options' -Probe {
+    $labels = @('Classic Dark', 'Graphite Dark', 'Light', 'Paper Light', 'Sand Light', 'Steel Light', 'Ocean Dark', 'Teal Dark', 'Ember Dark', 'Ink Dark', 'Neon Dark', 'Lavender Light', 'Mint Light', 'Forest Dark', 'Tangerine Dark', 'Rose Dark')
+    $items = Wait-E2E -Description 'sixteen theme preset UIA options' -Probe {
         $visible = @(Get-E2EVisibleControlElements $SettingsRoot ([System.Windows.Automation.ControlType]::ListItem))
         $themeItems = @($visible | Where-Object { $labels -ccontains [string]$_.Current.Name })
-        if ($themeItems.Count -eq 10) { return $themeItems }
+        if ($themeItems.Count -eq 16) { return $themeItems }
         return $false
     }
     $actualLabels = @($items | ForEach-Object { [string]$_.Current.Name })
@@ -3171,7 +3219,7 @@ function Select-E2ETheme {
     Wait-E2E -Description "theme UIA selection '$Label'" -Probe {
         return (Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $SettingsRoot)) -ceq $Label
     } | Out-Null
-    Write-E2E "theme-selector: PASS options=10 selected=$Label"
+    Write-E2E "theme-selector: PASS options=16 selected=$Label"
 }
 
 function Open-E2ESetupFromSettings {
@@ -3429,6 +3477,12 @@ function Invoke-E2EThemePresets {
             @{ Id = 'teal-dark'; Label = 'Teal Dark' },
             @{ Id = 'ember-dark'; Label = 'Ember Dark' },
             @{ Id = 'ink-dark'; Label = 'Ink Dark' },
+            @{ Id = 'neon-dark'; Label = 'Neon Dark' },
+            @{ Id = 'lavender-light'; Label = 'Lavender Light' },
+            @{ Id = 'mint-light'; Label = 'Mint Light' },
+            @{ Id = 'forest-dark'; Label = 'Forest Dark' },
+            @{ Id = 'tangerine-dark'; Label = 'Tangerine Dark' },
+            @{ Id = 'rose-dark'; Label = 'Rose Dark' },
             @{ Id = 'light'; Label = 'Light' })) {
         Select-E2ETheme $windows.Settings.Root $choice.Label
         $save = Find-E2EButtonByName $windows.Settings.Root 'Save'

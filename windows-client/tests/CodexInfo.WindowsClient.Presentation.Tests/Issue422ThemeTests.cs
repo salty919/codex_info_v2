@@ -57,7 +57,7 @@ public sealed class Issue422ThemeTests
     }
 
     [Fact]
-    public void SettingsExposeTenThemePresets()
+    public void SettingsExposeSixteenThemePresets()
     {
         var root = Directory.CreateTempSubdirectory("codex-info-issue-422-theme-options-test");
         var originalLanguage = LocalizationService.Current.LanguageCode;
@@ -67,6 +67,7 @@ public sealed class Issue422ThemeTests
             {
                 "classic-dark", "graphite-dark", "light", "paper-light", "sand-light",
                 "steel-light", "ocean-dark", "teal-dark", "ember-dark", "ink-dark",
+                "neon-dark", "lavender-light", "mint-light", "forest-dark", "tangerine-dark", "rose-dark",
             };
             var store = new ClientSettingsStore(Path.Combine(root.FullName, "settings.json"));
             foreach (var language in LocalizationService.Languages)
@@ -162,6 +163,7 @@ public sealed class Issue422ThemeTests
             var ids = new[]
             {
                 "paper-light", "sand-light", "steel-light", "ocean-dark", "teal-dark", "ember-dark", "ink-dark",
+                "neon-dark", "lavender-light", "mint-light", "forest-dark", "tangerine-dark", "rose-dark",
             };
             foreach (var id in ids)
             {
@@ -269,6 +271,60 @@ public sealed class Issue422ThemeTests
             LocalizationService.SetTimeZone(string.Equals(originalTimeZone, "UTC", StringComparison.OrdinalIgnoreCase) ? "UTC" : "local");
             root.Delete(recursive: true);
         }
+    }
+
+    [Fact]
+    public void ColorfulThemesKeepTextAndGraphContrast()
+    {
+        var original = ThemePalette.CurrentId;
+        try
+        {
+            foreach (var id in new[] { "neon-dark", "lavender-light", "mint-light", "forest-dark", "tangerine-dark", "rose-dark" })
+            {
+                Assert.True(ThemePalette.IsValid(id), $"Missing requested theme: {id}");
+                ThemePalette.Apply(id);
+                foreach (var surface in new[] { "#0E141E", "#151F2D", "#243E5A", "#111B2C", "#244D74" })
+                {
+                    AssertContrast(id, "#E9EFF8", surface, 4.5);
+                    AssertContrast(id, "#A8B7CA", surface, 4.5);
+                    AssertContrast(id, "#8BD4FF", surface, 3);
+                }
+                AssertContrast(id, "#4FB878", "#143426", 4.5);
+                AssertContrast(id, "#E6B85C", "#3A2A13", 4.5);
+                AssertContrast(id, "#E06B7A", "#3A1D24", 4.5);
+                AssertContrast(id, "#EF6A6A", "#151F2D", 4.5);
+                AssertContrast(id, "#EF6A6A", "#243E5A", 4.5);
+                AssertContrast(id, "#F5FAFF", "#236B9E", 4.5);
+                AssertContrast(id, "#78879C", "#121C2C", 4.5);
+                foreach (var series in new[] { "#56B2F5", "#A88CF5", "#5DC98A", "#E6A23C", "#EF6A6A" })
+                {
+                    AssertContrast(id, series, "#121C2C", 3);
+                }
+            }
+        }
+        finally
+        {
+            ThemePalette.Apply(original);
+        }
+    }
+
+    private static void AssertContrast(string id, string foreground, string background, double minimum)
+    {
+        static double Luminance(string hex)
+        {
+            static double Linear(int channel)
+            {
+                var value = channel / 255.0;
+                return value <= 0.04045 ? value / 12.92 : Math.Pow((value + 0.055) / 1.055, 2.4);
+            }
+            return 0.2126 * Linear(Convert.ToInt32(hex.Substring(1, 2), 16))
+                + 0.7152 * Linear(Convert.ToInt32(hex.Substring(3, 2), 16))
+                + 0.0722 * Linear(Convert.ToInt32(hex.Substring(5, 2), 16));
+        }
+        var a = Luminance(ThemePalette.Resolve(foreground));
+        var b = Luminance(ThemePalette.Resolve(background));
+        var contrast = (Math.Max(a, b) + 0.05) / (Math.Min(a, b) + 0.05);
+        Assert.True(contrast >= minimum, $"{id}: {foreground}/{background} contrast {contrast:F2} < {minimum}");
     }
 
     private static string ReadThemeOptionId(object option)
@@ -448,5 +504,17 @@ public sealed class Issue422ThemeTests
             ["#202126", "#2B2D32", "#F4F0E9", "#BCBDB7", "#E7BC62", "#26272C", "#505258", "#35373D", "#77725F", "#244437", "#5D9974", "#9FDC9E", "#3D3D47", "#686973", "#A5A3A0", "#F58A94", "#303238", "#555147", "#F2CB78"]),
         new("ink-dark", false, 0, 0, 0,
             ["#000000", "#121212", "#FFFFFF", "#D8D8D8", "#6DD3FF", "#050505", "#787878", "#242424", "#808080", "#002B17", "#78E8A4", "#78E8A4", "#202A34", "#FFFFFF", "#FFFFFF", "#FF8BA1", "#101010", "#174A66", "#FFFFFF"]),
+        new("neon-dark", false, 0, 0, 0,
+            ["#16122A", "#241C3B", "#F2ECFF", "#C4B8E2", "#70CBFF", "#1B1530", "#493B68", "#302448", "#37436A", "#163D33", "#4D8B70", "#8BDEB6", "#33264F", "#63517D", "#AF9AD0", "#FF929F", "#2C2144", "#493369", "#B19BFF"]),
+        new("lavender-light", true, 0, 0, 0,
+            ["#F2EAFB", "#FFFAFF", "#29233C", "#615570", "#7046AE", "#FFFAFF", "#D8CBE3", "#EBE0F4", "#DDD4EF", "#E3F3E9", "#5C9571", "#216C44", "#E7DDF5", "#BCAACE", "#78658F", "#AC2853", "#EFE7F8", "#DDD0EF", "#7046AE"]),
+        new("mint-light", true, 0, 0, 0,
+            ["#E8F7EE", "#F7FFFA", "#19382F", "#3F5F50", "#14765F", "#F7FFFA", "#C8DECF", "#DDEDE3", "#BEDCCD", "#D9F2E1", "#579772", "#207343", "#D7EDE0", "#A8C8B5", "#4D806C", "#AF2D4C", "#E8F6EC", "#C8E8D6", "#11735B"]),
+        new("forest-dark", false, 0, 0, 0,
+            ["#11231B", "#1B3427", "#EDF8EA", "#ADC9B5", "#94DB75", "#14291E", "#355642", "#263F30", "#40623A", "#193E29", "#508264", "#8CDCAC", "#284833", "#526F5B", "#8BAF90", "#FF949B", "#203F2E", "#31533A", "#B5EA94"]),
+        new("tangerine-dark", false, 0, 0, 0,
+            ["#29180F", "#3B261A", "#FFF3E5", "#DFC1A5", "#FFB46E", "#2C1D13", "#614533", "#453022", "#735035", "#213D28", "#567D59", "#A3D892", "#4D3424", "#876346", "#D3A37A", "#FF9A96", "#3D2B1D", "#68462C", "#FFCA86"]),
+        new("rose-dark", false, 0, 0, 0,
+            ["#281523", "#3A2233", "#FCECF5", "#DAB9CD", "#F49DC7", "#2D1B29", "#604258", "#482D3F", "#704762", "#1D3D32", "#507E68", "#9CDBBC", "#4C2F44", "#835A75", "#CC94B5", "#FF969F", "#412838", "#67425B", "#FFBDDF"]),
     ];
 }

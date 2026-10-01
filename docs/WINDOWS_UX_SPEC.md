@@ -41,7 +41,7 @@ Linux timezone設定、Issue #422で利用者が選択したWindows版の`WIN-TH
 
 ## WIN-THEME-422 — Windows版の組込みカラーテーマ
 
-Windows Settingsの外観欄は`classic-dark`（従来配色・既定）、`graphite-dark`、`light`、`paper-light`、`sand-light`、`steel-light`、`ocean-dark`、`teal-dark`、`ember-dark`、`ink-dark`の順に10種類の組込みpresetを選択できる。新規presetの表示名は順にPaper Light、Sand Light、Steel Light、Ocean Dark、Teal Dark、Ember Dark、Ink Darkとし、日本語では順にペーパー ライト、サンド ライト、スチール ライト、オーシャン ダーク、ティール ダーク、エンバー ダーク、インク ダークとする。これらは独自の配色であり、他製品の同名themeとの色互換を表明しない。VS Codeのように利用者がpresetを切り替える操作を提供し、外部themeの取込みや任意色編集は含めない。選択中は現在表示を変えず、既存の保存操作がDATA ownerの`WIN-THEME-PREF-422`に従って成功した後に、開いているMain、Settings、Setup、Graph、Threads、Legalの全Windowへ反映する。取消または保存失敗時は表示中の色と永続設定を変えない。次回起動時は保存したpresetをMain表示前に適用する。theme変更によってquota、Graph系列データ、Threadsの状態、接続、取得要求を変更しない。
+Windows Settingsの外観欄は`classic-dark`（従来配色・既定）、`graphite-dark`、`light`、`paper-light`、`sand-light`、`steel-light`、`ocean-dark`、`teal-dark`、`ember-dark`、`ink-dark`、`neon-dark`、`lavender-light`、`mint-light`、`forest-dark`、`tangerine-dark`、`rose-dark`の順に16種類の組込みpresetを選択できる。新規presetの表示名は順にPaper Light、Sand Light、Steel Light、Ocean Dark、Teal Dark、Ember Dark、Ink Darkとし、日本語では順にペーパー ライト、サンド ライト、スチール ライト、オーシャン ダーク、ティール ダーク、エンバー ダーク、インク ダークとする。これらは独自の配色であり、他製品の同名themeとの色互換を表明しない。VS Codeのように利用者がpresetを切り替える操作を提供し、外部themeの取込みや任意色編集は含めない。選択中は現在表示を変えず、既存の保存操作がDATA ownerの`WIN-THEME-PREF-422`に従って成功した後に、開いているMain、Settings、Setup、Graph、Threads、Legalの全Windowへ反映する。取消または保存失敗時は表示中の色と永続設定を変えない。次回起動時は保存したpresetをMain表示前に適用する。theme変更によってquota、Graph系列データ、Threadsの状態、接続、取得要求を変更しない。
 
 | preset | window背景 | card面 | 主要文字 | 補助文字 | accent | Graph背景 | grid | idle band |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -106,7 +106,22 @@ E2Eで画面内の色を判定する追加roleは次のexact値とする。`stat
 
 `classic-dark`の既存固定色、状態色、model色は維持する。他のpresetは同じ状態・modelの識別を色相と状態文の組で保ち、明色面では読める濃色を使う。Graphの線・grid・idle band、Mainのquota/status、Threadsの親card・接続線・動作状態、focus・selector・popupも選択paletteから描画し、一部だけ旧暗色を残さない。画面geometry、情報と状態の意味、Linux版の色は変更しない。preset名と選択操作は対応言語のcatalogとUI Automationで識別できるようにする。実Windowsの同一最終buildで選択、保存、再起動復元、6 Windowの表示色を確認する。
 
-以下の既存節にあるWindows固定HEXのpixel oracleは`classic-dark`へ適用する。他の9 presetでは、同じ情報・状態・描画geometryを保持しつつ、この節のpaletteへ変換した色を照合する。Linuxの固定HEXとpixel oracleは従来どおりとする。
+以下の既存節にあるWindows固定HEXのpixel oracleは`classic-dark`へ適用する。他の15 presetでは、同じ情報・状態・描画geometryを保持しつつ、この節のpaletteへ変換した色を照合する。Linuxの固定HEXとpixel oracleは従来どおりとする。
+
+### カラフルな追加6 preset
+
+追加presetの表示名（英語／日本語）はNeon Dark／ネオン ダーク、Lavender Light／ラベンダー ライト、Mint Light／ミント ライト、Forest Dark／フォレスト ダーク、Tangerine Dark／タンジェリン ダーク、Rose Dark／ローズ ダークとする。柔らかいパステル面には濃色の文字を使う。次表は既存19 roleキーの順（window、card、主要文字、補助文字、accent、Graph、grid、idle、quota未充填、ready背景、ready枠、ready強調、Threads親card、Threads枠、Threads接続線、動作中文字、popup、popup選択行、focus）のexact色を固定する。残り53キーは明色presetでlight列、暗色presetでgraphite-dark列を差分0で使い、状態とモデルの色の識別を保持する。
+
+| preset | 基準列 | 19 role色（上記順） |
+| --- | --- | --- |
+| `neon-dark` | `graphite-dark` | `#16122A` `#241C3B` `#F2ECFF` `#C4B8E2` `#70CBFF` `#1B1530` `#493B68` `#302448` `#37436A` `#163D33` `#4D8B70` `#8BDEB6` `#33264F` `#63517D` `#AF9AD0` `#FF929F` `#2C2144` `#493369` `#B19BFF` |
+| `lavender-light` | `light` | `#F2EAFB` `#FFFAFF` `#29233C` `#615570` `#7046AE` `#FFFAFF` `#D8CBE3` `#EBE0F4` `#DDD4EF` `#E3F3E9` `#5C9571` `#216C44` `#E7DDF5` `#BCAACE` `#78658F` `#AC2853` `#EFE7F8` `#DDD0EF` `#7046AE` |
+| `mint-light` | `light` | `#E8F7EE` `#F7FFFA` `#19382F` `#3F5F50` `#14765F` `#F7FFFA` `#C8DECF` `#DDEDE3` `#BEDCCD` `#D9F2E1` `#579772` `#207343` `#D7EDE0` `#A8C8B5` `#4D806C` `#AF2D4C` `#E8F6EC` `#C8E8D6` `#11735B` |
+| `forest-dark` | `graphite-dark` | `#11231B` `#1B3427` `#EDF8EA` `#ADC9B5` `#94DB75` `#14291E` `#355642` `#263F30` `#40623A` `#193E29` `#508264` `#8CDCAC` `#284833` `#526F5B` `#8BAF90` `#FF949B` `#203F2E` `#31533A` `#B5EA94` |
+| `tangerine-dark` | `graphite-dark` | `#29180F` `#3B261A` `#FFF3E5` `#DFC1A5` `#FFB46E` `#2C1D13` `#614533` `#453022` `#735035` `#213D28` `#567D59` `#A3D892` `#4D3424` `#876346` `#D3A37A` `#FF9A96` `#3D2B1D` `#68462C` `#FFCA86` |
+| `rose-dark` | `graphite-dark` | `#281523` `#3A2233` `#FCECF5` `#DAB9CD` `#F49DC7` `#2D1B29` `#604258` `#482D3F` `#704762` `#1D3D32` `#507E68` `#9CDBBC` `#4C2F44` `#835A75` `#CC94B5` `#FF969F` `#412838` `#67425B` `#FFBDDF` |
+
+追加6 presetでは主要・補助文字と状態文字は実際の面に対して4.5:1以上、Graphの各系列とfocus枠は3:1以上のsRGB輝度コントラストを保つ。gridとidle面は補助背景として扱い、系列色とは区別する。色の測定は画面表示・UIAの実Windows確認を代替しない。
 
 ## 1. UXの目的、利用者、主要タスク
 
