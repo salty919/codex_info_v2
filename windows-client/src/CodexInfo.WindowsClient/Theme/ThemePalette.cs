@@ -35,8 +35,8 @@ public static class ThemePalette
         NeonDark, LavenderLight, MintLight, ForestDark, TangerineDark, RoseDark,
     ];
 
-    // A one-to-one mapping keeps the existing dark appearance exact, including
-    // semantic status and model colors, while changing every direct consumer.
+    // The classic mapping preserves status and model colors. The documented
+    // parent-card correction improves running-text contrast.
     private static readonly IReadOnlyDictionary<string, (string Graphite, string Light)> Colors =
         new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase)
         {
@@ -58,7 +58,7 @@ public static class ThemePalette
             ["#1C5D91"] = ("#285A80", "#D7EAF7"),
             ["#1D2A38"] = ("#292D34", "#EDF1F5"),
             ["#236B9E"] = ("#2676A8", "#176AAB"),
-            ["#243E5A"] = ("#343E4B", "#DDEAF5"),
+            ["#243E5A"] = ("#303844", "#DDEAF5"),
             ["#24415E"] = ("#30485D", "#D7EAF7"),
             ["#244D74"] = ("#344D63", "#D9EBF8"),
             ["#263548"] = ("#3A444F", "#D5DFE9"),
@@ -134,13 +134,14 @@ public static class ThemePalette
             [PaperLight] = CreatePreset(true, 3, 1, -5,
                 ["#F7F6F2", "#FFFFFC", "#252B31", "#59636B", "#356C91", "#FFFFFC", "#D8E0E5", "#ECEFEB", "#B7CDD8", "#E6F3EB", "#5C9976", "#216543", "#E2EDF2", "#B7C7D0", "#708D9E", "#B23553", "#F1F4F1", "#DAE9EE", "#276A91"]),
             [SandLight] = CreatePreset(true, 10, 3, -22,
-                ["#FDF6E3", "#FFFBEF", "#334650", "#5D6B6F", "#1B748A", "#FFFBEF", "#C9D6D2", "#EBE4D2", "#B3C9C5", "#E3F0E2", "#6D9B72", "#2B714A", "#E1E9D9", "#BCCBBC", "#728D84", "#A83D48", "#F5EDDA", "#DCE8DB", "#126A7F"]),
+                ["#FDF6E3", "#FFFBEF", "#334650", "#566367", "#1B748A", "#FFFBEF", "#C9D6D2", "#EBE4D2", "#B3C9C5", "#E3F0E2", "#6D9B72", "#2B714A", "#E1E9D9", "#BCCBBC", "#728D84", "#A83D48", "#F5EDDA", "#DCE8DB", "#126A7F"]),
             [SteelLight] = CreatePreset(true, -3, -1, 3,
                 ["#F3F5F8", "#FFFFFF", "#202B38", "#586978", "#275FA8", "#FFFFFF", "#D5DEE9", "#E8EEF5", "#A9C4E1", "#E5F2EA", "#6EAA83", "#1E7047", "#DDE9F6", "#BACBDD", "#728BA9", "#B42F49", "#EDF2F8", "#D7E5F7", "#275FA8"]),
             [OceanDark] = CreatePreset(false, -8, 0, 14,
                 ["#10182A", "#18263D", "#EAF3FF", "#ACBED3", "#56B8F2", "#111D33", "#304968", "#1E304B", "#3D668B", "#16372F", "#3A8266", "#72CDA3", "#213958", "#45617F", "#82A9C5", "#F28B9B", "#192B45", "#284B70", "#7CD2FF"]),
             [TealDark] = CreatePreset(false, -22, 14, 13,
-                ["#002B36", "#073642", "#E6F0E9", "#A8C0BC", "#4FB3C3", "#073642", "#3C6570", "#174550", "#3C7583", "#124B40", "#47866A", "#79CAA3", "#174956", "#3D6C75", "#76AEB3", "#F47D88", "#0B3D49", "#1E5B67", "#74D2DB"]),
+                ["#002B36", "#073642", "#E6F0E9", "#A8C0BC", "#4FB3C3", "#073642", "#3C6570", "#174550", "#3C7583", "#124B40", "#47866A", "#79CAA3", "#123A46", "#3D6C75", "#76AEB3", "#F47D88", "#0B3D49", "#1E5B67", "#74D2DB"],
+                new Dictionary<string, string> { ["#236B9E"] = "#0D759F" }),
             [EmberDark] = CreatePreset(false, 11, 5, -6,
                 ["#202126", "#2B2D32", "#F4F0E9", "#BCBDB7", "#E7BC62", "#26272C", "#505258", "#35373D", "#77725F", "#244437", "#5D9974", "#9FDC9E", "#3D3D47", "#686973", "#A5A3A0", "#F58A94", "#303238", "#555147", "#F2CB78"]),
             [InkDark] = CreatePreset(false, 0, 0, 0,
@@ -160,10 +161,23 @@ public static class ThemePalette
         };
 
     private static AdditionalPreset CreatePreset(
-        bool usesLightBase, int redDelta, int greenDelta, int blueDelta, string[] roleColors) =>
-        new(usesLightBase, redDelta, greenDelta, blueDelta,
-            RoleKeys.Select((key, index) => (key, value: roleColors[index]))
-                .ToDictionary(pair => pair.key, pair => pair.value, StringComparer.OrdinalIgnoreCase));
+        bool usesLightBase, int redDelta, int greenDelta, int blueDelta, string[] roleColors,
+        IReadOnlyDictionary<string, string>? additionalOverrides = null)
+    {
+        var overrides = RoleKeys.Select((key, index) => (key, value: roleColors[index]))
+            .ToDictionary(pair => pair.key, pair => pair.value, StringComparer.OrdinalIgnoreCase);
+        if (additionalOverrides is not null)
+        {
+            foreach (var (key, value) in additionalOverrides) overrides[key] = value;
+        }
+        return new(usesLightBase, redDelta, greenDelta, blueDelta, overrides);
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> ClassicOverrides =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["#243E5A"] = "#1A2C40",
+        };
 
     private static IReadOnlyDictionary<string, IBrush> brushes = CreateBrushes(ClassicDark);
     public static string CurrentId { get; private set; } = ClassicDark;
@@ -181,7 +195,8 @@ public static class ThemePalette
         {
             throw new ArgumentOutOfRangeException(nameof(classicColor), classicColor, "Unregistered theme color.");
         }
-        if (id == ClassicDark) return classicColor;
+        if (id == ClassicDark) return ClassicOverrides.TryGetValue(classicColor, out var corrected)
+            ? corrected : classicColor;
         if (id == GraphiteDark) return alternatives.Graphite;
         if (id == Light) return alternatives.Light;
         if (!AdditionalPresets.TryGetValue(id, out var preset))

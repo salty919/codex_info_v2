@@ -2993,14 +2993,14 @@ $script:e2eThemeColors = @{
         Window = '#0E141E'; Card = '#151F2D'; Primary = '#E9EFF8'; Secondary = '#A8B7CA'; Accent = '#56B2F5'
         Plot = '#121C2C'; Grid = '#263850'; Idle = '#1A2838'; QuotaEmpty = '#326799'; QuotaFilled = '#56B2F5'
         ReadyBackground = '#143426'; ReadyBorder = '#276C49'; ReadyAccent = '#4FB878'
-        ParentCard = '#243E5A'; ChildCard = '#151F2D'; ThreadBorder = '#2B425B'; ThreadRail = '#76A7CC'; Running = '#EF6A6A'
+        ParentCard = '#1A2C40'; ChildCard = '#151F2D'; ThreadBorder = '#2B425B'; ThreadRail = '#76A7CC'; Running = '#EF6A6A'
         Remaining = '#56B2F5'; Popup = '#111B2C'; PopupSelected = '#244D74'; Focus = '#8BD4FF'
     }
     'graphite-dark' = @{
         Window = '#181A1F'; Card = '#242830'; Primary = '#F1F3F5'; Secondary = '#B5BEC9'; Accent = '#69B5F7'
         Plot = '#20242B'; Grid = '#3C4652'; Idle = '#303944'; QuotaEmpty = '#4A6B89'; QuotaFilled = '#69B5F7'
         ReadyBackground = '#18362A'; ReadyBorder = '#327653'; ReadyAccent = '#5CC88A'
-        ParentCard = '#343E4B'; ChildCard = '#242830'; ThreadBorder = '#4B5A6B'; ThreadRail = '#8CACBF'; Running = '#EF8585'
+        ParentCard = '#303844'; ChildCard = '#242830'; ThreadBorder = '#4B5A6B'; ThreadRail = '#8CACBF'; Running = '#EF8585'
         Remaining = '#69B5F7'; Popup = '#222730'; PopupSelected = '#344D63'; Focus = '#9AD7F8'
     }
     'light' = @{
@@ -3018,7 +3018,7 @@ $script:e2eThemeColors = @{
         Remaining = '#356C91'; Popup = '#F1F4F1'; PopupSelected = '#DAE9EE'; Focus = '#276A91'
     }
     'sand-light' = @{
-        Window = '#FDF6E3'; Card = '#FFFBEF'; Primary = '#334650'; Secondary = '#5D6B6F'; Accent = '#1B748A'
+        Window = '#FDF6E3'; Card = '#FFFBEF'; Primary = '#334650'; Secondary = '#566367'; Accent = '#1B748A'
         Plot = '#FFFBEF'; Grid = '#C9D6D2'; Idle = '#EBE4D2'; QuotaEmpty = '#B3C9C5'; QuotaFilled = '#1B748A'
         ReadyBackground = '#E3F0E2'; ReadyBorder = '#6D9B72'; ReadyAccent = '#2B714A'
         ParentCard = '#E1E9D9'; ChildCard = '#FFFBEF'; ThreadBorder = '#BCCBBC'; ThreadRail = '#728D84'; Running = '#A83D48'
@@ -3042,7 +3042,7 @@ $script:e2eThemeColors = @{
         Window = '#002B36'; Card = '#073642'; Primary = '#E6F0E9'; Secondary = '#A8C0BC'; Accent = '#4FB3C3'
         Plot = '#073642'; Grid = '#3C6570'; Idle = '#174550'; QuotaEmpty = '#3C7583'; QuotaFilled = '#4FB3C3'
         ReadyBackground = '#124B40'; ReadyBorder = '#47866A'; ReadyAccent = '#79CAA3'
-        ParentCard = '#174956'; ChildCard = '#073642'; ThreadBorder = '#3D6C75'; ThreadRail = '#76AEB3'; Running = '#F47D88'
+        ParentCard = '#123A46'; ChildCard = '#073642'; ThreadBorder = '#3D6C75'; ThreadRail = '#76AEB3'; Running = '#F47D88'
         Remaining = '#4FB3C3'; Popup = '#0B3D49'; PopupSelected = '#1E5B67'; Focus = '#74D2DB'
     }
     'ember-dark' = @{

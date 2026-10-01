@@ -125,6 +125,7 @@ public sealed class Issue422ThemeTests
 
             ThemePalette.Apply("classic-dark");
             Assert.Equal("#0E141E", ThemePalette.Resolve("#0E141E"));
+            Assert.Equal("#1A2C40", ThemePalette.Resolve("#243E5A"));
             ThemePalette.Apply("graphite-dark");
             Assert.Equal("#181A1F", ThemePalette.Resolve("#0E141E"));
             ThemePalette.Apply("light");
@@ -308,6 +309,26 @@ public sealed class Issue422ThemeTests
         }
     }
 
+    [Theory]
+    [InlineData("classic-dark", "#EF6A6A", "#243E5A")]
+    [InlineData("graphite-dark", "#EF6A6A", "#243E5A")]
+    [InlineData("sand-light", "#A8B7CA", "#243E5A")]
+    [InlineData("teal-dark", "#EF6A6A", "#243E5A")]
+    [InlineData("teal-dark", "#F5FAFF", "#236B9E")]
+    public void ExistingThemeTextContrastRegressions(string id, string foreground, string background)
+    {
+        var original = ThemePalette.CurrentId;
+        try
+        {
+            ThemePalette.Apply(id);
+            AssertContrast(id, foreground, background, 4.5);
+        }
+        finally
+        {
+            ThemePalette.Apply(original);
+        }
+    }
+
     private static void AssertContrast(string id, string foreground, string background, double minimum)
     {
         static double Luminance(string hex)
@@ -349,6 +370,7 @@ public sealed class Issue422ThemeTests
 
     private static string TransformColor(ThemeFixture theme, ClassicColor color)
     {
+        if (theme.Id == "teal-dark" && color.Classic == "#236B9E") return "#0D759F";
         if (theme.Id == "ink-dark")
         {
             var channels = ParseChannels(color.Graphite)
@@ -431,7 +453,7 @@ public sealed class Issue422ThemeTests
         new("#1C5D91", "#285A80", "#D7EAF7"),
         new("#1D2A38", "#292D34", "#EDF1F5"),
         new("#236B9E", "#2676A8", "#176AAB"),
-        new("#243E5A", "#343E4B", "#DDEAF5"),
+        new("#243E5A", "#303844", "#DDEAF5"),
         new("#24415E", "#30485D", "#D7EAF7"),
         new("#244D74", "#344D63", "#D9EBF8"),
         new("#263548", "#3A444F", "#D5DFE9"),
@@ -493,13 +515,13 @@ public sealed class Issue422ThemeTests
         new("paper-light", true, 3, 1, -5,
             ["#F7F6F2", "#FFFFFC", "#252B31", "#59636B", "#356C91", "#FFFFFC", "#D8E0E5", "#ECEFEB", "#B7CDD8", "#E6F3EB", "#5C9976", "#216543", "#E2EDF2", "#B7C7D0", "#708D9E", "#B23553", "#F1F4F1", "#DAE9EE", "#276A91"]),
         new("sand-light", true, 10, 3, -22,
-            ["#FDF6E3", "#FFFBEF", "#334650", "#5D6B6F", "#1B748A", "#FFFBEF", "#C9D6D2", "#EBE4D2", "#B3C9C5", "#E3F0E2", "#6D9B72", "#2B714A", "#E1E9D9", "#BCCBBC", "#728D84", "#A83D48", "#F5EDDA", "#DCE8DB", "#126A7F"]),
+            ["#FDF6E3", "#FFFBEF", "#334650", "#566367", "#1B748A", "#FFFBEF", "#C9D6D2", "#EBE4D2", "#B3C9C5", "#E3F0E2", "#6D9B72", "#2B714A", "#E1E9D9", "#BCCBBC", "#728D84", "#A83D48", "#F5EDDA", "#DCE8DB", "#126A7F"]),
         new("steel-light", true, -3, -1, 3,
             ["#F3F5F8", "#FFFFFF", "#202B38", "#586978", "#275FA8", "#FFFFFF", "#D5DEE9", "#E8EEF5", "#A9C4E1", "#E5F2EA", "#6EAA83", "#1E7047", "#DDE9F6", "#BACBDD", "#728BA9", "#B42F49", "#EDF2F8", "#D7E5F7", "#275FA8"]),
         new("ocean-dark", false, -8, 0, 14,
             ["#10182A", "#18263D", "#EAF3FF", "#ACBED3", "#56B8F2", "#111D33", "#304968", "#1E304B", "#3D668B", "#16372F", "#3A8266", "#72CDA3", "#213958", "#45617F", "#82A9C5", "#F28B9B", "#192B45", "#284B70", "#7CD2FF"]),
         new("teal-dark", false, -22, 14, 13,
-            ["#002B36", "#073642", "#E6F0E9", "#A8C0BC", "#4FB3C3", "#073642", "#3C6570", "#174550", "#3C7583", "#124B40", "#47866A", "#79CAA3", "#174956", "#3D6C75", "#76AEB3", "#F47D88", "#0B3D49", "#1E5B67", "#74D2DB"]),
+            ["#002B36", "#073642", "#E6F0E9", "#A8C0BC", "#4FB3C3", "#073642", "#3C6570", "#174550", "#3C7583", "#124B40", "#47866A", "#79CAA3", "#123A46", "#3D6C75", "#76AEB3", "#F47D88", "#0B3D49", "#1E5B67", "#74D2DB"]),
         new("ember-dark", false, 11, 5, -6,
             ["#202126", "#2B2D32", "#F4F0E9", "#BCBDB7", "#E7BC62", "#26272C", "#505258", "#35373D", "#77725F", "#244437", "#5D9974", "#9FDC9E", "#3D3D47", "#686973", "#A5A3A0", "#F58A94", "#303238", "#555147", "#F2CB78"]),
         new("ink-dark", false, 0, 0, 0,
