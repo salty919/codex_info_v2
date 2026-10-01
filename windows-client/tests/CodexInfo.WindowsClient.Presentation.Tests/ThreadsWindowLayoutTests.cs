@@ -229,13 +229,13 @@ public sealed class ThreadsWindowLayoutTests
             {
                 Assert.Equal("a", item.Id);
                 Assert.True(item.IsParent);
-                Assert.Equal("#243E5A", item.CardBackgroundHex);
+                Assert.Equal("#1A2C40", item.CardBackgroundHex);
             },
             item =>
             {
                 Assert.Equal("b", item.Id);
                 Assert.True(item.IsParent);
-                Assert.Equal("#243E5A", item.CardBackgroundHex);
+                Assert.Equal("#1A2C40", item.CardBackgroundHex);
             },
             item =>
             {

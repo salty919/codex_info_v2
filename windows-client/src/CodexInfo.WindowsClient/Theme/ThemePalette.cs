@@ -21,14 +21,22 @@ public static class ThemePalette
     public const string EmberDark = "ember-dark";
     public const string InkDark = "ink-dark";
 
+    public const string NeonDark = "neon-dark";
+    public const string LavenderLight = "lavender-light";
+    public const string MintLight = "mint-light";
+    public const string ForestDark = "forest-dark";
+    public const string TangerineDark = "tangerine-dark";
+    public const string RoseDark = "rose-dark";
+
     public static IReadOnlyList<string> PresetIds { get; } =
     [
         ClassicDark, GraphiteDark, Light, PaperLight, SandLight, SteelLight,
         OceanDark, TealDark, EmberDark, InkDark,
+        NeonDark, LavenderLight, MintLight, ForestDark, TangerineDark, RoseDark,
     ];
 
-    // A one-to-one mapping keeps the existing dark appearance exact, including
-    // semantic status and model colors, while changing every direct consumer.
+    // The classic mapping preserves status and model colors. The documented
+    // parent-card correction improves running-text contrast.
     private static readonly IReadOnlyDictionary<string, (string Graphite, string Light)> Colors =
         new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase)
         {
@@ -50,7 +58,7 @@ public static class ThemePalette
             ["#1C5D91"] = ("#285A80", "#D7EAF7"),
             ["#1D2A38"] = ("#292D34", "#EDF1F5"),
             ["#236B9E"] = ("#2676A8", "#176AAB"),
-            ["#243E5A"] = ("#343E4B", "#DDEAF5"),
+            ["#243E5A"] = ("#303844", "#DDEAF5"),
             ["#24415E"] = ("#30485D", "#D7EAF7"),
             ["#244D74"] = ("#344D63", "#D9EBF8"),
             ["#263548"] = ("#3A444F", "#D5DFE9"),
@@ -126,31 +134,58 @@ public static class ThemePalette
             [PaperLight] = CreatePreset(true, 3, 1, -5,
                 ["#F7F6F2", "#FFFFFC", "#252B31", "#59636B", "#356C91", "#FFFFFC", "#D8E0E5", "#ECEFEB", "#B7CDD8", "#E6F3EB", "#5C9976", "#216543", "#E2EDF2", "#B7C7D0", "#708D9E", "#B23553", "#F1F4F1", "#DAE9EE", "#276A91"]),
             [SandLight] = CreatePreset(true, 10, 3, -22,
-                ["#FDF6E3", "#FFFBEF", "#334650", "#5D6B6F", "#1B748A", "#FFFBEF", "#C9D6D2", "#EBE4D2", "#B3C9C5", "#E3F0E2", "#6D9B72", "#2B714A", "#E1E9D9", "#BCCBBC", "#728D84", "#A83D48", "#F5EDDA", "#DCE8DB", "#126A7F"]),
+                ["#FDF6E3", "#FFFBEF", "#334650", "#566367", "#1B748A", "#FFFBEF", "#C9D6D2", "#EBE4D2", "#B3C9C5", "#E3F0E2", "#6D9B72", "#2B714A", "#E1E9D9", "#BCCBBC", "#728D84", "#A83D48", "#F5EDDA", "#DCE8DB", "#126A7F"]),
             [SteelLight] = CreatePreset(true, -3, -1, 3,
                 ["#F3F5F8", "#FFFFFF", "#202B38", "#586978", "#275FA8", "#FFFFFF", "#D5DEE9", "#E8EEF5", "#A9C4E1", "#E5F2EA", "#6EAA83", "#1E7047", "#DDE9F6", "#BACBDD", "#728BA9", "#B42F49", "#EDF2F8", "#D7E5F7", "#275FA8"]),
             [OceanDark] = CreatePreset(false, -8, 0, 14,
                 ["#10182A", "#18263D", "#EAF3FF", "#ACBED3", "#56B8F2", "#111D33", "#304968", "#1E304B", "#3D668B", "#16372F", "#3A8266", "#72CDA3", "#213958", "#45617F", "#82A9C5", "#F28B9B", "#192B45", "#284B70", "#7CD2FF"]),
             [TealDark] = CreatePreset(false, -22, 14, 13,
-                ["#002B36", "#073642", "#E6F0E9", "#A8C0BC", "#4FB3C3", "#073642", "#3C6570", "#174550", "#3C7583", "#124B40", "#47866A", "#79CAA3", "#174956", "#3D6C75", "#76AEB3", "#F47D88", "#0B3D49", "#1E5B67", "#74D2DB"]),
+                ["#002B36", "#073642", "#E6F0E9", "#A8C0BC", "#4FB3C3", "#073642", "#3C6570", "#174550", "#3C7583", "#124B40", "#47866A", "#79CAA3", "#123A46", "#3D6C75", "#76AEB3", "#F47D88", "#0B3D49", "#1E5B67", "#74D2DB"],
+                new Dictionary<string, string> { ["#236B9E"] = "#0D759F" }),
             [EmberDark] = CreatePreset(false, 11, 5, -6,
                 ["#202126", "#2B2D32", "#F4F0E9", "#BCBDB7", "#E7BC62", "#26272C", "#505258", "#35373D", "#77725F", "#244437", "#5D9974", "#9FDC9E", "#3D3D47", "#686973", "#A5A3A0", "#F58A94", "#303238", "#555147", "#F2CB78"]),
             [InkDark] = CreatePreset(false, 0, 0, 0,
                 ["#000000", "#121212", "#FFFFFF", "#D8D8D8", "#6DD3FF", "#050505", "#787878", "#242424", "#808080", "#002B17", "#78E8A4", "#78E8A4", "#202A34", "#FFFFFF", "#FFFFFF", "#FF8BA1", "#101010", "#174A66", "#FFFFFF"]),
+            [NeonDark] = CreatePreset(false, 0, 0, 0,
+                ["#16122A", "#241C3B", "#F2ECFF", "#C4B8E2", "#70CBFF", "#1B1530", "#493B68", "#302448", "#37436A", "#163D33", "#4D8B70", "#8BDEB6", "#33264F", "#63517D", "#AF9AD0", "#FF929F", "#2C2144", "#493369", "#B19BFF"]),
+            [LavenderLight] = CreatePreset(true, 0, 0, 0,
+                ["#F2EAFB", "#FFFAFF", "#29233C", "#615570", "#7046AE", "#FFFAFF", "#D8CBE3", "#EBE0F4", "#DDD4EF", "#E3F3E9", "#5C9571", "#216C44", "#E7DDF5", "#BCAACE", "#78658F", "#AC2853", "#EFE7F8", "#DDD0EF", "#7046AE"]),
+            [MintLight] = CreatePreset(true, 0, 0, 0,
+                ["#E8F7EE", "#F7FFFA", "#19382F", "#3F5F50", "#14765F", "#F7FFFA", "#C8DECF", "#DDEDE3", "#BEDCCD", "#D9F2E1", "#579772", "#207343", "#D7EDE0", "#A8C8B5", "#4D806C", "#AF2D4C", "#E8F6EC", "#C8E8D6", "#11735B"]),
+            [ForestDark] = CreatePreset(false, 0, 0, 0,
+                ["#11231B", "#1B3427", "#EDF8EA", "#ADC9B5", "#94DB75", "#14291E", "#355642", "#263F30", "#40623A", "#193E29", "#508264", "#8CDCAC", "#284833", "#526F5B", "#8BAF90", "#FF949B", "#203F2E", "#31533A", "#B5EA94"]),
+            [TangerineDark] = CreatePreset(false, 0, 0, 0,
+                ["#29180F", "#3B261A", "#FFF3E5", "#DFC1A5", "#FFB46E", "#2C1D13", "#614533", "#453022", "#735035", "#213D28", "#567D59", "#A3D892", "#4D3424", "#876346", "#D3A37A", "#FF9A96", "#3D2B1D", "#68462C", "#FFCA86"]),
+            [RoseDark] = CreatePreset(false, 0, 0, 0,
+                ["#281523", "#3A2233", "#FCECF5", "#DAB9CD", "#F49DC7", "#2D1B29", "#604258", "#482D3F", "#704762", "#1D3D32", "#507E68", "#9CDBBC", "#4C2F44", "#835A75", "#CC94B5", "#FF969F", "#412838", "#67425B", "#FFBDDF"]),
         };
 
     private static AdditionalPreset CreatePreset(
-        bool usesLightBase, int redDelta, int greenDelta, int blueDelta, string[] roleColors) =>
-        new(usesLightBase, redDelta, greenDelta, blueDelta,
-            RoleKeys.Select((key, index) => (key, value: roleColors[index]))
-                .ToDictionary(pair => pair.key, pair => pair.value, StringComparer.OrdinalIgnoreCase));
+        bool usesLightBase, int redDelta, int greenDelta, int blueDelta, string[] roleColors,
+        IReadOnlyDictionary<string, string>? additionalOverrides = null)
+    {
+        var overrides = RoleKeys.Select((key, index) => (key, value: roleColors[index]))
+            .ToDictionary(pair => pair.key, pair => pair.value, StringComparer.OrdinalIgnoreCase);
+        if (additionalOverrides is not null)
+        {
+            foreach (var (key, value) in additionalOverrides) overrides[key] = value;
+        }
+        return new(usesLightBase, redDelta, greenDelta, blueDelta, overrides);
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> ClassicOverrides =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["#243E5A"] = "#1A2C40",
+        };
 
     private static IReadOnlyDictionary<string, IBrush> brushes = CreateBrushes(ClassicDark);
     public static string CurrentId { get; private set; } = ClassicDark;
     public static event EventHandler? Changed;
 
     public static bool IsValid(string? id) => id is ClassicDark or GraphiteDark or Light
-        or PaperLight or SandLight or SteelLight or OceanDark or TealDark or EmberDark or InkDark;
+        or PaperLight or SandLight or SteelLight or OceanDark or TealDark or EmberDark or InkDark
+        or NeonDark or LavenderLight or MintLight or ForestDark or TangerineDark or RoseDark;
 
     public static string Resolve(string classicColor) => ResolveFor(CurrentId, classicColor);
 
@@ -160,7 +195,8 @@ public static class ThemePalette
         {
             throw new ArgumentOutOfRangeException(nameof(classicColor), classicColor, "Unregistered theme color.");
         }
-        if (id == ClassicDark) return classicColor;
+        if (id == ClassicDark) return ClassicOverrides.TryGetValue(classicColor, out var corrected)
+            ? corrected : classicColor;
         if (id == GraphiteDark) return alternatives.Graphite;
         if (id == Light) return alternatives.Light;
         if (!AdditionalPresets.TryGetValue(id, out var preset))
@@ -203,7 +239,7 @@ public static class ThemePalette
         CurrentId = id;
         if (Application.Current is { } app)
         {
-            app.RequestedThemeVariant = id is Light or PaperLight or SandLight or SteelLight
+            app.RequestedThemeVariant = id is Light or PaperLight or SandLight or SteelLight or LavenderLight or MintLight
                 ? ThemeVariant.Light
                 : ThemeVariant.Dark;
             foreach (var (classic, brush) in brushes)
