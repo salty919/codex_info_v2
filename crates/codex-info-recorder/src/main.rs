@@ -14,6 +14,7 @@ use codex_info_recorder::{
     QuotaPollEvent, QuotaPoller, Recorder, RecorderConfig, RecorderError, RecorderStateWriter,
     ThreadPoller, DEFAULT_CHUNK_BYTES, DEFAULT_INTERVAL_SECS,
 };
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -49,6 +50,80 @@ enum CyclePublication {
     Degraded,
 }
 
+const ACTIVE_THREAD_INTERVAL: Duration = Duration::from_secs(5);
+const ACTIVE_THREAD_STABLE_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct AdaptiveThreadCadence {
+    epoch: Option<AccountEpochProof>,
+    totals: BTreeMap<String, Option<u64>>,
+    last_delta: Option<Instant>,
+    next_probe: Option<Instant>,
+    in_flight: bool,
+}
+
+impl AdaptiveThreadCadence {
+    // Only the complete, epoch-validated snapshot committed to the recorder
+    // reaches this method. Unknown totals establish a fresh comparison
+    // baseline; they neither mean zero nor prove unchanged usage.
+    fn accept(&mut self, epoch: &AccountEpochProof, snapshot: &ActiveThreadSnapshot, now: Instant) {
+        self.in_flight = false;
+        let totals: BTreeMap<_, _> = snapshot
+            .threads
+            .iter()
+            .map(|thread| (thread.id.clone(), thread.total_tokens))
+            .collect();
+        if self.epoch.as_ref() != Some(epoch) {
+            self.last_delta = None;
+            self.next_probe = None;
+        } else {
+            let changed = totals.iter().any(|(id, current)| {
+                matches!((self.totals.get(id), current), (Some(Some(previous)), Some(current)) if previous != current)
+            });
+            if changed {
+                if self.last_delta.is_none() {
+                    self.next_probe = Some(now + ACTIVE_THREAD_INTERVAL);
+                }
+                self.last_delta = Some(now);
+            } else if self.last_delta.is_some_and(|last_delta| {
+                now.saturating_duration_since(last_delta) >= ACTIVE_THREAD_STABLE_WINDOW
+            }) && self.totals == totals
+                && (totals.is_empty() || totals.values().any(Option::is_some))
+            {
+                self.last_delta = None;
+                self.next_probe = None;
+            }
+        }
+        self.epoch = Some(epoch.clone());
+        self.totals = totals;
+    }
+
+    fn failed(&mut self) {
+        self.in_flight = false;
+    }
+
+    fn submit<Submit>(
+        &mut self,
+        now: Instant,
+        checkpoints: &[SessionCheckpoint],
+        submit: &mut Submit,
+    ) -> bool
+    where
+        Submit: FnMut(&[SessionCheckpoint]) -> bool,
+    {
+        if self.in_flight || self.next_probe.is_some_and(|deadline| now < deadline) {
+            return false;
+        }
+        // Advance from this attempt instead of catching up missed slots. A
+        // slow worker is allowed to finish before another probe starts.
+        if self.last_delta.is_some() {
+            self.next_probe = Some(now + ACTIVE_THREAD_INTERVAL);
+        }
+        self.in_flight = submit(checkpoints);
+        self.in_flight
+    }
+}
+
 fn desired_acquisition_degraded(quota: LaneHealth, threads: LaneHealth) -> Option<bool> {
     if quota == LaneHealth::Failed || threads == LaneHealth::Failed {
         Some(true)
@@ -70,17 +145,21 @@ fn sync_acquisition_health(recorder: &mut Recorder, quota: LaneHealth, threads: 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_thread_poll_result<EpochCheck>(
     result: ActiveThreadPollResult,
     cycle_epoch: &AccountEpochProof,
     recorder: &mut Recorder,
     quota_health: LaneHealth,
     thread_health: &mut LaneHealth,
+    cadence: &mut AdaptiveThreadCadence,
+    now: Instant,
     epoch_matches: EpochCheck,
 ) -> Result<bool, Box<dyn std::error::Error>>
 where
     EpochCheck: FnMut(&AccountEpochProof) -> bool,
 {
+    cadence.failed();
     let mut epoch_matches = epoch_matches;
     if !epoch_matches(cycle_epoch) {
         return Err(RecorderError::AccountBoundaryChanged.into());
@@ -125,6 +204,7 @@ where
                     return Err(RecorderError::AccountBoundaryChanged.into());
                 }
                 *thread_health = LaneHealth::Ready;
+                cadence.accept(&epoch, &snapshot, now);
                 eprintln!(
                     "codex-info-recorder active-thread snapshot rows={} observed_at={} generation={generation}",
                     snapshot.threads.len(),
@@ -211,6 +291,7 @@ fn complete_cycle_publication_and_wait<Submit, Drain, WaitFor, Sleep, Clock, Epo
     quota_health: LaneHealth,
     thread_health: &mut LaneHealth,
     schedule: &mut FixedRateSchedule,
+    cadence: &mut AdaptiveThreadCadence,
     submit: &mut Submit,
     drain: &mut Drain,
     wait_for: &mut WaitFor,
@@ -227,7 +308,7 @@ where
     EpochCheck: FnMut(&AccountEpochProof) -> bool,
 {
     if let Ok(state) = recorder.state() {
-        let _ = submit(&state.checkpoints);
+        let _ = cadence.submit(clock(), &state.checkpoints, submit);
     }
     if let Some(result) = drain().into_iter().last() {
         commit_thread_poll_result(
@@ -236,6 +317,8 @@ where
             recorder,
             quota_health,
             thread_health,
+            cadence,
+            clock(),
             &mut *epoch_matches,
         )?;
     }
@@ -264,29 +347,65 @@ where
     }
     if !wait.sleep_for.is_zero() {
         let deadline = clock() + wait.sleep_for;
-        if let Some(result) = wait_for(wait.sleep_for) {
-            let committed = commit_thread_poll_result(
-                result,
-                cycle_epoch,
-                recorder,
-                quota_health,
-                thread_health,
-                &mut *epoch_matches,
-            )?;
-            if committed {
-                acknowledge_cycle_publication(
-                    publication,
+        loop {
+            let now = clock();
+            if now >= deadline {
+                break;
+            }
+            // Thread deadlines are independent of the Session schedule. A
+            // busy worker keeps its single outstanding request even when a
+            // five-second slot or the next Session boundary passes.
+            if !cadence.in_flight && cadence.next_probe.is_some_and(|due| now >= due) {
+                if !epoch_matches(cycle_epoch) {
+                    return Err(RecorderError::AccountBoundaryChanged.into());
+                }
+                if let Ok(state) = recorder.state() {
+                    let _ = cadence.submit(now, &state.checkpoints, submit);
+                } else {
+                    cadence.next_probe = Some(now + ACTIVE_THREAD_INTERVAL);
+                }
+            }
+            let wake_at = if cadence.in_flight {
+                deadline
+            } else {
+                cadence.next_probe.map_or(deadline, |due| due.min(deadline))
+            };
+            let timeout = wake_at.saturating_duration_since(clock());
+            if !cadence.in_flight {
+                if !timeout.is_zero() {
+                    sleep(timeout);
+                }
+                continue;
+            }
+            if let Some(result) = wait_for(timeout) {
+                let committed = commit_thread_poll_result(
+                    result,
                     cycle_epoch,
                     recorder,
-                    state_writer,
                     quota_health,
+                    thread_health,
+                    cadence,
+                    clock(),
                     &mut *epoch_matches,
                 )?;
+                if committed {
+                    acknowledge_cycle_publication(
+                        publication,
+                        cycle_epoch,
+                        recorder,
+                        state_writer,
+                        quota_health,
+                        &mut *epoch_matches,
+                    )?;
+                }
+            } else {
+                // A timeout never means an unchanged or completed probe. A
+                // disconnected worker also must not cause a busy wait.
+                let remaining = wake_at.saturating_duration_since(clock());
+                if !remaining.is_zero() {
+                    sleep(remaining);
+                }
             }
-        }
-        let remaining = deadline.saturating_duration_since(clock());
-        if !remaining.is_zero() {
-            sleep(remaining);
         }
     }
     Ok(true)
@@ -425,6 +544,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut quota_poller = QuotaPoller::start_with_interval(options.interval_secs);
     let thread_poller = ThreadPoller::start(options.sessions_root.clone());
     let mut schedule = FixedRateSchedule::new(Duration::from_secs(options.interval_secs));
+    let mut thread_cadence = AdaptiveThreadCadence::default();
     let mut quota_health = LaneHealth::Unknown;
     let mut thread_health = LaneHealth::Unknown;
     loop {
@@ -541,6 +661,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             quota_health,
             &mut thread_health,
             &mut schedule,
+            &mut thread_cadence,
             &mut submit,
             &mut drain,
             &mut wait_for,
@@ -941,6 +1062,303 @@ mod tests {
         }
     }
 
+    fn adaptive_thread_snapshot(total_tokens: Option<u64>) -> ActiveThreadSnapshot {
+        let mut snapshot = issue_362_snapshot("adaptive", 1);
+        snapshot.threads[0].total_tokens = total_tokens;
+        snapshot
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_baseline_does_not_activate() {
+        let fixture = issue_362_fixture("adaptive-baseline");
+        let mut cadence = AdaptiveThreadCadence::default();
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(10)),
+            Instant::now(),
+        );
+        assert_eq!(cadence.last_delta, None);
+        assert_eq!(cadence.next_probe, None);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_increase_and_decrease_activate_five_seconds() {
+        let fixture = issue_362_fixture("adaptive-delta");
+        let anchor = Instant::now();
+        for next in [11, 9] {
+            let mut cadence = AdaptiveThreadCadence::default();
+            cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(10)), anchor);
+            cadence.accept(
+                &fixture.epoch,
+                &adaptive_thread_snapshot(Some(next)),
+                anchor + Duration::from_secs(60),
+            );
+            assert_eq!(cadence.last_delta, Some(anchor + Duration::from_secs(60)));
+            assert_eq!(cadence.next_probe, Some(anchor + Duration::from_secs(65)));
+        }
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_null_is_unknown_and_zero_is_known() {
+        let fixture = issue_362_fixture("adaptive-null");
+        let anchor = Instant::now();
+        let mut cadence = AdaptiveThreadCadence::default();
+        for (at, value) in [(0, None), (60, Some(0)), (120, None), (180, Some(0))] {
+            cadence.accept(
+                &fixture.epoch,
+                &adaptive_thread_snapshot(value),
+                anchor + Duration::from_secs(at),
+            );
+            assert_eq!(cadence.last_delta, None);
+        }
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(1)),
+            anchor + Duration::from_secs(240),
+        );
+        assert_eq!(cadence.last_delta, Some(anchor + Duration::from_secs(240)));
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_new_thread_and_restart_establish_baselines() {
+        let fixture = issue_362_fixture("adaptive-identity");
+        let anchor = Instant::now();
+        let mut cadence = AdaptiveThreadCadence::default();
+        cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(10)), anchor);
+        let mut replacement = adaptive_thread_snapshot(Some(20));
+        replacement.threads[0].id = "replacement-thread".to_owned();
+        cadence.accept(
+            &fixture.epoch,
+            &replacement,
+            anchor + Duration::from_secs(60),
+        );
+        assert_eq!(cadence.last_delta, None);
+        replacement.threads[0].total_tokens = Some(21);
+        cadence.accept(
+            &fixture.epoch,
+            &replacement,
+            anchor + Duration::from_secs(120),
+        );
+        assert!(cadence.last_delta.is_some());
+        let mut restarted = AdaptiveThreadCadence::default();
+        restarted.accept(
+            &fixture.epoch,
+            &replacement,
+            anchor + Duration::from_secs(120),
+        );
+        assert_eq!(restarted.last_delta, None);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_account_epoch_change_resets_activity() {
+        let fixture = issue_362_fixture("adaptive-epoch");
+        let anchor = Instant::now();
+        let mut cadence = AdaptiveThreadCadence::default();
+        cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(10)), anchor);
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(11)),
+            anchor + Duration::from_secs(60),
+        );
+        assert!(cadence.last_delta.is_some());
+        fs::write(
+            fixture.options.codex_home.join("auth.json"),
+            br#"{"tokens":{"account_id":"adaptive-other-account","access_token":"secret"}}"#,
+        )
+        .expect("new test account authority");
+        let next_epoch =
+            AccountEpochProof::capture(&fixture.options.codex_home).expect("new account epoch");
+        assert_ne!(next_epoch, fixture.epoch);
+        cadence.accept(
+            &next_epoch,
+            &adaptive_thread_snapshot(Some(12)),
+            anchor + Duration::from_secs(65),
+        );
+        assert_eq!(cadence.last_delta, None);
+        assert_eq!(cadence.next_probe, None);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_failure_retains_last_good_and_activity() {
+        let fixture = issue_362_fixture("adaptive-failure");
+        let anchor = Instant::now();
+        let mut cadence = AdaptiveThreadCadence::default();
+        cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(10)), anchor);
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(11)),
+            anchor + Duration::from_secs(60),
+        );
+        let accepted = cadence.totals.clone();
+        cadence.in_flight = true;
+        cadence.failed();
+        assert!(!cadence.in_flight);
+        assert_eq!(cadence.totals, accepted);
+        assert_eq!(cadence.last_delta, Some(anchor + Duration::from_secs(60)));
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(12)),
+            anchor + Duration::from_secs(125),
+        );
+        assert_eq!(cadence.last_delta, Some(anchor + Duration::from_secs(125)));
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_does_not_queue_an_overlapping_probe() {
+        let mut cadence = AdaptiveThreadCadence::default();
+        let anchor = Instant::now();
+        let mut submissions = 0;
+        let mut submit = |_: &[SessionCheckpoint]| {
+            submissions += 1;
+            true
+        };
+        assert!(cadence.submit(anchor, &[], &mut submit));
+        assert!(!cadence.submit(anchor + ACTIVE_THREAD_INTERVAL, &[], &mut submit));
+        cadence.failed();
+        assert!(cadence.submit(anchor + ACTIVE_THREAD_INTERVAL, &[], &mut submit));
+        assert_eq!(submissions, 2);
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_only_exits_after_successful_stable_sixty_seconds() {
+        let fixture = issue_362_fixture("adaptive-stable");
+        let anchor = Instant::now();
+        let mut cadence = AdaptiveThreadCadence::default();
+        cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(10)), anchor);
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(11)),
+            anchor + Duration::from_secs(60),
+        );
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(11)),
+            anchor + Duration::from_secs(119),
+        );
+        assert!(cadence.last_delta.is_some());
+        cadence.failed();
+        assert!(cadence.last_delta.is_some());
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(11)),
+            anchor + Duration::from_secs(120),
+        );
+        assert_eq!(cadence.last_delta, None);
+        assert_eq!(cadence.next_probe, None);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_unknown_values_do_not_prove_stability() {
+        let fixture = issue_362_fixture("adaptive-unknown-stable");
+        let anchor = Instant::now();
+        let mut cadence = AdaptiveThreadCadence::default();
+        cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(10)), anchor);
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(11)),
+            anchor + Duration::from_secs(60),
+        );
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(None),
+            anchor + Duration::from_secs(120),
+        );
+        assert!(cadence.last_delta.is_some());
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(0)),
+            anchor + Duration::from_secs(125),
+        );
+        assert!(cadence.last_delta.is_some());
+        cadence.accept(
+            &fixture.epoch,
+            &adaptive_thread_snapshot(Some(0)),
+            anchor + Duration::from_secs(130),
+        );
+        assert_eq!(cadence.last_delta, None);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn adaptive_thread_cadence_wait_drives_five_second_probes_and_returns_to_configured_cycle() {
+        let mut fixture = issue_362_fixture("adaptive-wait");
+        fixture.options.interval_secs = 120;
+        fixture.seed_state(false, false);
+        let initial_publication = fixture.state_bytes();
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(120));
+        let mut cadence = AdaptiveThreadCadence::default();
+        cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(1)), anchor);
+        cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(2)), anchor);
+        let probe_pending = Cell::new(false);
+        let mut starts = Vec::new();
+        let mut submit = |_: &[SessionCheckpoint]| {
+            assert!(!probe_pending.replace(true), "probe work must not overlap");
+            starts.push(now.get().duration_since(anchor).as_secs());
+            true
+        };
+        let mut drain = || Vec::new();
+        let result = ActiveThreadPollResult::Snapshot {
+            snapshot: adaptive_thread_snapshot(Some(2)),
+            epoch: fixture.epoch.clone(),
+        };
+        let mut wait_for = |duration: Duration| {
+            assert!(probe_pending.get(), "wait only for an existing probe");
+            let elapsed = duration.min(Duration::from_secs(1));
+            now.set(now.get() + elapsed);
+            if elapsed == Duration::from_secs(1) {
+                probe_pending.set(false);
+                Some(result.clone())
+            } else {
+                None
+            }
+        };
+        let mut sleep = |duration: Duration| now.set(now.get() + duration);
+        let mut clock = || now.get();
+        let mut epoch_matches = |_: &AccountEpochProof| true;
+        let mut health = LaneHealth::Ready;
+        complete_cycle_publication_and_wait(
+            CyclePublication::NoCommit,
+            &fixture.options,
+            &fixture.epoch,
+            &mut fixture.recorder,
+            &mut fixture.state_writer,
+            LaneHealth::Ready,
+            &mut health,
+            &mut schedule,
+            &mut cadence,
+            &mut submit,
+            &mut drain,
+            &mut wait_for,
+            &mut sleep,
+            &mut clock,
+            &mut epoch_matches,
+        )
+        .expect("adaptive wait");
+        assert_eq!(starts, (1..=12).map(|slot| slot * 5).collect::<Vec<_>>());
+        assert_eq!(now.get(), anchor + Duration::from_secs(120));
+        assert_eq!(cadence.last_delta, None);
+        assert!(!cadence.in_flight);
+        assert_eq!(
+            fixture.state_bytes(),
+            initial_publication,
+            "NoCommit must not acknowledge adaptive commits"
+        );
+        assert_eq!(
+            schedule.complete_cycle(now.get()).sleep_for,
+            Duration::from_secs(120)
+        );
+        fixture.cleanup();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn issue_362_drive_cycle(
         fixture: &mut Issue362AsyncFixture,
@@ -985,6 +1403,7 @@ mod tests {
         let mut epoch_matches =
             move |_epoch: &AccountEpochProof| epoch_values.next().unwrap_or(true);
         let mut thread_health = LaneHealth::Unknown;
+        let mut cadence = AdaptiveThreadCadence::default();
         complete_cycle_publication_and_wait(
             publication,
             &fixture.options,
@@ -994,6 +1413,7 @@ mod tests {
             quota_health,
             &mut thread_health,
             schedule,
+            &mut cadence,
             &mut submit,
             &mut drain,
             &mut wait_for,

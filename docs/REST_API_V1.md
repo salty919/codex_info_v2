@@ -368,6 +368,28 @@ v3の`/v3/current`と`/v3/details`には、`THREAD-OPEN-362`で公開対象と�
 rootとsiblingの相対rankを保ったまま親先行depth-first・subtree-contiguousへpresentation投影する。
 存在しない`updatedAt`をclientで推測したり、title・受信時刻・IDだけで別順へ再sortしたりしない。
 
+### Threads producerの適応取得周期（Issue #435）
+
+recorderの通常Threads probeは設定済みcollection周期（既定60秒、環境変数
+`CODEX_INFO_DAEMON_INTERVAL_SECS`または優先する`--interval-secs`）に従う。
+Session収集とquotaの通常周期を変えず、同じaccount・epoch・thread IDの完全な受入済み
+snapshot間で、両方が既知の`total_tokens`に不一致があるとThreads probeだけを5秒周期へ切り替える。
+増加と減少を同じ差分として扱い、`null`を0へ変換しない。初回、再起動、identity変更、および
+未知値からの初観測は比較baselineを作り、差分を捏造しない。
+
+probeは一つだけを進行させ、実行中に次の要求をqueueせず、遅れた周期のまとめ実行もしない。
+失敗・不完全candidate・epoch不一致で前回の受入値を置換せず、失敗を無変化の成功とみなさない。
+最後の有効差分から60秒以上経過し、同じidentity集合の既知値を比較できる成功probeで差分が
+なければ通常周期へ戻す。連続する完全な空snapshotも無変化とする。未知値しかない結果は
+無変化の根拠にしない。新しい差分があれば60秒の安定待ちを再開する。
+
+この適応取得は`REST-172` / Issue #362のprobe/RPC回数を増やさない通常規則への明示的な例外である。
+5秒モードではcandidate scan、rollout読取り、短命app-serverの起動、initialize・account/read・
+thread/readの回数が増える。Sessionの全走査やquota収集周期、完全snapshot・account/epoch検証、
+published pairおよびerror/last-good契約は変えない。最初の差分検知は通常周期まで待ち得る。
+5秒はprobe開始の目標周期であり、probe処理、公開、Mainの10秒取得および詳細の5秒取得と
+同一pair受理の待ち時間を含む画面の5秒鮮度保証ではない。UI周期は後述のsurface契約に従う。
+
 全objectは上記キーを全て必須とし、未知、大小文字違い、同一object内の重複、型違い、
 配列上限超過が1件でもあればcandidate全体を拒否する。serverの`SnapshotPublisher`は現行
 `(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)`、profile publisherを所有する`SupervisorLeaseIdentity`、

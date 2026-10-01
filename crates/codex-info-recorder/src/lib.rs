@@ -601,9 +601,9 @@ impl ThreadPoller {
     }
 
     /// Wait for an already submitted probe without starting another probe.
-    /// The recorder uses this only during the existing fixed-rate sleep, so a
-    /// completed result can be committed in the current generation while the
-    /// periodic collection cadence remains unchanged.
+    /// The recorder uses this during the existing fixed-rate Session wait.
+    /// Completed normal or adaptive thread probes can be committed without
+    /// advancing Session collection; the caller tracks one in-flight probe.
     pub fn wait_for(&self, timeout: Duration) -> Option<ActiveThreadPollResult> {
         self.receiver.recv_timeout(timeout).ok()
     }
