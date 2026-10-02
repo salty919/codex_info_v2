@@ -6,11 +6,12 @@ from __future__ import annotations
 import ctypes
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 # required fixture process API; the shell call is reviewed below.
 import sys
 import time
+import unittest
 from pathlib import Path
-
+from unittest import mock
 
 GATE = Path(__file__).with_name("x11_service_recovery_visual_gate.sh")
 PRESS, RELEASE = 4, 5
@@ -202,10 +203,14 @@ def run_graph_path(
         + f"\nwindow_id={hex(fixture['main'])}\nui_pid={os.getpid()}\ngraph_window_id=''\n"
         + graph_block + "\n"
     )
+    # Intentionally execute repository Graph functions with generated numeric fixture identities.
+    # Fixed bash and disabled startup hooks prevent caller executable/startup injection.
+    environment = {key: value for key, value in os.environ.items() if key not in {"BASH_ENV", "ENV"}}
     try:
-        process = subprocess.Popen(
-            ["bash", "-c", shell, "x11-graph-path-test"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        process = subprocess.Popen(  # nosec B603 # fixed bash and intentional repository-only shell fixture.
+            ["/bin/bash", "--noprofile", "--norc", "-c", shell, "x11-graph-path-test"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment, shell=False,
         )
     except OSError as error:
         raise SetupFailure(f"cannot run extracted Graph path: {error}") from error
@@ -260,6 +265,30 @@ def case(x11, sources, label: str, *, wrapper: bool, covered=False, unmapped=Fal
         return passed, detail
     finally:
         close_fixture(fixture)
+
+
+class GraphProcessBoundaryTests(unittest.TestCase):
+    def graph_process_arguments(self):
+        process = mock.Mock()
+        process.poll.return_value = 0
+        process.communicate.return_value = ("", "")
+        process.returncode = 0
+        fixture = {"main": 1, "x11": mock.Mock(), "display": None,
+                   "watched": [], "graph": 0, "errors": []}
+        with mock.patch.object(subprocess, "Popen", return_value=process) as spawn:
+            run_graph_path(("", "", "", ""), fixture, graph_on_press=False)
+        return spawn.call_args
+
+    def test_graph_process_uses_fixed_bash(self):
+        call = self.graph_process_arguments()
+        self.assertEqual(call.args[0][:4], ["/bin/bash", "--noprofile", "--norc", "-c"])
+
+    def test_graph_process_removes_startup_hooks(self):
+        with mock.patch.dict(os.environ, {"BASH_ENV": "/untrusted/startup", "ENV": "/untrusted/profile"}):
+            call = self.graph_process_arguments()
+            environment = call.kwargs.get("env", os.environ)
+            self.assertNotIn("BASH_ENV", environment)
+            self.assertNotIn("ENV", environment)
 
 
 def main() -> int:

@@ -124,6 +124,8 @@ os.execvp(args[0],args)
         path.chmod(0o755)
 
     def git(self, *args):
+        # Only this test's local Git repository and literal fixture commands reach this call.
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
         return subprocess.check_output(  # nosec B603 # absolute Git and fixed offline fixture argv.
             [GIT, "-C", str(self.repo), *args], text=True, shell=False, stderr=subprocess.DEVNULL,
         )
@@ -133,6 +135,8 @@ os.execvp(args[0],args)
 
     def run_script(self, source, env=None, ok=True):
         # source is checked-in workflow text or a literal fixture, run against local tool stubs.
+        # Intentionally execute checked-in caller text/literal fixtures against offline tool stubs.
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
         result = subprocess.run(  # nosec B603 # finite trusted caller script, offline stubs, no shell=True.
             [BASH, "-euo", "pipefail", "-c", source], cwd=self.repo,
             env={**self.environment, **(env or {})}, text=True, capture_output=True,

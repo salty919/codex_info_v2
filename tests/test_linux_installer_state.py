@@ -4,10 +4,9 @@
 import pathlib
 import re
 import shlex
-import subprocess
+import subprocess  # nosec B404 # offline installer fixture API; fixed shell/env reviewed at the call.
 import tempfile
 import unittest
-
 
 INSTALLER = pathlib.Path(__file__).resolve().parents[1] / "packaging/install_linux_bundle.sh"
 
@@ -49,7 +48,7 @@ printf '%s %s %s\\n' "$legacy_combined_enabled" "$legacy_combined_active" "$lega
 """
                     # Shell input is this repository function plus literal fixtures.
                     # Exclude caller PATH and non-interactive shell startup hooks.
-                    result = subprocess.run(
+                    result = subprocess.run(  # nosec B603 # fixed bash/env; repository function and literal fixture stdin.
                         ["/bin/bash", "--noprofile", "--norc", "-s"],
                         input=script,
                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},

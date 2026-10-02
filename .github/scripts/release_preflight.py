@@ -35,7 +35,10 @@ def git_executable() -> str:
 
 
 def git(*args: str, data: bytes | None = None, env=None) -> bytes:
-    return subprocess.check_output(
+    # Trusted callers fix Git commands/version paths and validate source/main/workflow with oid().
+    # Blob content is stdin data; argv is passed directly without shell interpretation.
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+    return subprocess.check_output(  # nosec B603 # absolute Git, fixed commands, validated OIDs, no shell.
         [git_executable(), *args], input=data, env=env, shell=False,
     )
 
@@ -90,7 +93,9 @@ def plan(source: str, main: str, workflow: str) -> dict:
         expected_version = next_version(base_version)
         prepared_files(source, base_version, expected_version, temporary / "next")
         tree = version_tree(source, temporary / "next", temporary)
-    included = subprocess.run(
+    # oid() above constrains both ancestry operands; Git command/options are literal.
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+    included = subprocess.run(  # nosec B603 # absolute Git and validated ancestry OIDs, no shell.
         [git_executable(), "merge-base", "--is-ancestor", main, source],
         shell=False, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
