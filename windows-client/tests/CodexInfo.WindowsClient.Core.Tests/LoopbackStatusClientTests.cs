@@ -750,6 +750,114 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal(2, requestCount);
     }
 
+    [Theory]
+    [InlineData("daemon_stop_unrecoverable")]
+    [InlineData("reset_hint_expired")]
+    [InlineData("auth_epoch_tombstoned")]
+    public async Task HistoryPageRetainsGapRowsWithoutPeriodMetadata(string reason)
+    {
+        var gaps = $$"""[{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":100,"end_at":120,"reason":"{{reason}}"},{"gap_id":"fedcba9876543210fedcba9876543210","reset_at":200,"start_at":130,"end_at":140,"reason":"{{reason}}"},{"gap_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reset_at":201,"start_at":100,"end_at":120,"reason":"{{reason}}"}]""";
+        var result = await FetchHistoryPageWithGaps(gaps);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("period/opaque", result.Page!.PeriodId);
+        Assert.Equal(3, result.Page.HistoryGaps.Count);
+        Assert.Equal(new ApiHistoryGap("0123456789abcdef0123456789abcdef", 200, 100, 120, reason), result.Page.HistoryGaps[0]);
+        Assert.Equal(new ApiHistoryGap("fedcba9876543210fedcba9876543210", 200, 130, 140, reason), result.Page.HistoryGaps[1]);
+        Assert.Equal(new ApiHistoryGap("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 201, 100, 120, reason), result.Page.HistoryGaps[2]);
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("{}")]
+    [InlineData("[null]")]
+    [InlineData("""[{"gap_id":"0123456789ABCDEF0123456789abcdef","reset_at":200,"start_at":100,"end_at":120,"reason":"daemon_stop_unrecoverable"}]""")]
+    [InlineData("""[{"gap_id":"0123456789abcdef0123456789abcde","reset_at":200,"start_at":100,"end_at":120,"reason":"daemon_stop_unrecoverable"}]""")]
+    [InlineData("""[{"gap_id":"g123456789abcdef0123456789abcdef","reset_at":200,"start_at":100,"end_at":120,"reason":"daemon_stop_unrecoverable"}]""")]
+    [InlineData("""[{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":-1,"start_at":100,"end_at":120,"reason":"daemon_stop_unrecoverable"}]""")]
+    [InlineData("""[{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":100.5,"end_at":120,"reason":"daemon_stop_unrecoverable"}]""")]
+    [InlineData("""[{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":100,"end_at":253402300800,"reason":"daemon_stop_unrecoverable"}]""")]
+    [InlineData("""[{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":121,"end_at":120,"reason":"daemon_stop_unrecoverable"}]""")]
+    [InlineData("""[{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":100,"end_at":120,"reason":"not-a-reason"}]""")]
+    [InlineData("""[{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":100,"end_at":120}]""")]
+    [InlineData("""[{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":100,"end_at":120,"reason":"daemon_stop_unrecoverable","extra":true}]""")]
+    [InlineData("""[{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":100,"end_at":120,"reason":"daemon_stop_unrecoverable","reason":"reset_hint_expired"}]""")]
+    public async Task HistoryPageRejectsInvalidGapRows(string gaps)
+    {
+        var result = await FetchHistoryPageWithGaps(gaps);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Page);
+    }
+
+    [Theory]
+    [InlineData("duplicate-id")]
+    [InlineData("misordered-time")]
+    [InlineData("misordered-reset")]
+    [InlineData("overlap")]
+    [InlineData("touch")]
+    public async Task HistoryPageRejectsDuplicateMisorderedOrOverlappingGapRows(string violation)
+    {
+        const string first = """{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":100,"end_at":120,"reason":"daemon_stop_unrecoverable"}""";
+        var second = violation switch
+        {
+            "duplicate-id" => """{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":200,"start_at":130,"end_at":140,"reason":"reset_hint_expired"}""",
+            "misordered-time" => """{"gap_id":"fedcba9876543210fedcba9876543210","reset_at":200,"start_at":50,"end_at":80,"reason":"reset_hint_expired"}""",
+            "misordered-reset" => """{"gap_id":"fedcba9876543210fedcba9876543210","reset_at":199,"start_at":130,"end_at":140,"reason":"reset_hint_expired"}""",
+            "overlap" => """{"gap_id":"fedcba9876543210fedcba9876543210","reset_at":200,"start_at":110,"end_at":130,"reason":"reset_hint_expired"}""",
+            "touch" => """{"gap_id":"fedcba9876543210fedcba9876543210","reset_at":200,"start_at":120,"end_at":140,"reason":"reset_hint_expired"}""",
+            _ => throw new InvalidOperationException("unexpected gap violation"),
+        };
+        var result = await FetchHistoryPageWithGaps($"[{first},{second}]");
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Page);
+    }
+
+    [Theory]
+    [InlineData(4096, true)]
+    [InlineData(4097, false)]
+    public async Task HistoryPageGapArrayLimitIsEnforced(int count, bool accepted)
+    {
+        var rows = Enumerable.Range(0, count)
+            .Select(index => $$"""{"gap_id":"{{index:x32}}","reset_at":10000,"start_at":{{index * 2 + 1}},"end_at":{{index * 2 + 1}},"reason":"daemon_stop_unrecoverable"}""");
+        var result = await FetchHistoryPageWithGaps($"[{string.Join(",", rows)}]");
+
+        Assert.Equal(accepted, result.IsSuccess);
+        if (accepted)
+        {
+            Assert.Equal(count, result.Page!.HistoryGaps.Count);
+        }
+        else
+        {
+            Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+            Assert.Null(result.Page);
+        }
+    }
+
+    [Theory]
+    [InlineData("v1", 253402300738L, 253402300620L, 253402300640L)]
+    [InlineData("v3", 253402300738L, 253402300620L, 253402300640L)]
+    [InlineData("v1", 253402300799L, 253341820739L, 253402300640L)]
+    [InlineData("v3", 253402300799L, 253341820739L, 253402300640L)]
+    [InlineData("v1", 253402300799L, 253402300620L, 253402300741L)]
+    [InlineData("v3", 253402300799L, 253402300620L, 253402300741L)]
+    public async Task DetailsHistoryGapsRequirePeriodMembership(string version, long resetAt, long startAt, long endAt)
+    {
+        var gap = $$"""{"gap_id":"0123456789abcdef0123456789abcdef","reset_at":{{resetAt}},"start_at":{{startAt}},"end_at":{{endAt}},"reason":"daemon_stop_unrecoverable"}""";
+        var json = (version == "v3" ? ValidDetailsV3Json() : ValidDetailsJson())
+            .Replace("\"history_gaps\":[]", $"\"history_gaps\":[{gap}]", StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            version == "v1" && request.RequestUri!.AbsolutePath != "/v1/details"
+                ? NotFoundResponse()
+                : JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
     [Fact]
     public async Task HistoryPageUsesOpaquePeriodAndCursorAndAcceptsExplicitNullCompletionCursor()
     {
@@ -1650,6 +1758,15 @@ public sealed class LoopbackStatusClientTests
 
         Assert.NotNull(field);
         Assert.Equal(44_640, field!.GetRawConstantValue());
+    }
+
+    private static async Task<HistoryPageFetchResult> FetchHistoryPageWithGaps(string gaps)
+    {
+        var json = ValidHistoryPageJson().Replace("\"history_gaps\":[]", $"\"history_gaps\":{gaps}", StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        return await client.FetchHistoryPageAsync("period/opaque", cancellationToken: CancellationToken.None);
     }
 
     private static async Task<DetailsFetchResult> FetchDetails(string json)

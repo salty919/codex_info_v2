@@ -2675,54 +2675,20 @@ public sealed class LoopbackStatusClient :
         IReadOnlyList<ApiHistoryPeriod> periods,
         out List<ApiHistoryGap> gaps)
     {
-        gaps = new List<ApiHistoryGap>();
-        if (!parent.TryGetProperty("history_gaps", out var property) ||
-            property.ValueKind != JsonValueKind.Array ||
-            property.GetArrayLength() > MaxHistoryGaps)
+        if (!TryGetHistoryGapsWithoutPeriods(parent, out gaps))
         {
             return false;
         }
 
-        var gapIds = new HashSet<string>(StringComparer.Ordinal);
-        ApiHistoryGap? previous = null;
-        foreach (var gap in property.EnumerateArray())
+        foreach (var gap in gaps)
         {
-            if (!HasExactlyProperties(gap, HistoryGapProperties, 5) ||
-                !TryGetString(gap, "gap_id", out var gapId) ||
-                !IsLowercaseHexId(gapId) ||
-                !gapIds.Add(gapId) ||
-                !TryGetUnixSeconds(gap, "reset_at", out var resetAt) ||
-                !TryGetUnixSeconds(gap, "start_at", out var startAt) ||
-                !TryGetUnixSeconds(gap, "end_at", out var endAt) ||
-                startAt > endAt ||
-                !TryGetString(gap, "reason", out var reason) ||
-                !HistoryGapReasons.Contains(reason))
-            {
-                return false;
-            }
-
-            var matchingPeriods = periods.Where(period => period.ResetAt == resetAt).ToArray();
+            var matchingPeriods = periods.Where(period => period.ResetAt == gap.ResetAt).ToArray();
             if (matchingPeriods.Length != 1 ||
-                startAt < matchingPeriods[0].StartAt ||
-                endAt > matchingPeriods[0].EndAt)
+                gap.StartAt < matchingPeriods[0].StartAt ||
+                gap.EndAt > matchingPeriods[0].EndAt)
             {
                 return false;
             }
-
-            var candidate = new ApiHistoryGap(gapId, resetAt, startAt, endAt, reason);
-            if (previous is not null && CompareHistoryGaps(previous, candidate) >= 0)
-            {
-                return false;
-            }
-
-            if (previous is not null && previous.ResetAt == candidate.ResetAt &&
-                candidate.StartAt <= previous.EndAt)
-            {
-                return false;
-            }
-
-            previous = candidate;
-            gaps.Add(candidate);
         }
 
         return true;
