@@ -12,6 +12,14 @@ on:
       pr_number:
         required: true
         type: string
+      release_preflight:
+        description: Run release behavior checks without publication authority
+        type: boolean
+        default: false
+      preflight_plan:
+        description: Trusted read-only prospective release tree, empty for an actual source
+        type: string
+        default: ''
       release_candidate:
         required: true
         type: boolean
@@ -28,6 +36,33 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Reconstruct the trusted planned release tree
+        if: inputs.preflight_plan != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TRUSTED_SHA: ${{ github.workflow_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PLAN: ${{ inputs.preflight_plan }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_CANDIDATE" == false ]] || {
+            echo 'a prospective tree cannot publish a release candidate' >&2
+            exit 1
+          }
+          [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          trusted="$RUNNER_TEMP/planned-release-trusted"
+          mkdir -p "$trusted/.github/scripts" "$trusted/scripts"
+          for file in .github/scripts/release_preflight.py scripts/product_version.py; do
+            gh api "repos/$REPOSITORY/contents/$file?ref=$TRUSTED_SHA" \
+              --jq '.content' | base64 --decode > "$trusted/$file"
+          done
+          python_command=python3
+          if [[ "$RUNNER_OS" == Windows ]]; then python_command=python; fi
+          "$python_command" "$trusted/.github/scripts/release_preflight.py" apply \
+            --source "$SOURCE_SHA" --workflow "$TRUSTED_SHA" --plan "$PLAN"
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "10.0.x"
@@ -73,11 +108,11 @@ jobs:
           path: artifacts/codacy-coverage-windows/*.cobertura.xml
           if-no-files-found: error
       - name: Install locked Inno Setup compiler
-        if: inputs.release_candidate
+        if: inputs.release_preflight || inputs.release_candidate
         shell: pwsh
         run: ./windows-client/tools/Ensure-InnoSetupCompiler.ps1
       - name: Build standard Windows setup wizard
-        if: inputs.release_candidate
+        if: inputs.release_preflight || inputs.release_candidate
         shell: pwsh
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -86,7 +121,7 @@ jobs:
           -OutputDirectory artifacts/windows-installer
           -SourceSha $env:SOURCE_SHA
       - name: Upgrade latest published Windows release to the exact candidate
-        if: inputs.release_candidate
+        if: inputs.release_preflight || inputs.release_candidate
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -97,7 +132,7 @@ jobs:
           -CandidateSetup ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe
           -RetainSentinel
       - name: Run installed Windows UI Automation E2E
-        if: inputs.release_candidate
+        if: inputs.release_preflight || inputs.release_candidate
         shell: pwsh
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}

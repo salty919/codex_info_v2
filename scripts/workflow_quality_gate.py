@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
 import textwrap
 from typing import Mapping, Sequence
 
@@ -295,7 +296,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "feat.classify.checkout",
             _step(feat_classify, uses="actions/checkout@v5").get("with"),
             {
-                "ref": "${{ github.event.pull_request.base.sha }}",
+                "ref": "${{ github.workflow_sha }}",
                 "fetch-depth": 0,
                 "persist-credentials": False,
             },
@@ -306,7 +307,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         feat_classify_script = _step(feat_classify, step_id="classify").get("run")
         if (
             not isinstance(feat_classify_script, str)
-            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"'
+            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA" "$main_sha"'
             not in feat_classify_script
         ):
             errors.append(
@@ -318,11 +319,13 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("feat.quality.continue-on-error", feat_quality.get("continue-on-error"), None)
         mapping("feat.quality", feat_quality.get("with"), {
             "source_sha": "${{ github.event.pull_request.head.sha }}",
-            "base_sha": "${{ github.event.pull_request.base.sha }}",
+            "base_sha": "${{ needs.classify.outputs.main_base_sha }}",
             "head_ref": "${{ github.event.pull_request.head.ref }}",
             "pr_number": "${{ github.event.pull_request.number }}",
             "selection_json": "${{ needs.classify.outputs.selection_json }}",
             "release_candidate": False,
+            "release_preflight": True,
+            "preflight_plan": "${{ needs.classify.outputs.preflight_plan }}",
         })
         expect("version.quality.needs", version_quality.get("needs"), ["version-prepared"])
         expect("version.quality.if", version_quality.get("if"), "needs.version-prepared.outputs.ready == 'true'")
@@ -335,6 +338,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "pr_number": "${{ github.event.pull_request.number }}",
             "selection_json": "${{ needs.version-prepared.outputs.selection_json }}",
             "release_candidate": True,
+            "release_preflight": True,
         })
         expect("version.acceptance.needs", acceptance.get("needs"), ["version-prepared", "selective-quality"])
         expect("version.acceptance.continue-on-error", acceptance.get("continue-on-error"), None)
@@ -456,7 +460,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("selective.windows-name", selective_windows.get("name"), "windows-quality")
         expect("windows.leaf-name", windows_job.get("name"), "windows-quality")
         e2e = _step(windows_job, name="Run installed Windows UI Automation E2E")
-        expect("windows.e2e.if", e2e.get("if"), "inputs.release_candidate")
+        expect("windows.e2e.if", e2e.get("if"), "inputs.release_preflight || inputs.release_candidate")
         mapping("windows.e2e.env", e2e.get("env"), {
             "SOURCE_SHA": "${{ inputs.source_sha }}",
         })
@@ -488,10 +492,55 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "if-no-files-found": "error",
         })
 
+        # Reuse is optional; only the trusted runtime probe may suppress these
+        # two checks. Every release behavior and public candidate guard stays.
+        native_probe = _step(rust_job, step_id="native-proof")
+        expect("rust.probe.continue-on-error", native_probe.get("continue-on-error"), True)
+        mapping("rust.probe.env", native_probe.get("env"), {
+            "TRUSTED_SHA": "${{ github.workflow_sha }}",
+            "SOURCE_SHA": "${{ inputs.source_sha }}",
+            "MAIN_BASE_SHA": "${{ inputs.base_sha }}",
+        })
+        expect("rust.clippy.if", _step(rust_job, name="Reject native compiler and Clippy warnings").get("if"),
+               "steps.native-proof.outputs.reused != 'true'")
+        binding = _step(rust_job, name="Bind successful native checks to exact inputs")
+        expect("rust.proof.if", binding.get("if"), "steps.native-proof.outcome == 'success'")
+        expect("rust.proof.continue-on-error", binding.get("continue-on-error"), True)
+        mapping("rust.proof.env", binding.get("env"), {
+            "EXPECTED_HELPER_DIGEST": "${{ steps.native-proof.outputs.helper_digest }}",
+            "NATIVE_INPUTS": "${{ steps.native-proof.outputs.inputs_json }}",
+        })
+        for marker in ('contents/.github/scripts/native_quality_proof.py?ref=$TRUSTED_SHA',
+                       '"$actual_digest" == "$EXPECTED_HELPER_DIGEST"'):
+            if marker not in str(binding.get("run", "")):
+                errors.append("workflow wiring native proof: emit helper identity is not frozen")
+        order = [item.get("name") for item in rust_job["steps"]]
+        expected_order = ["Match actual native runtime before reuse", "Run native unit tests with coverage",
+                          "Reject native compiler and Clippy warnings", "Bind successful native checks to exact inputs",
+                          "Preserve native coverage for isolated upload"]
+        if [order.index(name) for name in expected_order] != sorted(order.index(name) for name in expected_order):
+            errors.append("workflow wiring native proof: coverage can precede successful Clippy")
+        bridge = _step(prepared, name="Bridge verified native coverage within this run")
+        expect("version.bridge.continue-on-error", bridge.get("continue-on-error"), True)
+        mapping("version.bridge", bridge.get("with"), {"retention-days": 1})
+        for document, job_id in ((docs["rust.yml"], "native-quality"),
+                                 (docs["linux-ui-quality.yml"], "linux-ui-quality"),
+                                 (windows, "windows-quality"), (linux_distribution, "linux-distribution")):
+            snapshot = _step(_job(document, job_id), name="Reconstruct the trusted planned release tree")
+            expect(f"{job_id}.snapshot.if", snapshot.get("if"), "inputs.preflight_plan != ''")
+            mapping(f"{job_id}.snapshot.env", snapshot.get("env"), {
+                "TRUSTED_SHA": "${{ github.workflow_sha }}",
+                "PLAN": "${{ inputs.preflight_plan }}",
+                "RELEASE_CANDIDATE": "${{ inputs.release_candidate }}",
+            })
+            for marker in ('"$RELEASE_CANDIDATE" == false', 'contents/$file?ref=$TRUSTED_SHA'):
+                if marker not in str(snapshot.get("run", "")):
+                    errors.append("workflow wiring snapshot: prospective publication or head helper is allowed")
+
         expect(
             "rust.unit.if",
             _step(rust_job, name="Run native unit tests with coverage").get("if"),
-            None,
+            "steps.native-proof.outputs.reused != 'true'",
         )
         for step_name in (
             "Build native release",
@@ -501,7 +550,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             expect(
                 f"rust.{step_name}.if",
                 _step(rust_job, name=step_name).get("if"),
-                "inputs.release_candidate",
+                "inputs.release_preflight || inputs.release_candidate",
             )
         expect(
             "linux-ui.startup.if",
@@ -509,7 +558,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
                 linux_ui_job,
                 name="Run startup UI image and failure-state acceptance",
             ).get("if"),
-            "inputs.release_candidate",
+            "inputs.release_preflight || inputs.release_candidate",
         )
         expect(
             "linux-ui.graph.if",
@@ -546,7 +595,9 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             expect(
                 f"windows.{step_name}.if",
                 _step(windows_job, name=step_name).get("if"),
-                "inputs.release_candidate",
+                ("inputs.release_candidate" if step_name in {
+                    "Create release manifest", "Upload release candidate"
+                } else "inputs.release_preflight || inputs.release_candidate"),
             )
         compiler_script = _step(
             windows_job,
@@ -685,10 +736,16 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             workflows["feat-integration.yml"],
             "Classify the event's exact base and head",
         )
-        if "--release-candidate" in feat_script:
-            errors.append(
-                "workflow wiring feat selection: release candidate context leaked into feat integration"
-            )
+        if 'scripts/ci_change_scope.py --name-status "$changes" --release-candidate' not in feat_script:
+            errors.append("workflow wiring feat selection: cumulative release owners are narrowed")
+        expect("feat.classify.permissions", feat_classify.get("permissions"), {"contents": "read"})
+        for marker in ('"$integration_sha" == "$BASE_SHA"',
+                       'git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"'):
+            if marker not in feat_script:
+                errors.append("workflow wiring feat planning: stale base/source can appear verified")
+        for forbidden in ("git push", "--method POST", "--method PATCH"):
+            if forbidden in feat_script:
+                errors.append("workflow wiring feat planning: branch/status mutation is forbidden")
         wrapper = f"{version_quality['name']} / {selective_windows['name']}"
         leaf = f"{wrapper} / {windows_job['name']}"
         for script, assignments in (
@@ -752,7 +809,9 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     for marker in (
         'branches: ["feat/next"]',
         "release_candidate: false",
-        '--name-status -z "$BASE_SHA...$HEAD_SHA"',
+        "release_preflight: true",
+        'scripts/ci_change_scope.py --name-status "$changes" --release-candidate',
+        '--name-status -z "$main_sha...$HEAD_SHA"',
     ):
         if marker not in feat:
             errors.append(f"feat-integration.yml: missing {marker}")
@@ -3545,11 +3604,27 @@ def release_self_test() -> int:
 
 
 
+def _preflight_caller_tests() -> int:
+    """Run finite real caller fixtures; no product build or external API call."""
+    cases = 0
+    for name in ("test_release_preflight.py", "test_native_quality_proof.py", "test_workflow_reuse.py", "test_snapshot_checkout.py"):
+        path = ROOT / ".github/tests" / name
+        loader = unittest.TestLoader()
+        suite = loader.discover(str(path.parent), pattern=path.name)
+        count = suite.countTestCases()
+        if count <= 0:
+            raise AssertionError("preflight fixture has no cases: " + name)
+        subprocess.run([sys.executable, str(path)], check=True,
+                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        cases += count
+    return cases
+
+
 def workflow_selection_self_test() -> int:
     """Exercise only the changed feat owner-selection wiring.
 
-    Release publication, bundle construction, installer, and product E2E are
-    separate risk paths and intentionally do not run for a feat pull request.
+    Release behavior runs against the planned feat tree. Publication and
+    acceptance authority remain confined to the actual main candidate.
     """
 
     baseline = sources()
@@ -3562,10 +3637,13 @@ def workflow_selection_self_test() -> int:
     mutations = (
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
+        ("feat-integration.yml", '"$integration_sha" == "$BASE_SHA"', '"$integration_sha" != "$BASE_SHA"'),
+        ("rust.yml", "if: steps.native-proof.outputs.reused != 'true'", "if: false"),
+        ("rust.yml", '"$actual_digest" == "$EXPECTED_HELPER_DIGEST"', '"$actual_digest" != "$EXPECTED_HELPER_DIGEST"'),
         (
             "feat-integration.yml",
+            'scripts/ci_change_scope.py --name-status "$changes" --release-candidate',
             'scripts/ci_change_scope.py --name-status "$changes"',
-            'scripts/ci_change_scope.py --release-candidate --name-status "$changes"',
         ),
         (
             "selective-quality.yml",
@@ -3606,18 +3684,20 @@ def workflow_selection_self_test() -> int:
         baseline["selective-quality.yml"]
     )
     copy_cases = _git_copy_detection_test()
-    total_cases = cases + release_candidate_cases + copy_cases + authority_dispatch_cases
+    preflight_cases = _preflight_caller_tests()
+    total_cases = cases + release_candidate_cases + copy_cases + authority_dispatch_cases + preflight_cases
     print(
         "workflow-quality-gate: PASS scope=owner-selection "
         f"total_cases={total_cases} static_cases={cases} "
         f"authority_dispatch_cases={authority_dispatch_cases} "
         f"release_non_narrowing_cases={release_candidate_cases} "
-        f"copy_cases={copy_cases}"
+        f"copy_cases={copy_cases} preflight_cases={preflight_cases}"
     )
     return 0
 
 
 def self_test() -> int:
+    _preflight_caller_tests()
     baseline = sources()
     acceptance_baseline = release_acceptance_sources()
     errors = validate(baseline)
@@ -3627,6 +3707,9 @@ def self_test() -> int:
     mutations = (
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
+        ("feat-integration.yml", '"$integration_sha" == "$BASE_SHA"', '"$integration_sha" != "$BASE_SHA"'),
+        ("rust.yml", "if: steps.native-proof.outputs.reused != 'true'", "if: false"),
+        ("rust.yml", '"$actual_digest" == "$EXPECTED_HELPER_DIGEST"', '"$actual_digest" != "$EXPECTED_HELPER_DIGEST"'),
         (
             "version-prepare.yml",
             "expected_version_transition=true",

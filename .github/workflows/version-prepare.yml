@@ -34,6 +34,7 @@ jobs:
       generated_observer: ${{ steps.prepare.outputs.generated_observer }}
       event_observer: ${{ steps.current.outputs.observer }}
       observer_reason: ${{ steps.current.outputs.reason }}
+      native_reuse_artifact: ${{ steps.native-reuse.outputs.artifact }}
     steps:
       - name: Read the current pull request once
         id: current
@@ -344,6 +345,26 @@ jobs:
             -f context='main-pr-quality/current-head' \
             -f description='Selected release quality is running' >/dev/null
 
+      - name: Resolve exact prior native quality evidence
+        id: native-reuse
+        if: steps.prepare.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ steps.prepare.outputs.quality_sha }}
+          MAIN_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TRUSTED_SHA: ${{ github.workflow_sha }}
+        run: python3 .github/scripts/native_quality_proof.py resolve
+      - name: Bridge verified native coverage within this run
+        if: steps.native-reuse.outputs.artifact != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.native-reuse.outputs.artifact }}
+          retention-days: 1
+          path: ${{ runner.temp }}/native-reuse/rust.cobertura.xml
+          if-no-files-found: error
+
   selective-quality:
     name: Run selected quality owners
     needs: [version-prepared]
@@ -355,6 +376,8 @@ jobs:
       head_ref: ${{ github.event.pull_request.head.ref }}
       pr_number: ${{ github.event.pull_request.number }}
       selection_json: ${{ needs.version-prepared.outputs.selection_json }}
+      native_reuse_artifact: ${{ needs.version-prepared.outputs.native_reuse_artifact }}
+      release_preflight: true
       release_candidate: true
     permissions:
       contents: read
