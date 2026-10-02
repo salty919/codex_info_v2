@@ -33,8 +33,15 @@ def command(*args: str, data: bytes | None = None, env=None) -> bytes:
     executable = shutil.which(args[0])
     if executable is None or not Path(executable).is_absolute():
         raise ValueError("native proof program has no absolute executable")
-    return subprocess.check_output(
-        [executable, *args[1:]], input=data, env=env, shell=False,
+    executable_path = Path(executable).resolve(strict=True)
+    if not executable_path.is_file() or executable_path.is_relative_to(Path.cwd().resolve()):
+        raise ValueError("native proof executable belongs to the source checkout or is not a file")
+    # Preserve argv[0] for multicall tools such as rustup, while fixing the checked execution target.
+    # Allowlisted tools come from outside the checkout; trusted callers supply argv, never a shell.
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+    return subprocess.check_output(  # nosec B603 # checked tool path, fixed caller argv, shell=False.
+        [executable, *args[1:]], executable=str(executable_path),
+        input=data, env=env, shell=False,
         stderr=subprocess.DEVNULL, timeout=30,
     )
 

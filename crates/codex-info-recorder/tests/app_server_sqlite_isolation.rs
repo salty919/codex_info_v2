@@ -216,6 +216,8 @@ for line in sys.stdin:
 fn live_session_process(root: &Path, session: &Path) -> ChildGuard {
     let executable = root.join("codex");
     fs::copy(
+        // Copy this same-UID test binary to create a benign fixture process, not a security identity.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         env::current_exe().expect("resolve current test executable"),
         &executable,
     )
@@ -268,6 +270,8 @@ fn live_session_process(root: &Path, session: &Path) -> ChildGuard {
 fn live_session_set_process(root: &Path, sessions: &[PathBuf]) -> ChildGuard {
     let executable = root.join("codex");
     fs::copy(
+        // Copy this same-UID test binary to create a benign fixture process, not a security identity.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         env::current_exe().expect("resolve current test executable"),
         &executable,
     )

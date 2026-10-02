@@ -23,6 +23,8 @@ LEAF_JOBS = {
 
 
 def git(directory: Path, *arguments: str) -> str:
+    # Only local temporary repositories and finite snapshot fixture commands reach this call.
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
     return subprocess.check_output(  # nosec B603 # absolute Git and fixed offline fixture argv.
         [GIT, "-C", str(directory), *arguments],
         shell=False,
