@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -255,25 +256,107 @@ class ProductVersionFixtures(unittest.TestCase):
         fixture.paths.windows_props.write_text(payload, encoding="utf-8")
         self.assert_rejected_without_writes(fixture)
 
-    def test_atomic_commit_failure_rolls_back_every_target(self) -> None:
+    def test_bump_without_fchmod_preserves_modes_and_atomic_replacement(self) -> None:
         fixture = self.use_fixture("1.0.8")
         before = fixture.snapshot()
+        for path, mode in zip(fixture.paths.ordered(), (0o640, 0o600, 0o644)):
+            path.chmod(mode)
+        modes = {path: stat.S_IMODE(path.stat().st_mode) for path in before}
         real_replace = product_version.os.replace
-        calls = 0
+        real_chmod = product_version.os.chmod
+        replaced = []
 
-        def fail_second_replace(source: str | bytes, destination: str | bytes) -> None:
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise OSError("fixture replacement failure")
-            real_replace(source, destination)
+        with mock.patch.dict(product_version.os.__dict__):
+            product_version.os.__dict__.pop("fchmod", None)
+            with mock.patch.object(
+                product_version.os, "chmod", wraps=real_chmod
+            ) as chmod:
+                def replace_staged(source: Path, destination: Path) -> None:
+                    self.assertEqual(source.parent, destination.parent)
+                    chmod.assert_any_call(source, modes[destination])
+                    self.assertEqual(stat.S_IMODE(source.stat().st_mode), modes[destination])
+                    self.assertEqual(destination.read_bytes(), before[destination])
+                    self.assertEqual(
+                        source.read_bytes(),
+                        before[destination].replace(b"1.0.8", b"1.0.9", 1),
+                    )
+                    real_replace(source, destination)
+                    replaced.append(destination)
 
-        with mock.patch.object(
-            product_version.os, "replace", side_effect=fail_second_replace
-        ), self.assertRaises(OSError):
-            product_version.bump_versions(fixture.paths, "1.0.8")
-        self.assertGreaterEqual(calls, 3)
+                with mock.patch.object(
+                    product_version.os, "replace", side_effect=replace_staged
+                ):
+                    result = product_version.bump_versions(fixture.paths, "1.0.8")
+
+        self.assertEqual(result.current, "1.0.9")
+        self.assertEqual(replaced, list(fixture.paths.ordered()))
+        for path, original in before.items():
+            self.assertEqual(path.read_bytes(), original.replace(b"1.0.8", b"1.0.9", 1))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), modes[path])
+        self.assertEqual(list(Path(fixture.directory.name).rglob(".*")), [])
+
+    def test_chmod_failure_without_fchmod_leaves_targets_unchanged(self) -> None:
+        fixture = self.use_fixture("1.0.8")
+        before = fixture.snapshot()
+        with mock.patch.dict(product_version.os.__dict__):
+            product_version.os.__dict__.pop("fchmod", None)
+            with mock.patch.object(
+                product_version.os, "chmod", side_effect=OSError("fixture chmod failure")
+            ), mock.patch.object(product_version.os, "replace") as replace:
+                with self.assertRaisesRegex(OSError, "fixture chmod failure"):
+                    product_version.bump_versions(fixture.paths, "1.0.8")
+                replace.assert_not_called()
         self.assertEqual(before, fixture.snapshot())
+        self.assertEqual(list(Path(fixture.directory.name).rglob(".*")), [])
+
+    def test_fchmod_failure_is_not_retried_with_chmod(self) -> None:
+        fixture = self.use_fixture("1.0.8")
+        before = fixture.snapshot()
+        with mock.patch.object(
+            product_version.os,
+            "fchmod",
+            side_effect=OSError("fixture fchmod failure"),
+            create=True,
+        ), mock.patch.object(product_version.os, "chmod") as chmod, mock.patch.object(
+            product_version.os, "replace"
+        ) as replace:
+            with self.assertRaisesRegex(OSError, "fixture fchmod failure"):
+                product_version.bump_versions(fixture.paths, "1.0.8")
+            chmod.assert_not_called()
+            replace.assert_not_called()
+        self.assertEqual(before, fixture.snapshot())
+        self.assertEqual(list(Path(fixture.directory.name).rglob(".*")), [])
+
+    def test_atomic_commit_failure_rolls_back_every_target(self) -> None:
+        for without_fchmod in (False, True):
+            with self.subTest(without_fchmod=without_fchmod):
+                fixture = self.use_fixture("1.0.8")
+                before = fixture.snapshot()
+                modes = {path: stat.S_IMODE(path.stat().st_mode) for path in before}
+                real_replace = product_version.os.replace
+                calls = 0
+
+                def fail_second_replace(
+                    source: Path, destination: Path, _replace=real_replace
+                ) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise OSError("fixture replacement failure")
+                    _replace(source, destination)
+
+                with mock.patch.dict(product_version.os.__dict__):
+                    if without_fchmod:
+                        product_version.os.__dict__.pop("fchmod", None)
+                    with mock.patch.object(
+                        product_version.os, "replace", side_effect=fail_second_replace
+                    ), self.assertRaisesRegex(OSError, "fixture replacement failure"):
+                        product_version.bump_versions(fixture.paths, "1.0.8")
+                self.assertGreaterEqual(calls, 3)
+                self.assertEqual(before, fixture.snapshot())
+                for path in before:
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), modes[path])
+                self.assertEqual(list(Path(fixture.directory.name).rglob(".*")), [])
 
 
 if __name__ == "__main__":

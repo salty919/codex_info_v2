@@ -424,7 +424,11 @@ def _write_staged(path: Path, data: bytes, mode: int, label: str) -> Path:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(fd, mode)
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, mode)
+        else:
+            os.chmod(temporary, mode)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
