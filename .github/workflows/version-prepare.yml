@@ -34,7 +34,6 @@ jobs:
       generated_observer: ${{ steps.prepare.outputs.generated_observer }}
       event_observer: ${{ steps.current.outputs.observer }}
       observer_reason: ${{ steps.current.outputs.reason }}
-      native_reuse_artifact: ${{ steps.native-reuse.outputs.artifact }}
     steps:
       - name: Read the current pull request once
         id: current
@@ -345,13 +344,40 @@ jobs:
             -f context='main-pr-quality/current-head' \
             -f description='Selected release quality is running' >/dev/null
 
+  # Resolve data-only evidence in a separate runner with no repository writes.
+  # PR objects are fetched for tree/ancestry comparisons, never checked out.
+  native-reuse:
+    name: Resolve optional native quality evidence
+    needs: [version-prepared]
+    if: needs.version-prepared.outputs.ready == 'true' && contains(fromJSON(needs.version-prepared.outputs.selection_json).owners, 'LINUX_BACKEND')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      native_reuse_artifact: ${{ steps.native-reuse.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch exact quality objects without checking out PR code
+        env:
+          SOURCE_SHA: ${{ needs.version-prepared.outputs.quality_sha }}
+          MAIN_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TRUSTED_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$MAIN_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$TRUSTED_SHA" ]]
+          git fetch --no-tags origin "$SOURCE_SHA" "$MAIN_BASE_SHA"
       - name: Resolve exact prior native quality evidence
         id: native-reuse
-        if: steps.prepare.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_SHA: ${{ steps.prepare.outputs.quality_sha }}
+          SOURCE_SHA: ${{ needs.version-prepared.outputs.quality_sha }}
           MAIN_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TRUSTED_SHA: ${{ github.workflow_sha }}
         run: python3 .github/scripts/native_quality_proof.py resolve
@@ -367,8 +393,8 @@ jobs:
 
   selective-quality:
     name: Run selected quality owners
-    needs: [version-prepared]
-    if: needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared, native-reuse]
+    if: always() && !cancelled() && needs.version-prepared.result == 'success' && needs.version-prepared.outputs.ready == 'true'
     uses: ./.github/workflows/selective-quality.yml
     with:
       source_sha: ${{ needs.version-prepared.outputs.quality_sha }}
@@ -376,7 +402,7 @@ jobs:
       head_ref: ${{ github.event.pull_request.head.ref }}
       pr_number: ${{ github.event.pull_request.number }}
       selection_json: ${{ needs.version-prepared.outputs.selection_json }}
-      native_reuse_artifact: ${{ needs.version-prepared.outputs.native_reuse_artifact }}
+      native_reuse_artifact: ${{ needs.native-reuse.result == 'success' && needs.native-reuse.outputs.native_reuse_artifact || '' }}
       release_preflight: true
       release_candidate: true
     permissions:

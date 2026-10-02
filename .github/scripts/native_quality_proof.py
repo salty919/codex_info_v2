@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-import xml.etree.ElementTree as ET  # nosec B405
+import xml.etree.ElementTree as ET
 import zipfile
 
 MAX_ARCHIVE = 16 * 1024 * 1024
@@ -80,10 +80,15 @@ def read_xml(data: bytes):
     declaration = b'<!DOCTYPE coverage SYSTEM "https://cobertura.sourceforge.net/xml/coverage-04.dtd">'
     if not data or len(data) > MAX_REPORT:
         raise ValueError("coverage XML is out of bounds")
-    data = data.replace(declaration, b"", 1)
-    if re.search(br"<!\s*(DOCTYPE|ENTITY)\b", data, re.I):
+    # Inspect the same decoded text that is parsed. UTF-16/32 declarations
+    # must not bypass the DTD/ENTITY check through interleaved NUL bytes.
+    text = data.decode("utf-8-sig")
+    if "\x00" in text:
+        raise ValueError("coverage XML must be UTF-8 without NUL bytes")
+    text = text.replace(declaration.decode("ascii"), "", 1)
+    if re.search(r"<!\s*(DOCTYPE|ENTITY)\b", text, re.I):
         raise ValueError("coverage XML is unsafe or out of bounds")
-    root = ET.fromstring(data)
+    root = ET.fromstring(text)
     if root.tag != "coverage" or not re.fullmatch(r"[1-9][0-9]*", root.get("lines-valid", "")):
         raise ValueError("coverage report has no valid lines")
     if any(re.match(r"(?:/|[A-Za-z]:[\\/])", node.get("filename", "")) for node in root.iter("class")):

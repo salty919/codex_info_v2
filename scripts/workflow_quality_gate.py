@@ -210,6 +210,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         feat_classify = _job(feat, "classify")
         feat_quality = _job(feat, "selective-quality")
         prepared = _job(version, "version-prepared")
+        native_reuse = _job(version, "native-reuse")
         version_quality = _job(version, "selective-quality")
         acceptance = _job(version, "acceptance")
         selective_windows = _job(selective, "windows-quality")
@@ -277,6 +278,47 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "pull-requests": "read",
             "statuses": "write",
         })
+        # PR tree/index operations stay in the version writer. Later Python
+        # execution belongs to the trusted, read-only evidence runner.
+        prepare_step = _step(prepared, step_id="prepare")
+        prepared_steps = prepared["steps"]
+        if prepared_steps[prepared_steps.index(prepare_step) + 1:]:
+            errors.append("workflow wiring version.prepared: execution follows PR tree preparation")
+        if "native_reuse_artifact" in prepared.get("outputs", {}):
+            errors.append("workflow wiring version.prepared: evidence resolver remains in the writer")
+        expect("native-reuse.permissions", native_reuse.get("permissions"), {
+            "actions": "read", "contents": "read",
+        })
+        expect("native-reuse.needs", native_reuse.get("needs"), ["version-prepared"])
+        expect("native-reuse.if", native_reuse.get("if"),
+               "needs.version-prepared.outputs.ready == 'true' && contains(fromJSON(needs.version-prepared.outputs.selection_json).owners, 'LINUX_BACKEND')")
+        expect("native-reuse.continue-on-error", native_reuse.get("continue-on-error"), None)
+        expect("native-reuse.outputs", native_reuse.get("outputs"), {
+            "native_reuse_artifact": "${{ steps.native-reuse.outputs.artifact }}",
+        })
+        expect("native-reuse.checkout", _step(native_reuse, uses="actions/checkout@v5").get("with"), {
+            "ref": "${{ github.workflow_sha }}", "fetch-depth": 0,
+            "persist-credentials": False,
+        })
+        evidence_env = {
+            "SOURCE_SHA": "${{ needs.version-prepared.outputs.quality_sha }}",
+            "MAIN_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+            "TRUSTED_SHA": "${{ github.workflow_sha }}",
+        }
+        fetch = _step(native_reuse, name="Fetch exact quality objects without checking out PR code")
+        expect("native-reuse.fetch.env", fetch.get("env"), evidence_env)
+        fetch_script = fetch.get("run", "")
+        if ('git fetch --no-tags origin "$SOURCE_SHA" "$MAIN_BASE_SHA"' not in fetch_script
+                or '[[ "$(git rev-parse HEAD)" == "$TRUSTED_SHA" ]]' not in fetch_script
+                or any(command in fetch_script for command in ("git checkout", "git switch", "git reset", "git read-tree"))):
+            errors.append("workflow wiring native-reuse: PR code can replace trusted checkout")
+        resolver = _step(native_reuse, step_id="native-reuse")
+        expect("native-reuse.resolver.env", resolver.get("env"), {
+            "GH_TOKEN": "${{ github.token }}", "REPOSITORY": "${{ github.repository }}",
+            **evidence_env,
+        })
+        expect("native-reuse.resolver.run", resolver.get("run"),
+               "python3 .github/scripts/native_quality_proof.py resolve")
         expect("acceptance.permissions", acceptance.get("permissions"), {
             "statuses": "write",
         })
@@ -327,8 +369,9 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "release_preflight": True,
             "preflight_plan": "${{ needs.classify.outputs.preflight_plan }}",
         })
-        expect("version.quality.needs", version_quality.get("needs"), ["version-prepared"])
-        expect("version.quality.if", version_quality.get("if"), "needs.version-prepared.outputs.ready == 'true'")
+        expect("version.quality.needs", version_quality.get("needs"), ["version-prepared", "native-reuse"])
+        expect("version.quality.if", version_quality.get("if"),
+               "always() && !cancelled() && needs.version-prepared.result == 'success' && needs.version-prepared.outputs.ready == 'true'")
         expect("version.quality.uses", version_quality.get("uses"), "./.github/workflows/selective-quality.yml")
         expect("version.quality.continue-on-error", version_quality.get("continue-on-error"), None)
         mapping("version.quality", version_quality.get("with"), {
@@ -337,6 +380,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "head_ref": "${{ github.event.pull_request.head.ref }}",
             "pr_number": "${{ github.event.pull_request.number }}",
             "selection_json": "${{ needs.version-prepared.outputs.selection_json }}",
+            "native_reuse_artifact": "${{ needs.native-reuse.result == 'success' && needs.native-reuse.outputs.native_reuse_artifact || '' }}",
             "release_candidate": True,
             "release_preflight": True,
         })
@@ -395,6 +439,9 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "source_sha": "${{ inputs.source_sha }}",
             "pr_number": "${{ inputs.pr_number }}",
             "release_candidate": "${{ inputs.release_candidate }}",
+        })
+        mapping("selective.native", _job(selective, "linux-backend-quality").get("with"), {
+            "pr_number": "${{ inputs.pr_number }}",
         })
         mapping("selective.windows", selective_windows.get("with"), {
             "pr_number": "${{ inputs.pr_number }}",
@@ -520,7 +567,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
                           "Preserve native coverage for isolated upload"]
         if [order.index(name) for name in expected_order] != sorted(order.index(name) for name in expected_order):
             errors.append("workflow wiring native proof: coverage can precede successful Clippy")
-        bridge = _step(prepared, name="Bridge verified native coverage within this run")
+        bridge = _step(native_reuse, name="Bridge verified native coverage within this run")
         expect("version.bridge.continue-on-error", bridge.get("continue-on-error"), True)
         mapping("version.bridge", bridge.get("with"), {"retention-days": 1})
         for document, job_id in ((docs["rust.yml"], "native-quality"),
@@ -3635,6 +3682,15 @@ def workflow_selection_self_test() -> int:
         baseline["selective-quality.yml"]
     )
     mutations = (
+        ("version-prepare.yml",
+         "contents: read\n    outputs:\n      native_reuse_artifact:",
+         "contents: write\n    outputs:\n      native_reuse_artifact:"),
+        ("version-prepare.yml",
+         "ref: ${{ github.workflow_sha }}\n          fetch-depth: 0\n          persist-credentials: false",
+         "ref: ${{ needs.version-prepared.outputs.quality_sha }}\n          fetch-depth: 0\n          persist-credentials: false"),
+        ("version-prepare.yml",
+         "always() && !cancelled() && needs.version-prepared.result == 'success'",
+         "needs.version-prepared.result == 'success'"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
         ("feat-integration.yml", '"$integration_sha" == "$BASE_SHA"', '"$integration_sha" != "$BASE_SHA"'),
@@ -3705,6 +3761,15 @@ def self_test() -> int:
         raise AssertionError("production workflow contract failed: " + "; ".join(errors))
 
     mutations = (
+        ("version-prepare.yml",
+         "contents: read\n    outputs:\n      native_reuse_artifact:",
+         "contents: write\n    outputs:\n      native_reuse_artifact:"),
+        ("version-prepare.yml",
+         "ref: ${{ github.workflow_sha }}\n          fetch-depth: 0\n          persist-credentials: false",
+         "ref: ${{ needs.version-prepared.outputs.quality_sha }}\n          fetch-depth: 0\n          persist-credentials: false"),
+        ("version-prepare.yml",
+         "always() && !cancelled() && needs.version-prepared.result == 'success'",
+         "needs.version-prepared.result == 'success'"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
         ("feat-integration.yml", '"$integration_sha" == "$BASE_SHA"', '"$integration_sha" != "$BASE_SHA"'),
@@ -3779,7 +3844,7 @@ def self_test() -> int:
         ),
         (
             "feat-integration.yml",
-            "ref: ${{ github.event.pull_request.base.sha }}",
+            "ref: ${{ github.workflow_sha }}",
             "ref: ${{ github.event.pull_request.head.sha }}",
         ),
         (

@@ -169,6 +169,7 @@ os.execvp(args[0],args)
         (self.repo / REPORT).unlink()
 
     def resolve(self, env=None):
+        self.run_script(step("version-prepare.yml", "Fetch exact quality objects without checking out PR code")["run"], env)
         self.run_script(step("version-prepare.yml", "Resolve exact prior native quality evidence")["run"], env)
         return self.outputs().get("artifact", "")
 
@@ -213,6 +214,30 @@ os.execvp(args[0],args)
         self.assertEqual(result, 9, "daemon failure must still reach the workflow result")
         self.assertEqual(self.native_calls(), ["build"])
 
+    def test_source_helper_never_replaces_the_read_only_resolver(self):
+        self.prepare_producer()
+        self.git("checkout", "-q", "--detach", self.quality)
+        helper = self.repo / ".github/scripts/native_quality_proof.py"
+        helper.write_text('raise SystemExit("UNTRUSTED_HELPER_EXECUTED")\n')
+        self.git("add", "."); self.git("commit", "-qm", "untrusted helper")
+        self.quality = self.git("rev-parse", "HEAD").strip()
+        self.environment["SOURCE_SHA"] = self.quality
+        self.git("checkout", "-q", "--detach", self.base)
+        trusted_helper = helper.read_bytes()
+        self.assertEqual(self.resolve(), "", "changed source tree must receive fresh checks")
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.base)
+        self.assertEqual(helper.read_bytes(), trusted_helper)
+        self.assertEqual(self.git("diff", "--name-only"), "")
+
+    def test_resolver_fetch_failure_leaves_native_checks_fresh(self):
+        self.prepare_producer()
+        fetch = step("version-prepare.yml", "Fetch exact quality objects without checking out PR code")
+        result = self.run_script(fetch["run"], {"SOURCE_SHA": "0" * 40}, ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.base)
+        self.assertFalse(self.leaf(bridge=False)[0])
+        self.assertEqual(self.native_calls(), ["llvm-cov", "clippy", "build"])
+
     def test_api_failure_runs_native_checks_fresh(self):
         self.prepare_producer()
         env = {"FIXTURE_API_FAILURE": "true"}
@@ -255,7 +280,13 @@ os.execvp(args[0],args)
 
     def test_changed_workflow_definition_runs_native_checks_fresh(self):
         self.prepare_producer()
-        changed = {"TRUSTED_SHA": "f" * 40}
+        # A new trusted workflow is actually checked out on the new runner.
+        # A fabricated SHA cannot satisfy its HEAD binding.
+        workflow = self.repo / ".github/workflows/fixture.yml"
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.write_text("name: updated trusted workflow\n")
+        self.git("add", "--", ".github/workflows/fixture.yml"); self.git("commit", "-qm", "trusted workflow update")
+        changed = {"TRUSTED_SHA": self.git("rev-parse", "HEAD").strip()}
         self.assertEqual(self.resolve(changed), "")
         self.assertFalse(self.leaf(env=changed)[0])
         self.assertEqual(self.native_calls(), ["llvm-cov", "clippy", "build"])

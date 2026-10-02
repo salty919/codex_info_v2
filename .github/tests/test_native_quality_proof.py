@@ -97,6 +97,12 @@ class NativeProofTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.module.read_xml(unsafe)
 
+    def test_multibyte_encoding_cannot_bypass_entity_rejection(self):
+        payload = '<!DOCTYPE coverage [<!ENTITY injected "encoding-bypass">]><coverage lines-valid="2">&injected;</coverage>'
+        for encoding in ("utf-16", "utf-16-le", "utf-32", "utf-32-le"):
+            with self.subTest(encoding=encoding), self.assertRaises(ValueError):
+                self.module.read_xml(payload.encode(encoding))
+
     def test_missing_or_unsafe_metadata_is_not_evidence(self):
         for data in (b'<coverage lines-valid="2"/>', b'<!DOCTYPE coverage><coverage/>',
                      b'<coverage codex-native-proof="not json"/>'):
