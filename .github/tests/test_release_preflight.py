@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 # required tool API; individual execution calls remain reviewed.
 import sys
 import tempfile
 import unittest
@@ -40,12 +40,14 @@ class PlannedReleaseTests(unittest.TestCase):
         self.source = self.git("rev-parse", "HEAD").strip()
 
     def git(self, *args):
-        return subprocess.check_output(
+        return subprocess.check_output(  # nosec B603 # absolute Git and fixed offline fixture argv.
             [GIT, "-C", str(self.repo), *args], text=True, shell=False,
         )
 
     def call(self, *args, ok=True):
-        result = subprocess.run(
+        # Fixed current interpreter/helper and temp Git data; negative exits are asserted below.
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        result = subprocess.run(  # nosec B603 # fixed Python/helper, offline fixture argv, no shell.
             [sys.executable, str(ROOT / ".github/scripts/release_preflight.py"), *args],
             cwd=self.repo, text=True, capture_output=True, shell=False, check=False,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},

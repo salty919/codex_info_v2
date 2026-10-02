@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 # required tool API; individual execution calls remain reviewed.
 import sys
 import tempfile
 import unittest
@@ -54,6 +54,16 @@ class WorkflowReuseTests(unittest.TestCase):
         self.git("remote", "add", "origin", self.repo.as_uri())
         self.bin = self.case / "bin"; self.bin.mkdir()
         self.runner = self.case / "runner"; self.runner.mkdir()
+        python_bin = self.runner / "native-proof-venv/bin"
+        python_bin.mkdir(parents=True)
+        # A symlink in another bin directory loses this venv's pyvenv.cfg.
+        # Use the current verified interpreter without downloading per fixture.
+        launcher = python_bin / "python"
+        launcher.write_text(
+            "#!" + sys.executable + "\nimport os, sys\n"
+            + f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+        )
+        launcher.chmod(0o755)
         self.calls = self.case / "calls.jsonl"
         self.state = self.case / "api.json"
         self.output = self.case / "output"
@@ -114,7 +124,7 @@ os.execvp(args[0],args)
         path.chmod(0o755)
 
     def git(self, *args):
-        return subprocess.check_output(
+        return subprocess.check_output(  # nosec B603 # absolute Git and fixed offline fixture argv.
             [GIT, "-C", str(self.repo), *args], text=True, shell=False, stderr=subprocess.DEVNULL,
         )
 
@@ -122,7 +132,8 @@ os.execvp(args[0],args)
         self.state.write_text(json.dumps(self.api))
 
     def run_script(self, source, env=None, ok=True):
-        result = subprocess.run(
+        # source is checked-in workflow text or a literal fixture, run against local tool stubs.
+        result = subprocess.run(  # nosec B603 # finite trusted caller script, offline stubs, no shell=True.
             [BASH, "-euo", "pipefail", "-c", source], cwd=self.repo,
             env={**self.environment, **(env or {})}, text=True, capture_output=True,
             shell=False, check=False,
@@ -214,6 +225,29 @@ os.execvp(args[0],args)
 
     def native_calls(self):
         return [item[1] for item in map(json.loads, self.calls.read_text().splitlines()) if item[0] == "cargo"]
+
+    def test_parser_setup_failure_keeps_native_checks_fresh(self):
+        self.prepare_producer()
+        self.assertTrue(self.resolve())
+        (self.runner / "native-proof-venv/bin/python").unlink()
+        probe = step("rust.yml", "Match actual native runtime before reuse")
+        resolver = step("version-prepare.yml", "Resolve exact prior native quality evidence")
+        self.assertEqual(probe["if"], "steps.native-parser.outcome == 'success'")
+        self.assertEqual(resolver["if"], "steps.native-parser.outcome == 'success'")
+        reused, result = self.leaf()
+        self.assertFalse(reused)
+        self.assertEqual(result, 0)
+        self.assertEqual(self.native_calls(), ["llvm-cov", "clippy", "build"])
+
+    def test_isolated_parser_ignores_product_pythonpath(self):
+        self.prepare_producer()
+        self.assertTrue(self.resolve())
+        shadow = self.case / "shadow/defusedxml"
+        shadow.mkdir(parents=True)
+        (shadow / "__init__.py").write_text('raise SystemExit("UNTRUSTED_XML_MODULE")\n')
+        reused, result = self.leaf(env={"PYTHONPATH": str(shadow.parent)})
+        self.assertTrue(reused)
+        self.assertEqual(result, 0)
 
     def test_real_resolver_bridge_leaf_reuses_only_two_checks(self):
         self.prepare_producer()

@@ -5,19 +5,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
-import unittest
 import textwrap
+import unittest
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_NAMES = (
@@ -318,7 +318,8 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             **evidence_env,
         })
         expect("native-reuse.resolver.run", resolver.get("run"),
-               "python3 .github/scripts/native_quality_proof.py resolve")
+               '"$RUNNER_TEMP/native-proof-venv/bin/python" -I .github/scripts/native_quality_proof.py resolve')
+        expect("native-reuse.resolver.if", resolver.get("if"), "steps.native-parser.outcome == 'success'")
         expect("acceptance.permissions", acceptance.get("permissions"), {
             "statuses": "write",
         })
@@ -541,7 +542,24 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
 
         # Reuse is optional; only the trusted runtime probe may suppress these
         # two checks. Every release behavior and public candidate guard stays.
+        parser_pin = next(line for line in (ROOT / ".github/requirements-native-proof.txt").read_text().splitlines()
+                          if line and not line.startswith("#"))
+        for parser_job in (rust_job, native_reuse, _job(selective, "governance-quality")):
+            parser_step = next(item for item in parser_job["steps"] if item.get("name") in {
+                "Install isolated native proof parser", "Install isolated CI parser dependency",
+            })
+            parser_script = parser_step.get("run", "")
+            if any(marker not in parser_script for marker in (
+                    parser_pin, "--only-binary=:all:", "--no-deps", "--require-hashes",
+                    '"$RUNNER_TEMP/native-proof-venv/bin/python" -I -m pip install')):
+                errors.append("workflow wiring native proof: parser dependency is not isolated and hash locked")
+            if parser_job is not _job(selective, "governance-quality"):
+                expect("native-parser.continue-on-error", parser_step.get("continue-on-error"), True)
+                expect("native-parser.id", parser_step.get("id"), "native-parser")
         native_probe = _step(rust_job, step_id="native-proof")
+        expect("rust.probe.if", native_probe.get("if"), "steps.native-parser.outcome == 'success'")
+        if '"$RUNNER_TEMP/native-proof-venv/bin/python" -I "$RUNNER_TEMP/native_quality_proof.py" probe' not in native_probe.get("run", ""):
+            errors.append("workflow wiring native proof: probe parser is not isolated")
         expect("rust.probe.continue-on-error", native_probe.get("continue-on-error"), True)
         mapping("rust.probe.env", native_probe.get("env"), {
             "TRUSTED_SHA": "${{ github.workflow_sha }}",
@@ -558,7 +576,8 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "NATIVE_INPUTS": "${{ steps.native-proof.outputs.inputs_json }}",
         })
         for marker in ('contents/.github/scripts/native_quality_proof.py?ref=$TRUSTED_SHA',
-                       '"$actual_digest" == "$EXPECTED_HELPER_DIGEST"'):
+                       '"$actual_digest" == "$EXPECTED_HELPER_DIGEST"',
+                       '"$RUNNER_TEMP/native-proof-venv/bin/python" -I "$RUNNER_TEMP/native_quality_proof.py" emit'):
             if marker not in str(binding.get("run", "")):
                 errors.append("workflow wiring native proof: emit helper identity is not frozen")
         order = [item.get("name") for item in rust_job["steps"]]
@@ -3652,19 +3671,31 @@ def release_self_test() -> int:
 
 
 def _preflight_caller_tests() -> int:
-    """Run finite real caller fixtures; no product build or external API call."""
-    cases = 0
-    for name in ("test_release_preflight.py", "test_native_quality_proof.py", "test_workflow_reuse.py", "test_snapshot_checkout.py"):
-        path = ROOT / ".github/tests" / name
-        loader = unittest.TestLoader()
-        suite = loader.discover(str(path.parent), pattern=path.name)
-        count = suite.countTestCases()
-        if count <= 0:
-            raise AssertionError("preflight fixture has no cases: " + name)
-        subprocess.run([sys.executable, str(path)], check=True,
-                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
-        cases += count
-    return cases
+    """Finite offline fixtures, with a hash-locked parser bootstrap if absent."""
+    # Existing default-main workflows must also test this PR before promotion.
+    # They do not yet contain the new dependency setup step.
+    with tempfile.TemporaryDirectory(prefix="ci-preflight-python-") as temporary:
+        interpreter = sys.executable
+        environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        if importlib.util.find_spec("defusedxml") is None:
+            venv = Path(temporary) / "venv"
+            _command((sys.executable, "-m", "venv", "--system-site-packages", str(venv)), cwd=ROOT)
+            interpreter = str(venv / "bin/python")
+            _command((interpreter, "-I", "-m", "pip", "install", "--disable-pip-version-check",
+                      "--only-binary=:all:", "--no-deps", "--require-hashes", "-r",
+                      str(ROOT / ".github/requirements-native-proof.txt")), cwd=ROOT)
+            environment["PATH"] = str(venv / "bin") + os.pathsep + environment["PATH"]
+        cases = 0
+        for name in ("test_release_preflight.py", "test_native_quality_proof.py", "test_workflow_reuse.py", "test_snapshot_checkout.py"):
+            path = ROOT / ".github/tests" / name
+            loader = unittest.TestLoader()
+            suite = loader.discover(str(path.parent), pattern=path.name)
+            count = suite.countTestCases()
+            if count <= 0:
+                raise AssertionError("preflight fixture has no cases: " + name)
+            subprocess.run([interpreter, str(path)], check=True, env=environment)
+            cases += count
+        return cases
 
 
 def workflow_selection_self_test() -> int:

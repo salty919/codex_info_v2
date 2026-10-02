@@ -372,15 +372,26 @@ jobs:
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$MAIN_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$(git rev-parse HEAD)" == "$TRUSTED_SHA" ]]
           git fetch --no-tags origin "$SOURCE_SHA" "$MAIN_BASE_SHA"
+      - name: Install isolated native proof parser
+        id: native-parser
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/native-proof-venv"
+          printf '%s\n' 'defusedxml==0.7.1 --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61' > "$RUNNER_TEMP/native-proof-requirements.txt"
+          "$RUNNER_TEMP/native-proof-venv/bin/python" -I -m pip install \
+            --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+            -r "$RUNNER_TEMP/native-proof-requirements.txt"
       - name: Resolve exact prior native quality evidence
         id: native-reuse
+        if: steps.native-parser.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           SOURCE_SHA: ${{ needs.version-prepared.outputs.quality_sha }}
           MAIN_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TRUSTED_SHA: ${{ github.workflow_sha }}
-        run: python3 .github/scripts/native_quality_proof.py resolve
+        run: '"$RUNNER_TEMP/native-proof-venv/bin/python" -I .github/scripts/native_quality_proof.py resolve'
       - name: Bridge verified native coverage within this run
         if: steps.native-reuse.outputs.artifact != ''
         continue-on-error: true

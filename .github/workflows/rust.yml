@@ -87,6 +87,16 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.9.0
           fallback: none
+      - name: Install isolated native proof parser
+        id: native-parser
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/native-proof-venv"
+          printf '%s\n' 'defusedxml==0.7.1 --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61' > "$RUNNER_TEMP/native-proof-requirements.txt"
+          "$RUNNER_TEMP/native-proof-venv/bin/python" -I -m pip install \
+            --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+            -r "$RUNNER_TEMP/native-proof-requirements.txt"
       - name: Download optional verified native coverage
         if: inputs.native_reuse_artifact != ''
         continue-on-error: true
@@ -96,6 +106,7 @@ jobs:
           path: ${{ runner.temp }}/native-reuse-download
       - name: Match actual native runtime before reuse
         id: native-proof
+        if: steps.native-parser.outcome == 'success'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -110,7 +121,7 @@ jobs:
             --jq '.content' | base64 --decode > "$RUNNER_TEMP/native_quality_proof.py"
           helper_digest="$(/usr/bin/sha256sum "$RUNNER_TEMP/native_quality_proof.py" | cut -d ' ' -f 1)"
           printf 'helper_digest=%s\n' "$helper_digest" >> "$GITHUB_OUTPUT"
-          python3 "$RUNNER_TEMP/native_quality_proof.py" probe
+          "$RUNNER_TEMP/native-proof-venv/bin/python" -I "$RUNNER_TEMP/native_quality_proof.py" probe
       - name: Check native formatting
         if: ${{ !inputs.release_candidate }}
         run: cargo fmt --check
@@ -151,7 +162,7 @@ jobs:
             --jq '.content' | base64 --decode > "$RUNNER_TEMP/native_quality_proof.py"
           actual_digest="$(/usr/bin/sha256sum "$RUNNER_TEMP/native_quality_proof.py" | cut -d ' ' -f 1)"
           [[ "$actual_digest" == "$EXPECTED_HELPER_DIGEST" ]] || exit 1
-          python3 "$RUNNER_TEMP/native_quality_proof.py" emit
+          "$RUNNER_TEMP/native-proof-venv/bin/python" -I "$RUNNER_TEMP/native_quality_proof.py" emit
       - name: Preserve native coverage for isolated upload
         uses: actions/upload-artifact@v6
         with:

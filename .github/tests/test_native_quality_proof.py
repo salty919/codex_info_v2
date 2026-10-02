@@ -112,6 +112,17 @@ class NativeProofTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.module.read_xml(unsafe)
 
+    def test_parser_forbids_declarations_even_without_text_prefilter(self):
+        payloads = (
+            '<!DOCTYPE coverage [<!ENTITY injected "value">]><coverage lines-valid="2">&injected;</coverage>',
+            '<!DOCTYPE coverage SYSTEM "file:///etc/passwd"><coverage lines-valid="2"/>',
+            '<!DOCTYPE coverage SYSTEM "https://example.invalid/evil.dtd"><coverage lines-valid="2"/>',
+        )
+        with mock.patch.object(self.module.re, "search", return_value=None):
+            for payload in payloads:
+                with self.subTest(payload=payload), self.assertRaises(ValueError):
+                    self.module.read_xml(payload.encode())
+
     def test_multibyte_encoding_cannot_bypass_entity_rejection(self):
         payload = '<!DOCTYPE coverage [<!ENTITY injected "encoding-bypass">]><coverage lines-valid="2">&injected;</coverage>'
         for encoding in ("utf-16", "utf-16-le", "utf-32", "utf-32-le"):

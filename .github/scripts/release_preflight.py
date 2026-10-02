@@ -13,7 +13,7 @@ import json
 import os
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404 # required tool API; individual execution calls remain reviewed.
 import sys
 import tempfile
 from pathlib import Path

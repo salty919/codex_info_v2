@@ -6,16 +6,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import io
 import json
 import os
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404 # required tool API; individual execution calls remain reviewed.
 import tempfile
-import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
+
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 MAX_ARCHIVE = 16 * 1024 * 1024
 MAX_REPORT = 32 * 1024 * 1024
@@ -104,7 +107,10 @@ def read_xml(data: bytes):
     text = text.replace(declaration.decode("ascii"), "", 1)
     if re.search(r"<!\s*(DOCTYPE|ENTITY)\b", text, re.I):
         raise ValueError("coverage XML is unsafe or out of bounds")
-    root = ET.fromstring(text)
+    try:
+        root = ET.fromstring(text, forbid_dtd=True, forbid_entities=True, forbid_external=True)
+    except DefusedXmlException as error:
+        raise ValueError("coverage XML contains a forbidden declaration") from error
     if root.tag != "coverage" or not re.fullmatch(r"[1-9][0-9]*", root.get("lines-valid", "")):
         raise ValueError("coverage report has no valid lines")
     if any(re.match(r"(?:/|[A-Za-z]:[\\/])", node.get("filename", "")) for node in root.iter("class")):
@@ -184,7 +190,14 @@ def resolve() -> None:
     if current_main != desired["main_base"]:
         print("native-reuse: actual main advanced beyond the event base; fresh checks required")
         return
-    from release_preflight import plan
+    # -I excludes script directories: load only the sibling of this trusted helper.
+    spec = importlib.util.spec_from_file_location(
+        "trusted_release_preflight", Path(__file__).resolve().with_name("release_preflight.py"),
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("trusted release planner is unavailable")
+    preflight = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(preflight)
     runs = api(repository, "actions/workflows/feat-integration.yml/runs?event=pull_request_target&per_page=30")
     for run in runs.get("workflow_runs", []):
         head = run.get("head_sha", "")
@@ -192,7 +205,7 @@ def resolve() -> None:
             continue
         try:
             command("git", "merge-base", "--is-ancestor", head, source)
-            snapshot = plan(head, desired["main_base"], desired["workflow"])
+            snapshot = preflight.plan(head, desired["main_base"], desired["workflow"])
         except (ValueError, RuntimeError, subprocess.SubprocessError):
             continue
         if snapshot["expected_tree"] != desired["tree"] or not snapshot["main_included"]:

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
+import subprocess  # nosec B404 # required tool API; individual execution calls remain reviewed.
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +23,7 @@ LEAF_JOBS = {
 
 
 def git(directory: Path, *arguments: str) -> str:
-    return subprocess.check_output(
+    return subprocess.check_output(  # nosec B603 # absolute Git and fixed offline fixture argv.
         [GIT, "-C", str(directory), *arguments],
         shell=False,
         text=True,
