@@ -336,12 +336,14 @@ class ProductVersionFixtures(unittest.TestCase):
                 real_replace = product_version.os.replace
                 calls = 0
 
-                def fail_second_replace(source: Path, destination: Path) -> None:
+                def fail_second_replace(
+                    source: Path, destination: Path, _replace=real_replace
+                ) -> None:
                     nonlocal calls
                     calls += 1
                     if calls == 2:
                         raise OSError("fixture replacement failure")
-                    real_replace(source, destination)
+                    _replace(source, destination)
 
                 with mock.patch.dict(product_version.os.__dict__):
                     if without_fchmod:
