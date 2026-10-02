@@ -1,0 +1,40 @@
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Dependency review
+
+on:
+  pull_request:
+    branches: [feat/next, main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - '**/Cargo.toml'
+      - '**/*.csproj'
+      - '**/packages.lock.json'
+      - '**/Directory.Packages.props'
+      - windows-client/Directory.Build.props
+      - '**/NuGet.Config'
+      - '**/nuget.config'
+      - '.github/workflows/*.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # API-only: no checkout or execution of PR source, and no PR comments.
+      # Rust licenses remain owned by deny.toml; NuGet allow rules are unspecified.
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          fail-on-scopes: runtime,development,unknown
+          license-check: 'false'
+          vulnerability-check: 'true'
+          comment-summary-in-pr: never
+          retry-on-snapshot-warnings: 'false'
+          show-openssf-scorecard: 'false'
+          warn-only: 'false'
