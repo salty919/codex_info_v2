@@ -4,7 +4,7 @@
 
 import json
 import pathlib
-import subprocess
+import subprocess  # nosec B404 # Required for the reviewed offline workflow fixture.
 import tempfile
 import unittest
 
@@ -80,7 +80,7 @@ class DependencySecurityWorkflowTests(unittest.TestCase):
                 )
                 executable.chmod(0o700)
                 log = root / "args.json"
-                result = subprocess.run(
+                result = subprocess.run(  # nosec B603 # Reviewed Bash; fixture env.
                     ["/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-s"],
                     input=script,
                     env={
