@@ -344,10 +344,68 @@ jobs:
             -f context='main-pr-quality/current-head' \
             -f description='Selected release quality is running' >/dev/null
 
+  # Resolve data-only evidence in a separate runner with no repository writes.
+  # PR objects are fetched for tree/ancestry comparisons, never checked out.
+  native-reuse:
+    name: Resolve optional native quality evidence
+    needs: [version-prepared]
+    if: needs.version-prepared.outputs.ready == 'true' && contains(fromJSON(needs.version-prepared.outputs.selection_json).owners, 'LINUX_BACKEND')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      native_reuse_artifact: ${{ steps.native-reuse.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch exact quality objects without checking out PR code
+        env:
+          SOURCE_SHA: ${{ needs.version-prepared.outputs.quality_sha }}
+          MAIN_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TRUSTED_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$MAIN_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$TRUSTED_SHA" ]]
+          git fetch --no-tags origin "$SOURCE_SHA" "$MAIN_BASE_SHA"
+      - name: Install isolated native proof parser
+        id: native-parser
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/native-proof-venv"
+          printf '%s\n' 'defusedxml==0.7.1 --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61' > "$RUNNER_TEMP/native-proof-requirements.txt"
+          "$RUNNER_TEMP/native-proof-venv/bin/python" -I -m pip install \
+            --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+            -r "$RUNNER_TEMP/native-proof-requirements.txt"
+      - name: Resolve exact prior native quality evidence
+        id: native-reuse
+        if: steps.native-parser.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.version-prepared.outputs.quality_sha }}
+          MAIN_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TRUSTED_SHA: ${{ github.workflow_sha }}
+        run: '"$RUNNER_TEMP/native-proof-venv/bin/python" -I .github/scripts/native_quality_proof.py resolve'
+      - name: Bridge verified native coverage within this run
+        if: steps.native-reuse.outputs.artifact != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.native-reuse.outputs.artifact }}
+          retention-days: 1
+          path: ${{ runner.temp }}/native-reuse/rust.cobertura.xml
+          if-no-files-found: error
+
   selective-quality:
     name: Run selected quality owners
-    needs: [version-prepared]
-    if: needs.version-prepared.outputs.ready == 'true'
+    needs: [version-prepared, native-reuse]
+    if: always() && !cancelled() && needs.version-prepared.result == 'success' && needs.version-prepared.outputs.ready == 'true'
     uses: ./.github/workflows/selective-quality.yml
     with:
       source_sha: ${{ needs.version-prepared.outputs.quality_sha }}
@@ -355,6 +413,8 @@ jobs:
       head_ref: ${{ github.event.pull_request.head.ref }}
       pr_number: ${{ github.event.pull_request.number }}
       selection_json: ${{ needs.version-prepared.outputs.selection_json }}
+      native_reuse_artifact: ${{ needs.native-reuse.result == 'success' && needs.native-reuse.outputs.native_reuse_artifact || '' }}
+      release_preflight: true
       release_candidate: true
     permissions:
       contents: read

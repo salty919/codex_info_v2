@@ -21,6 +21,18 @@ on:
       selection_json:
         required: true
         type: string
+      native_reuse_artifact:
+        description: Optional current-run bridge verified by the existing main authority
+        type: string
+        default: ''
+      release_preflight:
+        description: Run release behavior checks without publication authority
+        type: boolean
+        default: false
+      preflight_plan:
+        description: Trusted read-only prospective release tree, empty for an actual source
+        type: string
+        default: ''
       release_candidate:
         required: true
         type: boolean
@@ -62,6 +74,14 @@ jobs:
         with:
           go-version: '1.25.x'
           cache: false
+      - name: Install isolated CI parser dependency
+        run: |
+          set -euo pipefail
+          python3 -m venv --system-site-packages "$RUNNER_TEMP/native-proof-venv"
+          printf '%s\n' 'defusedxml==0.7.1 --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61' > "$RUNNER_TEMP/native-proof-requirements.txt"
+          "$RUNNER_TEMP/native-proof-venv/bin/python" -I -m pip install \
+            --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
+            -r "$RUNNER_TEMP/native-proof-requirements.txt"
       - name: Validate workflow contracts
         env:
           BASE_SHA: ${{ inputs.base_sha }}
@@ -69,6 +89,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
+          export PATH="$RUNNER_TEMP/native-proof-venv/bin:$PATH"
           if [[ "$RELEASE_CANDIDATE" == false ]]; then
             mapfile -t changed_workflows < <(
               git diff --name-only "$BASE_SHA" "$SOURCE_SHA" -- '.github/workflows/*.yml'
@@ -116,6 +137,11 @@ jobs:
     uses: ./.github/workflows/rust.yml
     with:
       source_sha: ${{ inputs.source_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      pr_number: ${{ inputs.pr_number }}
+      native_reuse_artifact: ${{ inputs.native_reuse_artifact }}
+      release_preflight: ${{ inputs.release_preflight && fromJSON(inputs.selection_json).binary_impact }}
+      preflight_plan: ${{ inputs.preflight_plan }}
       release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
     permissions:
       contents: read
@@ -126,6 +152,8 @@ jobs:
     uses: ./.github/workflows/linux-ui-quality.yml
     with:
       source_sha: ${{ inputs.source_sha }}
+      release_preflight: ${{ inputs.release_preflight && fromJSON(inputs.selection_json).binary_impact }}
+      preflight_plan: ${{ inputs.preflight_plan }}
       release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
     permissions:
       contents: read
@@ -137,6 +165,8 @@ jobs:
     with:
       source_sha: ${{ inputs.source_sha }}
       pr_number: ${{ inputs.pr_number }}
+      release_preflight: ${{ inputs.release_preflight && fromJSON(inputs.selection_json).binary_impact }}
+      preflight_plan: ${{ inputs.preflight_plan }}
       release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
     permissions:
       contents: read
@@ -160,6 +190,8 @@ jobs:
     with:
       source_sha: ${{ inputs.source_sha }}
       pr_number: ${{ inputs.pr_number }}
+      release_preflight: ${{ inputs.release_preflight }}
+      preflight_plan: ${{ inputs.preflight_plan }}
       release_candidate: ${{ inputs.release_candidate }}
     permissions:
       contents: read
