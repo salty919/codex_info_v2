@@ -24,7 +24,7 @@ jobs:
       contents: read
     steps:
       - name: Check out trusted coverage orchestration
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
@@ -57,7 +57,7 @@ jobs:
 
       - name: Download native coverage
         if: steps.pair.outputs.ready == 'true'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           run-id: ${{ github.event.workflow_run.id }}
           name: ${{ steps.pair.outputs.rust_name }}
@@ -66,7 +66,7 @@ jobs:
 
       - name: Download Windows coverage
         if: steps.pair.outputs.ready == 'true'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           run-id: ${{ github.event.workflow_run.id }}
           name: ${{ steps.pair.outputs.windows_name }}
@@ -75,7 +75,7 @@ jobs:
 
       - name: Check out the exact tested source without credentials
         if: steps.pair.outputs.ready == 'true'
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ steps.pair.outputs.source_sha }}
           path: source
