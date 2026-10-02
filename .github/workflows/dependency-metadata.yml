@@ -1,0 +1,41 @@
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Dependency metadata and Python/Actions advisories
+
+on:
+  pull_request:
+    branches: [feat/next, main]
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Collect and audit dependency metadata
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPORT: ${{ runner.temp }}/dependency-metadata.json
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/dependency_metadata.py --root . --output "$REPORT"
+      - name: Preserve metadata and explicit review requirements
+        if: always()
+        shell: bash
+        env:
+          REPORT: ${{ runner.temp }}/dependency-metadata.json
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n' 'License collection is not approval; review_required entries need an owner decision.' '```json'
+            cat "$REPORT"
+            printf '%s\n' '```'
+          } >> "$GITHUB_STEP_SUMMARY"

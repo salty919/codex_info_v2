@@ -3687,7 +3687,9 @@ def _preflight_caller_tests() -> int:
                       str(ROOT / ".github/requirements-native-proof.txt")), cwd=ROOT)
             environment["PATH"] = str(venv / "bin") + os.pathsep + environment["PATH"]
         cases = 0
-        for name in ("test_release_preflight.py", "test_native_quality_proof.py", "test_workflow_reuse.py", "test_snapshot_checkout.py"):
+        for name in ("test_release_preflight.py", "test_native_quality_proof.py",
+                     "test_workflow_reuse.py", "test_snapshot_checkout.py",
+                     "test_dependency_security_workflows.py", "test_dependency_metadata.py"):
             path = ROOT / ".github/tests" / name
             loader = unittest.TestLoader()
             suite = loader.discover(str(path.parent), pattern=path.name)
