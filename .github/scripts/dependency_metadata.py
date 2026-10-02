@@ -91,15 +91,15 @@ class Client:
 def steps(data):
     jobs = data.get("jobs", {})
     if not isinstance(jobs, dict):
-        raise ValueError("workflow jobs are not a mapping")
+        raise TypeError("workflow jobs are not a mapping")
     for job in jobs.values():
         if not isinstance(job, dict):
-            raise ValueError("workflow job is not a mapping")
+            raise TypeError("workflow job is not a mapping")
         if "uses" in job:
             yield job
         for step in job.get("steps", []):
             if not isinstance(step, dict):
-                raise ValueError("workflow step is not a mapping")
+                raise TypeError("workflow step is not a mapping")
             yield step
 
 
@@ -112,7 +112,7 @@ def inventory(root):
             raise ValueError("unsupported NuGet lock schema: " + str(path.relative_to(root)))
         for target, entries in lock["dependencies"].items():
             if not isinstance(entries, dict):
-                raise ValueError("NuGet target graph is incomplete")
+                raise TypeError("NuGet target graph is incomplete")
             for name, entry in entries.items():
                 kind = entry.get("type")
                 if kind == "Project":
@@ -142,7 +142,7 @@ def inventory(root):
     for path in sorted((root / ".github/workflows").glob("*.yml")):
         data = yaml.safe_load(path.read_text())
         if not isinstance(data, dict):
-            raise ValueError("workflow is not a mapping")
+            raise TypeError("workflow is not a mapping")
         for step in steps(data):
             for declaration in INLINE_PIN.findall(step.get("run", "")):
                 if declaration != declarations.get("defusedxml"):
@@ -155,7 +155,7 @@ def inventory(root):
             if use is None:
                 continue
             if not isinstance(use, str):
-                raise ValueError("workflow uses is not a literal string")
+                raise TypeError("workflow uses is not a literal string")
             if use.startswith("./"):
                 local.append({"path": str(path.relative_to(root)), "uses": use})
                 continue
@@ -189,7 +189,7 @@ def inventory(root):
 
 def license_metadata(data, ecosystem, source):
     if not isinstance(data, dict):
-        raise ValueError("license metadata is not an object")
+        raise TypeError("license metadata is not an object")
     if ecosystem == "NuGet":
         expression, url = data.get("licenseExpression"), data.get("licenseUrl")
         text, classifiers = None, []
@@ -202,27 +202,27 @@ def license_metadata(data, ecosystem, source):
             not isinstance(key, str) or (value is not None and not isinstance(value, str))
             for key, value in urls.items()
         ):
-            raise ValueError("PyPI project_urls is not a nullable string mapping")
+            raise TypeError("PyPI project_urls is not a nullable string mapping")
         url = urls.get("License") or urls.get("license")
         declared = data.get("classifiers")
         if declared is None:
             declared = []
         if not isinstance(declared, list) or any(not isinstance(item, str) for item in declared):
-            raise ValueError("PyPI classifiers is not a string array")
+            raise TypeError("PyPI classifiers is not a string array")
         classifiers = [item for item in declared if item.startswith("License ::")]
     elif ecosystem == "GitHub Actions":
         license_info = data.get("license")
         if license_info is None:
             license_info = {}
         if not isinstance(license_info, dict):
-            raise ValueError("GitHub license metadata is not an object")
+            raise TypeError("GitHub license metadata is not an object")
         expression = license_info.get("spdx_id")
         url, text, classifiers = data.get("html_url"), None, []
     else:
         raise ValueError("unsupported license metadata ecosystem")
     for field, value in (("expression", expression), ("url", url), ("text", text)):
         if value is not None and not isinstance(value, str):
-            raise ValueError("license " + field + " is not a nullable string")
+            raise TypeError("license " + field + " is not a nullable string")
     if expression == "NOASSERTION":
         expression = None
     return {"expression": expression, "text": text, "classifiers": classifiers,
@@ -239,7 +239,7 @@ def action_metadata(action, fetch):
         raise ValueError("action reference did not resolve to its exact commit")
     tags = fetch(base + "/tags?per_page=100")
     if not isinstance(tags, list):
-        raise ValueError("action tags metadata is not an array")
+        raise TypeError("action tags metadata is not an array")
     versions = set()
     for tag in tags:
         match = VERSION.fullmatch(tag.get("name", ""))

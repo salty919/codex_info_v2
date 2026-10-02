@@ -76,7 +76,14 @@ class DependencyMetadataTests(unittest.TestCase):
         self.assertEqual(result[0]["advisories"], [])
         self.assertEqual(result[1]["advisories"], ["GHSA-test"])
         self.assertEqual(fetch.call_args.args[1], {"queries": queries})
-        for response in ({}, {"results": [{}]}, {"results": [{}, {"next_page_token": "more"}]}):
+        for response in (
+            {},
+            {"results": [{}]},
+            {"results": [
+                {},
+                {"next_page_token": "more"},  # nosec B105 # Public OSV cursor fixture.
+            ]},
+        ):
             with self.subTest(response=response), self.assertRaises(ValueError):
                 module.audit_osv(queries, mock.Mock(return_value=response))
         with self.assertRaises(OSError):
@@ -115,7 +122,7 @@ class DependencyMetadataTests(unittest.TestCase):
             ("GitHub Actions", {"license": {"spdx_id": []}}),
         ]
         for ecosystem, metadata in invalid:
-            with self.subTest(ecosystem=ecosystem, metadata=metadata), self.assertRaises(ValueError):
+            with self.subTest(ecosystem=ecosystem, metadata=metadata), self.assertRaises(TypeError):
                 module.license_metadata(metadata, ecosystem, "https://pypi.org/pypi/p/1/json")
         nullable = [
             ("NuGet", {"licenseExpression": None, "licenseUrl": None}),
