@@ -174,6 +174,16 @@ class DependencyMetadataTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.action_metadata({"name": "a/b", "ref": sha}, wrong_sha)
 
+    def test_coverage_workflow_uses_verified_v5_action_commits(self):
+        job = self.workflow("codacy-coverage.yml")["jobs"]["upload-complete-coverage"]
+        refs = [step["uses"] for step in job["steps"] if "uses" in step]
+        checkout = "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
+        download = "actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0"
+        self.assertEqual(len(refs), 4)
+        for index, expected in enumerate((checkout, download, download, checkout)):
+            with self.subTest(step=index):
+                self.assertEqual(refs[index], expected)
+
     def test_metadata_workflow_is_read_only_and_propagates_failure(self):
         data = self.workflow("dependency-metadata.yml")
         events = data.get("on", data.get(True))
