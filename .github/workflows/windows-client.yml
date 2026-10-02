@@ -71,7 +71,31 @@ jobs:
         env:
           COVERAGE_ROOT: ${{ runner.temp }}\codacy-coverage-dotnet
         run: |
-          dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
+          $nugetConfigPath = Join-Path $env:RUNNER_TEMP 'codex-info-nuget-audit.config'
+          $nugetConfigXml = @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- Copyright (C) 2026 salty919 -->
+          <!-- SPDX-License-Identifier: GPL-3.0-only -->
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <auditSources>
+              <clear />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </auditSources>
+          </configuration>
+          '@
+          [System.IO.File]::WriteAllText(
+            $nugetConfigPath,
+            $nugetConfigXml.Replace("`r`n", "`n") + "`n",
+            [System.Text.UTF8Encoding]::new($false))
+          dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode `
+            --configfile $nugetConfigPath `
+            -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=low `
+            -warnaserror:NU1900,NU1901,NU1902,NU1903,NU1904,NU1905
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet format windows-client/CodexInfo.WindowsClient.sln --no-restore --verify-no-changes
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet test windows-client/CodexInfo.WindowsClient.sln `

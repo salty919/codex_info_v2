@@ -6,14 +6,6 @@ name: Rust dependency security and licenses
 on:
   pull_request:
     branches: [feat/next, main]
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - '**/Cargo.toml'
-      - '.cargo/**'
-      - 'rust-toolchain*'
-      - deny.toml
-      - .github/workflows/rust-dependencies.yml
 
 permissions:
   contents: read
