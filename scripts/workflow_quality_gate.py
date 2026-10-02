@@ -1277,6 +1277,7 @@ esac
                 "SOURCE_SHA": source_sha,
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "REAL_PYTHON3": sys.executable,
+                "RUNNER_TEMP": str(root / "runner"),
                 "GIT_OUTPUT_FILE": str(git_output),
                 "GIT_ARGS_FILE": str(git_args),
                 "GIT_EXIT_CODE": "0",
