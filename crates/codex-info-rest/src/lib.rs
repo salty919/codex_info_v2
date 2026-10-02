@@ -5,11 +5,14 @@
 //! `codex_info` crates.  A failed candidate read leaves the last complete
 //! generation in place and marks the store degraded for diagnostics.
 
+mod history;
+
 use codex_info_db_reader::{DbReader, DbSnapshot};
 use codex_info_rest_contract::{
     PublicAccountV3, PublicAccountsV3, PublicDetails, PublicDetailsV2, PublicDetailsV3,
-    PublicHistoryGap, PublicState, API_VERSION, API_VERSION_V2, API_VERSION_V3,
+    PublicState, API_VERSION, API_VERSION_V2, API_VERSION_V3,
 };
+use history::{HistoryIndex, PeriodIndex};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -27,6 +30,16 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HISTORY_PAGE: usize = 1_024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+#[cfg(test)]
+thread_local! {
+    static HISTORY_ROW_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_history_row_visit() {
+    HISTORY_ROW_VISITS.with(|count| count.set(count.get() + 1));
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PublishedSnapshot {
     pub generation: u64,
@@ -37,12 +50,22 @@ pub struct PublishedSnapshot {
     pub models_v3: Vec<codex_info_rest_contract::PublicModelUsageV3>,
     pub history_samples_v3: Vec<codex_info_rest_contract::PublicHistoryObservationV3>,
     pub history_samples_v2: Vec<codex_info_rest_contract::PublicHistoryObservation>,
+    history_index: HistoryIndex,
 }
 
 impl PublishedSnapshot {
-    fn from_db(snapshot: DbSnapshot) -> Self {
-        let hash_prefix = snapshot.data_hash.get(..32).unwrap_or(&snapshot.data_hash);
-        let pair = format!("v1:{:032x}{hash_prefix}", snapshot.generation);
+    fn from_db_for_account(snapshot: DbSnapshot, storage_epoch: u64) -> Self {
+        let history_index = HistoryIndex::build(&snapshot, storage_epoch);
+        // Preserve the pair shape while binding the stable account namespace,
+        // generation and the complete reader-validated content identity.
+        let hash_prefix = snapshot
+            .data_hash
+            .get(..32)
+            .expect("DbReader data hashes are canonical 64-character hex");
+        let pair = format!(
+            "v1:{storage_epoch:016x}{:016x}{hash_prefix}",
+            snapshot.generation
+        );
         Self {
             generation: snapshot.generation,
             data_hash: snapshot.data_hash,
@@ -52,26 +75,8 @@ impl PublishedSnapshot {
             models_v3: snapshot.models_v3,
             history_samples_v3: snapshot.history_samples_v3,
             history_samples_v2: snapshot.history_samples_v2,
+            history_index,
         }
-    }
-
-    fn from_db_for_account(snapshot: DbSnapshot, storage_epoch: u64) -> Self {
-        let mut published = Self::from_db(snapshot);
-        // Keep the established v1:<64 hex> wire shape while binding both the
-        // stable account-partition namespace and the complete content
-        // identity.  The fixed layout is epoch (64 bit), generation (64 bit),
-        // and the first 128 bits of the reader's SHA-256 data hash.  In
-        // particular, a restart after a same-generation content rewrite must
-        // not turn an old conditional request into a false 304.
-        let hash_prefix = published
-            .data_hash
-            .get(..32)
-            .expect("DbReader data hashes are canonical 64-character hex");
-        published.pair = format!(
-            "v1:{storage_epoch:016x}{:016x}{hash_prefix}",
-            published.generation
-        );
-        published
     }
 
     fn account_boundary(state: PublicState, generation: u64) -> Self {
@@ -101,6 +106,7 @@ impl PublishedSnapshot {
             models_v3: Vec::new(),
             history_samples_v3: Vec::new(),
             history_samples_v2: Vec::new(),
+            history_index: HistoryIndex::default(),
         }
     }
 }
@@ -783,7 +789,7 @@ struct Request {
     route: Option<Route>,
     account: Option<String>,
     period: Option<String>,
-    cursor: Option<usize>,
+    cursor: Option<String>,
     if_none_match: Option<String>,
     body_length: usize,
 }
@@ -889,6 +895,17 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
             .as_deref()
             .is_some_and(|pair| pair == snapshot.pair)
     {
+        // A matching pair cannot suppress validation of a stale history cursor.
+        if route == Route::HistoryV3 {
+            if let Err(error) = history_selection(
+                &snapshot,
+                request.period.as_deref(),
+                request.cursor.as_deref(),
+            ) {
+                write_route_error(stream, error);
+                return;
+            }
+        }
         write_json_response(stream, 304, Vec::new(), Some(snapshot.pair.as_str()), true);
         return;
     }
@@ -901,13 +918,19 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
     );
     match response {
         Ok(body) => write_json_response(stream, 200, body, Some(snapshot.pair.as_str()), false),
-        Err(RouteError::StaleCursor) => {
+        Err(error) => write_route_error(stream, error),
+    }
+}
+
+fn write_route_error(stream: &mut TcpStream, error: RouteError) {
+    match error {
+        RouteError::StaleCursor => {
             write_json_response(stream, 400, error_body("stale_cursor"), None, false)
         }
-        Err(RouteError::Serialization) => {
+        RouteError::Serialization => {
             write_json_response(stream, 500, error_body("serialization_failed"), None, false)
         }
-        Err(RouteError::UnknownPeriod) => write_json_response(
+        RouteError::UnknownPeriod => write_json_response(
             stream,
             400,
             error_body("invalid_history_query"),
@@ -988,6 +1011,13 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ParseError> {
             return Err(ParseError::HeadersTooLarge);
         }
     }
+    let authority = stream
+        .local_addr()
+        .map_err(|_| ParseError::BadRequest)?
+        .to_string();
+    if header(&headers, "host") != Some(authority.as_str()) {
+        return Err(ParseError::BadRequest);
+    }
     let content_length = header(&headers, "content-length")
         .map(|value| value.parse::<usize>().map_err(|_| ParseError::BadRequest))
         .transpose()?
@@ -1039,7 +1069,12 @@ fn parse_etag(value: &str) -> Result<String, ParseError> {
     Ok(pair.to_owned())
 }
 
-type ParsedTarget = (Option<Route>, Option<String>, Option<String>, Option<usize>);
+type ParsedTarget = (
+    Option<Route>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 fn valid_account_selector(value: &str) -> bool {
     let Some(epoch) = value.strip_prefix("account-") else {
@@ -1121,7 +1156,7 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
             }
             "period" if period.is_none() => period = Some(value.to_owned()),
             "cursor" if cursor.is_none() => {
-                cursor = Some(value.parse::<usize>().map_err(|_| ParseError::BadRequest)?);
+                cursor = Some(value.to_owned());
             }
             _ => return Err(ParseError::BadRequest),
         }
@@ -1140,7 +1175,7 @@ fn serialize_route(
     snapshot: &PublishedSnapshot,
     route: Route,
     period: Option<&str>,
-    cursor: Option<usize>,
+    cursor: Option<String>,
     degraded: bool,
 ) -> Result<Vec<u8>, RouteError> {
     let details = &snapshot.details;
@@ -1262,57 +1297,73 @@ fn flatten_with_version<T: serde::Serialize>(
     serialize_json(&Value::Object(object))
 }
 
+fn history_selection<'a>(
+    snapshot: &'a PublishedSnapshot,
+    period: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<(&'a PeriodIndex, usize), RouteError> {
+    let period = period.ok_or(RouteError::UnknownPeriod)?;
+    let indexed = snapshot
+        .history_index
+        .period(period)
+        .ok_or(if cursor.is_some() {
+            RouteError::StaleCursor
+        } else {
+            RouteError::UnknownPeriod
+        })?;
+    let start = match cursor {
+        Some(cursor) => indexed
+            .start_after(&snapshot.history_samples_v3, cursor)
+            .ok_or(RouteError::StaleCursor)?,
+        None => 0,
+    };
+    Ok((indexed, start))
+}
+
 fn serialize_history(
     snapshot: &PublishedSnapshot,
     period: Option<&str>,
-    cursor: Option<usize>,
+    cursor: Option<String>,
 ) -> Result<Vec<u8>, RouteError> {
-    let details = &snapshot.details;
-    let period = period.ok_or(RouteError::UnknownPeriod)?;
-    let Some(period_meta) = details
-        .history_periods
+    let (indexed, start) = history_selection(snapshot, period, cursor.as_deref())?;
+    let end = start
+        .saturating_add(MAX_HISTORY_PAGE)
+        .min(indexed.samples.len());
+    let samples = indexed.samples[start..end]
         .iter()
-        .find(|item| item.id == period)
-    else {
-        return Err(RouteError::UnknownPeriod);
-    };
-    // The paged history wire shape has no state field; its exact contract is
-    // preserved while the v3 details/current resources expose degradation.
-    let samples = snapshot
-        .history_samples_v3
-        .iter()
-        .filter(|sample| {
-            sample.reset_at >= period_meta.reset_at.saturating_sub(60)
-                && sample.reset_at <= period_meta.reset_at
-                && sample.timestamp >= period_meta.start_at
-                && sample.timestamp <= period_meta.end_at
+        .map(|&row| {
+            #[cfg(test)]
+            record_history_row_visit();
+            &snapshot.history_samples_v3[row]
         })
         .collect::<Vec<_>>();
-    let start = cursor.unwrap_or(0);
-    if start > samples.len() {
-        return Err(RouteError::StaleCursor);
-    }
-    let end = start.saturating_add(MAX_HISTORY_PAGE).min(samples.len());
-    let next_cursor = (end < samples.len()).then(|| end.to_string());
-    let history_gaps = if start == 0 {
-        details
-            .history_gaps
+    let resume_cursor = if end > 0 {
+        Some(indexed.resume(&snapshot.history_samples_v3, end - 1))
+    } else {
+        cursor.clone()
+    };
+    let next_cursor = if end < indexed.samples.len() {
+        resume_cursor.clone()
+    } else {
+        None
+    };
+    // The first page carries the complete gap set. Continuations prove that
+    // set is unchanged and leave the client's previously accepted gaps intact.
+    let history_gaps = if cursor.is_none() {
+        indexed
+            .gaps
             .iter()
-            .filter(|gap| {
-                gap.reset_at >= period_meta.reset_at.saturating_sub(60)
-                    && gap.reset_at <= period_meta.reset_at
-            })
-            .cloned()
-            .collect::<Vec<PublicHistoryGap>>()
+            .map(|&row| &snapshot.details.history_gaps[row])
+            .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
     serialize_json(&json!({
         "api_version": API_VERSION_V3,
-        "history_samples": &samples[start..end],
+        "history_samples": samples,
         "history_gaps": history_gaps,
         "next_cursor": next_cursor,
-        "resume_cursor": end.to_string(),
+        "resume_cursor": resume_cursor,
     }))
 }
 
@@ -1434,6 +1485,7 @@ mod tests {
             models_v3: Vec::new(),
             history_samples_v2: Vec::new(),
             history_samples_v3: Vec::new(),
+            history_index: HistoryIndex::default(),
         };
         let json = |route| -> serde_json::Value {
             serde_json::from_slice(&serialize_route(&snapshot, route, None, None, false).unwrap())
@@ -1493,6 +1545,7 @@ mod tests {
             models_v3: Vec::new(),
             history_samples_v2: Vec::new(),
             history_samples_v3: Vec::new(),
+            history_index: HistoryIndex::default(),
         };
         let json = |route| -> serde_json::Value {
             serde_json::from_slice(&serialize_route(&snapshot, route, None, None, false).unwrap())
@@ -1572,6 +1625,9 @@ mod tests {
 
     fn request(address: SocketAddr, request: &str) -> String {
         let mut stream = TcpStream::connect(address).expect("connect");
+        // Existing HTTP fixtures use x as an authority placeholder. Bind it
+        // to the actual ephemeral listener instead of accepting a foreign Host.
+        let request = request.replace("Host:x\r\n", &format!("Host:{address}\r\n"));
         stream.write_all(request.as_bytes()).expect("request");
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("response");
@@ -1587,6 +1643,285 @@ mod tests {
             .lines()
             .find_map(|line| line.strip_prefix("Codex-Info-Published-Pair: "))
             .expect("published pair")
+    }
+
+    fn history_test_fixture(
+        epoch: u64,
+        generation: u64,
+        count: usize,
+        corrected: bool,
+        gap: bool,
+        period_id: &str,
+    ) -> PublishedSnapshot {
+        let start = 1_800_000_000;
+        let reset = 1_802_678_400;
+        let end = start + count.saturating_sub(1) as i64 * 60;
+        let mut details = PublicDetails {
+            state: PublicState::Ready,
+            authenticated: true,
+            observed_at: Some(end),
+            ..PublicDetails::default()
+        };
+        details
+            .history_periods
+            .push(codex_info_rest_contract::PublicHistoryPeriod {
+                id: period_id.to_owned(),
+                start_at: start - 600,
+                end_at: end,
+                reset_at: reset,
+                label: "fixture".to_owned(),
+                current: true,
+            });
+        if gap {
+            details
+                .history_gaps
+                .push(codex_info_rest_contract::PublicHistoryGap {
+                    gap_id: "fixture-gap".to_owned(),
+                    reset_at: reset,
+                    start_at: start - 120,
+                    end_at: start - 60,
+                    reason: "recorder-stopped".to_owned(),
+                });
+        }
+        PublishedSnapshot::from_db_for_account(
+            DbSnapshot {
+                generation,
+                data_hash: format!("{generation:064x}"),
+                has_pending_ranges: false,
+                details,
+                models_v3: Vec::new(),
+                history_samples_v2: Vec::new(),
+                history_samples_v3: (0..count)
+                    .map(|i| codex_info_rest_contract::PublicHistoryObservationV3 {
+                        timestamp: start + i as i64 * 60,
+                        reset_at: reset,
+                        remaining_percent: Some(if corrected && i == 0 { 70.0 } else { 80.0 }),
+                        task_active_since_previous: None,
+                        models: None,
+                        models_complete: false,
+                        model_source: "legacy-unknown".to_owned(),
+                    })
+                    .collect(),
+            },
+            epoch,
+        )
+    }
+
+    fn history_test_page(
+        snapshot: &PublishedSnapshot,
+        period: &str,
+        cursor: Option<&str>,
+    ) -> Result<Value, RouteError> {
+        let target = match cursor {
+            Some(cursor) => format!("/v3/history?period={period}&cursor={cursor}"),
+            None => format!("/v3/history?period={period}"),
+        };
+        let (_, _, _, cursor) = parse_target(&target).map_err(|_| RouteError::StaleCursor)?;
+        let bytes = serialize_route(snapshot, Route::HistoryV3, Some(period), cursor, false)?;
+        serde_json::from_slice(&bytes).map_err(|_| RouteError::Serialization)
+    }
+
+    fn history_test_resume(snapshot: &PublishedSnapshot) -> String {
+        let mut cursor = None;
+        loop {
+            let page = history_test_page(snapshot, "1802678400", cursor.as_deref()).unwrap();
+            if page["next_cursor"].is_null() {
+                return page["resume_cursor"].as_str().unwrap().to_owned();
+            }
+            cursor = Some(page["next_cursor"].as_str().unwrap().to_owned());
+        }
+    }
+
+    #[test]
+    fn history_cursor_rejects_changed_prefix_gap_account_and_period() {
+        let original = history_test_fixture(10, 1, 2, false, false, "1802678400");
+        let cursor = history_test_resume(&original);
+        let cases = [
+            (
+                "sample correction",
+                history_test_fixture(10, 2, 3, true, false, "1802678400"),
+                "1802678400",
+            ),
+            (
+                "gap changed",
+                history_test_fixture(10, 2, 3, false, true, "1802678400"),
+                "1802678400",
+            ),
+            (
+                "different account",
+                history_test_fixture(11, 2, 3, false, false, "1802678400"),
+                "1802678400",
+            ),
+            (
+                "different period",
+                history_test_fixture(10, 2, 3, false, false, "other-period"),
+                "other-period",
+            ),
+        ];
+        let rejected = cases
+            .iter()
+            .map(|(name, snapshot, period)| {
+                let result = history_test_page(snapshot, period, Some(&cursor));
+                println!("{name}: {result:?}");
+                matches!(result, Err(RouteError::StaleCursor))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejected, vec![true, true, true, true]);
+    }
+
+    fn history_test_edit(
+        snapshot: PublishedSnapshot,
+        storage_epoch: u64,
+        edit: impl FnOnce(&mut DbSnapshot),
+    ) -> PublishedSnapshot {
+        let generation = snapshot.generation + 1;
+        let mut candidate = DbSnapshot {
+            generation,
+            data_hash: format!("{generation:064x}"),
+            has_pending_ranges: snapshot.has_pending_ranges,
+            details: snapshot.details,
+            models_v3: snapshot.models_v3,
+            history_samples_v2: snapshot.history_samples_v2,
+            history_samples_v3: snapshot.history_samples_v3,
+        };
+        edit(&mut candidate);
+        PublishedSnapshot::from_db_for_account(candidate, storage_epoch)
+    }
+
+    #[test]
+    fn history_cursor_rejects_deleted_prefix_and_gap_recovery_or_correction() {
+        let original = history_test_fixture(10, 1, 2, false, true, "1802678400");
+        let cursor = history_test_resume(&original);
+        let deleted_prefix = history_test_edit(original.clone(), 10, |snapshot| {
+            snapshot.history_samples_v3.remove(0);
+        });
+        let recovered_gap = history_test_edit(original.clone(), 10, |snapshot| {
+            snapshot.details.history_gaps.clear();
+        });
+        let corrected_gap = history_test_edit(original.clone(), 10, |snapshot| {
+            snapshot.details.history_gaps[0].end_at -= 1;
+        });
+        let changed_reset = history_test_edit(original.clone(), 10, |snapshot| {
+            snapshot.details.history_periods[0].reset_at += 60;
+        });
+        for snapshot in [
+            &deleted_prefix,
+            &recovered_gap,
+            &corrected_gap,
+            &changed_reset,
+        ] {
+            assert_eq!(
+                history_test_page(snapshot, "1802678400", Some(&cursor)),
+                Err(RouteError::StaleCursor)
+            );
+        }
+        for malformed in [
+            "2".to_owned(),
+            "h1.invalid".to_owned(),
+            cursor.replacen("h1.", "h2.", 1),
+            format!("{cursor}.extra"),
+            cursor.replacen("1800000060", "1800000061", 1),
+        ] {
+            assert_eq!(
+                history_test_page(&original, "1802678400", Some(&malformed)),
+                Err(RouteError::StaleCursor)
+            );
+        }
+        let metadata_only = history_test_edit(original, 10, |snapshot| {
+            snapshot.details.history_periods[0].label = "renamed".to_owned();
+            snapshot.details.history_periods[0].current = false;
+        });
+        let empty_delta = history_test_page(&metadata_only, "1802678400", Some(&cursor)).unwrap();
+        assert_eq!(empty_delta["history_samples"].as_array().unwrap().len(), 0);
+        assert_eq!(empty_delta["resume_cursor"], cursor);
+    }
+
+    #[test]
+    fn history_cursor_for_an_unknown_period_is_stale() {
+        let original = history_test_fixture(10, 1, 2, false, false, "1802678400");
+        let cursor = history_test_resume(&original);
+        assert_eq!(
+            history_test_page(&original, "unknown-period", Some(&cursor)),
+            Err(RouteError::StaleCursor)
+        );
+        assert_eq!(
+            history_test_page(&original, "unknown-period", None),
+            Err(RouteError::UnknownPeriod)
+        );
+    }
+
+    #[test]
+    fn history_cursor_preserves_append_paging_and_empty_delta() {
+        let original = history_test_fixture(10, 1, 2, false, true, "1802678400");
+        let cursor = history_test_resume(&original);
+        let extended = history_test_fixture(10, 2, 4, false, true, "1802678400");
+        let delta = history_test_page(&extended, "1802678400", Some(&cursor)).unwrap();
+        assert_eq!(delta["history_samples"].as_array().unwrap().len(), 2);
+        assert_eq!(delta["history_samples"][0]["timestamp"], 1_800_000_120_i64);
+        assert!(delta["history_gaps"].as_array().unwrap().is_empty());
+        let resume = delta["resume_cursor"].as_str().unwrap();
+        let empty = history_test_page(&extended, "1802678400", Some(resume)).unwrap();
+        assert_eq!(empty["resume_cursor"], resume);
+        assert!(empty["history_samples"].as_array().unwrap().is_empty());
+        let initial_empty = history_test_fixture(10, 1, 0, false, false, "1802678400");
+        assert!(
+            history_test_page(&initial_empty, "1802678400", None).unwrap()["resume_cursor"]
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn history_stale_cursor_is_not_hidden_by_matching_etag() {
+        let path = temp_db("history-stale-etag");
+        fixture(&path, 10);
+        let reader = DbReader::open(&path).unwrap();
+        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr();
+        let head = request(
+            address,
+            "GET /v3/history?period=1800000060 HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(head.starts_with("HTTP/1.1 200"));
+        let pair = published_pair(&head);
+        let stale = request(address, &format!(
+            "GET /v3/history?period=1800000060&cursor=999999 HTTP/1.1\r\nHost:x\r\nIf-None-Match: \"{pair}\"\r\n\r\n"
+        ));
+        assert!(stale.starts_with("HTTP/1.1 400"), "{stale}");
+        assert_eq!(
+            serde_json::from_str::<Value>(body(&stale)).unwrap(),
+            json!({"api_version":"v1","error":"stale_cursor"})
+        );
+        assert!(!stale.contains("Codex-Info-Published-Pair:"));
+        server.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn history_delta_work_depends_on_suffix_not_retained_prefix() {
+        let mut observed = Vec::new();
+        for prefix in [1_024_usize, 32_768] {
+            let original = history_test_fixture(10, 1, prefix, false, false, "1802678400");
+            let cursor = history_test_resume(&original);
+            let extended = history_test_fixture(10, 2, prefix + 2, false, false, "1802678400");
+            HISTORY_ROW_VISITS.with(|count| count.set(0));
+            let started = Instant::now();
+            let delta = history_test_page(&extended, "1802678400", Some(&cursor)).unwrap();
+            let elapsed = started.elapsed();
+            let visits = HISTORY_ROW_VISITS.with(|count| count.get());
+            assert_eq!(delta["history_samples"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                delta["history_samples"][0]["timestamp"],
+                1_800_000_000_i64 + prefix as i64 * 60
+            );
+            // Wire authority prescribes binary key lookup plus only the suffix.
+            let bound = (usize::BITS - (prefix + 2).leading_zeros()) as usize + 3;
+            println!("prefix={prefix} suffix=2 examined_rows={visits} binary_lookup_plus_suffix_bound={bound} debug_elapsed={elapsed:?}");
+            observed.push((visits, bound));
+        }
+        assert!(
+            observed.iter().all(|(visits, bound)| visits <= bound),
+            "{observed:?}"
+        );
     }
 
     #[test]
@@ -1617,24 +1952,31 @@ mod tests {
                 label: "task page".to_owned(),
                 current: true,
             });
-        let snapshot = PublishedSnapshot {
-            generation: 1,
-            data_hash: "hash".to_owned(),
-            pair: "pair".to_owned(),
-            has_pending_ranges: false,
-            details,
-            models_v3: Vec::new(),
-            history_samples_v2: Vec::new(),
-            history_samples_v3: history_samples,
-        };
+        let snapshot = PublishedSnapshot::from_db_for_account(
+            DbSnapshot {
+                generation: 1,
+                data_hash: format!("{:064x}", 1),
+                has_pending_ranges: false,
+                details,
+                models_v3: Vec::new(),
+                history_samples_v2: Vec::new(),
+                history_samples_v3: history_samples,
+            },
+            1,
+        );
 
         let first: serde_json::Value = serde_json::from_slice(
             &serialize_history(&snapshot, Some(&reset_at.to_string()), None)
                 .expect("first history page"),
         )
         .expect("first page JSON");
+        let (_, _, _, cursor) = parse_target(&format!(
+            "/v3/history?period={reset_at}&cursor={}",
+            first["next_cursor"].as_str().unwrap()
+        ))
+        .unwrap();
         let second: serde_json::Value = serde_json::from_slice(
-            &serialize_history(&snapshot, Some(&reset_at.to_string()), Some(1_024))
+            &serialize_history(&snapshot, Some(&reset_at.to_string()), cursor)
                 .expect("second history page"),
         )
         .expect("second page JSON");
@@ -1644,13 +1986,14 @@ mod tests {
             first["history_samples"][1023]["task_active_since_previous"],
             false
         );
-        assert_eq!(first["next_cursor"], "1024");
+        assert!(first["next_cursor"].is_string());
         assert_eq!(second["history_samples"].as_array().unwrap().len(), 1);
         assert_eq!(
             second["history_samples"][0]["task_active_since_previous"],
             true
         );
-        assert_eq!(second["resume_cursor"], "1025");
+        assert!(second["resume_cursor"].is_string());
+        assert_ne!(first["next_cursor"], second["resume_cursor"]);
     }
 
     #[test]
@@ -1697,6 +2040,33 @@ mod tests {
             assert!(model.get("cache_write_input_tokens").is_none());
             assert!(model.get("output_tokens").is_none());
         }
+        server.shutdown();
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn host_authority_is_required_before_snapshot_access() {
+        let path = temp_db("host-authority");
+        fixture(&path, 10);
+        let reader = DbReader::open(&path).expect("reader");
+        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("server");
+        let address = server.local_addr();
+        let duplicate = format!("Host: {address}\r\nHost: {address}\r\n");
+        for headers in ["", "Host: example.invalid\r\n", duplicate.as_str()] {
+            let response = request(
+                address,
+                &format!("GET /v1/details HTTP/1.1\r\n{headers}\r\n"),
+            );
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(!response.contains("Codex-Info-Published-Pair:"));
+            assert_eq!(server.store().status().generation, None);
+        }
+        let valid = request(
+            address,
+            &format!("GET /v1/details HTTP/1.1\r\nHost: {address}\r\n\r\n"),
+        );
+        assert!(valid.starts_with("HTTP/1.1 200"), "{valid}");
+        assert_eq!(server.store().status().generation, Some(1));
         server.shutdown();
         fs::remove_file(path).expect("cleanup");
     }

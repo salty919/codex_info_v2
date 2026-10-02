@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 name: Feat integration
+run-name: codex-feat-preflight-v1:pr=${{ github.event.pull_request.number }}:event_head=${{ github.event.pull_request.head.sha }}
 
 on:
   pull_request_target:
@@ -22,16 +23,20 @@ jobs:
       contents: read
     outputs:
       selection_json: ${{ steps.classify.outputs.selection_json }}
+      main_base_sha: ${{ steps.classify.outputs.main_base_sha }}
+      preflight_plan: ${{ steps.classify.outputs.preflight_plan }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.workflow_sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Classify the event's exact base and head
         id: classify
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_SHA: ${{ github.workflow_sha }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPOSITORY: ${{ github.repository }}
@@ -41,12 +46,29 @@ jobs:
             echo 'selective integration currently supports same-repository PRs' >&2
             exit 1
           }
-          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+          main_sha="$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          integration_sha="$(gh api "repos/$REPOSITORY/git/ref/heads/feat/next" --jq '.object.sha')"
+          [[ "$integration_sha" == "$BASE_SHA" ]] || {
+            echo 'feat base advanced after this event; a current snapshot is required' >&2
+            exit 1
+          }
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA" "$main_sha"
+          git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA" || {
+            echo 'source does not contain the current feat base; update the PR before preflight' >&2
+            exit 1
+          }
           changes="$RUNNER_TEMP/changed-paths.z"
           git diff --find-renames=50% --find-copies=50% --find-copies-harder \
-            --name-status -z "$BASE_SHA...$HEAD_SHA" > "$changes"
-          selection="$(python3 scripts/ci_change_scope.py --name-status "$changes")"
-          printf 'selection_json=%s\n' "$selection" >> "$GITHUB_OUTPUT"
+            --name-status -z "$main_sha...$HEAD_SHA" > "$changes"
+          selection="$(python3 scripts/ci_change_scope.py --name-status "$changes" --release-candidate)"
+          plan=''
+          if [[ "$(jq -r '.binary_impact' <<<"$selection")" == true ]]; then
+            plan="$(python3 .github/scripts/release_preflight.py plan \
+              --source "$HEAD_SHA" --main "$main_sha" --workflow "$TRUSTED_SHA")"
+          fi
+          printf 'selection_json=%s\nmain_base_sha=%s\npreflight_plan=%s\n' \
+            "$selection" "$main_sha" "$plan" >> "$GITHUB_OUTPUT"
 
   selective-quality:
     name: Run selected advisory quality
@@ -54,10 +76,12 @@ jobs:
     uses: ./.github/workflows/selective-quality.yml
     with:
       source_sha: ${{ github.event.pull_request.head.sha }}
-      base_sha: ${{ github.event.pull_request.base.sha }}
+      base_sha: ${{ needs.classify.outputs.main_base_sha }}
       head_ref: ${{ github.event.pull_request.head.ref }}
       pr_number: ${{ github.event.pull_request.number }}
       selection_json: ${{ needs.classify.outputs.selection_json }}
+      release_preflight: true
+      preflight_plan: ${{ needs.classify.outputs.preflight_plan }}
       release_candidate: false
     permissions:
       contents: read

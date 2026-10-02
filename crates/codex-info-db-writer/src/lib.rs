@@ -680,6 +680,24 @@ const MAX_RECORDED_RELATIVE_PATH_BYTES: usize = 4_096;
 pub const MAX_RECENT_HISTORY_SAMPLES: usize = 31 * 24 * 60;
 static BACKUP_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static BACKUP_RENAME_FAULTS: std::cell::RefCell<(usize, Vec<usize>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+fn rename_backup_generation(from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(test)]
+    if BACKUP_RENAME_FAULTS.with(|faults| {
+        let mut faults = faults.borrow_mut();
+        faults.0 += 1;
+        faults.1.contains(&faults.0)
+    }) {
+        return Err(std::io::Error::other("injected backup rename failure"));
+    }
+    fs::rename(from, to)
+}
+
 const UPSERT_SAMPLE: &str = r#"
 INSERT INTO usage_history (
     timestamp,
@@ -9063,22 +9081,24 @@ impl UsageStore {
             }
         }
 
-        // Move every existing generation out of the way first. Since each
-        // destination is now empty, a later failure can restore the exact
-        // original names without overwriting a racing file.
+        // Only completed moves belong to this transaction. In particular, an
+        // unmoved original generation must never be mistaken for a newly
+        // installed backup during rollback.
         let mut moved = Vec::new();
         let rotation_result = (|| -> Result<()> {
             for (final_path, stage_path) in &staged {
-                fs::rename(final_path, stage_path)?;
+                rename_backup_generation(final_path, stage_path)?;
                 moved.push((final_path.clone(), stage_path.clone()));
             }
             let first = path.with_extension("sqlite3.bak.1");
-            fs::rename(&temporary, &first)?;
+            rename_backup_generation(&temporary, &first)?;
+            moved.push((temporary.clone(), first));
             for generation in (2..=generations).rev() {
                 let source_stage = parent.join(format!("{stage_prefix}-{}", generation - 1));
                 if fs::symlink_metadata(&source_stage).is_ok() {
                     let destination = path.with_extension(format!("sqlite3.bak.{generation}"));
-                    fs::rename(&source_stage, destination)?;
+                    rename_backup_generation(&source_stage, &destination)?;
+                    moved.push((source_stage, destination));
                 }
             }
             // The oldest generation is intentionally discarded only after
@@ -9091,28 +9111,23 @@ impl UsageStore {
         })();
 
         if let Err(error) = rotation_result {
-            // Restore installed generations to their staging names. The new
-            // generation is moved back to its temporary name so the caller
-            // never observes a partially rotated set on a failed operation.
-            let first = path.with_extension("sqlite3.bak.1");
-            if fs::symlink_metadata(&first).is_ok() {
-                let _ = fs::rename(&first, &temporary);
-            }
-            for generation in 2..=generations {
-                let destination = path.with_extension(format!("sqlite3.bak.{generation}"));
-                let source_stage = parent.join(format!("{stage_prefix}-{}", generation - 1));
-                if fs::symlink_metadata(&destination).is_ok() {
-                    let _ = fs::rename(destination, source_stage);
+            let mut rollback_error = None;
+            for (source, destination) in moved.into_iter().rev() {
+                if let Err(restore_error) = rename_backup_generation(&destination, &source) {
+                    // Later undo moves depend on this one completing. Continuing
+                    // could overwrite an old generation still at destination.
+                    // Keep every remaining old copy for manual recovery.
+                    rollback_error = Some(restore_error);
+                    break;
                 }
             }
-            for (final_path, stage_path) in moved.into_iter().rev() {
-                if fs::symlink_metadata(&stage_path).is_ok() {
-                    let _ = fs::rename(stage_path, final_path);
-                }
-            }
+            // This path holds only the newly created candidate, never an old
+            // generation. Do not delete any staging files on failed rotation.
             let _ = fs::remove_file(&temporary);
-            for (_, stage_path) in staged {
-                let _ = fs::remove_file(stage_path);
+            if let Some(rollback_error) = rollback_error {
+                return Err(UsageStoreError::InvalidImport(format!(
+                    "backup rotation failed ({error}); rollback failed ({rollback_error}); backup files retained for recovery"
+                )));
             }
             return Err(error);
         }
@@ -16464,6 +16479,116 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], expected_second);
         remove_database(&path);
+    }
+
+    fn with_backup_rename_failures<T>(failures: &[usize], run: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BACKUP_RENAME_FAULTS.with(|faults| *faults.borrow_mut() = (0, Vec::new()));
+            }
+        }
+        BACKUP_RENAME_FAULTS.with(|faults| *faults.borrow_mut() = (0, failures.to_vec()));
+        let _reset = Reset;
+        run()
+    }
+
+    fn distinct_backup_rotation_fixture(label: &str) -> (PathBuf, Vec<Vec<u8>>, Vec<u8>) {
+        let path = database_path(label);
+        let store = UsageStore::open(&path).unwrap();
+        for dollars in [1.0, 2.0, 3.0] {
+            store
+                .upsert_sample(&sample(1_700_000_060, 1_700_604_800, Some(75.0), dollars))
+                .unwrap();
+            UsageStore::backup_generations(&path, 3).unwrap();
+        }
+        store
+            .upsert_sample(&sample(1_700_000_060, 1_700_604_800, Some(75.0), 4.0))
+            .unwrap();
+        drop(store);
+        let old_generations = (1..=3)
+            .map(|generation| {
+                fs::read(path.with_extension(format!("sqlite3.bak.{generation}"))).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            old_generations[0] != old_generations[1] && old_generations[1] != old_generations[2]
+        );
+        let source = fs::read(&path).unwrap();
+        (path, old_generations, source)
+    }
+
+    #[test]
+    fn backup_rotation_rename_failures_restore_each_original_generation() {
+        let mut mismatches = Vec::new();
+        // Three staging moves, publishing the new backup, then two retained
+        // generation moves. Each failure observes the public operation.
+        for failed_rename in 1..=6 {
+            let (path, old, source) = distinct_backup_rotation_fixture("rotation-rename-fault");
+            let result = with_backup_rename_failures(&[failed_rename], || {
+                UsageStore::backup_generations(&path, 3)
+            });
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("injected backup rename failure"));
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                source,
+                "source changed at rename {failed_rename}"
+            );
+            for (index, expected) in old.iter().enumerate() {
+                let generation = index + 1;
+                let actual =
+                    fs::read(path.with_extension(format!("sqlite3.bak.{generation}"))).ok();
+                if actual.as_ref() != Some(expected) {
+                    mismatches.push((failed_rename, generation));
+                }
+            }
+            remove_database(&path);
+        }
+        assert!(
+            mismatches.is_empty(),
+            "lost or replaced original backup at (failed rename, generation): {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn backup_rotation_failed_undo_preserves_recoverable_old_bytes() {
+        let mut lost = Vec::new();
+        // Undo failure during initial staging, new-backup publication, and
+        // retained-generation publication must never consume old copies.
+        for faults in [[2, 3], [5, 6], [6, 7]] {
+            let (path, old, source) = distinct_backup_rotation_fixture("rotation-undo-fault");
+            let result =
+                with_backup_rename_failures(&faults, || UsageStore::backup_generations(&path, 3));
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("injected backup rename failure"));
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                source,
+                "source changed for {faults:?}"
+            );
+            let retained = fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    path.is_file().then(|| fs::read(path).ok()).flatten()
+                })
+                .collect::<Vec<_>>();
+            for (index, expected) in old.iter().enumerate() {
+                if !retained.contains(expected) {
+                    lost.push((faults, index + 1));
+                }
+            }
+            remove_database(&path);
+        }
+        assert!(
+            lost.is_empty(),
+            "old generation bytes lost after failed undo: {lost:?}"
+        );
     }
 
     #[test]

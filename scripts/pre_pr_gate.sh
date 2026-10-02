@@ -93,7 +93,7 @@ PY
             scripts/regression_guard.sh|scripts/test_regression_guard.py)
                 run_regression_guard_fixture=1
                 ;;
-            .github/workflows/*|scripts/workflow_quality_gate.py)
+            .github/workflows/*|.github/scripts/*|.github/tests/*|scripts/workflow_quality_gate.py)
                 run_workflow_fixtures=1
                 ;;
         esac
