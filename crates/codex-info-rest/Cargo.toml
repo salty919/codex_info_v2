@@ -16,6 +16,7 @@ codex-info-db-reader = { path = "../codex-info-db-reader" }
 codex-info-rest-contract = { path = "../codex-info-rest-contract" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
