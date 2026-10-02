@@ -1,0 +1,45 @@
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Rust dependency security and licenses
+
+on:
+  pull_request:
+    branches: [feat/next, main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - '**/Cargo.toml'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - deny.toml
+      - .github/workflows/rust-dependencies.yml
+
+permissions:
+  contents: read
+
+jobs:
+  rust-dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Install pinned cargo-deny
+        uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+      - name: Check the existing Rust dependency policy
+        shell: bash
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-deny
+        run: |
+          set -euo pipefail
+          trap 'status=$?; printf "cargo-deny exit=%s UTC-end=" "$status"; /usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ; exit "$status"' EXIT
+          printf 'UTC-start='
+          /usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ
+          cargo deny --version
+          cargo deny --locked check advisories licenses sources
