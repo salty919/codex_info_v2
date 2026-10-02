@@ -12,27 +12,19 @@ import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
-RUST_PATHS = {
-    "Cargo.toml", "Cargo.lock", "**/Cargo.toml", ".cargo/**",
-    "rust-toolchain*", "deny.toml", ".github/workflows/rust-dependencies.yml",
-}
-REVIEW_PATHS = {
-    "Cargo.toml", "Cargo.lock", "**/Cargo.toml", "**/*.csproj",
-    "**/packages.lock.json", "**/Directory.Packages.props",
-    "windows-client/Directory.Build.props", "**/NuGet.Config", "**/nuget.config",
-    ".github/workflows/*.yml",
-}
+
 
 
 class DependencySecurityWorkflowTests(unittest.TestCase):
-    def workflow(self, name, paths):
+    def workflow(self, name):
         path = WORKFLOWS / name
         self.assertTrue(path.is_file(), f"unimplemented dependency workflow: {name}")
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         events = data.get("on", data.get(True))
         self.assertEqual(set(events), {"pull_request"})
         self.assertEqual(set(events["pull_request"]["branches"]), {"feat/next", "main"})
-        self.assertEqual(set(events["pull_request"]["paths"]), paths)
+        self.assertNotIn("paths", events["pull_request"])
+        self.assertNotIn("paths-ignore", events["pull_request"])
         self.assertEqual(data["permissions"], {"contents": "read"})
         self.assertEqual(len(data["jobs"]), 1)
         job = next(iter(data["jobs"].values()))
@@ -47,7 +39,7 @@ class DependencySecurityWorkflowTests(unittest.TestCase):
         return job
 
     def test_rust_workflow_contract(self):
-        job = self.workflow("rust-dependencies.yml", RUST_PATHS)
+        job = self.workflow("rust-dependencies.yml")
         checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["ref"], "$" + "{{ github.event.pull_request.head.sha }}")
         self.assertFalse(checkout["with"]["persist-credentials"])
@@ -57,7 +49,7 @@ class DependencySecurityWorkflowTests(unittest.TestCase):
         self.assertEqual(len([s for s in job["steps"] if "run" in s]), 1)
 
     def test_rust_check_propagates_cargo_status(self):
-        job = self.workflow("rust-dependencies.yml", RUST_PATHS)
+        job = self.workflow("rust-dependencies.yml")
         script = next(s["run"] for s in job["steps"] if "run" in s)
         scratch = ROOT / "target/dependency-security"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -101,7 +93,7 @@ class DependencySecurityWorkflowTests(unittest.TestCase):
                 )
 
     def test_dependency_review_contract(self):
-        job = self.workflow("dependency-review.yml", REVIEW_PATHS)
+        job = self.workflow("dependency-review.yml")
         self.assertEqual(len(job["steps"]), 1)
         review = job["steps"][0]
         self.assertRegex(review["uses"], r"^actions/dependency-review-action@[0-9a-f]{40}$")

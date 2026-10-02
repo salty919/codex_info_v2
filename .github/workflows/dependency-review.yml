@@ -6,17 +6,6 @@ name: Dependency review
 on:
   pull_request:
     branches: [feat/next, main]
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - '**/Cargo.toml'
-      - '**/*.csproj'
-      - '**/packages.lock.json'
-      - '**/Directory.Packages.props'
-      - windows-client/Directory.Build.props
-      - '**/NuGet.Config'
-      - '**/nuget.config'
-      - '.github/workflows/*.yml'
 
 permissions:
   contents: read

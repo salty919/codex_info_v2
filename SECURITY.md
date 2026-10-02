@@ -6,6 +6,7 @@ WIN-PARITY-RECOVERY-01
 SEC-CI-TRUST-01
 SEC-CODEQL-LOG-01
 SEC-RELEASE-CODEQL-01
+SEC-DEPENDENCY-AUDIT-01
 -->
 
 # Security threat model and acceptance gate
@@ -43,6 +44,10 @@ This versioned document defines the finite attack surface that R17 verifies. Any
 - Static gates: `cargo clippy --all-targets --all-features --locked -- -D warnings`, explicit-unsafe search, secret-pattern scan, and shell invocation review.
 - Dependency gates: `cargo deny check advisories licenses sources` with the repository `deny.toml`. Record the cargo-deny version, command, UTC start/end, RustSec advisory database commit/hash, registry/source set, exit code, and redacted result in the acceptance evidence. Known vulnerability, unsoundness, rejected-license, or rejected-source findings must be 0. A maintenance-only advisory may be excepted only by exact RustSec ID with a reason naming the transitive owner and absence of a safe upgrade; the three current Slint transitive exceptions are listed in `deny.toml`, and any new maintenance advisory fails closed. Tool absence, advisory database fetch/update failure, malformed output, or incomplete target graph is `INCONCLUSIVE` and delivery fails.
 - Independent security evaluation is used only when a security-boundary change cannot be decided by the registered direct oracle. It must inspect final source and raw evidence without inheriting the implementer's verdict. Routine changes do not add an AI review merely as a second opinion; environmental trust assumptions remain explicit rather than being waived.
+
+## Repository dependency audit (`SEC-DEPENDENCY-AUDIT-01`)
+
+This additional read-only CI gate is separate from the application runtime threat model and normal quality owner selection. Every pull request to `feat/next` or `main` triggers the Rust, dependency-review, and dependency-metadata workflows without GitHub path filters, whose finite diff window can omit a later dependency change. Rust full-graph advisories/licenses/sources remain owned by the unchanged Linux `deny.toml`. The existing Windows locked restore owns NuGet direct/transitive auditing at low severity and above, uses explicit nuget.org package/audit sources, treats NU1900–NU1905 as errors, and stops before format/test on a restore failure. The metadata helper inventories all NuGet lock targets, hash-pinned Python declarations and inline suppliers, the actual existing PyYAML runtime version, and structured Actions references; it queries official license metadata and OSV for Python and exact Actions release versions resolving to the scanned commit. Actions without an exact version, implicit/unhashed Python supply, upstream Python dependencies lacking a lock, and licenses without an approved non-Rust policy remain explicit review requirements. Collection success is not legal approval or complete Actions tool/transitive coverage. No Rust allowlist is generalized to another ecosystem. Known advisories, failed metadata acquisition, invalid identity/schema, and incomplete OSV results fail the job; missing license fields remain review-required. DependencyReview owns supported PR graph deltas, while CodeQL/Codacy continue to own code/workflow static analysis. CI has contents-read permission, immutable action pins in the new workflow, no privileged PR-source job, and no new paid service. The governance caller executes both dependency contract test modules once; direct offline fixtures, native PowerShell exit cases, one real locked SDK restore, and one live metadata collection are the acceptance evidence.
 
 ## Failure behavior
 
