@@ -308,6 +308,13 @@ deadline_timeout() {
     fi
     printf '%s\n' "$default"
 }
+reserve_rollback_budget() {
+    local now
+    now="$(now_unix)" || safe_blocked 'installation clock is unavailable'
+    (( operation_deadline > now + ROLLBACK_TIMEOUT )) ||
+        safe_blocked 'insufficient overall time for installation and rollback'
+    operation_deadline=$((operation_deadline - ROLLBACK_TIMEOUT))
+}
 systemctl_user() {
     local limit
     limit="$(deadline_timeout "$CONTROL_TIMEOUT")" || return 124
@@ -2568,9 +2575,10 @@ restore_runtime_state() {
 }
 rollback_transaction() {
     local previous="$1" reason="$2" ok=1 saved_deadline="$operation_deadline" rollback_now rollback_deadline
+    local overall_deadline="${install_deadline:-$operation_deadline}"
     rollback_now="$(now_unix)" || safe_blocked 'rollback clock is unavailable'
     rollback_deadline=$((rollback_now + ROLLBACK_TIMEOUT))
-    if (( saved_deadline > 0 && saved_deadline < rollback_deadline )); then rollback_deadline=$saved_deadline; fi
+    if (( overall_deadline > 0 && overall_deadline < rollback_deadline )); then rollback_deadline=$overall_deadline; fi
     operation_deadline=$rollback_deadline
     if [[ -n "$previous" ]]; then atomic_symlink "generations/$previous" "$current_link" || ok=0; else atomic_unlink "$current_link" || ok=0; fi
     remove_published_entrypoints || ok=0
@@ -2704,6 +2712,8 @@ verify_candidate() {
 }
 perform_install() {
     local validation bundle_version source_hash manifest_hash binary_hash
+    local install_deadline="$operation_deadline"
+    local operation_deadline="$operation_deadline"
     validation="$(validate_bundle "$ARCHIVE" "$MANIFEST")" || die 'candidate validation failed before mutation'
     check_glibc_compatibility "$MANIFEST" || die 'candidate glibc compatibility check failed'
     IFS=$'\t' read -r bundle_version source_hash manifest_hash binary_hash <<<"$validation"
@@ -2721,6 +2731,7 @@ perform_install() {
     fi
     capture_runtime_state
     local managed_pid=0; probe_active codex-info-rest.service && managed_pid="$(systemd_pid)" || true
+    reserve_rollback_budget
     # The durable pre-state marker must exist before the first stop or TERM.
     # This makes a crash after owner retirement resumable instead of leaving a
     # listener-less flat installation with no recovery authority.
@@ -2804,6 +2815,10 @@ run_update() {
     local start update_deadline releases selection info local_coherent=0 discovery_limit
     [[ ! -f "$transaction" ]] || resume_transaction
     start="$(now_unix)" || safe_blocked 'update clock is unavailable'; [[ "$TRIGGER" == timer ]] && update_deadline=$((start+TIMER_TIMEOUT)) || update_deadline=$((start+MANUAL_TIMEOUT))
+    if (( operation_deadline > 0 && operation_deadline < update_deadline )); then
+        update_deadline=$operation_deadline
+    fi
+    operation_deadline=$update_deadline
     require_user_manager; load_control_state
     local current_id current_manifest_path
     current_id="$(current_generation)" || safe_blocked 'installed current generation is not coherent'
