@@ -104,6 +104,38 @@ class DependencyMetadataTests(unittest.TestCase):
         self.assertEqual(known["approval_status"], "review_required")
         self.assertEqual(known["url"], "https://licenses.nuget.org/MIT")
         self.assertEqual(known["source"], "https://api.nuget.org/v3/catalog0/x.json")
+        invalid = [
+            ("NuGet", {"licenseExpression": []}),
+            ("NuGet", {"licenseExpression": "MIT", "licenseUrl": []}),
+            ("PyPI", {"classifiers": "License :: MIT"}),
+            ("PyPI", {"project_urls": []}),
+            ("PyPI", {"project_urls": {"License": []}}),
+            ("PyPI", {"license": False}),
+            ("GitHub Actions", {"license": "MIT"}),
+            ("GitHub Actions", {"license": {"spdx_id": []}}),
+        ]
+        for ecosystem, metadata in invalid:
+            with self.subTest(ecosystem=ecosystem, metadata=metadata), self.assertRaises(ValueError):
+                module.license_metadata(metadata, ecosystem, "https://pypi.org/pypi/p/1/json")
+        nullable = [
+            ("NuGet", {"licenseExpression": None, "licenseUrl": None}),
+            ("PyPI", {"license_expression": None, "license": None,
+                      "classifiers": None, "project_urls": None}),
+            ("GitHub Actions", {"license": None, "html_url": None}),
+        ]
+        for ecosystem, metadata in nullable:
+            result = module.license_metadata(metadata, ecosystem, "https://pypi.org/pypi/p/1/json")
+            self.assertIsNone(result["expression"])
+            self.assertEqual(result["approval_status"], "review_required")
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            output = pathlib.Path(directory) / "schema-error.json"
+            def invalid_license(*args):
+                return module.license_metadata({"licenseExpression": []}, "NuGet", "https://api.nuget.org")
+            with mock.patch.object(module, "inventory", return_value={}), mock.patch.object(
+                module, "collect", side_effect=invalid_license
+            ):
+                self.assertEqual(module.main(["--root", str(ROOT), "--output", str(output)]), 1)
+            self.assertEqual(json.loads(output.read_text())["collection_status"], "failed")
 
     def test_actions_exact_sha_and_version_coverage(self):
         module = self.helper()

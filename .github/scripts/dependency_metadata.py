@@ -195,12 +195,34 @@ def license_metadata(data, ecosystem, source):
         text, classifiers = None, []
     elif ecosystem == "PyPI":
         expression, text = data.get("license_expression"), data.get("license")
-        urls = data.get("project_urls") or {}
+        urls = data.get("project_urls")
+        if urls is None:
+            urls = {}
+        if not isinstance(urls, dict) or any(
+            not isinstance(key, str) or (value is not None and not isinstance(value, str))
+            for key, value in urls.items()
+        ):
+            raise ValueError("PyPI project_urls is not a nullable string mapping")
         url = urls.get("License") or urls.get("license")
-        classifiers = [item for item in data.get("classifiers", []) if item.startswith("License ::")]
-    else:
-        expression = (data.get("license") or {}).get("spdx_id")
+        declared = data.get("classifiers")
+        if declared is None:
+            declared = []
+        if not isinstance(declared, list) or any(not isinstance(item, str) for item in declared):
+            raise ValueError("PyPI classifiers is not a string array")
+        classifiers = [item for item in declared if item.startswith("License ::")]
+    elif ecosystem == "GitHub Actions":
+        license_info = data.get("license")
+        if license_info is None:
+            license_info = {}
+        if not isinstance(license_info, dict):
+            raise ValueError("GitHub license metadata is not an object")
+        expression = license_info.get("spdx_id")
         url, text, classifiers = data.get("html_url"), None, []
+    else:
+        raise ValueError("unsupported license metadata ecosystem")
+    for field, value in (("expression", expression), ("url", url), ("text", text)):
+        if value is not None and not isinstance(value, str):
+            raise ValueError("license " + field + " is not a nullable string")
     if expression == "NOASSERTION":
         expression = None
     return {"expression": expression, "text": text, "classifiers": classifiers,
