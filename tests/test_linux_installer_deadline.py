@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Finite deadline/propagation model; no live services, network or deployment."""
 
 import contextlib
@@ -311,16 +310,18 @@ class InstallerDeadlineTests(unittest.TestCase):
 
     def test_update_child_never_extends_parent_deadline(self):
         for trigger in ("manual", "timer", "startup"):
-            with self.subTest(trigger=trigger):
-                with self.fixture("update", start=100, trigger=trigger) as (root, result):
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    passed, child, at, limit = map(
-                        int, (root / "child").read_text().split()
-                    )
-                    self.assertEqual(passed, 1230)
-                    self.assertEqual(child, 1230)
-                    self.assertGreater(limit, 0)
-                    self.assertLessEqual(at + limit, 1230)
+            with (
+                self.subTest(trigger=trigger),
+                self.fixture("update", start=100, trigger=trigger) as (root, result),
+            ):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                passed, child, at, limit = map(
+                    int, (root / "child").read_text().split()
+                )
+                self.assertEqual(passed, 1230)
+                self.assertEqual(child, 1230)
+                self.assertGreater(limit, 0)
+                self.assertLessEqual(at + limit, 1230)
 
 
 if __name__ == "__main__":
