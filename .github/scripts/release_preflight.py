@@ -11,11 +11,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from product_version import VersionPaths, bump_versions, check_versions, next_version
@@ -26,8 +27,17 @@ FIELDS = {"schema", "source_sha", "source_tree", "main_base_sha", "workflow_sha"
           "base_version", "expected_version", "expected_tree", "main_included"}
 
 
+def git_executable() -> str:
+    executable = shutil.which("git")
+    if executable is None or not Path(executable).is_absolute():
+        raise ValueError("Git has no absolute executable")
+    return executable
+
+
 def git(*args: str, data: bytes | None = None, env=None) -> bytes:
-    return subprocess.check_output(["git", *args], input=data, env=env)
+    return subprocess.check_output(
+        [git_executable(), *args], input=data, env=env, shell=False,
+    )
 
 
 def oid(value: str) -> str:
@@ -80,8 +90,10 @@ def plan(source: str, main: str, workflow: str) -> dict:
         expected_version = next_version(base_version)
         prepared_files(source, base_version, expected_version, temporary / "next")
         tree = version_tree(source, temporary / "next", temporary)
-    included = subprocess.run(["git", "merge-base", "--is-ancestor", main, source],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    included = subprocess.run(
+        [git_executable(), "merge-base", "--is-ancestor", main, source],
+        shell=False, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
     if included.returncode not in (0, 1):
         raise ValueError("could not establish the pinned main ancestry")
     return {"schema": 1, "source_sha": source,

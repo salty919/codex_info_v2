@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -11,6 +12,9 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+GIT = shutil.which("git")
+if GIT is None or not Path(GIT).is_absolute():
+    raise RuntimeError("fixture requires an absolute Git executable")
 LEAF_JOBS = {
     "rust.yml": "native-quality",
     "linux-ui-quality.yml": "linux-ui-quality",
@@ -20,7 +24,8 @@ LEAF_JOBS = {
 
 def git(directory: Path, *arguments: str) -> str:
     return subprocess.check_output(
-        ["git", "-C", str(directory), *arguments],
+        [GIT, "-C", str(directory), *arguments],
+        shell=False,
         text=True,
         stderr=subprocess.STDOUT,
     ).strip()

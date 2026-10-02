@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Execute real CI caller scripts with finite, offline GitHub/tool fixtures."""
 from __future__ import annotations
 
@@ -5,17 +6,21 @@ import copy
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
+from pathlib import Path
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+GIT = shutil.which("git")
+BASH = shutil.which("bash")
+if any(path is None or not Path(path).is_absolute() for path in (GIT, BASH)):
+    raise RuntimeError("fixtures require absolute Git and Bash executables")
 REPORT = Path("artifacts/codacy-coverage-rust/rust.cobertura.xml")
 
 
@@ -58,7 +63,7 @@ class WorkflowReuseTests(unittest.TestCase):
             "ImageOS": "ubuntu24", "ImageVersion": "exact", "REPOSITORY": "owner/repo",
             "SOURCE_SHA": self.feature, "HEAD_SHA": self.feature, "BASE_SHA": self.base,
             "HEAD_REPOSITORY": "owner/repo", "MAIN_BASE_SHA": self.base, "TRUSTED_SHA": self.base,
-            "PR_NUMBER": "7", "RELEASE_CANDIDATE": "false", "GH_TOKEN": "fixture-only",
+            "PR_NUMBER": "7", "RELEASE_CANDIDATE": "false",
             "FIXTURE_STATE": str(self.state), "FIXTURE_CALLS": str(self.calls), "FIXTURE_ROOT": str(ROOT)}
         self.executable("gh", '''import base64,json,os,pathlib,sys
 endpoint=sys.argv[2]
@@ -109,14 +114,19 @@ os.execvp(args[0],args)
         path.chmod(0o755)
 
     def git(self, *args):
-        return subprocess.check_output(["git", "-C", str(self.repo), *args], text=True, stderr=subprocess.DEVNULL)
+        return subprocess.check_output(
+            [GIT, "-C", str(self.repo), *args], text=True, shell=False, stderr=subprocess.DEVNULL,
+        )
 
     def save_state(self):
         self.state.write_text(json.dumps(self.api))
 
     def run_script(self, source, env=None, ok=True):
-        result = subprocess.run(["bash", "-euo", "pipefail", "-c", source], cwd=self.repo,
-                                env={**self.environment, **(env or {})}, text=True, capture_output=True)
+        result = subprocess.run(
+            [BASH, "-euo", "pipefail", "-c", source], cwd=self.repo,
+            env={**self.environment, **(env or {})}, text=True, capture_output=True,
+            shell=False, check=False,
+        )
         if ok: self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 

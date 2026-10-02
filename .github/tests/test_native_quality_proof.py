@@ -1,13 +1,14 @@
+#!/usr/bin/env python3
 """Reject incomplete or mismatched native reuse evidence before skipping tests."""
 from __future__ import annotations
 
 import copy
 import importlib.util
 import io
-import json
-from pathlib import Path
 import unittest
 import zipfile
+from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -41,6 +42,20 @@ class NativeProofTests(unittest.TestCase):
                     "steps": [{"name": name, "status": "completed", "conclusion": "success"} for name in
                               ("Reconstruct the trusted planned release tree", "Run native unit tests with coverage",
                                "Reject native compiler and Clippy warnings", "Bind successful native checks to exact inputs")]}
+
+    def test_execution_boundary_rejects_programs_paths_and_non_oid_source(self):
+        with mock.patch.object(self.module.subprocess, "check_output") as execute:
+            for args in ((), ("bash", "-c", "exit 0"), ("/usr/bin/git", "status")):
+                with self.assertRaises(ValueError):
+                    self.module.command(*args)
+            for path in (None, "relative/git"):
+                with mock.patch.object(self.module.shutil, "which", return_value=path):
+                    with self.assertRaises(ValueError):
+                        self.module.command("git", "rev-parse", "HEAD")
+            with mock.patch.dict(self.module.os.environ, {"SOURCE_SHA": "--upload-pack=evil"}):
+                with self.assertRaises(ValueError):
+                    self.module.current_tree()
+            execute.assert_not_called()
 
     def test_only_exact_successful_proof_can_skip(self):
         self.assertTrue(self.module.matches(self.proof, self.expected))

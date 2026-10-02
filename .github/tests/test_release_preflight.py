@@ -1,16 +1,20 @@
+#!/usr/bin/env python3
 """Finite caller tests for the read-only planned release snapshot."""
 from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+GIT = shutil.which("git")
+if GIT is None or not Path(GIT).is_absolute():
+    raise RuntimeError("fixture requires an absolute Git executable")
 
 
 class PlannedReleaseTests(unittest.TestCase):
@@ -36,12 +40,14 @@ class PlannedReleaseTests(unittest.TestCase):
         self.source = self.git("rev-parse", "HEAD").strip()
 
     def git(self, *args):
-        return subprocess.check_output(["git", "-C", str(self.repo), *args], text=True)
+        return subprocess.check_output(
+            [GIT, "-C", str(self.repo), *args], text=True, shell=False,
+        )
 
     def call(self, *args, ok=True):
         result = subprocess.run(
             [sys.executable, str(ROOT / ".github/scripts/release_preflight.py"), *args],
-            cwd=self.repo, text=True, capture_output=True,
+            cwd=self.repo, text=True, capture_output=True, shell=False, check=False,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
         if ok:

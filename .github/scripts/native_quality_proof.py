@@ -9,12 +9,13 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+from pathlib import Path
 
 MAX_ARCHIVE = 16 * 1024 * 1024
 MAX_REPORT = 32 * 1024 * 1024
@@ -24,7 +25,21 @@ JOB = "Run selected advisory quality / linux-backend-quality / native-quality"
 
 
 def command(*args: str, data: bytes | None = None, env=None) -> bytes:
-    return subprocess.check_output(args, input=data, env=env, stderr=subprocess.DEVNULL, timeout=30)
+    if not args or args[0] not in {"git", "gh", "rustc", "cargo", "dpkg-query"}:
+        raise ValueError("native proof program is not allowed")
+    executable = shutil.which(args[0])
+    if executable is None or not Path(executable).is_absolute():
+        raise ValueError("native proof program has no absolute executable")
+    return subprocess.check_output(
+        [executable, *args[1:]], input=data, env=env, shell=False,
+        stderr=subprocess.DEVNULL, timeout=30,
+    )
+
+
+def oid(value: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise ValueError("native proof object ID is malformed")
+    return value
 
 
 def api(repository: str, suffix: str):
@@ -52,7 +67,8 @@ def runtime() -> dict:
 
 
 def current_tree() -> str:
-    if command("git", "rev-parse", "HEAD").decode().strip() != os.environ["SOURCE_SHA"]:
+    source = oid(os.environ["SOURCE_SHA"])
+    if command("git", "rev-parse", "HEAD").decode().strip() != source:
         raise ValueError("native checkout no longer matches the exact source")
     changed = set(command("git", "diff", "--name-only", "HEAD", "--").decode().splitlines())
     files = {"Cargo.toml", "Cargo.lock", "windows-client/Directory.Build.props"}
@@ -66,8 +82,8 @@ def current_tree() -> str:
 
 
 def expected(tree: str | None = None, with_runtime=True) -> dict:
-    result = {"tree": tree or current_tree(), "main_base": os.environ["MAIN_BASE_SHA"],
-              "workflow": os.environ["TRUSTED_SHA"]}
+    result = {"tree": tree or current_tree(), "main_base": oid(os.environ["MAIN_BASE_SHA"]),
+              "workflow": oid(os.environ["TRUSTED_SHA"])}
     if with_runtime:
         result["runtime"] = runtime()
     return result
@@ -161,7 +177,7 @@ def resolve() -> None:
     # Never fall back from the latest matching run to an older successful one.
     # A bounded search miss, unavailable API, or legacy run means fresh checks.
     repository = os.environ["REPOSITORY"]
-    source = os.environ["SOURCE_SHA"]
+    source = oid(os.environ["SOURCE_SHA"])
     tree = command("git", "rev-parse", f"{source}^{{tree}}").decode().strip()
     desired = expected(tree=tree, with_runtime=False)
     current_main = api(repository, "git/ref/heads/main").get("object", {}).get("sha")
