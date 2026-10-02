@@ -47,8 +47,16 @@ safe_blocked() {{ exit 88; }}
 capture_legacy_combined_state
 printf '%s %s %s\\n' "$legacy_combined_enabled" "$legacy_combined_active" "$legacy_combined_generation"
 """
+                    # Shell input is this repository function plus literal fixtures.
+                    # Exclude caller PATH and non-interactive shell startup hooks.
                     result = subprocess.run(
-                        ["bash", "-c", script], capture_output=True, text=True, timeout=3
+                        ["/bin/bash", "--noprofile", "--norc", "-s"],
+                        input=script,
+                        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, expected)
