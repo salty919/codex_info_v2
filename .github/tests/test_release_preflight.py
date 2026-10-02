@@ -40,6 +40,8 @@ class PlannedReleaseTests(unittest.TestCase):
         self.source = self.git("rev-parse", "HEAD").strip()
 
     def git(self, *args):
+        # Only this test's local Git repository and literal fixture commands reach this call.
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
         return subprocess.check_output(  # nosec B603 # absolute Git and fixed offline fixture argv.
             [GIT, "-C", str(self.repo), *args], text=True, shell=False,
         )

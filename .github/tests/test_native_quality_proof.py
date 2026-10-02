@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import io
+import tempfile
 import unittest
 import zipfile
 from pathlib import Path
@@ -56,6 +57,48 @@ class NativeProofTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.module.current_tree()
             execute.assert_not_called()
+
+    def test_checkout_executable_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "source"
+            checkout.mkdir()
+            executable = checkout / "git"
+            executable.write_text("checkout-controlled executable")
+            with (mock.patch.object(self.module.Path, "cwd", return_value=checkout),
+                  mock.patch.object(self.module.shutil, "which", return_value=str(executable)),
+                  mock.patch.object(self.module.subprocess, "check_output") as execute):
+                with self.assertRaises(ValueError):
+                    self.module.command("git", "rev-parse", "HEAD")
+                execute.assert_not_called()
+
+    def test_symlink_to_checkout_executable_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "source"
+            checkout.mkdir()
+            executable = checkout / "git"
+            executable.write_text("checkout-controlled executable")
+            external_link = root / "git-link"
+            external_link.symlink_to(executable)
+            with (mock.patch.object(self.module.Path, "cwd", return_value=checkout),
+                  mock.patch.object(self.module.shutil, "which", return_value=str(external_link)),
+                  mock.patch.object(self.module.subprocess, "check_output") as execute):
+                with self.assertRaises(ValueError):
+                    self.module.command("git", "rev-parse", "HEAD")
+                execute.assert_not_called()
+
+    def test_multicall_alias_preserves_argv_zero_and_checks_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "rustup"
+            target.write_text("multicall executable fixture")
+            alias = root / "rustc"
+            alias.symlink_to(target)
+            with (mock.patch.object(self.module.shutil, "which", return_value=str(alias)),
+                  mock.patch.object(self.module.subprocess, "check_output", return_value=b"rustc fixture") as execute):
+                self.assertEqual(self.module.command("rustc", "-Vv"), b"rustc fixture")
+            self.assertEqual(execute.call_args.args[0][0], str(alias))
+            self.assertEqual(execute.call_args.kwargs["executable"], str(target))
 
     def test_only_exact_successful_proof_can_skip(self):
         self.assertTrue(self.module.matches(self.proof, self.expected))
