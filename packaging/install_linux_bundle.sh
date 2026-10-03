@@ -44,6 +44,8 @@ legacy_combined_active=0
 legacy_combined_generation=0
 recorder_reused=0
 recorder_override_migrated=0
+migrate_recorder_override=0
+rollback_recorder_receipt=
 transaction_recovered=0
 operation_deadline=0
 readiness_deadline=0
@@ -81,7 +83,7 @@ proc_root="$(printenv CODEX_INFO_PROC_ROOT || printf '/proc')"
 usage() {
     cat <<'EOF'
 usage: install.sh --bundle ARCHIVE [--manifest FILE] [--sha256 FILE]
-       install.sh --update
+       install.sh --update [--migrate-recorder-override]
        install.sh --start
        install.sh --stop
        install.sh --disable-autostart
@@ -112,6 +114,9 @@ while (($# > 0)); do
         --update)
             [[ "$ACTION" == install && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] || die 'update cannot be combined with bundle options'
             ACTION=update; shift ;;
+        --migrate-recorder-override)
+            (( ! migrate_recorder_override )) || die 'recorder migration supplied twice'
+            migrate_recorder_override=1; shift ;;
         --timer-update)
             [[ "$ACTION" == install && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] || die 'timer-update cannot be combined with bundle options'
             ACTION=timer-update; shift ;;
@@ -148,6 +153,12 @@ while (($# > 0)); do
         *) die "unknown argument: $1" ;;
     esac
 done
+
+if (( migrate_recorder_override )); then
+    [[ "$ACTION" == update || ( "$ACTION" == install && -n "$ARCHIVE" &&
+        "${CODEX_INFO_INSTALL_LOCKED:-}" == 1 && -e /proc/self/fd/9 ) ]] ||
+        die '--migrate-recorder-override requires an explicit normal update'
+fi
 
 case "$ACTION" in
     startup) TRIGGER=startup ;;
@@ -2060,6 +2071,43 @@ guard_control_listener() {
 # A historical override is product-owned only when its exact configuration and
 # payload bind to a completely verified installed product generation.  A name,
 # location, process heartbeat, or displayed version is never ownership proof.
+capture_recorder_override_prestate() {
+    local generation="$1" content pid
+    pid="$(recorder_systemd_pid)"
+    content="$(python3 - "$operation_id" "$generation" "$recorder_override_destination" "$pid" "$proc_root" <<'PY_RECORDER_PRESTATE'
+import hashlib, json, os, pathlib, stat, sys
+operation, generation, override_name, pid, proc_root = sys.argv[1:]
+override = pathlib.Path(override_name)
+def record(path, mode):
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or
+            stat.S_IMODE(before.st_mode) != mode or path.resolve(strict=True) != path):
+        raise SystemExit("SAFE_BLOCKED: recorder prestate owner/type/mode/path differs")
+    data = path.read_bytes()
+    after = path.lstat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise SystemExit("SAFE_BLOCKED: recorder prestate changed while captured")
+    return data, {"device":before.st_dev,"inode":before.st_ino,"sha256":hashlib.sha256(data).hexdigest()}
+data, override_record = record(override, 0o644)
+lines = data.decode("utf-8").splitlines()
+if len(lines) != 3 or lines[:2] != ["[Service]", "ExecStart="] or not lines[2].startswith("ExecStart=/"):
+    raise SystemExit("SAFE_BLOCKED: recorder prestate is not an ExecStart-only drop-in")
+executable = pathlib.Path(lines[2].split("=",1)[1])
+_, executable_record = record(executable, 0o755)
+if pid != "0":
+    actual = pathlib.Path(proc_root) / pid / "exe"
+    metadata = actual.stat()
+    if (actual.resolve(strict=True) != executable or metadata.st_dev != executable_record["device"] or
+            metadata.st_ino != executable_record["inode"] or hashlib.sha256(actual.read_bytes()).hexdigest() != executable_record["sha256"]):
+        raise SystemExit("SAFE_BLOCKED: running recorder differs from the prestate being preserved")
+print(json.dumps({"schema":"codex-info-recorder-override-prestate-v1","operation_id":operation,
+                  "generation":generation,"override":str(override),"override_record":override_record,
+                  "executable":str(executable),"executable_record":executable_record}, separators=(",",":")))
+PY_RECORDER_PRESTATE
+    )" || safe_blocked 'recorder prestate capture failed; configuration preserved'
+    mkdir -p -- "$backup_dir"; chmod 700 -- "$backup_dir"
+    atomic_text "$backup_dir/$operation_id-recorder-override-prestate.json" 600 "$content"
+}
 recorder_execution_record() {
     local generation="$1" properties info expected_hash
     [[ -e "$unit_destination" || -L "$unit_destination" ]] || { printf 'canonical\n'; return; }
@@ -2072,9 +2120,10 @@ recorder_execution_record() {
         verify_generation_files "$generations_dir/$generation" || safe_blocked 'recorder override product provenance is unavailable'
     fi
     python3 - "$properties" "$unit_destination" "$recorder_override_destination" "$recorder_binary_destination" \
-        "$share_dir/hotfixes/issue-134/codex_info_recorder" "$generations_dir/$generation" "$expected_hash" <<'PY_RECORDER_EXECUTION'
-import hashlib, os, pathlib, re, stat, sys
-properties, unit_name, override_name, canonical, hotfix_name, generation_name, expected_hash = sys.argv[1:]
+        "$share_dir/hotfixes/issue-134/codex_info_recorder" "$generations_dir/$generation" "$expected_hash" \
+        "$migrate_recorder_override" "${rollback_recorder_receipt:-}" "${operation_id:-}" "$backup_dir" <<'PY_RECORDER_EXECUTION'
+import hashlib, json, os, pathlib, re, stat, sys
+properties, unit_name, override_name, canonical, hotfix_name, generation_name, expected_hash, selected, receipt_name, operation, backup_name = sys.argv[1:]
 def reject(reason):
     raise SystemExit("SAFE_BLOCKED: recorder ExecStart override conflict; " + reason + "; configuration preserved")
 fields = {}
@@ -2107,34 +2156,82 @@ for name in fields["DropInPaths"].split():
 if executable == canonical and not start_overrides:
     print("canonical")
     raise SystemExit(0)
-if start_overrides != [override] or executable != hotfix_name:
-    reject("command is not a verified product override")
-hotfix = pathlib.Path(hotfix_name)
+if start_overrides != [override]:
+    reject("command is not the supported single recorder drop-in")
+hotfix = pathlib.Path(executable)
 try:
     for candidate, mode in ((override, 0o644), (hotfix, 0o755)):
         metadata = candidate.lstat()
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != mode:
             reject("override or payload owner/type/mode differs")
         if candidate.resolve(strict=True) != candidate: reject("override or payload path is indirect")
-    if override.read_text(encoding="utf-8") != "[Service]\nExecStart=\nExecStart=" + hotfix_name + "\n":
-        reject("override contents are not the exact product template")
-    if hashlib.sha256(hotfix.read_bytes()).hexdigest() != expected_hash:
-        reject("payload has no verified installed product provenance")
-except (OSError, UnicodeError): reject("override or payload is unavailable")
-print("legacy")
+    if override.read_text(encoding="utf-8") != "[Service]\nExecStart=\nExecStart=" + executable + "\n":
+        reject("override contains unsupported or mixed settings")
+    payload_hash = hashlib.sha256(hotfix.read_bytes()).hexdigest()
+    override_hash = hashlib.sha256(override.read_bytes()).hexdigest()
+    if receipt_name:
+        receipt = pathlib.Path(receipt_name)
+        if receipt != pathlib.Path(backup_name) / (operation + "-recorder-override-prestate.json"):
+            reject("rollback receipt path differs")
+        metadata = receipt.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600 or receipt.resolve(strict=True) != receipt:
+            reject("rollback receipt owner/type/mode/path differs")
+        document = json.loads(receipt.read_text(encoding="utf-8"))
+        required = {"schema","operation_id","generation","override","override_record","executable","executable_record"}
+        if (not isinstance(document,dict) or set(document) != required or document["schema"] != "codex-info-recorder-override-prestate-v1" or
+                document["operation_id"] != operation or document["generation"] != generation.name or
+                document["override"] != str(override) or document["executable"] != executable):
+            reject("rollback receipt authority differs")
+        for candidate, key, digest in ((override,"override_record",override_hash),(hotfix,"executable_record",payload_hash)):
+            metadata = candidate.lstat()
+            if document[key] != {"device":metadata.st_dev,"inode":metadata.st_ino,"sha256":digest}:
+                reject("restored recorder prestate differs from its exact snapshot")
+        print("restored", payload_hash, sep="\t")
+        raise SystemExit(0)
+    if executable == hotfix_name and payload_hash == expected_hash:
+        print("legacy")
+        raise SystemExit(0)
+    plan = ("RECORDER_OVERRIDE_MIGRATION: drop-in=" + str(override) + "; from=" + executable +
+            "; to=" + canonical + "; backup=" + backup_name + "; original payload retained")
+    if selected == "1":
+        print(plan, file=sys.stderr)
+        print("selected")
+        raise SystemExit(0)
+    print(plan, file=sys.stderr)
+    reject("override has no verified installed product provenance; RECORDER_OVERRIDE_MIGRATION_REQUIRED; select codex-info --update --migrate-recorder-override")
+except (OSError, UnicodeError, ValueError, KeyError, TypeError): reject("override, payload, or rollback receipt is unavailable")
 PY_RECORDER_EXECUTION
 }
 recorder_binary_identity_check() {
-    local pid="$1" generation="$2" execution info expected_hash actual_hash before after
-    execution="$(recorder_execution_record "$generation")" || return 1
-    [[ "$execution" == canonical || "${allow_legacy_recorder_override:-0}" == 1 ]] ||
+    local pid="$1" generation="$2" execution info expected_hash actual_hash before after record restored_hash
+    record="$(recorder_execution_record "$generation")" || return 1
+    IFS=$'\t' read -r execution restored_hash <<<"$record"
+    [[ "$execution" == canonical || ( "$execution" == legacy && "${allow_legacy_recorder_override:-0}" == 1 ) ||
+       ( "$execution" == restored && "${allow_legacy_recorder_override:-0}" == 1 && -n "${rollback_recorder_receipt:-}" ) ]] ||
         safe_blocked 'recorder effective ExecStart remains pinned by a product override'
     info="$(manifest_record "$generations_dir/$generation/manifest.json")" || return 1
     IFS=$'\t' read -r _ _ _ expected_hash <<<"$info"
+    if [[ "$execution" == restored ]]; then expected_hash="$restored_hash"; fi
+    [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || safe_blocked 'recorder verification digest is invalid'
     before="$(proc_starttime "$pid" 2>/dev/null || true)"
     [[ -n "$before" && "$(recorder_systemd_pid)" == "$pid" ]] || safe_blocked 'recorder MainPID/starttime is unavailable'
     actual_hash="$(sha256sum -- "$proc_root/$pid/exe" 2>/dev/null | awk '{print $1}' || true)"
     [[ "$actual_hash" == "$expected_hash" ]] || safe_blocked 'running recorder executable digest is not the current product artifact'
+    if [[ "$execution" == restored ]]; then
+        # The classifier validated this operation's owner-private receipt.
+        # Rollback restores its exact file; canonical reuse keeps the hash rule.
+        if ! python3 - "$rollback_recorder_receipt" "$proc_root/$pid/exe" <<'PY_RESTORED_RECORDER_IDENTITY'
+import json, pathlib, sys
+document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+actual = pathlib.Path(sys.argv[2])
+metadata = actual.stat()
+expected = document["executable_record"]
+if (actual.resolve(strict=True) != pathlib.Path(document["executable"]) or
+        metadata.st_dev != expected["device"] or metadata.st_ino != expected["inode"]):
+    raise SystemExit("SAFE_BLOCKED: running recorder is not the exact restored prestate executable")
+PY_RESTORED_RECORDER_IDENTITY
+        then return 1; fi
+    fi
     after="$(proc_starttime "$pid" 2>/dev/null || true)"
     [[ "$after" == "$before" && "$(recorder_systemd_pid)" == "$pid" ]] || safe_blocked 'recorder MainPID/starttime changed during artifact verification'
 }
@@ -2664,6 +2761,10 @@ restore_runtime_state() {
 rollback_transaction() {
     local previous="$1" reason="$2" ok=1 saved_deadline="$operation_deadline" rollback_now rollback_deadline
     local allow_legacy_recorder_override=1
+    local rollback_recorder_receipt=
+    if [[ -f "$backup_dir/$operation_id-recorder-override-prestate.json" ]]; then
+        rollback_recorder_receipt="$backup_dir/$operation_id-recorder-override-prestate.json"
+    fi
     local overall_deadline="${install_deadline:-$operation_deadline}"
     rollback_now="$(now_unix)" || safe_blocked 'rollback clock is unavailable'
     rollback_deadline=$((rollback_now + ROLLBACK_TIMEOUT))
@@ -2828,8 +2929,10 @@ perform_install() {
     # The durable pre-state marker must exist before the first stop or TERM.
     # This makes a crash after owner retirement resumable instead of leaving a
     # listener-less flat installation with no recovery authority.
+    # Preserve explicit prestate before prepared, so interruption there can restore it.
+    if [[ "$recorder_execution" == selected ]]; then capture_recorder_override_prestate "$previous_id"; fi
     write_journal prepared
-    if [[ "$recorder_execution" == legacy ]]; then
+    if [[ "$recorder_execution" == legacy || "$recorder_execution" == selected ]]; then
         backup_legacy_path "$recorder_override_destination"
         recorder_override_migrated=1
         write_journal prepared
@@ -2912,12 +3015,13 @@ startup_local_generation_can_run() {
 reconcile_recorder_override() {
     local generation="$1" execution
     execution="$(recorder_execution_record "$generation")" || return 1
-    [[ "$execution" == legacy ]] || return 0
+    [[ "$execution" == legacy || "$execution" == selected ]] || return 0
     previous_id="$generation"; candidate_id="$generation"; operation_id="$(new_operation_id)"
     previous_flat=0; previous_combined=0; recorder_reused=0
     journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
     capture_runtime_state
     reserve_rollback_budget
+    if [[ "$execution" == selected ]]; then capture_recorder_override_prestate "$generation"; fi
     write_journal prepared
     backup_legacy_path "$recorder_override_destination"
     recorder_override_migrated=1
@@ -3032,8 +3136,10 @@ run_update() {
     local child_limit
     child_limit="$(deadline_timeout "$MANUAL_TIMEOUT")" || update_failure_with_fallback 'update overall timeout exceeded before candidate installation'
     local child_status=0
+    local -a migration_options=()
+    if (( migrate_recorder_override )); then migration_options=(--migrate-recorder-override); fi
     if CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
-        timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" --sha256 "$checksum_path"; then
+        timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" --sha256 "$checksum_path" "${migration_options[@]}"; then
         child_status=0
     else
         child_status="$?"

@@ -9,6 +9,7 @@
 set -euo pipefail
 
 operation='run'
+migration_option=()
 case "$#" in
     0) operation='start' ;;
     1)
@@ -23,6 +24,13 @@ case "$#" in
             --help) operation='help' ;;
             *) printf 'codex-info: E_LAUNCHER_ARGUMENT\n' >&2; exit 2 ;;
         esac
+        ;;
+    2)
+        [[ "$1" == --update && "$2" == --migrate-recorder-override ]] || {
+            printf 'codex-info: E_LAUNCHER_ARGUMENT\n' >&2; exit 2;
+        }
+        operation='update'
+        migration_option=(--migrate-recorder-override)
         ;;
     *) printf 'codex-info: E_LAUNCHER_ARGUMENT\n' >&2; exit 2 ;;
 esac
@@ -78,7 +86,7 @@ if (( ! installer_ready )); then
             fi
             ;;
         start|stop|disable-autostart|remove|status|update)
-            exec "$repository_installer" "--$operation"
+            exec "$repository_installer" "--$operation" "${migration_option[@]}"
             ;;
     esac
     [[ -L "$installer" && "$(readlink -- "$installer")" == '../share/codex-info/current/install.sh' && -x "$installer" ]] || {
@@ -89,7 +97,7 @@ fi
 
 case "$operation" in
     start|stop|disable-autostart|remove|status|update)
-        exec "$installer" "--$operation"
+        exec "$installer" "--$operation" "${migration_option[@]}"
         ;;
 esac
 
