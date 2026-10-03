@@ -43,6 +43,7 @@ legacy_combined_enabled=0
 legacy_combined_active=0
 legacy_combined_generation=0
 recorder_reused=0
+recorder_override_migrated=0
 transaction_recovered=0
 operation_deadline=0
 readiness_deadline=0
@@ -62,6 +63,7 @@ launcher_destination="$local_bin/codex-info"
 installer_destination="$local_libexec/codex-info-install.sh"
 manifest_destination="$share_dir/manifest.json"
 unit_destination="$unit_dir/codex-info-recorder.service"
+recorder_override_destination="$unit_destination.d/90-issue-134-current-cli.conf"
 rest_unit_destination="$unit_dir/codex-info-rest.service"
 legacy_combined_unit_destination="$unit_dir/codex-info.service"
 legacy_combined_enable_destination="$unit_dir/default.target.wants/codex-info.service"
@@ -1829,7 +1831,7 @@ link_entrypoints() {
     atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.timer' "$update_timer_destination"
 }
 restore_backups() {
-    python3 - "$operation_id" "$backup_dir" "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination" <<'PY'
+    python3 - "$operation_id" "$backup_dir" "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination" "$recorder_override_destination" <<'PY'
 import os,sys
 from pathlib import Path
 operation,backup_root,*destinations=sys.argv[1:]
@@ -2055,6 +2057,87 @@ guard_control_listener() {
     if probe_active codex-info-rest.service; then managed_pid="$(systemd_pid)"; fi
     [[ "$listener_pid" == "$managed_pid" ]] || safe_blocked 'foreign listener blocks control mutation'
 }
+# A historical override is product-owned only when its exact configuration and
+# payload bind to a completely verified installed product generation.  A name,
+# location, process heartbeat, or displayed version is never ownership proof.
+recorder_execution_record() {
+    local generation="$1" properties info expected_hash
+    [[ -e "$unit_destination" || -L "$unit_destination" ]] || { printf 'canonical\n'; return; }
+    [[ -n "$generation" ]] || safe_blocked 'recorder ExecStart override has no product generation authority'
+    properties="$(systemctl_user show --property=ExecStart --property=FragmentPath --property=DropInPaths codex-info-recorder.service)" ||
+        safe_blocked 'recorder effective ExecStart cannot be inspected'
+    info="$(manifest_record "$generations_dir/$generation/manifest.json")" || safe_blocked 'recorder ExecStart product manifest is unavailable'
+    IFS=$'\t' read -r _ _ _ expected_hash <<<"$info"
+    if [[ -e "$recorder_override_destination" || -L "$recorder_override_destination" ]]; then
+        verify_generation_files "$generations_dir/$generation" || safe_blocked 'recorder override product provenance is unavailable'
+    fi
+    python3 - "$properties" "$unit_destination" "$recorder_override_destination" "$recorder_binary_destination" \
+        "$share_dir/hotfixes/issue-134/codex_info_recorder" "$generations_dir/$generation" "$expected_hash" <<'PY_RECORDER_EXECUTION'
+import hashlib, os, pathlib, re, stat, sys
+properties, unit_name, override_name, canonical, hotfix_name, generation_name, expected_hash = sys.argv[1:]
+def reject(reason):
+    raise SystemExit("SAFE_BLOCKED: recorder ExecStart override conflict; " + reason + "; configuration preserved")
+fields = {}
+for line in properties.splitlines():
+    key, separator, value = line.partition("=")
+    if not separator or key in fields: reject("effective unit properties are ambiguous")
+    fields[key] = value
+if set(fields) != {"ExecStart", "FragmentPath", "DropInPaths"}: reject("effective unit properties are incomplete")
+unit, override, generation = map(pathlib.Path, (unit_name, override_name, generation_name))
+try:
+    if pathlib.Path(fields["FragmentPath"]).resolve(strict=True) != (generation / "codex-info-recorder.service").resolve(strict=True):
+        reject("service fragment is not the installed product unit")
+except OSError: reject("service fragment is unavailable")
+match = re.fullmatch(r"\{\s*path=(.*?)\s*;\s*argv\[\]=(.*?)\s*;[^{}]*\}", fields["ExecStart"])
+if match is None: reject("effective command is ambiguous")
+executable, arguments = match.groups()
+if arguments != executable: reject("custom command arguments are not product-owned")
+start_overrides = []
+for name in fields["DropInPaths"].split():
+    dropin = pathlib.Path(name)
+    try:
+        section = ""
+        for line in dropin.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("["): section = line
+            if section == "[Service]" and line.startswith("ExecStart="):
+                start_overrides.append(dropin)
+                break
+    except OSError: reject("drop-in cannot be inspected")
+if executable == canonical and not start_overrides:
+    print("canonical")
+    raise SystemExit(0)
+if start_overrides != [override] or executable != hotfix_name:
+    reject("command is not a verified product override")
+hotfix = pathlib.Path(hotfix_name)
+try:
+    for candidate, mode in ((override, 0o644), (hotfix, 0o755)):
+        metadata = candidate.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != mode:
+            reject("override or payload owner/type/mode differs")
+        if candidate.resolve(strict=True) != candidate: reject("override or payload path is indirect")
+    if override.read_text(encoding="utf-8") != "[Service]\nExecStart=\nExecStart=" + hotfix_name + "\n":
+        reject("override contents are not the exact product template")
+    if hashlib.sha256(hotfix.read_bytes()).hexdigest() != expected_hash:
+        reject("payload has no verified installed product provenance")
+except (OSError, UnicodeError): reject("override or payload is unavailable")
+print("legacy")
+PY_RECORDER_EXECUTION
+}
+recorder_binary_identity_check() {
+    local pid="$1" generation="$2" execution info expected_hash actual_hash before after
+    execution="$(recorder_execution_record "$generation")" || return 1
+    [[ "$execution" == canonical || "${allow_legacy_recorder_override:-0}" == 1 ]] ||
+        safe_blocked 'recorder effective ExecStart remains pinned by a product override'
+    info="$(manifest_record "$generations_dir/$generation/manifest.json")" || return 1
+    IFS=$'\t' read -r _ _ _ expected_hash <<<"$info"
+    before="$(proc_starttime "$pid" 2>/dev/null || true)"
+    [[ -n "$before" && "$(recorder_systemd_pid)" == "$pid" ]] || safe_blocked 'recorder MainPID/starttime is unavailable'
+    actual_hash="$(sha256sum -- "$proc_root/$pid/exe" 2>/dev/null | awk '{print $1}' || true)"
+    [[ "$actual_hash" == "$expected_hash" ]] || safe_blocked 'running recorder executable digest is not the current product artifact'
+    after="$(proc_starttime "$pid" 2>/dev/null || true)"
+    [[ "$after" == "$before" && "$(recorder_systemd_pid)" == "$pid" ]] || safe_blocked 'recorder MainPID/starttime changed during artifact verification'
+}
 recorder_identity_check() {
     local pid="$1" version="$2" source="$3" manifest_hash="$4" lock_path recorder_path data_root
     data_root="$(printenv CODEX_INFO_DATA_DIR || true)"
@@ -2189,7 +2272,7 @@ verify_runtime() {
     verify_fixed_links
     legacy_combined_retired || safe_blocked 'legacy combined unit was not retired'
     [[ -L "$current_link" ]] || safe_blocked 'current generation is absent'
-    local target generation info version source manifest_hash binary_hash rest_hash pid before
+    local target generation info version source manifest_hash binary_hash rest_hash pid recorder_pid before
     target="$(readlink -- "$current_link")"
     [[ "$target" == generations/* && "$target" != */*/* ]] || safe_blocked 'current generation link is invalid'
     generation="${target#generations/}"
@@ -2204,6 +2287,8 @@ verify_runtime() {
     probe_active codex-info-rest.service || safe_blocked 'REST service is inactive'
     pid="$(systemd_pid)"; [[ "$pid" != 0 ]] || safe_blocked 'REST service has no MainPID'
     before="$(proc_starttime "$pid" 2>/dev/null || true)"; [[ -n "$before" ]] || safe_blocked 'MainPID starttime unavailable'
+    recorder_pid="$(recorder_systemd_pid)"; [[ "$recorder_pid" != 0 ]] || safe_blocked 'recorder service has no MainPID'
+    recorder_binary_identity_check "$recorder_pid" "$generation" || return 1
     health_readback "$pid" "$before" "$version" "$source" "$manifest_hash" "$rest_hash"
     printf 'ready version=%s source=%s generation=%s pid=%s\n' "$version" "$source" "$generation" "$pid"
 }
@@ -2524,14 +2609,17 @@ recover_legacy_combined_state() {
     fi
 }
 recorder_artifact_matches_previous() {
-    local candidate_hash="$1" previous_path previous_hash
+    local candidate_hash="$1" previous_path previous_hash pid actual_hash
     [[ -n "$previous_id" && -n "$candidate_hash" ]] || return 1
     previous_path="$generations_dir/$previous_id"
     verify_generation_files "$previous_path" >/dev/null 2>&1 || return 1
     previous_path="$previous_path/codex_info_recorder"
     [[ -f "$previous_path" && ! -L "$previous_path" ]] || return 1
     previous_hash="$(sha256sum -- "$previous_path" | awk '{print $1}')" || return 1
-    [[ "$previous_hash" == "$candidate_hash" ]]
+    [[ "$previous_hash" == "$candidate_hash" ]] || return 1
+    pid="$(recorder_systemd_pid)" || return 1
+    actual_hash="$(sha256sum -- "$proc_root/$pid/exe" 2>/dev/null | awk '{print $1}' || true)"
+    [[ "$actual_hash" == "$candidate_hash" ]]
 }
 enforce_desired_state() {
     if [[ "$desired_state" != running && "$main_active" == 1 ]]; then
@@ -2575,6 +2663,7 @@ restore_runtime_state() {
 }
 rollback_transaction() {
     local previous="$1" reason="$2" ok=1 saved_deadline="$operation_deadline" rollback_now rollback_deadline
+    local allow_legacy_recorder_override=1
     local overall_deadline="${install_deadline:-$operation_deadline}"
     rollback_now="$(now_unix)" || safe_blocked 'rollback clock is unavailable'
     rollback_deadline=$((rollback_now + ROLLBACK_TIMEOUT))
@@ -2695,7 +2784,7 @@ activate_candidate() {
     rearm_update_timer || return 1
     [[ "$TRIGGER" == startup ]] && return
     if ((main_active)); then
-        if recorder_artifact_matches_previous "$candidate_recorder_hash"; then
+        if (( ! recorder_override_migrated )) && recorder_artifact_matches_previous "$candidate_recorder_hash"; then
             recorder_reused=1
         else
             systemctl_user restart --no-block codex-info-recorder.service >/dev/null 2>&1 || return 1
@@ -2711,7 +2800,7 @@ verify_candidate() {
     if [[ "$desired_state" == running && "$TRIGGER" != startup ]]; then wait_runtime_ready; fi
 }
 perform_install() {
-    local validation bundle_version source_hash manifest_hash binary_hash
+    local validation bundle_version source_hash manifest_hash binary_hash recorder_execution=canonical
     local install_deadline="$operation_deadline"
     local operation_deadline="$operation_deadline"
     validation="$(validate_bundle "$ARCHIVE" "$MANIFEST")" || die 'candidate validation failed before mutation'
@@ -2721,6 +2810,10 @@ perform_install() {
     previous_flat=0; previous_combined=0; legacy_combined_generation=0; recorder_reused=0
     journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
     load_control_state; require_user_manager
+    if [[ -n "$previous_id" ]]; then
+        recorder_execution="$(recorder_execution_record "$previous_id")" || return 1
+    fi
+    recorder_override_migrated=0
     if legacy_combined_present; then
         legacy_combined_mixed_split_present && safe_blocked 'legacy combined and split installation states are mixed'
         capture_legacy_combined_state
@@ -2736,6 +2829,11 @@ perform_install() {
     # This makes a crash after owner retirement resumable instead of leaving a
     # listener-less flat installation with no recovery authority.
     write_journal prepared
+    if [[ "$recorder_execution" == legacy ]]; then
+        backup_legacy_path "$recorder_override_destination"
+        recorder_override_migrated=1
+        write_journal prepared
+    fi
     retire_legacy_combined "$managed_pid"
     enforce_desired_state || safe_blocked 'could not enforce desired runtime state'
     retire_known_unmanaged "$managed_pid"
@@ -2811,6 +2909,31 @@ startup_local_generation_can_run() {
     [[ -z "$listener_pid" ]] || return 1
     printf '%s\n' "$current_id"
 }
+reconcile_recorder_override() {
+    local generation="$1" execution
+    execution="$(recorder_execution_record "$generation")" || return 1
+    [[ "$execution" == legacy ]] || return 0
+    previous_id="$generation"; candidate_id="$generation"; operation_id="$(new_operation_id)"
+    previous_flat=0; previous_combined=0; recorder_reused=0
+    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
+    capture_runtime_state
+    reserve_rollback_budget
+    write_journal prepared
+    backup_legacy_path "$recorder_override_destination"
+    recorder_override_migrated=1
+    write_journal current_switched
+    if ! activate_candidate; then
+        rollback_transaction "$previous_id" 'recorder override activation failed'
+        die 'recorder override activation failed; previous configuration restored'
+    fi
+    write_journal activation_requested
+    if ! verify_candidate; then
+        rollback_transaction "$previous_id" 'recorder override verification failed'
+        die 'recorder override verification failed; previous configuration restored'
+    fi
+    write_journal candidate_verified
+    write_journal committed override-migrated
+}
 run_update() {
     local start update_deadline releases selection info local_coherent=0 discovery_limit
     [[ ! -f "$transaction" ]] || resume_transaction
@@ -2836,6 +2959,7 @@ run_update() {
     # must terminate SAFE_BLOCKED without download or publication mutation;
     # only an exact known generation/legacy owner may be retired later after a
     # durable prepared journal exists.
+    [[ -z "$current_id" ]] || recorder_execution_record "$current_id" >/dev/null || return 1
     preflight_listener_owner
     IFS=$'\t' read -r installed_version _ installed_manifest_hash _ <<<"$info"
     if [[ -n "$current_id" && "$desired_state" == running ]] && ! verify_fixed_links_local; then
@@ -2863,6 +2987,7 @@ run_update() {
     local state newest; IFS=$'\t' read -r state newest < "$selection"
     if [[ "$state" == no-update ]]; then
         verify_local_generation || safe_blocked 'no-update local generation is incoherent'
+        reconcile_recorder_override "$current_id"
         if [[ "$desired_state" == running ]]; then
             if ! probe_active codex-info-recorder.service || ! probe_active codex-info-rest.service; then
                 retire_known_unmanaged 0
