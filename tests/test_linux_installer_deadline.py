@@ -29,6 +29,7 @@ FUNCTIONS = (
 MODEL = r'''
 fixture_root="$FIXTURE_ROOT"
 share_dir="$fixture_root/share"
+backup_dir="$share_dir/legacy-backups"
 generations_dir="$share_dir/generations"
 install_lock="$share_dir/.install.lock"
 transaction="$share_dir/transaction.json"

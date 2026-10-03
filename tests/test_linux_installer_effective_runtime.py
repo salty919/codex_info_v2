@@ -379,5 +379,154 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         self.preserved_profile()
 
 
+    def unknown_historical_override(self):
+        self.active_override(owned=True)
+        self.hotfix_bytes = b"unregistered historical recorder; explicit product migration required\n"
+        self.hotfix.write_bytes(self.hotfix_bytes)
+        self.assertNotEqual(digest(self.hotfix), digest(self.old_generation / "codex_info_recorder"))
+
+    def test_unknown_override_requires_choice_through_normal_launcher(self):
+        self.unknown_historical_override()
+        self.release("1.0.20", "2" * 40)
+        journal = self.home / ".local/share/codex-info/install-transaction.json"
+        before_journal = journal.read_bytes()
+        before_commands = pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"]).read_bytes()
+        result = self.command(self.home / ".local/bin/codex-info", "--update")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RECORDER_OVERRIDE_MIGRATION_REQUIRED", result.stderr)
+        self.assertIn("codex-info --update --migrate-recorder-override", result.stderr)
+        for destination in (self.override, self.hotfix, self.home / ".local/bin/codex_info_recorder",
+                            self.home / ".local/share/codex-info/legacy-backups"):
+            self.assertIn(str(destination), result.stderr)
+        self.assertEqual(self.current().resolve(strict=True), self.old_generation)
+        self.assertEqual(self.override.read_bytes(), self.override_bytes)
+        self.assertEqual(self.hotfix.read_bytes(), self.hotfix_bytes)
+        self.assertEqual(journal.read_bytes(), before_journal)
+        self.assertEqual(pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"]).read_bytes(), before_commands)
+        self.preserved_profile()
+
+    def test_explicit_migration_through_normal_launcher_preserves_originals(self):
+        # Both release-selection branches must retain the user's explicit choice.
+        for index, version in enumerate(("1.0.19", "1.0.20")):
+            with self.subTest(version=version):
+                if index:
+                    self.doCleanups()
+                    self.setUp()
+                self.unknown_historical_override()
+                self.release(version, ("1" if version == "1.0.19" else "2") * 40)
+                result = self.command(self.home / ".local/bin/codex-info", "--update", "--migrate-recorder-override")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("RECORDER_OVERRIDE_MIGRATION", result.stderr)
+                generation = self.current().resolve(strict=True)
+                running = (self.proc / str(RECORDER_PID) / "exe").resolve(strict=True)
+                self.assertEqual(running, generation / "codex_info_recorder")
+                self.assertEqual(digest(running), digest(generation / "codex_info_recorder"))
+                self.assertFalse(self.override.exists())
+                self.assertEqual(self.hotfix.read_bytes(), self.hotfix_bytes)
+                backups = self.home / ".local/share/codex-info/legacy-backups"
+                originals = [file for file in backups.rglob("*") if file.is_file()
+                             and file.read_bytes() == self.override_bytes]
+                self.assertEqual(len(originals), 1)
+                self.assertEqual(originals[0].stat().st_mode & 0o777, 0o644)
+                self.assertFalse(list(self.override.parent.glob("*.conf")))
+                self.preserved_profile()
+
+    def test_failed_explicit_migration_restores_exact_unknown_prestate(self):
+        self.unknown_historical_override()
+        self.release("1.0.20", "2" * 40)
+        self.env["FAKE_FAIL_START_UNIT"] = "codex-info-rest.service"
+        self.env["FAKE_FAIL_START_ONCE_FILE"] = str(self.root / "explicit-migration-rest-failed-once")
+        before_events = len(pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"]).read_text().splitlines())
+        result = self.command(self.home / ".local/bin/codex-info", "--update", "--migrate-recorder-override")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("previous generation restored", result.stderr)
+        events = [json.loads(line) for line in pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"]).read_text().splitlines()[before_events:]]
+        self.assertTrue(any(event["unit"] == "codex-info-recorder.service" and event["path"] != str(self.hotfix)
+                            for event in events), "activation must be attempted before the rollback oracle")
+        self.assertEqual(self.current().resolve(strict=True), self.old_generation)
+        self.assertEqual(self.override.read_bytes(), self.override_bytes)
+        self.assertEqual(self.override.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.hotfix.read_bytes(), self.hotfix_bytes)
+        self.assertEqual((self.proc / str(RECORDER_PID) / "exe").resolve(strict=True), self.hotfix)
+        journal = json.loads((self.home / ".local/share/codex-info/install-transaction.json").read_text())
+        self.assertEqual(journal["phase"], "committed", "rollback must finish its existing verification gate")
+        self.preserved_profile()
+
+    def test_explicit_migration_preserves_mixed_or_unsafe_dropin(self):
+        for index, kind in enumerate(("mixed", "unsafe_mode")):
+            with self.subTest(kind=kind):
+                if index:
+                    self.doCleanups()
+                    self.setUp()
+                self.unknown_historical_override()
+                if kind == "mixed":
+                    self.override.write_bytes(self.override_bytes + b"Environment=USER_SETTING=preserve\n")
+                else:
+                    self.override.chmod(0o666)
+                expected_bytes = self.override.read_bytes()
+                expected_mode = self.override.stat().st_mode & 0o777
+                self.release("1.0.20", "2" * 40)
+                before_commands = pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"]).read_bytes()
+                result = self.command(self.home / ".local/bin/codex-info", "--update", "--migrate-recorder-override")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("SAFE_BLOCKED", result.stderr)
+                self.assertEqual(self.current().resolve(strict=True), self.old_generation)
+                self.assertEqual(self.override.read_bytes(), expected_bytes)
+                self.assertEqual(self.override.stat().st_mode & 0o777, expected_mode)
+                self.assertEqual(self.hotfix.read_bytes(), self.hotfix_bytes)
+                self.assertEqual(pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"]).read_bytes(), before_commands)
+                self.preserved_profile()
+
+
+class RecorderRollbackIdentityTests(unittest.TestCase):
+    def test_rollback_binds_saved_file_identity_and_keeps_canonical_reuse(self):
+        function = re.findall(r"(?ms)^recorder_binary_identity_check\(\) \{\n.*?^\}\n", INSTALLER.read_text())
+        self.assertEqual(len(function), 1)
+        with tempfile.TemporaryDirectory(prefix="recorder-rollback-file-identity-") as directory:
+            root = pathlib.Path(directory)
+            original = root / "original-recorder"
+            identical = root / "other-recorder"
+            original.write_bytes(b"independent original recorder file identity oracle\n")
+            identical.write_bytes(original.read_bytes())
+            original.chmod(0o755)
+            identical.chmod(0o755)
+            metadata = original.stat()
+            self.assertNotEqual(metadata.st_ino, identical.stat().st_ino)
+            self.assertEqual(digest(original), digest(identical))
+            receipt = root / "receipt.json"
+            receipt.write_text(json.dumps({"executable":str(original), "executable_record":{
+                "device":metadata.st_dev, "inode":metadata.st_ino, "sha256":digest(original)}}))
+            receipt.chmod(0o600)
+            process = root / "proc/70"
+            process.mkdir(parents=True)
+            executable = process / "exe"
+            prefix = """set -euo pipefail
+allow_legacy_recorder_override=1
+proc_root="$FIXTURE_ROOT/proc"
+generations_dir="$FIXTURE_ROOT/generations"
+rollback_recorder_receipt="$FIXTURE_ROOT/receipt.json"
+safe_blocked() { printf '%s\\n' "$*" >&2; return 1; }
+proc_starttime() { printf '42\\n'; }
+recorder_systemd_pid() { printf '70\\n'; }
+# Classification and generation manifest are already verified caller inputs.
+recorder_execution_record() { printf '%s\\t%s\\n' "$EXECUTION_KIND" "$FIXTURE_SHA"; }
+manifest_record() { printf '1.0.19\\tsource\\tmanifest\\t%s\\n' "$FIXTURE_SHA"; }
+"""
+            for kind, target, expected in (("restored", original, 0), ("restored", identical, 1),
+                                          ("canonical", identical, 0)):
+                with self.subTest(kind=kind, executable=target.name):
+                    if executable.is_symlink():
+                        executable.unlink()
+                    executable.symlink_to(target)
+                    result = subprocess.run(
+                        ["/bin/bash", "--noprofile", "--norc", "-s"],
+                        input=prefix + function[0] + "\nrecorder_binary_identity_check 70 verified-old-generation\n",
+                        env={"PATH":"/usr/bin:/bin", "LC_ALL":"C", "FIXTURE_ROOT":str(root),
+                             "FIXTURE_SHA":digest(original), "EXECUTION_KIND":kind},
+                        capture_output=True, text=True, check=False, timeout=3,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
