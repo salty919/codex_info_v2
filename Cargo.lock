@@ -791,6 +791,8 @@ version = "0.1.0"
 dependencies = [
  "codex-info-account-locator",
  "codex-info-db-reader",
+ "codex-info-db-writer",
+ "codex-info-recorder",
  "codex-info-rest-contract",
  "rusqlite",
  "serde",
