@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Offline update-entrypoint regressions for recorder overrides.
 
 The oracle is the requested process path/hash, never UI or health version.
@@ -7,7 +6,6 @@ Only an isolated HOME, fake proc tree and trusted fixture bundles are used.
 
 import hashlib
 import json
-import os
 import pathlib
 import re
 import shutil
@@ -242,7 +240,7 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"]).touch()
         self.control("running")
         result = subprocess.run(  # nosec B603 # this offline adapter updates fixture lock identity only.
-            [str(self.bin / "systemctl"), "--user", "restart", "--no-block", "codex-info-recorder.service"],
+            ["/usr/bin/python3", str(self.bin / "systemctl"), "--user", "restart", "--no-block", "codex-info-recorder.service"],
             env=self.env, capture_output=True, text=True, check=False, timeout=5,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
