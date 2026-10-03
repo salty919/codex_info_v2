@@ -2431,7 +2431,10 @@ fn reset_window_started_between_observations(
     let observation_advance = observed_at.saturating_sub(previous_observed_at);
     let tracks_observation_clock =
         reset_advance.abs_diff(observation_advance) <= RESET_GROUP_TOLERANCE_SECONDS as u64;
-    next_start_at > previous_observed_at
+    // Provider window start and acquisition completion are different clocks.
+    // Use the existing boundary equivalence when the response finishes just
+    // after the window starts; quota recovery is still required by the caller.
+    (next_start_at > previous_observed_at || same_reset_group(next_start_at, previous_observed_at))
         && next_start_at <= observed_at
         && !tracks_observation_clock
 }
@@ -13131,6 +13134,39 @@ mod tests {
             path, identity, &backup
         )
         .unwrap());
+    }
+
+    #[test]
+    fn quota_rollover_with_overlapping_provider_start() {
+        // Anonymous provider fixture: a valid new weekly window is authoritative
+        // even when an old-window response finished just after its start.
+        // Boundary is the external rollover contract, not a classifier result.
+        const OBSERVED_AT: i64 = 2_000_000_000;
+        const WINDOW: i64 = 7 * 24 * 60 * 60;
+        let previous = PreviousQuotaState::new(
+            Some(OBSERVED_AT + 24 * 60 * 60),
+            WINDOW,
+            Some(OBSERVED_AT),
+            Some(25.0),
+        );
+        let transitions = [14_i64, 16_i64].map(|overlap| {
+            let provider_start = OBSERVED_AT - overlap;
+            classify_quota_transition(
+                previous,
+                QuotaCandidate::new(
+                    provider_start + WINDOW,
+                    WINDOW,
+                    Some(95.0),
+                    OBSERVED_AT + 120,
+                ),
+            )
+        });
+
+        assert_eq!(
+            transitions,
+            [QuotaTransition::Boundary, QuotaTransition::Boundary],
+            "provider rollover must not depend on which side of acquisition completion its start falls"
+        );
     }
 
     #[test]

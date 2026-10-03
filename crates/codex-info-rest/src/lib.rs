@@ -1997,6 +1997,137 @@ mod tests {
     }
 
     #[test]
+    fn idle_quota_rollover_commits_and_updates_rest_current() {
+        use codex_info_db_writer::{StoragePartitionIdentity, UsageStore};
+        use codex_info_recorder::{QuotaSnapshot, Recorder, RecorderConfig};
+
+        // Fixed anonymous timestamps and percentages are an independent oracle.
+        // No Session file, quota poller, account RPC, or production profile is used.
+        const OBSERVED_AT: i64 = 2_000_000_040;
+        const WINDOW: i64 = 7 * 24 * 60 * 60;
+        const NEXT_OBSERVED_AT: i64 = OBSERVED_AT + 120;
+        const NEXT_RESET_AT: i64 = OBSERVED_AT - 16 + WINDOW;
+        let root = tempfile::tempdir().expect("anonymous idle fixture");
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).expect("empty Session directory");
+        let database = root.path().join("usage_history.sqlite3");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 1,
+            partition_id: "33".repeat(32),
+        };
+        drop(UsageStore::create_partitioned(&database, &identity).expect("fixture DB"));
+        let mut recorder = Recorder::open_partitioned(
+            RecorderConfig {
+                sessions_root: sessions.clone(),
+                chunk_bytes: 1024,
+            },
+            &database,
+            &identity,
+        )
+        .expect("fixture recorder");
+        let first = recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: OBSERVED_AT,
+                reset_at: OBSERVED_AT + 24 * 60 * 60,
+                window_seconds: WINDOW,
+                remaining_percent: Some(25.0),
+            }))
+            .expect("old quota cycle")
+            .expect("quota-only commit");
+        assert_eq!(first.accepted_ranges, 0);
+        assert_eq!(first.pending_ranges, 0);
+        assert_eq!(first.sources_seen, 0);
+
+        let reader_identity = codex_info_db_reader::StoragePartitionIdentity {
+            schema_version: identity.schema_version.clone(),
+            profile_scope_id: identity.profile_scope_id.clone(),
+            account_scope_id: identity.account_scope_id.clone(),
+            storage_epoch: identity.storage_epoch,
+            partition_id: identity.partition_id.clone(),
+        };
+        let reader =
+            DbReader::open_partitioned(&database, &reader_identity).expect("fixture reader");
+        let mut server =
+            RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("test REST");
+        let before = request(
+            server.local_addr(),
+            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(before.starts_with("HTTP/1.1 200"));
+        let before_value: Value = serde_json::from_str(body(&before)).expect("old current JSON");
+        assert_eq!(before_value["state"], "ready");
+        assert_eq!(before_value["observed_at"], OBSERVED_AT);
+        assert_eq!(before_value["quota"]["remaining_percent"], 25.0);
+        assert_eq!(
+            before_value["quota"]["reset_at"],
+            OBSERVED_AT + 24 * 60 * 60
+        );
+        assert_eq!(before_value["quota"]["window_seconds"], WINDOW);
+
+        let rolled = recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: NEXT_OBSERVED_AT,
+                reset_at: NEXT_RESET_AT,
+                window_seconds: WINDOW,
+                remaining_percent: Some(95.0),
+            }))
+            .expect("idle rollover cycle")
+            .expect("idle quota-only commit");
+        assert!(rolled.generation > first.generation);
+        assert_eq!(rolled.accepted_ranges, 0);
+        assert_eq!(rolled.pending_ranges, 0);
+        assert_eq!(rolled.sources_seen, 0);
+        assert_eq!(fs::read_dir(&sessions).unwrap().count(), 0);
+
+        let connection = Connection::open(&database).expect("fixture DB assertions");
+        let generation: (String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT data_generation, reset_at, latest_quota_reset_at, window_seconds
+                 FROM collection_generation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(generation.0, rolled.generation.to_string());
+        assert_eq!(
+            (generation.1, generation.2, generation.3),
+            (NEXT_RESET_AT, NEXT_RESET_AT, WINDOW)
+        );
+        let quota_row: (i64, i64, f64) = connection
+            .query_row(
+                "SELECT timestamp, reset_at, remaining_percent FROM usage_history
+                 ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(quota_row, (NEXT_OBSERVED_AT, NEXT_RESET_AT, 95.0));
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 0);
+        drop(connection);
+
+        server.store().refresh();
+        let after = request(
+            server.local_addr(),
+            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(after.starts_with("HTTP/1.1 200"));
+        let after_value: Value = serde_json::from_str(body(&after)).expect("new current JSON");
+        assert_eq!(after_value["state"], "ready");
+        assert_eq!(after_value["observed_at"], NEXT_OBSERVED_AT);
+        assert_eq!(after_value["quota"]["remaining_percent"], 95.0);
+        assert_eq!(after_value["quota"]["reset_at"], NEXT_RESET_AT);
+        assert_eq!(after_value["quota"]["window_seconds"], WINDOW);
+        assert_ne!(published_pair(&before), published_pair(&after));
+        server.shutdown();
+    }
+
+    #[test]
     fn health_uses_the_strict_codex_info_contract_with_distribution_version() {
         let value: serde_json::Value = serde_json::from_slice(&health_body()).expect("health");
         let object = value.as_object().expect("health object");
