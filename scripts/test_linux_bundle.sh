@@ -240,6 +240,36 @@ case "${1-}" in
             else
                 printf '%s\n' "${FAKE_MAIN_PID:-0}"
             fi
+        elif [[ "$*" == *ExecStart* || "$*" == *FragmentPath* || "$*" == *DropInPaths* ]]; then
+            unit="${*: -1}"
+            python3 - "$HOME" "$unit" "$@" <<'PY_FAKE_UNIT_PROPERTIES'
+import pathlib, shlex, sys
+home, unit = sys.argv[1:3]
+unit_dir = pathlib.Path(home) / ".config/systemd/user"
+fragment = unit_dir / unit
+dropins = sorted((unit_dir / (unit + ".d")).glob("*.conf"))
+commands = []
+for path in [fragment, *dropins]:
+    if not path.exists(): continue
+    section = ""
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("["): section = line
+        if section == "[Service]" and line.startswith("ExecStart="):
+            value = line.split("=", 1)[1]
+            if not value: commands.clear()
+            else: commands.append(value.replace("%h", home))
+rendered = []
+for command in commands:
+    executable = shlex.split(command)[0]
+    rendered.append("{ path=" + executable + " ; argv[]=" + command + " ; ignore_errors=no ; }")
+fields = {"ExecStart": " ".join(rendered), "FragmentPath": str(fragment),
+          "DropInPaths": " ".join(map(str, dropins))}
+for argument in sys.argv[3:]:
+    if argument.startswith("--property="):
+        for name in argument.split("=", 1)[1].split(","):
+            if name in fields: print(fields[name] if "--value" in sys.argv else name + "=" + fields[name])
+PY_FAKE_UNIT_PROPERTIES
         fi
         exit 0
         ;;

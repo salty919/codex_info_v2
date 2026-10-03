@@ -153,6 +153,7 @@ validate_bundle() {
         aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 }
 check_glibc_compatibility() { :; }
+recorder_execution_record() { printf 'canonical\n'; }
 legacy_combined_present() { return 1; }
 legacy_flat_present() { return 1; }
 systemd_pid() { printf '123\n'; }
