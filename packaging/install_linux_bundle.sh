@@ -1088,6 +1088,9 @@ file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 class Unsafe(Exception):
     pass
 
+class ReferenceInspectionUnavailable(Exception):
+    pass
+
 def require(condition, message):
     if not condition:
         raise Unsafe(message)
@@ -1363,7 +1366,7 @@ def collect_references(known_names):
     try:
         process_names = os.listdir(proc_root)
     except OSError as error:
-        raise Unsafe("process references cannot be enumerated") from error
+        raise ReferenceInspectionUnavailable("process references cannot be enumerated") from error
     for pid in process_names:
         if not pid.isdecimal():
             continue
@@ -1373,7 +1376,7 @@ def collect_references(known_names):
         except FileNotFoundError:
             continue
         except OSError as error:
-            raise Unsafe("process owner cannot be inspected") from error
+            raise ReferenceInspectionUnavailable("process owner cannot be inspected") from error
         if process_stat.st_uid != uid:
             continue
         try:
@@ -1381,7 +1384,7 @@ def collect_references(known_names):
         except FileNotFoundError:
             continue
         except OSError as error:
-            raise Unsafe("owned process executable cannot be inspected") from error
+            raise ReferenceInspectionUnavailable("owned process executable cannot be inspected") from error
         if executable.endswith(" (deleted)"):
             executable = executable[:-10]
         generation = generation_from_path(executable, known_names)
@@ -1487,6 +1490,10 @@ def main():
 
 try:
     main()
+except ReferenceInspectionUnavailable as error:
+    # The committed generation has already been verified. Unknown process
+    # references prevent deletion, but do not invalidate that outcome.
+    print(f"GENERATION_PRUNE_DEFERRED: {error}; remaining obsolete generations retained", file=sys.stderr)
 except Exception as error:
     print(str(error) or error.__class__.__name__, file=sys.stderr)
     raise SystemExit(1)
