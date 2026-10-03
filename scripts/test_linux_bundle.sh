@@ -1180,6 +1180,96 @@ run_update "$retention_home" >/dev/null
     fail 'no-update after partial prune changed profile sentinels'
 printf 'case partial prune failure and safe no-update preservation: PASS\n'
 
+# A same-UID non-product process can deny /proc/PID/exe inspection. The
+# inability to prove obsolete generations unreferenced only defers cleanup;
+# it must not invalidate the already verified install/update outcome.
+inspection_home="$TEST_ROOT/inspection-home"
+mkdir -p -- "$inspection_home/.codex" "$inspection_home/.config/codex-info"
+printf 'inspection session sentinel\n' > "$inspection_home/.codex/session.jsonl"
+printf 'inspection settings sentinel\n' > "$inspection_home/.config/codex-info/settings.json"
+inspection_profile_hash="$(sha256sum "$inspection_home/.codex/session.jsonl" "$inspection_home/.config/codex-info/settings.json")"
+write_stopped_state "$inspection_home"
+run_install "$archive_v1" "$inspection_home" >/dev/null
+run_install "$retention_archive_v2" "$inspection_home" >/dev/null
+inspection_generations="$inspection_home/.local/share/codex-info/generations"
+inspection_old_hash="$(find "$inspection_generations" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum)"
+inspection_old_names="$(find "$inspection_generations" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort)"
+inspection_pid=1145
+[[ ! -e "$fake_proc/$inspection_pid" && ! -L "$fake_proc/$inspection_pid" ]] ||
+    fail 'inspection process fixture collides with fake proc'
+mkdir -- "$fake_proc/$inspection_pid"
+printf 'systemd\n' > "$fake_proc/$inspection_pid/comm"
+ln -s -- /usr/lib/systemd/systemd "$fake_proc/$inspection_pid/exe"
+inspection_denied_exe="$fake_proc/$inspection_pid/exe"
+inspection_hits="$TEST_ROOT/inspection-readlink-hits"
+cat >> "$retention_fault_python/sitecustomize.py" <<'PY'
+denied_exe = os.environ.get("CODEX_INFO_TEST_DENY_READLINK")
+if denied_exe:
+    original_readlink = os.readlink
+    def denied_readlink(path, *, dir_fd=None):
+        if dir_fd is None and os.fsdecode(path) == denied_exe:
+            with open(os.environ["CODEX_INFO_TEST_READLINK_HITS"], "a", encoding="utf-8") as output:
+                output.write("EACCES /proc/PID/exe\n")
+            raise PermissionError(13, "injected same-UID process executable inspection refusal", denied_exe)
+        return original_readlink(path, dir_fd=dir_fd)
+    os.readlink = denied_readlink
+PY
+PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_DENY_READLINK="$inspection_denied_exe" \
+    CODEX_INFO_TEST_READLINK_HITS="$inspection_hits" \
+    run_install "$retention_archive_v3" "$inspection_home" \
+    >"$TEST_ROOT/inspection-install.out" 2>"$TEST_ROOT/inspection-install.err"
+grep -Fq 'GENERATION_PRUNE_DEFERRED' "$TEST_ROOT/inspection-install.err" ||
+    fail 'readlink refusal did not visibly defer committed-install cleanup'
+grep -Fq 'installed generation=1.0.21-' "$TEST_ROOT/inspection-install.out" ||
+    fail 'readlink refusal changed the committed-install result'
+[[ -s "$inspection_hits" ]] || fail 'readlink EACCES fixture was not reached'
+while IFS= read -r name; do
+    [[ -d "$inspection_generations/$name" ]] || fail 'inspection refusal deleted an old generation'
+done <<<"$inspection_old_names"
+[[ "$(find "$inspection_generations" -type f ! -path "$inspection_generations/1.0.21-*/*" -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum)" == "$inspection_old_hash" ]] ||
+    fail 'inspection refusal changed an old generation'
+printf 'case same-UID readlink EACCES after verified commit: PASS\n'
+
+write_release "$retention_archive_v4"
+PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_DENY_READLINK="$inspection_denied_exe" \
+    CODEX_INFO_TEST_READLINK_HITS="$inspection_hits" \
+    run_update "$inspection_home" \
+    >"$TEST_ROOT/inspection-update.out" 2>"$TEST_ROOT/inspection-update.err"
+grep -Fq 'GENERATION_PRUNE_DEFERRED' "$TEST_ROOT/inspection-update.err" ||
+    fail 'readlink refusal did not visibly defer update cleanup'
+grep -Fxq 'updated from=1.0.21 to=1.0.22' "$TEST_ROOT/inspection-update.out" ||
+    fail 'readlink refusal changed the updater result'
+inspection_current="$(readlink -- "$inspection_home/.local/share/codex-info/current")"
+[[ "$inspection_current" == generations/1.0.22-* ]] || fail 'deferred cleanup changed update current'
+python3 - "$inspection_home/.local/share/codex-info/install-transaction.json" "${inspection_current#generations/}" <<'PY'
+import json, pathlib, sys
+journal = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert journal["phase"] == "committed" and journal["new_generation"] == sys.argv[2]
+PY
+[[ "$(find "$inspection_generations" -mindepth 1 -maxdepth 1 -type d | wc -l)" == 4 ]] ||
+    fail 'updater inspection refusal deleted a generation'
+printf 'case same-UID readlink EACCES updater result: PASS\n'
+
+inspection_generation_hash="$(find "$inspection_generations" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum)"
+PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_DENY_READLINK="$inspection_denied_exe" \
+    CODEX_INFO_TEST_READLINK_HITS="$inspection_hits" \
+    run_update "$inspection_home" \
+    >"$TEST_ROOT/inspection-no-update.out" 2>"$TEST_ROOT/inspection-no-update.err"
+grep -Fq 'GENERATION_PRUNE_DEFERRED' "$TEST_ROOT/inspection-no-update.err" ||
+    fail 'readlink refusal did not visibly defer verified-no-update cleanup'
+grep -Fxq 'no update current=1.0.22 newest=1.0.22' "$TEST_ROOT/inspection-no-update.out" ||
+    fail 'readlink refusal changed the verified-no-update result'
+[[ "$(readlink -- "$inspection_home/.local/share/codex-info/current")" == "$inspection_current" ]] ||
+    fail 'no-update inspection refusal changed current'
+[[ "$(find "$inspection_generations" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum)" == "$inspection_generation_hash" ]] ||
+    fail 'no-update inspection refusal changed or deleted a generation'
+[[ "$(sha256sum "$inspection_home/.codex/session.jsonl" "$inspection_home/.config/codex-info/settings.json")" == "$inspection_profile_hash" ]] ||
+    fail 'inspection refusal changed profile sentinels'
+[[ "$(wc -l < "$inspection_hits")" == 3 ]] || fail 'each inspection refusal was not reached exactly once'
+rm -- "$fake_proc/$inspection_pid/exe" "$fake_proc/$inspection_pid/comm"
+rmdir -- "$fake_proc/$inspection_pid"
+printf 'case same-UID readlink EACCES verified no-update preservation: PASS\n'
+
 write_release "$archive_v1"
 run_update "$fake_home" >/dev/null
 [[ -z "$(find "$update_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]] || fail 'no-update left temporary files'
