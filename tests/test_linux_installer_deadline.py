@@ -29,6 +29,7 @@ FUNCTIONS = (
 MODEL = r'''
 fixture_root="$FIXTURE_ROOT"
 share_dir="$fixture_root/share"
+backup_dir="$share_dir/legacy-backups"
 generations_dir="$share_dir/generations"
 install_lock="$share_dir/.install.lock"
 transaction="$share_dir/transaction.json"
@@ -153,6 +154,7 @@ validate_bundle() {
         aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 }
 check_glibc_compatibility() { :; }
+recorder_execution_record() { printf 'canonical\n'; }
 legacy_combined_present() { return 1; }
 legacy_flat_present() { return 1; }
 systemd_pid() { printf '123\n'; }
