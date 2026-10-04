@@ -391,7 +391,7 @@ while (($# > 0)); do
 done
 payload=''
 payload_file=''
-if [[ "$url" == */releases?per_page=100 ]]; then
+if [[ "$url" == */releases/latest ]]; then
     [[ "${FAKE_RELEASE_FAILURE:-0}" == 1 ]] && exit 22
     payload_file="$FAKE_RELEASE_JSON"
 elif [[ "$url" == */releases/download/*/* ]]; then
@@ -499,8 +499,7 @@ write_release() {
     cp -- "$archive" "$release_assets/$archive_name"
     cp -- "${archive%.tar.gz}.manifest.json" "$release_assets/${archive_name%.tar.gz}.manifest.json"
     cp -- "$archive.sha256" "$release_assets/$archive_name.sha256"
-    printf 'fixture Windows Setup %s\n' "$version" > "$release_assets/CodexInfo.WindowsClient.Setup.exe"
-    printf '{"version":"%s"}\n' "$version" > "$release_assets/CodexInfo.WindowsClient.update.json"
+    printf 'unrelated release asset\n' > "$release_assets/extra-not-for-linux.txt"
     python3 - "$release_assets" "$version" "$release_json" <<'PY'
 import hashlib, json, pathlib, sys
 root = pathlib.Path(sys.argv[1]); version = sys.argv[2]; output = pathlib.Path(sys.argv[3])
@@ -508,8 +507,7 @@ names = [
     f"codex-info-{version}-x86_64-unknown-linux-gnu.tar.gz",
     f"codex-info-{version}-x86_64-unknown-linux-gnu.tar.gz.sha256",
     f"codex-info-{version}-x86_64-unknown-linux-gnu.manifest.json",
-    "CodexInfo.WindowsClient.Setup.exe",
-    "CodexInfo.WindowsClient.update.json",
+    "extra-not-for-linux.txt",
 ]
 assets = []
 for name in names:
@@ -525,7 +523,7 @@ release = {
     "tag_name": f"windows-v{version}", "draft": False, "prerelease": False,
     "published_at": "2026-09-01T00:00:00Z", "assets": assets,
 }
-output.write_text(json.dumps([release], separators=(",", ":")) + "\n", encoding="utf-8")
+output.write_text(json.dumps(release, separators=(",", ":")) + "\n", encoding="utf-8")
 PY
 }
 
@@ -869,7 +867,13 @@ archive_v2=''
 glibc_home="$TEST_ROOT/glibc-home"
 mkdir -p -- "$glibc_home"
 write_stopped_state "$glibc_home"
-for glibc_case in unknown 2.30; do
+glibc_unknown_home="$TEST_ROOT/glibc-unknown-home"
+mkdir -p -- "$glibc_unknown_home"
+write_stopped_state "$glibc_unknown_home"
+run_install_glibc "$archive_v1" "$glibc_unknown_home" unknown >/dev/null
+assert_symlink "$glibc_unknown_home/.local/share/codex-info/current"
+printf 'case glibc probe unavailable does not block installation: PASS\n'
+for glibc_case in 2.30; do
     if run_install_glibc "$archive_v1" "$glibc_home" "$glibc_case" >/dev/null 2>&1; then
         fail "glibc $glibc_case candidate unexpectedly accepted"
     fi
@@ -877,7 +881,7 @@ for glibc_case in unknown 2.30; do
 done
 run_install_glibc "$archive_v1" "$glibc_home" 2.31 >/dev/null
 assert_symlink "$glibc_home/.local/share/codex-info/current"
-printf 'case glibc unknown/older/equal compatibility: PASS\n'
+printf 'case glibc older/equal compatibility: PASS\n'
 glibc_newer_home="$TEST_ROOT/glibc-newer-home"
 mkdir -p -- "$glibc_newer_home"
 write_stopped_state "$glibc_newer_home"
@@ -1478,7 +1482,7 @@ grep -Fq 'update deferred: public release discovery failed' "$startup_output" ||
     fail 'startup update failure changed durable state or profile data'
 [[ -z "$(find "$update_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
     fail 'startup update failure left temporary files'
-grep -Fq '/releases?per_page=100' "$log" || fail 'startup update failure did not query discovery'
+grep -Fq '/releases/latest' "$log" || fail 'startup update failure did not query latest release'
 if grep -Fq '/releases/download/' "$log"; then fail 'startup update failure downloaded an asset'; fi
 if grep -Eq '^systemctl --user (start|restart) ' "$log"; then
     fail 'startup reconcile started the service instead of returning to systemd ExecStart'

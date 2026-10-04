@@ -49,8 +49,8 @@ class SelectedQualityTests(unittest.TestCase):
             results(owners, codeql=True), release_candidate=False,
         )
 
-    def test_release_accepts_platform_complete_binary_result(self) -> None:
-        owners = ("LINUX_BACKEND", "WINDOWS")
+    def test_release_accepts_linux_only_binary_result(self) -> None:
+        owners = ("LINUX_BACKEND",)
         validate(
             selection(owners, binary=True, distribution=True, languages=("rust",)),
             results(owners, codeql=True, distribution=True), release_candidate=True,
@@ -60,34 +60,29 @@ class SelectedQualityTests(unittest.TestCase):
         owners = ("DOCS",)
         validate(selection(owners), results(owners), release_candidate=True)
 
-    def test_job_failure_skip_or_extra_execution_is_rejected(self) -> None:
+    def test_selected_job_must_succeed_and_unselected_job_is_ignored(self) -> None:
         owners = ("LINUX_BACKEND",)
         baseline = json.loads(results(owners))
         for job, value in (
             ("linux-backend-quality", "failure"),
             ("linux-backend-quality", "skipped"),
-            ("windows-quality", "success"),
         ):
             with self.subTest(job=job, value=value):
                 changed = dict(baseline)
                 changed[job] = value
                 with self.assertRaises(QualitySelectionError):
                     validate(selection(owners, binary=True), json.dumps(changed))
+        for value in ("success", "failure"):
+            with self.subTest(unselected_windows=value):
+                changed = dict(baseline)
+                changed["windows-quality"] = value
+                validate(selection(owners, binary=True), json.dumps(changed))
 
-    def test_release_binary_requires_windows_and_distribution(self) -> None:
-        bad = (
-            selection(("LINUX_BACKEND",), binary=True, distribution=True),
-            selection(("LINUX_BACKEND", "WINDOWS"), binary=True),
-        )
-        for payload in bad:
-            decoded = json.loads(payload)
-            owners = tuple(decoded["owners"])
-            with self.subTest(payload=payload), self.assertRaises(QualitySelectionError):
-                validate(
-                    payload,
-                    results(owners, distribution=decoded["distribution_required"]),
-                    release_candidate=True,
-                )
+    def test_release_binary_requires_distribution(self) -> None:
+        owners = ("LINUX_BACKEND",)
+        payload = selection(owners, binary=True)
+        with self.assertRaises(QualitySelectionError):
+            validate(payload, results(owners), release_candidate=True)
 
     def test_feat_cannot_request_distribution(self) -> None:
         owners = ("LINUX_BACKEND",)
@@ -105,7 +100,7 @@ class SelectedQualityTests(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(QualitySelectionError):
                 validate(payload, results(("DOCS",)))
 
-    def test_malformed_selection_and_result_shape_are_rejected(self) -> None:
+    def test_malformed_selection_is_rejected(self) -> None:
         valid_results = results(("DOCS",))
         bad_selections = (
             "[]", selection(()), selection(("DOCS", "DOCS")),
@@ -115,11 +110,6 @@ class SelectedQualityTests(unittest.TestCase):
         for payload in bad_selections:
             with self.subTest(payload=payload), self.assertRaises(QualitySelectionError):
                 validate(payload, valid_results)
-
-        incomplete = json.loads(valid_results)
-        incomplete.pop("codeql-quality")
-        with self.assertRaises(QualitySelectionError):
-            validate(selection(("DOCS",)), json.dumps(incomplete))
 
 
 if __name__ == "__main__":

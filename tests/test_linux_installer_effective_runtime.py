@@ -191,17 +191,18 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, "fixture bundle build failed:\n" + result.stderr)
         return self.root / f"output/codex-info-{version}-x86_64-unknown-linux-gnu.tar.gz"
 
-    def release(self, version, source, recorder_bytes=None):
+    def release(self, version, source, recorder_bytes=None, include_sidecars=True):
         archive = self.bundle(version, source, recorder_bytes=recorder_bytes)
-        paths = [archive, pathlib.Path(str(archive) + ".sha256"), archive.with_suffix("").with_suffix(".manifest.json")]
+        paths = [archive]
+        if include_sidecars:
+            paths.extend((pathlib.Path(str(archive) + ".sha256"), archive.with_suffix("").with_suffix(".manifest.json")))
         for path in paths:
             shutil.copyfile(path, self.assets / path.name)
-        (self.assets / "CodexInfo.WindowsClient.Setup.exe").write_bytes(b"offline Windows fixture\n")
-        (self.assets / "CodexInfo.WindowsClient.update.json").write_text(json.dumps({"version": version}))
+        (self.assets / "unrelated-release-asset.txt").write_text("ignored by Linux updater\n")
         assets = [{"name": path.name, "browser_download_url": f"https://github.com/salty919/codex_info_v2/releases/download/windows-v{version}/{path.name}",
                    "state": "uploaded", "size": path.stat().st_size, "digest": "sha256:" + digest(path)} for path in self.assets.iterdir()]
-        value = [{"tag_name": "windows-v" + version, "draft": False, "prerelease": False,
-                  "published_at": "2026-09-01T00:00:00Z", "assets": assets}]
+        value = {"tag_name": "windows-v" + version, "draft": False, "prerelease": False,
+                 "published_at": "2026-09-01T00:00:00Z", "assets": assets}
         pathlib.Path(self.env["FAKE_RELEASE_JSON"]).write_text(json.dumps(value))
 
     def active_override(self, owned):
@@ -251,7 +252,9 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
 
     def test_regular_update_migrates_product_override_and_tracks_next_generation(self):
         self.active_override(owned=True)
-        self.release("1.0.20", "2" * 40)
+        (self.bin / "getconf").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        (self.bin / "ldd").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        self.release("1.0.20", "2" * 40, include_sidecars=False)
         result = self.command(self.installed, "--update")
         generation = self.current().resolve(strict=True)
         running = (self.proc / str(RECORDER_PID) / "exe").resolve(strict=True)
@@ -268,7 +271,7 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         # A second normal update proves migration did not pin another version.
         for path in self.assets.iterdir():
             path.unlink()
-        self.release("1.0.21", "3" * 40)
+        self.release("1.0.21", "3" * 40, include_sidecars=False)
         result = self.command(self.installed, "--update")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.proc / str(RECORDER_PID) / "exe").resolve(strict=True),
