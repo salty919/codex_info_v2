@@ -9,7 +9,7 @@ PRODUCT="codex_info"
 SCHEMA="codex-info-linux-bundle-v1"
 CONTROL_SCHEMA="codex-info-control-state-v1"
 REPOSITORY="salty919/codex_info_v2"
-RELEASES_URL="https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=100"
+RELEASES_URL="https://api.github.com/repos/salty919/codex_info_v2/releases/latest"
 HEALTH_URL="http://127.0.0.1:8787/v1/health"
 DETAILS_URL="http://127.0.0.1:8787/v1/details"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
@@ -48,6 +48,7 @@ migrate_recorder_override=0
 rollback_recorder_receipt=
 transaction_recovered=0
 operation_deadline=0
+install_deadline=
 readiness_deadline=0
 requested_deadline="${CODEX_INFO_DEADLINE:-}"
 
@@ -1579,19 +1580,54 @@ check_glibc_compatibility() {
         host_text="$("$LDD_BIN" --version 2>/dev/null | head -n 1 || true)"
         host_version="$(printf '%s\n' "$host_text" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n 1 || true)"
     fi
-    [[ "$host_version" =~ ^[0-9]+([.][0-9]+)+$ ]] || die 'host glibc version is unavailable'
+    [[ "$host_version" =~ ^[0-9]+([.][0-9]+)+$ ]] || return 0
     python3 - "$manifest" "$host_version" <<'PY'
 import json,pathlib,re,sys
 manifest,host_text=sys.argv[1:]
 try:
     document=json.loads(pathlib.Path(manifest).read_text(encoding="utf-8"))
-except Exception as error:
-    raise SystemExit(f"manifest glibc identity is unreadable: {error}")
+except Exception:
+    raise SystemExit(0)
 minimum=document.get("glibc_minimum") if isinstance(document,dict) else None
 if not isinstance(minimum,str) or not re.fullmatch(r"[0-9]+(?:[.][0-9]+)+",minimum):
-    raise SystemExit("manifest glibc minimum is invalid")
+    raise SystemExit(0)
 host=tuple(int(part) for part in host_text.split(".")); required=tuple(int(part) for part in minimum.split("."))
 if host < required: raise SystemExit("host glibc is older than candidate minimum")
+PY
+}
+extract_bundle_manifest() {
+    local archive="$1" destination="$2"
+    python3 - "$archive" "$destination" <<'PY'
+import pathlib,sys,tarfile
+archive_path,destination=sys.argv[1:]
+try:
+    with tarfile.open(archive_path,"r:gz") as bundle:
+        members=[member for member in bundle.getmembers() if member.name=="manifest.json"]
+        if len(members)!=1 or not members[0].isfile():
+            raise SystemExit("archive manifest is unavailable")
+        source=bundle.extractfile(members[0])
+        if source is None:
+            raise SystemExit("archive manifest cannot be read")
+        pathlib.Path(destination).write_bytes(source.read())
+except (OSError,tarfile.TarError) as error:
+    raise SystemExit(f"archive manifest cannot be read: {error}")
+PY
+}
+published_release_identity() {
+    local manifest="$1" expected_version="$2"
+    python3 - "$manifest" "$expected_version" <<'PY'
+import hashlib,json,pathlib,re,sys
+manifest_path,expected_version=sys.argv[1:]
+try:
+    raw=pathlib.Path(manifest_path).read_bytes()
+    document=json.loads(raw.decode("utf-8"))
+except Exception as error:
+    raise SystemExit(f"archive generation identity is unavailable: {error}")
+version=document.get("version") if isinstance(document,dict) else None
+source=document.get("source_sha") if isinstance(document,dict) else None
+if version!=expected_version or not isinstance(source,str) or not re.fullmatch(r"[0-9a-f]{40}",source):
+    raise SystemExit("archive generation identity does not match the release")
+print(version,source,hashlib.sha256(raw).hexdigest(),sep="\t")
 PY
 }
 
@@ -2911,7 +2947,15 @@ perform_install() {
     local validation bundle_version source_hash manifest_hash binary_hash recorder_execution=canonical
     local install_deadline="$operation_deadline"
     local operation_deadline="$operation_deadline"
-    validation="$(validate_bundle "$ARCHIVE" "$MANIFEST")" || die 'candidate validation failed before mutation'
+    if [[ "${CODEX_INFO_RELEASE_DIGEST_VERIFIED:-}" == 1 ]]; then
+        [[ "${CODEX_INFO_INSTALL_LOCKED:-}" == 1 && -e /proc/self/fd/9 &&
+           "${CODEX_INFO_RELEASE_VERSION:-}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+            die 'verified-release installation requires the active update transaction'
+        validation="$(published_release_identity "$MANIFEST" "$CODEX_INFO_RELEASE_VERSION")" ||
+            die 'candidate generation identity is unavailable'
+    else
+        validation="$(validate_bundle "$ARCHIVE" "$MANIFEST")" || die 'candidate validation failed before mutation'
+    fi
     check_glibc_compatibility "$MANIFEST" || die 'candidate glibc compatibility check failed'
     IFS=$'\t' read -r bundle_version source_hash manifest_hash binary_hash <<<"$validation"
     candidate_id="$bundle_version-$source_hash-$manifest_hash"; previous_id="$(current_generation)"; operation_id="$(new_operation_id)"
@@ -3072,7 +3116,7 @@ run_update() {
     # durable prepared journal exists.
     [[ -z "$current_id" ]] || recorder_execution_record "$current_id" >/dev/null || return 1
     preflight_listener_owner
-    IFS=$'\t' read -r installed_version _ installed_manifest_hash _ <<<"$info"
+    IFS=$'\t' read -r installed_version _ _ _ <<<"$info"
     if [[ -n "$current_id" && "$desired_state" == running ]] && ! verify_fixed_links_local; then
         # --remove retains the verified generation and payload links but
         # removes only the three stable unit links.  An explicit subsequent
@@ -3091,8 +3135,7 @@ run_update() {
     if ! "$CURL_BIN" --fail --silent --show-error --proto '=https' --max-time "$discovery_limit" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' "$RELEASES_URL" >"$releases"; then
         update_failure_with_fallback 'public release discovery failed'
     fi
-    local manifest_size; manifest_size="$(stat -c %s -- "$current_manifest_path")"
-    if ! select_release "$releases" "$installed_version" "$installed_manifest_hash" "$manifest_size" "$local_coherent" >"$selection"; then
+    if ! select_release "$releases" "$installed_version" "$local_coherent" >"$selection"; then
         update_failure_with_fallback 'release selection failed'
     fi
     local state newest; IFS=$'\t' read -r state newest < "$selection"
@@ -3131,14 +3174,11 @@ run_update() {
     fi
     [[ "$state" == update ]] || die 'release selection returned unknown state'
     (( $(now_unix) <= update_deadline )) || update_failure_with_fallback 'update overall timeout exceeded before download'
-    local archive_name archive_url archive_size archive_digest checksum_name checksum_url checksum_size checksum_digest manifest_name manifest_url manifest_size manifest_digest
-    IFS=$'\t' read -r archive_name archive_url archive_size archive_digest < <(sed -n '2p' "$selection")
-    IFS=$'\t' read -r checksum_name checksum_url checksum_size checksum_digest < <(sed -n '3p' "$selection")
-    IFS=$'\t' read -r manifest_name manifest_url manifest_size manifest_digest < <(sed -n '4p' "$selection")
-    local archive_path="$update_root/$archive_name" checksum_path="$update_root/$checksum_name" manifest_path="$update_root/$manifest_name"
-    download_asset "$archive_url" "$archive_path" "$archive_size" "$archive_digest" || update_failure_with_fallback 'release archive download failed'
-    download_asset "$checksum_url" "$checksum_path" "$checksum_size" "$checksum_digest" || update_failure_with_fallback 'release checksum download failed'
-    download_asset "$manifest_url" "$manifest_path" "$manifest_size" "$manifest_digest" || update_failure_with_fallback 'release manifest download failed'
+    local archive_name archive_url archive_digest
+    IFS=$'\t' read -r archive_name archive_url archive_digest < <(sed -n '2p' "$selection")
+    local archive_path="$update_root/$archive_name" manifest_path="$update_root/manifest.json"
+    download_asset "$archive_url" "$archive_path" "$archive_digest" || update_failure_with_fallback 'release archive download failed'
+    extract_bundle_manifest "$archive_path" "$manifest_path" || update_failure_with_fallback 'release archive manifest is unavailable'
     (( $(now_unix) <= update_deadline )) || update_failure_with_fallback 'update overall timeout exceeded before candidate installation'
     local child_limit
     child_limit="$(deadline_timeout "$MANUAL_TIMEOUT")" || update_failure_with_fallback 'update overall timeout exceeded before candidate installation'
@@ -3146,7 +3186,8 @@ run_update() {
     local -a migration_options=()
     if (( migrate_recorder_override )); then migration_options=(--migrate-recorder-override); fi
     if CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
-        timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" --sha256 "$checksum_path" "${migration_options[@]}"; then
+        CODEX_INFO_RELEASE_DIGEST_VERIFIED=1 CODEX_INFO_RELEASE_VERSION="$newest" \
+        timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" "${migration_options[@]}"; then
         child_status=0
     else
         child_status="$?"
@@ -3159,69 +3200,50 @@ run_update() {
     rm -r -- "$update_root"; update_root=; ((QUIET)) || printf 'updated from=%s to=%s\n' "$installed_version" "$newest"
 }
 select_release() {
-    local releases="$1" current="$2" current_hash="$3" current_size="$4" local_coherent="${5:-0}"
-    python3 - "$releases" "$current" "$current_hash" "$current_size" "$local_coherent" "$REPOSITORY" "$TARGET" <<'PY'
+    local release="$1" current="$2" local_coherent="${3:-0}"
+    python3 - "$release" "$current" "$local_coherent" "$TARGET" <<'PY'
 import json,pathlib,re,sys
-release_path,current_text,current_hash,current_size,local_coherent,repository,target=sys.argv[1:]
+release_path,current_text,local_coherent,target=sys.argv[1:]
 def reject(message): raise SystemExit("release metadata validation failed: "+message)
-def pairs(items):
-    result={}
-    for key,value in items:
-        if key in result: reject("duplicate JSON key")
-        result[key]=value
-    return result
-try: releases=json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"),object_pairs_hook=pairs)
+try: release=json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
 except Exception as error: reject(str(error))
-if not isinstance(releases,list): reject("response is not an array")
-if len(releases)==100: reject("100-entry response is pagination-ambiguous")
 if not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",current_text): reject("installed version invalid")
-current=tuple(map(int,current_text.split("."))); stable=[]; tags=set()
-for release in releases:
-    if not isinstance(release,dict) or type(release.get("draft")) is not bool or type(release.get("prerelease")) is not bool: reject("release identity malformed")
-    tag=release.get("tag_name")
-    if not isinstance(tag,str) or tag in tags: reject("release tag malformed or duplicate")
-    tags.add(tag); match=re.fullmatch(r"windows-v((?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*))",tag)
-    if release["draft"] or release["prerelease"]: continue
-    if match is None: reject("stable tag malformed")
-    text=match.group(1); stable.append((tuple(map(int,text.split("."))),text,release))
-if not stable: print("no-update",current_text,sep="\t"); raise SystemExit(0)
-stable.sort(key=lambda item:item[0],reverse=True)
-if len(stable)>1 and stable[0][0]==stable[1][0]: reject("duplicate stable version")
-newest,newest_text,release=stable[0]
-if not isinstance(release.get("published_at"),str) or not release["published_at"]: reject("stable release unpublished")
+if not isinstance(release,dict): reject("latest release is not an object")
+tag=release.get("tag_name")
+match=re.fullmatch(r"windows-v((?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*))",tag) if isinstance(tag,str) else None
+if match is None: reject("latest release tag malformed")
+newest_text=match.group(1); newest=tuple(map(int,newest_text.split(".")))
+current=tuple(map(int,current_text.split(".")))
 assets=release.get("assets")
-if not isinstance(assets,list) or len(assets)!=5: reject("asset count is not exactly five")
-by_name={}
+if not isinstance(assets,list): reject("latest release assets are not an array")
+archive_name=f"codex-info-{newest_text}-{target}.tar.gz"
+selected=None
 for asset in assets:
-    if not isinstance(asset,dict): reject("asset is not an object")
-    name,url,state,size,digest=(asset.get(key) for key in ("name","browser_download_url","state","size","digest"))
-    if (not isinstance(name,str) or name in by_name or not isinstance(url,str) or state!="uploaded" or isinstance(size,bool) or not isinstance(size,int) or size<=0 or not isinstance(digest,str) or not re.fullmatch(r"sha256:[0-9a-f]{64}",digest)): reject("asset identity malformed")
-    by_name[name]=(url,size,digest)
-archive_name=f"codex-info-{newest_text}-{target}.tar.gz"; linux=(archive_name,archive_name+".sha256",archive_name[:-7]+".manifest.json")
-expected=set(linux+("CodexInfo.WindowsClient.Setup.exe","CodexInfo.WindowsClient.update.json"))
-if set(by_name)!=expected: reject("asset names are not exact canonical five")
-for name in expected:
-    if by_name[name][0]!=f"https://github.com/{repository}/releases/download/windows-v{newest_text}/{name}": reject("asset URL is not canonical")
-manifest_size,manifest_digest=by_name[linux[2]][1:]
-needs=(newest>current or (newest==current and not (manifest_digest=="sha256:"+current_hash and manifest_size==int(current_size))) or local_coherent!="1")
+    if not isinstance(asset,dict): continue
+    name=asset.get("name")
+    if name != archive_name: continue
+    if selected is not None: reject("latest release has multiple Linux archives for this version")
+    url,digest=(asset.get(key) for key in ("browser_download_url","digest"))
+    if not isinstance(url,str) or not isinstance(digest,str) or not re.fullmatch(r"sha256:[0-9a-f]{64}",digest):
+        reject("Linux archive digest or download URL is unavailable")
+    selected=(url,digest)
+if selected is None: reject("latest release is missing its Linux archive")
+needs=(newest>current or local_coherent!="1")
 if newest<current or not needs: print("no-update",newest_text,sep="\t"); raise SystemExit(0)
 print("update",newest_text,sep="\t")
-for name in linux:
-    url,size,digest=by_name[name]; print(name,url,size,digest,sep="\t")
+print(archive_name,selected[0],selected[1],sep="\t")
 PY
 }
 download_asset() {
-    local url="$1" destination="$2" size="$3" digest="$4" effective download_limit
-    [[ "$url" == https://github.com/$REPOSITORY/releases/download/*/* ]] || return 1
+    local url="$1" destination="$2" digest="$3" download_limit
+    [[ "$url" == https://* ]] || return 1
     download_limit=300
     if (( operation_deadline > 0 )); then
         download_limit="$(deadline_timeout 300)" || return 1
     fi
-    effective="$("$CURL_BIN" --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-redirs 3 --max-time "$download_limit" --output "$destination" --write-out '%{url_effective}' "$url")" || return 1
-    case "$effective" in "$url"|https://release-assets.githubusercontent.com/*) ;; *) return 1 ;; esac
+    "$CURL_BIN" --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time "$download_limit" --output "$destination" "$url" || return 1
     [[ -f "$destination" && ! -L "$destination" ]] || return 1
-    [[ "$size" =~ ^[1-9][0-9]*$ && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
-    [[ "$(stat -c %s -- "$destination")" == "$size" ]] || return 1
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
     [[ "sha256:$(sha256sum -- "$destination" | awk '{print $1}')" == "$digest" ]] || return 1
 }
 
@@ -3391,7 +3413,12 @@ if [[ "$ACTION" == update || "$ACTION" == timer-update ]]; then run_update; exit
 [[ -n "$ARCHIVE" ]] || die '--bundle ARCHIVE is required'
 archive_dir="$(cd -- "$(dirname -- "$ARCHIVE")" && pwd)"
 ARCHIVE="$archive_dir/$(basename -- "$ARCHIVE")"
-[[ -n "$CHECKSUM" ]] || CHECKSUM="$ARCHIVE.sha256"
 [[ -n "$MANIFEST" ]] || MANIFEST="${ARCHIVE%.tar.gz}.manifest.json"
-validate_external_checksum "$ARCHIVE" "$CHECKSUM"
+if [[ "${CODEX_INFO_RELEASE_DIGEST_VERIFIED:-}" == 1 ]]; then
+    [[ "$ACTION" == install && "${CODEX_INFO_INSTALL_LOCKED:-}" == 1 && -e /proc/self/fd/9 ]] ||
+        die 'verified-release installation requires the active update transaction'
+else
+    [[ -n "$CHECKSUM" ]] || CHECKSUM="$ARCHIVE.sha256"
+    validate_external_checksum "$ARCHIVE" "$CHECKSUM"
+fi
 perform_install

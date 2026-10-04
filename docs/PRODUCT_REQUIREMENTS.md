@@ -155,8 +155,8 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 
 - Linux bundleはbyte-identicalなruntime launcher `run.sh`、payload `codex_info`・`codex_info_recorder`・`codex_info_rest`、`install.sh`、recorder/REST/update serviceとtimer、license/notice、version/target情報を含む。外部manifestとarchive内manifestはbyte-identicalで、launcherを含む全regular memberのpath、mode、size、SHA-256を同じcandidate identityへ結合する。install後の固定入口はlauncher `$HOME/.local/bin/codex-info`、各payload `$HOME/.local/bin/codex_info*`、persistent installer `$HOME/.local/libexec/codex-info-install.sh`、manifest `$HOME/.local/share/codex-info/manifest.json`、unitは`$HOME/.config/systemd/user/`配下のexact 4名である。各固定入口はowner-onlyな`$HOME/.local/share/codex-info/generations/<version>-<source_sha>-<manifest_sha256>/`のregular fileをatomic `current` symlink経由で参照する。repository、Cargo、元bundle、`target/`へ依存しない。
 - manual、launcher startup、service `ExecStartPre`、timer、bootは一つのRelease resolver/installer authorityを使用する。timerは`OnActiveSec=5min`、`OnUnitActiveSec=1h`、`AccuracySec=1s`で、公開後の次回発見上限を1時間1秒とする。`codex-info-recorder.service`と`codex-info-rest.service`の起動前reconcileも同じauthorityを通るため、停止していたdaemonを新しく起動した場合に旧versionを無条件で開始しない。新版がなく同versionでも、local世代が不整合なら検証済みReleaseから修復する。ただし起動前の更新試行が失敗しても、`desired_state=running`、完全なcurrent generationと固定link、transaction不在またはexact `committed`、listener不在を再検証できた場合は、更新を`deferred`と失敗表示したままsystemdの`ExecStart`へ制御を返す。manual/timerの更新失敗、local不整合、未解決transaction、listenerの存在または曖昧性は成功へ変換しない。
-- resolverは固定HTTPS API `https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=100`の単一応答だけを読み、100件ならpagination曖昧として拒否する。非draft・非prereleaseでexact `windows-vSemVer`の最高stable Releaseを選び、`CodexInfo.WindowsClient.Setup.exe`、`CodexInfo.WindowsClient.update.json`、`codex-info-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz`、対応`.sha256`、対応`.manifest.json`のexact 5 asset、canonical URL、size、digestを検証する。導入済みversionより古いcandidateへdowngradeしない。同versionは外部manifest identityが一致すればno-op、不一致ならlocal coherenceのverified repairとして扱う。candidateがなくてもlocal世代が完全ならその旧世代を使用できるが、localも不完全なら`SAFE_BLOCKED`とする。
-- draft、prerelease、partial、extra asset、malformed Release、version/tag/asset identity、size/digest、HTTPS GitHub asset redirect境界の不一致はcandidateを拒否する。redirectは最大3回でAPI/repository Release asset境界だけを許可し、Release取得30秒、各asset取得300秒、更新全体20分を上限とする。archiveはchecksum、external/internal manifest同一性、全member名・mode・size・digestを完全検証するまでinstallation stateを変更しない。
+- resolverは固定HTTPS API `https://api.github.com/repos/salty919/codex_info_v2/releases/latest`の単一応答からlatest Releaseを取得し、`windows-vSemVer`に対応するLinux archiveだけを選ぶ。Release履歴件数、Windows assets、checksum/外部manifest sidecar、無関係assetをLinux更新の条件にしない。取得したarchive bytesはGitHub asset APIのSHA-256 digestと一度照合する。archive内manifestはgeneration identityに必要な値を読むために使い、上流で完了したmanifest/member/content検査を再実行しない。ホストglibcがcandidateのminimumより古いと確認できた場合だけABI不適合として適用を止め、glibc versionを取得できないことだけでは止めない。既存v1.0.113は上書き導入で置き換え、本契約の更新受入は置き換え後のresolverから次候補へのLinux更新とする。
+- 手動 `--bundle` installationは既存のchecksumと外部manifestを使う。自動更新はAPIのarchive digestで実転送を確認し、owner・同時変更回避、DB/current保持、transaction rollback、candidate展開後の実稼働結果を対象端末で確認する。Release publisherは選択candidateのrun/source identityとGitHubへのupload・公開結果を確認し、Linux packageのmember/content再検証はlinux-distribution ownerへ委ねる。downgradeは既存no-updateとして扱い、同versionでlocal generationが不整合ならlatest archiveからrepairする。
 - installはowner-onlyな`.install.lock`をnonblockingで取得し、`install-transaction.json`へ各phaseをatomic write・file fsync・parent directory fsyncしてからlegacy退避、entrypoint link、candidate publish、`current` switch、activation、functional readiness確認へ進む。functional readinessはsource-bound health、recorder identityに加えて同じ30秒枠内の`/v1/details state=ready|auth_required`と正の`observed_at`を必須とし、`initializing|error`を更新成功にしない。stale transactionは同じoperationを一意にresumeまたはrollbackしてから新operationを開始する。`current` switch後を含む失敗では旧generationへ戻し、旧serviceをsystemd管理下で復旧してから終了する。更新開始時に存在した使用可能な旧世代をunmanaged processとして残さない。
 - generation/current導入前の既知predecessor flat installは、旧manifestのexact schemaと記録済みpath/size/SHA-256、固定配置、owner/mode、同一sourceのbinary/installer/3 unitを全て再検証できる場合だけ一方向bootstrap入力にできる。旧installerがL1を保持したまま新serviceを最初に起動する区間は`ExecStartPre`が同じlockを待たず、検証済みflat payloadの起動を妨げない。lock解放後の最初のmanual/startup/timer/repository launcher操作は同Release archiveを取得・完全検証してgeneration/current/launcherへ移行し、旧flat状態をcompleted terminalにしない。検証不能なflat file、repository binary、`target/`、version文字列だけをbootstrapやrollbackへ使わない。
 - `desired_state=running`で完了したlauncher/startup/timer/update収束のterminal stateは、完全に検証した新世代がmanagedかつfunctionally readyなA、または完全に検証した旧世代がmanagedかつfunctionally readyなBのいずれかだけとする。`desired_state=stopped|disabled|removed`の操作は、対応するservice/timer/unit状態、listener不在、保持対象、local generation整合をread-backした場合だけ別の正常な非稼働terminalとする。unknown/foreign/malformed listenerまたはlockを安全に識別できない場合だけ、何も停止・上書きせず30秒以内に明示的`SAFE_BLOCKED`で終了できる。この安全例外を成功やA/Bへ読み替えず、次のmanual/startup/timer triggerを妨げない。manual/startupは20分30秒、control RPCは30秒、local validate/publishは60秒、stopは20秒、readinessは30秒、rollbackは60秒以内で必ずterminalになる。
@@ -214,15 +214,15 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   event自身の既存jobがexact headへ付くため、このstatusを重複作成しない。poll、retry、URL・時刻・表示値の照合も行わない。
   `acceptance`はmain向けに選択jobの結果だけを集約し、失敗時はRelease公開をHOLDするがmergeを禁止しない。
   Windowsを含むmain向けrelease candidateでは、Windows job自身が実Windows評価後にrelease candidateを作る。
-  Linux-only変更も、Linux archiveを既存`windows-vX.Y.Z` ReleaseへWindows Setup/manifestと同居させるため、
-  main向けrelease candidateではWindows評価・candidateを追加で実行する。`feat/next`向けPRは、PR本文や機能名の申告を
+  Linux-only変更ではLinux distribution・installer品質を実行するが、Windows評価・candidateを追加しない。
+  Windows評価・candidateはWINDOWS ownerが実際に選択された場合だけ実行する。`feat/next`向けPRは、PR本文や機能名の申告を
   品質選択へ使用しない。完全差分の各pathを安定した責務境界でDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類し、
   実際に影響するownerの通常品質だけを実行する。backendはformatとunit、Linux UIはbuildとgraph実画面、Windowsは
   restore・format・unit、文書は要求正本、workflowは変更workflowの構文とowner選択の直接契約を確認する。同一ownerの確認は
   1回へ統合し、別owner、installer、配布物、Release E2Eを通常のfeat PRへ追加しない。機能別profile、PR本文宣言、
   機能ごとのexact path allowlistを設けず、新しいfileは既存の責務prefixで分類できる。責務不明のpath、空差分、malformedな
   rename/copyだけは、無関係な全suiteへ拡大せず分類前に停止する。main向けRelease candidateは同じowner分類を使い、
-  binary impactがある場合だけWindows、distribution、installer、実OS/UI品質を追加する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release
+  binary impactがある場合だけdistribution、installer、実OS/UI品質を追加し、Windows ownerが実際に選択された場合だけWindows品質を追加する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release
   candidateは生成しない。実jobの失敗は赤のまま表示するがmergeを禁止しない。live repository ruleの再監査、
   選択済み製品testの再実行、branch名allowlist、custom check登録を追加しない。
 - バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。
@@ -242,8 +242,9 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   結び付く既存candidateをexact 1件要求する。期限切れ・削除を含む0件、複数、malformed、別identityは失敗とする。candidateは増やさず、
   既存のSetupとmanifestを持つ1件の名前へidentityを追加する。merge後にPRを再分類せず、quality test/build/CodeQLも再実行しない。
   公開jobだけをversion tag単位で直列化し、lock取得後にPR/final head、全attempt、candidate、tag、Release、assetsを1回再取得する。
-  tagとReleaseがともに不存在の場合だけDraftを作って2資産をupload後に公開し、完全一致のpublished状態だけを成功済みno-opとする。
-  orphan tag、Releaseだけの存在、Draft、partial、targetまたはasset不一致は自動修復せず失敗し、自動retry・cleanupを行わない。
+  tagとReleaseがともに不存在ならDraftを作る。既存tagだけが残る場合は、そのtagが選択済みmerge SHAを指すことを確認してReleaseを作る。
+  同じtagのDraftが残る場合は既存assetのupload digestが選択candidateと一致するものを保持し、不足assetだけをuploadして公開を再開する。
+  mismatched asset、Releaseだけの存在、または不一致のtagは公開せず、assetの削除・置換・自動cleanupは行わない。完全一致のpublished状態はno-opとする。
   Release mutationだけはcurrent repository限定の短命GitHub App installation token（Contents write / Workflows write）を使い、
   解決、lock後再検証、artifact取得はread-onlyの組み込みtokenを使う。
 - PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を持つjobで実行しない。
@@ -284,11 +285,11 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 | event authority identity | job開始前cancelを含め、event時draft、event head、action、PRを復元し、draft・closed・stale eventをowner対象から外す | draftのcancelを評価失敗と誤認する、stale headを評価する、またはmerge後のbranchへ未統合H1をpushする | job出力は開始前cancelでは存在せず、runの通常metadataだけではPR head epochを復元できない |
 | 生成H1 commit identity | H1 commitと同じGit objectにH0 producer run/attemptを記録し、正規生成H1だけowner再実行を抑止する | push後cancelでH0/H1対応を失う、または手動version commitを未評価にする | checkやartifactを後から作る方式にはpushとの間に原子的でない空白が残る |
 | main selected job結果 | mainのRelease候補ではselectedはsuccess、non-selectedはskipped以外を失敗にする | 未評価または無関係なartifactを公開する | Actionsはowner選択と公開可否の意味を知らない |
-| 実Windows評価 | WINDOWS選択時（main向けrelease candidateではLinux product ownerにも追加選択）だけWindows runnerでinstaller/UIを評価する | 壊れたWindows配布物を公開する | LinuxやGitHubはWindows製品動作を保証しない |
+| 実Windows評価 | WINDOWS選択時だけWindows runnerでinstaller/UIを評価する | 壊れたWindows配布物を公開する | LinuxやGitHubはWindows製品動作を保証しない |
 | final-head attempt集合 | current final headを実際に評価した全non-observer attemptを見て、1件の失敗もsame-head successで上書きしない | rerunの偶然のsuccessが未修正の評価失敗を隠し、旧candidateを公開する | latest成功だけでは過去attemptのfailure barrierを表現できない |
 | Windows jobとcandidate | Windows skippedは0件、successはown-run candidate exact 1を要求する | 非Windowsで不要なReleaseを動かす、または期限切れ・欠落candidateを黙って無視する | run successだけではWindowsの選択有無とartifact保存状態を区別できない |
 | merged/completed二信号 | quality先行とmerge先行のどちらも、両条件が揃った信号だけを公開候補にする | merge直後に未完了qualityを失敗扱いする、またはquality先行時に公開信号を失う | 両event間にGitHubの完了順序保証はない |
-| tag単位lock後の公開状態 | 同じtagの二信号を直列化し、lock取得後の完全不存在だけ作成、完全一致publishedだけno-opにする | 二重公開、orphan tagの流用、不完全Draftの自動修復 | Release作成と複数asset uploadは一つのtransactionではない |
+| tag単位lock後の公開状態 | 同じtagの二信号を直列化し、exact-target tagだけRelease作成に再利用する。同tag Draftは一致する既存assetを保ち、不足assetをuploadして再開する。published完全一致はno-opにし、不一致assetやReleaseだけの状態は変更しない | 二重公開、異なるcandidate bytesの混在、またはpublished済み不完全Releaseの成功扱い | Release作成と複数asset uploadは一つのtransactionではないため、失敗後に一致済みassetを保持し不足分を送る必要がある |
 | local台帳schema | PR前は要求・範囲・オラクル・実装状態の欠落だけを失敗にし、remote証拠は完了時に`--final`で確認する | PRでしか得られない証拠をPR前に要求する循環で作業が停止する | local実装確認とGitHub実挙動は異なる観測点を持つ |
 
 この表の4列を満たさない形式検査、identity再照合、poll、retry、証拠専用artifact、同一run内の二次分類は追加しない。

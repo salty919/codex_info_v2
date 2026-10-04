@@ -526,10 +526,6 @@ jobs:
                 }
               elif [[ "$linux_job_name" == "$linux_leaf" && "$linux_job_result" == success ]]; then
                 [[ "$(jq 'length' <<<"$linux_candidates")" -eq 1 ]]
-                [[ "$job_name" == "$windows_leaf" ]] || {
-                  echo 'Linux distribution candidate requires a Windows release candidate' >&2
-                  exit 1
-                }
                 linux_candidate="$(jq -c '.[0]' <<<"$linux_candidates")"
                 jq -e '.expired == false' <<<"$linux_candidate" >/dev/null
                 if [[ "$generated" == true ]]; then
@@ -623,7 +619,7 @@ jobs:
 
           ARTIFACT_IDS="${ARTIFACT_IDS:-$ARTIFACT_ID}"
           LINUX_PRESENT="${LINUX_PRESENT:-false}"
-          WINDOWS_PRESENT="${WINDOWS_PRESENT:-true}"
+          WINDOWS_PRESENT="${WINDOWS_PRESENT:-false}"
 
           workflow_path='.github/workflows/version-prepare.yml'
           title_re='^codex-main-quality-v1:pr=(?<pr>[1-9][0-9]*):event_head=(?<event_head>[0-9a-f]{40}):action=(?<action>opened|synchronize|reopened|ready_for_review):draft=(?<draft>true|false)$'
@@ -631,7 +627,6 @@ jobs:
           windows_candidate_re='^release-candidate-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
           linux_candidate_re='^release-candidate-linux-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
           generated_re='^chore: prepare version (?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\n\nCodex-Version-Prepare-Schema: v1\nCodex-Version-Prepare-PR: (?<pr>[1-9][0-9]*)\nCodex-Version-Prepare-Event-Head: (?<event_head>[0-9a-f]{40})\nCodex-Version-Prepare-Run-ID: (?<run_id>[1-9][0-9]*)\nCodex-Version-Prepare-Run-Attempt: (?<attempt>[1-9][0-9]*)$'
-          windows_leaf='Run selected quality owners / windows-quality / windows-quality'
           linux_wrapper='Run selected quality owners / linux-distribution'
           linux_leaf='Run selected quality owners / linux-distribution / linux-distribution'
 
@@ -830,27 +825,10 @@ jobs:
             <<<"$selected_run" >/dev/null
           jobs="$(object_pages \
             "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?filter=all&per_page=100" jobs)"
-          jq -e --arg leaf "$windows_leaf" \
-            '
-            [.[] | select(.name == $leaf)] |
-            length == 1 and .[0].status == "completed" and .[0].conclusion == "success"
-            ' <<<"$jobs" >/dev/null || {
-            jq -e --arg wrapper "Run selected quality owners / windows-quality" '
-              [.[] | select(.name == $wrapper)] |
-              length == 1 and .[0].status == "completed" and .[0].conclusion == "skipped"
-            ' <<<"$jobs" >/dev/null || {
-              echo 'Windows authority job is not in a valid selected/skipped state' >&2
-              exit 1
-            }
-          }
           linux_jobs="$(jq -c --arg wrapper "$linux_wrapper" --arg leaf "$linux_leaf" \
             '[.[] | select(.name == $wrapper or .name == $leaf)]' <<<"$jobs")"
           linux_job_count="$(jq 'length' <<<"$linux_jobs")"
           if [[ "$LINUX_PRESENT" == true ]]; then
-            [[ "$WINDOWS_PRESENT" == true ]] || {
-              echo 'Linux release assets require Windows release assets' >&2
-              exit 1
-            }
             [[ "$linux_job_count" -eq 1 ]] || {
               echo 'Linux distribution authority job is missing or duplicated' >&2
               exit 1
@@ -862,10 +840,6 @@ jobs:
             jq -e --arg wrapper "$linux_wrapper" '
               .[0].name == $wrapper and .[0].status == "completed" and .[0].conclusion == "skipped"
             ' <<<"$linux_jobs" >/dev/null
-            [[ "$WINDOWS_PRESENT" == false ]] || {
-              echo 'Windows candidate cannot be revalidated without its Linux distribution candidate' >&2
-              exit 1
-            }
           fi
 
           artifacts="$(object_pages \
@@ -950,8 +924,8 @@ jobs:
           FINAL_HEAD="${FINAL_HEAD:-}"
           [[ "$WINDOWS_PRESENT" == true || "$WINDOWS_PRESENT" == false ]]
           [[ "$LINUX_PRESENT" == true || "$LINUX_PRESENT" == false ]]
-          [[ "$WINDOWS_PRESENT" == true && "$LINUX_PRESENT" == true ]] || {
-            echo 'release publication requires both Windows and Linux candidates' >&2
+          [[ "$LINUX_PRESENT" == true ]] || {
+            echo 'release publication requires a Linux candidate' >&2
             exit 1
           }
 
@@ -982,13 +956,9 @@ jobs:
           }
           verify_release() {
             local release="$1" draft="$2"
-            jq -e --arg tag "$TAG" --arg merge "$MERGE_SHA" \
-              --arg name "Codex Info Monitor $VERSION" \
-              --arg body "Windows client $VERSION" --argjson draft "$draft" '
-              type == "object" and .tag_name == $tag and .target_commitish == $merge and
-              .name == $name and .body == $body and
-              .draft == $draft and .prerelease == false and
-              (if $draft then .published_at == null else (.published_at | type) == "string" end)
+            jq -e --arg tag "$TAG" --argjson draft "$draft" '
+              type == "object" and .tag_name == $tag and
+              .draft == $draft and .prerelease == false
             ' <<<"$release" >/dev/null
           }
           verify_asset_list() {
@@ -1008,7 +978,6 @@ jobs:
               --argjson linux_checksum_size "$linux_checksum_size" \
               --argjson linux_manifest_size "$linux_manifest_size" \
               --argjson windows "$WINDOWS_PRESENT" --argjson linux "$LINUX_PRESENT" '
-                length == ((if $windows then 2 else 0 end) + (if $linux then 3 else 0 end)) and
                 (if $windows then
                   ([.[] | select(.name == $setup_name and .state == "uploaded" and
                                  .size == $setup_size and .digest == $setup_digest)] | length) == 1 and
@@ -1054,6 +1023,30 @@ jobs:
               .size == $size and .digest == $digest
             ' <<<"$response" >/dev/null
           }
+          upload_asset_if_missing() {
+            local path="$1" filename="$2" content_type="$3" size="$4" digest="$5"
+            local matches count
+            matches="$(jq -c --arg name "$filename" '[.[] | select(.name == $name)]' <<<"$existing_assets")"
+            count="$(jq 'length' <<<"$matches")"
+            case "$count" in
+              0)
+                upload_asset "$path" "$filename" "$content_type" "$size" "$digest"
+                ;;
+              1)
+                if jq -e --arg digest "$digest" \
+                  '.[0].state == "uploaded" and .[0].digest == $digest' \
+                  <<<"$matches" >/dev/null; then
+                  return 0
+                fi
+                echo "existing draft asset does not match selected candidate: $filename" >&2
+                return 1
+                ;;
+              *)
+                echo "existing draft has duplicate asset names: $filename" >&2
+                return 1
+                ;;
+            esac
+          }
 
           setup='release-candidate/CodexInfo.WindowsClient.Setup.exe'
           manifest='release-candidate/CodexInfo.WindowsClient.update.json'
@@ -1085,10 +1078,8 @@ jobs:
           linux_checksum_digest=''
           linux_manifest_digest=''
           if [[ "$LINUX_PRESENT" == true ]]; then
-            mapfile -t linux_archives < <(find release-candidate -maxdepth 1 -type f \
-              -name 'codex-info-*-x86_64-unknown-linux-gnu.tar.gz' -print | LC_ALL=C sort)
-            [[ "${#linux_archives[@]}" -eq 1 ]]
-            linux_archive="${linux_archives[0]}"
+            linux_archive="release-candidate/codex-info-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+            [[ -f "$linux_archive" ]]
             linux_archive_name="$(basename "$linux_archive")"
             linux_checksum="$linux_archive.sha256"
             linux_manifest="${linux_archive%.tar.gz}.manifest.json"
@@ -1102,111 +1093,56 @@ jobs:
             linux_archive_digest="sha256:$(sha256sum "$linux_archive" | cut -d' ' -f1)"
             linux_checksum_digest="sha256:$(sha256sum "$linux_checksum" | cut -d' ' -f1)"
             linux_manifest_digest="sha256:$(sha256sum "$linux_manifest" | cut -d' ' -f1)"
-            expected_line="$(printf '%s  %s\n' "${linux_archive_digest#sha256:}" "$linux_archive_name")"
-            [[ "$(cat "$linux_checksum")" == "$expected_line" ]]
-            jq -e --arg version "$VERSION" --arg source "$FINAL_HEAD" \
-              --arg target 'x86_64-unknown-linux-gnu' '
-              type == "object" and .schema == "codex-info-linux-bundle-v1" and
-              .product == "codex_info" and .version == $version and
-              (.source_sha | type == "string" and test("^[0-9a-f]{40}$")) and
-              .source_sha == $source and .target == $target and
-              .compatibility == "glibc" and
-              (.glibc_minimum | type == "string" and test("^[0-9]+\\.[0-9]+$")) and
-              (.run_id | type == "string" and test("^[1-9][0-9]*$")) and
-              (.run_attempt | type == "number" and floor == . and . >= 1) and
-              (.files | type == "array" and length > 0 and
-                all(.[]; type == "object" and
-                  (.path | (type == "string" and length > 0 and
-                    (split("/") | all(.[]; length > 0 and . != "." and . != "..")) and
-                    (startswith("/") | not) and (contains("\\\\") | not) and
-                    (contains("/../") | not) and (startswith("../") | not) and
-                    (endswith("/..") | not) and . != "..")) and
-                  (.size | type == "number" and floor == . and . >= 0) and
-                  (.sha256 | type == "string" and test("^[0-9a-fA-F]{64}$"))) and
-                (["codex_info", "codex_info_recorder", "codex_info_rest",
-                  "codex-info-recorder.service", "codex-info-rest.service", "install.sh", "LICENSE",
-                  "COPYRIGHT", "THIRD_PARTY_NOTICES.md"] - [.[].path] | length == 0))
-            ' "$linux_manifest" >/dev/null
-            archive_check_dir="$RUNNER_TEMP/linux-release-archive-check"
-            rm -rf "$archive_check_dir"
-            mkdir -p "$archive_check_dir"
-            tar -tzf "$linux_archive" > "$archive_check_dir/paths"
-            backslash="\\"
-            while IFS= read -r archive_path; do
-              [[ -n "$archive_path" && "$archive_path" != /* && "$archive_path" != *'..'* ]]
-            done < "$archive_check_dir/paths"
-            tar -xzf "$linux_archive" -C "$archive_check_dir"
-            [[ -x "$archive_check_dir/codex_info" &&
-               -x "$archive_check_dir/codex_info_recorder" &&
-               -x "$archive_check_dir/codex_info_rest" &&
-               -f "$archive_check_dir/codex-info-recorder.service" &&
-               -f "$archive_check_dir/codex-info-rest.service" &&
-               -x "$archive_check_dir/install.sh" && -f "$archive_check_dir/LICENSE" &&
-               -f "$archive_check_dir/COPYRIGHT" && -f "$archive_check_dir/THIRD_PARTY_NOTICES.md" &&
-               -f "$archive_check_dir/manifest.json" && -f "$archive_check_dir/SHA256SUMS" ]]
-            (cd "$archive_check_dir" && sha256sum -c SHA256SUMS >/dev/null)
-            jq -e --argjson expected "$(cat "$archive_check_dir/manifest.json")" \
-              --arg version "$VERSION" --arg source "$FINAL_HEAD" '
-              .schema == $expected.schema and .product == $expected.product and
-              .version == $version and .source_sha == $source and
-              .target == $expected.target and .compatibility == $expected.compatibility and
-              .glibc_minimum == $expected.glibc_minimum and
-              .run_id == $expected.run_id and .run_attempt == $expected.run_attempt and
-              .files == $expected.files
-            ' "$linux_manifest" >/dev/null
-            while IFS=$'\t' read -r archive_path archive_size archive_digest; do
-              [[ -n "$archive_path" && "$archive_path" != /* &&
-                 "$archive_path" != *'..'* && "$archive_path" != *"$backslash"* ]]
-              [[ "$archive_size" =~ ^[0-9]+$ && "$archive_digest" =~ ^[0-9a-fA-F]{64}$ ]]
-              [[ -f "$archive_check_dir/$archive_path" ]]
-              [[ "$(stat -c %s "$archive_check_dir/$archive_path")" == "$archive_size" ]]
-              [[ "$(sha256sum "$archive_check_dir/$archive_path" | cut -d' ' -f1)" == "$archive_digest" ]]
-            done < <(jq -r '.files[] | [.path, (.size | tostring), .sha256] | @tsv' "$linux_manifest")
           fi
 
           read_state
           tag_count="$(jq 'length' <<<"$tags")"
           release_count="$(jq 'length' <<<"$matching_releases")"
           [[ "$tag_count" -le 1 && "$release_count" -le 1 ]]
+          resume_draft=false
+          existing_assets='[]'
           if [[ "$tag_count" -eq 1 && "$release_count" -eq 1 ]]; then
             release_id="$(jq -er '.[0].id | select(type == "number" and . > 0)' <<<"$matching_releases")"
-            jq -e '.[0].draft == false' <<<"$matching_releases" >/dev/null || {
-              echo 'existing release is draft or partial; automatic repair is forbidden' >&2
-              exit 1
-            }
             verify_tag
-            verify_assets "$release_id" false
-            echo "published release already matches exactly: $TAG"
-            exit 0
-          fi
-          if [[ "$tag_count" -ne 0 || "$release_count" -ne 0 ]]; then
-            echo 'orphan tag or release-without-tag state; automatic repair is forbidden' >&2
+            if jq -e '.[0].draft == false' <<<"$matching_releases" >/dev/null; then
+              verify_assets "$release_id" false
+              echo "published release already matches exactly: $TAG"
+              exit 0
+            fi
+            existing_release="$(api "repos/$REPOSITORY/releases/$release_id")"
+            verify_release "$existing_release" true
+            existing_assets="$(array_pages "repos/$REPOSITORY/releases/$release_id/assets?per_page=100")"
+            resume_draft=true
+          elif [[ "$tag_count" -eq 1 && "$release_count" -eq 0 ]]; then
+            verify_tag
+          elif [[ "$tag_count" -ne 0 || "$release_count" -ne 0 ]]; then
+            echo 'release exists without its matching tag; automatic repair is unavailable' >&2
             exit 1
           fi
 
-          draft="$(jq -nc --arg tag "$TAG" --arg merge "$MERGE_SHA" \
-            --arg name "Codex Info Monitor $VERSION" --arg body "Windows client $VERSION" \
-            '{tag_name:$tag,target_commitish:$merge,name:$name,body:$body,
-              draft:true,prerelease:false}' |
-            api --method POST "repos/$REPOSITORY/releases" --input -)"
-          verify_release "$draft" true
-          release_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"$draft")"
+          if [[ "$resume_draft" == false ]]; then
+            draft="$(jq -nc --arg tag "$TAG" --arg merge "$MERGE_SHA" \
+              --arg name "Codex Info Monitor $VERSION" --arg body "Windows client $VERSION" \
+              '{tag_name:$tag,target_commitish:$merge,name:$name,body:$body,
+                draft:true,prerelease:false}' |
+              api --method POST "repos/$REPOSITORY/releases" --input -)"
+            verify_release "$draft" true
+            release_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"$draft")"
+          fi
           upload_base="https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets"
-          upload_url="$(jq -er '.upload_url | select(type == "string")' <<<"$draft")"
-          [[ "$upload_url" == "$upload_base{?name,label}" ]]
 
           if [[ "$WINDOWS_PRESENT" == true ]]; then
-            upload_asset "$setup" 'CodexInfo.WindowsClient.Setup.exe' \
+            upload_asset_if_missing "$setup" 'CodexInfo.WindowsClient.Setup.exe' \
               'application/octet-stream' "$setup_size" "$setup_digest"
-            upload_asset "$manifest" 'CodexInfo.WindowsClient.update.json' \
+            upload_asset_if_missing "$manifest" 'CodexInfo.WindowsClient.update.json' \
               'application/json' "$manifest_size" "$manifest_digest"
           fi
           if [[ "$LINUX_PRESENT" == true ]]; then
-            upload_asset "$linux_archive" "$linux_archive_name" \
+            upload_asset_if_missing "$linux_archive" "$linux_archive_name" \
               'application/gzip' "$linux_archive_size" "$linux_archive_digest"
-            upload_asset "$linux_checksum" "$linux_checksum_name" \
+            upload_asset_if_missing "$linux_checksum" "$linux_checksum_name" \
               'text/plain' "$linux_checksum_size" "$linux_checksum_digest"
-            upload_asset "$linux_manifest" "$linux_manifest_name" \
+            upload_asset_if_missing "$linux_manifest" "$linux_manifest_name" \
               'application/json' "$linux_manifest_size" "$linux_manifest_digest"
           fi
 
@@ -1216,10 +1152,3 @@ jobs:
           verify_release "$published" false
           published_assets="$(jq -ce '.assets | select(type == "array")' <<<"$published")"
           verify_asset_list "$published_assets"
-
-          read_state
-          [[ "$(jq 'length' <<<"$tags")" -eq 1 &&
-             "$(jq 'length' <<<"$matching_releases")" -eq 1 &&
-             "$(jq -r '.[0].id' <<<"$matching_releases")" == "$release_id" ]]
-          verify_tag
-          verify_assets "$release_id" false

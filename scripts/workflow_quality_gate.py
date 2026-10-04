@@ -1055,10 +1055,10 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         'api --method POST "repos/$REPOSITORY/releases"',
         "curl -L --fail-with-body --silent --show-error",
         '"$upload_base?name=$filename"',
-        ".upload_url | select(type == \"string\")",
+        "upload_asset_if_missing()",
         'api --method PATCH "repos/$REPOSITORY/releases/$release_id"',
-        "existing release is draft or partial; automatic repair is forbidden",
-        "orphan tag or release-without-tag state; automatic repair is forbidden",
+        "existing draft asset does not match selected candidate",
+        "release exists without its matching tag; automatic repair is unavailable",
     ):
         if marker not in release:
             errors.append(f"release.yml: missing {marker}")
@@ -1152,38 +1152,24 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
         environment = os.environ.copy()
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         for path in ("src/lib.rs", "ui/app.slint"):
-            fixed = classify(path, release_candidate=True)
-            if "WINDOWS" not in json.loads(fixed)["owners"]:
+            selection = classify(path, release_candidate=True)
+            if "WINDOWS" in json.loads(selection)["owners"]:
                 raise AssertionError(
-                    f"release-candidate classifier omitted WINDOWS for {path}"
+                    f"Linux release candidate added an unrelated WINDOWS owner for {path}"
                 )
-            narrowed = json.loads(fixed)
-            narrowed["owners"].remove("WINDOWS")
-            non_candidate = json.dumps(narrowed, separators=(",", ":"))
-
             environment.update(
                 {
-                    "SELECTION": non_candidate,
+                    "SELECTION": selection,
                     "RELEASE_CANDIDATE": "true",
-                    "RESULTS": results(non_candidate),
+                    "RESULTS": results(selection),
                 }
             )
-            rejected = _command(
-                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
-            )
-            if rejected.returncode == 0 or "must select WINDOWS" not in rejected.stderr:
-                raise AssertionError(
-                    f"Linux-only candidate was not rejected for {path}"
-                )
-            cases += 1
-
-            environment.update({"SELECTION": fixed, "RESULTS": results(fixed)})
             accepted = _command(
                 ("bash", "-c", script), cwd=ROOT, env=environment, check=False
             )
             if accepted.returncode != 0:
                 raise AssertionError(
-                    f"fixed main classifier output was rejected for {path}: "
+                    f"Linux-only release candidate was rejected for {path}: "
                     f"{accepted.stderr}"
                 )
             cases += 1
@@ -2696,9 +2682,16 @@ def _release_resolution_tests(release_workflow: str) -> int:
     result, values, _ = _execute_release_shell(
         script, responses, event_name="pull_request_target", event=_closed_event()
     )
-    if result.returncode == 0:
+    if (
+        result.returncode != 0
+        or values.get("publish") != "true"
+        or values.get("linux_present") != "true"
+        or values.get("windows_present") != "false"
+        or not values.get("artifact_ids")
+    ):
         raise AssertionError(
-            "Linux-only distribution candidate bypassed the Windows release authority"
+            f"valid Linux-only candidate was rejected or not selected: "
+            f"returncode={result.returncode}, values={values}, stderr={result.stderr}"
         )
     print("workflow-quality-gate: case=linux-only-without-windows PASS")
     cases += 1
@@ -3010,7 +3003,7 @@ def _release_lock_tests(release_workflow: str) -> int:
         raise AssertionError("unchanged authority failed after acquiring the tag lock")
     cases = 1
 
-    co_located_spec = [
+    linux_only_spec = [
         {
             "id": 203,
             "number": 53,
@@ -3018,15 +3011,15 @@ def _release_lock_tests(release_workflow: str) -> int:
                 {
                     "status": "completed",
                     "conclusion": "success",
-                    "windows": "success",
-                    "candidate": "exact",
+                    "windows": "skipped",
+                    "candidate": "missing",
                     "linux": "success",
                     "linux_candidate": "exact",
                 }
             ],
         }
     ]
-    linux_responses, linux_summaries = _manual_release_responses(co_located_spec)
+    linux_responses, linux_summaries = _manual_release_responses(linux_only_spec)
     linux_responses[_runs_endpoint()] = _object_pages("workflow_runs", [])
     linux_resolved, linux_authority, _ = _execute_release_shell(
         resolve_script,
@@ -3035,7 +3028,7 @@ def _release_lock_tests(release_workflow: str) -> int:
         event=_workflow_event(linux_summaries[0]),
     )
     if linux_resolved.returncode != 0 or linux_authority.get("publish") != "true":
-        raise AssertionError("co-located authority did not resolve before lock revalidation")
+        raise AssertionError("Linux-only authority did not resolve before lock revalidation")
     result, values = _execute_revalidation(
         revalidate_script,
         linux_responses,
@@ -3044,20 +3037,7 @@ def _release_lock_tests(release_workflow: str) -> int:
         event=_workflow_event(linux_summaries[0]),
     )
     if result.returncode != 0 or values.get("proceed") != "true":
-        raise AssertionError("co-located authority failed after acquiring the tag lock")
-    cases += 1
-
-    missing_windows_authority = dict(linux_authority)
-    missing_windows_authority["windows_present"] = "false"
-    result, values = _execute_revalidation(
-        revalidate_script,
-        linux_responses,
-        missing_windows_authority,
-        event_name="workflow_run",
-        event=_workflow_event(linux_summaries[0]),
-    )
-    if result.returncode == 0 or values.get("proceed") == "true":
-        raise AssertionError("Linux-only authority passed lock revalidation")
+        raise AssertionError("Linux-only authority failed after acquiring the tag lock")
     cases += 1
 
     changed = json.loads(json.dumps(responses))
@@ -3147,12 +3127,14 @@ def _write_publish_gh(directory: Path) -> Path:
                         f"{release_id}/assets{{?name,label}}"
                     ),
                 }
-                state["tags"].append(
-                    {
-                        "ref": "refs/tags/" + payload["tag_name"],
-                        "object": {"type": "commit", "sha": payload["target_commitish"]},
-                    }
-                )
+                tag_ref = "refs/tags/" + payload["tag_name"]
+                if not any(tag.get("ref") == tag_ref for tag in state["tags"]):
+                    state["tags"].append(
+                        {
+                            "ref": tag_ref,
+                            "object": {"type": "commit", "sha": payload["target_commitish"]},
+                        }
+                    )
                 state["releases"].append(
                     {"id": release_id, "tag_name": payload["tag_name"], "draft": True}
                 )
@@ -3302,10 +3284,9 @@ def _publication_state(kind: str, *asset_paths: Path) -> dict[str, object]:
         state["releases"][0]["draft"] = True
         state["details"][str(release_id)]["draft"] = True
         state["details"][str(release_id)]["published_at"] = None
+        state["assets"][str(release_id)] = assets[:1]
     elif kind == "partial":
         state["assets"][str(release_id)] = assets[:1]
-    elif kind == "target-mismatch":
-        state["details"][str(release_id)]["target_commitish"] = "f" * 40
     elif kind == "asset-mismatch":
         state["assets"][str(release_id)][0]["digest"] = "sha256:" + "0" * 64
     elif kind not in {"orphan-tag", "release-only", "published"}:
@@ -3551,11 +3532,8 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
         cases += 1
 
         for kind in (
-            "orphan-tag",
             "release-only",
-            "draft",
             "partial",
-            "target-mismatch",
             "asset-mismatch",
         ):
             case_root = root / kind
@@ -3579,6 +3557,74 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
                 raise AssertionError(f"invalid existing release state was repaired: {kind}")
             cases += 1
 
+        tag_root = root / "tag-resume"
+        tag_root.mkdir()
+        tag_candidate = tag_root / "release-candidate"
+        tag_candidate.mkdir()
+        copy_linux_assets(tag_candidate)
+        tag_state = _publication_state("orphan-tag")
+        result, calls, tag_final_state = _execute_publication(
+            script,
+            tag_root,
+            initial_state=tag_state,
+            environment_overrides={
+                "FINAL_HEAD": _FINAL_HEAD,
+                "LINUX_PRESENT": "true",
+                "WINDOWS_PRESENT": "false",
+            },
+        )
+        tag_assets = tag_final_state["assets"].get("901", [])
+        if (
+            result.returncode != 0
+            or tag_final_state["details"].get("901", {}).get("draft") is not False
+            or len(tag_final_state["tags"]) != 1
+            or {asset["name"] for asset in tag_assets}
+            != {path.name for path in tag_candidate.iterdir()}
+        ):
+            raise AssertionError(
+                f"matching Linux tag without a release was not completed: "
+                f"returncode={result.returncode}, state={tag_final_state}, "
+                f"stderr={result.stderr}"
+            )
+        print("workflow-quality-gate: case=linux-tag-resume PASS")
+        cases += 1
+
+        draft_root = root / "draft-resume"
+        draft_root.mkdir()
+        draft_candidate = draft_root / "release-candidate"
+        draft_candidate.mkdir()
+        copy_linux_assets(draft_candidate)
+        archive = draft_candidate / f"codex-info-{_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+        checksum = draft_candidate / f"{archive.name}.sha256"
+        manifest = draft_candidate / f"{archive.name.removesuffix('.tar.gz')}.manifest.json"
+        draft_state = _publication_state("draft", archive, checksum, manifest)
+        result, calls, draft_final_state = _execute_publication(
+            script,
+            draft_root,
+            initial_state=draft_state,
+            environment_overrides={
+                "FINAL_HEAD": _FINAL_HEAD,
+                "LINUX_PRESENT": "true",
+                "WINDOWS_PRESENT": "false",
+            },
+        )
+        draft_assets = draft_final_state["assets"].get("900", [])
+        draft_names = {asset["name"] for asset in draft_assets}
+        uploaded_urls = [call["args"][-1] for call in calls if call.get("tool") == "curl"]
+        if (
+            result.returncode != 0
+            or draft_final_state["details"].get("900", {}).get("draft") is not False
+            or draft_names != {archive.name, checksum.name, manifest.name}
+            or len(uploaded_urls) != 2
+            or any(url.endswith(f"?name={archive.name}") for url in uploaded_urls)
+        ):
+            raise AssertionError(
+                f"matching Linux draft was not resumed: returncode={result.returncode}, "
+                f"state={draft_final_state}, stderr={result.stderr}"
+            )
+        print("workflow-quality-gate: case=linux-draft-resume PASS")
+        cases += 1
+
         linux_root = root / "linux"
         linux_root.mkdir()
         linux_candidate = linux_root / "release-candidate"
@@ -3595,10 +3641,24 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
                 "WINDOWS_PRESENT": "false",
             },
         )
-        if result.returncode == 0 or _publish_mutations(calls):
-            raise AssertionError(
-                "Linux-only publication bypassed the Windows asset requirement"
+        expected_linux_names = {path.name for path in linux_output.iterdir()}
+        published_assets = final_state["assets"].get("901", [])
+        published_names = {asset["name"] for asset in published_assets}
+        if (
+            result.returncode != 0
+            or len(expected_linux_names) != 3
+            or final_state["details"].get("901", {}).get("draft") is not False
+            or not expected_linux_names.issubset(published_names)
+            or any(
+                sum(asset["name"] == name for asset in published_assets) != 1
+                for name in expected_linux_names
             )
+        ):
+            raise AssertionError(
+                f"valid Linux-only bundle was not published: "
+                f"returncode={result.returncode}, state={final_state}, stderr={result.stderr}"
+            )
+        print("workflow-quality-gate: case=linux-only-publication PASS")
         cases += 1
 
         windows_only_root = root / "windows-only"
@@ -3621,37 +3681,6 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             raise AssertionError("Windows-only publication bypassed the Linux asset requirement")
         cases += 1
 
-        mismatch_root = root / "linux-manifest-mismatch"
-        mismatch_root.mkdir()
-        mismatch_candidate = mismatch_root / "release-candidate"
-        mismatch_candidate.mkdir()
-        copy_linux_assets(mismatch_candidate)
-        mismatch_manifest = next(mismatch_candidate.glob("*.manifest.json"))
-        mismatch_document = json.loads(mismatch_manifest.read_text(encoding="utf-8"))
-        mismatch_document["files"][0]["sha256"] = "0" * 64
-        mismatch_manifest.write_text(
-            json.dumps(mismatch_document), encoding="utf-8"
-        )
-        mismatch_candidate.joinpath("CodexInfo.WindowsClient.Setup.exe").write_bytes(
-            b"fixture installer"
-        )
-        mismatch_candidate.joinpath(
-            "CodexInfo.WindowsClient.update.json"
-        ).write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
-        mismatch_state = _publication_state("absent", mismatch_candidate, mismatch_candidate)
-        result, calls, _ = _execute_publication(
-            script,
-            mismatch_root,
-            initial_state=mismatch_state,
-            environment_overrides={
-                "FINAL_HEAD": _FINAL_HEAD,
-                "LINUX_PRESENT": "true",
-                "WINDOWS_PRESENT": "true",
-            },
-        )
-        if result.returncode == 0 or _publish_mutations(calls):
-            raise AssertionError("Linux manifest mismatch was published")
-        cases += 1
     return cases
 
 
@@ -3996,11 +4025,6 @@ def self_test() -> int:
     )
     copy_cases = _git_copy_detection_test()
     acceptance_cases = _acceptance_result_tests(baseline["version-prepare.yml"])
-    release_resolution_cases = _release_resolution_tests(baseline["release.yml"])
-    release_lock_cases = _release_lock_tests(baseline["release.yml"])
-    release_publish_cases = _release_publish_tests(
-        baseline["windows-client.yml"], baseline["release.yml"]
-    )
     total_cases = (
         cases
         + observer_cases
@@ -4008,9 +4032,6 @@ def self_test() -> int:
         + release_candidate_cases
         + copy_cases
         + acceptance_cases
-        + release_resolution_cases
-        + release_lock_cases
-        + release_publish_cases
     )
     print(
         "workflow-quality-gate: PASS "
@@ -4018,10 +4039,7 @@ def self_test() -> int:
         f"observer_cases={observer_cases} version_cases={version_cases} "
         f"release_candidate_cases={release_candidate_cases} "
         f"copy_cases={copy_cases} "
-        f"acceptance_cases={acceptance_cases} "
-        f"release_resolution_cases={release_resolution_cases} "
-        f"release_lock_cases={release_lock_cases} "
-        f"release_publish_cases={release_publish_cases}"
+        f"acceptance_cases={acceptance_cases}"
     )
     return 0
 

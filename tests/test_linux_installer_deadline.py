@@ -22,6 +22,7 @@ FUNCTIONS = (
     "activate_candidate",
     "verify_candidate",
     "rollback_transaction",
+    "resume_transaction",
     "perform_install",
     "run_update",
 )
@@ -33,6 +34,7 @@ backup_dir="$share_dir/legacy-backups"
 generations_dir="$share_dir/generations"
 install_lock="$share_dir/.install.lock"
 transaction="$share_dir/transaction.json"
+backup_dir="$fixture_root/backups"
 current_link="$share_dir/current"
 clock="$fixture_root/clock"
 trace="$fixture_root/trace"
@@ -205,9 +207,27 @@ select_release() {
 }
 download_asset() { :; }
 update_failure_with_fallback() { die "$*"; }
+# Fixed verified journal/owner inputs; this fixture observes deadline propagation.
+read_journal() {
+    journal_phase=current_switched
+    journal_operation_id=fixture-resume-operation
+    journal_candidate_id=fixture-candidate
+    journal_previous_id=old
+    journal_desired=running
+}
+journal_owner_stale() { return 0; }
+owner_starttime() { printf '1000\n'; }
+boot_id() { printf '11111111-1111-4111-8111-111111111111\n'; }
+recover_legacy_combined_state() { previous_combined=0; }
 
 initialize_mutating_action
-if [[ "$FIXTURE_CASE" == update ]]; then
+if [[ "$FIXTURE_CASE" == resume ]]; then
+    mkdir -p "$generations_dir/fixture-candidate" "$backup_dir"
+    : > "$transaction"
+    atomic_symlink generations/fixture-candidate "$current_link"
+    resume_transaction
+    printf '%s\n' "$operation_deadline" > "$fixture_root/caller-deadline"
+elif [[ "$FIXTURE_CASE" == update ]]; then
     run_update
 else
     perform_install
@@ -217,7 +237,7 @@ fi
 
 class InstallerDeadlineTests(unittest.TestCase):
     @contextlib.contextmanager
-    def fixture(self, case, start=0, trigger="manual"):
+    def fixture(self, case, start=0, trigger="manual", environment_deadline=None):
         source = INSTALLER.read_text()
         header = source.split('\nhome_dir="$HOME"', 1)[0]
         functions = []
@@ -232,19 +252,22 @@ class InstallerDeadlineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="issue455-deadline-") as directory:
             root = pathlib.Path(directory)
             script = header + "\n" + "\n".join(functions) + MODEL
+            environment = {
+                "PATH": "/usr/bin:/bin",
+                "LC_ALL": "C",
+                "FIXTURE_ROOT": str(root),
+                "FIXTURE_CASE": case,
+                "FIXTURE_TRIGGER": trigger,
+                "CLOCK_START": str(start),
+                "CODEX_INFO_INSTALL_LOCKED": "1",
+                "CODEX_INFO_DEADLINE": "1230",
+            }
+            if environment_deadline is not None:
+                environment["install_deadline"] = environment_deadline
             result = subprocess.run(  # nosec B603 # fixed Bash/env; offline repository functions.
                 ["/bin/bash", "--noprofile", "--norc", "-s"],
                 input=script,
-                env={
-                    "PATH": "/usr/bin:/bin",
-                    "LC_ALL": "C",
-                    "FIXTURE_ROOT": str(root),
-                    "FIXTURE_CASE": case,
-                    "FIXTURE_TRIGGER": trigger,
-                    "CLOCK_START": str(start),
-                    "CODEX_INFO_INSTALL_LOCKED": "1",
-                    "CODEX_INFO_DEADLINE": "1230",
-                },
+                env=environment,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -324,6 +347,38 @@ class InstallerDeadlineTests(unittest.TestCase):
                 self.assertEqual(child, 1230)
                 self.assertGreater(limit, 0)
                 self.assertLessEqual(at + limit, 1230)
+
+    def test_resumed_rollback_ignores_environment_deadline(self):
+        for environment_deadline in (None, "0", "1"):
+            with (
+                self.subTest(environment_deadline=environment_deadline),
+                self.fixture(
+                    "resume", start=1205, environment_deadline=environment_deadline
+                ) as (root, result),
+            ):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_old_state(root)
+                self.assertEqual(int((root / "caller-deadline").read_text()), 1230)
+                self.assertLessEqual(int((root / "clock").read_text()), 1230)
+                journal = (root / "journal").read_text().splitlines()
+                phases = [line.split()[0] for line in journal]
+                self.assertIn("rollback_verified", phases)
+                self.assertEqual(phases[-1], "committed")
+                self.assertIn("committed rolled_back ", journal[-1])
+                commands = []
+                for line in (root / "trace").read_text().splitlines():
+                    at, limit, command = line.split(" ", 2)
+                    self.assertGreater(int(limit), 0, line)
+                    self.assertLessEqual(int(at) + int(limit), 1230, line)
+                    commands.append(command)
+                self.assertIn(
+                    "fixture_systemctl --user restart --no-block codex-info-recorder.service",
+                    commands,
+                )
+                self.assertIn(
+                    "fixture_systemctl --user restart --no-block codex-info-rest.service",
+                    commands,
+                )
 
 
 if __name__ == "__main__":
