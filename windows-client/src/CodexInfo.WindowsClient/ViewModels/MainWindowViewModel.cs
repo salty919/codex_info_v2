@@ -1672,15 +1672,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         IReadOnlyList<ApiThreadDetails> source)
     {
         var byId = source.ToDictionary(thread => thread.Id, StringComparer.Ordinal);
-        var stoppedParentIds = source
-            .Where(thread => thread.ParentId is { } parentId &&
-                byId.TryGetValue(parentId, out var parent) &&
-                parent.ActivityStatus == ApiThreadActivityStatus.Stopped)
-            .Select(thread => thread.ParentId!)
-            .ToHashSet(StringComparer.Ordinal);
         return source.Where(thread =>
         {
-            if (stoppedParentIds.Contains(thread.Id))
+            if (thread.ParentId is null && thread.ActivityStatus == ApiThreadActivityStatus.Stopped)
             {
                 return false;
             }

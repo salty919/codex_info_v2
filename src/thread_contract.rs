@@ -1884,13 +1884,15 @@ where
             .filter(|snapshot| snapshot.activity_status == ThreadActivityStatus::Stopped)
             .map(|snapshot| snapshot.thread_id.as_str())
             .collect();
-        // Seed the stopped parent itself; the descendant pass removes its subtree.
-        excluded_ids.extend(snapshots.iter().filter_map(|snapshot| {
-            let parent_id = snapshot.parent_thread_id.as_deref()?;
-            stopped_ids
-                .contains(parent_id)
-                .then(|| parent_id.to_owned())
-        }));
+        excluded_ids.extend(
+            snapshots
+                .iter()
+                .filter(|snapshot| match snapshot.parent_thread_id.as_deref() {
+                    None => snapshot.activity_status == ThreadActivityStatus::Stopped,
+                    Some(parent_id) => stopped_ids.contains(parent_id),
+                })
+                .map(|snapshot| snapshot.thread_id.clone()),
+        );
     }
     loop {
         let excluded_children: Vec<String> = snapshots
@@ -3452,17 +3454,13 @@ mod tests {
     }
 
     #[test]
-    fn issue_362_open_session_idle_remains_visible() {
+    fn issue_419_stopped_open_root_is_hidden() {
         let idle = thread_fixture("open-idle", 20, "saved name");
         let outcome =
             select_active_threads(terminal_cycle(vec![idle]), |_| -> Result<Vec<u8>, ()> {
                 Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
             });
-        assert!(matches!(
-            outcome,
-            ThreadCycleOutcome::Snapshots(rows)
-                if rows.len() == 1 && rows[0].thread_id == "open-idle"
-        ));
+        assert_eq!(outcome, ThreadCycleOutcome::NoThread);
     }
 
     #[test]
@@ -3492,11 +3490,15 @@ mod tests {
                     Ok(rollout_bytes(&events))
                 });
             assert!(
-                matches!(
-                    outcome,
-                    ThreadCycleOutcome::Snapshots(rows)
-                        if rows.len() == 1 && rows[0].activity_status == expected
-                ),
+                match outcome {
+                    ThreadCycleOutcome::Snapshots(rows) => {
+                        expected != ThreadActivityStatus::Stopped
+                            && rows.len() == 1
+                            && rows[0].activity_status == expected
+                    }
+                    ThreadCycleOutcome::NoThread => expected == ThreadActivityStatus::Stopped,
+                    ThreadCycleOutcome::CycleError => false,
+                },
                 "case {index}"
             );
         }
@@ -4031,10 +4033,13 @@ mod tests {
 
     #[test]
     fn thread_c_open_without_token_keeps_both_threads_with_none() {
-        let cycle = terminal_cycle(vec![
-            thread_fixture("without-token", 20, "without-token"),
-            thread_fixture("older-with-token", 10, "older-with-token"),
-        ]);
+        let mut parent = thread_fixture("without-token", 20, "without-token");
+        parent["status"] = json!({"type":"active","activeFlags":[]});
+        let mut child = thread_fixture("older-with-token", 10, "older-with-token");
+        child["source"] = json!({"subAgent":{"thread_spawn":{
+            "parent_thread_id":"without-token","depth":1
+        }}});
+        let cycle = terminal_cycle(vec![parent, child]);
         let outcome = select_active_threads(cycle, |candidate| -> Result<Vec<u8>, ()> {
             Ok(if candidate.id() == "without-token" {
                 rollout_bytes(&[
@@ -4052,7 +4057,7 @@ mod tests {
         assert_eq!(rows[0].thread_id, "without-token");
         assert_eq!(rows[0].model, "model-only");
         assert_eq!(rows[0].total_tokens, None);
-        assert_eq!(rows[0].activity_status, ThreadActivityStatus::Stopped);
+        assert_eq!(rows[0].activity_status, ThreadActivityStatus::Running);
         assert_eq!(rows[1].thread_id, "older-with-token");
         assert_eq!(rows[1].total_tokens, None);
         assert_eq!(rows[1].activity_status, ThreadActivityStatus::Stopped);
@@ -4067,13 +4072,12 @@ mod tests {
         );
 
         let inactive = terminal_cycle(vec![thread_fixture("inactive", 1, "inactive")]);
-        assert!(matches!(
+        assert_eq!(
             select_active_threads(inactive, |_| -> Result<Vec<u8>, ()> {
                 Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
             }),
-            ThreadCycleOutcome::Snapshots(rows)
-                if rows.len() == 1 && rows[0].activity_status == ThreadActivityStatus::Stopped
-        ));
+            ThreadCycleOutcome::NoThread
+        );
 
         let mut invalid_item = full_thread();
         invalid_item["id"] = json!(null);
@@ -4196,6 +4200,7 @@ mod tests {
         let valid_child = subagent("valid-child", 40, "valid-parent", 1);
         let mut independent_root = thread_fixture("independent-root", 30, "independent-root");
         independent_root["source"] = json!("cli");
+        independent_root["status"] = json!({"type":"active","activeFlags":[]});
         let mut stopped_open_parent =
             thread_fixture("stopped-open-parent", 20, "stopped-open-parent");
         stopped_open_parent["source"] = json!("cli");
@@ -4253,7 +4258,7 @@ mod tests {
             rows.iter()
                 .filter(|row| row.activity_status == ThreadActivityStatus::Running)
                 .count(),
-            2
+            3
         );
         let failed = select_active_threads(
             terminal_cycle(candidates),
@@ -4270,10 +4275,11 @@ mod tests {
 
     #[test]
     fn thread_c_current_process_filter_excludes_stale_sessions_without_failure() {
-        let rows = vec![
+        let mut rows = vec![
             thread_fixture("current", 20, "current"),
             thread_fixture("stale", 10, "stale"),
         ];
+        rows[0]["status"] = json!({"type":"active","activeFlags":[]});
         let outcome = select_active_threads_where(
             terminal_cycle(rows.clone()),
             |candidate| candidate.id() == "current",
