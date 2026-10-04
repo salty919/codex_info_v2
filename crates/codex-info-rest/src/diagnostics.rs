@@ -40,7 +40,7 @@ impl FailureLog {
         let mut file = options.open(path)?;
         writeln!(file, "{line}")?;
         file.flush()?;
-        let cutoff = format!("rest-{}.log", (day - Days::new(6)).format("%Y-%m-%d"));
+        let cutoff = format!("rest-{}.log", (day - Days::new(7)).format("%Y-%m-%d"));
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -64,5 +64,35 @@ impl FailureLog {
             fs::remove_file(entry.path())?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn retains_log_from_one_week_ago() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("logs/rest");
+        fs::create_dir_all(&directory).unwrap();
+        let week_old = directory.join("rest-2026-09-28.log");
+        let expired = directory.join("rest-2026-09-27.log");
+        fs::write(&week_old, "one-week-old\n").unwrap();
+        fs::write(&expired, "expired\n").unwrap();
+
+        let log = FailureLog::default();
+        log.set_data_root(root.path());
+        let now = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).single().unwrap();
+        log.append_at(now, "today").unwrap();
+
+        assert!(week_old.is_file(), "rest-2026-09-28.log must remain readable");
+        assert_eq!(fs::read_to_string(week_old).unwrap(), "one-week-old\n");
+        assert!(!expired.exists());
+        assert_eq!(
+            fs::read_to_string(directory.join("rest-2026-10-05.log")).unwrap(),
+            "today\n"
+        );
     }
 }
