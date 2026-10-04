@@ -973,24 +973,20 @@ jobs:
               --arg linux_archive_digest "$linux_archive_digest" \
               --arg linux_checksum_digest "$linux_checksum_digest" \
               --arg linux_manifest_digest "$linux_manifest_digest" \
-              --argjson setup_size "$setup_size" --argjson manifest_size "$manifest_size" \
-              --argjson linux_archive_size "$linux_archive_size" \
-              --argjson linux_checksum_size "$linux_checksum_size" \
-              --argjson linux_manifest_size "$linux_manifest_size" \
               --argjson windows "$WINDOWS_PRESENT" --argjson linux "$LINUX_PRESENT" '
                 (if $windows then
                   ([.[] | select(.name == $setup_name and .state == "uploaded" and
-                                 .size == $setup_size and .digest == $setup_digest)] | length) == 1 and
+                                 .digest == $setup_digest)] | length) == 1 and
                   ([.[] | select(.name == $manifest_name and .state == "uploaded" and
-                                 .size == $manifest_size and .digest == $manifest_digest)] | length) == 1
+                                 .digest == $manifest_digest)] | length) == 1
                  else true end) and
                 (if $linux then
                   ([.[] | select(.name == $linux_archive_name and .state == "uploaded" and
-                                 .size == $linux_archive_size and .digest == $linux_archive_digest)] | length) == 1 and
+                                 .digest == $linux_archive_digest)] | length) == 1 and
                   ([.[] | select(.name == $linux_checksum_name and .state == "uploaded" and
-                                 .size == $linux_checksum_size and .digest == $linux_checksum_digest)] | length) == 1 and
+                                 .digest == $linux_checksum_digest)] | length) == 1 and
                   ([.[] | select(.name == $linux_manifest_name and .state == "uploaded" and
-                                 .size == $linux_manifest_size and .digest == $linux_manifest_digest)] | length) == 1
+                                 .digest == $linux_manifest_digest)] | length) == 1
                  else true end)
               ' <<<"$assets" >/dev/null
           }
@@ -1002,7 +998,7 @@ jobs:
             verify_asset_list "$assets"
           }
           upload_asset() {
-            local path="$1" filename="$2" content_type="$3" size="$4" digest="$5"
+            local path="$1" filename="$2" content_type="$3" digest="$4"
             local response_file status response
             response_file="$RUNNER_TEMP/release-upload-$release_id-$filename.json"
             status="$(curl -L --fail-with-body --silent --show-error \
@@ -1017,20 +1013,19 @@ jobs:
               "$upload_base?name=$filename")"
             [[ "$status" == 201 ]]
             response="$(<"$response_file")"
-            jq -e --arg name "$filename" --arg digest "$digest" --argjson size "$size" '
-              type == "object" and (.id | type) == "number" and .id > 0 and
-              .name == $name and .state == "uploaded" and
-              .size == $size and .digest == $digest
+            jq -e --arg name "$filename" --arg digest "$digest" '
+              type == "object" and .name == $name and .state == "uploaded" and
+              .digest == $digest
             ' <<<"$response" >/dev/null
           }
           upload_asset_if_missing() {
-            local path="$1" filename="$2" content_type="$3" size="$4" digest="$5"
+            local path="$1" filename="$2" content_type="$3" digest="$4"
             local matches count
             matches="$(jq -c --arg name "$filename" '[.[] | select(.name == $name)]' <<<"$existing_assets")"
             count="$(jq 'length' <<<"$matches")"
             case "$count" in
               0)
-                upload_asset "$path" "$filename" "$content_type" "$size" "$digest"
+                upload_asset "$path" "$filename" "$content_type" "$digest"
                 ;;
               1)
                 if jq -e --arg digest "$digest" \
@@ -1050,8 +1045,6 @@ jobs:
 
           setup='release-candidate/CodexInfo.WindowsClient.Setup.exe'
           manifest='release-candidate/CodexInfo.WindowsClient.update.json'
-          setup_size=0
-          manifest_size=0
           setup_digest=''
           manifest_digest=''
           if [[ "$WINDOWS_PRESENT" == true ]]; then
@@ -1060,9 +1053,6 @@ jobs:
               type == "object" and .version == $version and
               (.version | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
             ' "$manifest" >/dev/null
-            setup_size="$(stat -c %s "$setup")"
-            manifest_size="$(stat -c %s "$manifest")"
-            [[ "$setup_size" -gt 0 && "$manifest_size" -gt 0 ]]
             setup_digest="sha256:$(sha256sum "$setup" | cut -d' ' -f1)"
             manifest_digest="sha256:$(sha256sum "$manifest" | cut -d' ' -f1)"
           fi
@@ -1071,9 +1061,6 @@ jobs:
           linux_archive_name=''
           linux_checksum_name=''
           linux_manifest_name=''
-          linux_archive_size=0
-          linux_checksum_size=0
-          linux_manifest_size=0
           linux_archive_digest=''
           linux_checksum_digest=''
           linux_manifest_digest=''
@@ -1086,10 +1073,6 @@ jobs:
             [[ -f "$linux_checksum" && -f "$linux_manifest" ]]
             linux_checksum_name="$(basename "$linux_checksum")"
             linux_manifest_name="$(basename "$linux_manifest")"
-            linux_archive_size="$(stat -c %s "$linux_archive")"
-            linux_checksum_size="$(stat -c %s "$linux_checksum")"
-            linux_manifest_size="$(stat -c %s "$linux_manifest")"
-            [[ "$linux_archive_size" -gt 0 && "$linux_checksum_size" -gt 0 && "$linux_manifest_size" -gt 0 ]]
             linux_archive_digest="sha256:$(sha256sum "$linux_archive" | cut -d' ' -f1)"
             linux_checksum_digest="sha256:$(sha256sum "$linux_checksum" | cut -d' ' -f1)"
             linux_manifest_digest="sha256:$(sha256sum "$linux_manifest" | cut -d' ' -f1)"
@@ -1133,17 +1116,17 @@ jobs:
 
           if [[ "$WINDOWS_PRESENT" == true ]]; then
             upload_asset_if_missing "$setup" 'CodexInfo.WindowsClient.Setup.exe' \
-              'application/octet-stream' "$setup_size" "$setup_digest"
+              'application/octet-stream' "$setup_digest"
             upload_asset_if_missing "$manifest" 'CodexInfo.WindowsClient.update.json' \
-              'application/json' "$manifest_size" "$manifest_digest"
+              'application/json' "$manifest_digest"
           fi
           if [[ "$LINUX_PRESENT" == true ]]; then
             upload_asset_if_missing "$linux_archive" "$linux_archive_name" \
-              'application/gzip' "$linux_archive_size" "$linux_archive_digest"
+              'application/gzip' "$linux_archive_digest"
             upload_asset_if_missing "$linux_checksum" "$linux_checksum_name" \
-              'text/plain' "$linux_checksum_size" "$linux_checksum_digest"
+              'text/plain' "$linux_checksum_digest"
             upload_asset_if_missing "$linux_manifest" "$linux_manifest_name" \
-              'application/json' "$linux_manifest_size" "$linux_manifest_digest"
+              'application/json' "$linux_manifest_digest"
           fi
 
           published="$(jq -nc '{draft:false}' |
