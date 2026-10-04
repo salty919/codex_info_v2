@@ -84,10 +84,16 @@ mod tests {
 
         let log = FailureLog::default();
         log.set_data_root(root.path());
-        let now = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).single().unwrap();
+        let now = Utc
+            .with_ymd_and_hms(2026, 10, 5, 12, 0, 0)
+            .single()
+            .unwrap();
         log.append_at(now, "today").unwrap();
 
-        assert!(week_old.is_file(), "rest-2026-09-28.log must remain readable");
+        assert!(
+            week_old.is_file(),
+            "rest-2026-09-28.log must remain readable"
+        );
         assert_eq!(fs::read_to_string(week_old).unwrap(), "one-week-old\n");
         assert!(!expired.exists());
         assert_eq!(
