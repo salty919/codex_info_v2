@@ -448,7 +448,7 @@ pub(crate) fn read_recorder_state() -> Result<Option<RecorderState>, String> {
         }
     }
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-    let value = crate::decode_unique_json(&bytes)?;
+    let mut value = crate::decode_unique_json(&bytes)?;
     let object = value
         .as_object()
         .ok_or_else(|| "recorder state is not an object".to_owned())?;
@@ -465,9 +465,15 @@ pub(crate) fn read_recorder_state() -> Result<Option<RecorderState>, String> {
         "last_commit_unix",
         "updated_at_unix",
     ];
-    if object.len() != KEYS.len() || KEYS.iter().any(|key| !object.contains_key(*key)) {
+    if object.len() != KEYS.len() + usize::from(object.contains_key("recorder_version"))
+        || KEYS.iter().any(|key| !object.contains_key(*key))
+    {
         return Err("recorder state key set is invalid".into());
     }
+    value
+        .as_object_mut()
+        .expect("validated recorder object")
+        .remove("recorder_version");
     let state: RecorderState = serde_json::from_value(value).map_err(|error| error.to_string())?;
     state.validate()?;
     Ok(Some(state))

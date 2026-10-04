@@ -16,6 +16,7 @@ namespace CodexInfo.WindowsClient.Core;
 /// </remarks>
 public sealed class LoopbackStatusClient :
     ILoopbackHealthClient,
+    ILoopbackRuntimeVersionsClient,
     ILoopbackDetailsClient,
     ILoopbackResourceClient,
     ILoopbackAccountsClient,
@@ -321,12 +322,31 @@ public sealed class LoopbackStatusClient :
         };
     }
 
-    public async Task<HealthFetchResult> FetchHealthAsync(
+    public async Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
+    {
+        var (body, failure) = await FetchSmallDocumentAsync(HealthEndpoint, cancellationToken).ConfigureAwait(false);
+        if (failure is not null) return HealthFetchResult.FromFailure(failure.Value);
+        return body is not null && TryParseHealth(body, out var snapshot) && snapshot is not null
+            ? HealthFetchResult.Success(snapshot)
+            : HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+    }
+
+    public async Task<RuntimeVersionsFetchResult> FetchRuntimeVersionsAsync(CancellationToken cancellationToken = default)
+    {
+        var (body, failure) = await FetchSmallDocumentAsync($"{EndpointRoot}/v1/runtime", cancellationToken).ConfigureAwait(false);
+        if (failure is not null) return new(null, failure);
+        return body is not null && TryParseRuntimeVersions(body, out var snapshot)
+            ? new(snapshot, null)
+            : new(null, HealthFetchFailure.Response);
+    }
+
+    private async Task<(byte[]? Body, HealthFetchFailure? Failure)> FetchSmallDocumentAsync(
+        string endpoint,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, HealthEndpoint);
+            using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
             request.Headers.Accept.Clear();
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
@@ -338,7 +358,7 @@ public sealed class LoopbackStatusClient :
 
             if (response.StatusCode != HttpStatusCode.OK)
             {
-                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+                return (null, HealthFetchFailure.Response);
             }
 
             if (!HasAcceptableHeaderSize(response) ||
@@ -346,12 +366,12 @@ public sealed class LoopbackStatusClient :
                 !TryGetContentLength(response.Content, out var contentLength) ||
                 contentLength is not long declaredLength)
             {
-                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+                return (null, HealthFetchFailure.Response);
             }
 
             if (declaredLength > MaxHealthBodyBytes)
             {
-                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+                return (null, HealthFetchFailure.Response);
             }
 
             var bodyStatus = await ReadBodyAsync(
@@ -363,41 +383,36 @@ public sealed class LoopbackStatusClient :
 
             if (bodyStatus.Kind is BodyReadKind.Oversize)
             {
-                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+                return (null, HealthFetchFailure.Response);
             }
 
             if (bodyStatus.Kind is BodyReadKind.Transport || bodyStatus.Body is null)
             {
-                return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+                return (null, HealthFetchFailure.Transport);
             }
 
             if (bodyStatus.Body.LongLength != declaredLength)
             {
-                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
+                return (null, HealthFetchFailure.Response);
             }
 
-            if (!TryParseHealth(bodyStatus.Body, out var snapshot) || snapshot is null)
-            {
-                return HealthFetchResult.FromFailure(HealthFetchFailure.Response);
-            }
-
-            return HealthFetchResult.Success(snapshot);
+            return (bodyStatus.Body, null);
         }
         catch (OperationCanceledException)
         {
-            return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+            return (null, HealthFetchFailure.Transport);
         }
         catch (HttpRequestException)
         {
-            return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+            return (null, HealthFetchFailure.Transport);
         }
         catch (IOException)
         {
-            return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+            return (null, HealthFetchFailure.Transport);
         }
         catch (Exception)
         {
-            return HealthFetchResult.FromFailure(HealthFetchFailure.Transport);
+            return (null, HealthFetchFailure.Transport);
         }
     }
 
@@ -1604,6 +1619,32 @@ public sealed class LoopbackStatusClient :
         {
             return BodyReadResult.Transport();
         }
+    }
+
+    private static bool TryParseRuntimeVersions(byte[] body, out ApiRuntimeVersionsSnapshot? snapshot)
+    {
+        snapshot = null;
+        try
+        {
+            using var document = JsonDocument.Parse(body, new JsonDocumentOptions { MaxDepth = 4 });
+            var root = document.RootElement;
+            var properties = CreatePropertySet("api_version", "rest_version", "recorder_version", "recorder_status");
+            if (!HasExactlyProperties(root, properties, 4) ||
+                !TryGetString(root, "api_version", out var apiVersion) || apiVersion != "v1" ||
+                !TryGetBoundedString(root, "rest_version", 1, 32, out var restVersion) || !IsCanonicalStableVersion(restVersion) ||
+                !TryGetString(root, "recorder_status", out var recorderStatus)) return false;
+            var value = root.GetProperty("recorder_version");
+            string? recorderVersion = null;
+            if (value.ValueKind != JsonValueKind.Null)
+            {
+                if (!TryGetBoundedString(root, "recorder_version", 1, 32, out recorderVersion) || !IsCanonicalStableVersion(recorderVersion)) return false;
+            }
+            var expectedStatus = recorderVersion is null ? "unavailable" : recorderVersion == restVersion ? "available" : "mismatch";
+            if (recorderStatus != expectedStatus) return false;
+            snapshot = new(apiVersion, restVersion, recorderVersion, recorderStatus);
+            return true;
+        }
+        catch (JsonException) { return false; }
     }
 
     private static bool TryParseHealth(byte[] body, out ApiHealthSnapshot? snapshot)

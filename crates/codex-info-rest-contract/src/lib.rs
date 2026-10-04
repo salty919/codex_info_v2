@@ -11,6 +11,57 @@ use std::collections::HashSet;
 pub const API_VERSION: &str = "v1";
 pub const API_VERSION_V2: &str = "v2";
 pub const API_VERSION_V3: &str = "v3";
+
+/// Process versions are independent of account and database readiness.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicRuntimeVersions {
+    pub api_version: String,
+    pub rest_version: String,
+    pub recorder_version: Option<String>,
+    pub recorder_status: String,
+}
+
+impl PublicRuntimeVersions {
+    pub fn new(rest_version: &str, recorder_version: Option<String>) -> Self {
+        let recorder_status = match recorder_version.as_deref() {
+            None => "unavailable",
+            Some(version) if version == rest_version => "available",
+            Some(_) => "mismatch",
+        };
+        Self {
+            api_version: API_VERSION.to_owned(),
+            rest_version: rest_version.to_owned(),
+            recorder_version,
+            recorder_status: recorder_status.to_owned(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.api_version != API_VERSION
+            || !valid_runtime_version(&self.rest_version)
+            || self
+                .recorder_version
+                .as_deref()
+                .is_some_and(|v| !valid_runtime_version(v))
+            || *self != Self::new(&self.rest_version, self.recorder_version.clone())
+        {
+            return Err("invalid runtime versions");
+        }
+        Ok(())
+    }
+}
+
+pub fn valid_runtime_version(version: &str) -> bool {
+    let parts = version.split('.').collect::<Vec<_>>();
+    version.len() <= 32
+        && parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && (part.len() == 1 || !part.starts_with('0'))
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
 pub const MAX_PUBLIC_MODELS: usize = 3;
 pub const MAX_PUBLIC_MODELS_V3: usize = 1_024;
 pub const MAX_PUBLIC_HISTORY_PERIODS: usize = 128;

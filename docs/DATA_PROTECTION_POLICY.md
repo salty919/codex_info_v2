@@ -1,5 +1,6 @@
 <!-- codex-info-requirement-owner: DATA -->
 <!-- codex-info-master-ids:
+REST-LOG-RETENTION-482
 RECORDER-MODEL-01
 CUM-138-01
 CUM-138-02
@@ -181,9 +182,9 @@ Codex app-server / session JSONL / thread rollout
   writer processは同じ`UsageStore`のtransaction/upsert契約を使う。通常のrecorder二重起動はlease前にno-op、競合試験だけが別の許可済みwriter processを使い、
   製品経路でleaseを無効化しない。
 - recorder状態はowner-only 0600の`recorder-state.json`へatomic writeし、schema
-  `codex-info-recorder-state-v1`、exact key
+  `codex-info-recorder-state-v1`、必須key集合
   `schema,pid,process_starttime,owner_nonce,write_state,partition_id_hash,data_generation,collector_epoch,
-  cycle_seq,last_commit_unix,updated_at_unix`を持つ。`write_state`は
+  cycle_seq,last_commit_unix,updated_at_unix`を持つ。新producerはcompile済み配布versionの診断metadata `recorder_version` も公開する。consumerは旧11-key公開も受理し、この診断metadataを既存のreadiness/DB authority判定へ追加しない。`write_state`は
   `idle_no_account|ready|degraded`だけである。lock/state遷移またはDB transactionのacknowledged commit後だけ
   対応fieldを更新し、heartbeatからcommitを捏造しない。account admitted時は新規usage rowが0件でも各scheduled
   generationをcommitし、`last_commit_unix` freshnessを150秒以内に保つ。全write stateのheartbeat
@@ -582,3 +583,7 @@ delete、publish、synthetic recovery は全て `0` とし、old DB・verified b
 restart後は old DBを open/read でき、検証済み世代は `quick_check=ok` でなければならない。faultの原因解消前に
 同じcallbackで再試行せず、復旧後の新generationだけを1回 publishする。fault結果の流用、corrupt DBの上書き、
 未検証backup採用、prune先行、空DB成功化は FAIL とする。
+
+## REST診断ログの保存（Issue #482）
+
+`REST-LOG-RETENTION-482`: REST failure logは既存data root配下の `logs/rest/rest-YYYY-MM-DD.log` にJSON Linesで保存する。日付境界はUTCの暦日。当日と直前6日を保持し、次の記録時にそれより古い同形式のファイルを削除する。記録のない日について空ファイルを生成しない。再起動後も同日ファイルへappendする。保持中のファイルを直接読取り、直近7日の記録を閲覧できる。保存・削除の失敗は秘密値を含まない固定診断をstderrへ出し、HTTP結果やDB/publicationを変更しない。

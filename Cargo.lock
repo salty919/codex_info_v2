@@ -789,6 +789,7 @@ dependencies = [
 name = "codex-info-rest"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "codex-info-account-locator",
  "codex-info-db-reader",
  "codex-info-db-writer",
