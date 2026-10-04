@@ -132,6 +132,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     /// <summary>The bounded resource transport, when the v3 split contract is available.</summary>
     internal ILoopbackResourceClient? SplitResourceClient => detailsClient as ILoopbackResourceClient;
+    internal ILoopbackRuntimeVersionsClient? RuntimeVersionsClient =>
+        detailsClient as ILoopbackRuntimeVersionsClient ?? healthClient as ILoopbackRuntimeVersionsClient;
 
     internal ILoopbackAccountResourceClient? AccountResourceClient => accountResourceClient;
 

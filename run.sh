@@ -57,6 +57,11 @@ if [[ "$operation" == help ]]; then
     exec "$payload" --help
 fi
 
+if [[ "$operation" == ui && -s "$home_dir/.local/share/codex-info/last-update-failure.txt" ]]; then
+    printf 'codex-info: last update failed: ' >&2
+    cat -- "$home_dir/.local/share/codex-info/last-update-failure.txt" >&2 || true
+fi
+
 launcher_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_installer="$launcher_dir/packaging/install_linux_bundle.sh"
 installer_ready=0

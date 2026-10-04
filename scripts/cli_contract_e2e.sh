@@ -339,7 +339,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 expected = {
     "schema", "pid", "process_starttime", "owner_nonce", "write_state",
     "partition_id_hash", "data_generation", "collector_epoch", "cycle_seq",
-    "last_commit_unix", "updated_at_unix",
+    "last_commit_unix", "updated_at_unix", "recorder_version",
 }
 if set(state) != expected or state["schema"] != "codex-info-recorder-state-v1":
     raise SystemExit("recorder-state schema/key set changed")

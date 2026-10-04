@@ -20,6 +20,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private string selectedTimeZoneId;
     private string selectedThemeId;
     private bool saveFailed;
+    private ApiRuntimeVersionsSnapshot? runtimeVersions;
 
     public SettingsViewModel(ClientSettingsStore store, MainWindowViewModel? main = null)
     {
@@ -102,6 +103,27 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public string StatusDetail => saveFailed ? Texts.SettingsSaveFailed : main?.StatusDetail ?? Texts.UnavailableDetails;
     public bool SaveFailed => saveFailed;
     public bool CanAuthenticate => main?.IsAuthRequired == true;
+    public string RestVersion => runtimeVersions?.RestVersion ?? Texts.UnavailableValue;
+    public string RecorderVersion => runtimeVersions?.RecorderVersion ?? Texts.UnavailableValue;
+    public string RuntimeVersionState => runtimeVersions?.RecorderStatus ?? "unavailable";
+    public string RuntimeVersionStatus => RuntimeVersionState switch
+    {
+        "available" => Texts.LanguageCode == "ja" ? "Recorder / REST バージョン一致" : "Recorder / REST versions match",
+        "mismatch" => Texts.LanguageCode == "ja" ? "Recorder / REST バージョン不一致" : "Recorder / REST versions differ",
+        _ => Texts.LanguageCode == "ja" ? "稼働バージョンを取得できません" : "Runtime version unavailable",
+    };
+
+    public async Task RefreshRuntimeVersionsAsync()
+    {
+        var client = main?.RuntimeVersionsClient;
+        var result = client is null ? null : await client.FetchRuntimeVersionsAsync();
+        runtimeVersions = result?.IsSuccess == true ? result.Snapshot : null;
+        Notify(nameof(RestVersion));
+        Notify(nameof(RecorderVersion));
+        Notify(nameof(RuntimeVersionState));
+        Notify(nameof(RuntimeVersionStatus));
+    }
+
     public void Refresh() => main?.RefreshCommand.Execute(null);
     public void StartAuthentication() => main?.AuthCommand.Execute(null);
 
@@ -152,6 +174,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     private void OnLanguageChanged(object? sender, EventArgs eventArgs)
     {
+        Notify(nameof(RestVersion));
+        Notify(nameof(RecorderVersion));
+        Notify(nameof(RuntimeVersionStatus));
         Notify(nameof(Texts));
         Notify(nameof(CurrentEndpoint));
         Notify(nameof(SelectedTimeZone));

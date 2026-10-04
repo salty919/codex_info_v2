@@ -51,6 +51,11 @@
             </StackPanel>
           </Grid>
         </Border>
+        <StackPanel Spacing="4">
+          <Grid ColumnDefinitions="100,*"><TextBlock Classes="label" Text="Recorder" /><TextBlock Grid.Column="1" Text="{Binding RecorderVersion}" /></Grid>
+          <Grid ColumnDefinitions="100,*"><TextBlock Classes="label" Text="REST" /><TextBlock Grid.Column="1" Text="{Binding RestVersion}" /></Grid>
+          <TextBlock Classes="label" Text="{Binding RuntimeVersionStatus}" TextWrapping="Wrap" />
+        </StackPanel>
         </StackPanel>
       </Border>
     </ScrollViewer>

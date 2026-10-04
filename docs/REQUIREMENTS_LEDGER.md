@@ -4,6 +4,11 @@
 
 | ID | owner | 実装範囲 | 直接オラクル | 状態 |
 | --- | --- | --- | --- | --- |
+| LINUX-UPDATE-DIAGNOSTICS-479 | PRODUCT | installer update/rollback failure owner、既存run.sh | test_same_recorder_hash_update_and_rest_failure_preserve_running_recorder の実fixture失敗・target/stage/reasonログ・--ui stderr。実導入とDB維持はINCONCLUSIVE | implemented |
+| RUNTIME-VERSION-481 | WIRE | recorder状態公開、REST runtime metadata、共通DTO、既存state consumers | recorder_auth_state_idle_publication_has_no_account_or_generation_authority、issue_481_runtime_versions_are_available_without_an_account、Issue481RuntimeVersionsKeepSeparateProcessesAndUnavailableState | implemented |
+| RUNTIME-SETTINGS-481 | UX | 既存Linux TimeZoneSettingsWindow、Windows Settings/既存client | issue_481_native_settings_accepts_runtime_metadata_without_snapshot_pair の実HTTP/DTO、ExistingSettingsShowsBothRuntimeVersionsAndClearsUnavailableValues のVM値。fresh描画はINCONCLUSIVE | implemented |
+| REST-FAILURE-482 | WIRE | REST共有handler、snapshot/DB/projection/response write failure owner | failure_request_is_logged_without_private_request_data の到達可能な405失敗、固定stage/reason/route、秘密値不記録 | implemented |
+| REST-LOG-RETENTION-482 | DATA | data root配下のREST logger | 同じfailure_request_is_logged_without_private_request_dataでGNU dateの現在UTC日付とファイル名を照合。保持境界・再起動・書込み失敗の実運用証拠はINCONCLUSIVE | implemented |
 | RECORDER-MODEL-01 | DATA | `src/main.rs`、`src/usage_store.rs` | 任意model差分/cache write保存、source単位隔離、旧DB保持、restart/range再適用、ASTRAのみbackfillと旧3モデル既知値を不完全履歴として保持する直接case | implemented |
 | ASTRA-COST-01 | PRODUCT | `src/main.rs`、REST/各UIの価格projection | 指定4単価、cache write二重計上なし、未提供/不整合の未確定表示 | implemented |
 | MODEL-USAGE-DISPLAY-01 | PRODUCT | `src/main.rs`、Windows v3 adapter・`ModelUsageViewModel`、`tests/fixtures/model_usage_display_oracle.json` | SOL/LUNA/TERRA/ASTRA/価格未定の同一fixtureから両platformのInput/Cached/Output token＋隣接ドルを照合し、v3だけを正規化、v1/v2二重減算0、小数2桁、cache write二重計上0を直接検証 | implemented |

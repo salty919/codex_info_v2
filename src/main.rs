@@ -851,7 +851,7 @@ const GRAPH_WINDOW_HEIGHT: u32 = 640;
 const LEGAL_WINDOW_WIDTH: u32 = 720;
 const LEGAL_WINDOW_HEIGHT: u32 = 520;
 const SETTINGS_WINDOW_WIDTH: u32 = 440;
-const SETTINGS_WINDOW_HEIGHT: u32 = 220;
+const SETTINGS_WINDOW_HEIGHT: u32 = 300;
 const UNAUTHENTICATED_WINDOW_TITLE: &str = "アカウント未接続 — プラン未設定";
 // Keep the native title-bar purpose suffix ASCII: some X11 window managers
 // render `_NET_WM_NAME` with a fallback font that turns Japanese glyphs into
@@ -21201,7 +21201,7 @@ fn request_service_details_with_etag_and_timeout(
     // the standalone REST owner intentionally omits the published-pair
     // header there. Every other successful details resource remains bound to
     // one immutable generation.
-    let account_directory = route == "/v3/accounts";
+    let account_directory = matches!(route, "/v3/accounts" | "/v1/runtime");
     if (status == 200 || status == 304) && !account_directory {
         let pair_value = pair
             .as_deref()
@@ -21231,6 +21231,44 @@ fn request_service_details_with_etag_and_timeout(
         pair,
         body: body.to_vec(),
     })
+}
+
+fn fetch_service_runtime_versions(
+    address: SocketAddr,
+) -> Result<codex_info_rest_contract::PublicRuntimeVersions, String> {
+    let response = request_service_details_with_etag(address, "/v1/runtime", None)?;
+    let runtime: codex_info_rest_contract::PublicRuntimeVersions =
+        serde_json::from_slice(&response.body).map_err(|_| "invalid runtime version response")?;
+    runtime.validate().map_err(str::to_owned)?;
+    Ok(runtime)
+}
+
+fn native_runtime_versions_text(
+    runtime: Option<&codex_info_rest_contract::PublicRuntimeVersions>,
+    japanese: bool,
+) -> String {
+    let unavailable = if japanese {
+        "取得不可"
+    } else {
+        "Unavailable"
+    };
+    let status = match runtime.map(|runtime| runtime.recorder_status.as_str()) {
+        Some("available") if japanese => "Recorder / REST バージョン一致",
+        Some("available") => "Recorder / REST versions match",
+        Some("mismatch") if japanese => "Recorder / REST バージョン不一致",
+        Some("mismatch") => "Recorder / REST versions differ",
+        _ if japanese => "稼働バージョンを取得できません",
+        _ => "Runtime version unavailable",
+    };
+    format!(
+        "Recorder: {}\nREST: {}\n{status}",
+        runtime
+            .and_then(|runtime| runtime.recorder_version.as_deref())
+            .unwrap_or(unavailable),
+        runtime
+            .map(|runtime| runtime.rest_version.as_str())
+            .unwrap_or(unavailable),
+    )
 }
 
 #[cfg(test)]
@@ -23862,6 +23900,19 @@ fn run_ui(
                 ])));
                 window.set_selected_time_zone(active_time_zone.get().as_str().into());
                 window.set_save_error("".into());
+                let japanese = state_ref.i18n.language().code() == "ja";
+                window
+                    .set_runtime_versions_text(native_runtime_versions_text(None, japanese).into());
+                let weak_window = window.as_weak();
+                thread::spawn(move || {
+                    let runtime = fetch_service_runtime_versions(service_endpoint).ok();
+                    let text = native_runtime_versions_text(runtime.as_ref(), japanese);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_runtime_versions_text(text.into());
+                        }
+                    });
+                });
                 drop(state_ref);
                 let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
             }
@@ -25558,6 +25609,33 @@ mod tests {
         assert_eq!(state.service_published_pair, admitted_pair);
         assert_eq!(state.public_details(), admitted_details);
         server.shutdown();
+    }
+
+    #[test]
+    fn issue_481_native_settings_accepts_runtime_metadata_without_snapshot_pair() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = r#"{"api_version":"v1","rest_version":"1.2.3","recorder_version":"1.2.2","recorder_status":"mismatch"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).unwrap();
+            assert!(request[..read].starts_with(b"GET /v1/runtime HTTP/1.1\r\n"));
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let response = super::request_service_details(address, "/v1/runtime");
+        worker.join().unwrap();
+        let response = response.expect("runtime metadata has no snapshot generation header");
+        let runtime: codex_info_rest_contract::PublicRuntimeVersions =
+            serde_json::from_slice(&response.body).unwrap();
+        runtime.validate().unwrap();
+        assert_eq!(runtime.rest_version, "1.2.3");
+        assert_eq!(runtime.recorder_version.as_deref(), Some("1.2.2"));
+        assert_eq!(runtime.recorder_status, "mismatch");
     }
 
     #[test]

@@ -789,6 +789,7 @@ dependencies = [
 name = "codex-info-rest"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "codex-info-account-locator",
  "codex-info-db-reader",
  "codex-info-db-writer",
@@ -811,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "codex_info"
-version = "1.0.115"
+version = "1.0.116"
 dependencies = [
  "axum",
  "chrono",

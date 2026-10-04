@@ -1771,16 +1771,17 @@ export component StatusBanner inherits Rectangle {
 
 export component TimeZoneSettingsWindow inherits Window {
     preferred-width: 440px;
-    preferred-height: 220px;
+    preferred-height: 300px;
     min-width: 440px;
     max-width: 440px;
-    min-height: 220px;
-    max-height: 220px;
+    min-height: 300px;
+    max-height: 300px;
     in-out property <string> window-title;
     in property <UiStrings> strings;
     in property <[string]> time-zone-options;
     in-out property <string> selected-time-zone: "local";
     in-out property <string> save-error;
+    in-out property <string> runtime-versions-text;
     in-out property <bool> reset-close-buttons: false;
     callback save-time-zone(string);
     callback cancel-settings();
@@ -1827,18 +1828,23 @@ export component TimeZoneSettingsWindow inherits Window {
             selected(value) => { root.selected-time-zone = value; }
         }
         Text {
-            x: 18px; y: 98px; width: parent.width - 36px; height: 24px;
+            x: 18px; y: 98px; width: parent.width - 36px; height: 68px;
+            text: root.runtime-versions-text;
+            color: DesignTokens.text-secondary; font-size: 11px;
+        }
+        Text {
+            x: 18px; y: 174px; width: parent.width - 36px; height: 24px;
             text: root.save-error; visible: root.save-error != "";
             color: DesignTokens.danger; font-size: 11px; vertical-alignment: center;
             overflow: elide;
         }
         ActionButton {
-            x: parent.width - 206px; y: 132px; width: 88px; height: 34px;
+            x: parent.width - 206px; y: 212px; width: 88px; height: 34px;
             text: root.strings.cancel;
             clicked => { root.cancel-settings(); }
         }
         ActionButton {
-            x: parent.width - 108px; y: 132px; width: 90px; height: 34px;
+            x: parent.width - 108px; y: 212px; width: 90px; height: 34px;
             text: root.strings.save; primary: true;
             clicked => { root.save-time-zone(root.selected-time-zone); }
         }

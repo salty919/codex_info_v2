@@ -2681,7 +2681,10 @@ impl RecorderStateWriter {
             "last_commit_unix",
             "updated_at_unix",
         ];
-        if object.len() != KEYS.len() || KEYS.iter().any(|key| !object.contains_key(*key)) {
+        let version_key = usize::from(object.contains_key("recorder_version"));
+        if object.len() != KEYS.len() + version_key
+            || KEYS.iter().any(|key| !object.contains_key(*key))
+        {
             return Err(RecorderError::Invalid(
                 "recorder state key set is invalid".to_owned(),
             ));
@@ -2889,6 +2892,7 @@ impl RecorderStateWriter {
             .filter(|cycle| *cycle > 0);
         let document = json!({
             "schema": "codex-info-recorder-state-v1",
+            "recorder_version": codex_info::PRODUCT_VERSION,
             "pid": self.pid,
             "process_starttime": self.starttime_ticks,
             "owner_nonce": self.owner_nonce,
@@ -7330,6 +7334,14 @@ mod tests {
         )
         .expect("idle state JSON");
         assert_eq!(value["write_state"], "idle_no_account");
+        // The root distribution manifest is the version authority, independent
+        // of the recorder publication implementation and its package version.
+        let expected_version = include_str!("../../../Cargo.toml")
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \""))
+            .expect("distribution version")
+            .trim_end_matches('"');
+        assert_eq!(value["recorder_version"], expected_version);
         for field in [
             "partition_id_hash",
             "data_generation",
