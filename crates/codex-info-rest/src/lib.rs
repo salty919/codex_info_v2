@@ -368,12 +368,14 @@ impl AccountReader {
 /// Reader/cache boundary.  The cache is an in-memory last-good snapshot per
 /// account partition, not a second persistence authority and is never written
 /// to disk.  `new(DbReader)` remains the fixture-compatible single-reader API.
+type RecorderVersionReader = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 pub struct SnapshotStore {
     default_account_id: Option<String>,
     accounts: BTreeMap<String, AccountStore>,
     account_descriptors: Vec<PublicAccountV3>,
     boundary: RwLock<BoundaryPublication>,
-    recorder_version_reader: RwLock<Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>>,
+    recorder_version_reader: RwLock<Option<RecorderVersionReader>>,
     diagnostics: FailureLog,
 }
 
