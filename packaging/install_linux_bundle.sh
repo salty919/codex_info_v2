@@ -42,6 +42,8 @@ previous_combined=0
 legacy_combined_enabled=0
 legacy_combined_active=0
 legacy_combined_generation=0
+legacy_combined_prestate=
+journal_legacy_combined_prestate=
 recorder_reused=0
 recorder_override_migrated=0
 migrate_recorder_override=0
@@ -597,13 +599,14 @@ write_journal() {
         safe_blocked 'journal owner identity is invalid'
     timestamp="$(now_unix)" || safe_blocked 'transaction journal clock is unavailable'
     local content
-    content="$(python3 - "$phase" "$operation_id" "$journal_owner_pid" "$journal_owner_starttime" "$journal_boot_id" "$previous_id" "$candidate_id" "$desired_state" "$timestamp" <<'PY'
+    content="$(python3 - "$phase" "$operation_id" "$journal_owner_pid" "$journal_owner_starttime" "$journal_boot_id" "$previous_id" "$candidate_id" "$desired_state" "$timestamp" "$legacy_combined_prestate" <<'PY'
 import json, sys
-phase, operation, owner_pid, owner_starttime, boot, old_generation, new_generation, desired, timestamp = sys.argv[1:]
+phase, operation, owner_pid, owner_starttime, boot, old_generation, new_generation, desired, timestamp, legacy = sys.argv[1:]
 document = {"schema":"codex-info-install-transaction-v1","operation_id":operation,
             "owner_pid":int(owner_pid),"owner_starttime":int(owner_starttime),"boot_id":boot,
             "phase":phase,"old_generation":old_generation,"new_generation":new_generation,
             "desired_state":desired,"updated_at_unix":int(timestamp)}
+if legacy: document["legacy_combined"] = json.loads(legacy)
 print(json.dumps(document, ensure_ascii=False, indent=2) + "\n", end="")
 PY
     )"
@@ -626,7 +629,7 @@ def pairs(items):
 try: document=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), object_pairs_hook=pairs)
 except Exception as error: raise SystemExit(str(error))
 required={"schema","operation_id","owner_pid","owner_starttime","boot_id","phase","old_generation","new_generation","desired_state","updated_at_unix"}
-if not isinstance(document,dict) or set(document)!=required or document["schema"]!="codex-info-install-transaction-v1":
+if not isinstance(document,dict) or set(document) not in (required, required | {"legacy_combined"}) or document["schema"]!="codex-info-install-transaction-v1":
     raise SystemExit("journal keys are invalid")
 if document["phase"] not in {"prepared","legacy_backed_up","entrypoints_linked","candidate_published","current_switched","activation_requested","candidate_verified","rollback_switched","rollback_verified","committed"}:
     raise SystemExit("journal phase is invalid")
@@ -640,11 +643,19 @@ if (not isinstance(document["old_generation"],str) or not re.fullmatch(generatio
         not isinstance(document["new_generation"],str) or not re.fullmatch(generation_pattern,document["new_generation"]) or
         isinstance(document["updated_at_unix"],bool) or not isinstance(document["updated_at_unix"],int) or document["updated_at_unix"] <= 0):
     raise SystemExit("journal generation or timestamp is invalid")
+legacy = document.get("legacy_combined")
+if "legacy_combined" in document:
+    if (not isinstance(legacy, dict) or set(legacy) != {"generation", "enabled", "active", "manifest_sha256"} or
+            any(type(legacy[key]) is not bool for key in ("generation", "enabled", "active")) or
+            not isinstance(legacy["manifest_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", legacy["manifest_sha256"]) or
+            legacy["generation"] != bool(document["old_generation"]) or
+            (legacy["generation"] and not document["old_generation"].endswith("-" + legacy["manifest_sha256"]))):
+        raise SystemExit("legacy combined journal prestate is invalid")
 print(document["phase"],document["operation_id"],document["owner_pid"],document["owner_starttime"],
-      document["boot_id"],document["old_generation"],document["new_generation"],document["desired_state"],sep="\x1f")
+      document["boot_id"],document["old_generation"],document["new_generation"],document["desired_state"],json.dumps(legacy) if legacy is not None else "",sep="\x1f")
 PY
     )" || safe_blocked 'transaction journal is invalid or ambiguous'
-    IFS=$'\x1f' read -r journal_phase journal_operation_id journal_owner_pid journal_owner_starttime journal_boot_id journal_previous_id journal_candidate_id journal_desired <<<"$journal_line"
+    IFS=$'\x1f' read -r journal_phase journal_operation_id journal_owner_pid journal_owner_starttime journal_boot_id journal_previous_id journal_candidate_id journal_desired journal_legacy_combined_prestate <<<"$journal_line"
 }
 journal_owner_stale() {
     [[ "$journal_boot_id" != "$(boot_id)" ]] && return 0
@@ -1093,7 +1104,7 @@ PY_LEGACY_SCHEMA
         legacy_rollback_id="$journal_previous_id"
     fi
     if python3 - "$generations_dir" "$current_link" "$transaction" "$unit_dir" "$proc_root" \
-        "$legacy_rollback_id" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
+        "$legacy_rollback_id" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" "$journal_legacy_combined_prestate" <<'PY'
 import hashlib
 import json
 import os
@@ -1101,7 +1112,7 @@ import re
 import stat
 import sys
 
-generations_path, current_path, journal_path, unit_dir, proc_root, legacy_rollback_name, schema, product, target, compatibility = sys.argv[1:]
+generations_path, current_path, journal_path, unit_dir, proc_root, legacy_rollback_name, schema, product, target, compatibility, legacy_prestate = sys.argv[1:]
 uid = os.getuid()
 generation_pattern = re.compile(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64}")
 journal_generation_pattern = re.compile(r"(?:|(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64})")
@@ -1303,7 +1314,8 @@ def read_committed_state(root_fd):
         raise Unsafe("transaction journal is invalid") from error
     required = {"schema", "operation_id", "owner_pid", "owner_starttime", "boot_id", "phase",
                 "old_generation", "new_generation", "desired_state", "updated_at_unix"}
-    require(isinstance(journal, dict) and set(journal) == required and
+    require(isinstance(journal, dict) and set(journal) == (required | {"legacy_combined"} if legacy_prestate else required) and
+            journal.get("legacy_combined") == (json.loads(legacy_prestate) if legacy_prestate else None) and
             journal["schema"] == "codex-info-install-transaction-v1" and journal["phase"] == "committed",
             "transaction journal is not committed and exact")
     require(isinstance(journal["operation_id"], str) and journal["operation_id"] and
@@ -2631,6 +2643,102 @@ capture_legacy_combined_state() {
     [[ -L "$legacy_combined_unit_destination" ]] && legacy_combined_generation=1
     return 0
 }
+capture_legacy_combined_prestate() {
+    capture_legacy_combined_state
+    local info manifest_hash
+    info="$(legacy_combined_record)" || safe_blocked 'legacy combined identity is unavailable'
+    IFS=$'\t' read -r _ _ manifest_hash _ _ <<<"$info"
+    legacy_combined_prestate="$(python3 - "$legacy_combined_generation" "$legacy_combined_enabled" "$legacy_combined_active" "$manifest_hash" <<'PY'
+import json, re, sys
+generation, enabled, active, manifest_hash = sys.argv[1:]
+if not re.fullmatch(r"[0-9a-f]{64}", manifest_hash): raise SystemExit("legacy manifest identity is invalid")
+print(json.dumps({"generation": generation == "1", "enabled": enabled == "1",
+                  "active": active == "1", "manifest_sha256": manifest_hash}))
+PY
+    )" || safe_blocked 'legacy combined prestate could not be captured'
+}
+validate_legacy_combined_recovery() {
+    local destination backup expected info manifest_hash generation_path
+    local -a members=("$manifest_destination" "$binary_destination" "$installer_destination" "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination")
+    local -a restore_paths=()
+    if (( legacy_combined_generation )); then
+        generation_path="$generations_dir/$previous_id"
+        # A trusted generation does not authorize overwriting a foreign unit.
+        # Validate both the live binding and the same operation's pending move.
+        expected='../../../.local/share/codex-info/current/codex-info.service'
+        for destination in "$legacy_combined_unit_destination" "$backup_dir/$operation_id-codex-info.service"; do
+            [[ -e "$destination" || -L "$destination" ]] || continue
+            [[ -L "$destination" && "$(stat -c '%u' -- "$destination")" == "$(id -u)" ]] &&
+                { [[ "$(readlink -- "$destination")" == "$expected" ]] ||
+                  [[ "$(readlink -f -- "$destination")" == "$generation_path/codex-info.service" ]]; } ||
+                safe_blocked 'foreign legacy combined unit blocks recovery'
+        done
+        members=("$generation_path/manifest.json" "$generation_path/codex_info" "$generation_path/install.sh" "$generation_path/codex-info.service" "$generation_path/codex-info-update.service" "$generation_path/codex-info-update.timer")
+    fi
+    for destination in "${members[@]}"; do
+        backup="$backup_dir/$operation_id-$(basename -- "$destination")"
+        if (( ! legacy_combined_generation )) && [[ -e "$backup" || -L "$backup" ]]; then
+            if [[ -e "$destination" || -L "$destination" ]]; then
+                case "$destination" in
+                    "$manifest_destination") expected='current/manifest.json' ;;
+                    "$binary_destination") expected='../share/codex-info/current/codex_info' ;;
+                    "$installer_destination") expected='../share/codex-info/current/install.sh' ;;
+                    *) expected="../../../.local/share/codex-info/current/$(basename -- "$destination")" ;;
+                esac
+                [[ -L "$destination" && "$(readlink -- "$destination")" == "$expected" ]] ||
+                    safe_blocked 'foreign legacy destination blocks recovery'
+            fi
+            restore_paths+=("$backup")
+        else
+            restore_paths+=("$destination")
+        fi
+    done
+    info="$(legacy_combined_record_at "${restore_paths[@]}")" || safe_blocked 'legacy combined recovery snapshot is not trusted'
+    IFS=$'\t' read -r _ _ manifest_hash _ _ <<<"$info"
+    [[ "$manifest_hash" == "$legacy_combined_manifest_hash" ]] || safe_blocked 'legacy combined recovery identity changed'
+    validate_legacy_combined_enable_link
+}
+wait_legacy_combined_ready() {
+    local now deadline remaining health details pid
+    now="$(now_unix)" || return 1
+    deadline=$((now + HEALTH_TIMEOUT))
+    if (( operation_deadline > 0 && operation_deadline < deadline )); then deadline=$operation_deadline; fi
+    while :; do
+        now="$(now_unix)" || return 1; remaining=$((deadline - now))
+        (( remaining > 0 )) || return 1
+        if probe_active codex-info.service && legacy_combined_listener_matches; then
+            pid="$(systemctl_user show codex-info.service --property=MainPID --value)" || return 1
+            if [[ "$pid" == "$(socket_pid)" ]]; then
+                health="$("$CURL_BIN" --fail --silent --show-error --connect-timeout 2 --max-time "$remaining" "$HEALTH_URL")" || health=
+                now="$(now_unix)" || return 1; remaining=$((deadline - now))
+                (( remaining > 0 )) || return 1
+                details="$("$CURL_BIN" --fail --silent --show-error --connect-timeout 2 --max-time "$remaining" "$DETAILS_URL")" || details=
+                if python3 - "$health" "$details" "$legacy_combined_version" <<'PY'
+import json, sys
+def pairs(items):
+    value = {}
+    for key, item in items:
+        if key in value: raise ValueError("duplicate runtime key")
+        value[key] = item
+    return value
+try:
+    health, details = (json.loads(raw, object_pairs_hook=pairs) for raw in sys.argv[1:3])
+    valid = (health == {"api_version": "v1", "service": "codex-info", "product_version": sys.argv[3]} and
+             isinstance(details, dict) and details.get("state") in {"ready", "auth_required"} and
+             type(details.get("observed_at")) is int and details["observed_at"] > 0)
+except (ValueError, TypeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+                then
+                    [[ "$(systemctl_user show codex-info.service --property=MainPID --value)" == "$pid" && "$(socket_pid)" == "$pid" ]] &&
+                        legacy_combined_listener_matches && return 0
+                fi
+            fi
+        fi
+        sleep_interval 1
+    done
+}
 legacy_combined_mixed_split_present() {
     local path
     for path in "$recorder_binary_destination" "$rest_binary_destination" "$unit_destination" "$rest_unit_destination"; do
@@ -2654,7 +2762,7 @@ retire_legacy_combined() {
     local managed_pid="$1" listener_pid
     legacy_combined_present || return 0
     (( previous_combined )) && return 0
-    capture_legacy_combined_state
+    [[ -n "$legacy_combined_prestate" ]] || safe_blocked 'legacy retirement lacks durable prestate'
     previous_combined=1
     if (( legacy_combined_active )); then
         systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 ||
@@ -2702,7 +2810,7 @@ restore_legacy_combined_runtime() {
         fi
         disable_managed_unit "$split_unit" || return 1
     done
-    if (( legacy_combined_enabled )); then
+    if (( legacy_combined_enabled )) && [[ "$desired_state" != disabled && "$desired_state" != removed ]]; then
         if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
             validate_legacy_combined_enable_link
         fi
@@ -2716,7 +2824,7 @@ restore_legacy_combined_runtime() {
         fi
         ! probe_legacy_combined_enabled || return 1
     fi
-    if (( legacy_combined_active )); then
+    if [[ "$desired_state" == running ]]; then
         systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || return 1
         probe_active codex-info.service || return 1
     elif probe_active codex-info.service; then
@@ -2726,20 +2834,22 @@ restore_legacy_combined_runtime() {
     return 0
 }
 verify_legacy_combined_terminal() {
-    legacy_combined_record >/dev/null || return 1
+    local info
+    info="$(legacy_combined_record)" || return 1
+    IFS=$'\t' read -r legacy_combined_version _ legacy_combined_restored_hash _ _ <<<"$info"
+    [[ "$legacy_combined_restored_hash" == "$legacy_combined_manifest_hash" ]] || return 1
     if (( legacy_combined_generation )); then
         [[ -n "$previous_id" && "$(current_generation)" == "$previous_id" ]] || return 1
     else
         [[ ! -L "$current_link" ]] || return 1
     fi
-    if (( legacy_combined_enabled )); then
+    if (( legacy_combined_enabled )) && [[ "$desired_state" != disabled && "$desired_state" != removed ]]; then
         probe_legacy_combined_enabled || return 1
     else
         ! probe_legacy_combined_enabled || return 1
     fi
-    if (( legacy_combined_active )); then
-        probe_active codex-info.service || return 1
-        legacy_combined_listener_matches
+    if [[ "$desired_state" == running ]]; then
+        wait_legacy_combined_ready
     else
         ! probe_active codex-info.service || return 1
         [[ -z "$(socket_pid 2>/dev/null || true)" ]]
@@ -2747,22 +2857,22 @@ verify_legacy_combined_terminal() {
 }
 recover_legacy_combined_state() {
     previous_combined=0; legacy_combined_generation=0
-    if [[ -e "$legacy_combined_unit_destination" || -L "$legacy_combined_unit_destination" ]]; then
-        capture_legacy_combined_state
+    legacy_combined_prestate="${journal_legacy_combined_prestate:-}"
+    if [[ -n "$legacy_combined_prestate" ]]; then
+        local state
+        state="$(python3 - "$legacy_combined_prestate" <<'PY'
+import json, sys
+state = json.loads(sys.argv[1])
+print(int(state["generation"]), int(state["enabled"]), int(state["active"]), state["manifest_sha256"], sep="\t")
+PY
+        )" || safe_blocked 'legacy combined prestate is unavailable'
+        IFS=$'\t' read -r legacy_combined_generation legacy_combined_enabled legacy_combined_active legacy_combined_manifest_hash <<<"$state"
         previous_combined=1
-        return
+        validate_legacy_combined_recovery
+        return 0
     fi
-    local backup="$backup_dir/$operation_id-codex-info.service"
-    if [[ -e "$backup" || -L "$backup" ]]; then
-        previous_combined=1
-        [[ -n "$previous_id" ]] && legacy_combined_generation=1
-        if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
-            validate_legacy_combined_enable_link
-            legacy_combined_enabled=1
-        else
-            legacy_combined_enabled=0
-        fi
-        probe_active codex-info.service && legacy_combined_active=1 || true
+    if legacy_combined_present || [[ -e "$backup_dir/$operation_id-codex-info.service" || -L "$backup_dir/$operation_id-codex-info.service" ]]; then
+        safe_blocked 'legacy combined journal lacks trusted prestate'
     fi
 }
 recorder_artifact_matches_previous() {
@@ -2837,6 +2947,7 @@ rollback_transaction() {
     previous_id="$previous"
     if (( previous_combined )); then
         restore_legacy_combined_entrypoints || ok=0
+        ((ok)) && validate_legacy_combined_recovery || safe_blocked 'legacy combined restore is incomplete'
     else
         ensure_entrypoints_for_generation || ok=0
     fi
@@ -2906,7 +3017,7 @@ resume_transaction() {
             write_journal committed resumed
             return 0
         fi
-    elif [[ "$journal_phase" == rollback_switched ]]; then
+    elif [[ "$journal_phase" == rollback_switched ]] && (( ! previous_combined )); then
         if [[ -n "$previous_id" ]]; then
             if [[ "$(current_generation)" == "$previous_id" ]] && verify_local_generation >/dev/null 2>&1 &&
                 { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
@@ -2915,10 +3026,6 @@ resume_transaction() {
                 write_journal committed resumed
                 return 0
             fi
-        elif (( previous_combined )) && verify_legacy_combined_terminal >/dev/null 2>&1; then
-            write_journal rollback_verified resumed-legacy-combined-rollback
-            write_journal committed resumed
-            return 0
         elif legacy_flat_present && verify_legacy_terminal >/dev/null 2>&1; then
             write_journal rollback_verified resumed-legacy-rollback
             write_journal committed resumed
@@ -2977,8 +3084,8 @@ perform_install() {
     check_glibc_compatibility "$MANIFEST" || die 'candidate glibc compatibility check failed'
     IFS=$'\t' read -r bundle_version source_hash manifest_hash binary_hash <<<"$validation"
     candidate_id="$bundle_version-$source_hash-$manifest_hash"; previous_id="$(current_generation)"; operation_id="$(new_operation_id)"
-    previous_flat=0; previous_combined=0; legacy_combined_generation=0; recorder_reused=0
-    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
+    previous_flat=0; previous_combined=0; legacy_combined_generation=0; legacy_combined_prestate=; recorder_reused=0
+    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""; legacy_combined_prestate=
     load_control_state; require_user_manager
     if [[ -n "$previous_id" ]]; then
         recorder_execution="$(recorder_execution_record "$previous_id")" || return 1
@@ -2986,7 +3093,10 @@ perform_install() {
     recorder_override_migrated=0
     if legacy_combined_present; then
         legacy_combined_mixed_split_present && safe_blocked 'legacy combined and split installation states are mixed'
-        capture_legacy_combined_state
+        capture_legacy_combined_prestate
+        local legacy_info
+        legacy_info="$(legacy_combined_record)" || safe_blocked 'legacy combined identity is unavailable'
+        IFS=$'\t' read -r legacy_combined_version _ legacy_combined_manifest_hash _ _ <<<"$legacy_info"
     elif [[ -z "$previous_id" ]] && legacy_flat_present; then
         local legacy_info
         legacy_info="$(legacy_flat_record)" || safe_blocked 'flat predecessor is not trusted'
@@ -3089,7 +3199,7 @@ reconcile_recorder_override() {
     [[ "$execution" == legacy || "$execution" == selected ]] || return 0
     previous_id="$generation"; candidate_id="$generation"; operation_id="$(new_operation_id)"
     previous_flat=0; previous_combined=0; recorder_reused=0
-    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
+    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""; legacy_combined_prestate=
     capture_runtime_state
     reserve_rollback_budget
     if [[ "$execution" == selected ]]; then capture_recorder_override_prestate "$generation"; fi
