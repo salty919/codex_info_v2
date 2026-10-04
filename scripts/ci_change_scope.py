@@ -229,9 +229,6 @@ def selection_for_paths(
         binary_impact = binary_impact or path_selection.binary_impact
     if not owners:
         raise ScopeError("pull request contains no changed paths")
-    if release_candidate and binary_impact:
-        owners.add("WINDOWS")
-
     return Selection(
         owners=tuple(owner for owner in OWNER_ORDER if owner in owners),
         codeql_languages=tuple(

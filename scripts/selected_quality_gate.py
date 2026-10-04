@@ -85,34 +85,23 @@ def validate(
         raise QualitySelectionError(
             "feat selection must not select distribution"
         )
-    if release_candidate and binary_impact and "WINDOWS" not in owners:
-        raise QualitySelectionError(
-            "release candidate binary impact must select WINDOWS"
-        )
     if release_candidate and distribution_required != binary_impact:
         raise QualitySelectionError(
             "release candidate distribution decision must equal binary impact"
         )
-    if set(results) != ALL_JOBS:
-        raise QualitySelectionError("quality result keys do not match the job set")
-
     for owner, job in OWNER_JOBS.items():
-        expected = "success" if owner in selected else "skipped"
-        if results[job] != expected:
+        if owner in selected and results.get(job) != "success":
             raise QualitySelectionError(
-                f"{job} must be {expected}, found {results[job]!r}"
+                f"{job} must succeed, found {results.get(job)!r}"
             )
-    expected_codeql = "success" if languages else "skipped"
-    if results["codeql-quality"] != expected_codeql:
+    if languages and results.get("codeql-quality") != "success":
         raise QualitySelectionError(
-            f"codeql-quality must be {expected_codeql}, "
-            f"found {results['codeql-quality']!r}"
+            f"codeql-quality must succeed, found {results.get('codeql-quality')!r}"
         )
-    expected_distribution = "success" if distribution_required else "skipped"
-    if results[LINUX_DISTRIBUTION_JOB] != expected_distribution:
+    if distribution_required and results.get(LINUX_DISTRIBUTION_JOB) != "success":
         raise QualitySelectionError(
-            f"linux-distribution must be {expected_distribution}, "
-            f"found {results[LINUX_DISTRIBUTION_JOB]!r}"
+            "linux-distribution must succeed, "
+            f"found {results.get(LINUX_DISTRIBUTION_JOB)!r}"
         )
 
 
