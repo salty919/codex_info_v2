@@ -457,7 +457,7 @@ public sealed class DetailsPresentationCoverageTests
         {
             new ApiThreadDetails("running", "Running", null, "SOL", "SOL", null, null, null, 1, 1, false, 0, false)
                 { ActivityStatus = ApiThreadActivityStatus.Running },
-            new ApiThreadDetails("stopped", "Stopped", null, "LUNA", "LUNA", null, null, null, 1, 1, false, 0, false)
+            new ApiThreadDetails("stopped", "Stopped", "running", "LUNA", "LUNA", null, null, null, 1, 1, true, 1, false)
                 { ActivityStatus = ApiThreadActivityStatus.Stopped },
             new ApiThreadDetails("unknown", "Unknown", null, "TERRA", "TERRA", null, null, null, 1, 1, false, 0, false)
                 { ActivityStatus = ApiThreadActivityStatus.Unknown },

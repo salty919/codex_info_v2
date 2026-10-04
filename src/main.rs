@@ -34974,22 +34974,6 @@ mod tests {
             update,
             ActiveThreadUpdate::Snapshot(vec![
                 ActiveThread {
-                    activity_status: PublicThreadActivityStatus::Stopped,
-                    id: "completed".into(),
-                    created_at: Some(1),
-                    updated_at: 30,
-                    title: "title-completed".into(),
-                    model: "不明".into(),
-                    model_label: "不明".into(),
-                    total_tokens: None,
-                    context_usage_tokens: None,
-                    context_window_tokens: None,
-                    last_user_message_at: None,
-                    is_subagent: false,
-                    parent_thread_id: None,
-                    depth: None,
-                },
-                ActiveThread {
                     activity_status: PublicThreadActivityStatus::Running,
                     id: "running-z".into(),
                     created_at: Some(1),
