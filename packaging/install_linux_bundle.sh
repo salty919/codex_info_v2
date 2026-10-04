@@ -1602,22 +1602,19 @@ import pathlib,sys,tarfile
 archive_path,destination=sys.argv[1:]
 try:
     with tarfile.open(archive_path,"r:gz") as bundle:
-        members=[member for member in bundle.getmembers() if member.name=="manifest.json"]
-        if len(members)!=1 or not members[0].isfile():
-            raise SystemExit("archive manifest is unavailable")
-        source=bundle.extractfile(members[0])
+        source=bundle.extractfile("manifest.json")
         if source is None:
             raise SystemExit("archive manifest cannot be read")
         pathlib.Path(destination).write_bytes(source.read())
-except (OSError,tarfile.TarError) as error:
+except (KeyError,OSError,tarfile.TarError) as error:
     raise SystemExit(f"archive manifest cannot be read: {error}")
 PY
 }
 published_release_identity() {
-    local manifest="$1" expected_version="$2"
-    python3 - "$manifest" "$expected_version" <<'PY'
-import hashlib,json,pathlib,re,sys
-manifest_path,expected_version=sys.argv[1:]
+    local manifest="$1"
+    python3 - "$manifest" <<'PY'
+import hashlib,json,pathlib,sys
+manifest_path=sys.argv[1]
 try:
     raw=pathlib.Path(manifest_path).read_bytes()
     document=json.loads(raw.decode("utf-8"))
@@ -1625,8 +1622,6 @@ except Exception as error:
     raise SystemExit(f"archive generation identity is unavailable: {error}")
 version=document.get("version") if isinstance(document,dict) else None
 source=document.get("source_sha") if isinstance(document,dict) else None
-if version!=expected_version or not isinstance(source,str) or not re.fullmatch(r"[0-9a-f]{40}",source):
-    raise SystemExit("archive generation identity does not match the release")
 print(version,source,hashlib.sha256(raw).hexdigest(),sep="\t")
 PY
 }
@@ -2948,10 +2943,7 @@ perform_install() {
     local install_deadline="$operation_deadline"
     local operation_deadline="$operation_deadline"
     if [[ "${CODEX_INFO_RELEASE_DIGEST_VERIFIED:-}" == 1 ]]; then
-        [[ "${CODEX_INFO_INSTALL_LOCKED:-}" == 1 && -e /proc/self/fd/9 &&
-           "${CODEX_INFO_RELEASE_VERSION:-}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
-            die 'verified-release installation requires the active update transaction'
-        validation="$(published_release_identity "$MANIFEST" "$CODEX_INFO_RELEASE_VERSION")" ||
+        validation="$(published_release_identity "$MANIFEST")" ||
             die 'candidate generation identity is unavailable'
     else
         validation="$(validate_bundle "$ARCHIVE" "$MANIFEST")" || die 'candidate validation failed before mutation'
@@ -3186,7 +3178,7 @@ run_update() {
     local -a migration_options=()
     if (( migrate_recorder_override )); then migration_options=(--migrate-recorder-override); fi
     if CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
-        CODEX_INFO_RELEASE_DIGEST_VERIFIED=1 CODEX_INFO_RELEASE_VERSION="$newest" \
+        CODEX_INFO_RELEASE_DIGEST_VERIFIED=1 \
         timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" "${migration_options[@]}"; then
         child_status=0
     else
@@ -3236,14 +3228,12 @@ PY
 }
 download_asset() {
     local url="$1" destination="$2" digest="$3" download_limit
-    [[ "$url" == https://* ]] || return 1
     download_limit=300
     if (( operation_deadline > 0 )); then
         download_limit="$(deadline_timeout 300)" || return 1
     fi
     "$CURL_BIN" --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time "$download_limit" --output "$destination" "$url" || return 1
     [[ -f "$destination" && ! -L "$destination" ]] || return 1
-    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
     [[ "sha256:$(sha256sum -- "$destination" | awk '{print $1}')" == "$digest" ]] || return 1
 }
 

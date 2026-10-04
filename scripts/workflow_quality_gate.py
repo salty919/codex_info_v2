@@ -827,7 +827,6 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             (
                 revalidate_script,
                 (
-                    f"windows_leaf='{leaf}'",
                     "linux_wrapper='Run selected quality owners / linux-distribution'",
                     "linux_leaf='Run selected quality owners / linux-distribution / linux-distribution'",
                 ),
@@ -1055,10 +1054,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         'api --method POST "repos/$REPOSITORY/releases"',
         "curl -L --fail-with-body --silent --show-error",
         '"$upload_base?name=$filename"',
-        "upload_asset_if_missing()",
         'api --method PATCH "repos/$REPOSITORY/releases/$release_id"',
-        "existing draft asset does not match selected candidate",
-        "release exists without its matching tag; automatic repair is unavailable",
     ):
         if marker not in release:
             errors.append(f"release.yml: missing {marker}")

@@ -201,11 +201,10 @@ verify_fixed_links_local() { :; }
 fixture_curl() { printf '[]\n'; }
 select_release() {
     printf 'update\t2.0.0\n'
-    printf 'archive\tfixture-archive\t1\tdigest\n'
-    printf 'checksum\tfixture-checksum\t1\tdigest\n'
-    printf 'manifest\tfixture-manifest\t1\tdigest\n'
+    printf 'archive\tfixture-archive\tdigest\n'
 }
 download_asset() { :; }
+extract_bundle_manifest() { printf '{}\n' > "$2"; }
 update_failure_with_fallback() { die "$*"; }
 # Fixed verified journal/owner inputs; this fixture observes deadline propagation.
 read_journal() {
