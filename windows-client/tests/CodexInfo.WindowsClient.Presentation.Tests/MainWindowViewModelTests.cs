@@ -313,7 +313,7 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task Issue362StoppedOpenSessionCountsInSameMainCycle()
+    public async Task Issue419StoppedOpenRootIsHiddenInSameMainCycle()
     {
         var current = CurrentSnapshot(activeThreadCount: 0) with
         {
@@ -329,14 +329,14 @@ public sealed class MainWindowViewModelTests
         using var main = new MainWindowViewModel(client);
 
         main.Start();
-        await EventuallyAsync(() => main.DetailsSnapshot?.Threads.Count == 1);
+        await EventuallyAsync(() => main.DetailsSnapshot?.Threads.Count == 0);
 
         Assert.Equal(1, client.ThreadsCallCount);
-        Assert.Equal(1UL, main.ActiveThreadCount);
-        Assert.Equal(1, main.ActiveSolCount);
-        Assert.Equal(1, main.ActiveSolCount + main.ActiveTerraCount + main.ActiveLunaCount +
+        Assert.Equal(0UL, main.ActiveThreadCount);
+        Assert.Equal(0, main.ActiveSolCount);
+        Assert.Equal(0, main.ActiveSolCount + main.ActiveTerraCount + main.ActiveLunaCount +
             main.ActiveAstraCount + main.ActiveOtherCount);
-        Assert.Equal(ApiThreadActivityStatus.Stopped, Assert.Single(main.DetailsSnapshot!.Threads).ActivityStatus);
+        Assert.Empty(main.DetailsSnapshot!.Threads);
     }
 
     [Fact]
@@ -348,6 +348,9 @@ public sealed class MainWindowViewModelTests
         };
         var stoppedSol = ThreadDetails("gpt-5.6-sol", "stopped-sol") with
         {
+            ParentId = "running-luna",
+            IsSubAgent = true,
+            Depth = 1,
             ActivityStatus = ApiThreadActivityStatus.Stopped,
         };
         var runningLuna = ThreadDetails("gpt-5.6-luna", "running-luna") with

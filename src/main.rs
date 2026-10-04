@@ -13560,22 +13560,12 @@ fn visible_public_threads(threads: &[PublicThread]) -> Vec<&PublicThread> {
         .iter()
         .map(|thread| (thread.id.as_str(), thread))
         .collect::<BTreeMap<_, _>>();
-    let stopped_parent_ids = threads
-        .iter()
-        .filter_map(|thread| {
-            let parent_id = thread.parent_thread_id.as_deref()?;
-            by_id
-                .get(parent_id)
-                .is_some_and(|parent| {
-                    parent.activity_status == Some(PublicThreadActivityStatus::Stopped)
-                })
-                .then_some(parent_id)
-        })
-        .collect::<BTreeSet<_>>();
     threads
         .iter()
         .filter(|thread| {
-            if stopped_parent_ids.contains(thread.id.as_str()) {
+            if thread.parent_thread_id.is_none()
+                && thread.activity_status == Some(PublicThreadActivityStatus::Stopped)
+            {
                 return false;
             }
             let mut parent = thread.parent_thread_id.as_deref();
@@ -34448,11 +34438,16 @@ mod tests {
             }
         };
         let open_session_rows = vec![
-            thread(
-                "stopped-sol",
-                "gpt-5.6-sol",
-                PublicThreadActivityStatus::Stopped,
-            ),
+            ActiveThread {
+                parent_thread_id: Some("running-luna".into()),
+                is_subagent: true,
+                depth: Some(1),
+                ..thread(
+                    "stopped-sol",
+                    "gpt-5.6-sol",
+                    PublicThreadActivityStatus::Stopped,
+                )
+            },
             thread(
                 "running-luna",
                 "gpt-5.6-luna",
@@ -41873,7 +41868,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_362_linux_stopped_open_session_counts_and_fetches_in_main_cycle() {
+    fn issue_419_linux_stopped_open_root_is_hidden_in_main_cycle() {
         let (mut current, mut threads) = split_current_fixture();
         current.active_thread_count = 0;
         current.open_session_thread_count = 1;
@@ -41911,12 +41906,8 @@ mod tests {
         });
         assert_eq!(outcome, super::ServiceCurrentPollOutcome::Success);
         assert_eq!(requested_threads, 1);
-        assert_eq!(state.active_threads.len(), 1);
-        assert_eq!(
-            state.active_threads[0].activity_status,
-            PublicThreadActivityStatus::Stopped
-        );
-        assert_eq!(super::active_thread_summary(&state.active_threads).total, 1);
+        assert!(state.active_threads.is_empty());
+        assert_eq!(super::active_thread_summary(&state.active_threads).total, 0);
     }
 
     #[test]

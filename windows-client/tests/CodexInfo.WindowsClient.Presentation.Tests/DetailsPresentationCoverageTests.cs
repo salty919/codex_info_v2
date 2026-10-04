@@ -497,7 +497,7 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
-    public async Task ThreadsWindowPrioritizesRunningRootsAndKeepsSubtrees()
+    public async Task ThreadsWindowHidesStoppedRootAndKeepsSubtrees()
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var source = new[]
@@ -517,7 +517,7 @@ public sealed class DetailsPresentationCoverageTests
         using var threads = new ThreadsWindowViewModel(main);
 
         Assert.Equal(
-            new[] { "running-root", "running-child", "stopped-root" },
+            new[] { "running-root", "running-child" },
             threads.Threads.Select(item => item.Id));
         Assert.Equal([new ThreadTreeConnection(0, 1, 0)], threads.TreeConnections);
     }
