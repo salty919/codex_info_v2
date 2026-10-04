@@ -4,7 +4,6 @@ import hashlib
 import json
 import pathlib
 import re
-import shlex
 import subprocess  # nosec B404 # offline Bash fixture, no host services.
 import tempfile
 import unittest
