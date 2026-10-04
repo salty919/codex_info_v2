@@ -1,5 +1,6 @@
 <!-- codex-info-requirement-owner: PRODUCT -->
 <!-- codex-info-master-ids:
+LINUX-UPDATE-DIAGNOSTICS-479
 ASTRA-COST-01
 MODEL-USAGE-DISPLAY-01
 API-LIFECYCLE-01
@@ -556,3 +557,8 @@ component別max、last-row、null化、任意mergeを行わない。
 10. `--ui` のdaemon/REST起動に失敗しても、X版のGUIを消失・即時終了させず、接続失敗と再試行手段を表示する。
 11. 同一periodのモデル別累積はmodelごとに独立したログ観測として扱う。1 modelが直前の確定値より後退したrowは、そのmodelだけを回復点まで欠測とし、同じrowで確定している他modelの実測値を欠測や前回値へ置換しない。model集合が不完全でも、掲載modelの実測値は無効にしない。
 12. remote quotaとlocal Session/logは独立した取得元とする。remote transport障害中もresident local collectorとDB recorderを60秒以内の既存周期で継続し、local-only rowはquota `NULL`かつmodel source `confirmed`でcommitする。local取得失敗後も、そのcycleで取得済みのfresh remote quotaは元の観測時刻、実collector世代、model source `unavailable`として同じDB transactionへ保持し、直前のdurable model vectorを新しい確定rowとして複製しない。古いquotaを新しいtimestampへ複製しない。local取得失敗はsingle-flightを解放して次周期で再取得し、DB書込み失敗はprovenanceを含むexact pending batchを保持して同じdaemon内で再試行する。provenanceなしの旧rowは`legacy-unknown`であり、確定観測へ昇格しない。
+
+## Linux更新の診断（Issue #479）
+
+`LINUX-UPDATE-DIAGNOSTICS-479`: 既存updaterは更新の開始、選択した対象版、処理段階、結果、失敗理由を `~/.local/share/codex-info/update.log` のJSON Linesへ記録する。既存の適用失敗、rollback、commit後のcleanup失敗を別の段階・結果で識別する。記録できない場合はstderrへ診断を出す。更新判断、download digest、適用・稼働確認の契約は既存の更新ownerを維持する。
+最後の更新失敗理由は `last-update-failure.txt` に保存し、既存launcherの `codex-info --ui` 起動時にstderrへ表示する。次の更新試行は前回の失敗表示を消して開始し、その試行で失敗した理由を保存する。

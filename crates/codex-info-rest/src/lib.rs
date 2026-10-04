@@ -5,13 +5,15 @@
 //! `codex_info` crates.  A failed candidate read leaves the last complete
 //! generation in place and marks the store degraded for diagnostics.
 
+mod diagnostics;
 mod history;
 
-use codex_info_db_reader::{DbReader, DbSnapshot};
+use codex_info_db_reader::{DbReader, DbSnapshot, ReaderError};
 use codex_info_rest_contract::{
     PublicAccountV3, PublicAccountsV3, PublicDetails, PublicDetailsV2, PublicDetailsV3,
-    PublicState, API_VERSION, API_VERSION_V2, API_VERSION_V3,
+    PublicRuntimeVersions, PublicState, API_VERSION, API_VERSION_V2, API_VERSION_V3,
 };
+use diagnostics::FailureLog;
 use history::{HistoryIndex, PeriodIndex};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -157,7 +159,7 @@ impl AccountStore {
 
     /// Read one candidate and atomically replace the current generation only
     /// after the reader has completed all schema/value/domain checks.
-    fn refresh(&self) -> RefreshStatus {
+    fn refresh(&self, log: &FailureLog, route: &str) -> RefreshStatus {
         let _refresh_guard = self
             .refresh_lock
             .lock()
@@ -194,7 +196,12 @@ impl AccountStore {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    eprintln!("codex-info-rest: snapshot marker read failed: {error}");
+                    log.record(
+                        route,
+                        "snapshot_marker",
+                        &reader_failure_reason(&error),
+                        None,
+                    );
                     self.inner
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -261,7 +268,7 @@ impl AccountStore {
                 }
             }
             Err(error) => {
-                eprintln!("codex-info-rest: snapshot refresh failed: {error}");
+                log.record(route, "snapshot_read", &reader_failure_reason(&error), None);
                 if let Some(current_generation) =
                     inner.current.as_ref().map(|current| current.generation)
                 {
@@ -366,6 +373,8 @@ pub struct SnapshotStore {
     accounts: BTreeMap<String, AccountStore>,
     account_descriptors: Vec<PublicAccountV3>,
     boundary: RwLock<BoundaryPublication>,
+    recorder_version_reader: RwLock<Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>>,
+    diagnostics: FailureLog,
 }
 
 #[derive(Debug)]
@@ -447,6 +456,8 @@ impl SnapshotStore {
                 generation: 0,
                 snapshot: None,
             }),
+            recorder_version_reader: RwLock::new(None),
+            diagnostics: FailureLog::default(),
         })
     }
 
@@ -460,7 +471,35 @@ impl SnapshotStore {
                 generation: 1,
                 snapshot: Some(Arc::new(PublishedSnapshot::account_boundary(state, 1))),
             }),
+            recorder_version_reader: RwLock::new(None),
+            diagnostics: FailureLog::default(),
         }
+    }
+
+    pub fn set_log_data_root(&self, root: &std::path::Path) {
+        self.diagnostics.set_data_root(root);
+    }
+
+    pub fn set_recorder_version_reader(
+        &self,
+        reader: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) {
+        *self
+            .recorder_version_reader
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(reader));
+    }
+
+    fn runtime_versions(&self) -> PublicRuntimeVersions {
+        let reader = self
+            .recorder_version_reader
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        PublicRuntimeVersions::new(
+            env!("CODEX_INFO_PRODUCT_VERSION"),
+            reader.and_then(|read| read()),
+        )
     }
 
     pub fn reader(&self) -> &DbReader {
@@ -482,9 +521,13 @@ impl SnapshotStore {
     }
 
     pub fn refresh_account(&self, account_id: &str) -> RefreshStatus {
+        self.refresh_account_for_route(account_id, "snapshot_refresh")
+    }
+
+    fn refresh_account_for_route(&self, account_id: &str, route: &str) -> RefreshStatus {
         self.accounts
             .get(account_id)
-            .map(AccountStore::refresh)
+            .map(|account| account.refresh(&self.diagnostics, route))
             .unwrap_or(RefreshStatus::Unavailable)
     }
 
@@ -751,7 +794,9 @@ fn serve(listener: TcpListener, store: Arc<SnapshotStore>, stop: Arc<AtomicBool>
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }
@@ -759,6 +804,7 @@ fn serve(listener: TcpListener, store: Arc<SnapshotStore>, stop: Arc<AtomicBool>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Route {
     Health,
+    Runtime,
     Details,
     DetailsV2,
     DetailsV3,
@@ -770,6 +816,20 @@ enum Route {
 }
 
 impl Route {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Health => "/v1/health",
+            Self::Runtime => "/v1/runtime",
+            Self::Details => "/v1/details",
+            Self::DetailsV2 => "/v2/details",
+            Self::DetailsV3 => "/v3/details",
+            Self::AccountsV3 => "/v3/accounts",
+            Self::CurrentV3 => "/v3/current",
+            Self::HistoryPeriodsV3 => "/v3/history/periods",
+            Self::HistoryV3 => "/v3/history",
+            Self::ThreadsV3 => "/v3/threads",
+        }
+    }
     fn v3(self) -> bool {
         matches!(
             self,
@@ -802,11 +862,14 @@ enum ParseError {
 }
 
 fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
+    let mut route_label = "unparsed";
     let request = match read_request(stream) {
         Ok(request) => request,
         Err(ParseError::HeadersTooLarge) => {
             write_json_response(
                 stream,
+                &store.diagnostics,
+                route_label,
                 431,
                 error_body("request_headers_too_large"),
                 None,
@@ -817,6 +880,8 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
         Err(ParseError::BodyNotAllowed) => {
             write_json_response(
                 stream,
+                &store.diagnostics,
+                route_label,
                 413,
                 error_body("request_body_not_allowed"),
                 None,
@@ -825,21 +890,48 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
             return;
         }
         Err(ParseError::BadRequest) => {
-            write_json_response(stream, 400, error_body("bad_request"), None, false);
+            write_json_response(
+                stream,
+                &store.diagnostics,
+                route_label,
+                400,
+                error_body("bad_request"),
+                None,
+                false,
+            );
             return;
         }
     };
+    route_label = request.route.map(Route::label).unwrap_or("unknown_route");
     let Some(route) = request.route else {
-        write_json_response(stream, 404, error_body("not_found"), None, false);
+        write_json_response(
+            stream,
+            &store.diagnostics,
+            route_label,
+            404,
+            error_body("not_found"),
+            None,
+            false,
+        );
         return;
     };
     if request.method != "GET" {
-        write_json_response(stream, 405, error_body("method_not_allowed"), None, false);
+        write_json_response(
+            stream,
+            &store.diagnostics,
+            route_label,
+            405,
+            error_body("method_not_allowed"),
+            None,
+            false,
+        );
         return;
     }
     if request.body_length > 0 {
         write_json_response(
             stream,
+            &store.diagnostics,
+            route_label,
             413,
             error_body("request_body_not_allowed"),
             None,
@@ -848,17 +940,54 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
         return;
     }
     if route == Route::Health {
-        write_json_response(stream, 200, health_body(), None, false);
+        write_json_response(
+            stream,
+            &store.diagnostics,
+            route_label,
+            200,
+            health_body(),
+            None,
+            false,
+        );
+        return;
+    }
+    if route == Route::Runtime {
+        match flatten_with_version(API_VERSION, &store.runtime_versions()) {
+            Ok(body) => write_json_response(
+                stream,
+                &store.diagnostics,
+                route_label,
+                200,
+                body,
+                None,
+                false,
+            ),
+            Err(error) => write_route_error(stream, &store.diagnostics, route_label, error),
+        }
         return;
     }
 
     if route == Route::AccountsV3 {
         let accounts = store.public_accounts();
         match flatten_with_version(API_VERSION_V3, &accounts) {
-            Ok(body) => write_json_response(stream, 200, body, None, false),
-            Err(RouteError::Serialization) => {
-                write_json_response(stream, 500, error_body("serialization_failed"), None, false)
-            }
+            Ok(body) => write_json_response(
+                stream,
+                &store.diagnostics,
+                route_label,
+                200,
+                body,
+                None,
+                false,
+            ),
+            Err(RouteError::Serialization) => write_json_response(
+                stream,
+                &store.diagnostics,
+                route_label,
+                500,
+                error_body("serialization_failed"),
+                None,
+                false,
+            ),
             Err(_) => unreachable!("account descriptors are validated at startup"),
         }
         return;
@@ -869,23 +998,47 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
             (Some(snapshot), false)
         } else {
             let Some(account_id) = store.default_account_id() else {
-                write_json_response(stream, 503, error_body("snapshot_unavailable"), None, false);
+                write_json_response(
+                    stream,
+                    &store.diagnostics,
+                    route_label,
+                    503,
+                    error_body("snapshot_unavailable"),
+                    None,
+                    false,
+                );
                 return;
             };
-            let _refresh = store.refresh_account(account_id);
+            let _refresh = store.refresh_account_for_route(account_id, route_label);
             store.snapshot_with_status_account(account_id)
         }
     } else {
         let account_id = request.account.as_deref().expect("account checked above");
         if !store.has_account(account_id) {
-            write_json_response(stream, 400, error_body("unknown_account"), None, false);
+            write_json_response(
+                stream,
+                &store.diagnostics,
+                route_label,
+                400,
+                error_body("unknown_account"),
+                None,
+                false,
+            );
             return;
         }
-        let _refresh = store.refresh_account(account_id);
+        let _refresh = store.refresh_account_for_route(account_id, route_label);
         store.snapshot_with_status_account(account_id)
     };
     let Some(snapshot) = snapshot else {
-        write_json_response(stream, 503, error_body("snapshot_unavailable"), None, false);
+        write_json_response(
+            stream,
+            &store.diagnostics,
+            route_label,
+            503,
+            error_body("snapshot_unavailable"),
+            None,
+            false,
+        );
         return;
     };
     if !degraded
@@ -902,11 +1055,19 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
                 request.period.as_deref(),
                 request.cursor.as_deref(),
             ) {
-                write_route_error(stream, error);
+                write_route_error(stream, &store.diagnostics, route_label, error);
                 return;
             }
         }
-        write_json_response(stream, 304, Vec::new(), Some(snapshot.pair.as_str()), true);
+        write_json_response(
+            stream,
+            &store.diagnostics,
+            route_label,
+            304,
+            Vec::new(),
+            Some(snapshot.pair.as_str()),
+            true,
+        );
         return;
     }
     let response = serialize_route(
@@ -917,21 +1078,43 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
         degraded,
     );
     match response {
-        Ok(body) => write_json_response(stream, 200, body, Some(snapshot.pair.as_str()), false),
-        Err(error) => write_route_error(stream, error),
+        Ok(body) => write_json_response(
+            stream,
+            &store.diagnostics,
+            route_label,
+            200,
+            body,
+            Some(snapshot.pair.as_str()),
+            false,
+        ),
+        Err(error) => write_route_error(stream, &store.diagnostics, route_label, error),
     }
 }
 
-fn write_route_error(stream: &mut TcpStream, error: RouteError) {
+fn write_route_error(stream: &mut TcpStream, log: &FailureLog, route: &str, error: RouteError) {
     match error {
-        RouteError::StaleCursor => {
-            write_json_response(stream, 400, error_body("stale_cursor"), None, false)
-        }
-        RouteError::Serialization => {
-            write_json_response(stream, 500, error_body("serialization_failed"), None, false)
-        }
+        RouteError::StaleCursor => write_json_response(
+            stream,
+            log,
+            route,
+            400,
+            error_body("stale_cursor"),
+            None,
+            false,
+        ),
+        RouteError::Serialization => write_json_response(
+            stream,
+            log,
+            route,
+            500,
+            error_body("serialization_failed"),
+            None,
+            false,
+        ),
         RouteError::UnknownPeriod => write_json_response(
             stream,
+            log,
+            route,
             400,
             error_body("invalid_history_query"),
             None,
@@ -1093,6 +1276,7 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let route = match path {
         "/health" | "/v1/health" => Some(Route::Health),
+        "/v1/runtime" => Some(Route::Runtime),
         "/v1/details" => Some(Route::Details),
         "/v2/details" => Some(Route::DetailsV2),
         "/v3/details" => Some(Route::DetailsV3),
@@ -1181,6 +1365,7 @@ fn serialize_route(
     let details = &snapshot.details;
     match route {
         Route::Health => Ok(health_body()),
+        Route::Runtime => unreachable!("runtime versions do not use a database snapshot"),
         Route::Details => {
             let details = details_v1(snapshot, degraded);
             flatten_with_version(API_VERSION, &details)
@@ -1393,11 +1578,28 @@ fn error_body(error: &str) -> Vec<u8> {
 
 fn write_json_response(
     stream: &mut TcpStream,
+    log: &FailureLog,
+    route: &str,
     status: u16,
     body: Vec<u8>,
     pair: Option<&str>,
     not_modified: bool,
 ) {
+    if status >= 400 {
+        let value = serde_json::from_slice::<Value>(&body).ok();
+        let failure = value
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("response_failed");
+        let stage = match failure {
+            "bad_request" | "request_headers_too_large" => "request_parse",
+            "snapshot_unavailable" => "snapshot_read",
+            "serialization_failed" => "response_generation",
+            _ => "route_input",
+        };
+        log.record(route, stage, failure, Some(status));
+    }
     let reason = match status {
         200 => "OK",
         304 => "Not Modified",
@@ -1421,9 +1623,29 @@ fn write_json_response(
         "HTTP/1.1 {status} {reason}\r\n{pair_header}Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(&body);
-    let _ = stream.flush();
+    if let Err(error) = stream
+        .write_all(header.as_bytes())
+        .and_then(|_| stream.write_all(&body))
+        .and_then(|_| stream.flush())
+    {
+        log.record(
+            route,
+            "response_write",
+            &format!("{:?}", error.kind()),
+            Some(status),
+        );
+    }
+}
+
+fn reader_failure_reason(error: &ReaderError) -> String {
+    match error {
+        ReaderError::Io(error) => format!("database_io_{:?}", error.kind()),
+        ReaderError::Sqlite(error) => format!("database_sqlite_{:?}", error.sqlite_error_code()),
+        ReaderError::Schema(_) => "database_schema_invalid".to_owned(),
+        ReaderError::InvalidValue(_) => "database_value_invalid".to_owned(),
+        ReaderError::Contract(_) => "public_projection_invalid".to_owned(),
+        ReaderError::TooManyRows(_) => "history_projection_too_large".to_owned(),
+    }
 }
 
 /// Parse a `--port` value without allowing non-loopback binds.
@@ -1444,6 +1666,25 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn issue_481_runtime_versions_are_available_without_an_account() {
+        let server = RestServer::start_without_account(
+            PublicState::AuthRequired,
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("listener");
+        let response = request(
+            server.local_addr(),
+            "GET /v1/runtime HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let value: Value = serde_json::from_str(body(&response)).unwrap();
+        assert_eq!(value["api_version"], "v1");
+        assert_eq!(value["rest_version"], env!("CODEX_INFO_PRODUCT_VERSION"));
+        assert!(value["recorder_version"].is_null());
+        assert_eq!(value["recorder_status"], "unavailable");
+    }
 
     #[test]
     fn issue_362_v3_open_rows_preserve_legacy_active_projection() {

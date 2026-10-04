@@ -11,6 +11,7 @@ name = "codex_info_rest"
 path = "src/main.rs"
 
 [dependencies]
+chrono = "0.4"
 codex-info-account-locator = { path = "../codex-info-account-locator" }
 codex-info-db-reader = { path = "../codex-info-db-reader" }
 codex-info-rest-contract = { path = "../codex-info-rest-contract" }

@@ -17,6 +17,38 @@ public sealed class LoopbackStatusClientTests
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
     [Fact]
+    public async Task Issue481RuntimeVersionsKeepSeparateProcessesAndUnavailableState()
+    {
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            Assert.Equal("/v1/runtime", request.RequestUri!.AbsolutePath);
+            return JsonResponse("""
+                {"api_version":"v1","rest_version":"1.2.3","recorder_version":"1.2.2","recorder_status":"mismatch"}
+                """, includePublishedPair: false);
+        }));
+        // Dynamic dispatch keeps the new operation's missing implementation a
+        // behavioral RED rather than a compilation failure.
+        dynamic result = await ((dynamic)client).FetchRuntimeVersionsAsync(CancellationToken.None);
+        Assert.True((bool)result.IsSuccess);
+        Assert.Equal("1.2.3", (string)result.Snapshot.RestVersion);
+        Assert.Equal("1.2.2", (string)result.Snapshot.RecorderVersion);
+        Assert.Equal("mismatch", (string)result.Snapshot.RecorderStatus);
+
+        using var unavailable = new LoopbackStatusClient(new StubHandler(_ => JsonResponse("""
+            {"api_version":"v1","rest_version":"1.2.3","recorder_version":null,"recorder_status":"unavailable"}
+            """, includePublishedPair: false)));
+        dynamic missing = await ((dynamic)unavailable).FetchRuntimeVersionsAsync(CancellationToken.None);
+        Assert.True((bool)missing.IsSuccess);
+        Assert.Null((string?)missing.Snapshot.RecorderVersion);
+        Assert.Equal("unavailable", (string)missing.Snapshot.RecorderStatus);
+
+        using var failed = new LoopbackStatusClient(new StubHandler(_ => NotFoundResponse()));
+        dynamic failure = await ((dynamic)failed).FetchRuntimeVersionsAsync(CancellationToken.None);
+        Assert.False((bool)failure.IsSuccess);
+        Assert.Null((object?)failure.Snapshot);
+    }
+
+    [Fact]
     public async Task PublishedPairIsRetainedForDetails()
     {
         var details = await FetchDetails(ValidDetailsJson());

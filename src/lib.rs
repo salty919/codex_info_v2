@@ -3,6 +3,9 @@
 
 #![deny(unsafe_code)]
 
+/// Distribution version compiled into each process that uses this crate.
+pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod app_server_sqlite;
 pub mod i18n;
 pub mod protocol_contract;

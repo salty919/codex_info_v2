@@ -380,6 +380,13 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         self.assertNotIn("codex-info-recorder.service", activations)
         self.assertFalse(self.override.exists())
         self.preserved_profile()
+        records = [json.loads(line) for line in (self.home / ".local/share/codex-info/update.log").read_text().splitlines()]
+        failed = [record for record in records if record["target"] == "1.0.21"]
+        self.assertTrue(any(record["stage"] == "install" for record in failed))
+        self.assertTrue(any(record["stage"] == "rollback" for record in failed))
+        self.assertTrue(any(record["result"] == "failed" and "candidate activation failed" in record["reason"] for record in failed))
+        launcher = self.command(ROOT / "run.sh", "--ui")
+        self.assertIn("candidate activation failed", launcher.stderr)
 
 
     def unknown_historical_override(self):

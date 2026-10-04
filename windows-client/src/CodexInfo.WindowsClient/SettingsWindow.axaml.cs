@@ -18,6 +18,7 @@ public partial class SettingsWindow : Window
         InitializeComponent();
         this.mainWindow = mainWindow;
         DataContext = viewModel;
+        Opened += async (_, _) => await viewModel.RefreshRuntimeVersionsAsync();
         Closed += (_, _) => viewModel.Dispose();
     }
 
@@ -44,7 +45,14 @@ public partial class SettingsWindow : Window
         mainWindow?.OpenSetupFromChild();
     }
 
-    private void OnRefresh(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => (DataContext as SettingsViewModel)?.Refresh();
+    private async void OnRefresh(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if (DataContext is SettingsViewModel viewModel)
+        {
+            viewModel.Refresh();
+            await viewModel.RefreshRuntimeVersionsAsync();
+        }
+    }
     private void OnAuth(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => (DataContext as SettingsViewModel)?.StartAuthentication();
     private void OnOpenLegal(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => mainWindow?.OpenLegalFromChild();
 }

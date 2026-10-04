@@ -79,6 +79,9 @@ current_link="$share_dir/current"
 transaction="$share_dir/install-transaction.json"
 control_state="$share_dir/control-state.json"
 install_lock="$share_dir/.install.lock"
+update_stage=
+update_target=
+update_failure_file="$share_dir/last-update-failure.txt"
 proc_root="$(printenv CODEX_INFO_PROC_ROOT || printf '/proc')"
 
 usage() {
@@ -95,8 +98,25 @@ usage: install.sh --bundle ARCHIVE [--manifest FILE] [--sha256 FILE]
        install.sh --verify-ui [--quiet]
 EOF
 }
-die() { echo "linux-bundle-install: $*" >&2; exit 1; }
-safe_blocked() { echo "SAFE_BLOCKED: $*" >&2; exit 1; }
+update_log() {
+    [[ -n "$update_stage" ]] || return 0
+    python3 - "$share_dir" "$TRIGGER" "$update_target" "$update_stage" "$1" "${2:-}" <<'PY'
+import json, pathlib, sys, time
+directory, trigger, target, stage, result, reason = sys.argv[1:]
+directory = pathlib.Path(directory)
+try:
+    record = {"timestamp":int(time.time()), "trigger":trigger, "target":target,
+              "stage":stage, "result":result, "reason":reason}
+    with (directory / "update.log").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")
+    if result == "failed":
+        (directory / "last-update-failure.txt").write_text(reason + "\n", encoding="utf-8")
+except OSError:
+    print("linux-bundle-install: update_log_write_failed", file=sys.stderr)
+PY
+}
+die() { update_log failed "$*"; echo "linux-bundle-install: $*" >&2; exit 1; }
+safe_blocked() { update_log failed "$*"; echo "SAFE_BLOCKED: $*" >&2; exit 1; }
 
 while (($# > 0)); do
     case "$1" in
@@ -171,6 +191,8 @@ case "$ACTION" in
         if [[ "${CODEX_INFO_INSTALL_LOCKED:-}" == 1 && "${CODEX_INFO_INTERNAL_TRIGGER:-}" =~ ^(startup|timer)$ ]]; then
             TRIGGER="${CODEX_INFO_INTERNAL_TRIGGER}"
         fi
+        update_target="${CODEX_INFO_UPDATE_TARGET:-}"
+        [[ -z "$update_target" ]] || update_stage=install
         ;;
 esac
 
@@ -2289,14 +2311,14 @@ def pairs(items):
         if key in result: raise ValueError("duplicate recorder key")
         result[key] = value
     return result
-def read_object(path, keys):
+def read_object(path, keys, optional_keys=frozenset()):
     path = pathlib.Path(path)
     if not path.is_file() or path.is_symlink(): raise SystemExit("recorder identity file unavailable")
     metadata = path.stat()
     if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600: raise SystemExit("recorder identity file is not owner-private")
     try: value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs)
     except Exception as error: raise SystemExit(str(error))
-    if not isinstance(value, dict) or set(value) != keys: raise SystemExit("recorder identity schema is invalid")
+    if not isinstance(value, dict) or not keys <= set(value) or set(value) - keys - optional_keys: raise SystemExit("recorder identity schema is invalid")
     return value
 lock = read_object(lock_name, {"pid","started_at","starttime_ticks","executable_device","executable_inode","owner_nonce"})
 if lock["pid"] != pid or any(isinstance(lock[key], bool) or not isinstance(lock[key], int) or lock[key] <= 0 for key in ("pid","started_at","starttime_ticks","executable_device","executable_inode")):
@@ -2311,7 +2333,7 @@ if len(proc_fields) < 20 or proc_fields[19] != str(lock["starttime_ticks"]): rai
 try: executable = (pathlib.Path(proc_root) / pid_text / "exe").stat()
 except OSError: raise SystemExit("profile owner executable is unavailable")
 if executable.st_dev != lock["executable_device"] or executable.st_ino != lock["executable_inode"]: raise SystemExit("profile owner executable identity mismatch")
-state = read_object(recorder_name, {"schema","pid","process_starttime","owner_nonce","write_state","partition_id_hash","data_generation","collector_epoch","cycle_seq","last_commit_unix","updated_at_unix"})
+state = read_object(recorder_name, {"schema","pid","process_starttime","owner_nonce","write_state","partition_id_hash","data_generation","collector_epoch","cycle_seq","last_commit_unix","updated_at_unix"}, {"recorder_version"})
 if state["schema"] != "codex-info-recorder-state-v1" or state["pid"] != pid or state["process_starttime"] != lock["starttime_ticks"] or state["owner_nonce"] != lock["owner_nonce"]:
     raise SystemExit("recorder owner identity mismatch")
 if isinstance(state["updated_at_unix"], bool) or not isinstance(state["updated_at_unix"], int) or state["updated_at_unix"] <= 0: raise SystemExit("recorder updated_at_unix is invalid")
@@ -2798,6 +2820,7 @@ restore_runtime_state() {
 }
 rollback_transaction() {
     local previous="$1" reason="$2" ok=1 saved_deadline="$operation_deadline" rollback_now rollback_deadline
+    if [[ -n "$update_stage" ]]; then update_stage=rollback; update_log started "$reason"; fi
     local allow_legacy_recorder_override=1
     local rollback_recorder_receipt=
     if [[ -f "$backup_dir/$operation_id-recorder-override-prestate.json" ]]; then
@@ -2861,6 +2884,7 @@ rollback_transaction() {
     if ((ok)); then write_journal rollback_verified "$reason"; write_journal committed rolled_back; fi
     operation_deadline=$saved_deadline
     ((ok)) || safe_blocked "rollback could not be verified within $ROLLBACK_TIMEOUT seconds"
+    update_log succeeded "$reason"
 }
 resume_transaction() {
     [[ -f "$transaction" ]] || return 0
@@ -2908,6 +2932,7 @@ resume_transaction() {
     rollback_transaction "$previous_id" 'resumed rollback'
 }
 activate_candidate() {
+    if [[ -n "$update_stage" ]]; then update_stage=activation; update_log started; fi
     local candidate_recorder_hash
     recorder_reused=0
     candidate_recorder_hash="$(manifest_record "$generations_dir/$candidate_id/manifest.json" | awk -F $'\t' '{print $4}')" || return 1
@@ -2935,6 +2960,7 @@ activate_candidate() {
     else systemctl_user start --no-block codex-info-rest.service >/dev/null 2>&1 || return 1; fi
 }
 verify_candidate() {
+    if [[ -n "$update_stage" ]]; then update_stage=readiness; update_log started; fi
     verify_local_generation; [[ "$(current_generation)" == "$candidate_id" ]] || safe_blocked 'candidate is not current'
     if [[ "$desired_state" == running && "$TRIGGER" != startup ]]; then wait_runtime_ready; fi
 }
@@ -3017,6 +3043,8 @@ perform_install() {
 }
 update_failure_with_fallback() {
     local reason="$1" current_id startup_id fallback_ok=0
+    if [[ "$reason" == *GENERATION_PRUNE_FAILED* ]]; then update_stage=cleanup; fi
+    update_log failed "$reason"
     current_id="$(current_generation 2>/dev/null || true)"
     if [[ -n "$update_root" && -d "$update_root" && ! -L "$update_root" ]]; then
         rm -r -- "$update_root"
@@ -3083,6 +3111,8 @@ reconcile_recorder_override() {
 }
 run_update() {
     local start update_deadline releases selection info local_coherent=0 discovery_limit
+    update_stage=start; update_log started
+    rm -f -- "$update_failure_file"
     [[ ! -f "$transaction" ]] || resume_transaction
     start="$(now_unix)" || safe_blocked 'update clock is unavailable'; [[ "$TRIGGER" == timer ]] && update_deadline=$((start+TIMER_TIMEOUT)) || update_deadline=$((start+MANUAL_TIMEOUT))
     if (( operation_deadline > 0 && operation_deadline < update_deadline )); then
@@ -3121,6 +3151,7 @@ run_update() {
     fi
     verify_local_generation >/dev/null 2>&1 && local_coherent=1 || true
     update_root="$(mktemp -d "${TMPDIR:-/tmp}/codex-info-update.XXXXXX")"; releases="$update_root/releases.json"; selection="$update_root/selection"
+    update_target="$installed_version"; update_stage=discovery; update_log started
     command -v "$CURL_BIN" >/dev/null 2>&1 || update_failure_with_fallback "$CURL_BIN is required"
     discovery_limit=30
     if (( operation_deadline > 0 )); then discovery_limit="$(deadline_timeout 30)" || update_failure_with_fallback 'update overall timeout exceeded before discovery'; fi
@@ -3131,6 +3162,7 @@ run_update() {
         update_failure_with_fallback 'release selection failed'
     fi
     local state newest; IFS=$'\t' read -r state newest < "$selection"
+    update_target="$newest"; update_stage=selection; update_log succeeded
     if [[ "$state" == no-update ]]; then
         verify_local_generation || safe_blocked 'no-update local generation is incoherent'
         reconcile_recorder_override "$current_id"
@@ -3139,7 +3171,7 @@ run_update() {
                 retire_known_unmanaged 0
                 if [[ "$TRIGGER" == startup ]]; then
                     converge_enable_links || safe_blocked 'startup enable links could not be recovered'
-                    rm -r -- "$update_root"; update_root=; ((QUIET)) || printf 'no update current=%s newest=%s\n' "$installed_version" "$newest"; return
+                    rm -r -- "$update_root"; update_root=; update_log no-update; ((QUIET)) || printf 'no update current=%s newest=%s\n' "$installed_version" "$newest"; return
                 fi
                 reset_failed_main || safe_blocked 'could not reset failed managed service'
                 enable_managed_unit codex-info-recorder.service || safe_blocked 'could not enable recorder service'
@@ -3162,34 +3194,38 @@ run_update() {
                 update_failure_with_fallback 'GENERATION_PRUNE_FAILED after verified no-update'
             fi
         fi
-        rm -r -- "$update_root"; update_root=; ((QUIET)) || printf 'no update current=%s newest=%s\n' "$installed_version" "$newest"; return
+        rm -r -- "$update_root"; update_root=; update_log no-update; ((QUIET)) || printf 'no update current=%s newest=%s\n' "$installed_version" "$newest"; return
     fi
     [[ "$state" == update ]] || die 'release selection returned unknown state'
     (( $(now_unix) <= update_deadline )) || update_failure_with_fallback 'update overall timeout exceeded before download'
     local archive_name archive_url archive_digest
     IFS=$'\t' read -r archive_name archive_url archive_digest < <(sed -n '2p' "$selection")
     local archive_path="$update_root/$archive_name" manifest_path="$update_root/manifest.json"
+    update_stage=download; update_log started
     download_asset "$archive_url" "$archive_path" "$archive_digest" || update_failure_with_fallback 'release archive download failed'
     extract_bundle_manifest "$archive_path" "$manifest_path" || update_failure_with_fallback 'release archive manifest is unavailable'
     (( $(now_unix) <= update_deadline )) || update_failure_with_fallback 'update overall timeout exceeded before candidate installation'
     local child_limit
     child_limit="$(deadline_timeout "$MANUAL_TIMEOUT")" || update_failure_with_fallback 'update overall timeout exceeded before candidate installation'
     local child_status=0
+    update_stage=install; update_log started
     local -a migration_options=()
     if (( migrate_recorder_override )); then migration_options=(--migrate-recorder-override); fi
     if CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
         CODEX_INFO_RELEASE_DIGEST_VERIFIED=1 \
+        CODEX_INFO_UPDATE_TARGET="$newest" \
         timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" "${migration_options[@]}"; then
         child_status=0
     else
         child_status="$?"
         if [[ "$child_status" == 73 ]]; then
+            update_stage=cleanup
             update_failure_with_fallback 'candidate committed but GENERATION_PRUNE_FAILED'
         fi
-        update_failure_with_fallback 'candidate installation failed'
+        update_failure_with_fallback "$(cat -- "$update_failure_file" 2>/dev/null || printf 'candidate installation failed')"
     fi
     (( $(now_unix) <= update_deadline )) || update_failure_with_fallback 'update overall timeout exceeded after candidate installation'
-    rm -r -- "$update_root"; update_root=; ((QUIET)) || printf 'updated from=%s to=%s\n' "$installed_version" "$newest"
+    rm -r -- "$update_root"; update_root=; update_stage=complete; update_log succeeded; ((QUIET)) || printf 'updated from=%s to=%s\n' "$installed_version" "$newest"
 }
 select_release() {
     local release="$1" current="$2" local_coherent="${3:-0}"

@@ -1,5 +1,6 @@
 <!-- codex-info-requirement-owner: UX -->
 <!-- codex-info-master-ids:
+RUNTIME-SETTINGS-481
 CUM-138-06
 ACCOUNT-UX-134
 WIN-PARITY-RETRY-01
@@ -692,3 +693,7 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
    backend poll中も入力を塞がず、同じ機能結果を確認する。
 
 このゲートは、実装者の「見た目は良い」「動いた」という自己判断を受入証拠の代わりにしない。
+
+## 既存Settingsの稼働バージョン（Issue #481）
+
+`RUNTIME-SETTINGS-481`: Linuxの既存TimeZoneSettingsWindowとWindowsの既存Settingsで `RUNTIME-VERSION-481` のRecorder/REST値を別々に表示する。画面を開く際に既存loopback API clientから取得し、Windowsは既存Refresh操作でも更新する。一致、不一致、取得不可を同じ意味で示す。取得に失敗した値をUI自身のversionや前回値で補完せず、取得不可へ戻す。Linuxの既存Settingsは追加3行を収めるため高さ300pxとし、幅・既存の設定操作を維持する。

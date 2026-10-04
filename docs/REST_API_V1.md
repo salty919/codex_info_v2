@@ -2,6 +2,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
 <!-- codex-info-requirement-owner: WIRE -->
 <!-- codex-info-master-ids:
+RUNTIME-VERSION-481
+REST-FAILURE-482
 REST-129
 ACCOUNT-SELECT-134
 WIN-PARITY-WIRE-01
@@ -156,6 +158,7 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、publis
 
 | request | method | result | response / side effect |
 | --- | --- | --- | --- |
+| `/v1/runtime` | `GET` | `200` | 稼働version metadata、共通JSON/no-store header、snapshot pairなし、DB mutation=0 |
 | `/v1/health` | `GET` | `200` | JSON health object、required `Content-Type`/`Cache-Control` headers、DB write/transaction=0 |
 | `/v1/details` | `GET` | `200` | current immutable details generation、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
 | `/v2/details` | `GET` | `200` | 同じcurrent immutable generationのprovenance付きprojection、同じ必須published pair、DB write/transaction=0 |
@@ -505,7 +508,7 @@ connectionをabortし、追加JSONやpartial-success markerを送らない。cli
 ### Request resource contract
 
 製品endpointはHTTP/1.1だけを受け、request targetはorigin-formのexact
-`/health`、`/v1/health`、`/v1/details`、`/v2/details`、`/v3/details`、`/v3/current`、
+`/health`、`/v1/health`、`/v1/runtime`、`/v1/details`、`/v2/details`、`/v3/details`、`/v3/current`、
 `/v3/history/periods`、`/v3/history?period=<opaque>&cursor=<opaque>`、`/v3/threads`である。
 historyのstrict queryを除きpercent decode、path normalization、query、fragment、absolute-form、authority-form、asterisk-formを許可しない。
 
@@ -563,3 +566,12 @@ history全体を取得しない。history cursorはperiod、最後の`(reset_at,
 
 schema-validなdetailsの`state=auth_required|initializing|error,authenticated=false`が上記exact empty契約を満たす場合、
 その同じdetails rootで旧account可視値を空にする。認証開始・確認controlの成功・失敗だけではdata rootを変更しない。
+
+## 稼働プロセスのバージョン（Issue #481）
+
+`RUNTIME-VERSION-481`: `GET /v1/runtime` はaccount、DB snapshot、認証状態に依存しない診断メタデータである。HTTP 200のexact keysは `api_version`, `rest_version`, `recorder_version`, `recorder_status`。`api_version` は `v1`、RESTは応答中のprocessにcompileされた配布version、Recorderはfreshな状態公開と同一PID/starttimeの生存processが公開したcompile済みversionである。公開が旧schema・取得不可・失効の場合、Recorder値はnull、statusは `unavailable`。両値が等しければ `available`、異なれば `mismatch` とする。UI版や実行時のmanifestで値を補完しない。
+既存healthの3-key schemaを維持する。runtime応答は共通JSON/no-store headerを持ち、snapshot published-pair headerを持たない。Settingsの表示意味はUX owner `RUNTIME-SETTINGS-481` が所有する。
+
+## REST失敗の診断（Issue #482）
+
+`REST-FAILURE-482`: 全登録routeと共有failure ownerはrequest解析、route/input拒否、snapshot/DB読取り、projection/応答生成、応答書込みの失敗を診断できるようにする。HTTP失敗は既存の固定error code、内部失敗は固定categoryとOS/SQLite error kindを理由として記録する。記録項目はtimestamp、canonical routeまたは固定の未解析/未知route識別子、stage、reason、HTTP status。raw URL/query/body/header、token、credential、account識別子、DB値・例外のraw文言を記録しない。ログ保存・閲覧境界はDATA owner `REST-LOG-RETENTION-482` に従う。

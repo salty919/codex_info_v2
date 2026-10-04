@@ -154,6 +154,13 @@ fn run() -> Result<(), String> {
             )
         }
     };
+    server.store().set_log_data_root(&data_root);
+    let runtime_data_root = data_root.clone();
+    server.store().set_recorder_version_reader(move || {
+        read_recorder_publication_with_version(&runtime_data_root)
+            .ok()
+            .and_then(|(_, version)| version)
+    });
     eprintln!(
         "codex_info_rest: read-only listener={} accounts={} default={}",
         server.local_addr(),
@@ -358,6 +365,12 @@ fn boundary_state_without_catalog(
 }
 
 fn read_recorder_publication(data_root: &Path) -> Result<RecorderPublication, String> {
+    read_recorder_publication_with_version(data_root).map(|(publication, _)| publication)
+}
+
+fn read_recorder_publication_with_version(
+    data_root: &Path,
+) -> Result<(RecorderPublication, Option<String>), String> {
     let path = data_root.join("history/recorder-state.json");
     let metadata = fs::symlink_metadata(&path)
         .map_err(|_| "recorder publication is unavailable".to_owned())?;
@@ -377,7 +390,7 @@ fn read_recorder_publication(data_root: &Path) -> Result<RecorderPublication, St
     let object = value
         .as_object()
         .ok_or_else(|| "recorder publication is not an object".to_owned())?;
-    let expected = BTreeSet::from([
+    let mut expected = BTreeSet::from([
         "schema",
         "pid",
         "process_starttime",
@@ -390,6 +403,9 @@ fn read_recorder_publication(data_root: &Path) -> Result<RecorderPublication, St
         "last_commit_unix",
         "updated_at_unix",
     ]);
+    if object.contains_key("recorder_version") {
+        expected.insert("recorder_version");
+    }
     if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected
         || object.get("schema").and_then(Value::as_str) != Some("codex-info-recorder-state-v1")
         || !object
@@ -420,7 +436,7 @@ fn read_recorder_publication(data_root: &Path) -> Result<RecorderPublication, St
         })
         .ok_or_else(|| "recorder publication is stale".to_owned())?;
     let _ = updated_at;
-    match object.get("write_state").and_then(Value::as_str) {
+    let publication = match object.get("write_state").and_then(Value::as_str) {
         Some("idle_no_account") => {
             for key in [
                 "partition_id_hash",
@@ -469,7 +485,30 @@ fn read_recorder_publication(data_root: &Path) -> Result<RecorderPublication, St
             })
         }
         _ => Err("recorder write state is invalid".to_owned()),
-    }
+    }?;
+    let version = object
+        .get("recorder_version")
+        .and_then(Value::as_str)
+        .filter(|version| codex_info_rest_contract::valid_runtime_version(version))
+        .filter(|_| recorder_process_is_live(object))
+        .map(str::to_owned);
+    Ok((publication, version))
+}
+
+fn recorder_process_is_live(object: &serde_json::Map<String, Value>) -> bool {
+    let Some(pid) = object.get("pid").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, tail)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let fields = tail.split_whitespace().collect::<Vec<_>>();
+    !matches!(fields.first().copied(), None | Some("Z" | "X"))
+        && fields.get(19).and_then(|value| value.parse::<u64>().ok())
+            == object.get("process_starttime").and_then(Value::as_u64)
 }
 
 fn valid_lower_hex(value: &str, length: usize) -> bool {
@@ -579,6 +618,7 @@ mod tests {
 
         write_state(serde_json::json!({
             "schema": "codex-info-recorder-state-v1",
+            "recorder_version": "9.8.7",
             "pid": 1,
             "process_starttime": 1,
             "owner_nonce": "11111111111111111111111111111111",
