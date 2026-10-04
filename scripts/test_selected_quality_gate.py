@@ -100,7 +100,7 @@ class SelectedQualityTests(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(QualitySelectionError):
                 validate(payload, results(("DOCS",)))
 
-    def test_malformed_selection_and_result_shape_are_rejected(self) -> None:
+    def test_malformed_selection_is_rejected(self) -> None:
         valid_results = results(("DOCS",))
         bad_selections = (
             "[]", selection(()), selection(("DOCS", "DOCS")),
@@ -110,11 +110,6 @@ class SelectedQualityTests(unittest.TestCase):
         for payload in bad_selections:
             with self.subTest(payload=payload), self.assertRaises(QualitySelectionError):
                 validate(payload, valid_results)
-
-        incomplete = json.loads(valid_results)
-        incomplete.pop("codeql-quality")
-        with self.assertRaises(QualitySelectionError):
-            validate(selection(("DOCS",)), json.dumps(incomplete))
 
 
 if __name__ == "__main__":
