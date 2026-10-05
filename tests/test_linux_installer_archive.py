@@ -261,6 +261,22 @@ class ArchiveStageTests(unittest.TestCase):
         self.assertIn("run attempt", result.stderr)
         self.assert_predecessor()
 
+    def assert_beta_install_is_refused(self, *, release=False):
+        self.seed(version="1.0.110-beta.7.1")
+        result = self.run_source(step="install", release=release)
+        trace_path = self.home / "mutations"
+        trace = trace_path.read_text() if trace_path.exists() else ""
+        self.assertFalse(trace_path.exists(), "beta install reached mutation callbacks: " + trace)
+        self.assert_predecessor()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("beta bundle installation is not supported", result.stderr)
+
+    def test_manual_beta_install_refuses_before_predecessor_mutation(self):
+        self.assert_beta_install_is_refused()
+
+    def test_digest_beta_install_refuses_before_predecessor_mutation(self):
+        self.assert_beta_install_is_refused(release=True)
+
     def test_correct_canonical_bundle_has_exact_bytes_and_modes(self):
         self.seed()
         self.assert_stage(self.run_source())

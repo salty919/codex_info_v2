@@ -3401,6 +3401,8 @@ perform_install() {
         die 'candidate staging failed before mutation'
     check_glibc_compatibility "$candidate_stage/manifest.json" || die 'candidate glibc compatibility check failed'
     IFS=$'\t' read -r bundle_version source_hash manifest_hash binary_hash <<<"$validation"
+    # Private staging accepts beta identities; normal beta installation is not implemented.
+    [[ "$bundle_version" != *-beta.* ]] || die 'beta bundle installation is not supported'
     candidate_id="$bundle_version-$source_hash-$manifest_hash"; previous_id="$(current_generation)"; operation_id="$(new_operation_id)"
     previous_flat=0; previous_combined=0; legacy_combined_generation=0; legacy_combined_prestate=; legacy_recovery_reader_hash=; recorder_reused=0
     journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""; legacy_combined_prestate=; legacy_recovery_reader_hash=
