@@ -17,6 +17,47 @@ public sealed class LoopbackStatusClientTests
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
     [Fact]
+    public async Task BetaHealthAndRuntimePreserveProductAndProcessVersions()
+    {
+        using var health = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(HealthJson("1.0.110-beta.7.1"), includePublishedPair: false)));
+        var healthy = await health.FetchHealthAsync(CancellationToken.None);
+        Assert.True(healthy.IsSuccess);
+        Assert.Equal("1.0.110-beta.7.1", healthy.Snapshot!.ProductVersion);
+        foreach (var (rest, recorder, status) in new (string, string?, string)[]
+        {
+            ("1.0.110-beta.7.1", "1.0.110-beta.7.1", "available"),
+            ("1.0.110-beta.9.1", "1.0.110-beta.10.1", "mismatch"),
+            ("1.0.109", "1.0.110-beta.7.1", "mismatch"),
+            ("1.0.110-beta.7.1", "1.0.109", "mismatch"),
+            ("1.0.110-beta.7.1", null, "unavailable"),
+        })
+        {
+            var recorderJson = recorder is null ? "null" : $"\"{recorder}\"";
+            using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(
+                $$"""{"api_version":"v1","rest_version":"{{rest}}","recorder_version":{{recorderJson}},"recorder_status":"{{status}}"}""",
+                includePublishedPair: false)));
+            var result = await client.FetchRuntimeVersionsAsync(CancellationToken.None);
+            Assert.True(result.IsSuccess);
+            Assert.Equal(rest, result.Snapshot!.RestVersion);
+            Assert.Equal(recorder, result.Snapshot.RecorderVersion);
+            Assert.Equal(status, result.Snapshot.RecorderStatus);
+        }
+        foreach (var invalid in new[]
+        {
+            """{"api_version":"v1","rest_version":"1.0.110-beta.7.1","recorder_version":"1.0.110-beta.8.1","recorder_status":"available"}""",
+            """{"api_version":"v1","rest_version":"1.0.110-beta.7.1","recorder_version":null,"recorder_status":"available"}""",
+            """{"api_version":"v1","rest_version":"1.0.110-beta.7.1","recorder_version":"1.0.110-beta.07.1","recorder_status":"mismatch"}""",
+        })
+        {
+            using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(invalid, includePublishedPair: false)));
+            var result = await client.FetchRuntimeVersionsAsync(CancellationToken.None);
+            Assert.False(result.IsSuccess);
+            Assert.Null(result.Snapshot);
+        }
+    }
+
+    [Fact]
     public async Task Issue481RuntimeVersionsKeepSeparateProcessesAndUnavailableState()
     {
         using var client = new LoopbackStatusClient(new StubHandler(request =>
@@ -1247,6 +1288,10 @@ public sealed class LoopbackStatusClientTests
     [InlineData("1.0")]
     [InlineData("01.0.0")]
     [InlineData("1.0.0-mismatch")]
+    [InlineData("1.0.110-beta.0.1")]
+    [InlineData("1.0.110-beta.07.1")]
+    [InlineData("1.0.110-beta.7.01")]
+    [InlineData("1.0.110-beta.7.1+sha")]
     public async Task HealthRejectsMalformedProductVersion(string productVersion)
     {
         var result = await FetchHealth(HealthJson(productVersion));
