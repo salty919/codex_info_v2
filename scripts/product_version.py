@@ -608,7 +608,8 @@ def stamp_beta(
     if any(_local_name(node.tag) in metadata for node in tree.iter()):
         raise ProductVersionError("snapshot contains explicit assembly metadata; stamping would be ambiguous")
     match = _PROPS_VERSION_ELEMENT.search(text)
-    assert match is not None  # located by the source parser before replacement
+    if match is None:
+        raise ProductVersionError(f"{props.path}: Version element could not be located for beta stamping")
     newline = "\r\n" if "\r\n" in text else "\n"
     line_start = text.rfind("\n", 0, match.start()) + 1
     indentation = text[line_start:match.start()]
