@@ -101,6 +101,17 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public string CurrentEndpoint => Texts.ConnectionEndpoint;
     public string StatusTitle => main?.StatusTitle ?? Texts.Unavailable;
     public string StatusDetail => saveFailed ? Texts.SettingsSaveFailed : main?.StatusDetail ?? Texts.UnavailableDetails;
+    public ReadOnlyObservableCollection<ApiAccount>? Accounts => main?.Accounts;
+    public bool HasAccounts => main?.HasAccounts == true;
+    public ApiAccount? SelectedAccount
+    {
+        get => main?.SelectedAccount;
+        set
+        {
+            if (value is not null) main?.SelectAccount(value.Id);
+        }
+    }
+    public string SelectedAccountText => main?.SelectedAccountText ?? Texts.UnavailableValue;
     public bool SaveFailed => saveFailed;
     public bool CanAuthenticate => main?.IsAuthRequired == true;
     public string RestVersion => runtimeVersions?.RestVersion ?? Texts.UnavailableValue;
@@ -179,6 +190,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Notify(nameof(RuntimeVersionStatus));
         Notify(nameof(Texts));
         Notify(nameof(CurrentEndpoint));
+        Notify(nameof(SelectedAccountText));
         Notify(nameof(SelectedTimeZone));
         Notify(nameof(TimeZoneOptions));
         Notify(nameof(ThemeOptions));
@@ -190,6 +202,15 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
     {
+        if (eventArgs.PropertyName is nameof(MainWindowViewModel.Accounts) or
+            nameof(MainWindowViewModel.HasAccounts) or nameof(MainWindowViewModel.SelectedAccount) or
+            nameof(MainWindowViewModel.SelectedAccountText))
+        {
+            Notify(nameof(Accounts));
+            Notify(nameof(HasAccounts));
+            Notify(nameof(SelectedAccount));
+            Notify(nameof(SelectedAccountText));
+        }
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.StatusTitle) or nameof(MainWindowViewModel.StatusDetail) or nameof(MainWindowViewModel.IsAuthRequired))
         {
             Notify(nameof(StatusTitle)); Notify(nameof(StatusDetail)); Notify(nameof(CanAuthenticate));

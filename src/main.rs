@@ -851,7 +851,7 @@ const GRAPH_WINDOW_HEIGHT: u32 = 640;
 const LEGAL_WINDOW_WIDTH: u32 = 720;
 const LEGAL_WINDOW_HEIGHT: u32 = 520;
 const SETTINGS_WINDOW_WIDTH: u32 = 440;
-const SETTINGS_WINDOW_HEIGHT: u32 = 300;
+const SETTINGS_WINDOW_HEIGHT: u32 = 356;
 const UNAUTHENTICATED_WINDOW_TITLE: &str = "アカウント未接続 — プラン未設定";
 // Keep the native title-bar purpose suffix ASCII: some X11 window managers
 // render `_NET_WM_NAME` with a fallback font that turns Japanese glyphs into
@@ -15025,7 +15025,7 @@ impl CodexInfoState {
             && self.checking
     }
 
-    fn selected_account_index(&self) -> usize {
+    fn selected_account_index(&self) -> i32 {
         self.service_selected_account_id
             .as_deref()
             .and_then(|selected| {
@@ -15033,7 +15033,8 @@ impl CodexInfoState {
                     .iter()
                     .position(|account| account.id == selected)
             })
-            .unwrap_or(0)
+            .and_then(|index| i32::try_from(index).ok())
+            .unwrap_or(-1)
     }
 
     fn select_account_label(&mut self, label: &str) -> bool {
@@ -18513,6 +18514,28 @@ impl CodexInfoState {
     }
 }
 
+fn sync_settings_accounts(state: &CodexInfoState, window: &TimeZoneSettingsWindow) {
+    let options = state
+        .main_account_options()
+        .into_iter()
+        .map(|(label, current)| MainAccountOption {
+            label: label.into(),
+            current,
+        })
+        .collect::<Vec<_>>();
+    let previous = window.get_account_options();
+    // Keep the same popup model while only the visible resources are refreshed.
+    if previous.row_count() != options.len()
+        || previous
+            .iter()
+            .zip(&options)
+            .any(|(old, new)| old.label != new.label || old.current != new.current)
+    {
+        window.set_account_options(slint::ModelRc::new(slint::VecModel::from(options)));
+    }
+    window.set_selected_account_index(state.selected_account_index());
+}
+
 fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     graph.set_strings(ui_strings(&state.i18n));
     graph.set_history_loading(
@@ -18565,17 +18588,6 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
             })
             .collect::<Vec<_>>(),
     )));
-    let account_options = state.account_selector_options();
-    graph.set_account_options(slint::ModelRc::new(slint::VecModel::from(
-        account_options
-            .iter()
-            .cloned()
-            .map(slint::SharedString::from)
-            .collect::<Vec<_>>(),
-    )));
-    graph.set_selected_account_index(
-        i32::try_from(state.selected_account_index()).unwrap_or(i32::MAX),
-    );
     let history_period_options = state.history_period_options();
     graph.set_has_history_options(
         !history_period_options.is_empty()
@@ -19858,19 +19870,6 @@ impl CodexInfoState {
         ui.set_authenticated(self.authenticated);
         ui.set_historical_account(historical_account);
         ui.set_account_view_loading(account_view_loading);
-        let account_options = self.main_account_options();
-        ui.set_account_options(slint::ModelRc::new(slint::VecModel::from(
-            account_options
-                .into_iter()
-                .map(|(label, current)| MainAccountOption {
-                    label: label.into(),
-                    current,
-                })
-                .collect::<Vec<_>>(),
-        )));
-        ui.set_selected_account_index(
-            i32::try_from(self.selected_account_index()).unwrap_or(i32::MAX),
-        );
         ui.set_strings(ui_strings(&self.i18n));
         ui.set_has_usage(self.has_visible_usage());
         ui.set_has_auth_url(self.auth_url.is_some());
@@ -23462,34 +23461,12 @@ fn run_ui(
     }
     {
         let state = Rc::clone(&state);
-        let weak_ui = ui.as_weak();
-        let graph_window = Rc::clone(&graph_window);
-        ui.on_select_account(move |label| {
-            {
-                let mut state = state.borrow_mut();
-                if state.select_account_label(label.as_str()) {
-                    state.request_service_read("アカウントを切り替えています…");
-                }
-            }
-            if let Some(ui) = weak_ui.upgrade() {
-                state.borrow().sync_ui(&ui);
-            }
-            if let Some(graph) = graph_window.borrow().as_ref() {
-                if graph.window().is_visible() {
-                    sync_graph_window(&state.borrow(), graph);
-                }
-            }
-        });
-    }
-    {
-        let state = Rc::clone(&state);
         let graph_window = Rc::clone(&graph_window);
         let graph_maximize_state = Rc::clone(&graph_maximize_state);
         let x11_monitor = Rc::clone(&x11_monitor);
         let graph_old_preview = preview_kind.as_deref() == Some("graph-old");
         let graph_period_preview =
             matches!(preview_kind.as_deref(), Some("graph-period" | "graph-many"));
-        let weak_ui_for_account = ui.as_weak();
         ui.on_open_graph(move || {
             if !graph_old_preview {
                 state.borrow_mut().select_latest_history();
@@ -23625,22 +23602,6 @@ fn run_ui(
                                 sync_graph_window(&state_for_history.borrow(), &graph);
                             }
                         });
-                    });
-                    let weak_graph = graph.as_weak();
-                    let state_for_account = Rc::clone(&state);
-                    let weak_ui = weak_ui_for_account.clone();
-                    graph.on_select_account(move |label| {
-                        if let Some(graph) = weak_graph.upgrade() {
-                            let mut state = state_for_account.borrow_mut();
-                            if state.select_account_label(label.as_str()) {
-                                state.request_service_read("アカウントを切り替えています…");
-                            }
-                            drop(state);
-                            if let Some(ui) = weak_ui.upgrade() {
-                                state_for_account.borrow().sync_ui(&ui);
-                            }
-                            sync_graph_window(&state_for_account.borrow(), &graph);
-                        }
                     });
                     *graph_window = Some(graph);
                 }
@@ -23813,6 +23774,7 @@ fn run_ui(
         let active_time_zone = Rc::clone(&active_time_zone);
         let settings_window = Rc::clone(&settings_window);
         let graph_window = Rc::clone(&graph_window);
+        let threads_window = Rc::clone(&threads_window);
         let weak_ui = ui.as_weak();
         let x11_monitor = Rc::clone(&x11_monitor);
         ui.on_open_settings(move || {
@@ -23860,6 +23822,33 @@ fn run_ui(
                         CloseRequestResponse::HideWindow
                     });
                     let weak_window = window.as_weak();
+                    let state_for_account = Rc::clone(&state);
+                    let graph_for_account = Rc::clone(&graph_window);
+                    let threads_for_account = Rc::clone(&threads_window);
+                    let weak_ui_for_account = weak_ui.clone();
+                    window.on_select_account(move |label| {
+                        let mut state = state_for_account.borrow_mut();
+                        if state.select_account_label(label.as_str()) {
+                            state.request_service_read("アカウントを切り替えています…");
+                        }
+                        if let Some(ui) = weak_ui_for_account.upgrade() {
+                            state.sync_ui(&ui);
+                        }
+                        if let Some(graph) = graph_for_account.borrow().as_ref() {
+                            if graph.window().is_visible() {
+                                sync_graph_window(&state, graph);
+                            }
+                        }
+                        if let Some(window) = threads_for_account.borrow().as_ref() {
+                            if window.window().is_visible() {
+                                sync_threads_window(&state, window);
+                            }
+                        }
+                        if let Some(window) = weak_window.upgrade() {
+                            sync_settings_accounts(&state, &window);
+                        }
+                    });
+                    let weak_window = window.as_weak();
                     let state_for_save = Rc::clone(&state);
                     let store_for_save = Rc::clone(&time_zone_store);
                     let preference_for_save = Rc::clone(&active_time_zone);
@@ -23903,6 +23892,7 @@ fn run_ui(
             }
             if let Some(window) = settings_window.as_ref() {
                 let state_ref = state.borrow();
+                sync_settings_accounts(&state_ref, window);
                 window.set_strings(ui_strings(&state_ref.i18n));
                 window.set_window_title(native_main_labels(&state_ref.i18n).0.into());
                 window.set_time_zone_options(slint::ModelRc::new(slint::VecModel::from(vec![
@@ -24002,6 +23992,7 @@ fn run_ui(
     let weak_ui = ui.as_weak();
     let graph_window_for_timer = Rc::clone(&graph_window);
     let threads_window_for_timer = Rc::clone(&threads_window);
+    let settings_window_for_timer = Rc::clone(&settings_window);
     let timer = Timer::default();
     if !state.borrow().preview {
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
@@ -24047,6 +24038,11 @@ fn run_ui(
                 if let Some(window) = threads_window_for_timer.borrow().as_ref() {
                     if window.window().is_visible() {
                         sync_threads_window(&state, window);
+                    }
+                }
+                if let Some(window) = settings_window_for_timer.borrow().as_ref() {
+                    if window.window().is_visible() {
+                        sync_settings_accounts(&state, window);
                     }
                 }
             }
@@ -24251,7 +24247,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_349_linux_main_source_owns_the_hybrid_layout_and_timezone_only_settings() {
+    fn issue_349_linux_main_source_owns_the_hybrid_layout_and_settings() {
         let app = include_str!("../ui/app.slint");
         let components = include_str!("../ui/components.slint");
         let header = components
@@ -24273,10 +24269,7 @@ mod tests {
             );
         }
         assert!(!header.contains("callback open-threads();"));
-        assert!(
-            header.find("MainAccountSelect {").unwrap()
-                < header.find("root.strings.graph").unwrap()
-        );
+        assert!(!header.contains("MainAccountSelect {"));
         assert!(
             header.find("root.strings.graph").unwrap()
                 < header.find("root.strings.legal-notices").unwrap()
@@ -24390,8 +24383,7 @@ mod tests {
         assert!(header.contains("text: \"◈\";"));
         assert!(header.contains("text: root.strings.product-version;"));
         assert!(!header.contains("period-label"));
-        assert!(header.contains("width: 250px;"));
-        assert!(header.contains("height: 44px;"));
+        assert!(!header.contains("callback select-account(string);"));
         assert!(!header.contains("callback open-threads();"));
         let account_select = component(
             "export component MainAccountSelect inherits Rectangle {",
@@ -25438,43 +25430,60 @@ mod tests {
     }
 
     #[test]
-    fn graph_window_exposes_account_selector_callback_separately_from_history_and_metric() {
-        let source = include_str!("../ui/components.slint");
-        let graph = source
-            .split("export component GraphWindow inherits Window {")
-            .nth(1)
-            .expect("GraphWindow");
-        assert!(graph.contains("in property <[string]> account-options;"));
-        assert!(graph.contains("in property <int> selected-account-index: 0;"));
-        assert!(graph.contains("callback select-account(string);"));
-        assert!(graph.contains("model: root.account-options;"));
-        assert!(graph.contains("empty-label: \"アカウントなし\";"));
-        assert!(graph.contains("selected(value) => { root.select-account(value); }"));
-    }
-
-    #[test]
-    fn main_window_exposes_the_main_only_account_marker_contract() {
+    fn account_switcher_is_owned_only_by_settings() {
         let app = include_str!("../ui/app.slint");
-        let main = app
-            .split("export component MainWindow inherits Window {")
-            .nth(1)
-            .expect("MainWindow");
-        assert!(main.contains("in property <[MainAccountOption]> account-options;"));
-        assert!(main.contains("in property <int> selected-account-index: 0;"));
-        assert!(main.contains("callback select-account(string);"));
-        assert!(main.contains("account-options: root.account-options;"));
-        assert!(main.contains("select-account(value) => { root.select-account(value); }"));
-
         let components = include_str!("../ui/components.slint");
         let header = components
             .split("export component Header inherits Rectangle {")
             .nth(1)
+            .and_then(|body| body.split("export component RemainingQuota").next())
             .expect("Header");
-        assert!(header.contains("model: root.account-options;"));
-        assert!(header.contains("current-index: root.selected-account-index;"));
-        assert!(header.contains("MainAccountSelect {"));
-        assert!(components.contains("color: #5DC98A;"));
-        assert!(components.contains("visible: value.current;"));
+        let settings = components
+            .split("export component TimeZoneSettingsWindow inherits Window {")
+            .nth(1)
+            .and_then(|body| body.split("component GraphToggle").next())
+            .expect("Settings");
+        let graph = components
+            .split("export component GraphWindow inherits Window {")
+            .nth(1)
+            .and_then(|body| body.split("export component ThreadsWindow").next())
+            .expect("Graph");
+        for surface in [app, header, graph] {
+            assert!(!surface.contains("callback select-account(string);"));
+            assert!(!surface.contains("model: root.account-options;"));
+        }
+        assert_eq!(settings.matches("MainAccountSelect {").count(), 1);
+        assert!(settings.contains("in property <[MainAccountOption]> account-options;"));
+        assert!(settings.contains("in property <int> selected-account-index: -1;"));
+        assert!(settings.contains("callback select-account(string);"));
+        assert!(settings.contains("selected(value) => { root.select-account(value); }"));
+        let production = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("production source")
+            .0;
+        assert!(!production.contains("ui.on_select_account("));
+        assert!(!production.contains("graph.on_select_account("));
+        assert!(production.contains("window.on_select_account("));
+        assert!(production.contains("sync_settings_accounts(&state, window)"));
+    }
+
+    #[test]
+    fn settings_account_selection_has_no_implicit_history_default() {
+        let directory = super::parse_service_accounts_v3_document(
+            br#"{
+            "api_version":"v3",
+            "default_account_id":null,
+            "accounts":[{"id":"account-13","is_current":false,
+                "activation_at":null,"deactivation_at":null}]
+        }"#,
+        )
+        .expect("valid logged-out directory");
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_accounts(directory)
+            .expect("directory admitted");
+        assert!(state.service_selected_account_id.is_none());
+        assert_eq!(state.selected_account_index(), -1);
     }
 
     use super::{

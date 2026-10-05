@@ -73,8 +73,7 @@ public partial class GraphWindow : Window
         }
 
         if (IsWithin(eventArgs.Source, PeriodSelector) ||
-            IsWithin(eventArgs.Source, MetricSelector) ||
-            IsWithin(eventArgs.Source, AccountSelector))
+            IsWithin(eventArgs.Source, MetricSelector))
         {
             return;
         }
@@ -106,7 +105,6 @@ public partial class GraphWindow : Window
     {
         PeriodSelector.Close();
         MetricSelector.Close();
-        AccountSelector.Close();
     }
 
     private static bool IsWithin(object? source, Visual ancestor)
