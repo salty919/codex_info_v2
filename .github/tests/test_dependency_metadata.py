@@ -184,6 +184,69 @@ class DependencyMetadataTests(unittest.TestCase):
             with self.subTest(step=index):
                 self.assertEqual(refs[index], expected)
 
+    def test_codeql_workflow_uses_verified_action_commits(self):
+        job = self.workflow("codeql.yml")["jobs"]["analyze"]
+        refs = [step["uses"] for step in job["steps"] if "uses" in step]
+        expected = (
+            "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+            "github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
+            "github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
+        )
+        self.assertEqual(len(refs), len(expected))
+        for index, reference in enumerate(expected):
+            with self.subTest(step=index):
+                self.assertEqual(refs[index], reference)
+
+    def test_codeql_checkout_requires_same_repository_context(self):
+        condition = self.workflow("codeql.yml")["jobs"]["analyze"].get("if")
+        required = "github.event.pull_request.head.repo.full_name == github.repository"
+        cases = (
+            ("same repository", {"repository": "salty919/codex_info_v2", "event": {
+                "pull_request": {"head": {"repo": {"full_name": "salty919/codex_info_v2"}}}
+            }}, True),
+            ("fork repository", {"repository": "salty919/codex_info_v2", "event": {
+                "pull_request": {"head": {"repo": {"full_name": "contributor/codex_info_v2"}}}
+            }}, False),
+            ("missing PR context", {"repository": "salty919/codex_info_v2", "event": {}}, False),
+        )
+        for name, github, expected in cases:
+            with self.subTest(context=name):
+                if condition is None:
+                    admitted = True  # A missing job condition is unconditional.
+                else:
+                    self.assertEqual(condition, required)
+                    operands = []
+                    for operand in condition.split(" == "):
+                        value = {"github": github}
+                        for property_name in operand.split("."):
+                            value = value.get(property_name, "") if isinstance(value, dict) else ""
+                        operands.append(value.casefold())
+                    admitted = operands[0] == operands[1]
+                self.assertEqual(admitted, expected)
+
+    def test_codeql_pins_are_accepted_by_existing_workflow_consumers(self):
+        pinned = (ROOT / ".github/workflows/codeql.yml").read_text()
+        for mutable, immutable in (
+            ("actions/checkout@v5", "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"),
+            ("github/codeql-action/init@v4", "github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2"),
+            ("github/codeql-action/analyze@v4", "github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2"),
+        ):
+            pinned = pinned.replace(mutable, immutable)
+        for consumer in ("test_codeql_workflow", "workflow_quality_gate"):
+            with self.subTest(consumer=consumer):
+                path = ROOT / "scripts" / (consumer + ".py")
+                spec = importlib.util.spec_from_file_location(consumer, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                if consumer == "test_codeql_workflow":
+                    with mock.patch.object(module, "CODEQL") as codeql, mock.patch("builtins.print"):
+                        codeql.read_text.return_value = pinned
+                        self.assertEqual(module.main(), 0)
+                else:
+                    workflows = module.sources()
+                    workflows["codeql.yml"] = pinned
+                    self.assertEqual(module._semantic_workflow_errors(workflows), [])
+
     def test_metadata_workflow_is_read_only_and_propagates_failure(self):
         data = self.workflow("dependency-metadata.yml")
         events = data.get("on", data.get(True))

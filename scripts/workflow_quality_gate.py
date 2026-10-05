@@ -450,6 +450,11 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "head_ref": "${{ inputs.head_ref }}",
             "languages_json": "${{ toJSON(fromJSON(inputs.selection_json).codeql_languages) }}",
         })
+        expect(
+            "codeql.analyze.if",
+            _job(docs["codeql.yml"], "analyze").get("if"),
+            "github.event.pull_request.head.repo.full_name == github.repository",
+        )
         for document, job_id in (
             (selective, "docs-quality"),
             (selective, "governance-quality"),
@@ -461,7 +466,12 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         ):
             leaf_job = _job(document, job_id)
             expect(f"{job_id}.continue-on-error", leaf_job.get("continue-on-error"), None)
-            leaf_checkout = _step(leaf_job, uses="actions/checkout@v5")
+            checkout_ref = (
+                "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
+                if document is docs["codeql.yml"]
+                else "actions/checkout@v5"
+            )
+            leaf_checkout = _step(leaf_job, uses=checkout_ref)
             mapping(f"{job_id}.checkout", leaf_checkout.get("with"), {
                 "ref": "${{ inputs.source_sha }}"
             })
