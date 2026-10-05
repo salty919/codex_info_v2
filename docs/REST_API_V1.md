@@ -420,7 +420,7 @@ lineage、load profileは`DATA_PROTECTION_POLICY.md` §8を正本とする。本
 
 `GET /v1/health`の200 bodyはUTF-8 JSON objectでexact key集合を
 `api_version,service,product_version`、値を`api_version="v1"`、`service="codex-info"`、
-`product_version`をstable `X.Y.Z`形式へ固定する。unknown、missing、malformed、duplicate、
+`product_version`のcanonical stable/beta値はPRODUCT ownerの`VER-BETA-BUILD-CORE-467`に従う。unknown、missing、malformed、duplicate、
 case-altered key、control/bidi、trailing non-whitespace、depth追加を拒否する。client自身と異なる有効な
 product versionは診断情報として保持し、details取得を妨げない。transfer-decoded bodyは1 KiB以下である。旧2-key healthはLinux launcherが同一profileの検証済み
 ownerを更新するためだけに識別し、そのserviceのdetailsは表示へ受理しない。

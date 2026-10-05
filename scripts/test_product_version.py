@@ -454,5 +454,120 @@ class BetaIdentityFixtures(unittest.TestCase):
         )
 
 
+class BetaStampFixtures(unittest.TestCase):
+    def use_fixture(self) -> VersionFixture:
+        fixture = VersionFixture("1.0.119")
+        self.addCleanup(fixture.close)
+        return fixture
+
+    def run_stamp(self, fixture: VersionFixture, **overrides: str) -> subprocess.CompletedProcess[str]:
+        values = {
+            "snapshot": fixture.directory.name,
+            "expected-source-version": "1.0.119",
+            "source-sha": "a" * 40,
+            "stable-version": "1.0.109",
+            "run-number": "7",
+            "run-attempt": "1",
+        }
+        values.update(overrides)
+        arguments = [sys.executable, str(SCRIPT), "stamp-beta"]
+        for option, value in values.items():
+            arguments.extend([f"--{option}", value])
+        return subprocess.run(arguments, text=True, capture_output=True, check=False)
+
+    def test_stamp_beta_binds_full_version_and_source_in_snapshot(self) -> None:
+        fixture = self.use_fixture()
+        before = fixture.snapshot()
+        result = self.run_stamp(fixture)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout,
+                         "version=1.0.110-beta.7.1\n"
+                         "source_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+                         "synchronized=true\n")
+        for path in (fixture.paths.cargo_toml, fixture.paths.cargo_lock):
+            self.assertEqual(path.read_bytes(), before[path].replace(b"1.0.119", b"1.0.110-beta.7.1", 1))
+        props = fixture.paths.windows_props.read_text()
+        for literal in (
+            "<Version>1.0.110-beta.7.1</Version>",
+            "<AssemblyVersion>1.0.110.0</AssemblyVersion>",
+            "<FileVersion>1.0.110.0</FileVersion>",
+            "<InformationalVersion>1.0.110-beta.7.1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</InformationalVersion>",
+            "<IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>",
+            "<Deterministic>true</Deterministic>",
+        ):
+            self.assertIn(literal, props)
+        self.assertIn(b'name = "serde"\nversion = "1.0.0"', fixture.paths.cargo_lock.read_bytes())
+        # Stable release commands remain strict after the isolated beta stamp.
+        for command in ("check", "bump"):
+            after = fixture.snapshot()
+            rejected = run_cli(fixture, command, "1.0.119")
+            self.assertEqual(rejected.returncode, 1, rejected.stderr)
+            self.assertEqual(after, fixture.snapshot())
+
+    def test_stamp_invalid_identity_expected_and_numeric_inputs_do_not_write(self) -> None:
+        fixture = self.use_fixture()
+        before = fixture.snapshot()
+        entries = sorted(Path(fixture.directory.name).rglob("*"))
+        for overrides in (
+            {"expected-source-version": "1.0.118"},
+            {"source-sha": "not-a-source-sha"},
+            {"stable-version": "1.0.65534"},
+            {"run-number": "9" * 32},
+        ):
+            with self.subTest(overrides=overrides):
+                result = self.run_stamp(fixture, **overrides)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(before, fixture.snapshot())
+                self.assertEqual(entries, sorted(Path(fixture.directory.name).rglob("*")))
+
+    def test_stamp_rejects_inconsistent_source_and_existing_metadata(self) -> None:
+        for change in ("version", "metadata"):
+            with self.subTest(change=change):
+                fixture = self.use_fixture()
+                props = fixture.paths.windows_props.read_text()
+                props = (props.replace("1.0.119", "1.0.118") if change == "version" else
+                         props.replace("<Deterministic>", "<AssemblyVersion>1.0.119.0</AssemblyVersion>\n    <Deterministic>"))
+                fixture.paths.windows_props.write_text(props)
+                before = fixture.snapshot()
+                result = self.run_stamp(fixture)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(before, fixture.snapshot())
+
+    def test_stamp_checkout_and_symlink_are_not_snapshots(self) -> None:
+        fixture = self.use_fixture()
+        root = Path(fixture.directory.name)
+        (root / ".git").write_text("gitdir: /not-a-build-snapshot\n")
+        before = fixture.snapshot()
+        result = self.run_stamp(fixture)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(before, fixture.snapshot())
+        (root / ".git").unlink()
+        link = root / "snapshot-link"
+        link.symlink_to(root, target_is_directory=True)
+        result = self.run_stamp(fixture, snapshot=str(link))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(before, fixture.snapshot())
+
+    def test_stamp_replacement_failure_restores_all_source_bytes(self) -> None:
+        fixture = self.use_fixture()
+        before = fixture.snapshot()
+        real_replace = product_version.os.replace
+        calls = 0
+
+        def fail_third_replace(source: Path, destination: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError("fixture beta replacement failure")
+            real_replace(source, destination)
+
+        with mock.patch.object(product_version.os, "replace", side_effect=fail_third_replace):
+            with self.assertRaisesRegex(OSError, "fixture beta replacement failure"):
+                product_version.stamp_beta(Path(fixture.directory.name), "1.0.119", "a" * 40, "1.0.109", "7", "1")
+        self.assertEqual(before, fixture.snapshot())
+        self.assertEqual(list(Path(fixture.directory.name).rglob(".*")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
