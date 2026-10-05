@@ -53,7 +53,7 @@ jobs:
           candidate_prefix='release-candidate'
           windows_candidate_re='^release-candidate-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
           linux_candidate_re='^release-candidate-linux-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
-          generated_re='^chore: prepare version (?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\n\nCodex-Version-Prepare-Schema: v1\nCodex-Version-Prepare-PR: (?<pr>[1-9][0-9]*)\nCodex-Version-Prepare-Event-Head: (?<event_head>[0-9a-f]{40})\nCodex-Version-Prepare-Run-ID: (?<run_id>[1-9][0-9]*)\nCodex-Version-Prepare-Run-Attempt: (?<attempt>[1-9][0-9]*)$'
+          generated_re='^chore: prepare version (?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\n\n\nCodex-Version-Prepare-Schema: v1\nCodex-Version-Prepare-PR: (?<pr>[1-9][0-9]*)\nCodex-Version-Prepare-Event-Head: (?<event_head>[0-9a-f]{40})\nCodex-Version-Prepare-Run-ID: (?<run_id>[1-9][0-9]*)\nCodex-Version-Prepare-Run-Attempt: (?<attempt>[1-9][0-9]*)\nskip-checks: true$'
           draft_observer='Observe non-authoritative PR event'
           windows_wrapper='Run selected quality owners / windows-quality'
           windows_leaf='Run selected quality owners / windows-quality / windows-quality'
@@ -644,7 +644,7 @@ jobs:
           candidate_prefix='release-candidate'
           windows_candidate_re='^release-candidate-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
           linux_candidate_re='^release-candidate-linux-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
-          generated_re='^chore: prepare version (?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\n\nCodex-Version-Prepare-Schema: v1\nCodex-Version-Prepare-PR: (?<pr>[1-9][0-9]*)\nCodex-Version-Prepare-Event-Head: (?<event_head>[0-9a-f]{40})\nCodex-Version-Prepare-Run-ID: (?<run_id>[1-9][0-9]*)\nCodex-Version-Prepare-Run-Attempt: (?<attempt>[1-9][0-9]*)$'
+          generated_re='^chore: prepare version (?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\n\n\nCodex-Version-Prepare-Schema: v1\nCodex-Version-Prepare-PR: (?<pr>[1-9][0-9]*)\nCodex-Version-Prepare-Event-Head: (?<event_head>[0-9a-f]{40})\nCodex-Version-Prepare-Run-ID: (?<run_id>[1-9][0-9]*)\nCodex-Version-Prepare-Run-Attempt: (?<attempt>[1-9][0-9]*)\nskip-checks: true$'
           linux_wrapper='Run selected quality owners / linux-distribution'
           linux_leaf='Run selected quality owners / linux-distribution / linux-distribution'
 
