@@ -2659,6 +2659,33 @@ def _release_resolution_tests(release_workflow: str) -> int:
         raise AssertionError("skipped Windows authority with zero candidates was not a no-op")
     cases += 1
 
+    candidate_free_spec = [
+        {
+            "id": 126,
+            "number": 36,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "success",
+                    "candidate": "missing",
+                    "linux": "skipped",
+                    "linux_candidate": "missing",
+                }
+            ],
+        }
+    ]
+    responses, _ = _manual_release_responses(candidate_free_spec)
+    result, values, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode != 0 or values.get("publish") != "false":
+        raise AssertionError(
+            "successful Windows quality without a candidate and skipped Linux "
+            "was not a non-publishing success"
+        )
+    cases += 1
+
     linux_only_spec = [
         {
             "id": 122,
