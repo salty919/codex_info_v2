@@ -47,8 +47,6 @@ export component MainWindow inherits Window {
     // live reset countdown or current-thread panel.
     in-out property <bool> historical-account: false;
     in-out property <bool> account-view-loading: false;
-    in property <[MainAccountOption]> account-options;
-    in property <int> selected-account-index: 0;
     in-out property <string> quota-title;
     in-out property <bool> has-quota-percent: true;
     in-out property <int> active-thread-count: 0;
@@ -98,7 +96,6 @@ export component MainWindow inherits Window {
     callback check-auth();
     callback retry();
     callback open-graph();
-    callback select-account(string);
     callback open-threads();
     callback open-legal-notice();
     callback open-settings();
@@ -143,10 +140,7 @@ export component MainWindow inherits Window {
                 width: root.main-content-width;
                 height: 52px;
                 show-graph: root.authenticated && !root.account-view-loading;
-                account-options: root.account-options;
-                selected-account-index: root.selected-account-index;
                 open-graph => { root.open-graph(); }
-                select-account(value) => { root.select-account(value); }
                 open-legal-notice => { root.open-legal-notice(); }
                 open-settings => { root.open-settings(); }
                 begin-window-drag => { root.begin-window-drag(); }

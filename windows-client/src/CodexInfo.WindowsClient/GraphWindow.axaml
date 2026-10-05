@@ -108,26 +108,6 @@
         </StackPanel>
       </Grid>
 
-      <controls:GraphSelect x:Name="AccountSelector" Grid.Row="1" Margin="0,6,0,0"
-                            FieldLabel="{Binding Texts.Account}" HasFieldLabel="True" ValueMargin="17,0,0,0"
-                            ValueText="{Binding SelectedAccountValueText}"
-                            ItemsSource="{Binding Accounts}" SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
-                            MenuAutomationId="Graph.AccountMenu" PopupWidth="560" MaxVisibleItems="4"
-                            IsEnabled="{Binding HasAccounts}"
-                            AutomationProperties.Name="{Binding Texts.Account}"
-                            AutomationProperties.AutomationId="Graph.AccountSelector"
-                            AutomationProperties.HelpText="{Binding SelectedAccountText}"
-                            ToolTip.Tip="{Binding SelectedAccountText}">
-        <controls:GraphSelect.ItemTemplate>
-          <DataTemplate x:DataType="core:ApiAccount">
-            <TextBlock Text="{Binding MainDisplayLabel}" TextWrapping="Wrap"
-                       ToolTip.Tip="{Binding MainDisplayLabel}"
-                       AutomationProperties.Name="{Binding MainDisplayLabel}"
-                       AutomationProperties.HelpText="{Binding MainDisplayLabel}" />
-          </DataTemplate>
-        </controls:GraphSelect.ItemTemplate>
-      </controls:GraphSelect>
-
       <controls:GraphSelect x:Name="PeriodSelector" Grid.Row="2" Margin="0,12,0,0"
                             FieldLabel="{Binding Texts.PeriodSelectorHeading}" HasFieldLabel="True" ValueMargin="17,0,0,0"
                             ValueText="{Binding SelectedPeriodValueText}"

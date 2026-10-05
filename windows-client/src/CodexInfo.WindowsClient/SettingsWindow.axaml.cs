@@ -4,12 +4,14 @@
 using Avalonia.Controls;
 using Avalonia.Input;
 using CodexInfo.WindowsClient.ViewModels;
+using CodexInfo.WindowsClient.Core;
 
 namespace CodexInfo.WindowsClient;
 
 public partial class SettingsWindow : Window
 {
     private readonly MainWindow? mainWindow;
+    private string? accountSelectionAtOpen;
 
     public SettingsWindow() : this(new SettingsViewModel(App.SettingsStore), null) { }
 
@@ -28,6 +30,34 @@ public partial class SettingsWindow : Window
         {
             WindowDragBehavior.Begin(this, e);
         }
+    }
+
+    private void OnAccountSelectorCheckedChanged(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs)
+    {
+        var open = AccountSelector.IsChecked == true;
+        accountSelectionAtOpen = open
+            ? (DataContext as SettingsViewModel)?.SelectedAccount?.Id
+            : null;
+        SetAccountMenuOpen(open);
+    }
+
+    private void OnAccountSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
+    {
+        if (!AccountMenu.IsEnabled || sender is not ListBox { SelectedItem: ApiAccount selected } ||
+            string.Equals(selected.Id, accountSelectionAtOpen, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        SetAccountMenuOpen(false);
+        AccountSelector.IsChecked = false;
+    }
+
+    private void SetAccountMenuOpen(bool open)
+    {
+        AccountMenu.Opacity = open ? 1 : 0;
+        AccountMenu.IsEnabled = open;
+        AccountMenu.IsHitTestVisible = open;
     }
 
     private void OnSave(object? sender, Avalonia.Interactivity.RoutedEventArgs e)

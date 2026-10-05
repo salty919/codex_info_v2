@@ -3,6 +3,7 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
+        xmlns:core="using:CodexInfo.WindowsClient.Core"
         x:Class="CodexInfo.WindowsClient.SettingsWindow"
         x:DataType="vm:SettingsViewModel"
         Width="900" Height="480" MinWidth="900" MinHeight="480" MaxWidth="900" MaxHeight="480"
@@ -15,13 +16,63 @@
     <Style Selector="Border.surface"><Setter Property="Background" Value="{DynamicResource Theme151F2D}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme2C4258}" /><Setter Property="BorderThickness" Value="1" /><Setter Property="CornerRadius" Value="14" /></Style>
     <Style Selector="Button.primary"><Setter Property="Background" Value="{DynamicResource Theme236B9E}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme61B4EB}" /><Setter Property="Foreground" Value="{DynamicResource ThemeF5FAFF}" /><Setter Property="Padding" Value="16,8" /></Style>
     <Style Selector="Button.secondary"><Setter Property="Background" Value="{DynamicResource Theme1B2A3A}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme36516B}" /><Setter Property="Foreground" Value="{DynamicResource ThemeE9EFF8}" /><Setter Property="Padding" Value="16,8" /></Style>
+    <Style Selector="ToggleButton.account-selector">
+      <Setter Property="Background" Value="{DynamicResource Theme18283A}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme304A63}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeEAF2FB}" />
+      <Setter Property="Padding" Value="10,3" />
+    </Style>
+    <Style Selector="ToggleButton.account-selector:pointerover">
+      <Setter Property="Background" Value="{DynamicResource Theme24415E}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
+    </Style>
   </Window.Styles>
-  <Grid Margin="24" RowDefinitions="Auto,*,Auto" RowSpacing="18">
+  <Grid Margin="24" RowDefinitions="Auto,44,*,Auto" RowSpacing="18">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
       <StackPanel Orientation="Horizontal" Spacing="10"><TextBlock FontSize="20" Text="⚙" Foreground="{DynamicResource Theme71C7FF}" /><StackPanel><TextBlock FontSize="23" FontWeight="SemiBold" Text="{Binding Texts.Settings}" /><TextBlock Classes="label" Text="{Binding Texts.ConnectionEndpoint}" /></StackPanel></StackPanel>
       <Button Grid.Column="1" Background="Transparent" BorderBrush="Transparent" Foreground="{DynamicResource ThemeA8B7CA}" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Settings.Window.Close" Content="×" FontSize="22" ToolTip.Tip="{Binding Texts.Close}" />
     </Grid>
-    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <ToggleButton Grid.Row="1"
+                    Classes="account-selector"
+                    x:Name="AccountSelector"
+                    Width="250"
+                    Height="44"
+                    HorizontalAlignment="Left"
+                    HorizontalContentAlignment="Stretch"
+                    ClickMode="Press"
+                    IsCheckedChanged="OnAccountSelectorCheckedChanged"
+                    IsVisible="{Binding HasAccounts}"
+                    AutomationProperties.Name="{Binding Texts.Account}"
+                    AutomationProperties.AutomationId="Settings.AccountSelector"
+                    AutomationProperties.HelpText="{Binding SelectedAccountText}"
+                    ToolTip.Tip="{Binding SelectedAccountText}">
+        <Grid ColumnDefinitions="18,*,14" ColumnSpacing="0">
+          <TextBlock Width="14"
+                     Foreground="{DynamicResource Theme5DC98A}"
+                     Text="●"
+                     IsVisible="{Binding SelectedAccount.IsCurrent}"
+                     VerticalAlignment="Center"
+                     AutomationProperties.AutomationId="Settings.SelectedAccountCurrentMarker" />
+          <StackPanel Grid.Column="1" Spacing="0" VerticalAlignment="Center">
+            <TextBlock FontSize="9"
+                       Foreground="{DynamicResource Theme56B2F5}"
+                       Text="{Binding Texts.Account}" />
+            <TextBlock FontSize="11"
+                       FontWeight="SemiBold"
+                       Text="{Binding SelectedAccountText}"
+                       TextTrimming="CharacterEllipsis"
+                       TextWrapping="NoWrap" />
+          </StackPanel>
+          <TextBlock Grid.Column="2"
+                     HorizontalAlignment="Center"
+                     VerticalAlignment="Center"
+                     Foreground="{DynamicResource Theme9FB0C5}"
+                     Text="⌄" />
+        </Grid>
+      </ToggleButton>
+    <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <Border Classes="surface" Padding="22">
         <StackPanel Spacing="18">
         <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding Texts.Language}" />
@@ -59,10 +110,53 @@
         </StackPanel>
       </Border>
     </ScrollViewer>
-    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
+    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
       <Button Classes="secondary" Click="OnOpenSetup" AutomationProperties.Name="{Binding Texts.Setup}" ToolTip.Tip="{Binding Texts.Setup}"><TextBlock Text="{Binding Texts.Setup}" /></Button>
       <Button Classes="secondary" Click="OnOpenLegal" AutomationProperties.Name="{Binding Texts.Legal}" ToolTip.Tip="{Binding Texts.Legal}"><TextBlock Text="{Binding Texts.Legal}" /></Button>
       <Button Classes="primary" Click="OnSave" AutomationProperties.Name="{Binding Texts.Save}" ToolTip.Tip="{Binding Texts.Save}"><TextBlock Text="{Binding Texts.Save}" /></Button>
     </StackPanel>
+    <!-- The account list is measured at its final width before it is opened,
+         so opening the list does not move the other settings. -->
+    <Border x:Name="AccountMenu"
+            Grid.Row="1"
+            Grid.RowSpan="3"
+            ZIndex="100"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Top"
+            Margin="0,44,0,0"
+            Opacity="0"
+            IsEnabled="False"
+            IsHitTestVisible="False"
+            Width="560"
+            MaxWidth="560"
+            MaxHeight="320"
+            Padding="4"
+            Background="{DynamicResource Theme1B2838}"
+            BorderBrush="{DynamicResource Theme47769F}"
+            BorderThickness="1"
+            CornerRadius="6">
+      <ListBox ItemsSource="{Binding Accounts}"
+               SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
+               SelectionChanged="OnAccountSelectionChanged"
+               AutomationProperties.AutomationId="Settings.AccountMenu">
+        <ListBox.ItemTemplate>
+          <DataTemplate x:DataType="core:ApiAccount">
+            <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+              <TextBlock Foreground="{DynamicResource Theme5DC98A}"
+                         Text="●"
+                         IsVisible="{Binding IsCurrent}"
+                         VerticalAlignment="Center"
+                         AutomationProperties.AutomationId="Settings.AccountCurrentMarker" />
+              <TextBlock Grid.Column="1"
+                         Text="{Binding MainDisplayLabel}"
+                         TextWrapping="Wrap"
+                         ToolTip.Tip="{Binding MainDisplayLabel}"
+                         AutomationProperties.Name="{Binding MainDisplayLabel}"
+                         AutomationProperties.HelpText="{Binding MainDisplayLabel}" />
+            </Grid>
+          </DataTemplate>
+        </ListBox.ItemTemplate>
+      </ListBox>
+    </Border>
   </Grid>
 </Window>
