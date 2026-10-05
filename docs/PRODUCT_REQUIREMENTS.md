@@ -130,7 +130,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - RESTはread-onlyである。未知route/method、不正header/schema、oversize requestからDB、settings、cursor、processを変更しない。
 - GUIなしserverはwindow、Slint component、display backendを生成せず、明示したservice lifecycleで起動・停止・復旧する。
 - resident serviceは一つの完全candidateからimmutable published generationを公開する。Linux / WindowsのMainは`GET /v3/current`、Graphは`GET /v3/history/periods`と選択期間の`GET /v3/history` page、Threadsは`GET /v3/threads`だけを消費する。各surfaceは任意model配列とmodel-source provenanceを持つstrict validation済みの同一pair page集合だけをatomic表示し、別endpointのfieldを混在させない。履歴差分は前項のprefix証明を満たす場合だけ直前pairのrootを新pairへ更新できる。新resourceを持たない旧serviceが`/v3/current`へexact 404を返す場合だけ、互換用`GET /v3/details`、さらにexact 404の場合だけ`GET /v2/details`、`GET /v1/details`へ一応答ずつfallbackする。timeout、malformed、上限超過、他statusではfallbackしない。SQLite/JSONL/app-serverの再収集、値の再計算、client都合のfield補完を行わない。正確なresource、容量、cursor、頻度および失敗境界は`docs/REST_API_V1.md`を参照する。
-- `GET /health`（`/v1/health`互換）の200はresident serviceがread-only snapshot requestを受理できるreadinessと、Cargo/Windowsの単一authorityから導出したproduct versionを表す。wire値はcanonical stable/betaとする。beta consumerの実装・検証済み範囲は`VER-BETA-BUILD-CORE-467`のWindows Coreに限り、Linux consumerは未完了である。Linux launcherはsystemd `MainPID`、process starttime、実行fileのdevice/inode/SHA-256、profile lock identity、port 8787のsocket inodeとそのPIDのFD対応をhealth取得の前後で同一と確認し、manifestのsource generationへ結合する。PID、listener、health body、versionのいずれか単独ではcurrent ownerと判定しない。既知の旧Codex Info ownerだけを一度交代し、unknown・foreign・malformed ownerはsignalせず30秒以内に`SAFE_BLOCKED`とする。Linux / Windows clientはschema-validな異なるproduct versionを表示・診断情報として保持したままdetails受理へ進み、API互換性はv3 strict validationとexact 404時のv2/v1 fallbackで判定する。version欠落・malformed healthでは進まない。認証済み、data `state=ready`、最新収集成功を意味しない。認証開始・確認はcontrol-onlyであり、control応答を表示dataとしてcommitせず、その後に受理した新しいdetails generationだけが画面を変えられる。
+- `GET /health`（`/v1/health`互換）の200はresident serviceがread-only snapshot requestを受理できるreadinessと、Cargo/Windowsの単一authorityから導出したproduct versionを表す。wire値はcanonical stable/betaとする。beta consumerの実装・直接検証済み範囲は`VER-BETA-BUILD-CORE-467`のWindows CoreとLinux healthに限り、Linux更新比較/installerは未完了である。Linux launcherはsystemd `MainPID`、process starttime、実行fileのdevice/inode/SHA-256、profile lock identity、port 8787のsocket inodeとそのPIDのFD対応をhealth取得の前後で同一と確認し、manifestのsource generationへ結合する。PID、listener、health body、versionのいずれか単独ではcurrent ownerと判定しない。既知の旧Codex Info ownerだけを一度交代し、unknown・foreign・malformed ownerはsignalせず30秒以内に`SAFE_BLOCKED`とする。Linux / Windows clientはschema-validな異なるproduct versionを表示・診断情報として保持したままdetails受理へ進み、API互換性はv3 strict validationとexact 404時のv2/v1 fallbackで判定する。version欠落・malformed healthでは進まない。認証済み、data `state=ready`、最新収集成功を意味しない。認証開始・確認はcontrol-onlyであり、control応答を表示dataとしてcommitせず、その後に受理した新しいdetails generationだけが画面を変えられる。
 
 ## 4. データ保護
 
@@ -205,8 +205,10 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   Windows Coreは一つのcanonical stable/beta modelで数値比較し、`1.0.110-beta.9.1 < 1.0.110-beta.10.1 < 1.0.110`、
   同runのattemptも数値順とする。ProductInfoはInformationalVersionのsource metadataを除いたfull product versionを`v`表示へ渡す。
   Windows Coreのhealthとruntime metadataは同じmodelでcanonical stable/betaを受理し、REST/recorder別processのversion、null/unavailable/mismatch
-  と診断上のversion不一致を保持する。このCore・snapshot契約はpackage/manifest、update channel、Linux parser、公開・実機の
-  成立を表明しない。stable `check/next/bump`は引き続きstableだけを受理する。
+  と診断上のversion不一致を保持する。Linux health consumerも32文字以内のcanonical stable/betaを受理し、
+  beta N/Aは正canonical十進整数とする。HTTP200、api_version、service、strict schemaと診断上のversion不一致を保持する。
+  このconsumer・snapshot契約はpackage全体identity、update channel、Linux更新比較/installer、公開・実機の成立を表明しない。
+  stable `check/next/bump`は引き続きstableだけを受理する。
 - `VER-BETA-LINUX-BUNDLE-467`: Linux local bundle producerはcallerが固定したcanonical stable、または
   32文字以内のcanonical `X.Y.Z-beta.N.A`を受理し、同じfull versionを内部/外部manifest、archive/checksum/sidecar名に保持する。
   betaのN/Aは正canonical十進整数、Aはmanifestのrun_attemptと一致する。source_sha、run_id、既存schemaを保持し、
