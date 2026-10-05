@@ -54,12 +54,45 @@ const ACTIVE_THREAD_INTERVAL: Duration = Duration::from_secs(5);
 const ACTIVE_THREAD_STABLE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
+struct CheckpointRecovery {
+    epoch: Option<AccountEpochProof>,
+    attempted: bool,
+    pending: bool,
+}
+
+impl CheckpointRecovery {
+    fn request(&mut self, epoch: &AccountEpochProof) -> bool {
+        if self.epoch.as_ref() != Some(epoch) {
+            *self = Self {
+                epoch: Some(epoch.clone()),
+                ..Self::default()
+            };
+        }
+        if self.attempted {
+            return false;
+        }
+        self.attempted = true;
+        self.pending = true;
+        true
+    }
+
+    fn begin(&mut self, epoch: &AccountEpochProof) -> bool {
+        if self.epoch.as_ref() != Some(epoch) {
+            *self = Self::default();
+            return false;
+        }
+        std::mem::take(&mut self.pending)
+    }
+}
+
+#[derive(Default)]
 struct AdaptiveThreadCadence {
     epoch: Option<AccountEpochProof>,
     totals: BTreeMap<String, Option<u64>>,
     last_delta: Option<Instant>,
     next_probe: Option<Instant>,
     in_flight: bool,
+    checkpoint_recovery: CheckpointRecovery,
 }
 
 impl AdaptiveThreadCadence {
@@ -68,6 +101,7 @@ impl AdaptiveThreadCadence {
     // baseline; they neither mean zero nor prove unchanged usage.
     fn accept(&mut self, epoch: &AccountEpochProof, snapshot: &ActiveThreadSnapshot, now: Instant) {
         self.in_flight = false;
+        self.checkpoint_recovery = CheckpointRecovery::default();
         let totals: BTreeMap<_, _> = snapshot
             .threads
             .iter()
@@ -100,6 +134,16 @@ impl AdaptiveThreadCadence {
 
     fn failed(&mut self) {
         self.in_flight = false;
+    }
+
+    fn begin_checkpoint_recovery(&mut self, epoch: &AccountEpochProof) -> bool {
+        if !self.checkpoint_recovery.begin(epoch) {
+            return false;
+        }
+        // Re-probe the newly admitted inventory even if an adaptive deadline
+        // was scheduled before the reconciliation request.
+        self.next_probe = None;
+        true
     }
 
     fn submit<Submit>(
@@ -145,6 +189,20 @@ fn sync_acquisition_health(recorder: &mut Recorder, quota: LaneHealth, threads: 
     }
 }
 
+fn reject_checkpoint_recollection(
+    recorder: &mut Recorder,
+    quota_health: LaneHealth,
+    thread_health: &mut LaneHealth,
+    cadence: &mut AdaptiveThreadCadence,
+    next_collection: Instant,
+) {
+    *thread_health = LaneHealth::Failed;
+    sync_acquisition_health(recorder, quota_health, *thread_health);
+    // A failed collection did not establish trusted checkpoints. Do not let
+    // a probe of the old inventory clear the failure before the normal cycle.
+    cadence.next_probe = Some(next_collection);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn commit_thread_poll_result<EpochCheck>(
     result: ActiveThreadPollResult,
@@ -182,6 +240,19 @@ where
                 },
                 epoch,
             ))
+        }
+        ActiveThreadPollResult::CheckpointMismatch => {
+            if cadence.checkpoint_recovery.request(cycle_epoch) {
+                // No new candidate has been admitted yet. Preserve both the
+                // last complete snapshot and its health while the owner runs
+                // one guarded collection, before classifying this as failure.
+                eprintln!("codex-info-recorder active-thread checkpoint reconciliation requested");
+            } else {
+                *thread_health = LaneHealth::Failed;
+                eprintln!("codex-info-recorder active-thread lane degraded: active session checkpoint mismatch after reconciliation");
+                sync_acquisition_health(recorder, quota_health, *thread_health);
+            }
+            None
         }
         ActiveThreadPollResult::Failed(reason) => {
             *thread_health = LaneHealth::Failed;
@@ -336,17 +407,19 @@ where
         &mut *epoch_matches,
     )?;
     if options.once {
+        if cadence.checkpoint_recovery.pending {
+            *thread_health = LaneHealth::Failed;
+            sync_acquisition_health(recorder, quota_health, *thread_health);
+        }
         return Ok(false);
     }
-    let wait = schedule.complete_cycle(clock());
-    if wait.missed_deadlines != 0 {
-        eprintln!(
-            "codex-info-recorder sampling overrun: missed_deadlines={}",
-            wait.missed_deadlines
-        );
+    if cadence.checkpoint_recovery.pending {
+        return Ok(true);
     }
-    if !wait.sleep_for.is_zero() {
-        let deadline = clock() + wait.sleep_for;
+    let now = clock();
+    let remaining = schedule.time_until_deadline(now);
+    if !remaining.is_zero() {
+        let deadline = now + remaining;
         loop {
             let now = clock();
             if now >= deadline {
@@ -398,6 +471,9 @@ where
                         &mut *epoch_matches,
                     )?;
                 }
+                if cadence.checkpoint_recovery.pending {
+                    return Ok(true);
+                }
             } else {
                 // A timeout never means an unchanged or completed probe. A
                 // disconnected worker also must not cause a busy wait.
@@ -407,6 +483,15 @@ where
                 }
             }
         }
+    }
+    // Advance only after a normal wait, but account for work using its finish
+    // time rather than the wake-up time (which can be just past the deadline).
+    let wait = schedule.complete_cycle(now);
+    if wait.missed_deadlines != 0 {
+        eprintln!(
+            "codex-info-recorder sampling overrun: missed_deadlines={}",
+            wait.missed_deadlines
+        );
     }
     Ok(true)
 }
@@ -553,6 +638,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !recorder_epoch_matches(&options, &cycle_epoch) {
             return Err(RecorderError::AccountBoundaryChanged.into());
         }
+        let early_recollection = if thread_cadence.checkpoint_recovery.pending {
+            if !thread_cadence.begin_checkpoint_recovery(&cycle_epoch) {
+                std::thread::sleep(schedule.time_until_deadline(Instant::now()));
+                schedule.complete_cycle(Instant::now());
+                continue;
+            }
+            true
+        } else {
+            false
+        };
         let quota_candidate = quota_poller.latest();
         if quota_candidate
             .as_ref()
@@ -595,6 +690,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CyclePublication::Degraded
             }
         };
+        if early_recollection && matches!(publication, CyclePublication::Degraded) {
+            let now = Instant::now();
+            reject_checkpoint_recollection(
+                &mut recorder,
+                quota_health,
+                &mut thread_health,
+                &mut thread_cadence,
+                now + schedule.time_until_deadline(now),
+            );
+        }
         // Both lanes are deliberately submitted and drained with nonblocking
         // operations. The DB integration consumes these typed outcomes; an
         // app-server timeout or malformed response must not delay the next
@@ -1500,6 +1605,354 @@ mod tests {
             assert_eq!(wait_calls, 1);
             fixture.cleanup();
         }
+    }
+
+    fn issue_134_thread_row(fixture: &Issue362AsyncFixture) -> (String, i64) {
+        rusqlite::Connection::open(&fixture.options.database).unwrap()
+            .query_row("SELECT threads_json, acquisition_degraded FROM active_thread_snapshot WHERE singleton=1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue_134_drive_checkpoint_cycle(
+        fixture: &mut Issue362AsyncFixture,
+        cadence: &mut AdaptiveThreadCadence,
+        health: &mut LaneHealth,
+        schedule: &mut FixedRateSchedule,
+        now: &Cell<Instant>,
+        result: Option<ActiveThreadPollResult>,
+        initial_drain: bool,
+    ) {
+        let mut submit = |_: &[SessionCheckpoint]| true;
+        let mut initial = if initial_drain { result.clone() } else { None };
+        let mut pending = if initial_drain { None } else { result };
+        let mut drain = || initial.take().into_iter().collect();
+        let mut wait_for = |duration: Duration| {
+            let result = pending.take();
+            now.set(
+                now.get()
+                    + if result.is_some() {
+                        Duration::from_secs(1)
+                    } else {
+                        duration
+                    },
+            );
+            result
+        };
+        let mut sleep = |duration| now.set(now.get() + duration);
+        complete_cycle_publication_and_wait(
+            CyclePublication::Committed { has_pending: false },
+            &fixture.options,
+            &fixture.epoch,
+            &mut fixture.recorder,
+            &mut fixture.state_writer,
+            LaneHealth::Ready,
+            health,
+            schedule,
+            cadence,
+            &mut submit,
+            &mut drain,
+            &mut wait_for,
+            &mut sleep,
+            &mut || now.get(),
+            &mut |_| true,
+        )
+        .expect("checkpoint cycle");
+    }
+
+    #[test]
+    fn issue_134_checkpoint_reconciliation_recovers_on_original_deadline() {
+        let mut fixture = issue_362_fixture("checkpoint-reconcile-success");
+        fixture.seed_state(false, false);
+        let before = issue_134_thread_row(&fixture);
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+        let mut cadence = AdaptiveThreadCadence::default();
+        let mut health = LaneHealth::Ready;
+        issue_134_drive_checkpoint_cycle(
+            &mut fixture,
+            &mut cadence,
+            &mut health,
+            &mut schedule,
+            &now,
+            Some(ActiveThreadPollResult::CheckpointMismatch),
+            true,
+        );
+        assert_eq!(now.get(), anchor);
+        assert_eq!(
+            issue_134_thread_row(&fixture),
+            before,
+            "pending admission must not publish error or partial threads"
+        );
+        assert!(cadence.begin_checkpoint_recovery(&fixture.epoch));
+        fixture
+            .recorder
+            .run_cycle_with_quota_guarded(None, || true)
+            .expect("one guarded collection");
+        let complete = fixture.poll_result("verified new Session", 2);
+        issue_134_drive_checkpoint_cycle(
+            &mut fixture,
+            &mut cadence,
+            &mut health,
+            &mut schedule,
+            &now,
+            Some(complete),
+            false,
+        );
+        let after = issue_134_thread_row(&fixture);
+        assert_ne!(after.0, before.0);
+        assert_eq!(after.1, 0);
+        assert_eq!(health, LaneHealth::Ready);
+        assert_eq!(now.get(), anchor + Duration::from_secs(60));
+        assert_eq!(
+            schedule.time_until_deadline(now.get()),
+            Duration::from_secs(60)
+        );
+        assert!(!cadence.checkpoint_recovery.attempted);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue_134_repeated_checkpoint_mismatch_marks_error_without_second_recollection() {
+        let mut fixture = issue_362_fixture("checkpoint-reconcile-repeated");
+        fixture.seed_state(false, false);
+        let before = issue_134_thread_row(&fixture).0;
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+        let mut cadence = AdaptiveThreadCadence::default();
+        let mut health = LaneHealth::Ready;
+        issue_134_drive_checkpoint_cycle(
+            &mut fixture,
+            &mut cadence,
+            &mut health,
+            &mut schedule,
+            &now,
+            Some(ActiveThreadPollResult::CheckpointMismatch),
+            true,
+        );
+        assert!(cadence.begin_checkpoint_recovery(&fixture.epoch));
+        issue_134_drive_checkpoint_cycle(
+            &mut fixture,
+            &mut cadence,
+            &mut health,
+            &mut schedule,
+            &now,
+            Some(ActiveThreadPollResult::CheckpointMismatch),
+            true,
+        );
+        assert_eq!(now.get(), anchor + Duration::from_secs(60));
+        assert_eq!(issue_134_thread_row(&fixture), (before, 1));
+        assert_eq!(health, LaneHealth::Failed);
+        assert!(!cadence.checkpoint_recovery.pending);
+        assert!(!cadence.begin_checkpoint_recovery(&fixture.epoch));
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue_134_adaptive_checkpoint_reconciliation_retains_activity_and_deadline() {
+        let mut fixture = issue_362_fixture("checkpoint-adaptive-reconcile");
+        fixture.seed_state(false, false);
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+        let mut cadence = AdaptiveThreadCadence::default();
+        cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(1)), anchor);
+        cadence.accept(&fixture.epoch, &adaptive_thread_snapshot(Some(2)), anchor);
+        let mut health = LaneHealth::Ready;
+        issue_134_drive_checkpoint_cycle(
+            &mut fixture,
+            &mut cadence,
+            &mut health,
+            &mut schedule,
+            &now,
+            Some(ActiveThreadPollResult::CheckpointMismatch),
+            false,
+        );
+        assert_eq!(now.get(), anchor + Duration::from_secs(6));
+        assert_eq!(cadence.last_delta, Some(anchor));
+        assert!(cadence.begin_checkpoint_recovery(&fixture.epoch));
+        assert_eq!(
+            cadence.next_probe, None,
+            "recollection must immediately probe the fresh checkpoint set"
+        );
+        assert_eq!(cadence.last_delta, Some(anchor));
+        let complete = ActiveThreadPollResult::Snapshot {
+            snapshot: adaptive_thread_snapshot(Some(2)),
+            epoch: fixture.epoch.clone(),
+        };
+        issue_134_drive_checkpoint_cycle(
+            &mut fixture,
+            &mut cadence,
+            &mut health,
+            &mut schedule,
+            &now,
+            Some(complete),
+            false,
+        );
+        assert_eq!(now.get(), anchor + Duration::from_secs(60));
+        assert_eq!(issue_134_thread_row(&fixture).1, 0);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue_134_checkpoint_reconciliation_does_not_clear_existing_error() {
+        let mut fixture = issue_362_fixture("checkpoint-reconcile-existing-error");
+        fixture.seed_state(false, true);
+        let before = issue_134_thread_row(&fixture);
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+        let mut cadence = AdaptiveThreadCadence::default();
+        let mut health = LaneHealth::Failed;
+        issue_134_drive_checkpoint_cycle(
+            &mut fixture,
+            &mut cadence,
+            &mut health,
+            &mut schedule,
+            &now,
+            Some(ActiveThreadPollResult::CheckpointMismatch),
+            true,
+        );
+        assert_eq!(issue_134_thread_row(&fixture), before);
+        assert_eq!(health, LaneHealth::Failed);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue_134_checkpoint_recollection_failure_waits_for_normal_collection() {
+        let mut fixture = issue_362_fixture("checkpoint-recollect-failed");
+        fixture.seed_state(false, false);
+        let before = issue_134_thread_row(&fixture).0;
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+        let mut cadence = AdaptiveThreadCadence::default();
+        let mut health = LaneHealth::Ready;
+        issue_134_drive_checkpoint_cycle(
+            &mut fixture,
+            &mut cadence,
+            &mut health,
+            &mut schedule,
+            &now,
+            Some(ActiveThreadPollResult::CheckpointMismatch),
+            true,
+        );
+        assert!(cadence.begin_checkpoint_recovery(&fixture.epoch));
+        reject_checkpoint_recollection(
+            &mut fixture.recorder,
+            LaneHealth::Ready,
+            &mut health,
+            &mut cadence,
+            anchor + Duration::from_secs(60),
+        );
+        assert_eq!(issue_134_thread_row(&fixture), (before, 1));
+        assert!(!cadence.submit(anchor, &[], &mut |_| panic!(
+            "failed inventory must not be probed before normal collection"
+        )));
+        assert!(!cadence.checkpoint_recovery.pending);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue_134_checkpoint_reconciliation_rejects_changed_epoch() {
+        let fixture = issue_362_fixture("checkpoint-reconcile-epoch");
+        let mut cadence = AdaptiveThreadCadence::default();
+        assert!(cadence.checkpoint_recovery.request(&fixture.epoch));
+        fs::write(
+            fixture.options.codex_home.join("auth.json"),
+            br#"{"tokens":{"account_id":"changed-account","access_token":"fixture"}}"#,
+        )
+        .unwrap();
+        let changed = AccountEpochProof::capture(&fixture.options.codex_home).unwrap();
+        assert_ne!(fixture.epoch, changed);
+        assert!(!cadence.begin_checkpoint_recovery(&changed));
+        assert!(!cadence.checkpoint_recovery.pending);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue_134_once_mode_cannot_leave_checkpoint_reconciliation_pending() {
+        let mut fixture = issue_362_fixture("checkpoint-once");
+        fixture.options.once = true;
+        fixture.seed_state(false, false);
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        issue_134_drive_checkpoint_cycle(
+            &mut fixture,
+            &mut AdaptiveThreadCadence::default(),
+            &mut LaneHealth::Ready,
+            &mut FixedRateSchedule::anchored(anchor, Duration::from_secs(60)),
+            &now,
+            Some(ActiveThreadPollResult::CheckpointMismatch),
+            true,
+        );
+        assert_eq!(issue_134_thread_row(&fixture).1, 1);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue_134_checkpoint_mismatch_requests_collection_before_deadline() {
+        let mut fixture = issue_362_fixture("checkpoint-recovery-deadline");
+        fixture.seed_state(false, false);
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+        let mut submits = 0;
+        let mut drains = 0;
+        let mut waits = 0;
+        assert!(issue_362_drive_cycle(
+            &mut fixture,
+            CyclePublication::Committed { has_pending: false },
+            LaneHealth::Ready,
+            &mut schedule,
+            &now,
+            Some(ActiveThreadPollResult::CheckpointMismatch),
+            vec![true; 8],
+            None,
+            &mut submits,
+            &mut drains,
+            &mut waits,
+        )
+        .expect("checkpoint reconciliation requested"));
+        assert_eq!(
+            now.get(), anchor + Duration::from_secs(1),
+            "a newly active Session must trigger guarded collection without waiting for the periodic deadline"
+        );
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue_134_initial_checkpoint_reconciliation_keeps_last_good_health() {
+        let mut fixture = issue_362_fixture("checkpoint-pending-health");
+        fixture.seed_state(false, false);
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+        issue_362_drive_cycle(
+            &mut fixture,
+            CyclePublication::Committed { has_pending: false },
+            LaneHealth::Ready,
+            &mut schedule,
+            &now,
+            Some(ActiveThreadPollResult::CheckpointMismatch),
+            vec![true; 8],
+            None,
+            &mut 0,
+            &mut 0,
+            &mut 0,
+        )
+        .expect("pending checkpoint reconciliation");
+        let health: i64 = rusqlite::Connection::open(&fixture.options.database)
+            .unwrap()
+            .query_row(
+                "SELECT acquisition_degraded FROM active_thread_snapshot WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(health, 0, "first checkpoint discovery must retain the verified health until guarded reconciliation finishes");
+        fixture.cleanup();
     }
 
     #[test]
