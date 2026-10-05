@@ -184,6 +184,42 @@ class DependencyMetadataTests(unittest.TestCase):
             with self.subTest(step=index):
                 self.assertEqual(refs[index], expected)
 
+    def test_codeql_workflow_uses_verified_action_commits(self):
+        job = self.workflow("codeql.yml")["jobs"]["analyze"]
+        refs = [step["uses"] for step in job["steps"] if "uses" in step]
+        expected = (
+            "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+            "github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
+            "github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
+        )
+        self.assertEqual(len(refs), len(expected))
+        for index, reference in enumerate(expected):
+            with self.subTest(step=index):
+                self.assertEqual(refs[index], reference)
+
+    def test_codeql_pins_are_accepted_by_existing_workflow_consumers(self):
+        pinned = (ROOT / ".github/workflows/codeql.yml").read_text()
+        for mutable, immutable in (
+            ("actions/checkout@v5", "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"),
+            ("github/codeql-action/init@v4", "github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2"),
+            ("github/codeql-action/analyze@v4", "github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2"),
+        ):
+            pinned = pinned.replace(mutable, immutable)
+        for consumer in ("test_codeql_workflow", "workflow_quality_gate"):
+            with self.subTest(consumer=consumer):
+                path = ROOT / "scripts" / (consumer + ".py")
+                spec = importlib.util.spec_from_file_location(consumer, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                if consumer == "test_codeql_workflow":
+                    with mock.patch.object(module, "CODEQL") as codeql, mock.patch("builtins.print"):
+                        codeql.read_text.return_value = pinned
+                        self.assertEqual(module.main(), 0)
+                else:
+                    workflows = module.sources()
+                    workflows["codeql.yml"] = pinned
+                    self.assertEqual(module._semantic_workflow_errors(workflows), [])
+
     def test_metadata_workflow_is_read_only_and_propagates_failure(self):
         data = self.workflow("dependency-metadata.yml")
         events = data.get("on", data.get(True))
