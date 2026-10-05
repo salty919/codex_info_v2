@@ -42,6 +42,11 @@ previous_combined=0
 legacy_combined_enabled=0
 legacy_combined_active=0
 legacy_combined_generation=0
+legacy_combined_prestate=
+journal_legacy_combined_prestate=
+journal_legacy_recovery_reader_hash=
+legacy_recovery_reader_hash=
+running_installer_source="$(readlink -f -- "$0" 2>/dev/null || true)"
 recorder_reused=0
 recorder_override_migrated=0
 migrate_recorder_override=0
@@ -77,6 +82,8 @@ rest_enable_destination="$unit_dir/default.target.wants/codex-info-rest.service"
 timer_enable_destination="$unit_dir/timers.target.wants/codex-info-update.timer"
 current_link="$share_dir/current"
 transaction="$share_dir/install-transaction.json"
+legacy_recovery_reader_destination="$share_dir/.legacy-recovery-install.sh"
+legacy_recovery_journal="$share_dir/.legacy-recovery-transaction.json"
 control_state="$share_dir/control-state.json"
 install_lock="$share_dir/.install.lock"
 update_stage=
@@ -597,13 +604,14 @@ write_journal() {
         safe_blocked 'journal owner identity is invalid'
     timestamp="$(now_unix)" || safe_blocked 'transaction journal clock is unavailable'
     local content
-    content="$(python3 - "$phase" "$operation_id" "$journal_owner_pid" "$journal_owner_starttime" "$journal_boot_id" "$previous_id" "$candidate_id" "$desired_state" "$timestamp" <<'PY'
+    content="$(python3 - "$phase" "$operation_id" "$journal_owner_pid" "$journal_owner_starttime" "$journal_boot_id" "$previous_id" "$candidate_id" "$desired_state" "$timestamp" "${legacy_recovery_reader_image:-}" <<'PY'
 import json, sys
-phase, operation, owner_pid, owner_starttime, boot, old_generation, new_generation, desired, timestamp = sys.argv[1:]
+phase, operation, owner_pid, owner_starttime, boot, old_generation, new_generation, desired, timestamp, reader_image = sys.argv[1:]
 document = {"schema":"codex-info-install-transaction-v1","operation_id":operation,
             "owner_pid":int(owner_pid),"owner_starttime":int(owner_starttime),"boot_id":boot,
             "phase":phase,"old_generation":old_generation,"new_generation":new_generation,
             "desired_state":desired,"updated_at_unix":int(timestamp)}
+if reader_image: document["legacy_reader_image"] = reader_image
 print(json.dumps(document, ensure_ascii=False, indent=2) + "\n", end="")
 PY
     )"
@@ -615,8 +623,8 @@ read_journal() {
     [[ "$(stat -c '%u' -- "$transaction" 2>/dev/null || true)" == "$(id -u)" &&
        "$(stat -c '%a' -- "$transaction" 2>/dev/null || true)" == 600 ]] ||
         safe_blocked 'transaction journal owner or mode is invalid'
-    journal_line="$(python3 - "$transaction" <<'PY'
-import json, pathlib, re, sys
+    journal_line="$(python3 - "$transaction" "${legacy_recovery_journal:-}" <<'PY'
+import base64, gzip, hashlib, io, json, pathlib, re, sys
 def pairs(items):
     result={}
     for key,value in items:
@@ -626,7 +634,9 @@ def pairs(items):
 try: document=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), object_pairs_hook=pairs)
 except Exception as error: raise SystemExit(str(error))
 required={"schema","operation_id","owner_pid","owner_starttime","boot_id","phase","old_generation","new_generation","desired_state","updated_at_unix"}
-if not isinstance(document,dict) or set(document)!=required or document["schema"]!="codex-info-install-transaction-v1":
+staged_image = (isinstance(document,dict) and set(document)==required|{"legacy_reader_image"}
+                and pathlib.Path(sys.argv[1])==pathlib.Path(sys.argv[2]) and document["phase"]=="prepared")
+if not isinstance(document,dict) or (set(document)!=required and not staged_image) or document["schema"]!="codex-info-install-transaction-v1":
     raise SystemExit("journal keys are invalid")
 if document["phase"] not in {"prepared","legacy_backed_up","entrypoints_linked","candidate_published","current_switched","activation_requested","candidate_verified","rollback_switched","rollback_verified","committed"}:
     raise SystemExit("journal phase is invalid")
@@ -640,11 +650,43 @@ if (not isinstance(document["old_generation"],str) or not re.fullmatch(generatio
         not isinstance(document["new_generation"],str) or not re.fullmatch(generation_pattern,document["new_generation"]) or
         isinstance(document["updated_at_unix"],bool) or not isinstance(document["updated_at_unix"],int) or document["updated_at_unix"] <= 0):
     raise SystemExit("journal generation or timestamp is invalid")
+# The opaque operation ID carries the one prestate record while preserving the
+# exact v1 key set understood by the installed predecessor. All backup members
+# and owner checks use this complete ID; it is never replaced on resume.
+legacy = None
+reader_hash = ""
+if "~lc1~" in document["operation_id"]:
+    digest_pattern = r"(?:[0-9a-f]{64}|[A-Za-z0-9_-]{43})"
+    match = re.fullmatch(r"([A-Za-z0-9_-]{1,64})~lc1~([01]{3})~(" + digest_pattern + r")~(" + digest_pattern + r")", document["operation_id"])
+    if match is None: raise SystemExit("legacy operation identity is invalid")
+    def digest(value):
+        if len(value) == 64: return value
+        decoded = base64.b64decode(value + "=", altchars=b"-_", validate=True)
+        if len(decoded) != 32 or base64.urlsafe_b64encode(decoded).decode().rstrip("=") != value:
+            raise SystemExit("legacy digest encoding is invalid")
+        return decoded.hex()
+    flags = match.group(2)
+    manifest_hash, reader_hash = map(digest, match.group(3, 4))
+    legacy = {"generation": flags[0] == "1", "enabled": flags[1] == "1",
+              "active": flags[2] == "1", "manifest_sha256": manifest_hash}
+    if (legacy["generation"] != bool(document["old_generation"]) or
+            (legacy["generation"] and not document["old_generation"].endswith("-" + manifest_hash))):
+        raise SystemExit("legacy combined journal prestate is invalid")
+reader_image = document.get("legacy_reader_image", "")
+if staged_image:
+    if legacy is None or not isinstance(reader_image,str) or not reader_image or len(reader_image)>65536:
+        raise SystemExit("legacy reader image is invalid")
+    compressed = base64.b64decode(reader_image, validate=True)
+    if base64.b64encode(compressed).decode()!=reader_image: raise SystemExit("legacy reader encoding is invalid")
+    with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as image:
+        data = image.read(524289)
+    if len(data)>524288 or hashlib.sha256(data).hexdigest()!=reader_hash:
+        raise SystemExit("legacy reader image identity is invalid")
 print(document["phase"],document["operation_id"],document["owner_pid"],document["owner_starttime"],
-      document["boot_id"],document["old_generation"],document["new_generation"],document["desired_state"],sep="\x1f")
+      document["boot_id"],document["old_generation"],document["new_generation"],document["desired_state"],json.dumps(legacy) if legacy is not None else "",reader_hash,reader_image,sep="\x1f")
 PY
     )" || safe_blocked 'transaction journal is invalid or ambiguous'
-    IFS=$'\x1f' read -r journal_phase journal_operation_id journal_owner_pid journal_owner_starttime journal_boot_id journal_previous_id journal_candidate_id journal_desired <<<"$journal_line"
+    IFS=$'\x1f' read -r journal_phase journal_operation_id journal_owner_pid journal_owner_starttime journal_boot_id journal_previous_id journal_candidate_id journal_desired journal_legacy_combined_prestate journal_legacy_recovery_reader_hash journal_legacy_recovery_reader_image <<<"$journal_line"
 }
 journal_owner_stale() {
     [[ "$journal_boot_id" != "$(boot_id)" ]] && return 0
@@ -906,7 +948,7 @@ print(version,source,hashlib.sha256(raw).hexdigest(),by_path["codex_info"]["sha2
 PY
 }
 legacy_combined_record() {
-    local resolved generation_path
+    local resolved generation_path installer="$installer_destination"
     [[ -e "$legacy_combined_unit_destination" || -L "$legacy_combined_unit_destination" ]] || return 1
     if [[ -L "$legacy_combined_unit_destination" ]]; then
         resolved="$(readlink -f -- "$legacy_combined_unit_destination" 2>/dev/null || true)"
@@ -917,7 +959,10 @@ legacy_combined_record() {
             "$generation_path/install.sh" "$generation_path/codex-info.service" \
             "$generation_path/codex-info-update.service" "$generation_path/codex-info-update.timer"
     else
-        legacy_combined_record_at "$manifest_destination" "$binary_destination" "$installer_destination" \
+        if legacy_recovery_reader_active; then
+            installer="$backup_dir/$operation_id-$(basename -- "$installer_destination")"
+        fi
+        legacy_combined_record_at "$manifest_destination" "$binary_destination" "$installer" \
             "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination"
     fi
 }
@@ -1093,7 +1138,7 @@ PY_LEGACY_SCHEMA
         legacy_rollback_id="$journal_previous_id"
     fi
     if python3 - "$generations_dir" "$current_link" "$transaction" "$unit_dir" "$proc_root" \
-        "$legacy_rollback_id" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
+        "$legacy_rollback_id" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" "$journal_operation_id" <<'PY'
 import hashlib
 import json
 import os
@@ -1101,7 +1146,7 @@ import re
 import stat
 import sys
 
-generations_path, current_path, journal_path, unit_dir, proc_root, legacy_rollback_name, schema, product, target, compatibility = sys.argv[1:]
+generations_path, current_path, journal_path, unit_dir, proc_root, legacy_rollback_name, schema, product, target, compatibility, expected_operation = sys.argv[1:]
 uid = os.getuid()
 generation_pattern = re.compile(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64}")
 journal_generation_pattern = re.compile(r"(?:|(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64})")
@@ -1304,6 +1349,7 @@ def read_committed_state(root_fd):
     required = {"schema", "operation_id", "owner_pid", "owner_starttime", "boot_id", "phase",
                 "old_generation", "new_generation", "desired_state", "updated_at_unix"}
     require(isinstance(journal, dict) and set(journal) == required and
+            journal["operation_id"] == expected_operation and
             journal["schema"] == "codex-info-install-transaction-v1" and journal["phase"] == "committed",
             "transaction journal is not committed and exact")
     require(isinstance(journal["operation_id"], str) and journal["operation_id"] and
@@ -1883,7 +1929,7 @@ link_entrypoints() {
     atomic_symlink '../share/codex-info/current/codex_info_recorder' "$recorder_binary_destination"
     atomic_symlink '../share/codex-info/current/codex_info_rest' "$rest_binary_destination"
     atomic_symlink '../share/codex-info/current/run.sh' "$launcher_destination"
-    atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"
+    if [[ -z "${legacy_recovery_reader_hash:-}" ]]; then atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"; fi
     atomic_symlink 'current/manifest.json' "$manifest_destination"
     if [[ "${desired_state-}" == removed ]]; then
         local destination expected
@@ -1902,12 +1948,13 @@ link_entrypoints() {
     atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.timer' "$update_timer_destination"
 }
 restore_backups() {
-    python3 - "$operation_id" "$backup_dir" "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination" "$recorder_override_destination" <<'PY'
+    python3 - "$operation_id" "$backup_dir" "${legacy_recovery_reader_hash:-}" "$installer_destination" "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination" "$recorder_override_destination" <<'PY'
 import os,sys
 from pathlib import Path
-operation,backup_root,*destinations=sys.argv[1:]
+operation,backup_root,reader_hash,installer,*destinations=sys.argv[1:]
 backup_root=Path(backup_root)
 for destination_name in reversed(destinations):
+    if reader_hash and destination_name == installer: continue
     destination=Path(destination_name)
     backup=backup_root / (operation + "-" + destination.name)
     if backup.exists() or backup.is_symlink():
@@ -1928,6 +1975,7 @@ PY
 remove_published_entrypoints() {
     local destination link_target expected
     for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
+        if [[ "$destination" == "$installer_destination" && -n "${legacy_recovery_reader_hash:-}" ]]; then continue; fi
         [[ -L "$destination" ]] || continue
         link_target="$(readlink -- "$destination" 2>/dev/null || true)"
         case "$destination" in
@@ -2631,6 +2679,363 @@ capture_legacy_combined_state() {
     [[ -L "$legacy_combined_unit_destination" ]] && legacy_combined_generation=1
     return 0
 }
+legacy_recovery_reader_source() {
+    printf '%s\n' "$running_installer_source"
+}
+legacy_recovery_reader_valid() {
+    local expected="${1:-$legacy_recovery_reader_hash}"
+    [[ -n "$expected" && -f "$legacy_recovery_reader_destination" && ! -L "$legacy_recovery_reader_destination" &&
+       "$(stat -c '%u:%a' -- "$legacy_recovery_reader_destination")" == "$(id -u):755" &&
+       "$(sha256sum -- "$legacy_recovery_reader_destination" | awk '{print $1}')" == "$expected" ]]
+}
+legacy_recovery_reader_active() {
+    [[ -n "${legacy_recovery_reader_hash:-}" && -L "$installer_destination" &&
+       "$(readlink -- "$installer_destination")" == "$legacy_recovery_reader_destination" &&
+       "$(stat -c '%u' -- "$installer_destination")" == "$(id -u)" ]] && legacy_recovery_reader_valid
+}
+atomic_recovery_copy() {
+    python3 - "$1" "$2" "$3" "${4:-}" "${5:-}" <<'PY'
+import base64, gzip, hashlib, io, os, pathlib, sys, tempfile
+source, destination = map(pathlib.Path, sys.argv[1:3])
+expected, previous, reader_image = sys.argv[3:]
+if reader_image:
+    if len(reader_image)>65536: raise SystemExit("recovery image is too large")
+    with gzip.GzipFile(fileobj=io.BytesIO(base64.b64decode(reader_image, validate=True))) as image:
+        data = image.read(524289)
+    if len(data)>524288: raise SystemExit("recovery image is too large")
+else:
+    if not source.is_file() or source.is_symlink() or source.stat().st_uid != os.getuid():
+        raise SystemExit("recovery source is not owned regular bytes")
+    data = source.read_bytes()
+if hashlib.sha256(data).hexdigest() != expected:
+    raise SystemExit("recovery source identity changed")
+if destination.exists() or destination.is_symlink():
+    if (destination.is_symlink() or not destination.is_file() or destination.stat().st_uid != os.getuid() or
+            (destination.stat().st_mode & 0o7777) != 0o755 or not previous or
+            hashlib.sha256(destination.read_bytes()).hexdigest() != previous):
+        raise SystemExit("foreign recovery destination")
+fd, temporary = tempfile.mkstemp(prefix=".codex-info.", dir=destination.parent)
+try:
+    with os.fdopen(fd, "wb") as output:
+        output.write(data); output.flush(); os.fsync(output.fileno())
+    os.chmod(temporary, 0o755); os.replace(temporary, destination)
+    fd = os.open(destination.parent, os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+finally:
+    try: os.unlink(temporary)
+    except FileNotFoundError: pass
+PY
+}
+# One bounded executable cache; all prestate remains in the journal operation ID.
+# Keep the cache callable through startup and rollback, including the running caller.
+# The same prepared journal is staged until the new reader owns the installed
+# entrypoint, then renamed into the canonical path. The predecessor never sees
+# a pending transaction it cannot recover. This is not a second member ledger.
+validate_legacy_handoff_destination() {
+    local transaction="$1"
+    local journal_line journal_phase journal_operation_id journal_owner_pid journal_owner_starttime
+    local journal_boot_id journal_previous_id journal_candidate_id journal_desired
+    local journal_legacy_combined_prestate journal_legacy_recovery_reader_hash
+    [[ -e "$transaction" || -L "$transaction" ]] || return 0
+    read_journal
+    [[ "$journal_phase" == committed ]] || safe_blocked 'another transaction blocks legacy reader handoff'
+}
+
+stage_legacy_recovery_handoff() {
+    validate_legacy_handoff_destination "$transaction"
+    [[ ! -e "$legacy_recovery_journal" && ! -L "$legacy_recovery_journal" ]] ||
+        safe_blocked 'legacy reader handoff journal already exists'
+    local legacy_recovery_reader_image
+    legacy_recovery_reader_image="$(python3 - "$(legacy_recovery_reader_source)" "$legacy_recovery_reader_hash" <<'PY'
+import base64, gzip, hashlib, os, pathlib, sys
+source = pathlib.Path(sys.argv[1])
+if not source.is_file() or source.is_symlink() or source.stat().st_uid!=os.getuid():
+    raise SystemExit("legacy reader source is not owned regular bytes")
+data = source.read_bytes()
+if len(data)>524288 or hashlib.sha256(data).hexdigest()!=sys.argv[2]:
+    raise SystemExit("legacy reader source identity changed")
+image = base64.b64encode(gzip.compress(data, mtime=0)).decode()
+if len(image)>65536: raise SystemExit("legacy reader image is too large")
+print(image)
+PY
+    )" || safe_blocked 'legacy reader image could not be preserved'
+    local transaction="$legacy_recovery_journal" CODEX_INFO_INTERRUPT_PHASE=
+    write_journal prepared
+}
+
+promote_legacy_recovery_handoff() {
+    validate_legacy_handoff_destination "$transaction"
+    (
+        local transaction="$legacy_recovery_journal"
+        read_journal
+        [[ "$journal_phase" == prepared && "$journal_operation_id" == "$operation_id" &&
+           -n "$journal_legacy_combined_prestate" &&
+           "$journal_legacy_recovery_reader_hash" == "$legacy_recovery_reader_hash" ]] ||
+            safe_blocked 'legacy reader handoff identity is invalid'
+    ) || safe_blocked 'legacy reader handoff journal is invalid'
+    legacy_recovery_reader_active || safe_blocked 'legacy reader handoff entrypoint is unavailable'
+    seal_legacy_reader_handoff
+    python3 - "$legacy_recovery_journal" "$transaction" <<'PY'
+import os, pathlib, sys
+source, destination = map(pathlib.Path, sys.argv[1:])
+os.replace(source, destination)
+fd = os.open(destination.parent, os.O_DIRECTORY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+}
+
+recover_legacy_reader_handoff() {
+    local canonical_transaction="$transaction" transaction="$legacy_recovery_journal"
+    read_journal
+    [[ "$journal_phase" == prepared && -n "$journal_legacy_combined_prestate" &&
+       -n "$journal_legacy_recovery_reader_hash" ]] || safe_blocked 'legacy reader handoff state is invalid'
+    journal_owner_stale || safe_blocked 'legacy reader handoff owner is still live'
+    validate_legacy_handoff_destination "$canonical_transaction"
+    operation_id="$journal_operation_id"; candidate_id="$journal_candidate_id"
+    previous_id="$journal_previous_id"; desired_state="$journal_desired"
+    require_user_manager
+    recover_legacy_combined_state
+    prepare_legacy_recovery_reader
+    publish_legacy_recovery_reader
+    transaction="$canonical_transaction"
+    promote_legacy_recovery_handoff
+}
+
+# Commit linearizes the verified old runtime while the recovery reader still
+# protects startup. Only its final entrypoint switch remains; on interruption,
+# finish that switch under L1 without publishing or committing the operation again.
+finish_committed_legacy_recovery() {
+    [[ -n "${journal_legacy_recovery_reader_hash:-}" && -L "$installer_destination" &&
+       "$(readlink -- "$installer_destination")" == "$legacy_recovery_reader_destination" ]] || return 0
+    operation_id="$journal_operation_id"; candidate_id="$journal_candidate_id"
+    previous_id="$journal_previous_id"; desired_state="$journal_desired"
+    capture_runtime_state
+    recover_legacy_combined_state
+    [[ "$(current_generation)" == "$previous_id" ]] || safe_blocked 'committed legacy recovery generation changed'
+    restore_legacy_combined_runtime || safe_blocked 'committed legacy runtime could not be restored'
+    verify_legacy_combined_terminal || safe_blocked 'committed legacy runtime is not ready'
+    restore_legacy_recovery_installer
+    verify_legacy_combined_terminal || safe_blocked 'committed legacy snapshot is incomplete'
+    transaction_recovered=1
+}
+
+legacy_recovery_reader_image() {
+    (
+        local transaction="$legacy_recovery_journal"
+        read_journal
+        [[ "$journal_phase" == prepared && "$journal_operation_id" == "$operation_id" &&
+           "$journal_legacy_recovery_reader_hash" == "$legacy_recovery_reader_hash" ]] ||
+            safe_blocked 'legacy reader image belongs to another operation'
+        printf '%s\n' "$journal_legacy_recovery_reader_image"
+    )
+}
+
+legacy_recovery_reader_prior_hash() {
+    (
+        local transaction="$share_dir/install-transaction.json"
+        [[ -e "$transaction" || -L "$transaction" ]] || return 0
+        read_journal
+        [[ "$journal_phase" == committed ]] || safe_blocked 'unsettled journal blocks cache replacement'
+        printf '%s\n' "$journal_legacy_recovery_reader_hash"
+    )
+}
+
+# Once the cache and its installed binding are durable, strip the temporary
+# executable image before promotion. The canonical journal always has v1 keys.
+seal_legacy_reader_handoff() {
+    legacy_recovery_reader_active || safe_blocked 'legacy reader is not durable before journal promotion'
+    local content
+    content="$(python3 - "$legacy_recovery_journal" <<'PY'
+import json, pathlib, sys
+document = json.loads(pathlib.Path(sys.argv[1]).read_text())
+document.pop("legacy_reader_image", None)
+print(json.dumps(document, ensure_ascii=False, indent=2)+"\n", end="")
+PY
+    )" || safe_blocked 'legacy reader handoff could not be sealed'
+    atomic_text "$legacy_recovery_journal" 600 "$content"
+}
+
+prepare_legacy_recovery_reader() {
+    [[ -n "$legacy_recovery_reader_hash" ]] || return 0
+    legacy_recovery_reader_valid && return 0
+    local previous= reader_image=
+    if [[ -e "$legacy_recovery_reader_destination" || -L "$legacy_recovery_reader_destination" ]]; then
+        previous="$(legacy_recovery_reader_prior_hash)" || safe_blocked 'prior legacy reader authority is invalid'
+        legacy_recovery_reader_valid "$previous" || safe_blocked 'foreign legacy recovery executable'
+    fi
+    if [[ -e "$legacy_recovery_journal" || -L "$legacy_recovery_journal" ]]; then
+        reader_image="$(legacy_recovery_reader_image)" || safe_blocked 'legacy reader image is unavailable'
+    fi
+    atomic_recovery_copy "$(legacy_recovery_reader_source)" "$legacy_recovery_reader_destination" "$legacy_recovery_reader_hash" "$previous" "$reader_image" ||
+        safe_blocked 'legacy recovery executable could not be preserved'
+}
+validate_legacy_recovery_installer_binding() {
+    legacy_recovery_reader_active && return 0
+    if [[ -L "$installer_destination" ]]; then
+        [[ "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' &&
+           "$(stat -c '%u' -- "$installer_destination")" == "$(id -u)" ]] || return 1
+        local generation; generation="$(current_generation)"
+        [[ "$generation" == "$previous_id" || "$generation" == "$candidate_id" ]] && [[ -n "$generation" ]]
+    elif (( ! legacy_combined_generation )); then
+        local info manifest_hash
+        info="$(legacy_combined_record)" || return 1
+        IFS=$'\t' read -r _ _ manifest_hash _ _ <<<"$info"
+        [[ "$manifest_hash" == "$legacy_combined_manifest_hash" ]]
+    else
+        return 1
+    fi
+}
+publish_legacy_recovery_reader() {
+    [[ -n "$legacy_recovery_reader_hash" ]] || return 0
+    legacy_recovery_reader_valid || safe_blocked 'legacy recovery executable identity is unavailable'
+    validate_legacy_recovery_installer_binding || safe_blocked 'foreign legacy installer blocks recovery'
+    if (( ! legacy_combined_generation )) && ! legacy_recovery_reader_active; then
+        local backup="$backup_dir/$operation_id-$(basename -- "$installer_destination")"
+        if [[ ! -e "$backup" && ! -L "$backup" ]]; then
+            mkdir -p -- "$backup_dir"; chmod 700 -- "$backup_dir"
+            atomic_recovery_copy "$installer_destination" "$backup" "$(sha256sum -- "$installer_destination" | awk '{print $1}')" ||
+                safe_blocked 'legacy installer prestate could not be preserved'
+        fi
+    fi
+    atomic_symlink "$legacy_recovery_reader_destination" "$installer_destination"
+}
+restore_legacy_recovery_installer() {
+    [[ -n "$legacy_recovery_reader_hash" ]] || return 0
+    legacy_recovery_reader_active || safe_blocked 'foreign legacy installer blocks final restore'
+    if (( legacy_combined_generation )); then
+        atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"
+    else
+        validate_legacy_combined_recovery
+        python3 - "$backup_dir/$operation_id-$(basename -- "$installer_destination")" "$installer_destination" <<'PY'
+import os, pathlib, sys
+source, destination = map(pathlib.Path, sys.argv[1:])
+os.replace(source, destination)
+for parent in {source.parent, destination.parent}:
+    fd = os.open(parent, os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+PY
+    fi
+}
+capture_legacy_combined_prestate() {
+    capture_legacy_combined_state
+    local info manifest_hash
+    info="$(legacy_combined_record)" || safe_blocked 'legacy combined identity is unavailable'
+    IFS=$'\t' read -r _ _ manifest_hash _ _ <<<"$info"
+    legacy_combined_prestate="$(python3 - "$legacy_combined_generation" "$legacy_combined_enabled" "$legacy_combined_active" "$manifest_hash" <<'PY'
+import json, re, sys
+generation, enabled, active, manifest_hash = sys.argv[1:]
+if not re.fullmatch(r"[0-9a-f]{64}", manifest_hash): raise SystemExit("legacy manifest identity is invalid")
+print(json.dumps({"generation": generation == "1", "enabled": enabled == "1",
+                  "active": active == "1", "manifest_sha256": manifest_hash}))
+PY
+    )" || safe_blocked 'legacy combined prestate could not be captured'
+    local source; source="$(legacy_recovery_reader_source)"
+    legacy_recovery_reader_hash="$(sha256sum -- "$source" | awk '{print $1}')" || safe_blocked 'running installer identity is unavailable'
+    [[ "$operation_id" =~ ^[A-Za-z0-9_-]{1,64}$ && "$legacy_recovery_reader_hash" =~ ^[0-9a-f]{64}$ ]] ||
+        safe_blocked 'legacy recovery operation identity is invalid'
+    local encoded_identity
+    encoded_identity="$(python3 - "$manifest_hash" "$legacy_recovery_reader_hash" <<'PY'
+import base64, sys
+print("~".join(base64.urlsafe_b64encode(bytes.fromhex(value)).decode().rstrip("=") for value in sys.argv[1:]))
+PY
+    )" || safe_blocked 'legacy recovery operation identity could not be encoded'
+    operation_id+="~lc1~$legacy_combined_generation$legacy_combined_enabled$legacy_combined_active~$encoded_identity"
+}
+validate_legacy_combined_recovery() {
+    local destination backup expected info manifest_hash generation_path
+    local -a members=("$manifest_destination" "$binary_destination" "$installer_destination" "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination")
+    local -a restore_paths=()
+    if (( legacy_combined_generation )); then
+        generation_path="$generations_dir/$previous_id"
+        # A trusted generation does not authorize overwriting a foreign unit.
+        # Validate both the live binding and the same operation's pending move.
+        expected='../../../.local/share/codex-info/current/codex-info.service'
+        for destination in "$legacy_combined_unit_destination" "$backup_dir/$operation_id-codex-info.service"; do
+            [[ -e "$destination" || -L "$destination" ]] || continue
+            [[ -L "$destination" && "$(stat -c '%u' -- "$destination")" == "$(id -u)" ]] &&
+                { [[ "$(readlink -- "$destination")" == "$expected" ]] ||
+                  [[ "$(readlink -f -- "$destination")" == "$generation_path/codex-info.service" ]]; } ||
+                safe_blocked 'foreign legacy combined unit blocks recovery'
+        done
+        members=("$generation_path/manifest.json" "$generation_path/codex_info" "$generation_path/install.sh" "$generation_path/codex-info.service" "$generation_path/codex-info-update.service" "$generation_path/codex-info-update.timer")
+    fi
+    for destination in "${members[@]}"; do
+        backup="$backup_dir/$operation_id-$(basename -- "$destination")"
+        if (( ! legacy_combined_generation )) && [[ -e "$backup" || -L "$backup" ]]; then
+            if [[ -e "$destination" || -L "$destination" ]]; then
+                case "$destination" in
+                    "$manifest_destination") expected='current/manifest.json' ;;
+                    "$binary_destination") expected='../share/codex-info/current/codex_info' ;;
+                    "$installer_destination") expected='../share/codex-info/current/install.sh' ;;
+                    *) expected="../../../.local/share/codex-info/current/$(basename -- "$destination")" ;;
+                esac
+                if [[ "$destination" == "$installer_destination" ]] &&
+                    { legacy_recovery_reader_active ||
+                      { [[ -f "$destination" && ! -L "$destination" && "$(stat -c '%u:%a' -- "$destination")" == "$(id -u):755" ]] &&
+                        cmp -s -- "$destination" "$backup"; }; }; then
+                    :
+                else
+                    [[ -L "$destination" && "$(readlink -- "$destination")" == "$expected" ]] ||
+                        safe_blocked 'foreign legacy destination blocks recovery'
+                fi
+            fi
+            restore_paths+=("$backup")
+        else
+            restore_paths+=("$destination")
+        fi
+    done
+    info="$(legacy_combined_record_at "${restore_paths[@]}")" || safe_blocked 'legacy combined recovery snapshot is not trusted'
+    IFS=$'\t' read -r _ _ manifest_hash _ _ <<<"$info"
+    [[ "$manifest_hash" == "$legacy_combined_manifest_hash" ]] || safe_blocked 'legacy combined recovery identity changed'
+    if [[ -n "$legacy_recovery_reader_hash" ]]; then
+        validate_legacy_recovery_installer_binding || safe_blocked 'foreign legacy installer blocks recovery'
+    fi
+    validate_legacy_combined_enable_link
+}
+wait_legacy_combined_ready() {
+    local now deadline remaining health details pid
+    now="$(now_unix)" || return 1
+    deadline=$((now + HEALTH_TIMEOUT))
+    if (( operation_deadline > 0 && operation_deadline < deadline )); then deadline=$operation_deadline; fi
+    while :; do
+        now="$(now_unix)" || return 1; remaining=$((deadline - now))
+        (( remaining > 0 )) || return 1
+        if probe_active codex-info.service && legacy_combined_listener_matches; then
+            pid="$(systemctl_user show codex-info.service --property=MainPID --value)" || return 1
+            if [[ "$pid" == "$(socket_pid)" ]]; then
+                health="$("$CURL_BIN" --fail --silent --show-error --connect-timeout 2 --max-time "$remaining" "$HEALTH_URL")" || health=
+                now="$(now_unix)" || return 1; remaining=$((deadline - now))
+                (( remaining > 0 )) || return 1
+                details="$("$CURL_BIN" --fail --silent --show-error --connect-timeout 2 --max-time "$remaining" "$DETAILS_URL")" || details=
+                if python3 - "$health" "$details" "$legacy_combined_version" <<'PY'
+import json, sys
+def pairs(items):
+    value = {}
+    for key, item in items:
+        if key in value: raise ValueError("duplicate runtime key")
+        value[key] = item
+    return value
+try:
+    health, details = (json.loads(raw, object_pairs_hook=pairs) for raw in sys.argv[1:3])
+    valid = (health == {"api_version": "v1", "service": "codex-info", "product_version": sys.argv[3]} and
+             isinstance(details, dict) and details.get("state") in {"ready", "auth_required"} and
+             type(details.get("observed_at")) is int and details["observed_at"] > 0)
+except (ValueError, TypeError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+                then
+                    [[ "$(systemctl_user show codex-info.service --property=MainPID --value)" == "$pid" && "$(socket_pid)" == "$pid" ]] &&
+                        legacy_combined_listener_matches && return 0
+                fi
+            fi
+        fi
+        sleep_interval 1
+    done
+}
 legacy_combined_mixed_split_present() {
     local path
     for path in "$recorder_binary_destination" "$rest_binary_destination" "$unit_destination" "$rest_unit_destination"; do
@@ -2654,7 +3059,7 @@ retire_legacy_combined() {
     local managed_pid="$1" listener_pid
     legacy_combined_present || return 0
     (( previous_combined )) && return 0
-    capture_legacy_combined_state
+    [[ -n "$legacy_combined_prestate" ]] || safe_blocked 'legacy retirement lacks durable prestate'
     previous_combined=1
     if (( legacy_combined_active )); then
         systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 ||
@@ -2687,7 +3092,7 @@ restore_legacy_combined_entrypoints() {
     (( previous_combined && legacy_combined_generation )) || return 0
     atomic_symlink '../share/codex-info/current/codex_info' "$binary_destination"
     atomic_symlink '../share/codex-info/current/run.sh' "$launcher_destination"
-    atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"
+    if [[ -z "${legacy_recovery_reader_hash:-}" ]]; then atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"; fi
     atomic_symlink 'current/manifest.json' "$manifest_destination"
     atomic_symlink '../../../.local/share/codex-info/current/codex-info.service' "$legacy_combined_unit_destination"
     atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.service' "$update_service_destination"
@@ -2702,7 +3107,7 @@ restore_legacy_combined_runtime() {
         fi
         disable_managed_unit "$split_unit" || return 1
     done
-    if (( legacy_combined_enabled )); then
+    if (( legacy_combined_enabled )) && [[ "$desired_state" != disabled && "$desired_state" != removed ]]; then
         if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
             validate_legacy_combined_enable_link
         fi
@@ -2716,7 +3121,7 @@ restore_legacy_combined_runtime() {
         fi
         ! probe_legacy_combined_enabled || return 1
     fi
-    if (( legacy_combined_active )); then
+    if [[ "$desired_state" == running ]]; then
         systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || return 1
         probe_active codex-info.service || return 1
     elif probe_active codex-info.service; then
@@ -2726,20 +3131,22 @@ restore_legacy_combined_runtime() {
     return 0
 }
 verify_legacy_combined_terminal() {
-    legacy_combined_record >/dev/null || return 1
+    local info
+    info="$(legacy_combined_record)" || return 1
+    IFS=$'\t' read -r legacy_combined_version _ legacy_combined_restored_hash _ _ <<<"$info"
+    [[ "$legacy_combined_restored_hash" == "$legacy_combined_manifest_hash" ]] || return 1
     if (( legacy_combined_generation )); then
         [[ -n "$previous_id" && "$(current_generation)" == "$previous_id" ]] || return 1
     else
         [[ ! -L "$current_link" ]] || return 1
     fi
-    if (( legacy_combined_enabled )); then
+    if (( legacy_combined_enabled )) && [[ "$desired_state" != disabled && "$desired_state" != removed ]]; then
         probe_legacy_combined_enabled || return 1
     else
         ! probe_legacy_combined_enabled || return 1
     fi
-    if (( legacy_combined_active )); then
-        probe_active codex-info.service || return 1
-        legacy_combined_listener_matches
+    if [[ "$desired_state" == running ]]; then
+        wait_legacy_combined_ready
     else
         ! probe_active codex-info.service || return 1
         [[ -z "$(socket_pid 2>/dev/null || true)" ]]
@@ -2747,22 +3154,23 @@ verify_legacy_combined_terminal() {
 }
 recover_legacy_combined_state() {
     previous_combined=0; legacy_combined_generation=0
-    if [[ -e "$legacy_combined_unit_destination" || -L "$legacy_combined_unit_destination" ]]; then
-        capture_legacy_combined_state
+    legacy_combined_prestate="${journal_legacy_combined_prestate:-}"
+    legacy_recovery_reader_hash="${journal_legacy_recovery_reader_hash:-}"
+    if [[ -n "$legacy_combined_prestate" ]]; then
+        local state
+        state="$(python3 - "$legacy_combined_prestate" <<'PY'
+import json, sys
+state = json.loads(sys.argv[1])
+print(int(state["generation"]), int(state["enabled"]), int(state["active"]), state["manifest_sha256"], sep="\t")
+PY
+        )" || safe_blocked 'legacy combined prestate is unavailable'
+        IFS=$'\t' read -r legacy_combined_generation legacy_combined_enabled legacy_combined_active legacy_combined_manifest_hash <<<"$state"
         previous_combined=1
-        return
+        validate_legacy_combined_recovery
+        return 0
     fi
-    local backup="$backup_dir/$operation_id-codex-info.service"
-    if [[ -e "$backup" || -L "$backup" ]]; then
-        previous_combined=1
-        [[ -n "$previous_id" ]] && legacy_combined_generation=1
-        if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
-            validate_legacy_combined_enable_link
-            legacy_combined_enabled=1
-        else
-            legacy_combined_enabled=0
-        fi
-        probe_active codex-info.service && legacy_combined_active=1 || true
+    if legacy_combined_present || [[ -e "$backup_dir/$operation_id-codex-info.service" || -L "$backup_dir/$operation_id-codex-info.service" ]]; then
+        safe_blocked 'legacy combined journal lacks trusted prestate'
     fi
 }
 recorder_artifact_matches_previous() {
@@ -2831,12 +3239,16 @@ rollback_transaction() {
     rollback_deadline=$((rollback_now + ROLLBACK_TIMEOUT))
     if (( overall_deadline > 0 && overall_deadline < rollback_deadline )); then rollback_deadline=$overall_deadline; fi
     operation_deadline=$rollback_deadline
+    if (( previous_combined )) && [[ -n "$legacy_recovery_reader_hash" ]]; then
+        publish_legacy_recovery_reader
+    fi
     if [[ -n "$previous" ]]; then atomic_symlink "generations/$previous" "$current_link" || ok=0; else atomic_unlink "$current_link" || ok=0; fi
     remove_published_entrypoints || ok=0
     restore_backups || ok=0
     previous_id="$previous"
     if (( previous_combined )); then
         restore_legacy_combined_entrypoints || ok=0
+        ((ok)) && validate_legacy_combined_recovery || safe_blocked 'legacy combined restore is incomplete'
     else
         ensure_entrypoints_for_generation || ok=0
     fi
@@ -2881,14 +3293,28 @@ rollback_transaction() {
             [[ -z "$(socket_pid 2>/dev/null || true)" ]] || ok=0
         fi
     fi
-    if ((ok)); then write_journal rollback_verified "$reason"; write_journal committed rolled_back; fi
+    if ((ok)); then
+        write_journal rollback_verified "$reason"
+        write_journal committed rolled_back
+        if (( previous_combined )) && [[ -n "$legacy_recovery_reader_hash" ]]; then
+            restore_legacy_recovery_installer || ok=0
+            ((ok)) && verify_legacy_combined_terminal || ok=0
+        fi
+    fi
     operation_deadline=$saved_deadline
     ((ok)) || safe_blocked "rollback could not be verified within $ROLLBACK_TIMEOUT seconds"
     update_log succeeded "$reason"
 }
 resume_transaction() {
+    if [[ -e "${legacy_recovery_journal:-}" || -L "${legacy_recovery_journal:-}" ]]; then
+        recover_legacy_reader_handoff
+    fi
     [[ -f "$transaction" ]] || return 0
-    read_journal; [[ "$journal_phase" != committed ]] || return 0
+    read_journal
+    if [[ "$journal_phase" == committed ]]; then
+        if [[ -n "${journal_legacy_recovery_reader_hash:-}" ]]; then finish_committed_legacy_recovery; fi
+        return 0
+    fi
     transaction_recovered=1
     journal_owner_stale || safe_blocked 'transaction journal owner is still live'
     operation_id="$journal_operation_id"; candidate_id="$journal_candidate_id"; previous_id="$journal_previous_id"; desired_state="$journal_desired"
@@ -2898,6 +3324,7 @@ resume_transaction() {
     require_user_manager
     capture_runtime_state
     recover_legacy_combined_state
+    if [[ -n "${legacy_recovery_reader_hash:-}" ]]; then prepare_legacy_recovery_reader; fi
     if [[ "$journal_phase" == current_switched || "$journal_phase" == activation_requested ]]; then
         if [[ "$(current_generation)" == "$candidate_id" ]] && verify_local_generation >/dev/null 2>&1 &&
             { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
@@ -2906,7 +3333,7 @@ resume_transaction() {
             write_journal committed resumed
             return 0
         fi
-    elif [[ "$journal_phase" == rollback_switched ]]; then
+    elif [[ "$journal_phase" == rollback_switched ]] && (( ! previous_combined )); then
         if [[ -n "$previous_id" ]]; then
             if [[ "$(current_generation)" == "$previous_id" ]] && verify_local_generation >/dev/null 2>&1 &&
                 { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
@@ -2915,10 +3342,6 @@ resume_transaction() {
                 write_journal committed resumed
                 return 0
             fi
-        elif (( previous_combined )) && verify_legacy_combined_terminal >/dev/null 2>&1; then
-            write_journal rollback_verified resumed-legacy-combined-rollback
-            write_journal committed resumed
-            return 0
         elif legacy_flat_present && verify_legacy_terminal >/dev/null 2>&1; then
             write_journal rollback_verified resumed-legacy-rollback
             write_journal committed resumed
@@ -2977,8 +3400,8 @@ perform_install() {
     check_glibc_compatibility "$MANIFEST" || die 'candidate glibc compatibility check failed'
     IFS=$'\t' read -r bundle_version source_hash manifest_hash binary_hash <<<"$validation"
     candidate_id="$bundle_version-$source_hash-$manifest_hash"; previous_id="$(current_generation)"; operation_id="$(new_operation_id)"
-    previous_flat=0; previous_combined=0; legacy_combined_generation=0; recorder_reused=0
-    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
+    previous_flat=0; previous_combined=0; legacy_combined_generation=0; legacy_combined_prestate=; legacy_recovery_reader_hash=; recorder_reused=0
+    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""; legacy_combined_prestate=; legacy_recovery_reader_hash=
     load_control_state; require_user_manager
     if [[ -n "$previous_id" ]]; then
         recorder_execution="$(recorder_execution_record "$previous_id")" || return 1
@@ -2986,7 +3409,10 @@ perform_install() {
     recorder_override_migrated=0
     if legacy_combined_present; then
         legacy_combined_mixed_split_present && safe_blocked 'legacy combined and split installation states are mixed'
-        capture_legacy_combined_state
+        capture_legacy_combined_prestate
+        local legacy_info
+        legacy_info="$(legacy_combined_record)" || safe_blocked 'legacy combined identity is unavailable'
+        IFS=$'\t' read -r legacy_combined_version _ legacy_combined_manifest_hash _ _ <<<"$legacy_info"
     elif [[ -z "$previous_id" ]] && legacy_flat_present; then
         local legacy_info
         legacy_info="$(legacy_flat_record)" || safe_blocked 'flat predecessor is not trusted'
@@ -3000,6 +3426,14 @@ perform_install() {
     # listener-less flat installation with no recovery authority.
     # Preserve explicit prestate before prepared, so interruption there can restore it.
     if [[ "$recorder_execution" == selected ]]; then capture_recorder_override_prestate "$previous_id"; fi
+    if [[ -n "$legacy_recovery_reader_hash" ]]; then
+        stage_legacy_recovery_handoff
+        [[ "${CODEX_INFO_INTERRUPT_PHASE-}" != legacy_handoff_staged ]] || exit 75
+        prepare_legacy_recovery_reader
+        publish_legacy_recovery_reader
+        [[ "${CODEX_INFO_INTERRUPT_PHASE-}" != legacy_handoff_bound ]] || exit 75
+        promote_legacy_recovery_handoff
+    fi
     write_journal prepared
     if [[ "$recorder_execution" == legacy || "$recorder_execution" == selected ]]; then
         backup_legacy_path "$recorder_override_destination"
@@ -3010,7 +3444,7 @@ perform_install() {
     enforce_desired_state || safe_blocked 'could not enforce desired runtime state'
     retire_known_unmanaged "$managed_pid"
     for destination in "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
-        backup_legacy_path "$destination"
+        if [[ "$destination" != "$installer_destination" || -z "$legacy_recovery_reader_hash" ]]; then backup_legacy_path "$destination"; fi
         # Persist each legacy move, so a crash between two moves can always
         # replay the same operation without guessing from mtimes.
         write_journal prepared
@@ -3023,6 +3457,7 @@ perform_install() {
         safe_blocked 'published candidate artifacts are incoherent'
     fi
     write_journal candidate_published; atomic_symlink "generations/$candidate_id" "$current_link"; write_journal current_switched
+    if [[ -n "$legacy_recovery_reader_hash" ]]; then atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"; fi
     if ! activate_candidate; then rollback_transaction "$previous_id" 'candidate activation failed'; die 'candidate activation failed; previous generation restored'; fi
     write_journal activation_requested
     if ! verify_candidate; then rollback_transaction "$previous_id" 'candidate verification failed'; die 'candidate verification failed; previous generation restored'; fi
@@ -3089,7 +3524,7 @@ reconcile_recorder_override() {
     [[ "$execution" == legacy || "$execution" == selected ]] || return 0
     previous_id="$generation"; candidate_id="$generation"; operation_id="$(new_operation_id)"
     previous_flat=0; previous_combined=0; recorder_reused=0
-    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
+    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""; legacy_combined_prestate=; legacy_recovery_reader_hash=
     capture_runtime_state
     reserve_rollback_budget
     if [[ "$execution" == selected ]]; then capture_recorder_override_prestate "$generation"; fi
@@ -3331,14 +3766,10 @@ fi
 
 initialize_mutating_action
 
-# Every mutating operation settles an interrupted publication under the same
-# nonblocking L1 lock. A committed journal is durable history and requires no
-# replay.
-if (( ! lock_bypassed )) && [[ -f "$transaction" ]]; then
-    read_journal
-    if [[ "$journal_phase" != committed ]]; then
-        resume_transaction
-    fi
+# Settle publication and the bounded legacy entrypoint handoff under L1.
+# Committed history is never rewritten by final entrypoint cleanup.
+if (( ! lock_bypassed )); then
+    resume_transaction
 fi
 
 if [[ "$ACTION" == start ]]; then
