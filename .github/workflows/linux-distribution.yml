@@ -14,17 +14,17 @@ on:
         description: Pull request number used in the candidate identity
         required: true
         type: string
-      release_preflight:
-        description: Run release behavior checks without publication authority
-        type: boolean
-        default: false
-      preflight_plan:
-        description: Trusted read-only prospective release tree, empty for an actual source
-        type: string
-        default: ''
       release_candidate:
         description: Whether this run may publish a pre-merge candidate
         required: true
+        type: boolean
+      linux_backend_acceptance:
+        description: Run the selected backend acceptance against the packaged binaries
+        default: false
+        type: boolean
+      linux_ui_acceptance:
+        description: Run the selected UI acceptance against the packaged binaries
+        default: false
         type: boolean
 
 permissions:
@@ -44,41 +44,23 @@ jobs:
           fetch-depth: 1
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
-      - name: Reconstruct the trusted planned release tree
-        if: inputs.preflight_plan != ''
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          TRUSTED_SHA: ${{ github.workflow_sha }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          PLAN: ${{ inputs.preflight_plan }}
-          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
-        run: |
-          set -euo pipefail
-          [[ "$RELEASE_CANDIDATE" == false ]] || {
-            echo 'a prospective tree cannot publish a release candidate' >&2
-            exit 1
-          }
-          [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          trusted="$RUNNER_TEMP/planned-release-trusted"
-          mkdir -p "$trusted/.github/scripts" "$trusted/scripts"
-          for file in .github/scripts/release_preflight.py scripts/product_version.py; do
-            gh api "repos/$REPOSITORY/contents/$file?ref=$TRUSTED_SHA" \
-              --jq '.content' | base64 --decode > "$trusted/$file"
-          done
-          python_command=python3
-          if [[ "$RUNNER_OS" == Windows ]]; then python_command=python; fi
-          "$python_command" "$trusted/.github/scripts/release_preflight.py" apply \
-            --source "$SOURCE_SHA" --workflow "$TRUSTED_SHA" --plan "$PLAN"
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: x86_64-unknown-linux-gnu
+      - name: Restore compiled Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: distribution-x86_64-unknown-linux-gnu
+          workspaces: . -> target/distribution
+          env-vars: ImageOS
+          cache-workspace-crates: 'false'
+          cache-bin: 'false'
       - name: Install bundle validation tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq xvfb xauth xdotool x11-utils x11-apps libxkbcommon-x11-0
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq ripgrep sqlite3 xvfb xauth xdotool x11-utils x11-apps libxkbcommon-x11-0
       - name: Build the exact Linux target
         run: >-
           cargo build --release --locked --target "$LINUX_BUNDLE_TARGET"
+          --target-dir target/distribution
           -p codex_info -p codex-info-recorder -p codex-info-rest
       - name: Create and validate the Linux bundle
         id: bundle
@@ -87,27 +69,47 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_BACKEND_ACCEPTANCE: ${{ inputs.release_candidate && inputs.linux_backend_acceptance }}
+          RUN_UI_ACCEPTANCE: ${{ inputs.release_candidate && inputs.linux_ui_acceptance }}
         run: |
           set -euo pipefail
           output_dir="$RUNNER_TEMP/codex-info-linux-bundle"
           mkdir -p "$output_dir"
           bash scripts/build_linux_bundle.sh \
-            --ui-binary "target/$LINUX_BUNDLE_TARGET/release/codex_info" \
-            --recorder-binary "target/$LINUX_BUNDLE_TARGET/release/codex_info_recorder" \
-            --rest-binary "target/$LINUX_BUNDLE_TARGET/release/codex_info_rest" \
+            --ui-binary "target/distribution/$LINUX_BUNDLE_TARGET/release/codex_info" \
+            --recorder-binary "target/distribution/$LINUX_BUNDLE_TARGET/release/codex_info_recorder" \
+            --rest-binary "target/distribution/$LINUX_BUNDLE_TARGET/release/codex_info_rest" \
             --output-dir "$output_dir" \
             --source-sha "$SOURCE_SHA" \
             --run-id "$RUN_ID" \
             --run-attempt "$RUN_ATTEMPT"
           bash scripts/test_linux_bundle.sh --bundle-dir "$output_dir"
           archive="$(find "$output_dir" -mindepth 1 -maxdepth 1 -type f -name 'codex-info-*-x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
-          candidate_root="$GITHUB_WORKSPACE/.release-candidate-linux"
+          # Existing acceptance scripts use target/release. Populate it only
+          # from this archive, never from a second host build or a cache.
+          candidate_root="$GITHUB_WORKSPACE/target/release"
           mkdir "$candidate_root"
           tar -xzf "$archive" -C "$candidate_root" --no-same-owner
-          CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info" \
+          for binary in codex_info codex_info_recorder codex_info_rest; do
+            test -x "$candidate_root/$binary"
+          done
+          if [[ "$RUN_BACKEND_ACCEPTANCE" == true ]]; then
+            bash scripts/cli_contract_e2e.sh
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac' \
-            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
-            bash scripts/x11_service_recovery_visual_gate.sh
+              env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET bash scripts/record_daemon_e2e.sh
+          fi
+          if [[ "$RUN_UI_ACCEPTANCE" == true ]]; then
+            # Startup includes service recovery; do not repeat it below.
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac' \
+              env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET bash scripts/x11_startup_visual_gate.sh
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac' \
+              env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET bash scripts/x11_graph_visual_gate.sh
+          else
+            CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info" \
+              xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac' \
+              env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+              bash scripts/x11_service_recovery_visual_gate.sh
+          fi
           rm -r -- "$candidate_root"
           version="$(jq -er '.version | select(type == "string")' "$output_dir"/*.manifest.json)"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
