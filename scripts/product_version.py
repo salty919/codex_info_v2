@@ -431,6 +431,30 @@ def beta_version(stable_version: str, run_number: str, run_attempt: str) -> str:
     return f"{_next_patch(stable_version)}-beta.{run_number}.{run_attempt}"
 
 
+def compare_versions(left: str, right: str) -> int:
+    """Compare bounded canonical identities without files, Git or network access.
+
+    Future Linux candidate selection reuses this numeric precedence function;
+    this calculation does not authorize a channel transition or installation.
+    """
+    decimal = r"(?:0|[1-9][0-9]*)"
+    identity = rf"({decimal})[.]({decimal})[.]({decimal})(?:-beta[.]([1-9][0-9]*)[.]([1-9][0-9]*))?"
+
+    def key(value: str, option: str) -> tuple[int, int, int, int, int, int]:
+        if not isinstance(value, str) or not 1 <= len(value) <= 32:
+            raise ProductVersionError(f"{option}: invalid canonical product version")
+        match = re.fullmatch(identity, value, re.ASCII)
+        if match is None:
+            raise ProductVersionError(f"{option}: invalid canonical product version")
+        basis = tuple(int(match.group(index)) for index in (1, 2, 3))
+        if match.group(4) is None:
+            return (*basis, 1, 0, 0)
+        return (*basis, 0, int(match.group(4)), int(match.group(5)))
+
+    first, second = key(left, "--left"), key(right, "--right")
+    return (first > second) - (first < second)
+
+
 def _write_staged(path: Path, data: bytes, mode: int, label: str) -> Path:
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.{label}-", dir=str(path.parent)
@@ -662,6 +686,10 @@ def _parser() -> argparse.ArgumentParser:
     beta.add_argument("--run-number", required=True, help="positive canonical GitHub run number")
     beta.add_argument("--run-attempt", required=True, help="positive canonical GitHub run attempt")
 
+    comparison = commands.add_parser("compare", help="compare canonical stable/beta identities without files")
+    comparison.add_argument("--left", required=True, help="bounded canonical product identity")
+    comparison.add_argument("--right", required=True, help="bounded canonical product identity")
+
     stamp = commands.add_parser("stamp-beta", help="stamp an explicit isolated build snapshot")
     stamp.add_argument("--snapshot", type=Path, required=True)
     stamp.add_argument("--expected-source-version", required=True)
@@ -687,6 +715,13 @@ def _paths_from_arguments(arguments: argparse.Namespace) -> VersionPaths:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    if arguments.command == "compare":
+        try:
+            print(f"comparison={compare_versions(arguments.left, arguments.right)}")
+            return 0
+        except ProductVersionError as exc:
+            print(f"product-version: ERROR: {exc}", file=sys.stderr)
+            return 1
     paths = _paths_from_arguments(arguments)
     try:
         if arguments.command == "check":

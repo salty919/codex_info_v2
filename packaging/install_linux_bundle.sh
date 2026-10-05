@@ -17,6 +17,13 @@ CURL_BIN="${CURL_BIN:-curl}"
 GETCONF_BIN="${GETCONF_BIN:-getconf}"
 LDD_BIN="${LDD_BIN:-ldd}"
 ACTION=install
+SELECTION_METADATA=
+SELECTION_CURRENT=
+SELECTION_CHANNEL=stable
+SELECTION_CHANNEL_SET=0
+SELECTION_COHERENT=1
+SELECTION_COHERENT_SET=0
+selection_arguments=0
 ARCHIVE=
 MANIFEST=
 CHECKSUM=
@@ -95,6 +102,7 @@ usage() {
     cat <<'EOF'
 usage: install.sh --bundle ARCHIVE [--manifest FILE] [--sha256 FILE]
        install.sh --update [--migrate-recorder-override]
+       install.sh --select-release --release-metadata FILE --current-version VERSION [--channel stable|beta] [--local-coherent 0|1]
        install.sh --start
        install.sh --stop
        install.sh --disable-autostart
@@ -142,6 +150,25 @@ while (($# > 0)); do
         --update)
             [[ "$ACTION" == install && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] || die 'update cannot be combined with bundle options'
             ACTION=update; shift ;;
+        --select-release)
+            [[ "$ACTION" == install && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] || die 'selection cannot be combined with another action'
+            ACTION=select-release; shift ;;
+        --release-metadata)
+            (($# >= 2)) || die '--release-metadata requires a path'
+            [[ -z "$SELECTION_METADATA" ]] || die 'release metadata supplied twice'
+            SELECTION_METADATA="$2"; selection_arguments=1; shift 2 ;;
+        --current-version)
+            (($# >= 2)) || die '--current-version requires a version'
+            [[ -z "$SELECTION_CURRENT" ]] || die 'current version supplied twice'
+            SELECTION_CURRENT="$2"; selection_arguments=1; shift 2 ;;
+        --channel)
+            (($# >= 2)) || die '--channel requires stable or beta'
+            (( ! SELECTION_CHANNEL_SET )) || die 'selection channel supplied twice'
+            SELECTION_CHANNEL="$2"; SELECTION_CHANNEL_SET=1; selection_arguments=1; shift 2 ;;
+        --local-coherent)
+            (($# >= 2)) || die '--local-coherent requires 0 or 1'
+            (( ! SELECTION_COHERENT_SET )) || die 'local coherence supplied twice'
+            SELECTION_COHERENT="$2"; SELECTION_COHERENT_SET=1; selection_arguments=1; shift 2 ;;
         --migrate-recorder-override)
             (( ! migrate_recorder_override )) || die 'recorder migration supplied twice'
             migrate_recorder_override=1; shift ;;
@@ -181,6 +208,13 @@ while (($# > 0)); do
         *) die "unknown argument: $1" ;;
     esac
 done
+
+if [[ "$ACTION" == select-release ]]; then
+    [[ -n "$SELECTION_METADATA" && -n "$SELECTION_CURRENT" && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] ||
+        die 'selection requires local metadata and current version only'
+elif (( selection_arguments )); then
+    die 'selection options require --select-release'
+fi
 
 if (( migrate_recorder_override )); then
     [[ "$ACTION" == update || ( "$ACTION" == install && -n "$ARCHIVE" &&
@@ -3658,38 +3692,80 @@ run_update() {
     rm -r -- "$update_root"; update_root=; update_stage=complete; update_log succeeded; ((QUIET)) || printf 'updated from=%s to=%s\n' "$installed_version" "$newest"
 }
 select_release() {
-    local release="$1" current="$2" local_coherent="${3:-0}"
-    python3 - "$release" "$current" "$local_coherent" "$TARGET" <<'PY'
-import json,pathlib,re,sys
-release_path,current_text,local_coherent,target=sys.argv[1:]
+    local release="$1" current="$2" local_coherent="${3:-0}" channel="${4:-stable}" version_module
+    version_module="${running_installer_source%/*}/product_version.py"
+    # Direct source invocation has a fixed source-tree layout. Installed
+    # generations always use their own manifest-bound sibling, never a repo.
+    if [[ "${running_installer_source##*/}" == install_linux_bundle.sh &&
+          "${running_installer_source%/*}" == */packaging ]]; then
+        version_module="${running_installer_source%/*}/../scripts/product_version.py"
+    fi
+    python3 -B - "$release" "$current" "$local_coherent" "$TARGET" "$channel" "$version_module" <<'PY'
+import importlib.util,json,pathlib,re,sys
+release_path,current_text,local_coherent,target,channel,module_name=sys.argv[1:]
 def reject(message): raise SystemExit("release metadata validation failed: "+message)
-try: release=json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
-except Exception as error: reject(str(error))
-if not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",current_text): reject("installed version invalid")
-if not isinstance(release,dict): reject("latest release is not an object")
-tag=release.get("tag_name")
-match=re.fullmatch(r"windows-v((?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*))",tag) if isinstance(tag,str) else None
-if match is None: reject("latest release tag malformed")
-newest_text=match.group(1); newest=tuple(map(int,newest_text.split(".")))
-current=tuple(map(int,current_text.split(".")))
-assets=release.get("assets")
-if not isinstance(assets,list): reject("latest release assets are not an array")
-archive_name=f"codex-info-{newest_text}-{target}.tar.gz"
+if channel not in {"stable","beta"} or local_coherent not in {"0","1"}: reject("selection arguments invalid")
+module_path=pathlib.Path(module_name)
+if module_path.is_symlink() or not module_path.is_file(): reject("shared comparison module unavailable")
+try:
+    spec=importlib.util.spec_from_file_location("codex_info_product_version",module_path)
+    if spec is None or spec.loader is None: reject("shared comparison module unavailable")
+    product_version=importlib.util.module_from_spec(spec)
+    sys.modules[spec.name]=product_version
+    spec.loader.exec_module(product_version)
+except (OSError,ImportError,SyntaxError) as error: reject(str(error))
+def compare(left,right):
+    try: return product_version.compare_versions(left,right)
+    except product_version.ProductVersionError as error: reject(str(error))
+compare(current_text,current_text)
+try: metadata=json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
+except (OSError,UnicodeError,json.JSONDecodeError) as error: reject(str(error))
+single=isinstance(metadata,dict)
+if not single and not isinstance(metadata,list): reject("release metadata is not an object or array")
+releases=[metadata] if single else metadata
 selected=None
-for asset in assets:
-    if not isinstance(asset,dict): continue
-    name=asset.get("name")
-    if name != archive_name: continue
-    if selected is not None: reject("latest release has multiple Linux archives for this version")
-    url,digest=(asset.get(key) for key in ("browser_download_url","digest"))
-    if not isinstance(url,str) or not isinstance(digest,str) or not re.fullmatch(r"sha256:[0-9a-f]{64}",digest):
-        reject("Linux archive digest or download URL is unavailable")
-    selected=(url,digest)
-if selected is None: reject("latest release is missing its Linux archive")
-needs=(newest>current or local_coherent!="1")
-if newest<current or not needs: print("no-update",newest_text,sep="\t"); raise SystemExit(0)
+seen=set()
+for release in releases:
+    if not isinstance(release,dict): reject("release metadata entry is not an object")
+    draft,prerelease=(release.get(key) for key in ("draft","prerelease"))
+    if not isinstance(draft,bool) or not isinstance(prerelease,bool): reject("release publication flags invalid")
+    if draft:
+        if single: reject("latest release is a draft")
+        continue
+    tag=release.get("tag_name")
+    if not isinstance(tag,str) or not tag.startswith("windows-v"): reject("release tag malformed")
+    version=tag.removeprefix("windows-v")
+    compare(version,version)
+    if ("-beta." in version)!=prerelease: reject("release channel/tag mismatch")
+    if prerelease!=(channel=="beta"):
+        if single: reject("latest release is not the selected channel")
+        continue
+    if version in seen: reject("release version is ambiguous")
+    seen.add(version)
+    assets=release.get("assets")
+    if not isinstance(assets,list): reject("release assets are not an array")
+    archive_name=f"codex-info-{version}-{target}.tar.gz"
+    expected_url=f"https://github.com/salty919/codex_info_v2/releases/download/{tag}/{archive_name}"
+    archive=None
+    for asset in assets:
+        if not isinstance(asset,dict) or asset.get("name")!=archive_name: continue
+        if archive is not None: reject("release has multiple Linux archives for this version")
+        url,digest=(asset.get(key) for key in ("browser_download_url","digest"))
+        if asset.get("state")!="uploaded" or url!=expected_url: reject("Linux archive incomplete or download URL mismatch")
+        if not isinstance(digest,str) or not re.fullmatch(r"sha256:[0-9a-f]{64}",digest):
+            reject("Linux archive digest is unavailable")
+        archive=(archive_name,url,digest)
+    if archive is None: reject("release is missing its Linux archive")
+    if selected is None or compare(version,selected[0])>0: selected=(version,archive)
+if selected is None:
+    print("no-candidate",channel,sep="\t")
+    raise SystemExit(0)
+newest_text,archive=selected
+order=compare(newest_text,current_text)
+needs=(order>0 or local_coherent!="1")
+if order<0 or not needs: print("no-update",newest_text,sep="\t"); raise SystemExit(0)
 print("update",newest_text,sep="\t")
-print(archive_name,selected[0],selected[1],sep="\t")
+print(*archive,sep="\t")
 PY
 }
 download_asset() {
@@ -3713,6 +3789,13 @@ readonly_transaction_check() {
         safe_blocked 'transaction journal requires a mutating reconcile'
     fi
 }
+
+# Local metadata selection never initializes state, replays a journal,
+# downloads an asset, changes a channel, or enters the install path.
+if [[ "$ACTION" == select-release ]]; then
+    select_release "$SELECTION_METADATA" "$SELECTION_CURRENT" "$SELECTION_COHERENT" "$SELECTION_CHANNEL"
+    exit
+fi
 
 # Read-only actions intentionally run before all mutating initialization: no
 # state directories, lock file, journal replay, or control-state write is
