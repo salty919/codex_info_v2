@@ -34,6 +34,10 @@ backup_dir="$share_dir/legacy-backups"
 generations_dir="$share_dir/generations"
 install_lock="$share_dir/.install.lock"
 transaction="$share_dir/transaction.json"
+# Diagnostics are outside this clock/runtime oracle. Supply their caller dependencies.
+update_stage=
+update_failure_file="$share_dir/last-update-failure.txt"
+update_log() { :; }
 backup_dir="$fixture_root/backups"
 current_link="$share_dir/current"
 clock="$fixture_root/clock"
