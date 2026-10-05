@@ -820,7 +820,7 @@ public sealed record UiText(
 public static class LocalizationService
 {
     private static readonly UiText Japanese = new(
-        "ja", "日本語", "Codex Info Monitor", "Windows 監視クライアント", "利用状況", "推移", "Threads", "法的通知", "設定", "更新", "更新中…",
+        "ja", "日本語", "Codex Info Monitor", "Windows 監視クライアント", "CODEX情報", "推移", "Threads", "法的通知", "設定", "更新", "更新中…",
         "残り利用枠", "アカウント", "認証", "プラン", "リセット時刻", "観測時刻", "前回受信", "生成済みスレッド", "対象のスレッドはありません", "詳細",
         "モデル別利用量", "入力", "キャッシュ入力", "出力", "トークン", "概算ドル", "接続", "接続先: 127.0.0.1:8787（SSH ローカルポート転送専用）", "初期設定",
         "Codex Infoへようこそ", "Linux側のAPIとSSHローカル転送を確認して、安全に監視を始めます。認証情報やトークンは保存しません。", "接続ガイド",
