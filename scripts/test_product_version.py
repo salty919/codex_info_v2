@@ -562,9 +562,11 @@ class BetaStampFixtures(unittest.TestCase):
                 raise OSError("fixture beta replacement failure")
             real_replace(source, destination)
 
-        with mock.patch.object(product_version.os, "replace", side_effect=fail_third_replace):
-            with self.assertRaisesRegex(OSError, "fixture beta replacement failure"):
-                product_version.stamp_beta(Path(fixture.directory.name), "1.0.119", "a" * 40, "1.0.109", "7", "1")
+        with (
+            mock.patch.object(product_version.os, "replace", side_effect=fail_third_replace),
+            self.assertRaisesRegex(OSError, "fixture beta replacement failure"),
+        ):
+            product_version.stamp_beta(Path(fixture.directory.name), "1.0.119", "a" * 40, "1.0.109", "7", "1")
         self.assertEqual(before, fixture.snapshot())
         self.assertEqual(list(Path(fixture.directory.name).rglob(".*")), [])
 
