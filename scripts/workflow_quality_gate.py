@@ -1736,12 +1736,13 @@ def _version_state_tests(version_workflow: str) -> int:
             cwd=seed,
         ).stdout.strip().removeprefix("version=")
         expected_message = (
-            f"chore: prepare version {next_version}\n\n"
+            f"chore: prepare version {next_version}\n\n\n"
             "Codex-Version-Prepare-Schema: v1\n"
             "Codex-Version-Prepare-PR: 44\n"
             f"Codex-Version-Prepare-Event-Head: {h0}\n"
             "Codex-Version-Prepare-Run-ID: 12345\n"
-            "Codex-Version-Prepare-Run-Attempt: 7"
+            "Codex-Version-Prepare-Run-Attempt: 7\n"
+            "skip-checks: true"
         )
         message = _git(remote, "show", "-s", "--format=%B", h1)
         if message != expected_message or _git(remote, "rev-parse", f"{h1}^") != h0:
@@ -1828,12 +1829,13 @@ def _version_state_tests(version_workflow: str) -> int:
         _bump(fixture, version)
         next_version = _checked_version(seed)
         invalid_identity = (
-            f"chore: prepare version {next_version}\n\n"
+            f"chore: prepare version {next_version}\n\n\n"
             "Codex-Version-Prepare-Schema: v1\n"
             "Codex-Version-Prepare-PR: 45\n"
             f"Codex-Version-Prepare-Event-Head: {parent}\n"
             "Codex-Version-Prepare-Run-ID: 12345\n"
-            "Codex-Version-Prepare-Run-Attempt: 7"
+            "Codex-Version-Prepare-Run-Attempt: 7\n"
+            "skip-checks: true"
         )
         head = _commit(fixture, invalid_identity)
         result, values = _run_version_step(
@@ -1855,12 +1857,13 @@ def _version_state_tests(version_workflow: str) -> int:
         _bump(fixture, version)
         next_version = _checked_version(seed)
         schema_like_message = (
-            f"chore: prepare version {next_version}\n\n"
+            f"chore: prepare version {next_version}\n\n\n"
             "Codex-Version-Prepare-Schema: v1\n"
             "Codex-Version-Prepare-PR: 44\n"
             f"Codex-Version-Prepare-Event-Head: {parent}\n"
             "Codex-Version-Prepare-Run-ID: 12345\n"
             "Codex-Version-Prepare-Run-Attempt: 7\n"
+            "skip-checks: true\n"
             "Unexpected-Text: manual"
         )
         head = _commit(fixture, schema_like_message)
@@ -2109,12 +2112,13 @@ def _commit_object(
 
 def _invalid_generated_message(parent: str) -> str:
     return (
-        f"chore: prepare version {_VERSION}\n\n"
+        f"chore: prepare version {_VERSION}\n\n\n"
         "Codex-Version-Prepare-Schema: v1\n"
         "Codex-Version-Prepare-PR: 45\n"
         f"Codex-Version-Prepare-Event-Head: {parent}\n"
         "Codex-Version-Prepare-Run-ID: 999\n"
-        "Codex-Version-Prepare-Run-Attempt: 1"
+        "Codex-Version-Prepare-Run-Attempt: 1\n"
+        "skip-checks: true"
     )
 
 
@@ -2382,12 +2386,13 @@ def _generated_release_responses() -> tuple[dict[str, object], dict[str, object]
     generator = _quality_run(301, 30, 7, head=generator_head, action="opened")
     observer = _quality_run(302, 31, 1, head=_FINAL_HEAD, action="synchronize")
     message = (
-        f"chore: prepare version {_VERSION}\n\n"
+        f"chore: prepare version {_VERSION}\n\n\n"
         "Codex-Version-Prepare-Schema: v1\n"
         f"Codex-Version-Prepare-PR: {_PR_NUMBER}\n"
         f"Codex-Version-Prepare-Event-Head: {generator_head}\n"
         "Codex-Version-Prepare-Run-ID: 301\n"
-        "Codex-Version-Prepare-Run-Attempt: 7"
+        "Codex-Version-Prepare-Run-Attempt: 7\n"
+        "skip-checks: true"
     )
     candidate = _release_candidate(301, 7)
     responses: dict[str, object] = {
@@ -2421,6 +2426,130 @@ def _generated_release_responses() -> tuple[dict[str, object], dict[str, object]
         ),
     }
     return responses, generator
+
+
+class ReleaseGeneratedCommitTests(unittest.TestCase):
+    # Fixed wire shape observed on PR #534's H1; identities are local fixtures.
+    message = (
+        "chore: prepare version 1.2.3\n\n\n"
+        "Codex-Version-Prepare-Schema: v1\n"
+        "Codex-Version-Prepare-PR: 44\n"
+        "Codex-Version-Prepare-Event-Head: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n"
+        "Codex-Version-Prepare-Run-ID: 301\n"
+        "Codex-Version-Prepare-Run-Attempt: 7\n"
+        "skip-checks: true"
+    )
+
+    def setUp(self) -> None:
+        workflow = sources()["release.yml"]
+        self.resolve_script = _step_script(
+            workflow, "Resolve the immutable publication snapshot"
+        )
+        self.revalidate_script = _step_script(
+            workflow, "Revalidate authority after acquiring the tag lock"
+        )
+        self.responses, self.generator = _generated_release_responses()
+        self.commit_endpoint = f"repos/{_REPOSITORY}/commits/{_FINAL_HEAD}"
+        self.responses[self.commit_endpoint]["commit"]["message"] = self.message
+        # skip-checks H1 has no direct run: its H0 producer is the authority.
+        self.responses[_runs_endpoint()] = _object_pages(
+            "workflow_runs", [self.generator]
+        )
+        summary = [{
+            "run_id": 301, "run_number": 30, "latest_attempt": 7,
+            "status": "completed", "conclusion": "success",
+        }]
+        self.authority = {
+            "artifact_id": "30107",
+            "artifact_ids": "30107,30107",
+            "artifact_name": (
+                f"release-candidate-v1-pr-44-head-{_FINAL_HEAD}"
+                "-run-301-attempt-7-version-1.2.3"
+            ),
+            "final_head": _FINAL_HEAD,
+            "fingerprint": hashlib.sha256(
+                json.dumps(summary, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "merge_sha": _MERGE_SHA,
+            "pr_number": "44",
+            "run_attempt": "7",
+            "run_id": "301",
+            "run_number": "30",
+            "linux_present": "true",
+            "windows_present": "true",
+            "version": "1.2.3",
+        }
+
+    def test_current_generated_commit_resolves_from_both_signals(self) -> None:
+        for event_name, event in (
+            ("pull_request_target", _closed_event()),
+            ("workflow_run", _workflow_event(self.generator)),
+        ):
+            with self.subTest(event=event_name):
+                result, values, _ = _execute_release_shell(
+                    self.resolve_script, self.responses,
+                    event_name=event_name, event=event,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(values.get("publish"), "true", result.stdout)
+                for key, expected in self.authority.items():
+                    self.assertEqual(values.get(key), expected, key)
+
+    def test_current_generated_commit_revalidates_after_tag_lock(self) -> None:
+        result, values = _execute_revalidation(
+            self.revalidate_script, self.responses, self.authority,
+            event_name="pull_request_target", event=_closed_event(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values.get("proceed"), "true", result.stdout)
+
+    def test_noncanonical_or_mismatched_identity_cannot_supply_authority(self) -> None:
+        cases = {
+            "old-separator": self.message.replace("\n\n\n", "\n\n", 1),
+            "missing-skip": self.message.removesuffix("\nskip-checks: true"),
+            "extra-trailer": self.message + "\nUnexpected-Text: manual",
+            "wrong-pr": self.message.replace("Prepare-PR: 44", "Prepare-PR: 45"),
+            "wrong-run": self.message.replace("Prepare-Run-ID: 301", "Prepare-Run-ID: 999"),
+            "wrong-attempt": self.message.replace("Prepare-Run-Attempt: 7", "Prepare-Run-Attempt: 8"),
+            "wrong-parent": self.message,
+        }
+        for name, message in cases.items():
+            with self.subTest(case=name):
+                responses = json.loads(json.dumps(self.responses))
+                commit = responses[self.commit_endpoint]
+                commit["commit"]["message"] = message
+                if name == "wrong-parent":
+                    commit["parents"][0]["sha"] = "d" * 40
+                result, values, _ = _execute_release_shell(
+                    self.resolve_script, responses,
+                    event_name="pull_request_target", event=_closed_event(),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(values.get("publish"), "false")
+                result, values = _execute_revalidation(
+                    self.revalidate_script, responses, self.authority,
+                    event_name="pull_request_target", event=_closed_event(),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(values.get("proceed"), "false")
+
+    def test_failed_producer_attempt_is_not_overridden_by_retry(self) -> None:
+        failed = dict(self.generator, conclusion="failure")
+        latest = dict(self.generator, run_attempt=8)
+        self.responses[f"repos/{_REPOSITORY}/actions/runs/301"] = latest
+        self.responses[f"repos/{_REPOSITORY}/actions/runs/301/attempts/7"] = failed
+        self.responses[_runs_endpoint()] = _object_pages("workflow_runs", [latest])
+        result, values, calls = _execute_release_shell(
+            self.resolve_script, self.responses,
+            event_name="pull_request_target", event=_closed_event(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values.get("publish"), "false")
+        self.assertIn("a same-final-head attempt is pending or concluded non-success", result.stdout)
+        self.assertTrue(any(
+            f"repos/{_REPOSITORY}/actions/runs/301/attempts/7" in call
+            for call in calls
+        ))
 
 
 def _release_resolution_tests(release_workflow: str) -> int:
@@ -3639,8 +3768,15 @@ def release_self_test() -> int:
     errors = validate(baseline)
     if errors:
         raise AssertionError("production workflow contract failed: " + "; ".join(errors))
+    suite = unittest.TestLoader().loadTestsFromTestCase(ReleaseGeneratedCommitTests)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    if not result.wasSuccessful():
+        return 1
     cases = _release_resolution_tests(baseline["release.yml"])
-    print(f"workflow-quality-gate: PASS release_resolution_cases={cases}")
+    print(
+        "workflow-quality-gate: PASS "
+        f"release_commit_tests={result.testsRun} release_resolution_cases={cases}"
+    )
     return 0
 
 
