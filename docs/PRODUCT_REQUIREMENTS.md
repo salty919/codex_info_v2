@@ -27,6 +27,7 @@ WF-NONBLOCKING-QUALITY-01
 WF-POSTMERGE-01
 VER-AUTO-PATCH-01
 VER-SERIES-FIXED-01
+VER-BETA-IDENTITY-467
 WF-SERIAL-01
 LINUX-BUNDLE-TARGET-01
 LINUX-BUNDLE-RELEASE-01
@@ -185,6 +186,14 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 
 ## 7. 配布・顧客向け表明
 
+- `VER-BETA-IDENTITY-467`: 採番CLIの`beta --stable-version X.Y.Z --run-number N --run-attempt A`は、
+  callerが固定したmain stable snapshot由来のcanonical stable `X.Y.Z`と、GitHubの正canonical十進整数N/Aを入力とする。
+  major/minorを維持しpatchだけ十進で1増やした`X.Y.(Z+1)-beta.N.A`、`windows-v`付きtag、`channel=beta`、
+  `prerelease=true`、`make_latest=false`をidentity metadataとして出力する。同じ固定入力は同じidentity、新runまたはattemptは
+  異なるidentityとする。例は`1.0.109/7/1 → 1.0.110-beta.7.1`、`2.7.99/7/1 → 2.7.100-beta.7.1`。
+  非canonical stable、prerelease stable、N/Aの0・負値・leading zeroは出力前に拒否する。file・Git・networkは変更しない。
+  stable `check/next/bump`と3 version fileのstable限定契約を維持する。tagの予約・存在/衝突確認、source identity固定、
+  full versionのbinary stamp、公開producer、channel選択、stable復帰は後続責務であり、この計算の成功はRelease作成を意味しない。
 - Windows製品版とX版は単一のstable `X.Y.Z`を共有する。バイナリ影響ありのPRはmajor/minorを変更せず、mergeごとに
   自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
   `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。
