@@ -31,10 +31,15 @@ jobs:
       - name: Install Linux UI quality tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Restore compiled Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ui-release
+          workspaces: . -> target
+          env-vars: ImageOS
+          cache-workspace-crates: 'false'
+          cache-bin: 'false'
       - name: Build native release for UI evaluation
-        run: cargo build --release --locked -p codex_info -p codex-info-recorder -p codex-info-rest
-      - name: Run startup UI image and failure-state acceptance
-        if: inputs.release_candidate
-        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/x11_startup_visual_gate.sh
+        run: cargo build --release --locked -p codex_info
       - name: Run graph UI image acceptance
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/x11_graph_visual_gate.sh

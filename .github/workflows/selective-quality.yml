@@ -131,7 +131,7 @@ jobs:
 
   linux-ui-quality:
     name: linux-ui-quality
-    if: contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI')
+    if: contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI') && !fromJSON(inputs.selection_json).distribution_required
     uses: ./.github/workflows/linux-ui-quality.yml
     with:
       source_sha: ${{ inputs.source_sha }}
@@ -170,6 +170,8 @@ jobs:
       source_sha: ${{ inputs.source_sha }}
       pr_number: ${{ inputs.pr_number }}
       release_candidate: ${{ inputs.release_candidate }}
+      linux_backend_acceptance: ${{ contains(fromJSON(inputs.selection_json).owners, 'LINUX_BACKEND') }}
+      linux_ui_acceptance: ${{ contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI') }}
     permissions:
       contents: read
 

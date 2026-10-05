@@ -18,6 +18,14 @@ on:
         description: Whether this run may publish a pre-merge candidate
         required: true
         type: boolean
+      linux_backend_acceptance:
+        description: Run the selected backend acceptance against the packaged binaries
+        default: false
+        type: boolean
+      linux_ui_acceptance:
+        description: Run the selected UI acceptance against the packaged binaries
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -39,11 +47,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: x86_64-unknown-linux-gnu
+      - name: Restore compiled Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: distribution-x86_64-unknown-linux-gnu
+          workspaces: . -> target/distribution
+          env-vars: ImageOS
+          cache-workspace-crates: 'false'
+          cache-bin: 'false'
       - name: Install bundle validation tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq xvfb xauth xdotool x11-utils x11-apps libxkbcommon-x11-0
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq ripgrep sqlite3 xvfb xauth xdotool x11-utils x11-apps libxkbcommon-x11-0
       - name: Build the exact Linux target
         run: >-
           cargo build --release --locked --target "$LINUX_BUNDLE_TARGET"
+          --target-dir target/distribution
           -p codex_info -p codex-info-recorder -p codex-info-rest
       - name: Create and validate the Linux bundle
         id: bundle
@@ -52,27 +69,47 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_BACKEND_ACCEPTANCE: ${{ inputs.release_candidate && inputs.linux_backend_acceptance }}
+          RUN_UI_ACCEPTANCE: ${{ inputs.release_candidate && inputs.linux_ui_acceptance }}
         run: |
           set -euo pipefail
           output_dir="$RUNNER_TEMP/codex-info-linux-bundle"
           mkdir -p "$output_dir"
           bash scripts/build_linux_bundle.sh \
-            --ui-binary "target/$LINUX_BUNDLE_TARGET/release/codex_info" \
-            --recorder-binary "target/$LINUX_BUNDLE_TARGET/release/codex_info_recorder" \
-            --rest-binary "target/$LINUX_BUNDLE_TARGET/release/codex_info_rest" \
+            --ui-binary "target/distribution/$LINUX_BUNDLE_TARGET/release/codex_info" \
+            --recorder-binary "target/distribution/$LINUX_BUNDLE_TARGET/release/codex_info_recorder" \
+            --rest-binary "target/distribution/$LINUX_BUNDLE_TARGET/release/codex_info_rest" \
             --output-dir "$output_dir" \
             --source-sha "$SOURCE_SHA" \
             --run-id "$RUN_ID" \
             --run-attempt "$RUN_ATTEMPT"
           bash scripts/test_linux_bundle.sh --bundle-dir "$output_dir"
           archive="$(find "$output_dir" -mindepth 1 -maxdepth 1 -type f -name 'codex-info-*-x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
-          candidate_root="$GITHUB_WORKSPACE/.release-candidate-linux"
+          # Existing acceptance scripts use target/release. Populate it only
+          # from this archive, never from a second host build or a cache.
+          candidate_root="$GITHUB_WORKSPACE/target/release"
           mkdir "$candidate_root"
           tar -xzf "$archive" -C "$candidate_root" --no-same-owner
-          CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info" \
+          for binary in codex_info codex_info_recorder codex_info_rest; do
+            test -x "$candidate_root/$binary"
+          done
+          if [[ "$RUN_BACKEND_ACCEPTANCE" == true ]]; then
+            bash scripts/cli_contract_e2e.sh
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac' \
-            env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
-            bash scripts/x11_service_recovery_visual_gate.sh
+              env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET bash scripts/record_daemon_e2e.sh
+          fi
+          if [[ "$RUN_UI_ACCEPTANCE" == true ]]; then
+            # Startup includes service recovery; do not repeat it below.
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac' \
+              env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET bash scripts/x11_startup_visual_gate.sh
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac' \
+              env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET bash scripts/x11_graph_visual_gate.sh
+          else
+            CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info" \
+              xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac' \
+              env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+              bash scripts/x11_service_recovery_visual_gate.sh
+          fi
           rm -r -- "$candidate_root"
           version="$(jq -er '.version | select(type == "string")' "$output_dir"/*.manifest.json)"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"

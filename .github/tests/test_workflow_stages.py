@@ -200,6 +200,9 @@ class WorkflowStageTests(unittest.TestCase):
             (True, ["LINUX_BACKEND", "WINDOWS"], ["rust"], True,
              {"linux-backend-quality", "windows-quality", "codeql-quality",
               "linux-distribution", "selected-quality"}),
+            (True, ["LINUX_UI", "WINDOWS"], ["rust"], True,
+             {"windows-quality", "codeql-quality", "linux-distribution", "selected-quality"}),
+            (True, ["LINUX_UI"], [], False, {"linux-ui-quality", "selected-quality"}),
         )
         for release, owners, languages, binary, expected in cases:
             with self.subTest(release=release, owners=owners):
@@ -214,14 +217,14 @@ class WorkflowStageTests(unittest.TestCase):
             ("linux-backend-quality", "rust.yml", "native-quality",
              {"Run native unit tests with coverage", "Reject native compiler and Clippy warnings",
               "Verify recorder and REST compile-time boundary"},
-             {"Build native release", "Run public CLI lifecycle acceptance", "Run recorder daemon live acceptance"}),
+             set()),
             ("windows-quality", "windows-client.yml", "windows-quality",
              {"Run Windows unit tests"}, {"Build standard Windows setup wizard",
               "Upgrade latest published Windows release to the exact candidate",
               "Run installed Windows UI Automation E2E", "Upload release candidate"}),
             ("linux-ui-quality", "linux-ui-quality.yml", "linux-ui-quality",
              {"Build native release for UI evaluation", "Run graph UI image acceptance"},
-             {"Run startup UI image and failure-state acceptance"}),
+             set()),
         )
         for release in (False, True):
             for caller, file, job_id, ordinary, final in cases:
@@ -260,6 +263,172 @@ class WorkflowStageTests(unittest.TestCase):
                              "native_quality_proof.py"):
                 with self.subTest(file=file, obsolete=obsolete):
                     self.assertNotIn(obsolete, text)
+
+
+class LinuxBuildFlowTests(unittest.TestCase):
+    def test_dependency_cache_preserves_parallel_quality_and_excludes_product(self):
+        jobs = workflow('selective-quality.yml')['jobs']
+        for job in ('linux-backend-quality', 'linux-distribution', 'windows-quality', 'codeql-quality'):
+            self.assertNotIn('needs', jobs[job], job)
+        for name, target in (('rust.yml', '. -> target'), ('linux-ui-quality.yml', '. -> target'),
+                             ('linux-distribution.yml', '. -> target/distribution')):
+            with self.subTest(workflow=name):
+                steps = next(iter(workflow(name)['jobs'].values()))['steps']
+                caches = [step for step in steps if step.get('uses', '').startswith('Swatinem/rust-cache@')]
+                self.assertEqual(len(caches), 1, name)
+                cache = caches[0]
+                self.assertRegex(cache['uses'], r'@[a-f0-9]{40}$')
+                self.assertEqual(cache['with']['workspaces'], target)
+                self.assertEqual(cache['with']['cache-workspace-crates'], 'false')
+                self.assertEqual(cache['with']['cache-bin'], 'false')
+                self.assertEqual(cache['with']['env-vars'], 'ImageOS')
+                toolchain = next(i for i, step in enumerate(steps)
+                                 if step.get('uses', '').startswith('dtolnay/rust-toolchain@'))
+                self.assertLess(toolchain, steps.index(cache))
+                # A cache hit never replaces compilation or the tests themselves.
+                for step in steps:
+                    self.assertNotIn('cache-hit', str(step.get('if', '')))
+
+    def test_distribution_build_keeps_cached_host_outputs_away_from_acceptance(self):
+        steps = workflow('linux-distribution.yml')['jobs']['linux-distribution']['steps']
+        build = next(step['run'] for step in steps if step.get('name') == 'Build the exact Linux target')
+        bundle = next(step['run'] for step in steps if step.get('id') == 'bundle')
+        self.assertIn('--target-dir target/distribution', build)
+        self.assertIn('target/distribution/$LINUX_BUNDLE_TARGET/release/', bundle)
+        self.assertIn('candidate_root="$GITHUB_WORKSPACE/target/release"', bundle)
+
+    def inputs(self, release, owners, binary=True):
+        return WorkflowStageTests().inputs(release, owners, binary=binary)
+
+    def bindings(self, caller, inputs):
+        return {key: expression(value, inputs) for key, value in caller['with'].items()
+                if key in ('release_candidate', 'linux_backend_acceptance', 'linux_ui_acceptance')}
+
+    def test_single_release_build_and_ui_only_ordinary_build(self):
+        selective = workflow('selective-quality.yml')['jobs']
+        for release, owners in ((True, ['LINUX_BACKEND', 'LINUX_UI', 'WINDOWS']),
+                                (False, ['LINUX_UI'])):
+            with self.subTest(release=release):
+                inputs = self.inputs(release, owners)
+                builds = []
+                for job_id, name in (('linux-backend-quality', 'rust.yml'),
+                                     ('linux-ui-quality', 'linux-ui-quality.yml'),
+                                     ('linux-distribution', 'linux-distribution.yml')):
+                    caller = selective[job_id]
+                    if not expression(caller['if'], inputs):
+                        continue
+                    bindings = self.bindings(caller, inputs)
+                    for job in workflow(name)['jobs'].values():
+                        for step in job['steps']:
+                            if expression(step.get('if', True), bindings):
+                                builds.extend(line.strip() for line in step.get('run', '').splitlines()
+                                              if 'cargo build ' in line)
+                self.assertEqual(len(builds), 1, builds)
+                if release:
+                    self.assertIn('--target "$LINUX_BUNDLE_TARGET"', builds[0])
+                else:
+                    self.assertEqual(builds, ['cargo build --release --locked -p codex_info'])
+
+    def run_candidate(self, owners, fail_at=''):
+        with tempfile.TemporaryDirectory(prefix='candidate-flow-') as directory:
+            root = Path(directory)
+            (root / 'scripts').mkdir()
+            (root / 'bin').mkdir()
+            (root / 'runner').mkdir()
+            calls = root / 'calls'
+
+            def script(path, body):
+                target = root / path
+                target.write_text('#!/bin/bash\nset -euo pipefail\n' + body)
+                target.chmod(0o755)
+
+            script('bin/cargo', '''
+                printf 'build\\n' >> "$CALLS"
+                target=target
+                while (($#)); do
+                    if [[ "$1" == --target-dir ]]; then target="$2"; shift; fi
+                    shift
+                done
+                mkdir -p "$target/x86_64-unknown-linux-gnu/release"
+                for name in codex_info codex_info_recorder codex_info_rest; do
+                    printf 'packaged:%s\\n' "$name" > "$target/x86_64-unknown-linux-gnu/release/$name"
+                    chmod +x "$target/x86_64-unknown-linux-gnu/release/$name"
+                done
+''')
+            script('bin/xvfb-run', '''
+                while [[ "$1" == --* ]]; do shift; done
+                exec "$@"
+''')
+            script('scripts/build_linux_bundle.sh', '''
+                printf 'bundle\\n' >> "$CALLS"
+                while (($#)); do
+                    case "$1" in
+                        --output-dir) output="$2"; shift 2;;
+                        --ui-binary) payload="$(dirname "$2")"; shift 2;;
+                        *) shift 2;;
+                    esac
+                done
+                tar -czf "$output/codex-info-1.0.0-x86_64-unknown-linux-gnu.tar.gz" -C "$payload" .
+                printf '{}\\n' > "$output/fixture.sha256"
+                printf '{"version":"1.0.0"}\\n' > "$output/fixture.manifest.json"
+''')
+            script('scripts/test_linux_bundle.sh', 'printf "bundle-check\\n" >> "$CALLS"\n')
+            names = {'cli_contract_e2e.sh': 'cli', 'record_daemon_e2e.sh': 'daemon',
+                     'x11_startup_visual_gate.sh': 'startup', 'x11_graph_visual_gate.sh': 'graph',
+                     'x11_service_recovery_visual_gate.sh': 'recovery'}
+            # Preserve the real startup caller's nested recovery invocation.
+            recovery_call = next(line for line in (ROOT / 'scripts/x11_startup_visual_gate.sh').read_text().splitlines()
+                                 if line.startswith('bash ') and 'x11_service_recovery_visual_gate.sh' in line)
+            for name, label in names.items():
+                body = 'root_dir="$PWD"\n'
+                body += 'payload="${CODEX_INFO_ACCEPTANCE_BINARY:-$PWD/target/release/codex_info}"\n'
+                body += 'payload="$(dirname "$payload")"\n'
+                body += 'for name in codex_info codex_info_recorder codex_info_rest; do\n'
+                body += '  [[ -x "$payload/$name" && "$(cat "$payload/$name")" == "packaged:$name" ]]\ndone\n'
+                body += f'printf "{label}\\n" >> "$CALLS"\n'
+                body += f'[[ "$FAIL_AT" != "{label}" ]] || exit 23\n'
+                if label == 'startup':
+                    body += recovery_call + '\n'
+                script('scripts/' + name, body)
+            caller = workflow('selective-quality.yml')['jobs']['linux-distribution']
+            bindings = self.bindings(caller, self.inputs(True, owners))
+            job = workflow('linux-distribution.yml')['jobs']['linux-distribution']
+            env = {**os.environ, 'PATH': str(root / 'bin') + os.pathsep + os.environ['PATH'],
+                   'GITHUB_WORKSPACE': str(root), 'RUNNER_TEMP': str(root / 'runner'),
+                   'GITHUB_OUTPUT': str(root / 'output'), 'CALLS': str(calls), 'FAIL_AT': fail_at,
+                   'LINUX_BUNDLE_TARGET': 'x86_64-unknown-linux-gnu', 'PR_NUMBER': '1',
+                   'SOURCE_SHA': 'a' * 40, 'RUN_ID': '2', 'RUN_ATTEMPT': '1'}
+            result = None
+            for step in job['steps']:
+                if step.get('name') not in ('Build the exact Linux target', 'Create and validate the Linux bundle'):
+                    continue
+                for key, value in step.get('env', {}).items():
+                    if key in ('RUN_BACKEND_ACCEPTANCE', 'RUN_UI_ACCEPTANCE'):
+                        env[key] = str(expression(value, bindings)).lower()
+                # Execute the checked-in workflow against finite local command fixtures only.
+                # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+                result = subprocess.run(  # nosec B603 # absolute Bash, trusted workflow, fixed offline fixtures.
+                    [BASH, '-euo', 'pipefail', '-c', step['run']], cwd=root, env=env,
+                    text=True, capture_output=True, shell=False, check=False)
+                if result.returncode:
+                    break
+            return result, calls.read_text().splitlines()
+
+    def test_candidate_uses_one_build_and_one_recovery_per_selected_path(self):
+        for owners, expected in ((['LINUX_BACKEND', 'LINUX_UI'],
+                                  ['cli', 'daemon', 'startup', 'recovery', 'graph']),
+                                 (['LINUX_BACKEND'], ['cli', 'daemon', 'recovery']),
+                                 (['LINUX_UI'], ['startup', 'recovery', 'graph']),
+                                 (['WINDOWS'], ['recovery'])):
+            with self.subTest(owners=owners):
+                result, calls = self.run_candidate(owners)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls, ['build', 'bundle', 'bundle-check', *expected])
+
+    def test_candidate_stops_on_acceptance_failure(self):
+        result, calls = self.run_candidate(['LINUX_BACKEND', 'LINUX_UI'], fail_at='daemon')
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(calls, ['build', 'bundle', 'bundle-check', 'cli', 'daemon'])
 
 
 if __name__ == "__main__":

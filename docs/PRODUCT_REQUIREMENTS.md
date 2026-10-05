@@ -237,6 +237,14 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   `acceptance`はmain向けに選択jobの結果だけを集約し、失敗時はRelease公開をHOLDするがmergeを禁止しない。
   Windowsを含むmain向けrelease candidateでは、Windows job自身が実Windows評価後にrelease candidateを作る。
   Linux-only変更ではLinux distribution・installer品質を実行するが、Windows評価・candidateを追加しない。
+  Linux candidateのrelease buildは配布targetの1回に統合し、bundleから展開した同じUI・recorder・RESTで
+  選択されたbackendのCLI/daemon品質とUIのstartup/graph品質を評価する。native unit/Clippyは別の品質責務として保持する。
+  candidateがある場合のLinux UI品質はdistribution jobが所有し、独立UI jobのskipではなくdistributionの成功を必須とする。
+  サービス復旧の実画面確認はstartupに含む場合と単独実行を排他にし、同じcandidateに対して1回だけ実行する。
+  candidateがない通常UI品質ではUIだけをbuildし、使用しないREST・recorder executableをbuildしない。
+  Rustの依存コンパイル成果物はrunner OS・compiler・依存・build設定に応じてcacheへ保存し、製品sourceや製品版番号だけの
+  変更で依存全体を再buildしない。workspace製品とcoverage reportは再生成し、cache hitをtest成功へ読み替えない。
+  native unit/Clippy、配布build、Windows、CodeQLは相互の終了待ちを追加せず並列実行を維持する。
   Windows評価・candidateはWINDOWS ownerが実際に選択された場合だけ実行する。`feat/next`向けPRは、PR本文や機能名の申告を
   品質選択へ使用しない。そのPRのevent base/headの完全差分を使い、mainからfeatへ既に積み上がった別PRの変更を再選択しない。
   各pathを安定した責務境界でDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類し、

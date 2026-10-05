@@ -399,6 +399,8 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "source_sha": "${{ inputs.source_sha }}",
             "pr_number": "${{ inputs.pr_number }}",
             "release_candidate": "${{ inputs.release_candidate }}",
+            "linux_backend_acceptance": "${{ contains(fromJSON(inputs.selection_json).owners, 'LINUX_BACKEND') }}",
+            "linux_ui_acceptance": "${{ contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI') }}",
         })
         mapping("selective.windows", selective_windows.get("with"), {
             "pr_number": "${{ inputs.pr_number }}",
@@ -524,24 +526,27 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
                           "Preserve native coverage for isolated upload"]
         if [order.index(name) for name in expected_order] != sorted(order.index(name) for name in expected_order):
             errors.append("workflow wiring native quality: coverage can precede successful Clippy")
-        for step_name in (
-            "Build native release",
-            "Run public CLI lifecycle acceptance",
-            "Run recorder daemon live acceptance",
-        ):
-            expect(
-                f"rust.{step_name}.if",
-                _step(rust_job, name=step_name).get("if"),
-                "inputs.release_candidate",
-            )
-        expect(
-            "linux-ui.startup.if",
-            _step(
-                linux_ui_job,
-                name="Run startup UI image and failure-state acceptance",
-            ).get("if"),
-            "inputs.release_candidate",
-        )
+        expect("selective.linux-ui.if", _job(selective, "linux-ui-quality").get("if"),
+               "contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI') && !fromJSON(inputs.selection_json).distribution_required")
+        expect("linux-ui.build", _step(linux_ui_job, name="Build native release for UI evaluation").get("run"),
+               "cargo build --release --locked -p codex_info")
+        for job_id in ("linux-backend-quality", "linux-distribution", "windows-quality", "codeql-quality"):
+            expect(f"selective.{job_id}.needs", _job(selective, job_id).get("needs"), None)
+        for document, job_id, target in ((docs["rust.yml"], "native-quality", ". -> target"),
+                                        (docs["linux-ui-quality.yml"], "linux-ui-quality", ". -> target"),
+                                        (linux_distribution, "linux-distribution", ". -> target/distribution")):
+            cache = _step(_job(document, job_id), name="Restore compiled Rust dependencies")
+            expect(f"{job_id}.cache.uses", cache.get("uses"),
+                   "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6")
+            mapping(f"{job_id}.cache", cache.get("with"), {
+                "workspaces": target, "env-vars": "ImageOS",
+                "cache-workspace-crates": "false", "cache-bin": "false",
+            })
+        bundle = _step(_job(linux_distribution, "linux-distribution"), name="Create and validate the Linux bundle")
+        mapping("distribution.acceptance.env", bundle.get("env"), {
+            "RUN_BACKEND_ACCEPTANCE": "${{ inputs.release_candidate && inputs.linux_backend_acceptance }}",
+            "RUN_UI_ACCEPTANCE": "${{ inputs.release_candidate && inputs.linux_ui_acceptance }}",
+        })
         expect(
             "linux-ui.graph.if",
             _step(linux_ui_job, name="Run graph UI image acceptance").get("if"),
@@ -880,6 +885,12 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "cargo build --release --locked --target",
         "scripts/build_linux_bundle.sh",
         "scripts/test_linux_bundle.sh",
+        "--target-dir target/distribution",
+        'candidate_root="$GITHUB_WORKSPACE/target/release"',
+        "scripts/cli_contract_e2e.sh",
+        "scripts/record_daemon_e2e.sh",
+        "scripts/x11_startup_visual_gate.sh",
+        "scripts/x11_graph_visual_gate.sh",
         'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
         "xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac'",
         "env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET",
@@ -926,13 +937,13 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "cargo llvm-cov --workspace --locked --all-targets --cobertura",
         "codacy-coverage-rust-v1-head-${{ inputs.source_sha }}",
         "cargo clippy --workspace --locked --all-targets -- -D warnings",
-        "cargo build --workspace --release --locked",
-        "scripts/cli_contract_e2e.sh",
-        "scripts/record_daemon_e2e.sh",
-        "xvfb-run --auto-servernum",
     ):
         if marker not in rust:
             errors.append(f"rust.yml: missing {marker}")
+    count("rust.yml", "cargo build ", 0)
+    count("rust.yml", "scripts/cli_contract_e2e.sh", 0)
+    count("rust.yml", "scripts/record_daemon_e2e.sh", 0)
+    count("linux-ui-quality.yml", "scripts/x11_startup_visual_gate.sh", 0)
     count("rust.yml", "uses: actions/upload-artifact@v6", 1)
     count("rust.yml", "quality_profile", 0)
     count("linux-ui-quality.yml", "quality_profile", 0)
@@ -1035,6 +1046,8 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
         selection = json.loads(selection_raw)
         owners = set(selection["owners"])
         selected_jobs = {owner_jobs[owner] for owner in owners}
+        if selection["distribution_required"]:
+            selected_jobs.discard("linux-ui-quality")
         return json.dumps(
             {
                 job: {
@@ -3802,8 +3815,8 @@ def self_test() -> int:
         ),
         (
             "linux-distribution.yml",
-            'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
-            'CODEX_INFO_ACCEPTANCE_BINARY="$GITHUB_WORKSPACE/target/release/codex_info"',
+            'candidate_root="$GITHUB_WORKSPACE/target/release"',
+            'candidate_root="$GITHUB_WORKSPACE/unvalidated-host-build"',
         ),
         (
             "rust.yml",

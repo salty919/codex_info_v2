@@ -42,6 +42,27 @@ def results(
 
 
 class SelectedQualityTests(unittest.TestCase):
+    def test_candidate_distribution_owns_ui_quality_and_must_succeed(self) -> None:
+        owners = ("LINUX_UI",)
+        payload = selection(owners, binary=True, distribution=True, languages=("rust",))
+        observed = json.loads(results(owners, codeql=True, distribution=True))
+        observed["linux-ui-quality"] = "skipped"
+        validate(payload, json.dumps(observed), release_candidate=True)
+        for state in ("failure", "cancelled", "skipped", None):
+            with self.subTest(distribution=state):
+                changed = dict(observed)
+                changed["linux-distribution"] = state
+                with self.assertRaises(QualitySelectionError):
+                    validate(payload, json.dumps(changed), release_candidate=True)
+
+    def test_ui_without_candidate_still_requires_its_own_job(self) -> None:
+        for release in (False, True):
+            with self.subTest(release=release):
+                observed = json.loads(results(("LINUX_UI",)))
+                observed["linux-ui-quality"] = "skipped"
+                with self.assertRaises(QualitySelectionError):
+                    validate(selection(("LINUX_UI",)), json.dumps(observed), release_candidate=release)
+
     def test_feat_accepts_exact_owner_and_codeql_results(self) -> None:
         owners = ("DOCS", "LINUX_BACKEND")
         validate(
