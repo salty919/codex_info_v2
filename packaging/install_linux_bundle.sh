@@ -1628,18 +1628,6 @@ verify_local_generation() {
         verify_fixed_links_local || return 1
     fi
 }
-validate_external_checksum() {
-    local archive="$1" sum="$2" count hash name extra
-    [[ -f "$sum" && ! -L "$sum" ]] || die 'external checksum is not regular'
-    count="$(awk 'NF && $0 !~ /^[[:space:]]*#/ {n++} END {print n+0}' "$sum")"
-    [[ "$count" == 1 ]] || die 'external checksum must contain exactly one record'
-    read -r hash name extra < "$sum" || die 'external checksum cannot be read'
-    [[ -z "$extra" ]] || die 'external checksum has extra fields'
-    name="${name#\*}"
-    [[ "$name" == "$(basename -- "$archive")" ]] || die 'external checksum names wrong archive'
-    [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || die 'external checksum value is invalid'
-    [[ "$(sha256sum -- "$archive" | awk '{print $1}')" == "$(printf '%s' "$hash" | tr '[:upper:]' '[:lower:]')" ]] || die 'bundle SHA-256 does not match external checksum'
-}
 check_glibc_compatibility() {
     local manifest="$1" host_text host_version
     host_text="$("$GETCONF_BIN" GNU_LIBC_VERSION 2>/dev/null || true)"
@@ -1678,139 +1666,145 @@ except (KeyError,OSError,tarfile.TarError) as error:
     raise SystemExit(f"archive manifest cannot be read: {error}")
 PY
 }
-published_release_identity() {
-    local manifest="$1"
-    python3 - "$manifest" <<'PY'
-import hashlib,json,pathlib,sys
-manifest_path=sys.argv[1]
-try:
-    raw=pathlib.Path(manifest_path).read_bytes()
-    document=json.loads(raw.decode("utf-8"))
-except Exception as error:
-    raise SystemExit(f"archive generation identity is unavailable: {error}")
-version=document.get("version") if isinstance(document,dict) else None
-source=document.get("source_sha") if isinstance(document,dict) else None
-print(version,source,hashlib.sha256(raw).hexdigest(),sep="\t")
-PY
-}
 
 validate_bundle() {
-    local archive="$1" external="$2" validation_limit="$VALIDATE_TIMEOUT"
+    local archive="$1" external="$2" destination="$3" checksum="$4" release_digest="${5:-}" validation_limit="$VALIDATE_TIMEOUT"
     [[ -f "$archive" && ! -L "$archive" ]] || die 'bundle archive is not regular'
     [[ "$archive" == *.tar.gz ]] || die 'bundle archive has wrong suffix'
     [[ -f "$external" && ! -L "$external" ]] || die 'external manifest is not regular'
     if (( operation_deadline > 0 )); then
         validation_limit="$(deadline_timeout "$VALIDATE_TIMEOUT")" || return 1
     fi
-    python3 - "$archive" "$external" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" "$validation_limit" <<'PY'
-import hashlib,json,pathlib,re,sys,tarfile
-import signal
-archive_name,manifest_name,schema,product,target,compatibility,timeout_seconds=sys.argv[1:]
-def timeout_handler(signum, frame): raise TimeoutError("bundle validation timed out")
-signal.signal(signal.SIGALRM, timeout_handler); signal.alarm(int(timeout_seconds))
-def reject(message): raise SystemExit("bundle validation failed: "+message)
+    python3 - "$archive" "$external" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" "$validation_limit" "$destination" "$checksum" "$release_digest" <<'PY'
+import hashlib,json,os,pathlib,re,signal,stat,sys,tarfile,tempfile
+archive_name,manifest_name,schema,product,target,compatibility,timeout_seconds,destination_name,checksum_name,release_digest=sys.argv[1:]
+def reject(message): raise SystemExit("candidate staging failed: "+message)
+def timeout_handler(signum, frame): raise TimeoutError("candidate staging timed out")
+signal.signal(signal.SIGALRM,timeout_handler); signal.alarm(int(timeout_seconds))
 def pairs(items):
     result={}
     for key,value in items:
         if key in result: reject("duplicate JSON key")
         result[key]=value
     return result
-try:
-    raw=pathlib.Path(manifest_name).read_bytes(); manifest=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs)
-except Exception as error: reject(str(error))
-required={"schema","product","version","source_sha","run_id","run_attempt","target","compatibility","glibc_minimum","files"}
-if not isinstance(manifest,dict) or set(manifest)!=required: reject("manifest keys are not exact")
-if manifest["schema"]!=schema or manifest["product"]!=product: reject("manifest identity")
-if not isinstance(manifest["version"],str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",manifest["version"]): reject("version")
-if pathlib.Path(archive_name).name != f"codex-info-{manifest['version']}-{target}.tar.gz": reject("archive name")
-if not isinstance(manifest["source_sha"],str) or not re.fullmatch(r"[0-9a-f]{40}",manifest["source_sha"]): reject("source")
-if not isinstance(manifest["run_id"],str) or not re.fullmatch(r"[1-9][0-9]*",manifest["run_id"]): reject("run id")
-if isinstance(manifest["run_attempt"],bool) or not isinstance(manifest["run_attempt"],int) or manifest["run_attempt"]<1: reject("run attempt")
-if manifest["target"]!=target or manifest["compatibility"]!=compatibility: reject("target")
-if not isinstance(manifest["glibc_minimum"],str) or not re.fullmatch(r"[0-9]+(?:[.][0-9]+)+",manifest["glibc_minimum"]): reject("glibc")
-entries=manifest["files"]
-if not isinstance(entries,list) or not entries: reject("files")
-paths=[]; by_path={}
-for entry in entries:
-    if not isinstance(entry,dict) or set(entry)!={"path","size","sha256","mode"}: reject("file entry")
-    path=entry["path"]
-    if not isinstance(path,str) or not path or path.startswith("/") or "\\" in path or path.startswith("./") or any(part in {"",".",".."} for part in path.split("/")): reject("unsafe path")
-    if path in by_path: reject("duplicate path")
-    if (isinstance(entry["size"],bool) or not isinstance(entry["size"],int) or entry["size"]<0 or
-            not isinstance(entry["sha256"],str) or not re.fullmatch(r"[0-9a-f]{64}",entry["sha256"]) or
-            isinstance(entry["mode"],bool) or not isinstance(entry["mode"],int) or entry["mode"] not in {0o644,0o755}): reject("file identity")
-    paths.append(path); by_path[path]=entry
-if paths!=sorted(paths): reject("files not sorted")
-if "codex-info" + ".service" in set(paths): reject("combined recorder/REST unit is forbidden")
-required_files={"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh","codex-info-recorder.service","codex-info-rest.service","codex-info-update.service","codex-info-update.timer","LICENSE","COPYRIGHT"}
-if not required_files.issubset(by_path) or not ({"THIRD_PARTY_NOTICES.md","NOTICE.txt"} & set(by_path)): reject("required member missing")
-try:
-    with tarfile.open(archive_name,"r:gz") as archive:
-        actual=[]
-        for member in archive.getmembers():
-            path=member.name
-            if not path or path.startswith("/") or "\\" in path or path.startswith("./") or any(part in {"",".",".."} for part in path.split("/")) or not member.isfile(): reject("unsafe member")
-            if path in actual: reject("duplicate member")
-            actual.append(path)
-        if actual!=sorted(actual): reject("members not sorted")
-        if set(actual)!=set(by_path)|{"manifest.json","SHA256SUMS"}: reject("member set differs")
-        internal=archive.extractfile("manifest.json")
-        if internal is None or internal.read()!=raw: reject("manifest bytes differ")
-        sums=archive.extractfile("SHA256SUMS")
-        if sums is None: reject("SHA256SUMS missing")
-        records={}
-        for line in sums.read().decode("utf-8").splitlines():
-            fields=line.split()
-            if len(fields)!=2 or not re.fullmatch(r"[0-9a-f]{64}",fields[0]): reject("bad SHA256SUMS")
-            name=fields[1].removeprefix("*")
-            if name in records: reject("duplicate SHA256SUMS")
-            records[name]=fields[0]
-        if set(records)!=set(actual)-{"SHA256SUMS"}: reject("SHA256SUMS coverage")
-        for path,expected in records.items():
-            digest=hashlib.sha256(); stream=archive.extractfile(path)
-            while chunk:=stream.read(1024*1024): digest.update(chunk)
-            if digest.hexdigest()!=expected: reject("SHA256SUMS digest")
-        for path,entry in by_path.items():
-            member=archive.getmember(path); mode=member.mode&0o7777
-            expected_mode=0o755 if path in {"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh"} else 0o644
-            if mode!=expected_mode or mode!=entry["mode"] or member.size!=entry["size"]: reject("mode/size mismatch")
-            digest=hashlib.sha256(); stream=archive.extractfile(member)
-            while chunk:=stream.read(1024*1024): digest.update(chunk)
-            if digest.hexdigest()!=entry["sha256"]: reject("manifest digest")
-        for path in ("manifest.json", "SHA256SUMS"):
-            if archive.getmember(path).mode&0o7777 != 0o644: reject("metadata mode mismatch")
-except (OSError,tarfile.TarError,UnicodeError) as error: reject(str(error))
-signal.alarm(0)
-print(manifest["version"],manifest["source_sha"],hashlib.sha256(raw).hexdigest(),by_path["codex_info_recorder"]["sha256"],sep="\t")
-PY
-}
-extract_candidate() {
-    local archive="$1" destination="$2"
-    chmod 700 -- "$destination"
-    python3 - "$archive" "$destination" <<'PY'
-import os,pathlib,tarfile,tempfile,sys
-archive_name,destination_name=sys.argv[1:]; destination=pathlib.Path(destination_name)
-with tarfile.open(archive_name,"r:gz") as archive:
-    for member in archive.getmembers():
-        if not member.isfile(): raise SystemExit("candidate member is not regular")
-        target=destination.joinpath(*pathlib.PurePosixPath(member.name).parts); target.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
-        source=archive.extractfile(member)
-        if source is None: raise SystemExit("candidate member is unreadable")
-        fd,temporary=tempfile.mkstemp(prefix=".codex-info.",dir=target.parent)
-        try:
-            with os.fdopen(fd,"wb") as output:
-                while chunk:=source.read(1024*1024): output.write(chunk)
-                output.flush(); os.fsync(output.fileno())
-            os.chmod(temporary,member.mode&0o7777)
-            os.replace(temporary,target); fd=os.open(target.parent,os.O_DIRECTORY)
-            try: os.fsync(fd)
-            finally: os.close(fd)
-        finally:
-            try: os.unlink(temporary)
-            except FileNotFoundError: pass
-fd=os.open(destination,os.O_DIRECTORY)
-try: os.fsync(fd)
-finally: os.close(fd)
+def regular_bytes(name):
+    fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW)
+    with os.fdopen(fd,"rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode): reject("input is not regular")
+        return stream.read()
+def identity(metadata):
+    return metadata.st_dev,metadata.st_ino,metadata.st_size,metadata.st_mtime_ns,metadata.st_ctime_ns
+def stage():
+    destination=pathlib.Path(destination_name)
+    metadata=destination.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=os.getuid() or
+            stat.S_IMODE(metadata.st_mode)!=0o700 or any(destination.iterdir())): reject("stage is not empty and owner-only")
+    raw=regular_bytes(manifest_name)
+    manifest=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs)
+    required={"schema","product","version","source_sha","run_id","run_attempt","target","compatibility","glibc_minimum","files"}
+    if not isinstance(manifest,dict) or set(manifest)!=required: reject("manifest keys are not exact")
+    if manifest["schema"]!=schema or manifest["product"]!=product: reject("manifest identity")
+    if not isinstance(manifest["version"],str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",manifest["version"]): reject("version")
+    if pathlib.Path(archive_name).name!=f"codex-info-{manifest['version']}-{target}.tar.gz": reject("archive name")
+    if not isinstance(manifest["source_sha"],str) or not re.fullmatch(r"[0-9a-f]{40}",manifest["source_sha"]): reject("source")
+    if not isinstance(manifest["run_id"],str) or not re.fullmatch(r"[1-9][0-9]*",manifest["run_id"]): reject("run id")
+    if isinstance(manifest["run_attempt"],bool) or not isinstance(manifest["run_attempt"],int) or manifest["run_attempt"]<1: reject("run attempt")
+    if manifest["target"]!=target or manifest["compatibility"]!=compatibility: reject("target")
+    if not isinstance(manifest["glibc_minimum"],str) or not re.fullmatch(r"[0-9]+(?:[.][0-9]+)+",manifest["glibc_minimum"]): reject("glibc")
+    entries=manifest["files"]
+    if not isinstance(entries,list) or not entries: reject("files")
+    paths=[]; by_path={}
+    for entry in entries:
+        if not isinstance(entry,dict) or set(entry)!={"path","size","sha256","mode"}: reject("file entry")
+        path=entry["path"]
+        if not isinstance(path,str) or not path or path.startswith("/") or "\\" in path or path.startswith("./") or any(part in {"",".",".."} for part in path.split("/")): reject("unsafe path")
+        if path in by_path: reject("duplicate path")
+        if (isinstance(entry["size"],bool) or not isinstance(entry["size"],int) or entry["size"]<0 or
+                not isinstance(entry["sha256"],str) or not re.fullmatch(r"[0-9a-f]{64}",entry["sha256"]) or
+                isinstance(entry["mode"],bool) or not isinstance(entry["mode"],int) or entry["mode"] not in {0o644,0o755}): reject("file identity")
+        paths.append(path); by_path[path]=entry
+    if paths!=sorted(paths): reject("files not sorted")
+    if release_digest:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}",release_digest): reject("release digest is invalid")
+        expected_archive_hash=release_digest.removeprefix("sha256:")
+    else:
+        if "codex-info"+".service" in by_path: reject("combined recorder/REST unit is forbidden")
+        required_files={"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh","codex-info-recorder.service","codex-info-rest.service","codex-info-update.service","codex-info-update.timer","LICENSE","COPYRIGHT"}
+        if not required_files.issubset(by_path) or not ({"THIRD_PARTY_NOTICES.md","NOTICE.txt"}&set(by_path)): reject("required member missing")
+        lines=regular_bytes(checksum_name).decode("utf-8").splitlines()
+        if sum(bool(line.strip()) and not line.lstrip().startswith("#") for line in lines)!=1: reject("external checksum must contain exactly one record")
+        fields=lines[0].split() if lines else []
+        if len(fields)!=2 or not re.fullmatch(r"[0-9a-fA-F]{64}",fields[0]) or fields[1].removeprefix("*")!=pathlib.Path(archive_name).name: reject("external checksum record is invalid")
+        expected_archive_hash=fields[0].lower()
+    # Copy and hash the bytes together. Path replacement or in-place changes cannot
+    # turn a later archive open into a different validated candidate.
+    source_fd=os.open(archive_name,os.O_RDONLY|os.O_NOFOLLOW)
+    with os.fdopen(source_fd,"rb") as source, tempfile.TemporaryFile(dir=destination) as snapshot:
+        before=os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode): reject("archive is not regular")
+        digest=hashlib.sha256()
+        while chunk:=source.read(1024*1024):
+            digest.update(chunk); snapshot.write(chunk)
+        if digest.hexdigest()!=expected_archive_hash: reject("archive digest differs")
+        snapshot.flush(); snapshot.seek(0)
+        with tarfile.open(fileobj=snapshot,mode="r:gz") as archive:
+            actual=[]
+            for member in archive.getmembers():
+                path=member.name
+                if not path or path.startswith("/") or "\\" in path or path.startswith("./") or any(part in {"",".",".."} for part in path.split("/")) or not member.isfile(): reject("unsafe member")
+                if path in actual: reject("duplicate member")
+                actual.append(path)
+            if actual!=sorted(actual): reject("members not sorted")
+            if set(actual)!=set(by_path)|{"manifest.json","SHA256SUMS"}: reject("member set differs")
+            internal=archive.extractfile("manifest.json")
+            if internal is None or internal.read()!=raw: reject("manifest bytes differ")
+            sums=archive.extractfile("SHA256SUMS")
+            if sums is None: reject("SHA256SUMS missing")
+            records={}
+            for line in sums.read().decode("utf-8").splitlines():
+                fields=line.split()
+                if len(fields)!=2 or not re.fullmatch(r"[0-9a-f]{64}",fields[0]): reject("bad SHA256SUMS")
+                name=fields[1].removeprefix("*")
+                if name in records: reject("duplicate SHA256SUMS")
+                records[name]=fields[0]
+            if set(records)!=set(actual)-{"SHA256SUMS"}: reject("SHA256SUMS coverage")
+            for path,entry in by_path.items():
+                member=archive.getmember(path)
+                expected_mode=entry["mode"] if release_digest else (0o755 if path in {"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh"} else 0o644)
+                if member.mode&0o7777!=expected_mode or expected_mode!=entry["mode"] or member.size!=entry["size"]: reject("mode/size mismatch")
+            for path in ("manifest.json","SHA256SUMS"):
+                if archive.getmember(path).mode&0o7777!=0o644: reject("metadata mode mismatch")
+            for member in archive.getmembers():
+                target_path=destination.joinpath(*pathlib.PurePosixPath(member.name).parts)
+                target_path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+                stream=archive.extractfile(member)
+                if stream is None: reject("member cannot be read")
+                fd,temporary=tempfile.mkstemp(prefix=".codex-info.",dir=target_path.parent)
+                try:
+                    with os.fdopen(fd,"wb") as output:
+                        digest=hashlib.sha256(); size=0
+                        while chunk:=stream.read(1024*1024):
+                            output.write(chunk); digest.update(chunk); size+=len(chunk)
+                        if size!=member.size: reject("member size differs")
+                        if member.name!="SHA256SUMS" and digest.hexdigest()!=records[member.name]: reject("SHA256SUMS digest")
+                        if member.name in by_path and digest.hexdigest()!=by_path[member.name]["sha256"]: reject("manifest digest")
+                        output.flush(); os.fsync(output.fileno())
+                    os.chmod(temporary,member.mode&0o7777); os.replace(temporary,target_path)
+                    parent_fd=os.open(target_path.parent,os.O_DIRECTORY)
+                    try: os.fsync(parent_fd)
+                    finally: os.close(parent_fd)
+                finally:
+                    try: os.unlink(temporary)
+                    except FileNotFoundError: pass
+        if identity(os.fstat(source.fileno()))!=identity(before) or identity(os.lstat(archive_name))!=identity(before): reject("archive changed during staging")
+    stage_fd=os.open(destination,os.O_DIRECTORY)
+    try: os.fsync(stage_fd)
+    finally: os.close(stage_fd)
+    signal.alarm(0)
+    recorder_hash="" if release_digest else by_path["codex_info_recorder"]["sha256"]
+    print(manifest["version"],manifest["source_sha"],hashlib.sha256(raw).hexdigest(),recorder_hash,sep="\t")
+try: stage()
+except (OSError,tarfile.TarError,UnicodeError,ValueError,TimeoutError) as error: reject(str(error))
 PY
 }
 publish_candidate() {
@@ -3391,13 +3385,15 @@ perform_install() {
     local validation bundle_version source_hash manifest_hash binary_hash recorder_execution=canonical
     local install_deadline="$operation_deadline"
     local operation_deadline="$operation_deadline"
+    local release_digest=
     if [[ "${CODEX_INFO_RELEASE_DIGEST_VERIFIED:-}" == 1 ]]; then
-        validation="$(published_release_identity "$MANIFEST")" ||
-            die 'candidate generation identity is unavailable'
-    else
-        validation="$(validate_bundle "$ARCHIVE" "$MANIFEST")" || die 'candidate validation failed before mutation'
+        release_digest="${CODEX_INFO_RELEASE_ARCHIVE_DIGEST:-}"
+        [[ -n "$release_digest" ]] || die 'verified release archive digest is unavailable'
     fi
-    check_glibc_compatibility "$MANIFEST" || die 'candidate glibc compatibility check failed'
+    candidate_stage="$(mktemp -d "$generations_dir/.candidate.XXXXXX")"
+    validation="$(validate_bundle "$ARCHIVE" "$MANIFEST" "$candidate_stage" "${CHECKSUM:-$ARCHIVE.sha256}" "$release_digest")" ||
+        die 'candidate staging failed before mutation'
+    check_glibc_compatibility "$candidate_stage/manifest.json" || die 'candidate glibc compatibility check failed'
     IFS=$'\t' read -r bundle_version source_hash manifest_hash binary_hash <<<"$validation"
     candidate_id="$bundle_version-$source_hash-$manifest_hash"; previous_id="$(current_generation)"; operation_id="$(new_operation_id)"
     previous_flat=0; previous_combined=0; legacy_combined_generation=0; legacy_combined_prestate=; legacy_recovery_reader_hash=; recorder_reused=0
@@ -3450,7 +3446,6 @@ perform_install() {
         write_journal prepared
     done
     write_journal legacy_backed_up; link_entrypoints; write_journal entrypoints_linked
-    candidate_stage="$(mktemp -d "$generations_dir/.candidate.XXXXXX")"; extract_candidate "$ARCHIVE" "$candidate_stage"
     candidate_final="$generations_dir/$candidate_id"; publish_candidate "$candidate_stage" "$candidate_final"; candidate_stage=
     if ! verify_generation_files "$candidate_final"; then
         (( candidate_created )) && rm -r -- "$candidate_final"
@@ -3647,7 +3642,7 @@ run_update() {
     local -a migration_options=()
     if (( migrate_recorder_override )); then migration_options=(--migrate-recorder-override); fi
     if CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
-        CODEX_INFO_RELEASE_DIGEST_VERIFIED=1 \
+        CODEX_INFO_RELEASE_DIGEST_VERIFIED=1 CODEX_INFO_RELEASE_ARCHIVE_DIGEST="$archive_digest" \
         CODEX_INFO_UPDATE_TARGET="$newest" \
         timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" "${migration_options[@]}"; then
         child_status=0
@@ -3876,6 +3871,5 @@ if [[ "${CODEX_INFO_RELEASE_DIGEST_VERIFIED:-}" == 1 ]]; then
         die 'verified-release installation requires the active update transaction'
 else
     [[ -n "$CHECKSUM" ]] || CHECKSUM="$ARCHIVE.sha256"
-    validate_external_checksum "$ARCHIVE" "$CHECKSUM"
 fi
 perform_install
