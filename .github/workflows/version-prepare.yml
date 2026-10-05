@@ -235,13 +235,14 @@ jobs:
                  generator_event_head="$(trailer_value Codex-Version-Prepare-Event-Head)" && \
                  generator_run_id="$(trailer_value Codex-Version-Prepare-Run-ID)" && \
                  generator_run_attempt="$(trailer_value Codex-Version-Prepare-Run-Attempt)"; then
-                expected_generated_message="$(printf '%s\n\n%s\n%s\n%s\n%s\n%s' \
+                expected_generated_message="$(printf '%s\n\n\n%s\n%s\n%s\n%s\n%s\n%s' \
                   "chore: prepare version $head_version" \
                   'Codex-Version-Prepare-Schema: v1' \
                   "Codex-Version-Prepare-PR: $generator_pr" \
                   "Codex-Version-Prepare-Event-Head: $generator_event_head" \
                   "Codex-Version-Prepare-Run-ID: $generator_run_id" \
-                  "Codex-Version-Prepare-Run-Attempt: $generator_run_attempt")"
+                  "Codex-Version-Prepare-Run-Attempt: $generator_run_attempt" \
+                  'skip-checks: true')"
                 if [[ "$commit_message" == "$expected_generated_message" && \
                       "$generator_schema" == v1 && \
                       "$generator_pr" == "$PR_NUMBER" && \
@@ -319,13 +320,14 @@ jobs:
             echo 'workflow run identity is malformed' >&2
             exit 1
           }
-          commit_message="$(printf '%s\n\n%s\n%s\n%s\n%s\n%s\n' \
+          commit_message="$(printf '%s\n\n\n%s\n%s\n%s\n%s\n%s\n%s\n' \
             "chore: prepare version $next_version" \
             'Codex-Version-Prepare-Schema: v1' \
             "Codex-Version-Prepare-PR: $PR_NUMBER" \
             "Codex-Version-Prepare-Event-Head: $HEAD_SHA" \
             "Codex-Version-Prepare-Run-ID: $GITHUB_RUN_ID" \
-            "Codex-Version-Prepare-Run-Attempt: $GITHUB_RUN_ATTEMPT")"
+            "Codex-Version-Prepare-Run-Attempt: $GITHUB_RUN_ATTEMPT" \
+            'skip-checks: true')"
           commit_sha="$(printf '%s\n' "$commit_message" | git commit-tree "$tree_sha" -p "$HEAD_SHA")"
 
           # A concurrent head update makes this non-force push fail. No ref
