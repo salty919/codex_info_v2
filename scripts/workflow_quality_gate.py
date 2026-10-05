@@ -83,7 +83,6 @@ def _windows_gate_script_errors(scripts: Mapping[str, str]) -> list[str]:
             "--artifacts-path $buildArtifacts",
         ),
         "upgrade": (
-            "/releases/latest",
             "Previous stable installer failed",
             "if ($previousHash -cne [string]$manifest.installer.sha256)",
             "Latest stable Windows Setup digest does not match its published manifest",
@@ -3991,7 +3990,6 @@ def self_test() -> int:
             "-p:SourceRevisionId=$SourceSha",
             "-p:SourceRevisionId=unknown",
         ),
-        ("upgrade", "/releases/latest", "/releases/omitted"),
         (
             "upgrade",
             '$expectedProductVersion = "$candidateVersionText+$SourceSha"',

@@ -54,22 +54,48 @@ $headers = @{
 if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
     $headers.Authorization = "Bearer $($env:GITHUB_TOKEN)"
 }
-$latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/latest" -Headers $headers
-$tagMatch = [regex]::Match([string]$latest.tag_name, '^windows-v([0-9]+\.[0-9]+\.[0-9]+)$')
-if ($latest.draft -or $latest.prerelease -or -not $tagMatch.Success) {
-    throw 'Latest published release is not a canonical stable Windows release.'
+$releases = @(Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases?per_page=100" -Headers $headers)
+$stableReleases = @(
+    foreach ($release in $releases) {
+        $tagMatch = [regex]::Match([string]$release.tag_name, '^windows-v([0-9]+\.[0-9]+\.[0-9]+)$')
+        if ($release.draft -or $release.prerelease -or -not $tagMatch.Success) {
+            continue
+        }
+        [pscustomobject]@{
+            Release = $release
+            VersionText = $tagMatch.Groups[1].Value
+            Version = [version]$tagMatch.Groups[1].Value
+        }
+    }
+)
+if ($stableReleases.Count -eq 0) {
+    throw 'No canonical stable Windows release is available.'
 }
-$previousVersionText = $tagMatch.Groups[1].Value
-$previousVersion = [version]$previousVersionText
-if ($previousVersion -ge $candidateVersion) {
-    throw "Candidate version must be newer than the latest published version: $previousVersionText -> $candidateVersionText"
+$latestStableRelease = $stableReleases | Sort-Object -Property Version -Descending | Select-Object -First 1
+if ($latestStableRelease.Version -ge $candidateVersion) {
+    throw "Candidate version must be newer than the latest published version: $($latestStableRelease.VersionText) -> $candidateVersionText"
 }
 
-$setupAssets = @($latest.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.Setup.exe' })
-$manifestAssets = @($latest.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.update.json' })
-if ($setupAssets.Count -ne 1 -or $manifestAssets.Count -ne 1) {
-    throw 'Latest stable release must contain exactly one Windows Setup and update manifest.'
+$previousWindowsRelease = $null
+foreach ($stableRelease in ($stableReleases | Sort-Object -Property Version -Descending)) {
+    if ($stableRelease.Version -ge $candidateVersion) {
+        continue
+    }
+    $candidateSetupAssets = @($stableRelease.Release.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.Setup.exe' })
+    $candidateManifestAssets = @($stableRelease.Release.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.update.json' })
+    if ($candidateSetupAssets.Count -eq 1 -and $candidateManifestAssets.Count -eq 1) {
+        $previousWindowsRelease = $stableRelease
+        $setupAssets = $candidateSetupAssets
+        $manifestAssets = $candidateManifestAssets
+        break
+    }
 }
+if ($null -eq $previousWindowsRelease) {
+    throw "No stable Windows release with a Setup and update manifest is available before candidate $candidateVersionText."
+}
+$latest = $previousWindowsRelease.Release
+$previousVersionText = $previousWindowsRelease.VersionText
+Write-Host "windows-installer-baseline: $($latest.tag_name)"
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-windows-upgrade-" + [Guid]::NewGuid().ToString('N'))
 $previousSetup = Join-Path $temporaryRoot 'CodexInfo.WindowsClient.previous.Setup.exe'
 $previousManifest = Join-Path $temporaryRoot 'CodexInfo.WindowsClient.previous.update.json'
