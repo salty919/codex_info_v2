@@ -25,13 +25,14 @@ def main() -> int:
     for marker in (
         "  workflow_call:\n",
         "      languages_json:\n",
+        "    if: github.event.pull_request.head.repo.full_name == github.repository\n",
         "        language: ${{ fromJSON(inputs.languages_json) }}\n",
         "          ref: ${{ inputs.source_sha }}\n",
         "          sha: ${{ inputs.source_sha }}\n",
         "          ref: refs/heads/${{ inputs.head_ref }}\n",
         "          build-mode: none\n",
-        "github/codeql-action/init@v4",
-        "github/codeql-action/analyze@v4",
+        "github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
+        "github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2",
     ):
         require(codeql, marker)
     for marker in ("  schedule:\n", "  push:\n", "  pull_request:\n", "autobuild@"):
