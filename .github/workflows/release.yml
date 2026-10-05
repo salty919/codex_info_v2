@@ -924,6 +924,10 @@ jobs:
           FINAL_HEAD="${FINAL_HEAD:-}"
           [[ "$WINDOWS_PRESENT" == true || "$WINDOWS_PRESENT" == false ]]
           [[ "$LINUX_PRESENT" == true || "$LINUX_PRESENT" == false ]]
+          [[ "$WINDOWS_PRESENT" == true ]] || {
+            echo 'release publication requires a Windows candidate' >&2
+            exit 1
+          }
           [[ "$LINUX_PRESENT" == true ]] || {
             echo 'release publication requires a Linux candidate' >&2
             exit 1

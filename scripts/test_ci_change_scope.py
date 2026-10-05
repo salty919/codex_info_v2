@@ -80,9 +80,9 @@ class OwnerSelectionTests(unittest.TestCase):
         self.assertFalse(value.distribution_required)
         self.assertEqual(value.codeql_languages, ())
 
-    def test_release_candidate_selects_linux_distribution_without_windows(self) -> None:
+    def test_release_candidate_selects_paired_windows_and_linux_candidates(self) -> None:
         value = selection_for_paths(("src/usage_store.rs",), release_candidate=True)
-        self.assertEqual(value.owners, ("LINUX_BACKEND",))
+        self.assertEqual(value.owners, ("LINUX_BACKEND", "WINDOWS"))
         self.assertTrue(value.binary_impact)
         self.assertTrue(value.distribution_required)
 

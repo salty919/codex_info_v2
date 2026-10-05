@@ -383,7 +383,7 @@ os.execvp(args[0],args)
         script = step("feat-integration.yml", "Classify the event's exact base and head")["run"]
         self.run_script(script)
         selection = json.loads(self.outputs()["selection_json"])
-        self.assertNotIn("WINDOWS", selection["owners"])
+        self.assertIn("WINDOWS", selection["owners"])
         self.assertTrue(selection["distribution_required"])
         self.assertTrue(json.loads(self.outputs()["preflight_plan"])["main_included"])
         self.api["repos/owner/repo/git/ref/heads/feat/next"]["object"]["sha"] = self.feature
