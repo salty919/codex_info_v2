@@ -506,7 +506,7 @@ impl I18n {
                 PlanFree => "無料",
                 PlanEnterprise => "エンタープライズ",
                 PlanEducation => "教育",
-                UsageStatus => "利用状況",
+                UsageStatus => "CODEX情報",
                 Graph => "推移",
                 LegalNotices => "法的通知",
                 Running => "稼働",
