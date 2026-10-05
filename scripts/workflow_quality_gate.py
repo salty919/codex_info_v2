@@ -1882,7 +1882,7 @@ def _version_state_tests(version_workflow: str) -> int:
             result.returncode != 0
             or values.get("generated_head") != "true"
             or json.loads(values["selection_json"])["owners"]
-            != ["LINUX_BACKEND"]
+            != ["LINUX_BACKEND", "WINDOWS"]
         ):
             raise AssertionError(
                 "Linux H0 generated H1 with unexpected release owners"
