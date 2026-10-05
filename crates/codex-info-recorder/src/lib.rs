@@ -99,6 +99,10 @@ impl FixedRateSchedule {
         }
     }
 
+    pub fn time_until_deadline(&self, now: Instant) -> Duration {
+        self.next_deadline.saturating_duration_since(now)
+    }
+
     pub fn complete_cycle(&mut self, now: Instant) -> FixedRateWait {
         if now <= self.next_deadline {
             let sleep_for = self.next_deadline.saturating_duration_since(now);
@@ -547,6 +551,8 @@ pub enum ActiveThreadPollResult {
     Empty {
         epoch: AccountEpochProof,
     },
+    /// Reconcile the inventory before classifying an unadmitted active Session.
+    CheckpointMismatch,
     Failed(String),
 }
 
@@ -1258,6 +1264,14 @@ fn collect_active_thread_snapshot(
         Ok(value) => value,
         Err(error) => return ActiveThreadPollResult::Failed(error),
     };
+    collect_active_thread_snapshot_from_paths(&sessions_root, &active_paths, checkpoints)
+}
+
+fn collect_active_thread_snapshot_from_paths(
+    sessions_root: &Path,
+    active_paths: &BTreeSet<PathBuf>,
+    checkpoints: &[SessionCheckpoint],
+) -> ActiveThreadPollResult {
     if active_paths.is_empty() {
         return match AccountEpochProof::capture(&default_codex_home()) {
             Ok(epoch) => ActiveThreadPollResult::Empty { epoch },
@@ -1265,20 +1279,20 @@ fn collect_active_thread_snapshot(
         };
     }
 
-    let root_metadata = match fs::metadata(&sessions_root) {
+    let root_metadata = match fs::metadata(sessions_root) {
         Ok(metadata) => metadata,
         Err(_) => return ActiveThreadPollResult::Failed("session root stat failed".to_owned()),
     };
-    let root_identity = root_identity(&sessions_root, &root_metadata);
+    let root_identity = root_identity(sessions_root, &root_metadata);
     let mut candidates = Vec::with_capacity(active_paths.len());
-    for path in active_paths {
+    for path in active_paths.iter().cloned() {
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
                 return ActiveThreadPollResult::Failed("active session disappeared".to_owned())
             }
         };
-        let relative_path = match path.strip_prefix(&sessions_root) {
+        let relative_path = match path.strip_prefix(sessions_root) {
             Ok(relative) if !relative.as_os_str().is_empty() => {
                 relative.to_string_lossy().replace('\\', "/")
             }
@@ -1294,12 +1308,12 @@ fn collect_active_thread_snapshot(
                 && checkpoint.file_device == file_device(&metadata)
                 && checkpoint.file_inode == file_inode(&metadata)
         }) else {
-            // A live Session without a read-back checkpoint is not a trusted
-            // rollout state. Treat it as degraded rather than publishing a
-            // false empty snapshot.
-            return ActiveThreadPollResult::Failed("active session checkpoint mismatch".to_owned());
+            // The inventory may predate this active Session. Only the guarded
+            // collector can admit it; never read uncheckpointed rollout data
+            // or publish a partial/empty thread snapshot here.
+            return ActiveThreadPollResult::CheckpointMismatch;
         };
-        let thread_id = match read_session_meta_id(&sessions_root, &path, &metadata) {
+        let thread_id = match read_session_meta_id(sessions_root, &path, &metadata) {
             Ok(id) => id,
             Err(error) => return ActiveThreadPollResult::Failed(error),
         };
@@ -1373,7 +1387,7 @@ fn collect_active_thread_snapshot(
         let mut rollouts = BTreeMap::new();
         let mut thread_items = Vec::with_capacity(candidates.len());
         for (path, metadata, thread_id, checkpoint) in &candidates {
-            let rollout = read_active_rollout(&sessions_root, path, metadata, checkpoint)?;
+            let rollout = read_active_rollout(sessions_root, path, metadata, checkpoint)?;
             let request_id = next_request_id;
             next_request_id = next_request_id
                 .checked_add(1)
@@ -1396,7 +1410,7 @@ fn collect_active_thread_snapshot(
             let candidate = thread_contract::validate_thread_item(thread_item)
                 .map_err(|_| "thread/read response rejected".to_owned())?;
             let response_path = candidate.path().and_then(|value| {
-                security::canonical_regular_file_under(&sessions_root, Path::new(value)).ok()
+                security::canonical_regular_file_under(sessions_root, Path::new(value)).ok()
             });
             if candidate.id() != thread_id || response_path.as_ref() != Some(path) {
                 return Err("thread/read identity mismatch".to_owned());
@@ -1439,8 +1453,7 @@ fn collect_active_thread_snapshot(
                 candidate
                     .path()
                     .and_then(|value| {
-                        security::canonical_regular_file_under(&sessions_root, Path::new(value))
-                            .ok()
+                        security::canonical_regular_file_under(sessions_root, Path::new(value)).ok()
                     })
                     .is_some_and(|path| {
                         candidates
@@ -9344,6 +9357,22 @@ mod tests {
         assert_eq!(snapshot.window_seconds, 120 * 60);
         assert_eq!(snapshot.remaining_percent, Some(80.0));
         assert!(snapshot.observed_at > 0);
+    }
+
+    #[test]
+    fn issue_134_checkpoint_reconciliation_precedes_untrusted_session_read() {
+        let root = temp_root("checkpoint-before-read");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let session = sessions.join("new.jsonl");
+        fs::write(&session, b"invalid unadmitted contents").unwrap();
+        let result = collect_active_thread_snapshot_from_paths(
+            &sessions.canonicalize().unwrap(),
+            &BTreeSet::from([session.canonicalize().unwrap()]),
+            &[],
+        );
+        assert_eq!(result, ActiveThreadPollResult::CheckpointMismatch);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

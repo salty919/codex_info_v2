@@ -122,7 +122,7 @@ fn fake_app_server_launch_count(calls: &Path, client: &str) -> usize {
 fn poll_result_kind(result: &ActiveThreadPollResult) -> &'static str {
     match result {
         ActiveThreadPollResult::Empty { .. } => "empty",
-        ActiveThreadPollResult::Failed(_) => "failed",
+        ActiveThreadPollResult::Failed(_) | ActiveThreadPollResult::CheckpointMismatch => "failed",
         ActiveThreadPollResult::Snapshot { .. } => "snapshot",
     }
 }
@@ -489,6 +489,9 @@ fn stopped_parent_and_descendants_are_absent_after_real_thread_read_cycle() {
         ActiveThreadPollResult::Snapshot { snapshot, .. } => snapshot,
         ActiveThreadPollResult::Failed(error) => {
             panic!("FIXTURE_NOT_ADMITTED: thread/read cycle failed: {error}")
+        }
+        ActiveThreadPollResult::CheckpointMismatch => {
+            panic!("FIXTURE_NOT_ADMITTED: active session checkpoint mismatch")
         }
         ActiveThreadPollResult::Empty { .. } => {
             panic!("FIXTURE_NOT_ADMITTED: thread/read cycle was empty")
