@@ -1704,11 +1704,17 @@ def stage():
     required={"schema","product","version","source_sha","run_id","run_attempt","target","compatibility","glibc_minimum","files"}
     if not isinstance(manifest,dict) or set(manifest)!=required: reject("manifest keys are not exact")
     if manifest["schema"]!=schema or manifest["product"]!=product: reject("manifest identity")
-    if not isinstance(manifest["version"],str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",manifest["version"]): reject("version")
+    version=manifest["version"]
+    if not isinstance(version,str): reject("version")
+    stable_pattern=r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)"
+    beta_version=(re.fullmatch(stable_pattern+r"-beta[.][1-9][0-9]*[.](?P<attempt>[1-9][0-9]*)",version)
+                  if len(version)<=32 else None)
+    if not re.fullmatch(stable_pattern,version) and beta_version is None: reject("version")
     if pathlib.Path(archive_name).name!=f"codex-info-{manifest['version']}-{target}.tar.gz": reject("archive name")
     if not isinstance(manifest["source_sha"],str) or not re.fullmatch(r"[0-9a-f]{40}",manifest["source_sha"]): reject("source")
     if not isinstance(manifest["run_id"],str) or not re.fullmatch(r"[1-9][0-9]*",manifest["run_id"]): reject("run id")
     if isinstance(manifest["run_attempt"],bool) or not isinstance(manifest["run_attempt"],int) or manifest["run_attempt"]<1: reject("run attempt")
+    if beta_version is not None and beta_version["attempt"]!=str(manifest["run_attempt"]): reject("beta version run attempt differs")
     if manifest["target"]!=target or manifest["compatibility"]!=compatibility: reject("target")
     if not isinstance(manifest["glibc_minimum"],str) or not re.fullmatch(r"[0-9]+(?:[.][0-9]+)+",manifest["glibc_minimum"]): reject("glibc")
     entries=manifest["files"]

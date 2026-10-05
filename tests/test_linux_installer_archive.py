@@ -142,15 +142,16 @@ class ArchiveStageTests(unittest.TestCase):
                 member.mtime = 0
                 archive.addfile(member, io.BytesIO(data))
 
-    def seed(self, legacy=False):
+    def seed(self, legacy=False, *, version="2.0.0", run_attempt=1):
+        self.archive = self.home / f"codex-info-{version}-{TARGET}.tar.gz"
         payload = dict(PAYLOAD)
         if legacy:
             payload["codex-info.service"] = (b"[Service]\n# trusted legacy combined unit\n", 0o644)
             del payload["codex_info_recorder"]
             del payload["codex_info_rest"]
         document = {
-            "schema": "codex-info-linux-bundle-v1", "product": "codex_info", "version": "2.0.0",
-            "source_sha": "2" * 40, "run_id": "100", "run_attempt": 1,
+            "schema": "codex-info-linux-bundle-v1", "product": "codex_info", "version": version,
+            "source_sha": "2" * 40, "run_id": "100", "run_attempt": run_attempt,
             "target": TARGET, "compatibility": "glibc", "glibc_minimum": "2.31",
             "files": [{"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mode": mode}
                       for name, (data, mode) in sorted(payload.items())],
@@ -202,7 +203,7 @@ class ArchiveStageTests(unittest.TestCase):
         self.assertFalse((self.home / "published-run").exists())
         self.assertEqual(list(self.generations.iterdir()), [self.sentinel])
 
-    def assert_stage(self, result):
+    def assert_stage(self, result, version="2.0.0"):
         self.assertEqual(result.returncode, 0, result.stderr)
         stage = self.generations / ".candidate.literal"
         actual = {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_file()}
@@ -210,7 +211,55 @@ class ArchiveStageTests(unittest.TestCase):
         for name, (data, mode) in self.expected.items():
             self.assertEqual((stage / name).read_bytes(), data, name)
             self.assertEqual(stat.S_IMODE((stage / name).stat().st_mode), mode, name)
-        self.assertEqual(result.stdout.rstrip("\n").split("\t")[:3], ["2.0.0", "2" * 40, hashlib.sha256(self.raw_manifest).hexdigest()])
+        self.assertEqual(result.stdout.rstrip("\n").split("\t")[:3], [version, "2" * 40, hashlib.sha256(self.raw_manifest).hexdigest()])
+
+    def assert_beta_stage(self, version, *, run_attempt=1, release=False):
+        self.seed(version=version, run_attempt=run_attempt)
+        stage = self.generations / ".candidate.literal"
+        try:
+            result = self.run_source(release=release)
+            self.assert_stage(result, version)
+            manifest = json.loads((stage / "manifest.json").read_bytes())
+            self.assertEqual(manifest["version"], version)
+            self.assertEqual(manifest["source_sha"], "2" * 40)
+            self.assertEqual(manifest["run_id"], "100")
+            self.assertEqual(manifest["run_attempt"], run_attempt)
+        finally:
+            # Only the private flat literal fixture is removed between subcases.
+            if stage.exists():
+                for member in stage.iterdir():
+                    member.unlink()
+                stage.rmdir()
+        self.assert_predecessor()
+
+    def test_beta_bundle_has_exact_full_identity(self):
+        for release in (False, True):
+            with self.subTest(release_digest=release):
+                self.assert_beta_stage("1.0.110-beta.7.1", release=release)
+
+    def test_beta_version_boundary_and_canonical_components(self):
+        self.assert_beta_stage("1.0.110-beta.12345678901234567.1")
+        for version in (
+            "1.0.110-beta.123456789012345678.1",
+            "1.0.110-beta.0.1",
+            "1.0.110-beta.07.1",
+            "1.0.110-beta.7.0",
+            "1.0.110-beta.7.01",
+        ):
+            with self.subTest(version=version):
+                self.seed(version=version)
+                result = self.run_source(step="install")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("candidate staging failed: version", result.stderr)
+                self.assert_predecessor()
+
+    def test_beta_attempt_is_manifest_run_attempt(self):
+        self.assert_beta_stage("1.0.110-beta.7.2", run_attempt=2)
+        self.seed(version="1.0.110-beta.7.2", run_attempt=1)
+        result = self.run_source(step="install")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("run attempt", result.stderr)
+        self.assert_predecessor()
 
     def test_correct_canonical_bundle_has_exact_bytes_and_modes(self):
         self.seed()
