@@ -22013,32 +22013,7 @@ enum ServiceHealthDocument {
 }
 
 fn is_product_version(value: &str) -> bool {
-    if value.len() > 32 {
-        return false;
-    }
-    let (basis, beta) = value
-        .split_once("-beta.")
-        .map_or((value, None), |(basis, beta)| (basis, Some(beta)));
-    let valid_component = |component: &str| {
-        !component.is_empty()
-            && (component == "0" || !component.starts_with('0'))
-            && component.bytes().all(|byte| byte.is_ascii_digit())
-    };
-    let mut components = basis.split('.');
-    if !(components.next().is_some_and(valid_component)
-        && components.next().is_some_and(valid_component)
-        && components.next().is_some_and(valid_component)
-        && components.next().is_none())
-    {
-        return false;
-    }
-    beta.is_none_or(|beta| {
-        let valid_positive = |component: &str| component != "0" && valid_component(component);
-        let mut components = beta.split('.');
-        components.next().is_some_and(valid_positive)
-            && components.next().is_some_and(valid_positive)
-            && components.next().is_none()
-    })
+    codex_info_rest_contract::valid_runtime_version(value)
 }
 
 #[cfg(test)]
@@ -25629,6 +25604,44 @@ mod tests {
         assert_eq!(state.service_published_pair, admitted_pair);
         assert_eq!(state.public_details(), admitted_details);
         server.shutdown();
+    }
+
+    #[test]
+    fn issue467_native_runtime_beta_diagnostics_preserve_versions_and_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = r#"{"api_version":"v1","rest_version":"1.0.110-beta.7.1","recorder_version":"1.0.110-beta.7.2","recorder_status":"mismatch"}"#;
+        let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).unwrap();
+            assert!(request[..read].starts_with(b"GET /v1/runtime HTTP/1.1\r\n"));
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let fetched = super::fetch_service_runtime_versions(address);
+        worker.join().unwrap();
+        let runtime = fetched.expect("canonical beta runtime accepted");
+        assert_eq!(runtime.rest_version, "1.0.110-beta.7.1");
+        assert_eq!(
+            runtime.recorder_version.as_deref(),
+            Some("1.0.110-beta.7.2")
+        );
+        assert_eq!(runtime.recorder_status, "mismatch");
+        assert_eq!(
+            super::native_runtime_versions_text(Some(&runtime), false),
+            "Recorder: 1.0.110-beta.7.2\nREST: 1.0.110-beta.7.1\nRecorder / REST versions differ"
+        );
+        assert_eq!(
+            super::native_runtime_versions_text(Some(&runtime), true),
+            "Recorder: 1.0.110-beta.7.2\nREST: 1.0.110-beta.7.1\nRecorder / REST バージョン不一致"
+        );
     }
 
     #[test]
