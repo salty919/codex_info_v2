@@ -19,7 +19,7 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET  # nosec B405  # nosemgrep
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 VERSION_PATTERN = re.compile(
@@ -559,6 +559,74 @@ def bump_versions(paths: VersionPaths, expected: str) -> VersionResult:
     return VersionResult(previous=previous, current=current)
 
 
+def stamp_beta(
+    snapshot: Path,
+    expected_source_version: str,
+    source_sha: str,
+    stable_version: str,
+    run_number: str,
+    run_attempt: str,
+) -> str:
+    """Stamp only the three version inputs in an explicit, non-checkout build snapshot.
+
+    The caller owns extracting the fixed source SHA; this operation binds that
+    identity to the generated .NET metadata, without fetching or changing refs.
+    """
+
+    expected = _stable_version(expected_source_version, Path("--expected-source-version"))
+    if re.fullmatch(r"[0-9a-f]{40}", source_sha, re.ASCII) is None:
+        raise ProductVersionError("--source-sha: must be a canonical 40-digit lowercase SHA")
+    version = beta_version(stable_version, run_number, run_attempt)
+    base = version.split("-", 1)[0]
+    if len(version) > 32:
+        raise ProductVersionError("beta version exceeds the product metadata length limit")
+    if any(len(part) > 5 or (len(part) == 5 and part > "65534") for part in base.split(".")):
+        raise ProductVersionError("beta numeric base exceeds the AssemblyVersion component limit")
+
+    directory = Path(snapshot).absolute()
+    if not directory.is_dir() or directory.is_symlink() or (directory / ".git").exists():
+        raise ProductVersionError("--snapshot: must be a non-checkout build directory")
+    paths = VersionPaths(directory / "Cargo.toml", directory / "Cargo.lock",
+                         directory / "windows-client" / "Directory.Build.props")
+    if directory.resolve() != directory or any(path.resolve() != path for path in paths.ordered()):
+        raise ProductVersionError("--snapshot: symlink paths are not build inputs")
+    parsed = _parse_all(paths)
+    if parsed[0].version != expected:
+        raise ProductVersionError(f"expected source version {expected}, but synchronized version is {parsed[0].version}")
+    stamped = [item.with_version(version) for item in parsed]
+    props = stamped[2]
+    text, has_bom = _decode_utf8(props.replacement, props.path)
+    metadata = {
+        "AssemblyVersion": f"{base}.0",
+        "FileVersion": f"{base}.0",
+        "InformationalVersion": f"{version}+{source_sha}",
+        "IncludeSourceRevisionInInformationalVersion": "false",
+    }
+    # The source snapshot has one Version authority. Do not override a second
+    # explicit metadata authority or introduce duplicate evaluated properties.
+    tree = ET.fromstring(text)  # nosec B314  # nosemgrep  # bounded, already validated above
+    if any(_local_name(node.tag) in metadata for node in tree.iter()):
+        raise ProductVersionError("snapshot contains explicit assembly metadata; stamping would be ambiguous")
+    match = _PROPS_VERSION_ELEMENT.search(text)
+    assert match is not None  # located by the source parser before replacement
+    newline = "\r\n" if "\r\n" in text else "\n"
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    indentation = text[line_start:match.start()]
+    if indentation.strip():
+        indentation = "    "
+    additions = "".join(f"{newline}{indentation}<{name}>{value}</{name}>" for name, value in metadata.items())
+    replacement_text = text[:match.end()] + additions + text[match.end():]
+    stamped[2] = replace(props, replacement=_encode_utf8(replacement_text, has_bom))
+
+    def verify() -> None:
+        for item in stamped:
+            if _read_regular(item.path)[0] != item.replacement:
+                raise ProductVersionError(f"{item.path}: beta stamp verification failed")
+
+    _atomic_replace_all(stamped, verify)
+    return version
+
+
 def _default_paths() -> VersionPaths:
     root = Path(__file__).resolve().parents[1]
     return VersionPaths(
@@ -592,6 +660,14 @@ def _parser() -> argparse.ArgumentParser:
     beta.add_argument("--stable-version", required=True, help="fixed main stable X.Y.Z version")
     beta.add_argument("--run-number", required=True, help="positive canonical GitHub run number")
     beta.add_argument("--run-attempt", required=True, help="positive canonical GitHub run attempt")
+
+    stamp = commands.add_parser("stamp-beta", help="stamp an explicit isolated build snapshot")
+    stamp.add_argument("--snapshot", type=Path, required=True)
+    stamp.add_argument("--expected-source-version", required=True)
+    stamp.add_argument("--source-sha", required=True, help="fixed source SHA extracted by the caller")
+    stamp.add_argument("--stable-version", required=True)
+    stamp.add_argument("--run-number", required=True)
+    stamp.add_argument("--run-attempt", required=True)
 
     bump = commands.add_parser("bump", help="increment patch after an exact expected version")
     _add_path_arguments(bump, suppress_defaults=True)
@@ -629,6 +705,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("channel=beta")
             print("prerelease=true")
             print("make_latest=false")
+            return 0
+        if arguments.command == "stamp-beta":
+            if any(getattr(arguments, name, None) is not None for name in ("cargo_toml", "cargo_lock", "windows_props")):
+                raise ProductVersionError("stamp-beta uses only its explicit snapshot paths")
+            version = stamp_beta(arguments.snapshot, arguments.expected_source_version,
+                                 arguments.source_sha, arguments.stable_version,
+                                 arguments.run_number, arguments.run_attempt)
+            print(f"version={version}")
+            print(f"source_sha={arguments.source_sha}")
+            print("synchronized=true")
             return 0
         result = bump_versions(paths, arguments.expected)
         print(f"previous_version={result.previous}")
