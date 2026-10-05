@@ -12,7 +12,6 @@ from pathlib import Path
 
 from test_linux_beta_bundle import LinuxBetaBundleFixtures
 
-
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "packaging/install_linux_bundle.sh"
 VERSION_MODULE = ROOT / "scripts/product_version.py"
@@ -117,7 +116,8 @@ class LinuxReleaseSelectionFixtures(unittest.TestCase):
             if channel is not None:
                 arguments += ["--channel", channel]
         result = subprocess.run(  # nosec B603 # Fixed Bash argv and bounded offline metadata.
-            arguments, env=self.env, cwd=self.root, capture_output=True, text=True,
+            ["/bin/bash", *arguments[1:]],
+            env=self.env, cwd=self.root, capture_output=True, text=True,
             timeout=10, check=False, shell=False,
         )
         self.assertEqual(self.snapshot(), before, "selection changed private fixture bytes/modes/entries")
