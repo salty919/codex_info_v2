@@ -169,14 +169,27 @@ class FeatCallerTests(unittest.TestCase):
         self.assertEqual(json.loads(outputs["selection_json"])["owners"],
                          ["DOCS", "LINUX_BACKEND"])
 
-    def test_stale_base_and_source_without_current_base_remain_rejected(self):
+    def test_event_snapshot_survives_feat_advance(self):
         self.write("docs/new.md", "this PR\n")
         head = self.commit("docs PR")
-        for source, overrides in ((head, {"FIXTURE_FEAT": head}), (self.main, {})):
-            with self.subTest(source=source, overrides=overrides):
-                result, outputs = self.classify(source, **overrides)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn("selection_json", outputs)
+        self.git("checkout", "-qb", "integration", self.base)
+        self.write("windows-client/src/other.cs", "another merged PR\n")
+        advanced = self.commit("another PR advances feat")
+        self.git("merge", "--no-ff", "-qm", "merge the reported PR", head)
+        merged = self.git("rev-parse", "HEAD")
+        for label, current_feat in (("another PR", advanced), ("this PR merged", merged)):
+            with self.subTest(event=label):
+                result, outputs = self.classify(head, FIXTURE_FEAT=current_feat)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(outputs["selection_json"]), {
+                    "owners": ["DOCS"], "codeql_languages": [],
+                    "binary_impact": False, "distribution_required": False,
+                })
+
+    def test_source_without_event_base_remains_rejected(self):
+        result, outputs = self.classify(self.main)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("selection_json", outputs)
 
 
 class WorkflowStageTests(unittest.TestCase):
