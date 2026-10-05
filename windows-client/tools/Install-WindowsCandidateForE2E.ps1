@@ -1,4 +1,4 @@
-# Installs the latest stable Windows release and upgrades it to the exact
+# Installs the affected Windows 1.0.116 baseline and upgrades it to the exact
 # release candidate. Local reproduction and CI share this implementation.
 [CmdletBinding()]
 param(
@@ -54,47 +54,21 @@ $headers = @{
 if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
     $headers.Authorization = "Bearer $($env:GITHUB_TOKEN)"
 }
-$releases = @(Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases?per_page=100" -Headers $headers)
-$stableReleases = @(
-    foreach ($release in $releases) {
-        $tagMatch = [regex]::Match([string]$release.tag_name, '^windows-v([0-9]+\.[0-9]+\.[0-9]+)$')
-        if ($release.draft -or $release.prerelease -or -not $tagMatch.Success) {
-            continue
-        }
-        [pscustomobject]@{
-            Release = $release
-            VersionText = $tagMatch.Groups[1].Value
-            Version = [version]$tagMatch.Groups[1].Value
-        }
-    }
-)
-if ($stableReleases.Count -eq 0) {
-    throw 'No canonical stable Windows release is available.'
+$previousVersionText = '1.0.116'
+$baselineTag = "windows-v$previousVersionText"
+$baselineVersion = [version]$previousVersionText
+if ($baselineVersion -ge $candidateVersion) {
+    throw "Candidate version must be newer than the Windows update baseline: $previousVersionText -> $candidateVersionText"
 }
-$latestStableRelease = $stableReleases | Sort-Object -Property Version -Descending | Select-Object -First 1
-if ($latestStableRelease.Version -ge $candidateVersion) {
-    throw "Candidate version must be newer than the latest published version: $($latestStableRelease.VersionText) -> $candidateVersionText"
+$latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/tags/$baselineTag" -Headers $headers
+if ($latest.draft -or $latest.prerelease -or [string]$latest.tag_name -cne $baselineTag) {
+    throw "Windows update baseline release is unavailable: $baselineTag"
 }
-
-$previousWindowsRelease = $null
-foreach ($stableRelease in ($stableReleases | Sort-Object -Property Version -Descending)) {
-    if ($stableRelease.Version -ge $candidateVersion) {
-        continue
-    }
-    $candidateSetupAssets = @($stableRelease.Release.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.Setup.exe' })
-    $candidateManifestAssets = @($stableRelease.Release.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.update.json' })
-    if ($candidateSetupAssets.Count -eq 1 -and $candidateManifestAssets.Count -eq 1) {
-        $previousWindowsRelease = $stableRelease
-        $setupAssets = $candidateSetupAssets
-        $manifestAssets = $candidateManifestAssets
-        break
-    }
+$setupAssets = @($latest.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.Setup.exe' })
+$manifestAssets = @($latest.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.update.json' })
+if ($setupAssets.Count -ne 1 -or $manifestAssets.Count -ne 1) {
+    throw "Windows update baseline is missing its Setup or update manifest: $baselineTag"
 }
-if ($null -eq $previousWindowsRelease) {
-    throw "No stable Windows release with a Setup and update manifest is available before candidate $candidateVersionText."
-}
-$latest = $previousWindowsRelease.Release
-$previousVersionText = $previousWindowsRelease.VersionText
 Write-Host "windows-installer-baseline: $($latest.tag_name)"
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-windows-upgrade-" + [Guid]::NewGuid().ToString('N'))
 $previousSetup = Join-Path $temporaryRoot 'CodexInfo.WindowsClient.previous.Setup.exe'
