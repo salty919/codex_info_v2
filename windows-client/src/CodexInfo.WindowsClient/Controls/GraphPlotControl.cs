@@ -5,11 +5,14 @@ using System.Globalization;
 using Avalonia;
 using Avalonia.Automation.Peers;
 using Avalonia.Controls;
+using Avalonia.Media;
+using Avalonia.Platform;
+using Avalonia.Rendering.SceneGraph;
+using Avalonia.Skia;
 using Avalonia.Threading;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Theme;
-using ScottPlot.Avalonia;
 using ScottPlot.TickGenerators;
 
 namespace CodexInfo.WindowsClient.Controls;
@@ -19,7 +22,7 @@ namespace CodexInfo.WindowsClient.Controls;
 /// framework-independent Graphing layer; this control only applies theme,
 /// axes, visibility, and projected labels.
 /// </summary>
-public sealed class GraphPlotControl : AvaPlot
+public sealed class GraphPlotControl : Control
 {
     internal const string RemainingColorHex = "#56b2f5";
     internal const string SolColorHex = "#a88cf5";
@@ -46,37 +49,14 @@ public sealed class GraphPlotControl : AvaPlot
     private ScottPlot.Color GridColor => new(ThemePalette.Resolve(GridColorHex));
     private ScottPlot.Color PlotColor => new(ThemePalette.Resolve(PlotColorHex));
 
-    private ScottPlot.Plottables.Scatter? remainingSeries;
-    private ScottPlot.Plottables.Scatter? remainingIdleSeries;
-    private ScottPlot.Plottables.Scatter? remainingDashedSeries;
-    private ScottPlot.Plottables.Scatter? remainingMarkers;
-    private ModelSeriesVisual? solSeries;
-    private ModelSeriesVisual? terraSeries;
-    private ModelSeriesVisual? lunaSeries;
-    private ModelSeriesVisual? astraSeries;
-    private ScottPlot.Plottables.Scatter? remainingConnector;
-    private ScottPlot.Plottables.Scatter? solConnector;
-    private ScottPlot.Plottables.Scatter? terraConnector;
-    private ScottPlot.Plottables.Scatter? lunaConnector;
-    private ScottPlot.Plottables.Scatter? astraConnector;
-    private ScottPlot.Plottables.Text? remainingLabel;
-    private ScottPlot.Plottables.Text? solLabel;
-    private ScottPlot.Plottables.Text? terraLabel;
-    private ScottPlot.Plottables.Text? lunaLabel;
-    private ScottPlot.Plottables.Text? astraLabel;
-    private double[] remainingConnectorX = [];
-    private double[] solConnectorX = [];
-    private double[] terraConnectorX = [];
-    private double[] lunaConnectorX = [];
-    private double[] astraConnectorX = [];
+    private PlotPresentation presentation = new(GraphScene.Empty());
     private double? referenceControlWidth;
     private readonly Dictionary<GraphMetric, double> referenceDataAreaWidths = [];
     private int sceneRevision;
 
     public GraphPlotControl()
     {
-        UserInputProcessor.Disable();
-        HandleMouseWheelEvent = false;
+        Focusable = true;
         ClipToBounds = true;
         SizeChanged += OnControlSizeChanged;
         AttachedToVisualTree += (_, _) => ThemePalette.Changed += OnThemeChanged;
@@ -100,6 +80,8 @@ public sealed class GraphPlotControl : AvaPlot
         AvaloniaProperty.Register<GraphPlotControl, bool>(nameof(ShowLuna), true);
     public static readonly StyledProperty<bool> ShowAstraProperty =
         AvaloniaProperty.Register<GraphPlotControl, bool>(nameof(ShowAstra), true);
+
+    public ScottPlot.Plot Plot => presentation.Plot;
 
     public GraphScene Scene { get => GetValue(SceneProperty); set => SetValue(SceneProperty, value); }
     public bool ShowRemaining { get => GetValue(ShowRemainingProperty); set => SetValue(ShowRemainingProperty, value); }
@@ -132,45 +114,47 @@ public sealed class GraphPlotControl : AvaPlot
 
     private void ApplyScene()
     {
-        var revision = ++sceneRevision;
-        Plot.Clear();
-        remainingSeries = null;
-        remainingIdleSeries = null;
-        remainingDashedSeries = null;
-        remainingMarkers = null;
-        solSeries = null;
-        terraSeries = null;
-        lunaSeries = null;
-        astraSeries = null;
-        remainingConnector = null;
-        solConnector = null;
-        terraConnector = null;
-        lunaConnector = null;
-        astraConnector = null;
-        remainingLabel = null;
-        solLabel = null;
-        terraLabel = null;
-        lunaLabel = null;
-        astraLabel = null;
-        remainingConnectorX = [];
-        solConnectorX = [];
-        terraConnectorX = [];
-        lunaConnectorX = [];
-        astraConnectorX = [];
-        ApplyTheme();
+        // Build away from the plot held by previously submitted draw operations.
+        // Neither a slow preparation nor a failure can expose a partial plot.
+        var next = new PlotPresentation(Scene);
+        try
+        {
+            PopulatePlot(next);
+        }
+        catch
+        {
+            next.Plot.Dispose();
+            throw;
+        }
 
-        var scene = Scene;
+        presentation = next;
+        var revision = ++sceneRevision;
+        InvalidateVisual();
+        if (next.Scene.HasPoints)
+        {
+            ScheduleReferenceCapture(
+                next.Scene.Metric,
+                revision,
+                (long)next.Plot.RenderManager.RenderCount,
+                attemptsRemaining: 20);
+        }
+    }
+
+    private void PopulatePlot(PlotPresentation presentation)
+    {
+        ApplyTheme(presentation);
+
+        var scene = presentation.Scene;
         if (!scene.HasPoints)
         {
-            Refresh();
             return;
         }
 
         var axes = BuildAxesForCurrentWidth(scene);
-        AddPlotGrid(scene, axes);
+        AddPlotGrid(presentation, scene, axes);
         foreach (var interval in GraphPlotProjection.BuildVisibleUnusedIntervals(scene))
         {
-            var band = Plot.Add.Rectangle(
+            var band = presentation.Plot.Add.Rectangle(
                 interval.StartAt,
                 interval.EndAt,
                 axes.ModelDisplayMinimum,
@@ -182,57 +166,55 @@ public sealed class GraphPlotControl : AvaPlot
         // Match the native graph's painter order: endpoint leaders sit below
         // the data strokes, inferred model paths precede measured paths, and
         // Remaining is painted last over its boundary markers.
-        AddEndpointLabels(scene, axes);
+        AddEndpointLabels(presentation, scene, axes);
         var lunaLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Luna);
         var terraLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Terra);
         var solLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
         var astraLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Astra);
-        var lunaDashed = AddLine(lunaLines.Dashed.Line, LunaColor.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth);
-        var terraDashed = AddLine(terraLines.Dashed.Line, TerraColor.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth);
-        var solDashed = AddLine(solLines.Dashed.Line, SolColor.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth);
-        var astraDashed = AddLine(astraLines.Dashed.Line, AstraColor.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth);
-        var lunaIdle = AddLine(lunaLines.Idle.Line, LunaColor.WithOpacity(0.95), Plot.Axes.Left, IdleLineWidth);
-        var terraIdle = AddLine(terraLines.Idle.Line, TerraColor.WithOpacity(0.95), Plot.Axes.Left, IdleLineWidth);
-        var solIdle = AddLine(solLines.Idle.Line, SolColor.WithOpacity(0.95), Plot.Axes.Left, IdleLineWidth);
-        var astraIdle = AddLine(astraLines.Idle.Line, AstraColor.WithOpacity(0.95), Plot.Axes.Left, IdleLineWidth);
-        var lunaFlat = AddLine(lunaLines.Flat.Line, LunaColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth);
-        var astraFlat = AddLine(astraLines.Flat.Line, AstraColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth);
-        var astraRising = AddLine(astraLines.Rising.Line, AstraColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth);
-        var lunaRising = AddLine(lunaLines.Rising.Line, LunaColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth);
-        var terraFlat = AddLine(terraLines.Flat.Line, TerraColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth);
-        var terraRising = AddLine(terraLines.Rising.Line, TerraColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth);
-        var solFlat = AddLine(solLines.Flat.Line, SolColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth);
-        var solRising = AddLine(solLines.Rising.Line, SolColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth);
-        lunaSeries = new ModelSeriesVisual(lunaIdle, lunaFlat, lunaRising, lunaDashed);
-        terraSeries = new ModelSeriesVisual(terraIdle, terraFlat, terraRising, terraDashed);
-        solSeries = new ModelSeriesVisual(solIdle, solFlat, solRising, solDashed);
-        astraSeries = new ModelSeriesVisual(astraIdle, astraFlat, astraRising, astraDashed);
+        var lunaDashed = AddLine(presentation, lunaLines.Dashed.Line, LunaColor.WithOpacity(0.72), presentation.Plot.Axes.Left, InferredLineWidth);
+        var terraDashed = AddLine(presentation, terraLines.Dashed.Line, TerraColor.WithOpacity(0.72), presentation.Plot.Axes.Left, InferredLineWidth);
+        var solDashed = AddLine(presentation, solLines.Dashed.Line, SolColor.WithOpacity(0.72), presentation.Plot.Axes.Left, InferredLineWidth);
+        var astraDashed = AddLine(presentation, astraLines.Dashed.Line, AstraColor.WithOpacity(0.72), presentation.Plot.Axes.Left, InferredLineWidth);
+        var lunaIdle = AddLine(presentation, lunaLines.Idle.Line, LunaColor.WithOpacity(0.95), presentation.Plot.Axes.Left, IdleLineWidth);
+        var terraIdle = AddLine(presentation, terraLines.Idle.Line, TerraColor.WithOpacity(0.95), presentation.Plot.Axes.Left, IdleLineWidth);
+        var solIdle = AddLine(presentation, solLines.Idle.Line, SolColor.WithOpacity(0.95), presentation.Plot.Axes.Left, IdleLineWidth);
+        var astraIdle = AddLine(presentation, astraLines.Idle.Line, AstraColor.WithOpacity(0.95), presentation.Plot.Axes.Left, IdleLineWidth);
+        var lunaFlat = AddLine(presentation, lunaLines.Flat.Line, LunaColor.WithOpacity(0.95), presentation.Plot.Axes.Left, MeasuredFlatModelLineWidth);
+        var astraFlat = AddLine(presentation, astraLines.Flat.Line, AstraColor.WithOpacity(0.95), presentation.Plot.Axes.Left, MeasuredFlatModelLineWidth);
+        var astraRising = AddLine(presentation, astraLines.Rising.Line, AstraColor.WithOpacity(0.95), presentation.Plot.Axes.Left, MeasuredModelLineWidth);
+        var lunaRising = AddLine(presentation, lunaLines.Rising.Line, LunaColor.WithOpacity(0.95), presentation.Plot.Axes.Left, MeasuredModelLineWidth);
+        var terraFlat = AddLine(presentation, terraLines.Flat.Line, TerraColor.WithOpacity(0.95), presentation.Plot.Axes.Left, MeasuredFlatModelLineWidth);
+        var terraRising = AddLine(presentation, terraLines.Rising.Line, TerraColor.WithOpacity(0.95), presentation.Plot.Axes.Left, MeasuredModelLineWidth);
+        var solFlat = AddLine(presentation, solLines.Flat.Line, SolColor.WithOpacity(0.95), presentation.Plot.Axes.Left, MeasuredFlatModelLineWidth);
+        var solRising = AddLine(presentation, solLines.Rising.Line, SolColor.WithOpacity(0.95), presentation.Plot.Axes.Left, MeasuredModelLineWidth);
+        presentation.LunaSeries = new ModelSeriesVisual(lunaIdle, lunaFlat, lunaRising, lunaDashed);
+        presentation.TerraSeries = new ModelSeriesVisual(terraIdle, terraFlat, terraRising, terraDashed);
+        presentation.SolSeries = new ModelSeriesVisual(solIdle, solFlat, solRising, solDashed);
+        presentation.AstraSeries = new ModelSeriesVisual(astraIdle, astraFlat, astraRising, astraDashed);
         var remainingLines = GraphPlotProjection.BuildCanonicalRemainingLines(
             scene,
             GraphRemainingBaselineMode.PeriodStartAtFullQuota);
-        remainingDashedSeries = AddLine(
+        presentation.RemainingDashedSeries = AddLine(
+            presentation,
             remainingLines.Dashed.Line,
             RemainingColor.WithOpacity(0.72),
-            Plot.Axes.Right,
+            presentation.Plot.Axes.Right,
             InferredLineWidth);
-        remainingIdleSeries = AddLine(
+        presentation.RemainingIdleSeries = AddLine(
+            presentation,
             remainingLines.Idle.Line,
             RemainingColor,
-            Plot.Axes.Right,
+            presentation.Plot.Axes.Right,
             IdleLineWidth);
-        remainingMarkers = AddRemainingMarkers(scene);
-        remainingSeries = AddLine(
+        presentation.RemainingMarkers = AddRemainingMarkers(presentation, scene);
+        presentation.RemainingSeries = AddLine(
+            presentation,
             remainingLines.Solid.Line,
             RemainingColor,
-            Plot.Axes.Right,
+            presentation.Plot.Axes.Right,
             MeasuredRemainingLineWidth);
-        ApplyAxes(scene, axes);
-        ApplyVisibility();
-        ScheduleReferenceCapture(
-            scene.Metric,
-            revision,
-            (long)Plot.RenderManager.RenderCount,
-            attemptsRemaining: 20);
+        ApplyAxes(presentation, scene, axes);
+        ApplyVisibility(presentation);
     }
 
     private GraphAxisProjection BuildAxesForCurrentWidth(GraphScene scene)
@@ -259,6 +241,7 @@ public sealed class GraphPlotControl : AvaPlot
     }
 
     private ScottPlot.Plottables.Scatter? AddLine(
+        PlotPresentation presentation,
         GraphLineProjection line,
         ScottPlot.Color color,
         ScottPlot.IYAxis axis,
@@ -268,14 +251,14 @@ public sealed class GraphPlotControl : AvaPlot
         {
             return null;
         }
-        var series = Plot.Add.Scatter(line.X.ToArray(), line.Y.ToArray(), color);
+        var series = presentation.Plot.Add.Scatter(line.X.ToArray(), line.Y.ToArray(), color);
         series.Axes.YAxis = axis;
         series.LineWidth = lineWidth;
         series.MarkerSize = 0;
         return series;
     }
 
-    private ScottPlot.Plottables.Scatter? AddRemainingMarkers(GraphScene scene)
+    private ScottPlot.Plottables.Scatter? AddRemainingMarkers(PlotPresentation presentation, GraphScene scene)
     {
         var markers = GraphPlotProjection.BuildCanonicalRemainingMarkers(scene);
         if (markers.Count == 0)
@@ -289,85 +272,87 @@ public sealed class GraphPlotControl : AvaPlot
         var y = markers
             .Select(marker => Math.Clamp((99 - marker.YTop) / 0.98, 0, 100))
             .ToArray();
-        var series = Plot.Add.Scatter(x, y, RemainingColor);
-        series.Axes.YAxis = Plot.Axes.Right;
+        var series = presentation.Plot.Add.Scatter(x, y, RemainingColor);
+        series.Axes.YAxis = presentation.Plot.Axes.Right;
         series.LineWidth = 0;
         series.MarkerSize = 2;
         return series;
     }
 
-    private void ApplyTheme()
+    private void ApplyTheme(PlotPresentation presentation)
     {
-        Plot.FigureBackground.Color = PlotColor;
-        Plot.DataBackground.Color = PlotColor;
-        Plot.Axes.ContinuouslyAutoscale = false;
-        Plot.Axes.Color(MutedColor);
-        Plot.Axes.FrameColor(GridColor);
-        Plot.Grid.MajorLineColor = GridColor;
-        Plot.Grid.MinorLineColor = GridColor.WithOpacity(0.35);
+        presentation.Plot.FigureBackground.Color = PlotColor;
+        presentation.Plot.DataBackground.Color = PlotColor;
+        presentation.Plot.Axes.ContinuouslyAutoscale = false;
+        presentation.Plot.Axes.Color(MutedColor);
+        presentation.Plot.Axes.FrameColor(GridColor);
+        presentation.Plot.Grid.MajorLineColor = GridColor;
+        presentation.Plot.Grid.MinorLineColor = GridColor.WithOpacity(0.35);
         // ScottPlot's built-in horizontal grid spans the endpoint-label
         // gutter. X keeps the gutter clear, so bounded grid segments are
-        // painted explicitly by AddPlotGrid().
-        Plot.Grid.MajorLineWidth = 0;
-        Plot.Grid.MinorLineWidth = 0;
-        Plot.Font.Set("Noto Sans JP Medium");
+        // painted explicitly by AddPlotGrid(presentation).
+        presentation.Plot.Grid.MajorLineWidth = 0;
+        presentation.Plot.Grid.MinorLineWidth = 0;
+        presentation.Plot.Font.Set("Noto Sans JP Medium");
     }
 
-    private void AddPlotGrid(GraphScene scene, GraphAxisProjection axes)
+    private void AddPlotGrid(PlotPresentation presentation, GraphScene scene, GraphAxisProjection axes)
     {
         foreach (var y in axes.ModelValues)
         {
             AddLine(
+                presentation,
                 new GraphLineProjection(
                     new double[] { scene.PeriodStartAt, scene.PeriodEndAt },
                     new double[] { y, y }),
                 GridColor,
-                Plot.Axes.Left,
+                presentation.Plot.Axes.Left,
                 1f);
         }
         foreach (var x in axes.BottomValues)
         {
             AddLine(
+                presentation,
                 new GraphLineProjection(
                     new double[] { x, x },
                     new double[] { axes.ModelDisplayMinimum, axes.ModelDisplayMaximum }),
                 GridColor,
-                Plot.Axes.Left,
+                presentation.Plot.Axes.Left,
                 1f);
         }
     }
 
-    private void ApplyAxes(GraphScene scene, GraphAxisProjection axes)
+    private void ApplyAxes(PlotPresentation presentation, GraphScene scene, GraphAxisProjection axes)
     {
-        ApplyLimits(scene, axes);
-        Plot.Axes.Bottom.TickGenerator = new NumericManual(
+        ApplyLimits(presentation, scene, axes);
+        presentation.Plot.Axes.Bottom.TickGenerator = new NumericManual(
             axes.BottomValues.ToArray(),
             axes.BottomLabels.ToArray());
-        Plot.Axes.Left.TickGenerator = new NumericManual(
+        presentation.Plot.Axes.Left.TickGenerator = new NumericManual(
             axes.ModelValues.ToArray(),
             axes.ModelLabels.ToArray());
-        Plot.Axes.Right.TickGenerator = new NumericManual(
+        presentation.Plot.Axes.Right.TickGenerator = new NumericManual(
             axes.RemainingValues.ToArray(),
             axes.RemainingLabels.ToArray());
         // The native graph owns remaining-percent semantics with its coloured
         // endpoint label. A second set of frame ticks steals the dedicated
         // label gutter and is not part of the X graph.
-        Plot.Axes.Right.IsVisible = false;
+        presentation.Plot.Axes.Right.IsVisible = false;
     }
 
-    private void ApplyLimits(GraphScene scene, GraphAxisProjection axes)
+    private void ApplyLimits(PlotPresentation presentation, GraphScene scene, GraphAxisProjection axes)
     {
-        Plot.Axes.SetLimits(
+        presentation.Plot.Axes.SetLimits(
             scene.PeriodStartAt,
             axes.DisplayEndAt,
             axes.ModelDisplayMinimum,
             axes.ModelDisplayMaximum,
-            Plot.Axes.Bottom,
-            Plot.Axes.Left);
-        Plot.Axes.SetLimitsY(
+            presentation.Plot.Axes.Bottom,
+            presentation.Plot.Axes.Left);
+        presentation.Plot.Axes.SetLimitsY(
             axes.RemainingDisplayMinimum,
             axes.RemainingDisplayMaximum,
-            Plot.Axes.Right);
+            presentation.Plot.Axes.Right);
     }
 
     private void OnControlSizeChanged(object? sender, SizeChangedEventArgs change)
@@ -387,7 +372,7 @@ public sealed class GraphPlotControl : AvaPlot
             return;
         }
 
-        var scene = Scene;
+        var scene = presentation.Scene;
         if (!scene.HasPoints || referenceControlWidth is null)
         {
             return;
@@ -398,7 +383,7 @@ public sealed class GraphPlotControl : AvaPlot
             ScheduleReferenceCapture(
                 scene.Metric,
                 revision,
-                (long)Plot.RenderManager.RenderCount,
+                (long)presentation.Plot.RenderManager.RenderCount,
                 attemptsRemaining: 20);
             return;
         }
@@ -413,7 +398,7 @@ public sealed class GraphPlotControl : AvaPlot
     {
         DispatcherTimer.RunOnce(() =>
         {
-            var currentScene = Scene;
+            var currentScene = presentation.Scene;
             if (sceneRevision != revision ||
                 !currentScene.HasPoints ||
                 currentScene.Metric != metric ||
@@ -422,7 +407,14 @@ public sealed class GraphPlotControl : AvaPlot
                 return;
             }
 
-            if ((long)Plot.RenderManager.RenderCount <= priorRenderCount)
+            long renderCount;
+            double currentDataAreaWidth;
+            lock (presentation.Plot.Sync)
+            {
+                renderCount = (long)presentation.Plot.RenderManager.RenderCount;
+                currentDataAreaWidth = presentation.Plot.LastRender.DataRect.Width;
+            }
+            if (renderCount <= priorRenderCount)
             {
                 if (attemptsRemaining > 1)
                 {
@@ -436,7 +428,6 @@ public sealed class GraphPlotControl : AvaPlot
             }
 
             var currentControlWidth = Bounds.Width;
-            var currentDataAreaWidth = Plot.LastRender.DataRect.Width;
             if (referenceControlWidth is not { } controlWidth ||
                 !double.IsFinite(currentControlWidth) || currentControlWidth <= 0 ||
                 !double.IsFinite(currentDataAreaWidth) || currentDataAreaWidth <= 0)
@@ -479,13 +470,16 @@ public sealed class GraphPlotControl : AvaPlot
             CultureInfo.CurrentCulture,
             currentDataAreaWidth,
             referenceDataAreaWidth);
-        ApplyLimits(scene, axes);
-        UpdateEndpointLayout(remainingConnectorX, remainingLabel, axes.EndpointLabelAt);
-        UpdateEndpointLayout(solConnectorX, solLabel, axes.EndpointLabelAt);
-        UpdateEndpointLayout(terraConnectorX, terraLabel, axes.EndpointLabelAt);
-        UpdateEndpointLayout(lunaConnectorX, lunaLabel, axes.EndpointLabelAt);
-        UpdateEndpointLayout(astraConnectorX, astraLabel, axes.EndpointLabelAt);
-        Refresh();
+        lock (presentation.Plot.Sync)
+        {
+            ApplyLimits(presentation, scene, axes);
+            UpdateEndpointLayout(presentation.RemainingConnectorX, presentation.RemainingLabel, axes.EndpointLabelAt);
+            UpdateEndpointLayout(presentation.SolConnectorX, presentation.SolLabel, axes.EndpointLabelAt);
+            UpdateEndpointLayout(presentation.TerraConnectorX, presentation.TerraLabel, axes.EndpointLabelAt);
+            UpdateEndpointLayout(presentation.LunaConnectorX, presentation.LunaLabel, axes.EndpointLabelAt);
+            UpdateEndpointLayout(presentation.AstraConnectorX, presentation.AstraLabel, axes.EndpointLabelAt);
+        }
+        InvalidateVisual();
     }
 
     private static void UpdateEndpointLayout(
@@ -503,11 +497,11 @@ public sealed class GraphPlotControl : AvaPlot
         }
     }
 
-    private void AddEndpointLabels(GraphScene scene, GraphAxisProjection axes)
+    private void AddEndpointLabels(PlotPresentation presentation, GraphScene scene, GraphAxisProjection axes)
     {
         foreach (var endpoint in GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.CurrentCulture))
         {
-            var axis = endpoint.Series == GraphSeries.Remaining ? Plot.Axes.Right : Plot.Axes.Left;
+            var axis = endpoint.Series == GraphSeries.Remaining ? presentation.Plot.Axes.Right : presentation.Plot.Axes.Left;
             var color = endpoint.Series switch
             {
                 GraphSeries.Remaining => RemainingColor,
@@ -518,7 +512,7 @@ public sealed class GraphPlotControl : AvaPlot
                 _ => MutedColor,
             };
             var connectorX = new double[] { scene.PeriodEndAt, axes.EndpointLabelAt };
-            var connector = Plot.Add.Scatter(
+            var connector = presentation.Plot.Add.Scatter(
                 connectorX,
                 new double[] { endpoint.PointAxisValue, endpoint.AxisValue },
                 color.WithOpacity(0.8));
@@ -526,7 +520,7 @@ public sealed class GraphPlotControl : AvaPlot
             connector.LineWidth = 1;
             connector.MarkerSize = 0;
 
-            var label = Plot.Add.Text(endpoint.Text, axes.EndpointLabelAt, endpoint.AxisValue);
+            var label = presentation.Plot.Add.Text(endpoint.Text, axes.EndpointLabelAt, endpoint.AxisValue);
             label.Axes.YAxis = axis;
             label.Alignment = ScottPlot.Alignment.MiddleLeft;
             label.OffsetX = 0;
@@ -538,15 +532,15 @@ public sealed class GraphPlotControl : AvaPlot
             switch (endpoint.Series)
             {
                 case GraphSeries.Remaining:
-                    remainingLabel = label; remainingConnector = connector; remainingConnectorX = connectorX; break;
+                    presentation.RemainingLabel = label; presentation.RemainingConnector = connector; presentation.RemainingConnectorX = connectorX; break;
                 case GraphSeries.Sol:
-                    solLabel = label; solConnector = connector; solConnectorX = connectorX; break;
+                    presentation.SolLabel = label; presentation.SolConnector = connector; presentation.SolConnectorX = connectorX; break;
                 case GraphSeries.Terra:
-                    terraLabel = label; terraConnector = connector; terraConnectorX = connectorX; break;
+                    presentation.TerraLabel = label; presentation.TerraConnector = connector; presentation.TerraConnectorX = connectorX; break;
                 case GraphSeries.Luna:
-                    lunaLabel = label; lunaConnector = connector; lunaConnectorX = connectorX; break;
+                    presentation.LunaLabel = label; presentation.LunaConnector = connector; presentation.LunaConnectorX = connectorX; break;
                 case GraphSeries.Astra:
-                    astraLabel = label; astraConnector = connector; astraConnectorX = connectorX; break;
+                    presentation.AstraLabel = label; presentation.AstraConnector = connector; presentation.AstraConnectorX = connectorX; break;
                 default:
                     connector.IsVisible = false;
                     label.IsVisible = false;
@@ -557,23 +551,27 @@ public sealed class GraphPlotControl : AvaPlot
 
     private void ApplyVisibility()
     {
-        SetVisible(
-            remainingSeries,
-            remainingIdleSeries,
-            remainingDashedSeries,
-            remainingMarkers,
-            remainingConnector,
-            remainingLabel,
-            ShowRemaining);
-        SetVisible(solSeries, solConnector, solLabel, ShowModels && ShowSol);
-        SetVisible(terraSeries, terraConnector, terraLabel, ShowModels && ShowTerra);
-        SetVisible(lunaSeries, lunaConnector, lunaLabel, ShowModels && ShowLuna);
-        SetVisible(astraSeries, astraConnector, astraLabel, ShowModels && ShowAstra);
-        // AvaPlot.Refresh() always posts at Background priority. Visibility
-        // changes originate on the UI thread, so invalidate immediately and
-        // let the next compositor frame paint both the toggle and the plot.
-        // This avoids an extra dispatcher turn on every series ON/OFF action.
+        lock (presentation.Plot.Sync)
+        {
+            ApplyVisibility(presentation);
+        }
         InvalidateVisual();
+    }
+
+    private void ApplyVisibility(PlotPresentation presentation)
+    {
+        SetVisible(
+            presentation.RemainingSeries,
+            presentation.RemainingIdleSeries,
+            presentation.RemainingDashedSeries,
+            presentation.RemainingMarkers,
+            presentation.RemainingConnector,
+            presentation.RemainingLabel,
+            ShowRemaining);
+        SetVisible(presentation.SolSeries, presentation.SolConnector, presentation.SolLabel, ShowModels && ShowSol);
+        SetVisible(presentation.TerraSeries, presentation.TerraConnector, presentation.TerraLabel, ShowModels && ShowTerra);
+        SetVisible(presentation.LunaSeries, presentation.LunaConnector, presentation.LunaLabel, ShowModels && ShowLuna);
+        SetVisible(presentation.AstraSeries, presentation.AstraConnector, presentation.AstraLabel, ShowModels && ShowAstra);
     }
 
     private static void SetVisible(
@@ -605,6 +603,72 @@ public sealed class GraphPlotControl : AvaPlot
         if (series?.Dashed is not null) series.Dashed.IsVisible = visible;
         if (connector is not null) connector.IsVisible = visible;
         if (label is not null) label.IsVisible = visible;
+    }
+
+    public override void Render(DrawingContext context)
+    {
+        // Avalonia may execute this operation after another Scene is accepted.
+        // Capture the complete plot rather than a mutable control/multiplot.
+        context.Custom(new GraphPlotDrawOperation(new Rect(Bounds.Size), presentation.Plot));
+    }
+
+    private sealed class GraphPlotDrawOperation(Rect bounds, ScottPlot.Plot plot) : ICustomDrawOperation
+    {
+        public Rect Bounds { get; } = bounds;
+
+        public bool HitTest(Point point) => Bounds.Contains(point);
+
+        public bool Equals(ICustomDrawOperation? other) => false;
+
+        public void Dispose()
+        {
+            // A plot can belong to several queued operations. Its ordinary
+            // graph primitives are managed and remain alive with this snapshot.
+        }
+
+        public void Render(ImmediateDrawingContext context)
+        {
+            var feature = context.TryGetFeature<ISkiaSharpApiLeaseFeature>();
+            if (feature is null)
+            {
+                return;
+            }
+            using var lease = feature.Lease();
+            using var canvasState = new SkiaSharp.SKAutoCanvasRestore(lease.SkCanvas, false);
+            lease.SkCanvas.SaveLayer();
+            plot.Render(lease.SkCanvas, new ScottPlot.PixelRect(0, (float)Bounds.Width, (float)Bounds.Height, 0));
+        }
+    }
+
+    private sealed class PlotPresentation(GraphScene scene)
+    {
+        public GraphScene Scene { get; } = scene;
+
+        public ScottPlot.Plot Plot { get; } = new();
+
+        public ScottPlot.Plottables.Scatter? RemainingSeries;
+        public ScottPlot.Plottables.Scatter? RemainingIdleSeries;
+        public ScottPlot.Plottables.Scatter? RemainingDashedSeries;
+        public ScottPlot.Plottables.Scatter? RemainingMarkers;
+        public ModelSeriesVisual? SolSeries;
+        public ModelSeriesVisual? TerraSeries;
+        public ModelSeriesVisual? LunaSeries;
+        public ModelSeriesVisual? AstraSeries;
+        public ScottPlot.Plottables.Scatter? RemainingConnector;
+        public ScottPlot.Plottables.Scatter? SolConnector;
+        public ScottPlot.Plottables.Scatter? TerraConnector;
+        public ScottPlot.Plottables.Scatter? LunaConnector;
+        public ScottPlot.Plottables.Scatter? AstraConnector;
+        public ScottPlot.Plottables.Text? RemainingLabel;
+        public ScottPlot.Plottables.Text? SolLabel;
+        public ScottPlot.Plottables.Text? TerraLabel;
+        public ScottPlot.Plottables.Text? LunaLabel;
+        public ScottPlot.Plottables.Text? AstraLabel;
+        public double[] RemainingConnectorX = [];
+        public double[] SolConnectorX = [];
+        public double[] TerraConnectorX = [];
+        public double[] LunaConnectorX = [];
+        public double[] AstraConnectorX = [];
     }
 
     private sealed record ModelSeriesVisual(

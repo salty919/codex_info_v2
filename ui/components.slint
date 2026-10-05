@@ -2570,7 +2570,7 @@ export component GraphWindow inherits Window {
                 y: 28px;
                 width: root.plot-width;
                 height: parent.height - 52px;
-                background: DesignTokens.raised;
+                background: root.has-graph-data ? transparent : DesignTokens.raised;
                 Spinner {
                     x: parent.width / 2 - 12px;
                     y: parent.height / 2 - 30px;
