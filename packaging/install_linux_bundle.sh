@@ -604,13 +604,14 @@ write_journal() {
         safe_blocked 'journal owner identity is invalid'
     timestamp="$(now_unix)" || safe_blocked 'transaction journal clock is unavailable'
     local content
-    content="$(python3 - "$phase" "$operation_id" "$journal_owner_pid" "$journal_owner_starttime" "$journal_boot_id" "$previous_id" "$candidate_id" "$desired_state" "$timestamp" <<'PY'
+    content="$(python3 - "$phase" "$operation_id" "$journal_owner_pid" "$journal_owner_starttime" "$journal_boot_id" "$previous_id" "$candidate_id" "$desired_state" "$timestamp" "${legacy_recovery_reader_image:-}" <<'PY'
 import json, sys
-phase, operation, owner_pid, owner_starttime, boot, old_generation, new_generation, desired, timestamp = sys.argv[1:]
+phase, operation, owner_pid, owner_starttime, boot, old_generation, new_generation, desired, timestamp, reader_image = sys.argv[1:]
 document = {"schema":"codex-info-install-transaction-v1","operation_id":operation,
             "owner_pid":int(owner_pid),"owner_starttime":int(owner_starttime),"boot_id":boot,
             "phase":phase,"old_generation":old_generation,"new_generation":new_generation,
             "desired_state":desired,"updated_at_unix":int(timestamp)}
+if reader_image: document["legacy_reader_image"] = reader_image
 print(json.dumps(document, ensure_ascii=False, indent=2) + "\n", end="")
 PY
     )"
@@ -622,8 +623,8 @@ read_journal() {
     [[ "$(stat -c '%u' -- "$transaction" 2>/dev/null || true)" == "$(id -u)" &&
        "$(stat -c '%a' -- "$transaction" 2>/dev/null || true)" == 600 ]] ||
         safe_blocked 'transaction journal owner or mode is invalid'
-    journal_line="$(python3 - "$transaction" <<'PY'
-import base64, json, pathlib, re, sys
+    journal_line="$(python3 - "$transaction" "${legacy_recovery_journal:-}" <<'PY'
+import base64, gzip, hashlib, io, json, pathlib, re, sys
 def pairs(items):
     result={}
     for key,value in items:
@@ -633,7 +634,9 @@ def pairs(items):
 try: document=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), object_pairs_hook=pairs)
 except Exception as error: raise SystemExit(str(error))
 required={"schema","operation_id","owner_pid","owner_starttime","boot_id","phase","old_generation","new_generation","desired_state","updated_at_unix"}
-if not isinstance(document,dict) or set(document)!=required or document["schema"]!="codex-info-install-transaction-v1":
+staged_image = (isinstance(document,dict) and set(document)==required|{"legacy_reader_image"}
+                and pathlib.Path(sys.argv[1])==pathlib.Path(sys.argv[2]) and document["phase"]=="prepared")
+if not isinstance(document,dict) or (set(document)!=required and not staged_image) or document["schema"]!="codex-info-install-transaction-v1":
     raise SystemExit("journal keys are invalid")
 if document["phase"] not in {"prepared","legacy_backed_up","entrypoints_linked","candidate_published","current_switched","activation_requested","candidate_verified","rollback_switched","rollback_verified","committed"}:
     raise SystemExit("journal phase is invalid")
@@ -669,11 +672,21 @@ if "~lc1~" in document["operation_id"]:
     if (legacy["generation"] != bool(document["old_generation"]) or
             (legacy["generation"] and not document["old_generation"].endswith("-" + manifest_hash))):
         raise SystemExit("legacy combined journal prestate is invalid")
+reader_image = document.get("legacy_reader_image", "")
+if staged_image:
+    if legacy is None or not isinstance(reader_image,str) or not reader_image or len(reader_image)>65536:
+        raise SystemExit("legacy reader image is invalid")
+    compressed = base64.b64decode(reader_image, validate=True)
+    if base64.b64encode(compressed).decode()!=reader_image: raise SystemExit("legacy reader encoding is invalid")
+    with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as image:
+        data = image.read(524289)
+    if len(data)>524288 or hashlib.sha256(data).hexdigest()!=reader_hash:
+        raise SystemExit("legacy reader image identity is invalid")
 print(document["phase"],document["operation_id"],document["owner_pid"],document["owner_starttime"],
-      document["boot_id"],document["old_generation"],document["new_generation"],document["desired_state"],json.dumps(legacy) if legacy is not None else "",reader_hash,sep="\x1f")
+      document["boot_id"],document["old_generation"],document["new_generation"],document["desired_state"],json.dumps(legacy) if legacy is not None else "",reader_hash,reader_image,sep="\x1f")
 PY
     )" || safe_blocked 'transaction journal is invalid or ambiguous'
-    IFS=$'\x1f' read -r journal_phase journal_operation_id journal_owner_pid journal_owner_starttime journal_boot_id journal_previous_id journal_candidate_id journal_desired journal_legacy_combined_prestate journal_legacy_recovery_reader_hash <<<"$journal_line"
+    IFS=$'\x1f' read -r journal_phase journal_operation_id journal_owner_pid journal_owner_starttime journal_boot_id journal_previous_id journal_candidate_id journal_desired journal_legacy_combined_prestate journal_legacy_recovery_reader_hash journal_legacy_recovery_reader_image <<<"$journal_line"
 }
 journal_owner_stale() {
     [[ "$journal_boot_id" != "$(boot_id)" ]] && return 0
@@ -2681,13 +2694,19 @@ legacy_recovery_reader_active() {
        "$(stat -c '%u' -- "$installer_destination")" == "$(id -u)" ]] && legacy_recovery_reader_valid
 }
 atomic_recovery_copy() {
-    python3 - "$1" "$2" "$3" "${4:-}" <<'PY'
-import hashlib, os, pathlib, sys, tempfile
+    python3 - "$1" "$2" "$3" "${4:-}" "${5:-}" <<'PY'
+import base64, gzip, hashlib, io, os, pathlib, sys, tempfile
 source, destination = map(pathlib.Path, sys.argv[1:3])
-expected, previous = sys.argv[3:]
-if not source.is_file() or source.is_symlink() or source.stat().st_uid != os.getuid():
-    raise SystemExit("recovery source is not owned regular bytes")
-data = source.read_bytes()
+expected, previous, reader_image = sys.argv[3:]
+if reader_image:
+    if len(reader_image)>65536: raise SystemExit("recovery image is too large")
+    with gzip.GzipFile(fileobj=io.BytesIO(base64.b64decode(reader_image, validate=True))) as image:
+        data = image.read(524289)
+    if len(data)>524288: raise SystemExit("recovery image is too large")
+else:
+    if not source.is_file() or source.is_symlink() or source.stat().st_uid != os.getuid():
+        raise SystemExit("recovery source is not owned regular bytes")
+    data = source.read_bytes()
 if hashlib.sha256(data).hexdigest() != expected:
     raise SystemExit("recovery source identity changed")
 if destination.exists() or destination.is_symlink():
@@ -2727,6 +2746,20 @@ stage_legacy_recovery_handoff() {
     validate_legacy_handoff_destination "$transaction"
     [[ ! -e "$legacy_recovery_journal" && ! -L "$legacy_recovery_journal" ]] ||
         safe_blocked 'legacy reader handoff journal already exists'
+    local legacy_recovery_reader_image
+    legacy_recovery_reader_image="$(python3 - "$(legacy_recovery_reader_source)" "$legacy_recovery_reader_hash" <<'PY'
+import base64, gzip, hashlib, os, pathlib, sys
+source = pathlib.Path(sys.argv[1])
+if not source.is_file() or source.is_symlink() or source.stat().st_uid!=os.getuid():
+    raise SystemExit("legacy reader source is not owned regular bytes")
+data = source.read_bytes()
+if len(data)>524288 or hashlib.sha256(data).hexdigest()!=sys.argv[2]:
+    raise SystemExit("legacy reader source identity changed")
+image = base64.b64encode(gzip.compress(data, mtime=0)).decode()
+if len(image)>65536: raise SystemExit("legacy reader image is too large")
+print(image)
+PY
+    )" || safe_blocked 'legacy reader image could not be preserved'
     local transaction="$legacy_recovery_journal" CODEX_INFO_INTERRUPT_PHASE=
     write_journal prepared
 }
@@ -2742,6 +2775,7 @@ promote_legacy_recovery_handoff() {
             safe_blocked 'legacy reader handoff identity is invalid'
     ) || safe_blocked 'legacy reader handoff journal is invalid'
     legacy_recovery_reader_active || safe_blocked 'legacy reader handoff entrypoint is unavailable'
+    seal_legacy_reader_handoff
     python3 - "$legacy_recovery_journal" "$transaction" <<'PY'
 import os, pathlib, sys
 source, destination = map(pathlib.Path, sys.argv[1:])
@@ -2787,15 +2821,54 @@ finish_committed_legacy_recovery() {
     transaction_recovered=1
 }
 
+legacy_recovery_reader_image() {
+    (
+        local transaction="$legacy_recovery_journal"
+        read_journal
+        [[ "$journal_phase" == prepared && "$journal_operation_id" == "$operation_id" &&
+           "$journal_legacy_recovery_reader_hash" == "$legacy_recovery_reader_hash" ]] ||
+            safe_blocked 'legacy reader image belongs to another operation'
+        printf '%s\n' "$journal_legacy_recovery_reader_image"
+    )
+}
+
+legacy_recovery_reader_prior_hash() {
+    (
+        local transaction="$share_dir/install-transaction.json"
+        [[ -e "$transaction" || -L "$transaction" ]] || return 0
+        read_journal
+        [[ "$journal_phase" == committed ]] || safe_blocked 'unsettled journal blocks cache replacement'
+        printf '%s\n' "$journal_legacy_recovery_reader_hash"
+    )
+}
+
+# Once the cache and its installed binding are durable, strip the temporary
+# executable image before promotion. The canonical journal always has v1 keys.
+seal_legacy_reader_handoff() {
+    legacy_recovery_reader_active || safe_blocked 'legacy reader is not durable before journal promotion'
+    local content
+    content="$(python3 - "$legacy_recovery_journal" <<'PY'
+import json, pathlib, sys
+document = json.loads(pathlib.Path(sys.argv[1]).read_text())
+document.pop("legacy_reader_image", None)
+print(json.dumps(document, ensure_ascii=False, indent=2)+"\n", end="")
+PY
+    )" || safe_blocked 'legacy reader handoff could not be sealed'
+    atomic_text "$legacy_recovery_journal" 600 "$content"
+}
+
 prepare_legacy_recovery_reader() {
     [[ -n "$legacy_recovery_reader_hash" ]] || return 0
     legacy_recovery_reader_valid && return 0
-    local previous=
+    local previous= reader_image=
     if [[ -e "$legacy_recovery_reader_destination" || -L "$legacy_recovery_reader_destination" ]]; then
-        previous="$journal_legacy_recovery_reader_hash"
+        previous="$(legacy_recovery_reader_prior_hash)" || safe_blocked 'prior legacy reader authority is invalid'
         legacy_recovery_reader_valid "$previous" || safe_blocked 'foreign legacy recovery executable'
     fi
-    atomic_recovery_copy "$(legacy_recovery_reader_source)" "$legacy_recovery_reader_destination" "$legacy_recovery_reader_hash" "$previous" ||
+    if [[ -e "$legacy_recovery_journal" || -L "$legacy_recovery_journal" ]]; then
+        reader_image="$(legacy_recovery_reader_image)" || safe_blocked 'legacy reader image is unavailable'
+    fi
+    atomic_recovery_copy "$(legacy_recovery_reader_source)" "$legacy_recovery_reader_destination" "$legacy_recovery_reader_hash" "$previous" "$reader_image" ||
         safe_blocked 'legacy recovery executable could not be preserved'
 }
 validate_legacy_recovery_installer_binding() {
@@ -3354,9 +3427,9 @@ perform_install() {
     # Preserve explicit prestate before prepared, so interruption there can restore it.
     if [[ "$recorder_execution" == selected ]]; then capture_recorder_override_prestate "$previous_id"; fi
     if [[ -n "$legacy_recovery_reader_hash" ]]; then
-        prepare_legacy_recovery_reader
         stage_legacy_recovery_handoff
         [[ "${CODEX_INFO_INTERRUPT_PHASE-}" != legacy_handoff_staged ]] || exit 75
+        prepare_legacy_recovery_reader
         publish_legacy_recovery_reader
         [[ "${CODEX_INFO_INTERRUPT_PHASE-}" != legacy_handoff_bound ]] || exit 75
         promote_legacy_recovery_handoff

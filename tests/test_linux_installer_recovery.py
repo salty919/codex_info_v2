@@ -1,5 +1,6 @@
 """Literal predecessor snapshots resumed across separate installer processes."""
 
+import base64
 import gzip
 import hashlib
 import json
@@ -36,6 +37,7 @@ FUNCTIONS = (
     "restore_legacy_recovery_installer", "validate_legacy_handoff_destination",
     "stage_legacy_recovery_handoff", "promote_legacy_recovery_handoff",
     "recover_legacy_reader_handoff", "finish_committed_legacy_recovery",
+    "legacy_recovery_reader_image", "legacy_recovery_reader_prior_hash", "seal_legacy_reader_handoff",
 )
 
 MODEL = r"""
@@ -112,14 +114,26 @@ assert sys.argv[1] == "-"
 sys.argv = sys.argv[1:]
 code = sys.stdin.read()
 original_replace = os.replace
+original_fsync = os.fsync
+cache_published = False
 def replace(source, destination):
+    global cache_published
     original_replace(source, destination)
+    if pathlib.Path(destination).name == ".legacy-recovery-install.sh":
+        cache_published = True
     if (os.environ["CRASH_RESTORE"] == "1" and
             pathlib.Path(source).name == sys.argv[1] + "-codex-info.service"):
         pathlib.Path(os.environ["HOME"], "partial-receipt").write_text("unit restored; old manifest/payload pending\n")
         os.kill(os.getppid(), signal.SIGKILL)
         raise SystemExit(75)
+def fsync(descriptor):
+    original_fsync(descriptor)
+    if cache_published and os.environ.get("CRASH_CACHE") == "1":
+        pathlib.Path(os.environ["HOME"], "cache-receipt").write_text("recovery cache file and directory fsynced\n")
+        os.kill(os.getppid(), signal.SIGKILL)
+        raise SystemExit(75)
 os.replace = replace
+os.fsync = fsync
 exec(compile(code, "installer-inline-python", "exec"))
 """
 
@@ -180,7 +194,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.enable.symlink_to("../codex-info.service")
         (self.home / "codex-info.service.active").write_text("1\n")
 
-    def run_step(self, step, *, desired="running", crash_stop=False, crash_restore=False, details="ready", interrupt_phase=""):
+    def run_step(self, step, *, desired="running", crash_stop=False, crash_restore=False, crash_cache=False, details="ready", interrupt_phase="", reader_source=None):
         source = INSTALLER.read_text()
         prefix = source.split("\nusage() {", 1)[0]
         functions = []
@@ -196,8 +210,8 @@ class LegacyRecoveryTests(unittest.TestCase):
             ["/bin/bash", "--noprofile", "--norc", "-s"], input=script,
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": str(self.home), "SHIM": str(self.shim),
                  "STEP": step, "DESIRED": desired, "CRASH_STOP": str(int(crash_stop)),
-                 "CRASH_RESTORE": str(int(crash_restore)), "DETAILS_STATE": details,
-                 "CODEX_INFO_INTERRUPT_PHASE": interrupt_phase, "CURRENT_INSTALLER": str(INSTALLER)},
+                 "CRASH_RESTORE": str(int(crash_restore)), "CRASH_CACHE": str(int(crash_cache)), "DETAILS_STATE": details,
+                 "CODEX_INFO_INTERRUPT_PHASE": interrupt_phase, "CURRENT_INSTALLER": str(reader_source or INSTALLER)},
             capture_output=True, text=True, check=False, timeout=8,
         )
 
@@ -434,6 +448,92 @@ class LegacyRecoveryTests(unittest.TestCase):
         quarantine = self.backups / (document["operation_id"] + "-generation-" + document["new_generation"])
         quarantine.mkdir(mode=0o700)
         quarantine.rmdir()
+
+    def test_cache_copy_has_durable_authority_before_owner_death(self):
+        self.seed_pinned_installer()
+        first = self.run_step("install", crash_cache=True)
+        self.assertEqual(first.returncode, -9, first.stderr)
+        self.assertEqual((self.home / "cache-receipt").read_text(), "recovery cache file and directory fsynced\n")
+        cache = self.share / ".legacy-recovery-install.sh"
+        self.assertEqual(cache.read_bytes(), INSTALLER.read_bytes())
+        pending = self.share / ".legacy-recovery-transaction.json"
+        self.assertTrue(pending.exists(), "fsynced recovery code has no durable authority")
+        self.operation = json.loads(pending.read_text())["operation_id"]
+        newer = self.home / "newer-installer.sh"
+        newer.write_bytes(INSTALLER.read_bytes() + b"\n# different retry image\n")
+        newer.chmod(0o755)
+        recovered = self.run_step("resume", reader_source=newer)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_snapshot()
+
+    def test_staged_handoff_recreates_missing_cache_with_different_retry_bytes(self):
+        self.seed_pinned_installer()
+        first = self.run_step("install", interrupt_phase="legacy_handoff_staged")
+        self.assertEqual(first.returncode, 75, first.stderr)
+        cache = self.share / ".legacy-recovery-install.sh"
+        self.assertFalse(cache.exists(), "cache was published before staged authority")
+        pending = self.share / ".legacy-recovery-transaction.json"
+        self.operation = json.loads(pending.read_text())["operation_id"]
+        newer = self.home / "newer-installer.sh"
+        newer.write_bytes(INSTALLER.read_bytes() + b"\n# different retry image\n")
+        newer.chmod(0o755)
+        recovered = self.run_step("resume", reader_source=newer)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_snapshot()
+        self.assertEqual(cache.read_bytes(), INSTALLER.read_bytes())
+
+    def test_foreign_staged_code_image_preserves_snapshot_and_authority(self):
+        self.seed_pinned_installer()
+        first = self.run_step("install", interrupt_phase="legacy_handoff_staged")
+        self.assertEqual(first.returncode, 75, first.stderr)
+        pending = self.share / ".legacy-recovery-transaction.json"
+        document = json.loads(pending.read_text())
+        document["legacy_reader_image"] = base64.b64encode(gzip.compress(b"#!/bin/bash\n# foreign program\n", mtime=0)).decode()
+        foreign = (json.dumps(document) + "\n").encode()
+        pending.write_bytes(foreign)
+        recovered = self.run_step("resume")
+        self.assertEqual(recovered.returncode, 88, recovered.stderr)
+        self.assertEqual(pending.read_bytes(), foreign)
+        self.assertFalse(self.journal.exists())
+        self.assertFalse((self.share / ".legacy-recovery-install.sh").exists())
+        for name, (data, mode) in self.snapshot.items():
+            self.assertEqual(self.paths[name].read_bytes(), data, name)
+            self.assertEqual(self.paths[name].stat().st_mode & 0o777, mode, name)
+        for name, data in self.sentinels.items():
+            self.assertEqual((self.home / name).read_bytes(), data)
+
+    def test_known_prior_cache_can_be_replaced_after_stage_interruption(self):
+        self.seed_pinned_installer()
+        cache = self.share / ".legacy-recovery-install.sh"
+        prior = INSTALLER.read_bytes() + b"\n# prior operation recovery code\n"
+        cache.write_bytes(prior)
+        cache.chmod(0o755)
+        def encode(data):
+            return base64.urlsafe_b64encode(data).decode().rstrip("=")
+        prior_operation = "prior-operation~lc1~111~" + encode(hashlib.sha256(self.manifest).digest()) + "~" + encode(hashlib.sha256(prior).digest())
+        document = {
+            "schema": "codex-info-install-transaction-v1", "operation_id": prior_operation,
+            "owner_pid": 999999, "owner_starttime": 1000, "boot_id": "literal-boot",
+            "phase": "committed", "old_generation": self.old_id, "new_generation": "",
+            "desired_state": "running", "updated_at_unix": 100,
+        }
+        self.journal.write_text(json.dumps(document) + "\n")
+        self.journal.chmod(0o600)
+        # Suppress capture of the deliberately separate prior history record.
+        self.operation = "waiting-for-current-stage"
+        first = self.run_step("install", interrupt_phase="legacy_handoff_staged")
+        self.assertEqual(first.returncode, 75, first.stderr)
+        self.assertEqual(cache.read_bytes(), prior)
+        pending = self.share / ".legacy-recovery-transaction.json"
+        self.operation = json.loads(pending.read_text())["operation_id"]
+        self.assertNotEqual(self.operation, prior_operation)
+        newer = self.home / "newer-installer.sh"
+        newer.write_bytes(INSTALLER.read_bytes() + b"\n# different retry image\n")
+        newer.chmod(0o755)
+        recovered = self.run_step("resume", reader_source=newer)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_snapshot()
+        self.assertEqual(cache.read_bytes(), INSTALLER.read_bytes())
 
     def test_retired_active_combined_resumes_original_runtime(self):
         self.retired_runtime(False)
