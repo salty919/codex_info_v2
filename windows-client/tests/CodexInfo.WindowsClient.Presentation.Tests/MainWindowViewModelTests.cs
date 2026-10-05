@@ -491,6 +491,54 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public void SettingsAccountSelectionUsesSharedStateAndFreshStartupUsesCurrent()
+    {
+        var store = new ClientSettingsStore(Path.Combine(Path.GetTempPath(),
+            "codex-info-account-settings-" + Guid.NewGuid().ToString("N"), "settings.json"));
+        using var main = new MainWindowViewModel(new AccountScopedClient());
+        var settings = new SettingsViewModel(store, main);
+        try
+        {
+            // The public binding contract must exist before any implementation
+            // is added; a missing selector is an assertion failure, not a build failure.
+            var selectedProperty = typeof(SettingsViewModel).GetProperty("SelectedAccount");
+            var accountsProperty = typeof(SettingsViewModel).GetProperty("Accounts");
+            Assert.NotNull(selectedProperty);
+            Assert.NotNull(accountsProperty);
+            var notifications = new List<string?>();
+            settings.PropertyChanged += (_, change) => notifications.Add(change.PropertyName);
+
+            Assert.True(ApplyAccountsSnapshot(main, AccountsAIsCurrent()));
+            Assert.Same(main.Accounts, accountsProperty.GetValue(settings));
+            Assert.Equal("account-7", Assert.IsType<ApiAccount>(selectedProperty.GetValue(settings)).Id);
+            Assert.Contains("SelectedAccount", notifications);
+            Assert.Contains("Accounts", notifications);
+
+            selectedProperty.SetValue(settings, main.Accounts.Single(account => account.Id == "account-15"));
+            Assert.Equal("account-15", main.SelectedAccount?.Id);
+            Assert.Contains("SelectedAccountText", notifications);
+            Assert.True(ApplyAccountsSnapshot(main, AccountsBIsCurrent()));
+            Assert.Equal("account-15", Assert.IsType<ApiAccount>(selectedProperty.GetValue(settings)).Id);
+
+            using var freshMain = new MainWindowViewModel(new AccountScopedClient());
+            var freshSettings = new SettingsViewModel(store, freshMain);
+            try
+            {
+                Assert.True(ApplyAccountsSnapshot(freshMain, AccountsBIsCurrent()));
+                Assert.Equal("account-13", Assert.IsType<ApiAccount>(selectedProperty.GetValue(freshSettings)).Id);
+            }
+            finally
+            {
+                freshSettings.Dispose();
+            }
+        }
+        finally
+        {
+            settings.Dispose();
+        }
+    }
+
+    [Fact]
     public void AccountDirectoryReconciliationFollowsOnlyThePreviousDefault()
     {
         using var automatic = new MainWindowViewModel(new AccountScopedClient());

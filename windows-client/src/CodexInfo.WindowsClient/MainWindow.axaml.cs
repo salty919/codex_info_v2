@@ -19,7 +19,6 @@ public partial class MainWindow : Window
     private LegalNoticesWindow? legalNoticesWindow;
     private SettingsWindow? settingsWindow;
     private SetupWindow? setupWindow;
-    private string? accountSelectionAtOpen;
 
     public MainWindow()
     {
@@ -114,34 +113,6 @@ public partial class MainWindow : Window
     }
 
     private void OnOpenThreads(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs) => OpenThreads();
-
-    private void OnAccountSelectorCheckedChanged(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs)
-    {
-        var open = AccountSelector.IsChecked == true;
-        accountSelectionAtOpen = open
-            ? (DataContext as MainWindowViewModel)?.SelectedAccount?.Id
-            : null;
-        SetAccountMenuOpen(open);
-    }
-
-    private void OnAccountSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
-    {
-        if (!AccountMenu.IsEnabled || sender is not ListBox { SelectedItem: ApiAccount selected } ||
-            string.Equals(selected.Id, accountSelectionAtOpen, StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        SetAccountMenuOpen(false);
-        AccountSelector.IsChecked = false;
-    }
-
-    private void SetAccountMenuOpen(bool open)
-    {
-        AccountMenu.Opacity = open ? 1 : 0;
-        AccountMenu.IsEnabled = open;
-        AccountMenu.IsHitTestVisible = open;
-    }
 
     private void OpenThreads()
     {

@@ -333,7 +333,7 @@ Mainを既定の到達先とし、保存済みselectorで次回自動再接続�
 自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
 
-Mainはstrict validation済み`/v3/current`、Graphは`/v3/history/periods`と選択期間のhistory page、Threadsは`/v3/threads`を使う。account selectorは`/v3/accounts`の非秘密IDを使い、既定を現accountとし、過去accountを一つずつ選択できる。`default_account_id=null`はログアウトとして選択中accountを0件にし、Linux/Windowsとも旧accountのidentity、quota、reset、model、threadを同じ境界で消去して、selectorなし`/v3/current`の`auth_required`を表示する。選択変更時はMain、Graph、Threadsの旧account値、pair、cursor、pending、errorを一括破棄し、選択accountのresourceだけを再取得する。各取得cycleは必要な応答が全て同じaccountかつ同じpublished pairの場合だけatomic置換する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v3/current`がexact 404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
+Mainはstrict validation済み`/v3/current`、Graphは`/v3/history/periods`と選択期間のhistory page、Threadsは`/v3/threads`を使う。account selectorは`/v3/accounts`の非秘密IDを使い、起動時の既定と起動後の選択維持は`ACCOUNT-LIFECYCLE-134`に従う。`default_account_id=null`の新規起動または現accountへの追従中は選択中accountを0件にし、Linux/Windowsとも旧accountのidentity、quota、reset、model、threadを同じ境界で消去して、selectorなし`/v3/current`の`auth_required`を表示する。選択変更時はMain、Graph、Threadsの旧account値、pair、cursor、pending、errorを一括破棄し、選択accountのresourceだけを再取得する。各取得cycleは必要な応答が全て同じaccountかつ同じpublished pairの場合だけatomic置換する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v3/current`がexact 404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
 exact 404でlegacy details modeへ入った接続は、一つの受理済みdetails rootをMain、Graph、Threadsへ同時投影し、split routeを追加要求しない。再接続時に`/v3/current`から能力判定をやり直す。
 Mainは10秒、Graph差分はopen中60秒、Threadsはopen中5秒で確認し、Graph/Threadsを閉じている間は対応requestを送らない。SQLite、別pair、認証control応答でfieldを補完せず、quota/history/threadの再収集、
 値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は該当surfaceだけが同じlast-good rootを保持し、他surfaceやrecorderを変更しない。
@@ -353,9 +353,10 @@ component順や表示所有者を変更しない。
 
 ### 4.1 Monitor
 
-- 画面上部は両platformとも`CODEX情報→アカウント→推移→法的通知→設定`の順とし、
+- 画面上部は両platformとも`CODEX情報→推移→法的通知→設定`の順とし、
   window controlsをその後に置く。Threads入口を上部へ置かない。
-- Mainのaccount selectorとそのdropdownは検証済みlogin IDまたはpublic account番号だけを表示し、
+- account selectorは両platformともSettingsだけに置き、MainとGraphに切替操作を置かない。
+  selectorとそのdropdownは検証済みlogin IDまたはpublic account番号だけを表示し、
   `ログイン中`、`履歴`および各localeで同じ意味の状態語を付けない。現在認証中accountだけ、
   labelの直前にsuccess green `#5DC98A`の`●`を置き、過去accountにはmarkerを置かない。
   選択、partition、logout、Graph/Threadsのaccount表示意味は変更しない。
@@ -380,9 +381,7 @@ component順や表示所有者を変更しない。
   `#3A1D24/#8E3D4D/#E06B7A`（background/border/accent）を使い、状態によってcanvas全体を
   着色しない。
 - Headerは`210px / 250px / 残幅`の3列と`10px`列間隔を使い、左列に`36×36px`のmark、
-  `22px`のCODEX情報title、`12px`のversionを置く。account selectorは`250×44px`とし、
-  閉じたselector内のaccount labelとIDを左`28px`に揃え、矢印は幅全体の右端から`24px`の
-  `14px`欄の中央へ置く。展開listの形状と選択動作は変更しない。
+  `22px`のCODEX情報title、`12px`のversionを置く。中央列には切替操作を置かない。
   右列に推移、法的通知、設定、最小化、閉じるを置く。期間labelをHeaderへ重複表示しない。
 - RemainingQuotaはWindowsの単一card内で主値と概算を並べ、その下のbarをcard内の利用可能幅
   全体（左右`14px`を除く`828px`、高さ`6px`）へ伸ばす。WeekGaugeはWindows Mainの表示を参照し、
@@ -546,7 +545,12 @@ component順や表示所有者を変更しない。
 
 ### 4.4 Setup / Settings
 
-- Linux Settingsはtimezone一項目だけを持つsingleton Windowとする。選択肢と保存値はexact
+- Settingsのaccount selectorは既存の表示対象を即時に切り替え、認証accountを変更しない。
+  起動と選択維持は`ACCOUNT-LIFECYCLE-134`に従い、開いているSettingsも同じ一覧・選択へ追従する。
+  account選択は保存操作を要さず、取消またはCloseで戻さず、永続設定へ追加しない。
+  selectorは`250×44px`とし、閉じたselector内のaccount labelとIDを左`28px`に揃え、
+  矢印は幅全体の右端から`24px`の`14px`欄の中央へ置く。
+- Linux Settingsはaccount selectorとtimezoneを持つsingleton Windowとする。timezoneの選択肢と保存値はexact
   `local|UTC`で、未保存変更はMain/Graphへ反映せず、取消またはCloseで破棄する。保存成功時だけ
   同一directory内のatomic renameを完了してから開いているMain/Graphの時刻表示へ即時反映し、Windowを閉じる。
   成功した保存値は通常のprocess再起動後に復元する。
@@ -696,4 +700,4 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
 
 ## 既存Settingsの稼働バージョン（Issue #481）
 
-`RUNTIME-SETTINGS-481`: Linuxの既存TimeZoneSettingsWindowとWindowsの既存Settingsで `RUNTIME-VERSION-481` のRecorder/REST値を別々に表示する。画面を開く際に既存loopback API clientから取得し、Windowsは既存Refresh操作でも更新する。一致、不一致、取得不可を同じ意味で示す。取得に失敗した値をUI自身のversionや前回値で補完せず、取得不可へ戻す。Linuxの既存Settingsは追加3行を収めるため高さ300pxとし、幅・既存の設定操作を維持する。
+`RUNTIME-SETTINGS-481`: Linuxの既存TimeZoneSettingsWindowとWindowsの既存Settingsで `RUNTIME-VERSION-481` のRecorder/REST値を別々に表示する。画面を開く際に既存loopback API clientから取得し、Windowsは既存Refresh操作でも更新する。一致、不一致、取得不可を同じ意味で示す。取得に失敗した値をUI自身のversionや前回値で補完せず、取得不可へ戻す。Linuxの既存Settingsはaccount selectorと稼働versionの3行を収めるため高さ356pxとし、幅・既存の設定操作を維持する。
