@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Globalization;
-using System.Reflection;
 using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Graphing;
@@ -65,10 +64,11 @@ public sealed class Issue337HistoryGapTests
             timestamp => timestamp < firstObservation);
 
         var control = new GraphPlotControl { Scene = scene };
-        var renderedLeadingQuota = typeof(GraphPlotControl)
-            .GetField("remainingDashedSeries", BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new MissingFieldException(typeof(GraphPlotControl).FullName, "remainingDashedSeries");
-        Assert.NotNull(renderedLeadingQuota.GetValue(control));
+        Assert.Contains(
+            control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>(),
+            line => line.Axes.YAxis == control.Plot.Axes.Right &&
+                line.LineWidth == GraphPlotControl.InferredLineWidth &&
+                line.Data.GetScatterPoints().Any(point => point.X == periodStart && point.Y == 100));
     }
 
     private static ApiHistorySample Sample(

@@ -17663,13 +17663,8 @@ impl CodexInfoState {
 
     fn selected_history_period_label(&self) -> String {
         let periods = self.history_periods();
-        if let Some(pending) = self.service_history_pending_reset_at {
-            if let Some(period) = periods.iter().find(|period| {
-                period.canonical_reset_at.abs_diff(pending) <= RESET_AT_TOLERANCE_SECONDS as u64
-            }) {
-                return period.label.clone();
-            }
-        }
+        // The selector labels the accepted graph. A requested period becomes
+        // visible only when its complete history page commits below.
         if let Some(period) = periods
             .iter()
             .find(|period| period.label == self.selected_history_period)
@@ -29747,6 +29742,7 @@ mod tests {
             client.service_history_samples.clone(),
             client.history.samples.clone(),
         );
+        let last_good_selector = client.selected_history_period_label();
         client.select_history(&target_label);
 
         assert_eq!(
@@ -29763,6 +29759,7 @@ mod tests {
             ),
             last_good
         );
+        assert_eq!(client.selected_history_period_label(), last_good_selector);
         assert!(client.graph_history_loading());
         assert!(client.service_history_error.is_none());
 
@@ -29786,6 +29783,7 @@ mod tests {
         assert_eq!(client.service_history_pending_failures, 1);
         assert!(client.service_history_force_poll);
         assert!(client.service_history_error.is_none());
+        assert_eq!(client.selected_history_period_label(), last_good_selector);
         assert!(client.graph_history_loading());
         assert_eq!(
             (
@@ -29831,6 +29829,7 @@ mod tests {
         );
         assert_eq!(client.service_history_samples, [target_sample]);
         assert!(!client.service_history_force_poll);
+        assert_eq!(client.selected_history_period_label(), target_label);
         assert!(!client.graph_history_loading());
         assert!(client.service_history_error.is_none());
     }
@@ -49205,6 +49204,10 @@ mod tests {
         assert!(graph.contains("in property <bool> history-loading: false;"));
         assert!(graph.contains("in property <bool> history-load-error: false;"));
         assert!(graph.contains("if root.history-loading : Rectangle"));
+        // G137-10 keeps the loading spinner while the accepted graph stays visible.
+        assert!(
+            graph.contains("background: root.has-graph-data ? transparent : DesignTokens.raised;")
+        );
         assert!(graph.contains("Spinner {"));
         assert!(graph.contains(
             "visible: !root.has-graph-data && !root.history-loading && !root.history-load-error;"
