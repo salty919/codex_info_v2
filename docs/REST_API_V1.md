@@ -129,6 +129,7 @@ v3 clientはrouteとqueryごとに直前に受理したpublished pairをquoted `
 published generationならserverは同じpair headerとbody 0の`304`を返す。旧client向け200応答へ新headerを
 追加せず、v1/v2 fallbackへ条件headerを送らない。304を新しいsnapshotや失敗へ
 読み替えずlast-good rootを維持し、pairが異なる場合だけ200の完全rootをatomic置換する。
+一時的な読取り失敗によるdegraded応答も正常応答とは異なるpublished pairを持つ。全snapshot resourceは同じ取得状態なら同じpairを返し、DBの内容が変わらず回復した場合も、error応答のpairによる条件要求へは正常な完全rootを200で返す。これによりerror状態を304で保持し続けない。
 許可する成功メソッドは `GET` だけである。自動解凍、redirect、cookie、proxyは使用しない。
 
 | Request | Result |
@@ -575,3 +576,4 @@ schema-validなdetailsの`state=auth_required|initializing|error,authenticated=f
 ## REST失敗の診断（Issue #482）
 
 `REST-FAILURE-482`: 全登録routeと共有failure ownerはrequest解析、route/input拒否、snapshot/DB読取り、projection/応答生成、応答書込みの失敗を診断できるようにする。HTTP失敗は既存の固定error code、内部失敗は固定categoryとOS/SQLite error kindを理由として記録する。記録項目はtimestamp、canonical routeまたは固定の未解析/未知route識別子、stage、reason、HTTP status。raw URL/query/body/header、token、credential、account識別子、DB値・例外のraw文言を記録しない。ログ保存・閲覧境界はDATA owner `REST-LOG-RETENTION-482` に従う。
+HTTP 200の本文で`state=error`を返す場合も記録する。未完了収集または取得laneのdegraded、refresh失敗によるlast-good保持、account境界のerrorを固定categoryで区別する。未完了収集と取得laneのdegradedはreaderが統合した値のため、REST側でどちらかに断定しない。

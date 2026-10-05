@@ -16,6 +16,8 @@ use codex_info_rest_contract::{
 use diagnostics::FailureLog;
 use history::{HistoryIndex, PeriodIndex};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -56,6 +58,20 @@ pub struct PublishedSnapshot {
 }
 
 impl PublishedSnapshot {
+    fn response_pair(&self, degraded: bool) -> Cow<'_, str> {
+        if !degraded {
+            return Cow::Borrowed(&self.pair);
+        }
+        // Health is part of the published representation even when the DB
+        // generation has not changed. A separate namespace lets existing
+        // clients accept both the error and its recovery without comparing
+        // their counters or retaining an error body behind a healthy 304.
+        let mut hash = Sha256::new();
+        hash.update(b"codex-info-rest-degraded-v1\0");
+        hash.update(self.pair.as_bytes());
+        Cow::Owned(format!("v1:{:x}", hash.finalize()))
+    }
+
     fn from_db_for_account(snapshot: DbSnapshot, storage_epoch: u64) -> Self {
         let history_index = HistoryIndex::build(&snapshot, storage_epoch);
         // Preserve the pair shape while binding the stable account namespace,
@@ -1043,12 +1059,17 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
         );
         return;
     };
+    let response_pair = if route.v3() {
+        snapshot.response_pair(degraded)
+    } else {
+        Cow::Borrowed(snapshot.pair.as_str())
+    };
     if !degraded
         && route.v3()
         && request
             .if_none_match
             .as_deref()
-            .is_some_and(|pair| pair == snapshot.pair)
+            .is_some_and(|pair| pair == response_pair)
     {
         // A matching pair cannot suppress validation of a stale history cursor.
         if route == Route::HistoryV3 {
@@ -1067,7 +1088,7 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
             route_label,
             304,
             Vec::new(),
-            Some(snapshot.pair.as_str()),
+            Some(response_pair.as_ref()),
             true,
         );
         return;
@@ -1080,15 +1101,33 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
         degraded,
     );
     match response {
-        Ok(body) => write_json_response(
-            stream,
-            &store.diagnostics,
-            route_label,
-            200,
-            body,
-            Some(snapshot.pair.as_str()),
-            false,
-        ),
+        Ok(body) => {
+            if matches!(
+                route,
+                Route::Details | Route::DetailsV2 | Route::DetailsV3 | Route::CurrentV3
+            ) && (degraded || snapshot.details.state == PublicState::Error)
+            {
+                let reason = if degraded && snapshot.has_pending_ranges {
+                    "incomplete_source_or_acquisition"
+                } else if degraded {
+                    "last_good_after_refresh_failure"
+                } else {
+                    "account_boundary_error"
+                };
+                store
+                    .diagnostics
+                    .record(route_label, "publication_state", reason, Some(200));
+            }
+            write_json_response(
+                stream,
+                &store.diagnostics,
+                route_label,
+                200,
+                body,
+                Some(response_pair.as_ref()),
+                false,
+            )
+        }
         Err(error) => write_route_error(stream, &store.diagnostics, route_label, error),
     }
 }
@@ -2734,6 +2773,151 @@ mod tests {
         assert_eq!(recovered_json["state"], "ready");
         server.shutdown();
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn issue_134_degraded_pair_recovers_without_database_change() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("usage.sqlite3");
+        fixture(&path, 10);
+        let mut server = RestServer::start(
+            DbReader::open(&path).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let routes = [
+            "/v3/current",
+            "/v3/details",
+            "/v3/threads",
+            "/v3/history/periods",
+            "/v3/history?period=1800000060",
+        ];
+        let initial = request(
+            server.local_addr(),
+            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let initial_json: Value = serde_json::from_str(body(&initial)).unwrap();
+        let ready_pair = published_pair(&initial).to_owned();
+        let moved = path.with_extension("moved");
+        fs::rename(&path, &moved).unwrap();
+        let mut error_pair = None;
+        for route in routes {
+            let response = request(
+                server.local_addr(),
+                &format!(
+                    "GET {route} HTTP/1.1\r\nHost:x\r\nIf-None-Match: \"{ready_pair}\"\r\n\r\n"
+                ),
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{route}");
+            let pair = published_pair(&response);
+            if let Some(expected) = &error_pair {
+                assert_eq!(pair, expected, "split resources must agree");
+            } else {
+                error_pair = Some(pair.to_owned());
+            }
+            if route == "/v3/current" {
+                let error: Value = serde_json::from_str(body(&response)).unwrap();
+                assert_eq!(error["state"], "error");
+                assert_eq!(error["models"], initial_json["models"]);
+            }
+        }
+        fs::rename(&moved, &path).unwrap();
+        let error_pair = error_pair.unwrap();
+        let recovered = request(
+            server.local_addr(),
+            &format!(
+                "GET /v3/current HTTP/1.1\r\nHost:x\r\nIf-None-Match: \"{error_pair}\"\r\n\r\n"
+            ),
+        );
+        assert!(
+            recovered.starts_with("HTTP/1.1 200"),
+            "recovery must replace the cached error, even with unchanged DB: {recovered}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(body(&recovered)).unwrap(),
+            initial_json
+        );
+        assert_eq!(published_pair(&recovered), ready_pair);
+        // Linux accepts namespace changes independently of its monotonic counter.
+        assert_ne!(&error_pair[3..35], &ready_pair[3..35]);
+        assert_eq!(error_pair.len(), ready_pair.len());
+        assert!(error_pair[3..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        let unchanged = request(
+            server.local_addr(),
+            &format!(
+                "GET /v3/current HTTP/1.1\r\nHost:x\r\nIf-None-Match: \"{ready_pair}\"\r\n\r\n"
+            ),
+        );
+        assert!(unchanged.starts_with("HTTP/1.1 304"));
+        server.shutdown();
+    }
+
+    #[test]
+    fn issue_134_http_success_error_state_is_logged() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private-db-name.sqlite3");
+        fixture(&path, 10);
+        let mut server = RestServer::start(
+            DbReader::open(&path).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        server.store().set_log_data_root(root.path());
+        let wire = "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n";
+        let _ = request(server.local_addr(), wire);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE session_pending_ranges(source_id TEXT, range_start INTEGER, complete INTEGER); INSERT INTO session_pending_ranges VALUES('private-source-name',0,0); UPDATE collection_generation SET data_generation='2';").unwrap();
+        let pending = request(server.local_addr(), wire);
+        assert_eq!(
+            serde_json::from_str::<Value>(body(&pending)).unwrap()["state"],
+            "error"
+        );
+        connection
+            .execute_batch("DELETE FROM session_pending_ranges; UPDATE collection_generation SET data_generation='3';")
+            .unwrap();
+        drop(connection);
+        let _ = request(server.local_addr(), wire);
+        let moved = path.with_extension("moved");
+        fs::rename(&path, &moved).unwrap();
+        let _ = request(server.local_addr(), wire);
+        fs::rename(&moved, &path).unwrap();
+        server.store().publish_account_boundary(PublicState::Error);
+        let _ = request(server.local_addr(), wire);
+        server
+            .store()
+            .publish_account_boundary(PublicState::Initializing);
+        let _ = request(server.local_addr(), wire);
+        let log = fs::read_dir(root.path().join("logs/rest"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        let rows: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let publication: Vec<_> = rows
+            .iter()
+            .filter(|row| row["stage"] == "publication_state")
+            .collect();
+        assert_eq!(
+            publication.len(),
+            3,
+            "every HTTP200 error state must be diagnosed; ready/initializing are not errors: {log}"
+        );
+        for (row, reason) in publication.iter().zip([
+            "incomplete_source_or_acquisition",
+            "last_good_after_refresh_failure",
+            "account_boundary_error",
+        ]) {
+            assert_eq!(row["reason"], reason);
+            assert_eq!(row["route"], "/v3/current");
+            assert_eq!(row["http_status"], 200);
+        }
+        assert!(!log.contains("private-db-name"));
+        assert!(!log.contains("private-source-name"));
+        server.shutdown();
     }
 
     #[test]
