@@ -197,6 +197,33 @@ class DependencyMetadataTests(unittest.TestCase):
             with self.subTest(step=index):
                 self.assertEqual(refs[index], reference)
 
+    def test_codeql_checkout_requires_same_repository_context(self):
+        condition = self.workflow("codeql.yml")["jobs"]["analyze"].get("if")
+        required = "github.event.pull_request.head.repo.full_name == github.repository"
+        cases = (
+            ("same repository", {"repository": "salty919/codex_info_v2", "event": {
+                "pull_request": {"head": {"repo": {"full_name": "salty919/codex_info_v2"}}}
+            }}, True),
+            ("fork repository", {"repository": "salty919/codex_info_v2", "event": {
+                "pull_request": {"head": {"repo": {"full_name": "contributor/codex_info_v2"}}}
+            }}, False),
+            ("missing PR context", {"repository": "salty919/codex_info_v2", "event": {}}, False),
+        )
+        for name, github, expected in cases:
+            with self.subTest(context=name):
+                if condition is None:
+                    admitted = True  # A missing job condition is unconditional.
+                else:
+                    self.assertEqual(condition, required)
+                    operands = []
+                    for operand in condition.split(" == "):
+                        value = {"github": github}
+                        for property_name in operand.split("."):
+                            value = value.get(property_name, "") if isinstance(value, dict) else ""
+                        operands.append(value.casefold())
+                    admitted = operands[0] == operands[1]
+                self.assertEqual(admitted, expected)
+
     def test_codeql_pins_are_accepted_by_existing_workflow_consumers(self):
         pinned = (ROOT / ".github/workflows/codeql.yml").read_text()
         for mutable, immutable in (

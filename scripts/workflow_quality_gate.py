@@ -450,6 +450,11 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "head_ref": "${{ inputs.head_ref }}",
             "languages_json": "${{ toJSON(fromJSON(inputs.selection_json).codeql_languages) }}",
         })
+        expect(
+            "codeql.analyze.if",
+            _job(docs["codeql.yml"], "analyze").get("if"),
+            "github.event.pull_request.head.repo.full_name == github.repository",
+        )
         for document, job_id in (
             (selective, "docs-quality"),
             (selective, "governance-quality"),

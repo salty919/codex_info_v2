@@ -25,6 +25,7 @@ def main() -> int:
     for marker in (
         "  workflow_call:\n",
         "      languages_json:\n",
+        "    if: github.event.pull_request.head.repo.full_name == github.repository\n",
         "        language: ${{ fromJSON(inputs.languages_json) }}\n",
         "          ref: ${{ inputs.source_sha }}\n",
         "          sha: ${{ inputs.source_sha }}\n",
