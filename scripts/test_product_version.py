@@ -519,7 +519,7 @@ class BetaComparisonFixtures(unittest.TestCase):
             with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                 try:
                     code = product_version.main(["compare", "--left", cases[0][0], "--right", cases[0][1]])
-                except BaseException as error:
+                except (AssertionError, SystemExit) as error:
                     self.fail(f"read-only comparison crossed the path boundary: {type(error).__name__}: {error}")
             resolver.assert_not_called()
         self.assertEqual(code, 0)
