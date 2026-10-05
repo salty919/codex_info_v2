@@ -1,5 +1,6 @@
 """Literal predecessor snapshots resumed across separate installer processes."""
 
+import gzip
 import hashlib
 import json
 import pathlib
@@ -10,6 +11,8 @@ import unittest
 
 INSTALLER = pathlib.Path(__file__).resolve().parents[1] / "packaging/install_linux_bundle.sh"
 OPERATION = "literal-recovery-operation"
+PINNED_INSTALLER = INSTALLER.parents[1] / "tests/fixtures/linux_installer_before_456.sh.gz"
+PINNED_INSTALLER_SHA256 = "9b88e9bdb9ab0fcf667ccbcd225c96fdef9e9aeabb36a652cadc5cabfcfe4126"
 MEMBERS = {
     "codex_info": (b"literal old combined payload\n", 0o755),
     "install.sh": (b"#!/bin/bash\n# literal old installer\n", 0o755),
@@ -27,6 +30,10 @@ FUNCTIONS = (
     "restore_legacy_combined_runtime", "verify_legacy_combined_terminal",
     "recover_legacy_combined_state", "rollback_transaction", "resume_transaction",
     "perform_install", "enforce_desired_state",
+    "atomic_recovery_copy", "legacy_recovery_reader_source", "legacy_recovery_reader_valid",
+    "legacy_recovery_reader_active", "prepare_legacy_recovery_reader",
+    "validate_legacy_recovery_installer_binding", "publish_legacy_recovery_reader",
+    "restore_legacy_recovery_installer",
 )
 
 MODEL = r"""
@@ -71,6 +78,7 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 safe_blocked() { printf 'SAFE_BLOCKED: %s\n' "$*" >&2; exit 88; }
 require_user_manager() { :; }
 load_control_state() { desired_state="$DESIRED"; }
+legacy_recovery_reader_source() { printf '%s\n' "$CURRENT_INSTALLER"; }
 new_operation_id() { printf 'literal-recovery-operation\n'; }
 validate_bundle() { printf '2.0.0\t%s\t%s\t%s\n' "$(printf '2%.0s' {1..40})" "$(printf 'b%.0s' {1..64})" "$(printf 'c%.0s' {1..64})"; }
 check_glibc_compatibility() { :; }
@@ -105,7 +113,7 @@ original_replace = os.replace
 def replace(source, destination):
     original_replace(source, destination)
     if (os.environ["CRASH_RESTORE"] == "1" and
-            pathlib.Path(source).name == "literal-recovery-operation-codex-info.service"):
+            pathlib.Path(source).name == sys.argv[1] + "-codex-info.service"):
         pathlib.Path(os.environ["HOME"], "partial-receipt").write_text("unit restored; old manifest/payload pending\n")
         os.kill(os.getppid(), signal.SIGKILL)
         raise SystemExit(75)
@@ -149,6 +157,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         for name, data in self.sentinels.items():
             (self.home / name).write_bytes(data)
         self.generation = False
+        self.operation = None
 
     def seed(self, generation=False):
         self.generation = generation
@@ -169,7 +178,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.enable.symlink_to("../codex-info.service")
         (self.home / "codex-info.service.active").write_text("1\n")
 
-    def run_step(self, step, *, desired="running", crash_stop=False, crash_restore=False, details="ready"):
+    def run_step(self, step, *, desired="running", crash_stop=False, crash_restore=False, details="ready", interrupt_phase=""):
         source = INSTALLER.read_text()
         prefix = source.split("\nusage() {", 1)[0]
         functions = []
@@ -181,13 +190,19 @@ class LegacyRecoveryTests(unittest.TestCase):
         for name in ("capture_legacy_combined_prestate", "validate_legacy_combined_recovery", "wait_legacy_combined_ready"):
             functions.extend(re.findall(rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", source))
         script = prefix + "\n" + "\n".join(functions) + MODEL
-        return subprocess.run(  # nosec B603 # fixed shell/env; literal fixture and repository functions.
+        result = subprocess.run(  # nosec B603 # fixed shell/env; literal fixture and repository functions.
             ["/bin/bash", "--noprofile", "--norc", "-s"], input=script,
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": str(self.home), "SHIM": str(self.shim),
                  "STEP": step, "DESIRED": desired, "CRASH_STOP": str(int(crash_stop)),
-                 "CRASH_RESTORE": str(int(crash_restore)), "DETAILS_STATE": details},
+                 "CRASH_RESTORE": str(int(crash_restore)), "DETAILS_STATE": details,
+                 "CODEX_INFO_INTERRUPT_PHASE": interrupt_phase, "CURRENT_INSTALLER": str(INSTALLER)},
             capture_output=True, text=True, check=False, timeout=8,
         )
+
+        if self.operation is None and self.journal.exists():
+            self.operation = json.loads(self.journal.read_text())["operation_id"]
+            self.assertEqual(self.operation.split("~lc1~", 1)[0], OPERATION)
+        return result
 
     def assert_snapshot(self, *, enabled=True, active=True):
         for name, (data, mode) in self.snapshot.items():
@@ -199,7 +214,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         for name, data in self.sentinels.items():
             self.assertEqual((self.home / name).read_bytes(), data)
         document = json.loads(self.journal.read_text())
-        self.assertEqual(document["operation_id"], OPERATION)
+        self.assertEqual(document["operation_id"], self.operation)
         self.assertEqual(document["phase"], "committed")
         self.assertEqual(document["old_generation"], self.old_id if self.generation else "")
 
@@ -220,6 +235,83 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.assertEqual((self.home / "trace").read_text(), trace)
         self.assertFalse(list(self.backups.iterdir()))
 
+    def seed_pinned_installer(self):
+        # Frozen pre-PR executable; no runtime dependency on Git history or HEAD.
+        installed = gzip.decompress(PINNED_INSTALLER.read_bytes())
+        self.assertEqual(hashlib.sha256(installed).hexdigest(), PINNED_INSTALLER_SHA256)
+        self.snapshot["install.sh"] = (installed, 0o755)
+        self.snapshot["codex-info.service"] = (
+            b"[Service]\nExecStartPre=%h/.local/libexec/codex-info-install.sh --startup-reconcile --quiet\n"
+            b"ExecStart=%h/.local/bin/codex_info --daemon\n", 0o644,
+        )
+        manifest = json.loads(self.manifest)
+        manifest["source_sha"] = "f331961bc11dc090160ab86f9dc28c5683919fc3"
+        manifest["files"] = [
+            {"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            for name, (data, _) in sorted(self.snapshot.items()) if name != "manifest.json"
+        ]
+        self.manifest = json.dumps(manifest, indent=2).encode() + b"\n"
+        self.snapshot["manifest.json"] = (self.manifest, 0o644)
+        self.old_id = "1.0.48-" + manifest["source_sha"] + "-" + hashlib.sha256(self.manifest).hexdigest()
+        self.seed(generation=True)
+        self.share.chmod(0o700)
+        lock = self.share / ".install.lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+
+    def run_installed_startup(self):
+        # The fixed executable runs its actual argv parser and startup path.
+        # Override external runtime/transport operations after its definitions;
+        # journal readers and recovery functions remain the executable's own.
+        runtime = MODEL.split('\nif [[ "$STEP" == install', 1)[0]
+        runtime += '\nrun_update() { printf "startup resolver reached\\n" >> "$trace"; }\n'
+        (self.home / "startup-model.sh").write_text(runtime)
+        hook = self.home / "startup-hook.sh"
+        hook.write_text(
+            'trap \'if [[ "$BASH_COMMAND" == initialize_mutating_action ]]; then '
+            'trap - DEBUG; source "$HOME/startup-model.sh"; fi\' DEBUG\n'
+        )
+        return subprocess.run(  # nosec B603 # digest-pinned isolated executable, stub host effects.
+            [str(self.paths["install.sh"]), "--startup-reconcile", "--quiet"],
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": str(self.home),
+                 "BASH_ENV": str(hook), "SHIM": str(self.shim), "DESIRED": "running",
+                 "CRASH_STOP": "0", "CRASH_RESTORE": "0", "DETAILS_STATE": "ready",
+                 "CURRENT_INSTALLER": str(INSTALLER)},
+            capture_output=True, text=True, check=False, timeout=8,
+        )
+
+    def test_prepared_recovery_uses_installed_startup_executable(self):
+        for checkpoint in ("prepared", "retired"):
+            with self.subTest(checkpoint=checkpoint):
+                if checkpoint == "retired":
+                    self.doCleanups()
+                    self.setUp()
+                self.seed_pinned_installer()
+                first = self.run_step(
+                    "install", crash_stop=checkpoint == "retired",
+                    interrupt_phase="prepared" if checkpoint == "prepared" else "",
+                )
+                self.assertEqual(first.returncode, 75 if checkpoint == "prepared" else -9, first.stderr)
+                self.assertEqual(json.loads(self.journal.read_text())["phase"], "prepared")
+                old_executable = self.share / "generations" / self.old_id / "install.sh"
+                self.assertEqual(hashlib.sha256(old_executable.read_bytes()).hexdigest(), PINNED_INSTALLER_SHA256)
+                recovered = self.run_installed_startup()
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                self.assert_snapshot()
+                self.assertIn("startup resolver reached", (self.home / "trace").read_text())
+
+    def test_restored_installer_can_read_rollback_journal(self):
+        self.seed_pinned_installer()
+        first = self.run_step("install", crash_stop=True)
+        self.assertEqual(first.returncode, -9, first.stderr)
+        interrupted = self.run_step("resume", interrupt_phase="rollback_verified")
+        self.assertEqual(interrupted.returncode, 75, interrupted.stderr)
+        self.assertEqual(json.loads(self.journal.read_text())["phase"], "rollback_verified")
+        self.assertEqual(hashlib.sha256(self.paths["install.sh"].read_bytes()).hexdigest(), PINNED_INSTALLER_SHA256)
+        recovered = self.run_installed_startup()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_snapshot()
+
     def test_retired_active_combined_resumes_original_runtime(self):
         self.retired_runtime(False)
 
@@ -230,8 +322,9 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.seed()
         first = self.run_step("install", crash_stop=True)
         self.assertEqual(first.returncode, -9, first.stderr)
-        for path in self.paths.values():
-            path.replace(self.backups / (OPERATION + "-" + path.name))
+        for name, path in self.paths.items():
+            if name == "install.sh": continue  # Its original copy already protects the recovery entrypoint.
+            path.replace(self.backups / (self.operation + "-" + path.name))
         interrupted = self.run_step("resume", crash_restore=True)
         self.assertEqual(interrupted.returncode, -9, interrupted.stderr)
         self.assertEqual(self.paths["codex-info.service"].read_bytes(), MEMBERS["codex-info.service"][0])
