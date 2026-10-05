@@ -28,6 +28,7 @@ WF-POSTMERGE-01
 VER-AUTO-PATCH-01
 VER-SERIES-FIXED-01
 VER-BETA-IDENTITY-467
+VER-BETA-BUILD-CORE-467
 WF-SERIAL-01
 LINUX-BUNDLE-TARGET-01
 LINUX-BUNDLE-RELEASE-01
@@ -194,6 +195,17 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   非canonical stable、prerelease stable、N/Aの0・負値・leading zeroは出力前に拒否する。file・Git・networkは変更しない。
   stable `check/next/bump`と3 version fileのstable限定契約を維持する。tagの予約・存在/衝突確認、source identity固定、
   full versionのbinary stamp、公開producer、channel選択、stable復帰は後続責務であり、この計算の成功はRelease作成を意味しない。
+- `VER-BETA-BUILD-CORE-467`: `stamp-beta`はcallerが固定した40桁lowercase source SHA、main stable、run N/A、
+  期待source versionと明示build snapshotを受け取り、snapshotのroot Cargo package/root lock/.NET Versionを同じfull betaへ
+  atomic同期する。checkout自身やsymlink経由の入力、不一致、非canonical入力は変更前に拒否する。既存依存・別process package
+  は保持し、通常tree・branch/tagを採番で変更しない。InformationalVersionはfull betaと固定source SHA、Assembly/FileVersionは
+  numeric baseの4成分（末尾0、各成分0～65534）とする。full versionは既存healthの32文字境界内とし、長すぎる入力は拒否する。
+  例はsource version `1.0.119`、main `1.0.109`、run `7/1`から`1.0.110-beta.7.1`、numeric `1.0.110.0`。
+  Windows Coreは一つのcanonical stable/beta modelで数値比較し、`1.0.110-beta.9.1 < 1.0.110-beta.10.1 < 1.0.110`、
+  同runのattemptも数値順とする。ProductInfoはInformationalVersionのsource metadataを除いたfull product versionを`v`表示へ渡す。
+  healthとruntime metadataは同じmodelでcanonical stable/betaを受理し、REST/recorder別processのversion、null/unavailable/mismatch
+  と診断上のversion不一致を保持する。このCore・snapshot契約はpackage/manifest、update channel、Linux parser、公開・実機の
+  成立を表明しない。stable `check/next/bump`は引き続きstableだけを受理する。
 - Windows製品版とX版は単一のstable `X.Y.Z`を共有する。バイナリ影響ありのPRはmajor/minorを変更せず、mergeごとに
   自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
   `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。

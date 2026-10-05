@@ -1,6 +1,8 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
+using System.Reflection;
+
 namespace CodexInfo.WindowsClient.Core;
 
 /// <summary>
@@ -15,10 +17,10 @@ public static class ProductInfo
     {
         get
         {
-            var version = typeof(ProductInfo).Assembly.GetName().Version;
-            return version is { Major: >= 0, Minor: >= 0, Build: >= 0 }
-                ? $"{version.Major}.{version.Minor}.{version.Build}"
-                : "unknown";
+            var information = typeof(ProductInfo).Assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            var value = information?.Split('+')[0];
+            return ProductVersion.TryParse(value, out var version) ? version!.ToString() : "unknown";
         }
     }
 

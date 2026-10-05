@@ -1631,13 +1631,13 @@ public sealed class LoopbackStatusClient :
             var properties = CreatePropertySet("api_version", "rest_version", "recorder_version", "recorder_status");
             if (!HasExactlyProperties(root, properties, 4) ||
                 !TryGetString(root, "api_version", out var apiVersion) || apiVersion != "v1" ||
-                !TryGetBoundedString(root, "rest_version", 1, 32, out var restVersion) || !IsCanonicalStableVersion(restVersion) ||
+                !TryGetBoundedString(root, "rest_version", 1, 32, out var restVersion) || !ProductVersion.TryParse(restVersion, out _) ||
                 !TryGetString(root, "recorder_status", out var recorderStatus)) return false;
             var value = root.GetProperty("recorder_version");
             string? recorderVersion = null;
             if (value.ValueKind != JsonValueKind.Null)
             {
-                if (!TryGetBoundedString(root, "recorder_version", 1, 32, out recorderVersion) || !IsCanonicalStableVersion(recorderVersion)) return false;
+                if (!TryGetBoundedString(root, "recorder_version", 1, 32, out recorderVersion) || !ProductVersion.TryParse(recorderVersion, out _)) return false;
             }
             var expectedStatus = recorderVersion is null ? "unavailable" : recorderVersion == restVersion ? "available" : "mismatch";
             if (recorderStatus != expectedStatus) return false;
@@ -1669,7 +1669,7 @@ public sealed class LoopbackStatusClient :
                 !TryGetBoundedString(root, "service", 1, 64, out var service) ||
                 service != "codex-info" ||
                 !TryGetBoundedString(root, "product_version", 1, 32, out var productVersion) ||
-                !IsCanonicalStableVersion(productVersion))
+                !ProductVersion.TryParse(productVersion, out _))
             {
                 return false;
             }
@@ -1693,15 +1693,6 @@ public sealed class LoopbackStatusClient :
         {
             return false;
         }
-    }
-
-    private static bool IsCanonicalStableVersion(string value)
-    {
-        var components = value.Split('.');
-        return components.Length == 3 && components.All(component =>
-            component.Length > 0 &&
-            (component.Length == 1 || component[0] != '0') &&
-            component.All(character => character is >= '0' and <= '9'));
     }
 
     private static ApiAccountsSnapshot? ParseAccounts(byte[] body)

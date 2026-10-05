@@ -1,6 +1,7 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
+using System.Reflection;
 using CodexInfo.WindowsClient.Core;
 using Xunit;
 
@@ -9,17 +10,54 @@ namespace CodexInfo.WindowsClient.Core.Tests;
 public sealed class ContractsTests
 {
     [Fact]
-    public void ProductVersionIsDerivedFromTheCoreAssemblyVersion()
+    public void ProductVersionIsDerivedFromTheCoreInformationalVersion()
     {
-        var assemblyVersion = typeof(ProductInfo).Assembly.GetName().Version;
+        var assembly = typeof(ProductInfo).Assembly;
+        var information = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion;
+        var productVersion = information.Split('+')[0];
+        Assert.Equal(productVersion, ProductInfo.Version);
+        Assert.Equal($"v{productVersion}", ProductInfo.DisplayVersion);
+        // The isolated beta build selects a literal compile-input oracle;
+        // ordinary stable builds keep the same informational-version contract.
+        if (Environment.GetEnvironmentVariable("CODEX_INFO_TEST_BETA_SNAPSHOT") == "1")
+        {
+            Assert.Equal("1.0.110-beta.7.1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", information);
+            Assert.Equal("1.0.110-beta.7.1", ProductInfo.Version);
+            Assert.Equal("v1.0.110-beta.7.1", ProductInfo.DisplayVersion);
+            Assert.Equal(new Version(1, 0, 110, 0), assembly.GetName().Version);
+            Assert.Equal("1.0.110.0", assembly.GetCustomAttribute<AssemblyFileVersionAttribute>()!.Version);
+        }
+    }
 
-        Assert.NotNull(assemblyVersion);
-        Assert.Equal(
-            $"{assemblyVersion!.Major}.{assemblyVersion.Minor}.{assemblyVersion.Build}",
-            ProductInfo.Version);
-        Assert.Equal(
-            $"v{assemblyVersion!.Major}.{assemblyVersion.Minor}.{assemblyVersion.Build}",
-            ProductInfo.DisplayVersion);
+    [Fact]
+    public void BetaProductVersionsHaveNumericPrecedence()
+    {
+        // Reflection makes the absent shared model a behavioral RED.
+        var model = typeof(ProductInfo).Assembly.GetType("CodexInfo.WindowsClient.Core.ProductVersion");
+        Assert.NotNull(model);
+        var parse = model!.GetMethod("Parse", [typeof(string)]);
+        Assert.NotNull(parse);
+        foreach (var (left, right) in new[]
+        {
+            ("1.0.110-beta.9.1", "1.0.110-beta.10.1"),
+            ("1.0.110-beta.10.1", "1.0.110"),
+            ("1.0.110-beta.7.1", "1.0.110-beta.7.2"),
+            ("1.0.109", "1.0.110-beta.7.1"),
+            ("1.0.2147483648", "1.0.2147483649"),
+        })
+        {
+            dynamic lower = parse!.Invoke(null, [left])!;
+            dynamic higher = parse.Invoke(null, [right])!;
+            Assert.True((int)lower.CompareTo(higher) < 0);
+            Assert.True((int)higher.CompareTo(lower) > 0);
+            Assert.Equal(0, (int)lower.CompareTo(lower));
+            Assert.Equal(left, (string)lower.ToString());
+        }
+        foreach (var malformed in new[] { "01.0.110", "1.0.110-beta.0.1", "1.0.110-beta.07.1", "1.0.110-beta.7.01", "1.0.110-beta.7.1+sha" })
+        {
+            var error = Assert.Throws<TargetInvocationException>(() => parse!.Invoke(null, [malformed]));
+            Assert.IsType<FormatException>(error.InnerException);
+        }
     }
 
     [Fact]
