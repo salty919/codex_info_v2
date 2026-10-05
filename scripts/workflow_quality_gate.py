@@ -209,7 +209,6 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         feat_classify = _job(feat, "classify")
         feat_quality = _job(feat, "selective-quality")
         prepared = _job(version, "version-prepared")
-        native_reuse = _job(version, "native-reuse")
         version_quality = _job(version, "selective-quality")
         acceptance = _job(version, "acceptance")
         selective_windows = _job(selective, "windows-quality")
@@ -277,48 +276,13 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "pull-requests": "read",
             "statuses": "write",
         })
-        # PR tree/index operations stay in the version writer. Later Python
-        # execution belongs to the trusted, read-only evidence runner.
+        # No PR code or evidence resolver runs after the trusted version writer.
         prepare_step = _step(prepared, step_id="prepare")
         prepared_steps = prepared["steps"]
         if prepared_steps[prepared_steps.index(prepare_step) + 1:]:
             errors.append("workflow wiring version.prepared: execution follows PR tree preparation")
-        if "native_reuse_artifact" in prepared.get("outputs", {}):
-            errors.append("workflow wiring version.prepared: evidence resolver remains in the writer")
-        expect("native-reuse.permissions", native_reuse.get("permissions"), {
-            "actions": "read", "contents": "read",
-        })
-        expect("native-reuse.needs", native_reuse.get("needs"), ["version-prepared"])
-        expect("native-reuse.if", native_reuse.get("if"),
-               "needs.version-prepared.outputs.ready == 'true' && contains(fromJSON(needs.version-prepared.outputs.selection_json).owners, 'LINUX_BACKEND')")
-        expect("native-reuse.continue-on-error", native_reuse.get("continue-on-error"), None)
-        expect("native-reuse.outputs", native_reuse.get("outputs"), {
-            "native_reuse_artifact": "${{ steps.native-reuse.outputs.artifact }}",
-        })
-        expect("native-reuse.checkout", _step(native_reuse, uses="actions/checkout@v5").get("with"), {
-            "ref": "${{ github.workflow_sha }}", "fetch-depth": 0,
-            "persist-credentials": False,
-        })
-        evidence_env = {
-            "SOURCE_SHA": "${{ needs.version-prepared.outputs.quality_sha }}",
-            "MAIN_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
-            "TRUSTED_SHA": "${{ github.workflow_sha }}",
-        }
-        fetch = _step(native_reuse, name="Fetch exact quality objects without checking out PR code")
-        expect("native-reuse.fetch.env", fetch.get("env"), evidence_env)
-        fetch_script = fetch.get("run", "")
-        if ('git fetch --no-tags origin "$SOURCE_SHA" "$MAIN_BASE_SHA"' not in fetch_script
-                or '[[ "$(git rev-parse HEAD)" == "$TRUSTED_SHA" ]]' not in fetch_script
-                or any(command in fetch_script for command in ("git checkout", "git switch", "git reset", "git read-tree"))):
-            errors.append("workflow wiring native-reuse: PR code can replace trusted checkout")
-        resolver = _step(native_reuse, step_id="native-reuse")
-        expect("native-reuse.resolver.env", resolver.get("env"), {
-            "GH_TOKEN": "${{ github.token }}", "REPOSITORY": "${{ github.repository }}",
-            **evidence_env,
-        })
-        expect("native-reuse.resolver.run", resolver.get("run"),
-               '"$RUNNER_TEMP/native-proof-venv/bin/python" -I .github/scripts/native_quality_proof.py resolve')
-        expect("native-reuse.resolver.if", resolver.get("if"), "steps.native-parser.outcome == 'success'")
+        if "native-reuse" in version["jobs"]:
+            errors.append("workflow wiring main: redundant native evidence runner remains")
         expect("acceptance.permissions", acceptance.get("permissions"), {
             "statuses": "write",
         })
@@ -349,7 +313,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         feat_classify_script = _step(feat_classify, step_id="classify").get("run")
         if (
             not isinstance(feat_classify_script, str)
-            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA" "$main_sha"'
+            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"'
             not in feat_classify_script
         ):
             errors.append(
@@ -361,15 +325,13 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("feat.quality.continue-on-error", feat_quality.get("continue-on-error"), None)
         mapping("feat.quality", feat_quality.get("with"), {
             "source_sha": "${{ github.event.pull_request.head.sha }}",
-            "base_sha": "${{ needs.classify.outputs.main_base_sha }}",
+            "base_sha": "${{ github.event.pull_request.base.sha }}",
             "head_ref": "${{ github.event.pull_request.head.ref }}",
             "pr_number": "${{ github.event.pull_request.number }}",
             "selection_json": "${{ needs.classify.outputs.selection_json }}",
             "release_candidate": False,
-            "release_preflight": True,
-            "preflight_plan": "${{ needs.classify.outputs.preflight_plan }}",
         })
-        expect("version.quality.needs", version_quality.get("needs"), ["version-prepared", "native-reuse"])
+        expect("version.quality.needs", version_quality.get("needs"), ["version-prepared"])
         expect("version.quality.if", version_quality.get("if"),
                "always() && !cancelled() && needs.version-prepared.result == 'success' && needs.version-prepared.outputs.ready == 'true'")
         expect("version.quality.uses", version_quality.get("uses"), "./.github/workflows/selective-quality.yml")
@@ -380,9 +342,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "head_ref": "${{ github.event.pull_request.head.ref }}",
             "pr_number": "${{ github.event.pull_request.number }}",
             "selection_json": "${{ needs.version-prepared.outputs.selection_json }}",
-            "native_reuse_artifact": "${{ needs.native-reuse.result == 'success' && needs.native-reuse.outputs.native_reuse_artifact || '' }}",
             "release_candidate": True,
-            "release_preflight": True,
         })
         expect("version.acceptance.needs", acceptance.get("needs"), ["version-prepared", "selective-quality"])
         expect("version.acceptance.continue-on-error", acceptance.get("continue-on-error"), None)
@@ -439,13 +399,14 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "source_sha": "${{ inputs.source_sha }}",
             "pr_number": "${{ inputs.pr_number }}",
             "release_candidate": "${{ inputs.release_candidate }}",
-        })
-        mapping("selective.native", _job(selective, "linux-backend-quality").get("with"), {
-            "pr_number": "${{ inputs.pr_number }}",
+            "linux_backend_acceptance": "${{ contains(fromJSON(inputs.selection_json).owners, 'LINUX_BACKEND') }}",
+            "linux_ui_acceptance": "${{ contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI') }}",
         })
         mapping("selective.windows", selective_windows.get("with"), {
             "pr_number": "${{ inputs.pr_number }}",
         })
+        expect("selective.codeql.if", selective_codeql.get("if"),
+               "inputs.release_candidate && toJSON(fromJSON(inputs.selection_json).codeql_languages) != '[]'")
         mapping("selective.codeql", selective_codeql.get("with"), {
             "head_ref": "${{ inputs.head_ref }}",
             "languages_json": "${{ toJSON(fromJSON(inputs.selection_json).codeql_languages) }}",
@@ -517,7 +478,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("selective.windows-name", selective_windows.get("name"), "windows-quality")
         expect("windows.leaf-name", windows_job.get("name"), "windows-quality")
         e2e = _step(windows_job, name="Run installed Windows UI Automation E2E")
-        expect("windows.e2e.if", e2e.get("if"), "inputs.release_preflight || inputs.release_candidate")
+        expect("windows.e2e.if", e2e.get("if"), "inputs.release_candidate")
         mapping("windows.e2e.env", e2e.get("env"), {
             "SOURCE_SHA": "${{ inputs.source_sha }}",
         })
@@ -549,92 +510,43 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "if-no-files-found": "error",
         })
 
-        # Reuse is optional; only the trusted runtime probe may suppress these
-        # two checks. Every release behavior and public candidate guard stays.
+        # The remaining isolated parser serves the dependency-audit fixtures.
         parser_pin = next(line for line in (ROOT / ".github/requirements-native-proof.txt").read_text().splitlines()
                           if line and not line.startswith("#"))
-        for parser_job in (rust_job, native_reuse, _job(selective, "governance-quality")):
-            parser_step = next(item for item in parser_job["steps"] if item.get("name") in {
-                "Install isolated native proof parser", "Install isolated CI parser dependency",
-            })
-            parser_script = parser_step.get("run", "")
-            if any(marker not in parser_script for marker in (
-                    parser_pin, "--only-binary=:all:", "--no-deps", "--require-hashes",
-                    '"$RUNNER_TEMP/native-proof-venv/bin/python" -I -m pip install')):
-                errors.append("workflow wiring native proof: parser dependency is not isolated and hash locked")
-            if parser_job is not _job(selective, "governance-quality"):
-                expect("native-parser.continue-on-error", parser_step.get("continue-on-error"), True)
-                expect("native-parser.id", parser_step.get("id"), "native-parser")
-        native_probe = _step(rust_job, step_id="native-proof")
-        expect("rust.probe.if", native_probe.get("if"), "steps.native-parser.outcome == 'success'")
-        if '"$RUNNER_TEMP/native-proof-venv/bin/python" -I "$RUNNER_TEMP/native_quality_proof.py" probe' not in native_probe.get("run", ""):
-            errors.append("workflow wiring native proof: probe parser is not isolated")
-        expect("rust.probe.continue-on-error", native_probe.get("continue-on-error"), True)
-        mapping("rust.probe.env", native_probe.get("env"), {
-            "TRUSTED_SHA": "${{ github.workflow_sha }}",
-            "SOURCE_SHA": "${{ inputs.source_sha }}",
-            "MAIN_BASE_SHA": "${{ inputs.base_sha }}",
-        })
-        expect("rust.clippy.if", _step(rust_job, name="Reject native compiler and Clippy warnings").get("if"),
-               "steps.native-proof.outputs.reused != 'true'")
-        binding = _step(rust_job, name="Bind successful native checks to exact inputs")
-        expect("rust.proof.if", binding.get("if"), "steps.native-proof.outcome == 'success'")
-        expect("rust.proof.continue-on-error", binding.get("continue-on-error"), True)
-        mapping("rust.proof.env", binding.get("env"), {
-            "EXPECTED_HELPER_DIGEST": "${{ steps.native-proof.outputs.helper_digest }}",
-            "NATIVE_INPUTS": "${{ steps.native-proof.outputs.inputs_json }}",
-        })
-        for marker in ('contents/.github/scripts/native_quality_proof.py?ref=$TRUSTED_SHA',
-                       '"$actual_digest" == "$EXPECTED_HELPER_DIGEST"',
-                       '"$RUNNER_TEMP/native-proof-venv/bin/python" -I "$RUNNER_TEMP/native_quality_proof.py" emit'):
-            if marker not in str(binding.get("run", "")):
-                errors.append("workflow wiring native proof: emit helper identity is not frozen")
+        parser_step = _step(_job(selective, "governance-quality"), name="Install isolated CI parser dependency")
+        parser_script = parser_step.get("run", "")
+        if any(marker not in parser_script for marker in (
+                parser_pin, "--only-binary=:all:", "--no-deps", "--require-hashes",
+                '"$RUNNER_TEMP/native-proof-venv/bin/python" -I -m pip install')):
+            errors.append("workflow wiring CI parser: dependency is not isolated and hash locked")
+        for name in ("Run native unit tests with coverage", "Reject native compiler and Clippy warnings"):
+            expect(f"rust.{name}.if", _step(rust_job, name=name).get("if"), None)
         order = [item.get("name") for item in rust_job["steps"]]
-        expected_order = ["Match actual native runtime before reuse", "Run native unit tests with coverage",
-                          "Reject native compiler and Clippy warnings", "Bind successful native checks to exact inputs",
+        expected_order = ["Run native unit tests with coverage", "Reject native compiler and Clippy warnings",
                           "Preserve native coverage for isolated upload"]
         if [order.index(name) for name in expected_order] != sorted(order.index(name) for name in expected_order):
-            errors.append("workflow wiring native proof: coverage can precede successful Clippy")
-        bridge = _step(native_reuse, name="Bridge verified native coverage within this run")
-        expect("version.bridge.continue-on-error", bridge.get("continue-on-error"), True)
-        mapping("version.bridge", bridge.get("with"), {"retention-days": 1})
-        for document, job_id in ((docs["rust.yml"], "native-quality"),
-                                 (docs["linux-ui-quality.yml"], "linux-ui-quality"),
-                                 (windows, "windows-quality"), (linux_distribution, "linux-distribution")):
-            snapshot = _step(_job(document, job_id), name="Reconstruct the trusted planned release tree")
-            expect(f"{job_id}.snapshot.if", snapshot.get("if"), "inputs.preflight_plan != ''")
-            mapping(f"{job_id}.snapshot.env", snapshot.get("env"), {
-                "TRUSTED_SHA": "${{ github.workflow_sha }}",
-                "PLAN": "${{ inputs.preflight_plan }}",
-                "RELEASE_CANDIDATE": "${{ inputs.release_candidate }}",
+            errors.append("workflow wiring native quality: coverage can precede successful Clippy")
+        expect("selective.linux-ui.if", _job(selective, "linux-ui-quality").get("if"),
+               "contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI') && !fromJSON(inputs.selection_json).distribution_required")
+        expect("linux-ui.build", _step(linux_ui_job, name="Build native release for UI evaluation").get("run"),
+               "cargo build --release --locked -p codex_info")
+        for job_id in ("linux-backend-quality", "linux-distribution", "windows-quality", "codeql-quality"):
+            expect(f"selective.{job_id}.needs", _job(selective, job_id).get("needs"), None)
+        for document, job_id, target in ((docs["rust.yml"], "native-quality", ". -> target"),
+                                        (docs["linux-ui-quality.yml"], "linux-ui-quality", ". -> target"),
+                                        (linux_distribution, "linux-distribution", ". -> target/distribution")):
+            cache = _step(_job(document, job_id), name="Restore compiled Rust dependencies")
+            expect(f"{job_id}.cache.uses", cache.get("uses"),
+                   "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6")
+            mapping(f"{job_id}.cache", cache.get("with"), {
+                "workspaces": target, "env-vars": "ImageOS",
+                "cache-workspace-crates": "false", "cache-bin": "false",
             })
-            for marker in ('"$RELEASE_CANDIDATE" == false', 'contents/$file?ref=$TRUSTED_SHA'):
-                if marker not in str(snapshot.get("run", "")):
-                    errors.append("workflow wiring snapshot: prospective publication or head helper is allowed")
-
-        expect(
-            "rust.unit.if",
-            _step(rust_job, name="Run native unit tests with coverage").get("if"),
-            "steps.native-proof.outputs.reused != 'true'",
-        )
-        for step_name in (
-            "Build native release",
-            "Run public CLI lifecycle acceptance",
-            "Run recorder daemon live acceptance",
-        ):
-            expect(
-                f"rust.{step_name}.if",
-                _step(rust_job, name=step_name).get("if"),
-                "inputs.release_preflight || inputs.release_candidate",
-            )
-        expect(
-            "linux-ui.startup.if",
-            _step(
-                linux_ui_job,
-                name="Run startup UI image and failure-state acceptance",
-            ).get("if"),
-            "inputs.release_preflight || inputs.release_candidate",
-        )
+        bundle = _step(_job(linux_distribution, "linux-distribution"), name="Create and validate the Linux bundle")
+        mapping("distribution.acceptance.env", bundle.get("env"), {
+            "RUN_BACKEND_ACCEPTANCE": "${{ inputs.release_candidate && inputs.linux_backend_acceptance }}",
+            "RUN_UI_ACCEPTANCE": "${{ inputs.release_candidate && inputs.linux_ui_acceptance }}",
+        })
         expect(
             "linux-ui.graph.if",
             _step(linux_ui_job, name="Run graph UI image acceptance").get("if"),
@@ -670,9 +582,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             expect(
                 f"windows.{step_name}.if",
                 _step(windows_job, name=step_name).get("if"),
-                ("inputs.release_candidate" if step_name in {
-                    "Create release manifest", "Upload release candidate"
-                } else "inputs.release_preflight || inputs.release_candidate"),
+                "inputs.release_candidate",
             )
         compiler_script = _step(
             windows_job,
@@ -811,8 +721,9 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             workflows["feat-integration.yml"],
             "Classify the event's exact base and head",
         )
-        if 'scripts/ci_change_scope.py --name-status "$changes" --release-candidate' not in feat_script:
-            errors.append("workflow wiring feat selection: cumulative release owners are narrowed")
+        if ('scripts/ci_change_scope.py --name-status "$changes"' not in feat_script
+                or "--release-candidate" in feat_script):
+            errors.append("workflow wiring feat selection: normal PR owners must not expand to release owners")
         expect("feat.classify.permissions", feat_classify.get("permissions"), {"contents": "read"})
         for marker in ('"$integration_sha" == "$BASE_SHA"',
                        'git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"'):
@@ -870,6 +781,10 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "release_state_gate.py",
         "ci_trust_fixture.py",
         "scripts/data_protection_gate.sh",
+        "release_preflight",
+        "preflight_plan",
+        "native_reuse_artifact",
+        "native_quality_proof.py",
     ):
         if forbidden in joined:
             errors.append(f"obsolete or local-only mechanism remains in Actions: {forbidden}")
@@ -883,9 +798,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     for marker in (
         'branches: ["feat/next"]',
         "release_candidate: false",
-        "release_preflight: true",
-        'scripts/ci_change_scope.py --name-status "$changes" --release-candidate',
-        '--name-status -z "$main_sha...$HEAD_SHA"',
+        'scripts/ci_change_scope.py --name-status "$changes"',
+        '--name-status -z "$BASE_SHA...$HEAD_SHA"',
     ):
         if marker not in feat:
             errors.append(f"feat-integration.yml: missing {marker}")
@@ -971,6 +885,12 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "cargo build --release --locked --target",
         "scripts/build_linux_bundle.sh",
         "scripts/test_linux_bundle.sh",
+        "--target-dir target/distribution",
+        'candidate_root="$GITHUB_WORKSPACE/target/release"',
+        "scripts/cli_contract_e2e.sh",
+        "scripts/record_daemon_e2e.sh",
+        "scripts/x11_startup_visual_gate.sh",
+        "scripts/x11_graph_visual_gate.sh",
         'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
         "xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac'",
         "env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET",
@@ -1017,13 +937,13 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "cargo llvm-cov --workspace --locked --all-targets --cobertura",
         "codacy-coverage-rust-v1-head-${{ inputs.source_sha }}",
         "cargo clippy --workspace --locked --all-targets -- -D warnings",
-        "cargo build --workspace --release --locked",
-        "scripts/cli_contract_e2e.sh",
-        "scripts/record_daemon_e2e.sh",
-        "xvfb-run --auto-servernum",
     ):
         if marker not in rust:
             errors.append(f"rust.yml: missing {marker}")
+    count("rust.yml", "cargo build ", 0)
+    count("rust.yml", "scripts/cli_contract_e2e.sh", 0)
+    count("rust.yml", "scripts/record_daemon_e2e.sh", 0)
+    count("linux-ui-quality.yml", "scripts/x11_startup_visual_gate.sh", 0)
     count("rust.yml", "uses: actions/upload-artifact@v6", 1)
     count("rust.yml", "quality_profile", 0)
     count("linux-ui-quality.yml", "quality_profile", 0)
@@ -1126,6 +1046,8 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
         selection = json.loads(selection_raw)
         owners = set(selection["owners"])
         selected_jobs = {owner_jobs[owner] for owner in owners}
+        if selection["distribution_required"]:
+            selected_jobs.discard("linux-ui-quality")
         return json.dumps(
             {
                 job: {
@@ -3744,8 +3666,7 @@ def _preflight_caller_tests() -> int:
                       str(ROOT / ".github/requirements-native-proof.txt")), cwd=ROOT)
             environment["PATH"] = str(venv / "bin") + os.pathsep + environment["PATH"]
         cases = 0
-        for name in ("test_release_preflight.py", "test_native_quality_proof.py",
-                     "test_workflow_reuse.py", "test_snapshot_checkout.py",
+        for name in ("test_workflow_stages.py", "test_snapshot_checkout.py",
                      "test_dependency_security_workflows.py", "test_dependency_metadata.py"):
             path = ROOT / ".github/tests" / name
             loader = unittest.TestLoader()
@@ -3761,7 +3682,7 @@ def _preflight_caller_tests() -> int:
 def workflow_selection_self_test() -> int:
     """Exercise only the changed feat owner-selection wiring.
 
-    Release behavior runs against the planned feat tree. Publication and
+    Feat checks only its PR diff. Release behavior, CodeQL, publication, and
     acceptance authority remain confined to the actual main candidate.
     """
 
@@ -3774,23 +3695,21 @@ def workflow_selection_self_test() -> int:
     )
     mutations = (
         ("version-prepare.yml",
-         "contents: read\n    outputs:\n      native_reuse_artifact:",
-         "contents: write\n    outputs:\n      native_reuse_artifact:"),
-        ("version-prepare.yml",
-         "ref: ${{ github.workflow_sha }}\n          fetch-depth: 0\n          persist-credentials: false",
-         "ref: ${{ needs.version-prepared.outputs.quality_sha }}\n          fetch-depth: 0\n          persist-credentials: false"),
+         "source_sha: ${{ needs.version-prepared.outputs.quality_sha }}",
+         "source_sha: ${{ github.event.pull_request.head.sha }}"),
+        ("selective-quality.yml",
+         "inputs.release_candidate && toJSON(fromJSON(inputs.selection_json).codeql_languages)",
+         "toJSON(fromJSON(inputs.selection_json).codeql_languages)"),
         ("version-prepare.yml",
          "always() && !cancelled() && needs.version-prepared.result == 'success'",
          "needs.version-prepared.result == 'success'"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
         ("feat-integration.yml", '"$integration_sha" == "$BASE_SHA"', '"$integration_sha" != "$BASE_SHA"'),
-        ("rust.yml", "if: steps.native-proof.outputs.reused != 'true'", "if: false"),
-        ("rust.yml", '"$actual_digest" == "$EXPECTED_HELPER_DIGEST"', '"$actual_digest" != "$EXPECTED_HELPER_DIGEST"'),
         (
             "feat-integration.yml",
-            'scripts/ci_change_scope.py --name-status "$changes" --release-candidate',
-            'scripts/ci_change_scope.py --name-status "$changes"',
+            '--name-status -z "$BASE_SHA...$HEAD_SHA"',
+            '--name-status -z "$main_sha...$HEAD_SHA"',
         ),
         (
             "selective-quality.yml",
@@ -3853,19 +3772,17 @@ def self_test() -> int:
 
     mutations = (
         ("version-prepare.yml",
-         "contents: read\n    outputs:\n      native_reuse_artifact:",
-         "contents: write\n    outputs:\n      native_reuse_artifact:"),
-        ("version-prepare.yml",
-         "ref: ${{ github.workflow_sha }}\n          fetch-depth: 0\n          persist-credentials: false",
-         "ref: ${{ needs.version-prepared.outputs.quality_sha }}\n          fetch-depth: 0\n          persist-credentials: false"),
+         "source_sha: ${{ needs.version-prepared.outputs.quality_sha }}",
+         "source_sha: ${{ github.event.pull_request.head.sha }}"),
+        ("selective-quality.yml",
+         "inputs.release_candidate && toJSON(fromJSON(inputs.selection_json).codeql_languages)",
+         "toJSON(fromJSON(inputs.selection_json).codeql_languages)"),
         ("version-prepare.yml",
          "always() && !cancelled() && needs.version-prepared.result == 'success'",
          "needs.version-prepared.result == 'success'"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
         ("feat-integration.yml", '"$integration_sha" == "$BASE_SHA"', '"$integration_sha" != "$BASE_SHA"'),
-        ("rust.yml", "if: steps.native-proof.outputs.reused != 'true'", "if: false"),
-        ("rust.yml", '"$actual_digest" == "$EXPECTED_HELPER_DIGEST"', '"$actual_digest" != "$EXPECTED_HELPER_DIGEST"'),
         (
             "version-prepare.yml",
             "expected_version_transition=true",
@@ -3898,8 +3815,8 @@ def self_test() -> int:
         ),
         (
             "linux-distribution.yml",
-            'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
-            'CODEX_INFO_ACCEPTANCE_BINARY="$GITHUB_WORKSPACE/target/release/codex_info"',
+            'candidate_root="$GITHUB_WORKSPACE/target/release"',
+            'candidate_root="$GITHUB_WORKSPACE/unvalidated-host-build"',
         ),
         (
             "rust.yml",

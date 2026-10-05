@@ -55,7 +55,8 @@ class DependencyMetadataTests(unittest.TestCase):
         python = {p["name"]: p for p in inventory["packages"] if p["ecosystem"] == "PyPI"}
         self.assertEqual(set(python), {"defusedxml", "PyYAML"})
         self.assertEqual(python["defusedxml"]["version"], "0.7.1")
-        self.assertEqual(len(python["defusedxml"]["inline_suppliers"]), 3)
+        self.assertEqual(python["defusedxml"]["inline_suppliers"],
+                         [".github/workflows/selective-quality.yml"])
         self.assertEqual(python["PyYAML"]["version"], yaml.__version__)
         self.assertEqual(python["PyYAML"]["supply_status"], "review_required")
         self.assertEqual(inventory["external_python_imports"], ["defusedxml", "yaml"])

@@ -90,6 +90,9 @@ def validate(
             "release candidate distribution decision must equal binary impact"
         )
     for owner, job in OWNER_JOBS.items():
+        # Candidate UI acceptance runs on the single packaged Linux build.
+        if owner == "LINUX_UI" and distribution_required:
+            job = LINUX_DISTRIBUTION_JOB
         if owner in selected and results.get(job) != "success":
             raise QualitySelectionError(
                 f"{job} must succeed, found {results.get(job)!r}"
