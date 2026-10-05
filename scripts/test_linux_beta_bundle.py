@@ -7,8 +7,7 @@ No installer, binary execution, Cargo build, service or network is invoked.
 
 import hashlib
 import json
-import os
-import subprocess
+import subprocess  # nosec B404 # only fixed offline Bash with private fixture env.
 import tarfile
 import tempfile
 import unittest
@@ -56,31 +55,32 @@ class LinuxBetaBundleFixtures(unittest.TestCase):
         self.source_sentinel.write_bytes(b"literal source sentinel\n")
 
     def produce(self, version, output, *, attempt="1", legacy=False):
-        args = ["bash", str(BUILDER)]
         if legacy:
-            args += ["--binary", str(self.inputs / "codex_info")]
+            binary_options = ["--binary", str(self.inputs / "codex_info")]
         else:
-            args += [
+            binary_options = [
                 "--ui-binary", str(self.inputs / "codex_info"),
                 "--recorder-binary", str(self.inputs / "codex_info_recorder"),
                 "--rest-binary", str(self.inputs / "codex_info_rest"),
             ]
-        args += [
-            "--version", version,
-            "--source-sha", SOURCE,
-            "--run-id", "92001",
-            "--run-attempt", attempt,
-            "--output-dir", str(output),
-        ]
-        env = os.environ.copy()
-        env.update({
+        env = {
             "OBJDUMP_BIN": str(self.tools / "objdump"),
-            "PATH": f"{self.tools}:{env['PATH']}",
+            "PATH": f"{self.tools}:/usr/bin:/bin",
             "CARGO_TRAP": str(self.cargo_trap),
-        })
-        result = subprocess.run(
-            args, cwd=ROOT, env=env, capture_output=True, text=True, timeout=30,
-            check=False,
+            "HOME": str(self.root),
+            "LC_ALL": "C",
+        }
+        result = subprocess.run(  # nosec B603 # fixed Bash argv, private paths/env, no command text.
+            [
+                "/bin/bash", "--noprofile", "--norc", str(BUILDER), *binary_options,
+                "--version", version,
+                "--source-sha", SOURCE,
+                "--run-id", "92001",
+                "--run-attempt", attempt,
+                "--output-dir", str(output),
+            ],
+            cwd=ROOT, env=env, capture_output=True, text=True, timeout=30,
+            check=False, shell=False,
         )
         self.assertFalse(self.cargo_trap.exists(), "fixture invoked Cargo")
         self.assertEqual(
