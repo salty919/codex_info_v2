@@ -157,14 +157,33 @@ fi
 if [[ -z "$VERSION" ]]; then
     VERSION="$(awk -F '"' '/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/{print $2; exit}' "$ROOT_DIR/Cargo.toml")"
 fi
-[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+IS_BETA=0
+BETA_ATTEMPT=""
+if [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    : # Keep the existing stable version contract.
+elif [[ ${#VERSION} -le 32 && "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.([1-9][0-9]*)\.([1-9][0-9]*)$ ]]; then
+    IS_BETA=1
+    BETA_ATTEMPT="${BASH_REMATCH[5]}"
+else
     die "invalid product version: $VERSION"
+fi
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] ||
     die 'source SHA must be a 40-character lowercase hexadecimal value'
 [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]] ||
     die 'run id must be a positive decimal workflow run id'
 [[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] ||
     die 'run attempt must be a positive integer'
+
+archive_name="${ARCHIVE_PREFIX}-${VERSION}-${TARGET}.tar.gz"
+manifest_name="${ARCHIVE_PREFIX}-${VERSION}-${TARGET}.manifest.json"
+if ((IS_BETA == 1)); then
+    [[ "$BETA_ATTEMPT" == "$RUN_ATTEMPT" ]] ||
+        die 'beta version attempt must match manifest run attempt'
+    for name in "$archive_name" "$archive_name.sha256" "$manifest_name"; do
+        [[ ! -e "$OUTPUT_DIR/$name" && ! -L "$OUTPUT_DIR/$name" ]] ||
+            die "beta output already exists: $name"
+    done
+fi
 
 if ((ALLOW_SOURCE_BUILD == 1)) &&
    [[ ! -f "$UI_BINARY" || ! -x "$UI_BINARY" || -L "$UI_BINARY" ||
@@ -288,7 +307,6 @@ sum_stage="$work_dir/SHA256SUMS"
 ) > "$sum_stage"
 install -m 0644 -- "$sum_stage" "$payload/SHA256SUMS"
 
-archive_name="${ARCHIVE_PREFIX}-${VERSION}-${TARGET}.tar.gz"
 archive_stage="$work_dir/$archive_name"
 (
     cd -- "$payload"
@@ -299,11 +317,17 @@ archive_stage="$work_dir/$archive_name"
 )
 checksum_stage="$work_dir/$archive_name.sha256"
 (cd -- "$work_dir" && sha256sum -- "$archive_name") > "$checksum_stage"
-manifest_name="${ARCHIVE_PREFIX}-${VERSION}-${TARGET}.manifest.json"
 
-mv -f -- "$archive_stage" "$OUTPUT_DIR/$archive_name"
-mv -f -- "$checksum_stage" "$OUTPUT_DIR/$archive_name.sha256"
-mv -f -- "$manifest_stage" "$OUTPUT_DIR/$manifest_name"
+if ((IS_BETA == 1)); then
+    # Stage and output share a filesystem; hard links refuse replacement atomically.
+    ln -- "$archive_stage" "$OUTPUT_DIR/$archive_name"
+    ln -- "$checksum_stage" "$OUTPUT_DIR/$archive_name.sha256"
+    ln -- "$manifest_stage" "$OUTPUT_DIR/$manifest_name"
+else
+    mv -f -- "$archive_stage" "$OUTPUT_DIR/$archive_name"
+    mv -f -- "$checksum_stage" "$OUTPUT_DIR/$archive_name.sha256"
+    mv -f -- "$manifest_stage" "$OUTPUT_DIR/$manifest_name"
+fi
 printf 'bundle=%s\nchecksum=%s\nmanifest=%s\ntarget=%s\n' \
     "$OUTPUT_DIR/$archive_name" "$OUTPUT_DIR/$archive_name.sha256" \
     "$OUTPUT_DIR/$manifest_name" "$TARGET"
