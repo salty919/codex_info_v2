@@ -424,6 +424,7 @@ jobs:
           skipped=0
           windows=0
           linux=0
+          candidate_free=0
           while IFS= read -r row; do
             run_id="$(jq -r '.run_id' <<<"$row")"
             run_number="$(jq -r '.run_number' <<<"$row")"
@@ -492,21 +493,28 @@ jobs:
             [[ "$job_status" == completed ]]
             candidates="$(run_candidates "$run_id" | jq -c --argjson attempt "$attempt" \
               '[.[] | select(.attempt == $attempt and .platform == "windows")]')"
+            window_candidate_count="$(jq 'length' <<<"$candidates")"
+            window_candidate_missing=false
             if [[ "$job_name" == "$windows_wrapper" && "$job_result" == skipped ]]; then
-              [[ "$(jq 'length' <<<"$candidates")" -eq 0 ]]
+              [[ "$window_candidate_count" -eq 0 ]]
               skipped=$((skipped + 1))
             elif [[ "$job_name" == "$windows_leaf" && "$job_result" == success ]]; then
-              [[ "$(jq 'length' <<<"$candidates")" -eq 1 ]]
-              candidate="$(jq -c '.[0]' <<<"$candidates")"
-              jq -e '.expired == false' <<<"$candidate" >/dev/null
-              if [[ "$generated" == true ]]; then
-                [[ "$(jq -r '.version' <<<"$candidate")" == "$generated_version" ]]
+              if [[ "$window_candidate_count" -eq 0 ]]; then
+                window_candidate_missing=true
+                candidate_free=$((candidate_free + 1))
+              else
+                [[ "$window_candidate_count" -eq 1 ]]
+                candidate="$(jq -c '.[0]' <<<"$candidates")"
+                jq -e '.expired == false' <<<"$candidate" >/dev/null
+                if [[ "$generated" == true ]]; then
+                  [[ "$(jq -r '.version' <<<"$candidate")" == "$generated_version" ]]
+                fi
+                jq -nc --argjson run_id "$run_id" --argjson run_number "$run_number" \
+                  --argjson attempt "$attempt" --argjson candidate "$candidate" \
+                  '$candidate + {run_id:$run_id,run_number:$run_number,attempt:$attempt}' \
+                  >>"$selected_candidates"
+                windows=$((windows + 1))
               fi
-              jq -nc --argjson run_id "$run_id" --argjson run_number "$run_number" \
-                --argjson attempt "$attempt" --argjson candidate "$candidate" \
-                '$candidate + {run_id:$run_id,run_number:$run_number,attempt:$attempt}' \
-                >>"$selected_candidates"
-              windows=$((windows + 1))
             else
               echo 'Windows authority has an unexpected name/result pair' >&2
               exit 1
@@ -520,11 +528,18 @@ jobs:
                 '[.[] | select(.attempt == $attempt and .platform == "linux")]')"
               if [[ "$linux_job_name" == "$linux_wrapper" && "$linux_job_result" == skipped ]]; then
                 [[ "$(jq 'length' <<<"$linux_candidates")" -eq 0 ]]
-                [[ "$job_name" == "$windows_wrapper" ]] || {
+                [[ "$job_name" == "$windows_wrapper" || \
+                   ("$job_name" == "$windows_leaf" && \
+                    "$window_candidate_missing" == true) ]] || {
                   echo 'Windows success cannot publish without its Linux distribution candidate' >&2
                   exit 1
                 }
               elif [[ "$linux_job_name" == "$linux_leaf" && "$linux_job_result" == success ]]; then
+                [[ "$job_name" != "$windows_leaf" || \
+                   "$window_candidate_missing" == false ]] || {
+                  echo 'Windows candidate is required when Linux distribution succeeds' >&2
+                  exit 1
+                }
                 [[ "$(jq 'length' <<<"$linux_candidates")" -eq 1 ]]
                 linux_candidate="$(jq -c '.[0]' <<<"$linux_candidates")"
                 jq -e '.expired == false' <<<"$linux_candidate" >/dev/null
@@ -540,6 +555,9 @@ jobs:
                 echo 'Linux distribution authority has an unexpected name/result pair' >&2
                 exit 1
               fi
+            elif [[ "$window_candidate_missing" == true ]]; then
+              echo 'Windows candidate-free success requires a skipped Linux distribution authority' >&2
+              exit 1
             fi
           done <"$successful_attempts"
 
@@ -547,7 +565,7 @@ jobs:
           [[ "$windows" -eq 0 || "$skipped" -eq 0 ]]
           [[ "$linux" -eq 0 || "$linux" -eq "$success_count" ]]
           if [[ "$windows" -eq 0 && "$linux" -eq 0 ]]; then
-            [[ "$skipped" -eq "$success_count" ]]
+            [[ "$((skipped + candidate_free))" -eq "$success_count" ]]
             printf 'publish=false\n' >>"$GITHUB_OUTPUT"
             exit 0
           fi
@@ -924,6 +942,10 @@ jobs:
           FINAL_HEAD="${FINAL_HEAD:-}"
           [[ "$WINDOWS_PRESENT" == true || "$WINDOWS_PRESENT" == false ]]
           [[ "$LINUX_PRESENT" == true || "$LINUX_PRESENT" == false ]]
+          [[ "$WINDOWS_PRESENT" == true ]] || {
+            echo 'release publication requires a Windows candidate' >&2
+            exit 1
+          }
           [[ "$LINUX_PRESENT" == true ]] || {
             echo 'release publication requires a Linux candidate' >&2
             exit 1

@@ -1,4 +1,4 @@
-# Installs the latest stable Windows release and upgrades it to the exact
+# Installs the affected Windows 1.0.116 baseline and upgrades it to the exact
 # release candidate. Local reproduction and CI share this implementation.
 [CmdletBinding()]
 param(
@@ -54,22 +54,22 @@ $headers = @{
 if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
     $headers.Authorization = "Bearer $($env:GITHUB_TOKEN)"
 }
-$latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/latest" -Headers $headers
-$tagMatch = [regex]::Match([string]$latest.tag_name, '^windows-v([0-9]+\.[0-9]+\.[0-9]+)$')
-if ($latest.draft -or $latest.prerelease -or -not $tagMatch.Success) {
-    throw 'Latest published release is not a canonical stable Windows release.'
+$previousVersionText = '1.0.116'
+$baselineTag = "windows-v$previousVersionText"
+$baselineVersion = [version]$previousVersionText
+if ($baselineVersion -ge $candidateVersion) {
+    throw "Candidate version must be newer than the Windows update baseline: $previousVersionText -> $candidateVersionText"
 }
-$previousVersionText = $tagMatch.Groups[1].Value
-$previousVersion = [version]$previousVersionText
-if ($previousVersion -ge $candidateVersion) {
-    throw "Candidate version must be newer than the latest published version: $previousVersionText -> $candidateVersionText"
+$latest = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/tags/$baselineTag" -Headers $headers
+if ($latest.draft -or $latest.prerelease -or [string]$latest.tag_name -cne $baselineTag) {
+    throw "Windows update baseline release is unavailable: $baselineTag"
 }
-
 $setupAssets = @($latest.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.Setup.exe' })
 $manifestAssets = @($latest.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.update.json' })
 if ($setupAssets.Count -ne 1 -or $manifestAssets.Count -ne 1) {
-    throw 'Latest stable release must contain exactly one Windows Setup and update manifest.'
+    throw "Windows update baseline is missing its Setup or update manifest: $baselineTag"
 }
+Write-Host "windows-installer-baseline: $($latest.tag_name)"
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-windows-upgrade-" + [Guid]::NewGuid().ToString('N'))
 $previousSetup = Join-Path $temporaryRoot 'CodexInfo.WindowsClient.previous.Setup.exe'
 $previousManifest = Join-Path $temporaryRoot 'CodexInfo.WindowsClient.previous.update.json'

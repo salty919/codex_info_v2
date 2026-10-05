@@ -353,7 +353,7 @@ component順や表示所有者を変更しない。
 
 ### 4.1 Monitor
 
-- 画面上部は両platformとも`利用状況→アカウント→推移→法的通知→設定`の順とし、
+- 画面上部は両platformとも`CODEX情報→アカウント→推移→法的通知→設定`の順とし、
   window controlsをその後に置く。Threads入口を上部へ置かない。
 - Mainのaccount selectorとそのdropdownは検証済みlogin IDまたはpublic account番号だけを表示し、
   `ログイン中`、`履歴`および各localeで同じ意味の状態語を付けない。現在認証中accountだけ、
@@ -380,7 +380,7 @@ component順や表示所有者を変更しない。
   `#3A1D24/#8E3D4D/#E06B7A`（background/border/accent）を使い、状態によってcanvas全体を
   着色しない。
 - Headerは`210px / 250px / 残幅`の3列と`10px`列間隔を使い、左列に`36×36px`のmark、
-  `22px`の利用状況title、`12px`のversionを置く。account selectorは`250×44px`とし、
+  `22px`のCODEX情報title、`12px`のversionを置く。account selectorは`250×44px`とし、
   閉じたselector内のaccount labelとIDを左`28px`に揃え、矢印は幅全体の右端から`24px`の
   `14px`欄の中央へ置く。展開listの形状と選択動作は変更しない。
   右列に推移、法的通知、設定、最小化、閉じるを置く。期間labelをHeaderへ重複表示しない。

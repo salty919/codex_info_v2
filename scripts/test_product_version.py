@@ -359,5 +359,100 @@ class ProductVersionFixtures(unittest.TestCase):
                 self.assertEqual(list(Path(fixture.directory.name).rglob(".*")), [])
 
 
+class BetaIdentityFixtures(unittest.TestCase):
+    def run_beta(
+        self,
+        stable_version: str = "1.0.109",
+        run_number: str = "7",
+        run_attempt: str = "1",
+        fixture: VersionFixture | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = [sys.executable, str(SCRIPT)]
+        if fixture is not None:
+            arguments.extend(
+                [
+                    "--cargo-toml", str(fixture.paths.cargo_toml),
+                    "--cargo-lock", str(fixture.paths.cargo_lock),
+                    "--windows-props", str(fixture.paths.windows_props),
+                ]
+            )
+        arguments.extend(
+            [
+                "beta", "--stable-version", stable_version,
+                "--run-number", run_number, "--run-attempt", run_attempt,
+            ]
+        )
+        return subprocess.run(arguments, text=True, capture_output=True, check=False)
+
+    def test_beta_identity_outputs_next_patch_and_release_flags(self) -> None:
+        result = self.run_beta()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            "version=1.0.110-beta.7.1\n"
+            "tag=windows-v1.0.110-beta.7.1\n"
+            "channel=beta\nprerelease=true\nmake_latest=false\n",
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_beta_identity_run_and_attempt_are_distinct(self) -> None:
+        for number, attempt, expected in (
+            ("7", "1", "version=1.0.110-beta.7.1"),
+            ("8", "1", "version=1.0.110-beta.8.1"),
+            ("7", "2", "version=1.0.110-beta.7.2"),
+        ):
+            with self.subTest(number=number, attempt=attempt):
+                result = self.run_beta(run_number=number, run_attempt=attempt)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[0], expected)
+
+    def test_beta_identity_patch_increment_preserves_major_minor(self) -> None:
+        result = self.run_beta(stable_version="2.7.99")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "version=2.7.100-beta.7.1")
+        self.assertEqual(result.stdout.splitlines()[1], "tag=windows-v2.7.100-beta.7.1")
+
+    def test_beta_identity_invalid_inputs_fail_without_output_or_writes(self) -> None:
+        fixture = VersionFixture()
+        self.addCleanup(fixture.close)
+        before = fixture.snapshot()
+        directory = Path(fixture.directory.name)
+        entries = sorted(path.relative_to(directory) for path in directory.rglob("*"))
+        for stable, number, attempt, option in (
+            ("1.0.109", "0", "1", "--run-number"),
+            ("1.0.109", "-1", "1", "--run-number"),
+            ("1.0.109", "07", "1", "--run-number"),
+            ("1.0.109", "7", "0", "--run-attempt"),
+            ("1.0.109", "7", "-1", "--run-attempt"),
+            ("1.0.109", "7", "01", "--run-attempt"),
+            ("1.0.010", "7", "1", "--stable-version"),
+            ("1.0.109-beta.7.1", "7", "1", "--stable-version"),
+        ):
+            with self.subTest(stable=stable, number=number, attempt=attempt):
+                result = self.run_beta(stable, number, attempt, fixture)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(option, result.stderr)
+                self.assertEqual(before, fixture.snapshot())
+                self.assertEqual(
+                    entries,
+                    sorted(path.relative_to(directory) for path in directory.rglob("*")),
+                )
+
+    def test_beta_identity_is_read_only(self) -> None:
+        fixture = VersionFixture()
+        self.addCleanup(fixture.close)
+        before = fixture.snapshot()
+        directory = Path(fixture.directory.name)
+        entries = sorted(path.relative_to(directory) for path in directory.rglob("*"))
+        result = self.run_beta(fixture=fixture)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, fixture.snapshot())
+        self.assertEqual(
+            entries,
+            sorted(path.relative_to(directory) for path in directory.rglob("*")),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

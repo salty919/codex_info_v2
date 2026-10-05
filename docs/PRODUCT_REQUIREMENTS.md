@@ -27,6 +27,7 @@ WF-NONBLOCKING-QUALITY-01
 WF-POSTMERGE-01
 VER-AUTO-PATCH-01
 VER-SERIES-FIXED-01
+VER-BETA-IDENTITY-467
 WF-SERIAL-01
 LINUX-BUNDLE-TARGET-01
 LINUX-BUNDLE-RELEASE-01
@@ -185,6 +186,14 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 
 ## 7. 配布・顧客向け表明
 
+- `VER-BETA-IDENTITY-467`: 採番CLIの`beta --stable-version X.Y.Z --run-number N --run-attempt A`は、
+  callerが固定したmain stable snapshot由来のcanonical stable `X.Y.Z`と、GitHubの正canonical十進整数N/Aを入力とする。
+  major/minorを維持しpatchだけ十進で1増やした`X.Y.(Z+1)-beta.N.A`、`windows-v`付きtag、`channel=beta`、
+  `prerelease=true`、`make_latest=false`をidentity metadataとして出力する。同じ固定入力は同じidentity、新runまたはattemptは
+  異なるidentityとする。例は`1.0.109/7/1 → 1.0.110-beta.7.1`、`2.7.99/7/1 → 2.7.100-beta.7.1`。
+  非canonical stable、prerelease stable、N/Aの0・負値・leading zeroは出力前に拒否する。file・Git・networkは変更しない。
+  stable `check/next/bump`と3 version fileのstable限定契約を維持する。tagの予約・存在/衝突確認、source identity固定、
+  full versionのbinary stamp、公開producer、channel選択、stable復帰は後続責務であり、この計算の成功はRelease作成を意味しない。
 - Windows製品版とX版は単一のstable `X.Y.Z`を共有する。バイナリ影響ありのPRはmajor/minorを変更せず、mergeごとに
   自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
   `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。
@@ -240,7 +249,9 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   除外する。本来のattemptにmissing、failure、cancelその他の非成功が1件でもあれば、同じheadの後続rerunまたはreopen successで
   上書きせず、新headまで公開をHOLDする。旧成功runへfallbackしない。
 - 成功authorityの`windows-quality`が`skipped`ならcandidateは0件だけを許可し、`success`なら同じrun、attempt、PR、final head、versionに
-  結び付く既存candidateをexact 1件要求する。期限切れ・削除を含む0件、複数、malformed、別identityは失敗とする。candidateは増やさず、
+  結び付く既存candidateをexact 1件要求する。ただしWindows authorityが`success`でcandidate 0件、同じattemptのLinux distribution authorityが
+  `skipped`かつLinux candidate 0件の場合は、非binaryの品質成功としてresolverを終了0・`publish=false`にする。Linux distributionが成功する場合や
+  Linux candidateが存在する場合のWindows candidate欠落は失敗とする。期限切れcandidate、複数、malformed、別identityも失敗とする。candidateは増やさず、
   既存のSetupとmanifestを持つ1件の名前へidentityを追加する。merge後にPRを再分類せず、quality test/build/CodeQLも再実行しない。
   公開jobだけをversion tag単位で直列化し、lock取得後にPR/final head、全attempt、candidate、tag、Release、assetsを1回再取得する。
   tagとReleaseがともに不存在ならDraftを作る。既存tagだけが残る場合は、そのtagが選択済みmerge SHAを指すことを確認してReleaseを作る。
@@ -288,7 +299,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 | main selected job結果 | mainのRelease候補ではselectedはsuccess、non-selectedはskipped以外を失敗にする | 未評価または無関係なartifactを公開する | Actionsはowner選択と公開可否の意味を知らない |
 | 実Windows評価 | WINDOWS選択時だけWindows runnerでinstaller/UIを評価する | 壊れたWindows配布物を公開する | LinuxやGitHubはWindows製品動作を保証しない |
 | final-head attempt集合 | current final headを実際に評価した全non-observer attemptを見て、1件の失敗もsame-head successで上書きしない | rerunの偶然のsuccessが未修正の評価失敗を隠し、旧candidateを公開する | latest成功だけでは過去attemptのfailure barrierを表現できない |
-| Windows jobとcandidate | Windows skippedは0件、successはown-run candidate exact 1を要求する | 非Windowsで不要なReleaseを動かす、または期限切れ・欠落candidateを黙って無視する | run successだけではWindowsの選択有無とartifact保存状態を区別できない |
+| Windows jobとcandidate | Windows skippedは0件、successはown-run candidate exact 1を要求する。ただしLinux distribution skipped・Linux candidate 0件との組だけはcandidate-free非公開成功にする | 非Windowsで不要なReleaseを動かす、またはbinary片側欠落を公開する | run successだけではWindowsの選択有無とartifact保存状態を区別できない |
 | merged/completed二信号 | quality先行とmerge先行のどちらも、両条件が揃った信号だけを公開候補にする | merge直後に未完了qualityを失敗扱いする、またはquality先行時に公開信号を失う | 両event間にGitHubの完了順序保証はない |
 | tag単位lock後の公開状態 | 同じtagの二信号を直列化し、exact-target tagだけRelease作成に再利用する。同tag Draftは一致する既存assetを保ち、不足assetをuploadして再開する。published完全一致はno-opにし、不一致assetやReleaseだけの状態は変更しない | 二重公開、異なるcandidate bytesの混在、またはpublished済み不完全Releaseの成功扱い | Release作成と複数asset uploadは一つのtransactionではないため、失敗後に一致済みassetを保持し不足分を送る必要がある |
 | local台帳schema | PR前は要求・範囲・オラクル・実装状態の欠落だけを失敗にし、remote証拠は完了時に`--final`で確認する | PRでしか得られない証拠をPR前に要求する循環で作業が停止する | local実装確認とGitHub実挙動は異なる観測点を持つ |

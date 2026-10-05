@@ -418,6 +418,19 @@ def next_version(version: str) -> str:
     return _next_patch(_stable_version(version, Path("--version")))
 
 
+def beta_version(stable_version: str, run_number: str, run_attempt: str) -> str:
+    """Compute a beta identity from fixed caller inputs without reading or writing files."""
+
+    stable_version = _stable_version(stable_version, Path("--stable-version"))
+    for value, option in (
+        (run_number, "--run-number"),
+        (run_attempt, "--run-attempt"),
+    ):
+        if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value, re.ASCII) is None:
+            raise ProductVersionError(f"{option}: must be a positive canonical decimal: {value!r}")
+    return f"{_next_patch(stable_version)}-beta.{run_number}.{run_attempt}"
+
+
 def _write_staged(path: Path, data: bytes, mode: int, label: str) -> Path:
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.{label}-", dir=str(path.parent)
@@ -575,6 +588,11 @@ def _parser() -> argparse.ArgumentParser:
     next_command = commands.add_parser("next", help="print the next patch version")
     next_command.add_argument("--version", required=True, help="stable X.Y.Z version")
 
+    beta = commands.add_parser("beta", help="print a beta identity without writing")
+    beta.add_argument("--stable-version", required=True, help="fixed main stable X.Y.Z version")
+    beta.add_argument("--run-number", required=True, help="positive canonical GitHub run number")
+    beta.add_argument("--run-attempt", required=True, help="positive canonical GitHub run attempt")
+
     bump = commands.add_parser("bump", help="increment patch after an exact expected version")
     _add_path_arguments(bump, suppress_defaults=True)
     bump.add_argument("--expected", required=True, help="expected synchronized X.Y.Z version")
@@ -601,6 +619,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.command == "next":
             print(f"version={next_version(arguments.version)}")
+            return 0
+        if arguments.command == "beta":
+            version = beta_version(
+                arguments.stable_version, arguments.run_number, arguments.run_attempt
+            )
+            print(f"version={version}")
+            print(f"tag=windows-v{version}")
+            print("channel=beta")
+            print("prerelease=true")
+            print("make_latest=false")
             return 0
         result = bump_versions(paths, arguments.expected)
         print(f"previous_version={result.previous}")
