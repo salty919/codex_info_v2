@@ -21,18 +21,6 @@ on:
       selection_json:
         required: true
         type: string
-      native_reuse_artifact:
-        description: Optional current-run bridge verified by the existing main authority
-        type: string
-        default: ''
-      release_preflight:
-        description: Run release behavior checks without publication authority
-        type: boolean
-        default: false
-      preflight_plan:
-        description: Trusted read-only prospective release tree, empty for an actual source
-        type: string
-        default: ''
       release_candidate:
         required: true
         type: boolean
@@ -137,11 +125,6 @@ jobs:
     uses: ./.github/workflows/rust.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      base_sha: ${{ inputs.base_sha }}
-      pr_number: ${{ inputs.pr_number }}
-      native_reuse_artifact: ${{ inputs.native_reuse_artifact }}
-      release_preflight: ${{ inputs.release_preflight && fromJSON(inputs.selection_json).binary_impact }}
-      preflight_plan: ${{ inputs.preflight_plan }}
       release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
     permissions:
       contents: read
@@ -152,8 +135,6 @@ jobs:
     uses: ./.github/workflows/linux-ui-quality.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      release_preflight: ${{ inputs.release_preflight && fromJSON(inputs.selection_json).binary_impact }}
-      preflight_plan: ${{ inputs.preflight_plan }}
       release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
     permissions:
       contents: read
@@ -165,15 +146,13 @@ jobs:
     with:
       source_sha: ${{ inputs.source_sha }}
       pr_number: ${{ inputs.pr_number }}
-      release_preflight: ${{ inputs.release_preflight && fromJSON(inputs.selection_json).binary_impact }}
-      preflight_plan: ${{ inputs.preflight_plan }}
       release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
     permissions:
       contents: read
 
   codeql-quality:
     name: codeql-quality
-    if: toJSON(fromJSON(inputs.selection_json).codeql_languages) != '[]'
+    if: inputs.release_candidate && toJSON(fromJSON(inputs.selection_json).codeql_languages) != '[]'
     uses: ./.github/workflows/codeql.yml
     with:
       source_sha: ${{ inputs.source_sha }}
@@ -190,8 +169,6 @@ jobs:
     with:
       source_sha: ${{ inputs.source_sha }}
       pr_number: ${{ inputs.pr_number }}
-      release_preflight: ${{ inputs.release_preflight }}
-      preflight_plan: ${{ inputs.preflight_plan }}
       release_candidate: ${{ inputs.release_candidate }}
     permissions:
       contents: read

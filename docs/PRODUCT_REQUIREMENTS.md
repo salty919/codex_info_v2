@@ -238,10 +238,13 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   Windowsを含むmain向けrelease candidateでは、Windows job自身が実Windows評価後にrelease candidateを作る。
   Linux-only変更ではLinux distribution・installer品質を実行するが、Windows評価・candidateを追加しない。
   Windows評価・candidateはWINDOWS ownerが実際に選択された場合だけ実行する。`feat/next`向けPRは、PR本文や機能名の申告を
-  品質選択へ使用しない。完全差分の各pathを安定した責務境界でDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類し、
+  品質選択へ使用しない。そのPRのevent base/headの完全差分を使い、mainからfeatへ既に積み上がった別PRの変更を再選択しない。
+  各pathを安定した責務境界でDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類し、
   実際に影響するownerの通常品質だけを実行する。backendはformatとunit、Linux UIはbuildとgraph実画面、Windowsは
   restore・format・unit、文書は要求正本、workflowは変更workflowの構文とowner選択の直接契約を確認する。同一ownerの確認は
-  1回へ統合し、別owner、installer、配布物、Release E2Eを通常のfeat PRへ追加しない。機能別profile、PR本文宣言、
+  1回へ統合し、別owner、installer、配布物、Release E2E、CodeQLを通常のfeat PRへ追加しない。
+  featではPR headそのものを検証し、将来のRelease versionを仮に書き込んだtreeを作らない。
+  mainでは公開対象の最終headそのものを検証し、異なるheadのfeat結果を品質成功として流用しない。機能別profile、PR本文宣言、
   機能ごとのexact path allowlistを設けず、新しいfileは既存の責務prefixで分類できる。責務不明のpath、空差分、malformedな
   rename/copyだけは、無関係な全suiteへ拡大せず分類前に停止する。main向けRelease candidateは同じowner分類を使い、
   binary impactがある場合だけdistribution、installer、実OS/UI品質を追加し、Windows ownerが実際に選択された場合だけWindows品質を追加する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release
@@ -276,8 +279,8 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   same-repository headへexact 1 commitをnon-force pushし、競合pushはGit自身のnon-fast-forward拒否に任せてreadbackやretryを行わない。
   H1 custom check作成jobは置かず、生成H1のstatus更新は既存のversion-preparedとacceptanceだけが所有する。Releaseのread-only解決jobはGitHub objectとrun状態だけを読み、
   write jobはsourceをcheckout・実行せず、解決済みcandidateとlock取得後に再取得したremote状態だけを入力にする。
-- 完全path分類からCodeQL言語が導出されるPRではその言語だけを実行し、main向けRelease品質ではanalysis成功とcritical/high finding不在を
-  公開条件とする。CodeQL失敗はworkflowへ表示するがbranch mergeを禁止しない。CodeQL言語が選択されないPRとmerge後pushでは
+- main向けPRの完全path分類からCodeQL言語が導出される場合、その言語だけを実行し、Release品質ではanalysis成功とcritical/high finding不在を
+  公開条件とする。CodeQL失敗はworkflowへ表示するがbranch mergeを禁止しない。feat向けPR、CodeQL言語が選択されないPR、merge後pushでは
   CodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの
   設定はworkflow内で再監査しない。外部AI findingsが
   provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、選択済みCodeQL、

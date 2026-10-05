@@ -39,6 +39,7 @@ def main() -> int:
         forbid(codeql, marker)
 
     require(selective, "  codeql-quality:\n")
+    require(selective, "    if: inputs.release_candidate && toJSON(fromJSON(inputs.selection_json).codeql_languages) != '[]'\n")
     require(selective, "    uses: ./.github/workflows/codeql.yml\n")
     require(
         selective,

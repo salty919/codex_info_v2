@@ -10,24 +10,6 @@ on:
         description: Immutable source commit selected by the trusted caller
         required: true
         type: string
-      native_reuse_artifact:
-        description: Optional current-run bridge verified by the existing main authority
-        type: string
-        default: ''
-      release_preflight:
-        description: Run release behavior checks without publication authority
-        type: boolean
-        default: false
-      preflight_plan:
-        description: Trusted read-only prospective release tree, empty for an actual source
-        type: string
-        default: ''
-      base_sha:
-        required: true
-        type: string
-      pr_number:
-        required: true
-        type: string
       release_candidate:
         description: Whether this is the final main release-candidate path
         required: true
@@ -49,35 +31,8 @@ jobs:
           fetch-depth: 1
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
-      - name: Reconstruct the trusted planned release tree
-        if: inputs.preflight_plan != ''
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          TRUSTED_SHA: ${{ github.workflow_sha }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          PLAN: ${{ inputs.preflight_plan }}
-          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
-        run: |
-          set -euo pipefail
-          [[ "$RELEASE_CANDIDATE" == false ]] || {
-            echo 'a prospective tree cannot publish a release candidate' >&2
-            exit 1
-          }
-          [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          trusted="$RUNNER_TEMP/planned-release-trusted"
-          mkdir -p "$trusted/.github/scripts" "$trusted/scripts"
-          for file in .github/scripts/release_preflight.py scripts/product_version.py; do
-            gh api "repos/$REPOSITORY/contents/$file?ref=$TRUSTED_SHA" \
-              --jq '.content' | base64 --decode > "$trusted/$file"
-          done
-          python_command=python3
-          if [[ "$RUNNER_OS" == Windows ]]; then python_command=python; fi
-          "$python_command" "$trusted/.github/scripts/release_preflight.py" apply \
-            --source "$SOURCE_SHA" --workflow "$TRUSTED_SHA" --plan "$PLAN"
       - name: Install required native quality tools
-        if: inputs.release_preflight || inputs.release_candidate
+        if: inputs.release_candidate
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -87,46 +42,10 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.9.0
           fallback: none
-      - name: Install isolated native proof parser
-        id: native-parser
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/native-proof-venv"
-          printf '%s\n' 'defusedxml==0.7.1 --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61' > "$RUNNER_TEMP/native-proof-requirements.txt"
-          "$RUNNER_TEMP/native-proof-venv/bin/python" -I -m pip install \
-            --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
-            -r "$RUNNER_TEMP/native-proof-requirements.txt"
-      - name: Download optional verified native coverage
-        if: inputs.native_reuse_artifact != ''
-        continue-on-error: true
-        uses: actions/download-artifact@v7
-        with:
-          name: ${{ inputs.native_reuse_artifact }}
-          path: ${{ runner.temp }}/native-reuse-download
-      - name: Match actual native runtime before reuse
-        id: native-proof
-        if: steps.native-parser.outcome == 'success'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          MAIN_BASE_SHA: ${{ inputs.base_sha }}
-          TRUSTED_SHA: ${{ github.workflow_sha }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          set -euo pipefail
-          [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          gh api "repos/$REPOSITORY/contents/.github/scripts/native_quality_proof.py?ref=$TRUSTED_SHA" \
-            --jq '.content' | base64 --decode > "$RUNNER_TEMP/native_quality_proof.py"
-          helper_digest="$(/usr/bin/sha256sum "$RUNNER_TEMP/native_quality_proof.py" | cut -d ' ' -f 1)"
-          printf 'helper_digest=%s\n' "$helper_digest" >> "$GITHUB_OUTPUT"
-          "$RUNNER_TEMP/native-proof-venv/bin/python" -I "$RUNNER_TEMP/native_quality_proof.py" probe
       - name: Check native formatting
         if: ${{ !inputs.release_candidate }}
         run: cargo fmt --check
       - name: Run native unit tests with coverage
-        if: steps.native-proof.outputs.reused != 'true'
         run: |
           mkdir -p artifacts/codacy-coverage-rust
           cargo llvm-cov --workspace --locked --all-targets --cobertura \
@@ -140,29 +59,7 @@ jobs:
             exit 1
           fi
       - name: Reject native compiler and Clippy warnings
-        if: steps.native-proof.outputs.reused != 'true'
         run: cargo clippy --workspace --locked --all-targets -- -D warnings
-      - name: Bind successful native checks to exact inputs
-        if: steps.native-proof.outcome == 'success'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          EXPECTED_HELPER_DIGEST: ${{ steps.native-proof.outputs.helper_digest }}
-          NATIVE_INPUTS: ${{ steps.native-proof.outputs.inputs_json }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          MAIN_BASE_SHA: ${{ inputs.base_sha }}
-          TRUSTED_SHA: ${{ github.workflow_sha }}
-          PLAN: ${{ inputs.preflight_plan }}
-        run: |
-          set -euo pipefail
-          [[ "$EXPECTED_HELPER_DIGEST" =~ ^[0-9a-f]{64}$ && "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          gh api "repos/$REPOSITORY/contents/.github/scripts/native_quality_proof.py?ref=$TRUSTED_SHA" \
-            --jq '.content' | base64 --decode > "$RUNNER_TEMP/native_quality_proof.py"
-          actual_digest="$(/usr/bin/sha256sum "$RUNNER_TEMP/native_quality_proof.py" | cut -d ' ' -f 1)"
-          [[ "$actual_digest" == "$EXPECTED_HELPER_DIGEST" ]] || exit 1
-          "$RUNNER_TEMP/native-proof-venv/bin/python" -I "$RUNNER_TEMP/native_quality_proof.py" emit
       - name: Preserve native coverage for isolated upload
         uses: actions/upload-artifact@v6
         with:
@@ -170,13 +67,13 @@ jobs:
           path: artifacts/codacy-coverage-rust/rust.cobertura.xml
           if-no-files-found: error
       - name: Build native release
-        if: inputs.release_preflight || inputs.release_candidate
+        if: inputs.release_candidate
         run: cargo build --workspace --release --locked
       - name: Verify recorder and REST compile-time boundary
         run: bash scripts/check_recorder_rest_boundary.sh --static-only
       - name: Run public CLI lifecycle acceptance
-        if: inputs.release_preflight || inputs.release_candidate
+        if: inputs.release_candidate
         run: bash scripts/cli_contract_e2e.sh
       - name: Run recorder daemon live acceptance
-        if: inputs.release_preflight || inputs.release_candidate
+        if: inputs.release_candidate
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/record_daemon_e2e.sh
