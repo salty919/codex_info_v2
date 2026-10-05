@@ -33,7 +33,6 @@ jobs:
         id: classify
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          GH_TOKEN: ${{ github.token }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPOSITORY: ${{ github.repository }}
@@ -43,14 +42,11 @@ jobs:
             echo 'selective integration currently supports same-repository PRs' >&2
             exit 1
           }
-          integration_sha="$(gh api "repos/$REPOSITORY/git/ref/heads/feat/next" --jq '.object.sha')"
-          [[ "$integration_sha" == "$BASE_SHA" ]] || {
-            echo 'feat base advanced after this event; a current snapshot is required' >&2
-            exit 1
-          }
+          # The event identifies immutable inputs. A later merge can advance
+          # feat/next without changing the PR snapshot being evaluated.
           git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
           git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA" || {
-            echo 'source does not contain the current feat base; update the PR before quality checks' >&2
+            echo 'source does not contain the event base; update the PR before quality checks' >&2
             exit 1
           }
           changes="$RUNNER_TEMP/changed-paths.z"

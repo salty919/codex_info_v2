@@ -725,10 +725,10 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
                 or "--release-candidate" in feat_script):
             errors.append("workflow wiring feat selection: normal PR owners must not expand to release owners")
         expect("feat.classify.permissions", feat_classify.get("permissions"), {"contents": "read"})
-        for marker in ('"$integration_sha" == "$BASE_SHA"',
-                       'git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"'):
-            if marker not in feat_script:
-                errors.append("workflow wiring feat planning: stale base/source can appear verified")
+        if 'git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"' not in feat_script:
+            errors.append("workflow wiring feat planning: source must contain the event base")
+        if "git/ref/heads/feat/next" in feat_script:
+            errors.append("workflow wiring feat planning: event inputs must not depend on a moving ref")
         for forbidden in ("git push", "--method POST", "--method PATCH"):
             if forbidden in feat_script:
                 errors.append("workflow wiring feat planning: branch/status mutation is forbidden")
@@ -3705,7 +3705,8 @@ def workflow_selection_self_test() -> int:
          "needs.version-prepared.result == 'success'"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
-        ("feat-integration.yml", '"$integration_sha" == "$BASE_SHA"', '"$integration_sha" != "$BASE_SHA"'),
+        ("feat-integration.yml", 'git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"',
+         'git merge-base --is-ancestor "$HEAD_SHA" "$BASE_SHA"'),
         (
             "feat-integration.yml",
             '--name-status -z "$BASE_SHA...$HEAD_SHA"',
@@ -3782,7 +3783,8 @@ def self_test() -> int:
          "needs.version-prepared.result == 'success'"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
-        ("feat-integration.yml", '"$integration_sha" == "$BASE_SHA"', '"$integration_sha" != "$BASE_SHA"'),
+        ("feat-integration.yml", 'git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"',
+         'git merge-base --is-ancestor "$HEAD_SHA" "$BASE_SHA"'),
         (
             "version-prepare.yml",
             "expected_version_transition=true",
