@@ -22013,17 +22013,33 @@ enum ServiceHealthDocument {
     Legacy(LegacyServiceHealth),
 }
 
-fn is_stable_product_version(value: &str) -> bool {
-    let mut components = value.split('.');
+fn is_product_version(value: &str) -> bool {
+    if value.len() > 32 {
+        return false;
+    }
+    let (basis, beta) = value
+        .split_once("-beta.")
+        .map_or((value, None), |(basis, beta)| (basis, Some(beta)));
     let valid_component = |component: &str| {
         !component.is_empty()
             && (component == "0" || !component.starts_with('0'))
             && component.bytes().all(|byte| byte.is_ascii_digit())
     };
-    components.next().is_some_and(valid_component)
+    let mut components = basis.split('.');
+    if !(components.next().is_some_and(valid_component)
         && components.next().is_some_and(valid_component)
         && components.next().is_some_and(valid_component)
-        && components.next().is_none()
+        && components.next().is_none())
+    {
+        return false;
+    }
+    beta.is_none_or(|beta| {
+        let valid_positive = |component: &str| component != "0" && valid_component(component);
+        let mut components = beta.split('.');
+        components.next().is_some_and(valid_positive)
+            && components.next().is_some_and(valid_positive)
+            && components.next().is_none()
+    })
 }
 
 #[cfg(test)]
@@ -22047,7 +22063,7 @@ fn service_health_response_version(response: &[u8]) -> Option<ServiceHealthVersi
         ServiceHealthDocument::Versioned(document)
             if document.api_version == "v1"
                 && document.service == "codex-info"
-                && is_stable_product_version(&document.product_version) =>
+                && is_product_version(&document.product_version) =>
         {
             Some(if document.product_version == PRODUCT_VERSION {
                 ServiceHealthVersion::Current
@@ -22161,7 +22177,7 @@ fn service_is_healthy(address: SocketAddr) -> bool {
     };
     document.api_version == "v1"
         && document.service == "codex-info"
-        && is_stable_product_version(&document.product_version)
+        && is_product_version(&document.product_version)
 }
 
 /// The installed launcher sets this marker for every packaged UI start.  The
@@ -25684,6 +25700,71 @@ mod tests {
         assert!(!is_service_health_response(
             b"HTTP/1.1 200 OK\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\""
         ));
+    }
+
+    fn service_health_fixture(product_version: &str) -> bool {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "api_version": "v1",
+            "service": "codex-info",
+            "product_version": product_version,
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0_u8; 512];
+            let read = stream.read(&mut request).unwrap();
+            assert!(request[..read].starts_with(b"GET /v1/health HTTP/1.1\r\n"));
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let healthy = service_is_healthy(address);
+        worker.join().unwrap();
+        healthy
+    }
+
+    #[test]
+    fn service_health_accepts_canonical_beta_version() {
+        // Literal Issue467 beta identity and the existing 32-character wire boundary.
+        for version in ["1.0.110-beta.7.1", "1234567890123456789.0.0-beta.1.1"] {
+            assert!(service_health_fixture(version), "canonical beta: {version}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\r\n{{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"{version}\"}}"
+            );
+            assert!(service_health_response_version(response.as_bytes()).is_some());
+        }
+    }
+
+    #[test]
+    fn service_health_rejects_noncanonical_beta_version() {
+        for version in [
+            "1.0.110-beta.0.1",
+            "1.0.110-beta.01.1",
+            "1.0.110-beta.7.0",
+            "1.0.110-beta.7.01",
+            "1.0.110-beta.7.1-beta.8.1",
+            "1.0.110-rc.7.1",
+            "01.0.110-beta.7.1",
+            "1.0.110-beta.7.1+source",
+            "12345678901234567890.0.0-beta.1.1",
+            "12345678901234567890123456789.0.0",
+        ] {
+            assert!(
+                !service_health_fixture(version),
+                "invalid identity: {version}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\r\n{{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"{version}\"}}"
+            );
+            assert_eq!(service_health_response_version(response.as_bytes()), None);
+        }
     }
 
     #[test]
@@ -36049,9 +36130,7 @@ mod tests {
     #[test]
     fn product_version_is_visible_once_on_native_main_surface() {
         assert!(!PRODUCT_VERSION.is_empty());
-        assert!(PRODUCT_VERSION.split('.').all(
-            |component| !component.is_empty() && component.chars().all(|c| c.is_ascii_digit())
-        ));
+        assert!(super::is_product_version(PRODUCT_VERSION));
 
         let source = include_str!("../ui/components.slint");
         assert!(source.contains("product-version: string"));
