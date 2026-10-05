@@ -262,10 +262,15 @@ where
         }
     };
     if let Some((snapshot, epoch)) = snapshot {
-        // Unknown quota health must not clear a degraded marker left by a
-        // previous process. The snapshot remains readable while the marker
-        // records that both acquisition lanes are not yet ready.
-        let acquisition_degraded = quota_health != LaneHealth::Ready;
+        // A successful thread probe cannot establish a new complete root
+        // while quota is still unknown. Preserve the entire last publication
+        // (including an existing failure), just as health synchronization
+        // does, until a normal cycle has a decided quota outcome.
+        let Some(acquisition_degraded) =
+            desired_acquisition_degraded(quota_health, LaneHealth::Ready)
+        else {
+            return Ok(false);
+        };
         if !epoch_matches(&epoch) {
             return Err(RecorderError::AccountBoundaryChanged.into());
         }
@@ -1605,6 +1610,139 @@ mod tests {
             assert_eq!(wait_calls, 1);
             fixture.cleanup();
         }
+    }
+
+    #[test]
+    fn issue_134_pending_quota_preserves_complete_root() {
+        for degraded in [false, true] {
+            let mut fixture = issue_362_fixture("pending-quota-retention");
+            let before_ack = fixture.seed_state(false, degraded);
+            let before_row = issue_134_thread_row(&fixture);
+            let before_generation = fixture.recorder.state().unwrap().data_generation;
+            let anchor = Instant::now();
+            let now = Cell::new(anchor);
+            let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+            let candidate = fixture.poll_result("not-yet-complete-root", 2);
+            let (mut submits, mut drains, mut waits) = (0, 0, 0);
+            issue_362_drive_cycle(
+                &mut fixture,
+                CyclePublication::Committed { has_pending: false },
+                LaneHealth::Unknown,
+                &mut schedule,
+                &now,
+                Some(candidate),
+                vec![true; 8],
+                None,
+                &mut submits,
+                &mut drains,
+                &mut waits,
+            )
+            .unwrap();
+            assert_eq!(
+                issue_134_thread_row(&fixture),
+                before_row,
+                "an unfinished quota probe is not a failed or complete new root"
+            );
+            assert_eq!(
+                fixture.recorder.state().unwrap().data_generation,
+                before_generation
+            );
+            assert_eq!(fixture.state_bytes(), before_ack);
+            assert_eq!(now.get(), anchor + Duration::from_secs(60));
+            assert_eq!((submits, drains, waits), (1, 1, 1));
+            fixture.cleanup();
+        }
+    }
+
+    #[test]
+    fn issue_134_pending_quota_does_not_publish_first_thread_candidate() {
+        let mut fixture = issue_362_fixture("pending-quota-first-root");
+        let mut health = LaneHealth::Unknown;
+        let mut cadence = AdaptiveThreadCadence::default();
+        let before_generation = fixture.recorder.state().unwrap().data_generation;
+        let epoch = fixture.epoch.clone();
+        for quota in [LaneHealth::Unknown, LaneHealth::Ready] {
+            let committed = commit_thread_poll_result(
+                ActiveThreadPollResult::Empty {
+                    epoch: epoch.clone(),
+                },
+                &epoch,
+                &mut fixture.recorder,
+                quota,
+                &mut health,
+                &mut cadence,
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap();
+            let rows: i64 = rusqlite::Connection::open(&fixture.options.database)
+                .unwrap()
+                .query_row("SELECT count(*) FROM active_thread_snapshot", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            if quota == LaneHealth::Unknown {
+                assert_eq!(rows, 0, "a partial first root must not be published");
+                assert!(!committed);
+                assert_eq!(
+                    fixture.recorder.state().unwrap().data_generation,
+                    before_generation
+                );
+                assert_eq!(health, LaneHealth::Unknown);
+            } else {
+                assert!(committed);
+                assert_eq!(rows, 1);
+                assert_eq!(issue_134_thread_row(&fixture), ("[]".to_owned(), 0));
+                assert_eq!(health, LaneHealth::Ready);
+            }
+        }
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue_134_pending_quota_still_reports_actual_failures() {
+        let mut fixture = issue_362_fixture("pending-quota-real-failure");
+        fixture.seed_state(false, false);
+        let before_payload = issue_134_thread_row(&fixture).0;
+        let mut health = LaneHealth::Unknown;
+        let mut cadence = AdaptiveThreadCadence::default();
+        let epoch = fixture.epoch.clone();
+        let cases = [
+            (
+                LaneHealth::Unknown,
+                ActiveThreadPollResult::Failed("test failure".to_owned()),
+                1,
+            ),
+            (
+                LaneHealth::Failed,
+                fixture.poll_result("quota-failed", 2),
+                1,
+            ),
+            (LaneHealth::Ready, fixture.poll_result("both-ready", 3), 0),
+        ];
+        for (quota, result, expected_degraded) in cases {
+            commit_thread_poll_result(
+                result,
+                &epoch,
+                &mut fixture.recorder,
+                quota,
+                &mut health,
+                &mut cadence,
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap();
+            let (payload, degraded) = issue_134_thread_row(&fixture);
+            assert_eq!(degraded, expected_degraded);
+            if quota == LaneHealth::Unknown {
+                assert_eq!(
+                    payload, before_payload,
+                    "actual failure retains last-good data"
+                );
+                assert_eq!(health, LaneHealth::Failed);
+            }
+        }
+        fixture.cleanup();
     }
 
     fn issue_134_thread_row(fixture: &Issue362AsyncFixture) -> (String, i64) {
