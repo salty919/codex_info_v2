@@ -120,6 +120,19 @@ public sealed class MainLayoutParityTests
             element.Attribute("Text")?.Value == "{Binding SelectedAccountText}");
         Assert.Equal("2", chevron.Attribute("Grid.Column")?.Value);
         Assert.Equal("Center", chevron.Attribute("HorizontalAlignment")?.Value);
+
+        var accountStyle = document.Descendants().Single(element =>
+            element.Name.LocalName == "Style" &&
+            element.Attribute("Selector")?.Value == "ToggleButton.account-selector");
+        Assert.Equal("{DynamicResource Theme18283A}", accountStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "Background").Attribute("Value")?.Value);
+        Assert.Equal("{DynamicResource Theme304A63}", accountStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "BorderBrush").Attribute("Value")?.Value);
+        Assert.Equal("6", accountStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "CornerRadius").Attribute("Value")?.Value);
     }
 
     [Fact]
@@ -265,19 +278,6 @@ public sealed class MainLayoutParityTests
             element.Attribute("IsVisible")?.Value == "{Binding ShowLastReceived}");
         Assert.Equal("2", showLastReceived.Attribute("Grid.RowSpan")?.Value);
         Assert.Equal("0,0,4,0", showLastReceived.Attribute("Margin")?.Value);
-
-        var accountStyle = document.Descendants().Single(element =>
-            element.Name.LocalName == "Style" &&
-            element.Attribute("Selector")?.Value == "ToggleButton.account-selector");
-        Assert.Equal("{DynamicResource Theme18283A}", accountStyle.Descendants().Single(element =>
-            element.Name.LocalName == "Setter" &&
-            element.Attribute("Property")?.Value == "Background").Attribute("Value")?.Value);
-        Assert.Equal("{DynamicResource Theme304A63}", accountStyle.Descendants().Single(element =>
-            element.Name.LocalName == "Setter" &&
-            element.Attribute("Property")?.Value == "BorderBrush").Attribute("Value")?.Value);
-        Assert.Equal("6", accountStyle.Descendants().Single(element =>
-            element.Name.LocalName == "Setter" &&
-            element.Attribute("Property")?.Value == "CornerRadius").Attribute("Value")?.Value);
 
         var legalCommand = document.Descendants().Single(element =>
             element.Name.LocalName == "Button" &&

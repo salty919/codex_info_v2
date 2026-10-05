@@ -25483,7 +25483,7 @@ mod tests {
             .apply_service_accounts(directory)
             .expect("directory admitted");
         assert!(state.service_selected_account_id.is_none());
-        assert_eq!(i64::try_from(state.selected_account_index()).unwrap(), -1);
+        assert_eq!(state.selected_account_index(), -1);
     }
 
     use super::{
