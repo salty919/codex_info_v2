@@ -8,7 +8,7 @@ import json
 import os
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404 # required tool API; individual execution calls remain reviewed.
 import sys
 import tempfile
 import unittest
@@ -19,8 +19,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 GIT = shutil.which("git")
 BASH = shutil.which("bash")
-if not GIT or not BASH:
-    raise RuntimeError("offline workflow fixtures require Git and Bash")
+if any(path is None or not Path(path).is_absolute() for path in (GIT, BASH)):
+    raise RuntimeError("offline workflow fixtures require absolute Git and Bash executables")
 
 
 def workflow(name):
@@ -106,8 +106,12 @@ class FeatCallerTests(unittest.TestCase):
         gh.chmod(0o755)
 
     def git(self, *args):
-        return subprocess.check_output([GIT, "-C", str(self.repo), *args], text=True,
-                                       stderr=subprocess.DEVNULL).strip()
+        # Only this test's local Git repository and literal fixture commands reach this call.
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        return subprocess.check_output(  # nosec B603 # absolute Git and fixed offline fixture argv.
+            [GIT, "-C", str(self.repo), *args], text=True, shell=False,
+            stderr=subprocess.DEVNULL,
+        ).strip()
 
     def write(self, name, content):
         path = self.repo / name
@@ -130,8 +134,12 @@ class FeatCallerTests(unittest.TestCase):
                **overrides}
         steps = workflow("feat-integration.yml")["jobs"]["classify"]["steps"]
         script = next(step["run"] for step in steps if step.get("id") == "classify")
-        result = subprocess.run([BASH, "-euo", "pipefail", "-c", script], cwd=self.repo,
-                                env=env, text=True, capture_output=True, check=False)
+        # Execute this checkout's workflow step with local Git and the finite GitHub stub above.
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        result = subprocess.run(  # nosec B603 # trusted checked-in script, offline fixtures, no shell=True.
+            [BASH, "-euo", "pipefail", "-c", script], cwd=self.repo,
+            env=env, text=True, capture_output=True, shell=False, check=False,
+        )
         outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
         return result, outputs
 
