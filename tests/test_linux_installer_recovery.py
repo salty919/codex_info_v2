@@ -155,6 +155,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         for path in (*self.paths.values(), self.backups / "unused", self.units / "default.target.wants/unused"):
             path.parent.mkdir(parents=True, exist_ok=True)
         self.backups.chmod(0o700)
+        (self.share / "generations").mkdir(exist_ok=True, mode=0o700)
         self.manifest = json.dumps({
             "schema": "codex-info-linux-bundle-v1", "product": "codex_info", "version": "1.0.48",
             "source_sha": "3" * 40, "run_id": "100", "run_attempt": 1,
