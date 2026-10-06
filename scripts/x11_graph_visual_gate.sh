@@ -66,6 +66,9 @@ for _ in $(seq 1 80); do
         [[ "$window_pid" == "$preview_pid" ]] || continue
         name_line="$(xprop -id "$window_id" WM_NAME 2>/dev/null || true)"
         if [[ "$name_line" == *Graph* ]]; then
+            # WM_NAME can exist before mapping; X_GetImage needs a viewable window.
+            window_state="$(LC_ALL=C xwininfo -id "$window_id" -stats 2>/dev/null || true)"
+            [[ "$window_state" == *"Map State: IsViewable"* ]] || continue
             graph_id="$window_id"
         else
             main_id="$window_id"
