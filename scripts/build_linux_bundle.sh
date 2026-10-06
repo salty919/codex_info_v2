@@ -207,6 +207,7 @@ for required_file in \
     "$ROOT_DIR/packaging/codex-info-rest.service" \
     "$ROOT_DIR/packaging/codex-info-update.service" \
     "$ROOT_DIR/packaging/codex-info-update.timer" \
+    "$ROOT_DIR/scripts/product_version.py" \
     "$ROOT_DIR/packaging/install_linux_bundle.sh" \
     "$ROOT_DIR/LICENSE" "$ROOT_DIR/LICENSE.ja.md" "$ROOT_DIR/COPYRIGHT" \
     "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$ROOT_DIR/assets/NOTICE.txt"; do
@@ -237,6 +238,7 @@ install -m 0755 -- "$RECORDER_BINARY" "$payload/codex_info_recorder"
 install -m 0755 -- "$REST_BINARY" "$payload/codex_info_rest"
 install -m 0755 -- "$ROOT_DIR/run.sh" "$payload/run.sh"
 install -m 0755 -- "$ROOT_DIR/packaging/install_linux_bundle.sh" "$payload/install.sh"
+install -m 0644 -- "$ROOT_DIR/scripts/product_version.py" "$payload/product_version.py"
 install -m 0644 -- "$ROOT_DIR/packaging/codex-info-recorder.service" "$payload/codex-info-recorder.service"
 install -m 0644 -- "$ROOT_DIR/packaging/codex-info-rest.service" "$payload/codex-info-rest.service"
 install -m 0644 -- "$ROOT_DIR/packaging/codex-info-update.service" "$payload/codex-info-update.service"
