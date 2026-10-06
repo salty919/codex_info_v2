@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+import io
 import stat
 import subprocess
 import sys
@@ -452,6 +454,96 @@ class BetaIdentityFixtures(unittest.TestCase):
             entries,
             sorted(path.relative_to(directory) for path in directory.rglob("*")),
         )
+
+
+class BetaComparisonFixtures(unittest.TestCase):
+    def fixture(self) -> VersionFixture:
+        fixture = VersionFixture()
+        self.addCleanup(fixture.close)
+        # Inert malformed version files must never be read by comparison.
+        for path, mode in zip(fixture.paths.ordered(), (0o640, 0o600, 0o644)):
+            path.write_bytes(b"private fixture: not a version document\n")
+            path.chmod(mode)
+        return fixture
+
+    def state(self, fixture: VersionFixture) -> tuple:
+        root = Path(fixture.directory.name)
+        return (
+            fixture.snapshot(),
+            {path: stat.S_IMODE(path.stat().st_mode) for path in fixture.paths.ordered()},
+            sorted(path.relative_to(root) for path in root.rglob("*")),
+        )
+
+    def compare(self, fixture: VersionFixture, left: str, right: str) -> subprocess.CompletedProcess[str]:
+        arguments = [sys.executable, "-B", str(SCRIPT),
+                     "--cargo-toml", str(fixture.paths.cargo_toml),
+                     "--cargo-lock", str(fixture.paths.cargo_lock),
+                     "--windows-props", str(fixture.paths.windows_props),
+                     "compare", "--left", left, "--right", right]
+        return subprocess.run(arguments, text=True, capture_output=True, check=False)
+
+    def test_compare_matches_existing_windows_numeric_oracle(self) -> None:
+        fixture = self.fixture()
+        before = self.state(fixture)
+        # First five literal pairs are the existing Windows Core oracle.
+        cases = (
+            ("1.0.110-beta.9.1", "1.0.110-beta.10.1", -1),
+            ("1.0.110-beta.10.1", "1.0.110", -1),
+            ("1.0.110-beta.7.1", "1.0.110-beta.7.2", -1),
+            ("1.0.109", "1.0.110-beta.7.1", -1),
+            ("1.0.2147483648", "1.0.2147483649", -1),
+            ("1.0.9", "1.0.10", -1),
+            ("1.1.0-beta.1.1", "1.0.999", 1),
+            ("1.0.110-beta.7.1", "1.0.110-beta.7.1", 0),
+        )
+        for left, right, expected in cases:
+            for first, second, order in ((left, right, expected), (right, left, -expected), (left, left, 0)):
+                result = self.compare(fixture, first, second)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"comparison={order}\n")
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(self.state(fixture), before)
+        boundary = "1234567890123456789.0.0-beta.1.1"
+        self.assertEqual(len(boundary), 32)
+        result = self.compare(fixture, boundary, boundary)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "comparison=0\n")
+        self.assertEqual(self.state(fixture), before)
+        pure = getattr(product_version, "compare_versions", None)
+        self.assertTrue(callable(pure), "shared pure comparison function is missing")
+        for left, right, expected in cases:
+            self.assertEqual(pure(left, right), expected)
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(product_version, "_paths_from_arguments", side_effect=AssertionError("comparison resolved version paths")) as resolver:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                try:
+                    code = product_version.main(["compare", "--left", cases[0][0], "--right", cases[0][1]])
+                except (AssertionError, SystemExit) as error:
+                    self.fail(f"read-only comparison crossed the path boundary: {type(error).__name__}: {error}")
+            resolver.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "comparison=-1\n")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_compare_rejects_noncanonical_and_preserves_fixture(self) -> None:
+        fixture = self.fixture()
+        before = self.state(fixture)
+        malformed = (
+            "01.0.110", "1.0.110-beta.0.1", "1.0.110-beta.7.0",
+            "1.0.110-beta.07.1", "1.0.110-beta.7.01",
+            "1.0.110-beta.-1.1", "1.0.110-beta.7.-1", "1.0.110-alpha.1",
+            "1.0.110-beta.7.1-beta.8.1", "1.0.110-beta.7.1+sha",
+            "1.0.\u0661", "1.0", "1.0.110.0", "12345678901234567890.0.0-beta.1.1",
+        )
+        for invalid in malformed:
+            for left, right, option in ((invalid, "1.0.110-beta.7.1", "--left"), ("1.0.110-beta.7.1", invalid, "--right")):
+                result = self.compare(fixture, left, right)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(option, result.stderr)
+                self.assertIn("invalid canonical product version", result.stderr)
+                self.assertEqual(self.state(fixture), before)
 
 
 class BetaStampFixtures(unittest.TestCase):

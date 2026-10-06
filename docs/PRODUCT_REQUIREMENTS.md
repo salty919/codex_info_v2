@@ -203,7 +203,12 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   numeric baseの4成分（末尾0、各成分0～65534）とする。full versionは既存healthの32文字境界内とし、長すぎる入力は拒否する。
   例はsource version `1.0.119`、main `1.0.109`、run `7/1`から`1.0.110-beta.7.1`、numeric `1.0.110.0`。
   Windows Coreは一つのcanonical stable/beta modelで数値比較し、`1.0.110-beta.9.1 < 1.0.110-beta.10.1 < 1.0.110`、
-  同runのattemptも数値順とする。ProductInfoはInformationalVersionのsource metadataを除いたfull product versionを`v`表示へ渡す。
+  同runのattemptも数値順とする。
+  Linux比較CLI `compare --left L --right R`は`scripts/product_version.py`の純粋`compare_versions`で同じliteral oracleを比較し、
+  canonical stable/betaを32文字以内、ASCII十進数、beta N/Aは正数に限定する。base/run/attemptの数値順と同base beta<stableを使い、
+  `comparison=-1/0/1`だけを出力する。非canonical入力はstdoutなしで拒否し、version-fileのpath解決・読取・変更より前に返す。
+  後続Linux候補選択はこの同じ関数を再利用する。現行release selector/download/install/channel操作はこの比較CLIでは変更しない。
+  ProductInfoはInformationalVersionのsource metadataを除いたfull product versionを`v`表示へ渡す。
   Windows Coreのhealthとruntime metadataは同じmodelでcanonical stable/betaを受理し、REST/recorder別processのversion、null/unavailable/mismatch
   と診断上のversion不一致を保持する。Linux health consumerも32文字以内のcanonical stable/betaを受理し、
   beta N/Aは正canonical十進整数とする。HTTP200、api_version、service、strict schemaと診断上のversion不一致を保持する。
