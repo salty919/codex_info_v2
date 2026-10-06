@@ -30,6 +30,7 @@ VER-SERIES-FIXED-01
 VER-BETA-IDENTITY-467
 VER-BETA-BUILD-CORE-467
 VER-BETA-LINUX-BUNDLE-467
+VER-BETA-LINUX-CHANNEL-467
 WF-SERIAL-01
 LINUX-BUNDLE-TARGET-01
 LINUX-BUNDLE-RELEASE-01
@@ -159,7 +160,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 
 - Linux bundleはbyte-identicalなruntime launcher `run.sh`、payload `codex_info`・`codex_info_recorder`・`codex_info_rest`、`install.sh`、recorder/REST/update serviceとtimer、license/notice、version/target情報を含む。外部manifestとarchive内manifestはbyte-identicalで、launcherを含む全regular memberのpath、mode、size、SHA-256を同じcandidate identityへ結合する。install後の固定入口はlauncher `$HOME/.local/bin/codex-info`、各payload `$HOME/.local/bin/codex_info*`、persistent installer `$HOME/.local/libexec/codex-info-install.sh`、manifest `$HOME/.local/share/codex-info/manifest.json`、unitは`$HOME/.config/systemd/user/`配下のexact 4名である。各固定入口はowner-onlyな`$HOME/.local/share/codex-info/generations/<version>-<source_sha>-<manifest_sha256>/`のregular fileをatomic `current` symlink経由で参照する。repository、Cargo、元bundle、`target/`へ依存しない。
 - manual、launcher startup、service `ExecStartPre`、timer、bootは一つのRelease resolver/installer authorityを使用する。timerは`OnActiveSec=5min`、`OnUnitActiveSec=1h`、`AccuracySec=1s`で、公開後の次回発見上限を1時間1秒とする。`codex-info-recorder.service`と`codex-info-rest.service`の起動前reconcileも同じauthorityを通るため、停止していたdaemonを新しく起動した場合に旧versionを無条件で開始しない。新版がなく同versionでも、local世代が不整合なら検証済みReleaseから修復する。ただし起動前の更新試行が失敗しても、`desired_state=running`、完全なcurrent generationと固定link、transaction不在またはexact `committed`、listener不在を再検証できた場合は、更新を`deferred`と失敗表示したままsystemdの`ExecStart`へ制御を返す。manual/timerの更新失敗、local不整合、未解決transaction、listenerの存在または曖昧性は成功へ変換しない。
-- resolverは固定HTTPS API `https://api.github.com/repos/salty919/codex_info_v2/releases/latest`の単一応答からlatest Releaseを取得し、`windows-vSemVer`に対応するLinux archiveだけを選ぶ。Release履歴件数、Windows assets、checksum/外部manifest sidecar、無関係assetをLinux更新の条件にしない。取得したarchive bytesはGitHub asset APIのSHA-256 digestと一度照合する。archive内manifestはgeneration identityに必要な値を読むために使い、上流で完了したmanifest/member/content検査を再実行しない。ホストglibcがcandidateのminimumより古いと確認できた場合だけABI不適合として適用を止め、glibc versionを取得できないことだけでは止めない。既存v1.0.113は上書き導入で置き換え、本契約の更新受入は置き換え後のresolverから次候補へのLinux更新とする。
+- resolverは固定HTTPS API `https://api.github.com/repos/salty919/codex_info_v2/releases/latest`の単一応答からlatest Releaseを取得し、`windows-vSemVer`に対応するLinux archiveだけを選ぶ。Release履歴件数、Windows assets、checksum/外部manifest sidecar、無関係assetをLinux更新の条件にしない。取得したarchive bytesはGitHub asset APIのSHA-256 digestと一度照合する。archive内manifestはgeneration identityに必要な値を読むために使い、上流で完了したmanifest/member/content検査を再実行しない。ホストglibcがcandidateのminimumより古いと確認できた場合だけABI不適合として適用を止め、glibc versionを取得できないことだけでは止めない。既存v1.0.113は上書き導入で置き換え、本契約の更新受入は置き換え後のresolverから次候補へのLinux更新とする。 通常stableの比較は同じbundleに0644で同梱しmanifestへ結合した`product_version.py::compare_versions`を使い、canonical32文字のstable/beta数値順序を共有する。通常のlatest取得と`update`・`no-update`・同version不整合時のrepairを維持する。`--select-release --release-metadata FILE --current-version VERSION`はローカルmetadataの読み取り選択だけを行い、未指定channelはstable、明示`--channel beta`は非draft・prerelease・exact beta tagと一致するarchive/digest/URLだけを対象とする。beta候補なしは`no-candidate`として別channelへfallbackしない。選択はstate初期化より前に返り、download/install、channel保存、service/DB変更、低いstableへの実復帰を許可しない。
 - 手動 `--bundle` installationは既存のchecksumと外部manifestを使う。自動更新はAPIのarchive digestで実転送を確認し、owner・同時変更回避、DB/current保持、transaction rollback、candidate展開後の実稼働結果を対象端末で確認する。Release publisherは選択candidateのrun/source identityとGitHubへのupload・公開結果を確認し、Linux packageのmember/content再検証はlinux-distribution ownerへ委ねる。downgradeは既存no-updateとして扱い、同versionでlocal generationが不整合ならlatest archiveからrepairする。
 - installはowner-onlyな`.install.lock`をnonblockingで取得し、`install-transaction.json`へ各phaseをatomic write・file fsync・parent directory fsyncしてからlegacy退避、entrypoint link、candidate publish、`current` switch、activation、functional readiness確認へ進む。functional readinessはsource-bound health、recorder identityに加えて同じ30秒枠内の`/v1/details state=ready|auth_required`と正の`observed_at`を必須とし、`initializing|error`を更新成功にしない。stale transactionは同じoperationを一意にresumeまたはrollbackしてから新operationを開始する。`current` switch後を含む失敗では旧generationへ戻し、旧serviceをsystemd管理下で復旧してから終了する。更新開始時に存在した使用可能な旧世代をunmanaged processとして残さない。
 - generation/current導入前の既知predecessor flat installは、旧manifestのexact schemaと記録済みpath/size/SHA-256、固定配置、owner/mode、同一sourceのbinary/installer/3 unitを全て再検証できる場合だけ一方向bootstrap入力にできる。旧installerがL1を保持したまま新serviceを最初に起動する区間は`ExecStartPre`が同じlockを待たず、検証済みflat payloadの起動を妨げない。lock解放後の最初のmanual/startup/timer/repository launcher操作は同Release archiveを取得・完全検証してgeneration/current/launcherへ移行し、旧flat状態をcompleted terminalにしない。検証不能なflat file、repository binary、`target/`、version文字列だけをbootstrapやrollbackへ使わない。
@@ -203,7 +204,12 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   numeric baseの4成分（末尾0、各成分0～65534）とする。full versionは既存healthの32文字境界内とし、長すぎる入力は拒否する。
   例はsource version `1.0.119`、main `1.0.109`、run `7/1`から`1.0.110-beta.7.1`、numeric `1.0.110.0`。
   Windows Coreは一つのcanonical stable/beta modelで数値比較し、`1.0.110-beta.9.1 < 1.0.110-beta.10.1 < 1.0.110`、
-  同runのattemptも数値順とする。ProductInfoはInformationalVersionのsource metadataを除いたfull product versionを`v`表示へ渡す。
+  同runのattemptも数値順とする。
+  Linux比較CLI `compare --left L --right R`は`scripts/product_version.py`の純粋`compare_versions`で同じliteral oracleを比較し、
+  canonical stable/betaを32文字以内、ASCII十進数、beta N/Aは正数に限定する。base/run/attemptの数値順と同base beta<stableを使い、
+  `comparison=-1/0/1`だけを出力する。非canonical入力はstdoutなしで拒否し、version-fileのpath解決・読取・変更より前に返す。
+  後続Linux候補選択はこの同じ関数を再利用する。現行release selector/download/install/channel操作はこの比較CLIでは変更しない。
+  ProductInfoはInformationalVersionのsource metadataを除いたfull product versionを`v`表示へ渡す。
   Windows Coreのhealthとruntime metadataは同じmodelでcanonical stable/betaを受理し、REST/recorder別processのversion、null/unavailable/mismatch
   と診断上のversion不一致を保持する。Linux health consumerも32文字以内のcanonical stable/betaを受理し、
   beta N/Aは正canonical十進整数とする。HTTP200、api_version、service、strict schemaと診断上のversion不一致を保持する。
@@ -214,8 +220,22 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   betaのN/Aは正canonical十進整数、Aはmanifestのrun_attemptと一致する。source_sha、run_id、既存schemaを保持し、
   run_idをbetaのN（run_number）へ読み替えない。非canonical・長すぎるbeta・attempt不一致は出力前に拒否する。
   同beta名のarchive/checksum/manifestが一つでも存在すれば再発行・置換せず拒否する。stableの既存入力・出力契約を維持する。
-  これは既存のtrusted prebuilt inputをlocal packageへ渡す責務だけであり、compiled full identity、Linux parser/installer、
-  公開5asset、channel選択・stable復帰・実機は後続責務とする。fixture packageの成功を公開・実binaryの成功としない。
+  incoming archive validatorも同じstable/beta形状とA/run_attempt一致を検証し、内部/外部manifestのfull version、
+  source_sha、run_id、archive名/digest、member bytes/modeを保持した同一snapshotをprivate candidateへstageする。
+  非canonical・長すぎるbeta・attempt不一致は既存payload/current/service意図のmutation前に拒否する。
+  compiled full identity、実導入のgeneration/launcher/journal、Linux更新比較、公開5asset、channel選択・stable復帰・実機は
+  後続責務とする。local package/private stagingの成功を公開・実binary・実導入の成功としない。
+- `VER-BETA-LINUX-CHANNEL-467`: Linux installerの選択channelはinstallationごとの
+  `~/.local/share/codex-info/update-channel.json`へ`codex-info-update-channel-v1`のexact schema/channel/revisionで保存する。
+  未設定はstable、app directory0700/file0600・同一owner・regular single-link・atomic replaceとし、既存presentation settingsへkeyを追加しない。
+  `--set-update-channel`/`--get-update-channel`は選択意図を保存/読戻しし、installed channel/versionはverified current manifestから別表示する。
+  既存normal updaterは同じlease下でこの意図を読み、stable latestまたは最大5page/100件の完全なbeta release listから既存selectorを呼ぶ。
+  channel snapshotをdiscovery/download/child applyへ固定し、途中変更・partial enumeration・候補なしの暗黙fallbackを拒否する。
+  明示beta選択のみ、manifest-bound共有module付きbetaを既存staging/journal/current/readiness/rollbackへ渡し、modern identity consumerは同じcanonical32 oracleを使う。
+  legacy形式は従来のstable限定を維持し、同channel downgradeや通常操作でのbeta→stable復帰は許さない。
+  このsource接続の直接検証は合成HOME/proc/fake transportsとfixture identityに限定する。初期対応beta SHA、固定stable復帰、実DB reader/writer互換、
+  両OS設定UI、公開assets/実機は未成立であり、dummy data sentinelの保全を実互換証明にしない。
+
 - Windows製品版とX版は単一のstable `X.Y.Z`を共有する。バイナリ影響ありのPRはmajor/minorを変更せず、mergeごとに
   自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
   `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。

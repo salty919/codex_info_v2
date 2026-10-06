@@ -17,6 +17,17 @@ CURL_BIN="${CURL_BIN:-curl}"
 GETCONF_BIN="${GETCONF_BIN:-getconf}"
 LDD_BIN="${LDD_BIN:-ldd}"
 ACTION=install
+UPDATE_CHANNEL_VALUE=
+update_channel=stable
+update_channel_snapshot=
+current_installed_version=
+SELECTION_METADATA=
+SELECTION_CURRENT=
+SELECTION_CHANNEL=stable
+SELECTION_CHANNEL_SET=0
+SELECTION_COHERENT=1
+SELECTION_COHERENT_SET=0
+selection_arguments=0
 ARCHIVE=
 MANIFEST=
 CHECKSUM=
@@ -95,6 +106,9 @@ usage() {
     cat <<'EOF'
 usage: install.sh --bundle ARCHIVE [--manifest FILE] [--sha256 FILE]
        install.sh --update [--migrate-recorder-override]
+       install.sh --get-update-channel
+       install.sh --set-update-channel stable|beta
+       install.sh --select-release --release-metadata FILE --current-version VERSION [--channel stable|beta] [--local-coherent 0|1]
        install.sh --start
        install.sh --stop
        install.sh --disable-autostart
@@ -142,6 +156,33 @@ while (($# > 0)); do
         --update)
             [[ "$ACTION" == install && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] || die 'update cannot be combined with bundle options'
             ACTION=update; shift ;;
+        --get-update-channel)
+            [[ "$ACTION" == install && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] || die 'channel action cannot be combined'
+            ACTION=get-update-channel; shift ;;
+        --set-update-channel)
+            (($# >= 2)) || die '--set-update-channel requires stable or beta'
+            [[ "$ACTION" == install && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] || die 'channel action cannot be combined'
+            [[ "$2" == stable || "$2" == beta ]] || die 'invalid update channel'
+            ACTION=set-update-channel; UPDATE_CHANNEL_VALUE="$2"; shift 2 ;;
+        --select-release)
+            [[ "$ACTION" == install && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] || die 'selection cannot be combined with another action'
+            ACTION=select-release; shift ;;
+        --release-metadata)
+            (($# >= 2)) || die '--release-metadata requires a path'
+            [[ -z "$SELECTION_METADATA" ]] || die 'release metadata supplied twice'
+            SELECTION_METADATA="$2"; selection_arguments=1; shift 2 ;;
+        --current-version)
+            (($# >= 2)) || die '--current-version requires a version'
+            [[ -z "$SELECTION_CURRENT" ]] || die 'current version supplied twice'
+            SELECTION_CURRENT="$2"; selection_arguments=1; shift 2 ;;
+        --channel)
+            (($# >= 2)) || die '--channel requires stable or beta'
+            (( ! SELECTION_CHANNEL_SET )) || die 'selection channel supplied twice'
+            SELECTION_CHANNEL="$2"; SELECTION_CHANNEL_SET=1; selection_arguments=1; shift 2 ;;
+        --local-coherent)
+            (($# >= 2)) || die '--local-coherent requires 0 or 1'
+            (( ! SELECTION_COHERENT_SET )) || die 'local coherence supplied twice'
+            SELECTION_COHERENT="$2"; SELECTION_COHERENT_SET=1; selection_arguments=1; shift 2 ;;
         --migrate-recorder-override)
             (( ! migrate_recorder_override )) || die 'recorder migration supplied twice'
             migrate_recorder_override=1; shift ;;
@@ -181,6 +222,17 @@ while (($# > 0)); do
         *) die "unknown argument: $1" ;;
     esac
 done
+
+if [[ "$ACTION" == select-release ]]; then
+    [[ -n "$SELECTION_METADATA" && -n "$SELECTION_CURRENT" && -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] ||
+        die 'selection requires local metadata and current version only'
+elif (( selection_arguments )); then
+    die 'selection options require --select-release'
+fi
+
+if [[ "$ACTION" == get-update-channel || "$ACTION" == set-update-channel ]]; then
+    [[ -z "$ARCHIVE" && -z "$MANIFEST" && -z "$CHECKSUM" ]] || die 'channel action cannot be combined with bundle'
+fi
 
 if (( migrate_recorder_override )); then
     [[ "$ACTION" == update || ( "$ACTION" == install && -n "$ARCHIVE" &&
@@ -253,6 +305,224 @@ fd = os.open(path.parent, os.O_DIRECTORY)
 try: os.fsync(fd)
 finally: os.close(fd)
 PY
+}
+
+version_python() {
+    local module="${running_installer_source%/*}/product_version.py"
+    if [[ "${running_installer_source##*/}" == install_linux_bundle.sh &&
+          "${running_installer_source%/*}" == */packaging ]]; then
+        module="${running_installer_source%/*}/../scripts/product_version.py"
+    fi
+    {
+        cat <<'PY_VERSION_AUTHORITY'
+import hashlib, importlib.util, json, os, pathlib, re, stat, sys
+module_path = pathlib.Path(sys.argv.pop())
+try:
+    module_fd = os.open(module_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(module_fd, "rb") as module_stream:
+        module_stat = os.fstat(module_stream.fileno())
+        if not stat.S_ISREG(module_stat.st_mode) or module_stat.st_size > 1024 * 1024:
+            raise ValueError("shared version module is not regular/bounded")
+        module_bytes = module_stream.read()
+    manifest_path = module_path.parent / "manifest.json"
+    if manifest_path.exists():
+        if manifest_path.is_symlink(): raise ValueError("shared version manifest is not regular")
+        manifest_raw = manifest_path.read_bytes()
+        generation_parts = module_path.parent.name.rsplit("-", 2)
+        if len(generation_parts) != 3 or hashlib.sha256(manifest_raw).hexdigest() != generation_parts[2]:
+            raise ValueError("shared version generation manifest differs")
+        manifest = json.loads(manifest_raw)
+        entries = [entry for entry in manifest["files"] if entry["path"] == "product_version.py"]
+        if len(entries) != 1 or entries[0]["sha256"] != hashlib.sha256(module_bytes).hexdigest() or entries[0]["size"] != len(module_bytes) or entries[0]["mode"] != 0o644:
+            raise ValueError("shared version module differs from manifest")
+    spec = importlib.util.spec_from_file_location("codex_info_update_version", module_path)
+    if spec is None: raise ValueError("shared version module unavailable")
+    version_authority = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = version_authority
+    exec(compile(module_bytes, str(module_path), "exec"), version_authority.__dict__)
+except (OSError, ValueError, KeyError, TypeError, SyntaxError) as error:
+    raise SystemExit("shared version authority unavailable: " + str(error))
+
+def canonical_version(value):
+    if not isinstance(value, str): return False
+    try: return version_authority.compare_versions(value, value) == 0
+    except version_authority.ProductVersionError: return False
+
+def canonical_manifest_version(document):
+    value = document.get("version")
+    if not canonical_version(value): return False
+    if "-beta." not in value: return True
+    attempt = document.get("run_attempt")
+    return isinstance(attempt, int) and not isinstance(attempt, bool) and attempt > 0 and str(attempt) == value.rsplit(".", 1)[1]
+
+def canonical_generation(value):
+    if not isinstance(value, str): return False
+    parts = value.rsplit("-", 2)
+    return len(parts) == 3 and canonical_version(parts[0]) and re.fullmatch(r"[0-9a-f]{40}", parts[1]) is not None and re.fullmatch(r"[0-9a-f]{64}", parts[2]) is not None
+PY_VERSION_AUTHORITY
+        cat
+    } | python3 -B - "$@" "$module"
+}
+
+update_channel_record() {
+    python3 -B - "$home_dir" "${1:-read}" "${2:-}" <<'PY_CHANNEL'
+import hashlib, json, os, pathlib, re, secrets, stat, sys
+home, action, requested = sys.argv[1:]
+schema = "codex-info-update-channel-v1"
+def reject(reason): raise SystemExit("SAFE_BLOCKED: update channel " + reason)
+def pairs(items):
+    value = {}
+    for key, item in items:
+        if key in value: reject("has duplicate keys")
+        value[key] = item
+    return value
+root = pathlib.Path(home)
+parent = root
+for part in (".local", "share", "codex-info"):
+    parent /= part
+    if not parent.exists() and not parent.is_symlink():
+        if action == "read":
+            print("stable", "absent", sep="\t")
+            raise SystemExit(0)
+        reject("directory is unavailable")
+    metadata = parent.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+        reject("directory owner/type/mode is unsafe")
+if stat.S_IMODE(parent.stat().st_mode) != 0o700: reject("directory mode is not owner-only")
+directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+name = "update-channel.json"
+def read():
+    try: descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except FileNotFoundError: return None, None
+    except OSError: reject("file is not regular")
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1 or metadata.st_size > 4096:
+            reject("file owner/type/mode/size is unsafe")
+        raw = stream.read(4097)
+    try: value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    except (UnicodeError, ValueError): reject("JSON is invalid")
+    if not isinstance(value, dict) or set(value) != {"schema", "channel", "revision"} or value["schema"] != schema:
+        reject("schema/keys are invalid")
+    if value["channel"] not in ("stable", "beta") or not isinstance(value["revision"], str) or not re.fullmatch(r"[0-9a-f]{32}", value["revision"]):
+        reject("value/revision is invalid")
+    return value, raw
+value, raw = read()
+if action == "write":
+    if requested not in ("stable", "beta"): reject("requested value is invalid")
+    if value is None or value["channel"] != requested:
+        value = {"schema": schema, "channel": requested, "revision": secrets.token_hex(16)}
+        output = (json.dumps(value, separators=(",", ":")) + "\n").encode()
+        temporary = ".update-channel-" + secrets.token_hex(16)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(output); stream.flush(); os.fsync(stream.fileno())
+            current_value, current_raw = read()
+            if current_raw != raw: reject("changed during atomic save")
+            path_identity = os.stat(parent, follow_symlinks=False)
+            descriptor_identity = os.fstat(directory)
+            if (path_identity.st_dev, path_identity.st_ino, path_identity.st_mode, path_identity.st_uid) != (descriptor_identity.st_dev, descriptor_identity.st_ino, descriptor_identity.st_mode, descriptor_identity.st_uid): reject("directory changed during atomic save")
+            os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+            raw = output
+        finally:
+            try: os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError: pass
+elif action != "read": reject("action is invalid")
+print(value["channel"] if value is not None else "stable", hashlib.sha256(raw).hexdigest() if raw is not None else "absent", sep="\t")
+os.close(directory)
+PY_CHANNEL
+}
+
+show_update_channel() {
+    local record selected installed=unavailable version=unavailable info
+    local desired_state state_boot_id state_line
+    record="$(update_channel_record)" || return 1
+    selected="${record%%$'\t'*}"
+    if [[ -L "$current_link" ]]; then
+        load_control_state
+        info="$(manifest_record)" || safe_blocked 'installed channel identity is unavailable'
+        verify_local_generation || safe_blocked 'installed channel generation is incoherent'
+        IFS=$'\t' read -r version _ _ _ <<<"$info"
+        installed=stable; [[ "$version" != *-beta.* ]] || installed=beta
+    elif [[ -e "$current_link" ]]; then
+        safe_blocked 'installed channel current link is invalid'
+    fi
+    printf 'selected_channel=%s installed_channel=%s installed_version=%s\n' "$selected" "$installed" "$version"
+}
+
+verify_update_channel_snapshot() {
+    local current
+    current="$(update_channel_record)" || return 1
+    [[ "$current" == "$update_channel_snapshot" ]] || safe_blocked 'update channel changed during discovery or apply'
+}
+
+discover_update_releases() {
+    local destination="$1" limit="$2" page next url body headers merged
+    if [[ "$update_channel" == stable ]]; then
+        "$CURL_BIN" --fail --silent --show-error --proto '=https' --max-time "$limit" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' "$RELEASES_URL" >"$destination"
+        return
+    fi
+    printf '[]' >"$destination"
+    for page in 1 2 3 4 5; do
+        url="https://api.github.com/repos/$REPOSITORY/releases?per_page=100&page=$page"
+        body="$update_root/release-page-$page.json"; headers="$update_root/release-page-$page.headers"; merged="$update_root/release-merged.json"
+        if (( operation_deadline > 0 )); then limit="$(deadline_timeout 30)" || return 1; fi
+        "$CURL_BIN" --fail --silent --show-error --proto '=https' --max-time "$limit" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' --dump-header "$headers" "$url" >"$body" || return 1
+        next="$(python3 -B - "$destination" "$body" "$headers" "$merged" "$page" "$REPOSITORY" <<'PY_DISCOVERY'
+import json, pathlib, re, sys
+old, page_file, header_file, merged, number, repository = sys.argv[1:]
+def reject(reason): raise SystemExit("beta release discovery failed: " + reason)
+try:
+    existing = json.loads(pathlib.Path(old).read_text())
+    page = json.loads(pathlib.Path(page_file).read_text())
+    headers = pathlib.Path(header_file).read_text()
+except (OSError, ValueError, UnicodeError): reject("response unavailable")
+if not isinstance(existing, list) or not isinstance(page, list) or len(page) > 100: reject("response is not a bounded page")
+links = [line.split(":", 1)[1].strip() for line in headers.splitlines() if line.lower().startswith("link:")]
+next_links = []
+for value in links:
+    for link in value.split(","):
+        if re.search(r';\s*rel="next"', link):
+            match = re.fullmatch(r'\s*<([^>]+)>;\s*rel="next"\s*', link)
+            if match is None: reject("next page identity is ambiguous")
+            next_links.append(match[1])
+if len(next_links) > 1: reject("multiple next pages")
+if next_links:
+    expected = f"https://api.github.com/repos/{repository}/releases?per_page=100&page={int(number)+1}"
+    if next_links[0] != expected or int(number) == 5: reject("incomplete or noncanonical page sequence")
+pathlib.Path(merged).write_text(json.dumps(existing + page))
+print("next" if next_links else "complete")
+PY_DISCOVERY
+        )" || return 1
+        mv -- "$merged" "$destination"
+        [[ "$next" != complete ]] || return 0
+    done
+    return 1
+}
+
+check_incoming_channel() {
+    local version="$1" record selected current info order
+    record="$(update_channel_record)" || return 1
+    selected="${record%%$'\t'*}"
+    [[ -z "${CODEX_INFO_UPDATE_CHANNEL_SNAPSHOT:-}" || "$record" == "$CODEX_INFO_UPDATE_CHANNEL_SNAPSHOT" ]] || safe_blocked 'update channel changed before candidate staging'
+    if [[ "$version" == *-beta.* ]]; then
+        [[ "$selected" == beta ]] || die 'beta bundle installation is not supported without selected beta channel'
+    fi
+    current="$(current_generation)" || return 1
+    if [[ -n "$current" ]]; then
+        info="$(manifest_record)" || return 1
+        IFS=$'\t' read -r current _ _ _ <<<"$info"
+        [[ "$current" != *-beta.* || "$version" == *-beta.* ]] || safe_blocked 'explicit beta-to-stable return is not supported'
+        if [[ "$version" == *-beta.* ]]; then
+            order="$(version_python "$version" "$current" <<'PY_ORDER'
+print(version_authority.compare_versions(*sys.argv[1:]))
+PY_ORDER
+            )" || return 1
+            (( order >= 0 )) || safe_blocked 'beta channel downgrade is not supported'
+        fi
+    fi
 }
 
 initialize_mutating_action() {
@@ -549,7 +819,7 @@ load_control_state() {
     [[ "$(stat -c '%u' -- "$control_state" 2>/dev/null || true)" == "$(id -u)" &&
        "$(stat -c '%a' -- "$control_state" 2>/dev/null || true)" == 600 ]] ||
         safe_blocked 'control-state.json owner or mode is invalid'
-    state_line="$(python3 - "$control_state" "$CONTROL_SCHEMA" <<'PY'
+    state_line="$(version_python "$control_state" "$CONTROL_SCHEMA" <<'PY'
 import json, pathlib, re, sys
 path, schema = sys.argv[1:]
 def pairs(items):
@@ -568,7 +838,7 @@ if document["schema"] != schema or document["desired_state"] not in {"running","
 for key in ("boot_id","operation_id"):
     if not isinstance(document[key], str) or not document[key]: raise SystemExit("state identity is invalid")
 generation = document["generation_id"]
-if not isinstance(generation, str) or (generation and not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64}", generation)):
+if not isinstance(generation, str) or (generation and not canonical_generation(generation)):
     raise SystemExit("state generation identity is invalid")
 if isinstance(document["updated_at_unix"], bool) or not isinstance(document["updated_at_unix"], int) or document["updated_at_unix"] <= 0:
     raise SystemExit("state timestamp is invalid")
@@ -582,10 +852,10 @@ write_control_state() {
     local desired="$1" operation timestamp generation content
     operation="$(new_operation_id)"; timestamp="$(now_unix)" || safe_blocked 'control-state clock is unavailable'
     generation="$(current_generation || true)"
-    content="$(python3 - "$CONTROL_SCHEMA" "$desired" "$(boot_id)" "$operation" "$generation" "$timestamp" <<'PY'
+    content="$(version_python "$CONTROL_SCHEMA" "$desired" "$(boot_id)" "$operation" "$generation" "$timestamp" <<'PY'
 import json, re, sys
 schema, desired, boot, operation, generation, timestamp = sys.argv[1:]
-if generation and not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64}", generation):
+if generation and not canonical_generation(generation):
     raise SystemExit("state generation identity is invalid")
 print(json.dumps({"schema":schema,"desired_state":desired,"boot_id":boot,"operation_id":operation,"generation_id":generation,"updated_at_unix":int(timestamp)}, separators=(",",":")))
 PY
@@ -623,7 +893,7 @@ read_journal() {
     [[ "$(stat -c '%u' -- "$transaction" 2>/dev/null || true)" == "$(id -u)" &&
        "$(stat -c '%a' -- "$transaction" 2>/dev/null || true)" == 600 ]] ||
         safe_blocked 'transaction journal owner or mode is invalid'
-    journal_line="$(python3 - "$transaction" "${legacy_recovery_journal:-}" <<'PY'
+    journal_line="$(version_python "$transaction" "${legacy_recovery_journal:-}" <<'PY'
 import base64, gzip, hashlib, io, json, pathlib, re, sys
 def pairs(items):
     result={}
@@ -645,9 +915,9 @@ if (isinstance(document["owner_pid"],bool) or not isinstance(document["owner_pid
         not isinstance(document["boot_id"],str) or not document["boot_id"] or not isinstance(document["operation_id"],str) or not document["operation_id"] or
         document["desired_state"] not in {"running","stopped","disabled","removed"}):
     raise SystemExit("journal state is invalid")
-generation_pattern=r"(?:|(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64})"
-if (not isinstance(document["old_generation"],str) or not re.fullmatch(generation_pattern,document["old_generation"]) or
-        not isinstance(document["new_generation"],str) or not re.fullmatch(generation_pattern,document["new_generation"]) or
+def generation_identity(value): return value == "" or canonical_generation(value)
+if (not isinstance(document["old_generation"],str) or not generation_identity(document["old_generation"]) or
+        not isinstance(document["new_generation"],str) or not generation_identity(document["new_generation"]) or
         isinstance(document["updated_at_unix"],bool) or not isinstance(document["updated_at_unix"],int) or document["updated_at_unix"] <= 0):
     raise SystemExit("journal generation or timestamp is invalid")
 # The opaque operation ID carries the one prestate record while preserving the
@@ -764,7 +1034,7 @@ manifest_record() {
     else
         [[ -f "$path" && ! -L "$path" ]] || safe_blocked 'generation manifest is absent'
     fi
-    python3 - "$path" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
+    version_python "$path" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
 import hashlib,json,pathlib,re,sys
 path,schema,product,target,compatibility=sys.argv[1:]
 def pairs(items):
@@ -779,7 +1049,7 @@ except Exception as error: raise SystemExit(str(error))
 if not isinstance(document,dict) or document.get("schema")!=schema or document.get("product")!=product or document.get("target")!=target or document.get("compatibility")!=compatibility:
     raise SystemExit("manifest identity is invalid")
 version,source,entries=document.get("version"),document.get("source_sha"),document.get("files")
-if (not isinstance(version,str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",version)
+if (not isinstance(version,str) or not canonical_manifest_version(document)
     or not isinstance(source,str) or not re.fullmatch(r"[0-9a-f]{40}",source) or not isinstance(entries,list)):
     raise SystemExit("manifest fields are invalid")
 paths=[]; binaries={}
@@ -1009,7 +1279,7 @@ legacy_flat_present() {
 }
 verify_generation_files() {
     local generation_dir_name="$1"
-    python3 - "$generation_dir_name" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
+    version_python "$generation_dir_name" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
 import hashlib, json, os, pathlib, re, stat, sys
 root = pathlib.Path(sys.argv[1]); schema, product, target, compatibility = sys.argv[2:]
 if (not root.is_dir() or root.is_symlink() or root.stat().st_uid != os.getuid() or
@@ -1032,7 +1302,7 @@ if not isinstance(document, dict) or set(document) != required: raise SystemExit
 if document["schema"] != schema or document["product"] != product or document["target"] != target or document["compatibility"] != compatibility:
     raise SystemExit("generation manifest identity is invalid")
 if (not isinstance(document["version"], str) or
-        not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)", document["version"]) or
+        not canonical_manifest_version(document) or
         not isinstance(document["source_sha"], str) or not re.fullmatch(r"[0-9a-f]{40}", document["source_sha"]) or
         not isinstance(document["run_id"], str) or not re.fullmatch(r"[1-9][0-9]*", document["run_id"]) or
         isinstance(document["run_attempt"], bool) or not isinstance(document["run_attempt"], int) or document["run_attempt"] < 1):
@@ -1111,7 +1381,7 @@ prune_obsolete_generations() {
            "$(stat -c '%u' -- "$generations_dir/$journal_previous_id" 2>/dev/null || true)" == "$(id -u)" &&
            "$(stat -c '%a' -- "$generations_dir/$journal_previous_id" 2>/dev/null || true)" == 700 ]] ||
             { generation_prune_failed 'rollback generation is not a trusted legacy directory'; return 1; }
-        python3 - "$generations_dir/$journal_previous_id/manifest.json" <<'PY_LEGACY_SCHEMA' ||
+        version_python "$generations_dir/$journal_previous_id/manifest.json" <<'PY_LEGACY_SCHEMA' ||
 import json, pathlib, sys
 try:
     document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
@@ -1137,7 +1407,7 @@ PY_LEGACY_SCHEMA
             { generation_prune_failed 'legacy rollback generation failed its installed contract'; return 1; }
         legacy_rollback_id="$journal_previous_id"
     fi
-    if python3 - "$generations_dir" "$current_link" "$transaction" "$unit_dir" "$proc_root" \
+    if version_python "$generations_dir" "$current_link" "$transaction" "$unit_dir" "$proc_root" \
         "$legacy_rollback_id" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" "$journal_operation_id" <<'PY'
 import hashlib
 import json
@@ -1148,8 +1418,8 @@ import sys
 
 generations_path, current_path, journal_path, unit_dir, proc_root, legacy_rollback_name, schema, product, target, compatibility, expected_operation = sys.argv[1:]
 uid = os.getuid()
-generation_pattern = re.compile(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64}")
-journal_generation_pattern = re.compile(r"(?:|(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)-[0-9a-f]{40}-[0-9a-f]{64})")
+
+
 directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -1207,7 +1477,7 @@ def open_member(root_fd, path):
         raise
 
 def validate_generation(name, root_fd):
-    require(generation_pattern.fullmatch(name) is not None, "generation directory name is malformed")
+    require(canonical_generation(name), "generation directory name is malformed")
     generation_fd = os.open(name, directory_flags, dir_fd=root_fd)
     try:
         root_st = os.fstat(generation_fd)
@@ -1225,7 +1495,7 @@ def validate_generation(name, root_fd):
                 document["target"] == target and document["compatibility"] == compatibility,
                 "generation manifest authority differs")
         require(isinstance(document["version"], str) and
-                re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)", document["version"]) is not None and
+                canonical_manifest_version(document) and
                 isinstance(document["source_sha"], str) and re.fullmatch(r"[0-9a-f]{40}", document["source_sha"]) is not None,
                 "generation version identity differs")
         require(isinstance(document["run_id"], str) and re.fullmatch(r"[1-9][0-9]*", document["run_id"]) is not None and
@@ -1327,7 +1597,7 @@ def read_committed_state(root_fd):
     require(current_target.startswith("generations/") and current_target.count("/") == 1,
             "current generation link is not canonical")
     current_name = current_target.split("/", 1)[1]
-    require(generation_pattern.fullmatch(current_name) is not None, "current generation name is invalid")
+    require(canonical_generation(current_name), "current generation name is invalid")
     journal_fd = os.open(journal_path, file_flags)
     try:
         journal_stat = os.fstat(journal_fd)
@@ -1359,8 +1629,8 @@ def read_committed_state(root_fd):
             journal["desired_state"] in {"running", "stopped", "disabled", "removed"} and
             type(journal["updated_at_unix"]) is int and journal["updated_at_unix"] > 0,
             "transaction journal fields are invalid")
-    require(isinstance(journal["old_generation"], str) and journal_generation_pattern.fullmatch(journal["old_generation"]) is not None and
-            isinstance(journal["new_generation"], str) and journal_generation_pattern.fullmatch(journal["new_generation"]) is not None,
+    require(isinstance(journal["old_generation"], str) and (journal["old_generation"] == "" or canonical_generation(journal["old_generation"])) and
+            isinstance(journal["new_generation"], str) and (journal["new_generation"] == "" or canonical_generation(journal["new_generation"])),
             "committed journal generation fields are invalid")
     install_commit = journal["new_generation"] == current_name
     rollback_commit = journal["old_generation"] == current_name
@@ -1532,7 +1802,7 @@ def main():
         valid = {}
         for name in os.listdir(root_fd):
             entry_stat = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-            if not stat.S_ISDIR(entry_stat.st_mode) or not generation_pattern.fullmatch(name):
+            if not stat.S_ISDIR(entry_stat.st_mode) or not canonical_generation(name):
                 continue
             known_names.add(name)
         require(current in known_names and (not rollback or rollback in known_names),
@@ -1704,11 +1974,17 @@ def stage():
     required={"schema","product","version","source_sha","run_id","run_attempt","target","compatibility","glibc_minimum","files"}
     if not isinstance(manifest,dict) or set(manifest)!=required: reject("manifest keys are not exact")
     if manifest["schema"]!=schema or manifest["product"]!=product: reject("manifest identity")
-    if not isinstance(manifest["version"],str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",manifest["version"]): reject("version")
+    version=manifest["version"]
+    if not isinstance(version,str): reject("version")
+    stable_pattern=r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)"
+    beta_version=(re.fullmatch(stable_pattern+r"-beta[.][1-9][0-9]*[.](?P<attempt>[1-9][0-9]*)",version)
+                  if len(version)<=32 else None)
+    if not re.fullmatch(stable_pattern,version) and beta_version is None: reject("version")
     if pathlib.Path(archive_name).name!=f"codex-info-{manifest['version']}-{target}.tar.gz": reject("archive name")
     if not isinstance(manifest["source_sha"],str) or not re.fullmatch(r"[0-9a-f]{40}",manifest["source_sha"]): reject("source")
     if not isinstance(manifest["run_id"],str) or not re.fullmatch(r"[1-9][0-9]*",manifest["run_id"]): reject("run id")
     if isinstance(manifest["run_attempt"],bool) or not isinstance(manifest["run_attempt"],int) or manifest["run_attempt"]<1: reject("run attempt")
+    if beta_version is not None and beta_version["attempt"]!=str(manifest["run_attempt"]): reject("beta version run attempt differs")
     if manifest["target"]!=target or manifest["compatibility"]!=compatibility: reject("target")
     if not isinstance(manifest["glibc_minimum"],str) or not re.fullmatch(r"[0-9]+(?:[.][0-9]+)+",manifest["glibc_minimum"]): reject("glibc")
     entries=manifest["files"]
@@ -2078,7 +2354,7 @@ retire_known_unmanaged() {
     generation_path="${resolved%/codex_info_rest}"
     [[ "$(dirname -- "$generation_path")" == "$generations_dir" ]] || safe_blocked 'listener generation path is invalid'
     verify_generation_files "$generation_path" || safe_blocked 'known listener generation is incoherent'
-    expected="$(python3 - "$resolved" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
+    expected="$(version_python "$resolved" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
 import hashlib, json, pathlib, re, stat, sys
 
 path = pathlib.Path(sys.argv[1])
@@ -2108,7 +2384,7 @@ if (document["schema"] != schema or document["product"] != product or
 version = document["version"]
 source = document["source_sha"]
 if (not isinstance(version, str) or
-        not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)", version) or
+        not canonical_version(version) or
         not isinstance(source, str) or not re.fullmatch(r"[0-9a-f]{40}", source)):
     raise SystemExit("listener generation version identity is invalid")
 manifest_hash = hashlib.sha256(raw).hexdigest()
@@ -3378,7 +3654,7 @@ activate_candidate() {
 }
 verify_candidate() {
     if [[ -n "$update_stage" ]]; then update_stage=readiness; update_log started; fi
-    verify_local_generation; [[ "$(current_generation)" == "$candidate_id" ]] || safe_blocked 'candidate is not current'
+    verify_local_generation || return 1; [[ "$(current_generation)" == "$candidate_id" ]] || safe_blocked 'candidate is not current'
     if [[ "$desired_state" == running && "$TRIGGER" != startup ]]; then wait_runtime_ready; fi
 }
 perform_install() {
@@ -3395,6 +3671,14 @@ perform_install() {
         die 'candidate staging failed before mutation'
     check_glibc_compatibility "$candidate_stage/manifest.json" || die 'candidate glibc compatibility check failed'
     IFS=$'\t' read -r bundle_version source_hash manifest_hash binary_hash <<<"$validation"
+    if [[ "$bundle_version" == *-beta.* ]]; then
+        [[ "${update_channel:-stable}" == beta ]] || die 'beta bundle installation is not supported without selected beta channel'
+        [[ -f "$candidate_stage/product_version.py" && ! -L "$candidate_stage/product_version.py" &&
+           "$(stat -c '%a' -- "$candidate_stage/product_version.py")" == 644 ]] || die 'beta bundle shared version module is unavailable'
+        check_incoming_channel "$bundle_version" || return 1
+    elif [[ "${current_installed_version:-}" == *-beta.* ]]; then
+        safe_blocked 'explicit beta-to-stable return is not supported'
+    fi
     candidate_id="$bundle_version-$source_hash-$manifest_hash"; previous_id="$(current_generation)"; operation_id="$(new_operation_id)"
     previous_flat=0; previous_combined=0; legacy_combined_generation=0; legacy_combined_prestate=; legacy_recovery_reader_hash=; recorder_reused=0
     journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""; legacy_combined_prestate=; legacy_recovery_reader_hash=
@@ -3540,7 +3824,9 @@ reconcile_recorder_override() {
     write_journal committed override-migrated
 }
 run_update() {
-    local start update_deadline releases selection info local_coherent=0 discovery_limit
+    local start update_deadline releases selection info local_coherent=0 discovery_limit update_channel_snapshot update_channel
+    update_channel_snapshot="$(update_channel_record)" || return 1
+    update_channel="${update_channel_snapshot%%$'\t'*}"
     update_stage=start; update_log started
     rm -f -- "$update_failure_file"
     [[ ! -f "$transaction" ]] || resume_transaction
@@ -3569,6 +3855,8 @@ run_update() {
     [[ -z "$current_id" ]] || recorder_execution_record "$current_id" >/dev/null || return 1
     preflight_listener_owner
     IFS=$'\t' read -r installed_version _ _ _ <<<"$info"
+    [[ "$installed_version" != *-beta.* || "$update_channel" == beta ]] ||
+        update_failure_with_fallback 'explicit beta-to-stable return is not supported'
     if [[ -n "$current_id" && "$desired_state" == running ]] && ! verify_fixed_links_local; then
         # --remove retains the verified generation and payload links but
         # removes only the three stable unit links.  An explicit subsequent
@@ -3585,13 +3873,20 @@ run_update() {
     command -v "$CURL_BIN" >/dev/null 2>&1 || update_failure_with_fallback "$CURL_BIN is required"
     discovery_limit=30
     if (( operation_deadline > 0 )); then discovery_limit="$(deadline_timeout 30)" || update_failure_with_fallback 'update overall timeout exceeded before discovery'; fi
-    if ! "$CURL_BIN" --fail --silent --show-error --proto '=https' --max-time "$discovery_limit" --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' "$RELEASES_URL" >"$releases"; then
+    if ! discover_update_releases "$releases" "$discovery_limit"; then
         update_failure_with_fallback 'public release discovery failed'
     fi
-    if ! select_release "$releases" "$installed_version" "$local_coherent" >"$selection"; then
+    verify_update_channel_snapshot || update_failure_with_fallback 'update channel changed during discovery'
+    if ! select_release "$releases" "$installed_version" "$local_coherent" "$update_channel" >"$selection"; then
         update_failure_with_fallback 'release selection failed'
     fi
     local state newest; IFS=$'\t' read -r state newest < "$selection"
+    if [[ "$state" == no-candidate ]]; then
+        update_target="$installed_version"; update_stage=selection
+        rm -r -- "$update_root"; update_root=; update_log no-update "no $update_channel candidate"
+        ((QUIET)) || printf 'no %s candidate current=%s\n' "$update_channel" "$installed_version"
+        return 0
+    fi
     update_target="$newest"; update_stage=selection; update_log succeeded
     if [[ "$state" == no-update ]]; then
         verify_local_generation || safe_blocked 'no-update local generation is incoherent'
@@ -3631,6 +3926,7 @@ run_update() {
     local archive_name archive_url archive_digest
     IFS=$'\t' read -r archive_name archive_url archive_digest < <(sed -n '2p' "$selection")
     local archive_path="$update_root/$archive_name" manifest_path="$update_root/manifest.json"
+    verify_update_channel_snapshot || update_failure_with_fallback 'update channel changed before download'
     update_stage=download; update_log started
     download_asset "$archive_url" "$archive_path" "$archive_digest" || update_failure_with_fallback 'release archive download failed'
     extract_bundle_manifest "$archive_path" "$manifest_path" || update_failure_with_fallback 'release archive manifest is unavailable'
@@ -3641,7 +3937,8 @@ run_update() {
     update_stage=install; update_log started
     local -a migration_options=()
     if (( migrate_recorder_override )); then migration_options=(--migrate-recorder-override); fi
-    if CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
+    verify_update_channel_snapshot || update_failure_with_fallback 'update channel changed before apply'
+    if CODEX_INFO_UPDATE_CHANNEL_SNAPSHOT="$update_channel_snapshot" CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
         CODEX_INFO_RELEASE_DIGEST_VERIFIED=1 CODEX_INFO_RELEASE_ARCHIVE_DIGEST="$archive_digest" \
         CODEX_INFO_UPDATE_TARGET="$newest" \
         timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" "${migration_options[@]}"; then
@@ -3658,38 +3955,80 @@ run_update() {
     rm -r -- "$update_root"; update_root=; update_stage=complete; update_log succeeded; ((QUIET)) || printf 'updated from=%s to=%s\n' "$installed_version" "$newest"
 }
 select_release() {
-    local release="$1" current="$2" local_coherent="${3:-0}"
-    python3 - "$release" "$current" "$local_coherent" "$TARGET" <<'PY'
-import json,pathlib,re,sys
-release_path,current_text,local_coherent,target=sys.argv[1:]
+    local release="$1" current="$2" local_coherent="${3:-0}" channel="${4:-stable}" version_module
+    version_module="${running_installer_source%/*}/product_version.py"
+    # Direct source invocation has a fixed source-tree layout. Installed
+    # generations always use their own manifest-bound sibling, never a repo.
+    if [[ "${running_installer_source##*/}" == install_linux_bundle.sh &&
+          "${running_installer_source%/*}" == */packaging ]]; then
+        version_module="${running_installer_source%/*}/../scripts/product_version.py"
+    fi
+    python3 -B - "$release" "$current" "$local_coherent" "$TARGET" "$channel" "$version_module" <<'PY'
+import importlib.util,json,pathlib,re,sys
+release_path,current_text,local_coherent,target,channel,module_name=sys.argv[1:]
 def reject(message): raise SystemExit("release metadata validation failed: "+message)
-try: release=json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
-except Exception as error: reject(str(error))
-if not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",current_text): reject("installed version invalid")
-if not isinstance(release,dict): reject("latest release is not an object")
-tag=release.get("tag_name")
-match=re.fullmatch(r"windows-v((?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*))",tag) if isinstance(tag,str) else None
-if match is None: reject("latest release tag malformed")
-newest_text=match.group(1); newest=tuple(map(int,newest_text.split(".")))
-current=tuple(map(int,current_text.split(".")))
-assets=release.get("assets")
-if not isinstance(assets,list): reject("latest release assets are not an array")
-archive_name=f"codex-info-{newest_text}-{target}.tar.gz"
+if channel not in {"stable","beta"} or local_coherent not in {"0","1"}: reject("selection arguments invalid")
+module_path=pathlib.Path(module_name)
+if module_path.is_symlink() or not module_path.is_file(): reject("shared comparison module unavailable")
+try:
+    spec=importlib.util.spec_from_file_location("codex_info_product_version",module_path)
+    if spec is None or spec.loader is None: reject("shared comparison module unavailable")
+    product_version=importlib.util.module_from_spec(spec)
+    sys.modules[spec.name]=product_version
+    spec.loader.exec_module(product_version)
+except (OSError,ImportError,SyntaxError) as error: reject(str(error))
+def compare(left,right):
+    try: return product_version.compare_versions(left,right)
+    except product_version.ProductVersionError as error: reject(str(error))
+compare(current_text,current_text)
+try: metadata=json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
+except (OSError,UnicodeError,json.JSONDecodeError) as error: reject(str(error))
+single=isinstance(metadata,dict)
+if not single and not isinstance(metadata,list): reject("release metadata is not an object or array")
+releases=[metadata] if single else metadata
 selected=None
-for asset in assets:
-    if not isinstance(asset,dict): continue
-    name=asset.get("name")
-    if name != archive_name: continue
-    if selected is not None: reject("latest release has multiple Linux archives for this version")
-    url,digest=(asset.get(key) for key in ("browser_download_url","digest"))
-    if not isinstance(url,str) or not isinstance(digest,str) or not re.fullmatch(r"sha256:[0-9a-f]{64}",digest):
-        reject("Linux archive digest or download URL is unavailable")
-    selected=(url,digest)
-if selected is None: reject("latest release is missing its Linux archive")
-needs=(newest>current or local_coherent!="1")
-if newest<current or not needs: print("no-update",newest_text,sep="\t"); raise SystemExit(0)
+seen=set()
+for release in releases:
+    if not isinstance(release,dict): reject("release metadata entry is not an object")
+    draft,prerelease=(release.get(key) for key in ("draft","prerelease"))
+    if not isinstance(draft,bool) or not isinstance(prerelease,bool): reject("release publication flags invalid")
+    if draft:
+        if single: reject("latest release is a draft")
+        continue
+    tag=release.get("tag_name")
+    if not isinstance(tag,str) or not tag.startswith("windows-v"): reject("release tag malformed")
+    version=tag.removeprefix("windows-v")
+    compare(version,version)
+    if ("-beta." in version)!=prerelease: reject("release channel/tag mismatch")
+    if prerelease!=(channel=="beta"):
+        if single: reject("latest release is not the selected channel")
+        continue
+    if version in seen: reject("release version is ambiguous")
+    seen.add(version)
+    assets=release.get("assets")
+    if not isinstance(assets,list): reject("release assets are not an array")
+    archive_name=f"codex-info-{version}-{target}.tar.gz"
+    expected_url=f"https://github.com/salty919/codex_info_v2/releases/download/{tag}/{archive_name}"
+    archive=None
+    for asset in assets:
+        if not isinstance(asset,dict) or asset.get("name")!=archive_name: continue
+        if archive is not None: reject("release has multiple Linux archives for this version")
+        url,digest=(asset.get(key) for key in ("browser_download_url","digest"))
+        if asset.get("state")!="uploaded" or url!=expected_url: reject("Linux archive incomplete or download URL mismatch")
+        if not isinstance(digest,str) or not re.fullmatch(r"sha256:[0-9a-f]{64}",digest):
+            reject("Linux archive digest is unavailable")
+        archive=(archive_name,url,digest)
+    if archive is None: reject("release is missing its Linux archive")
+    if selected is None or compare(version,selected[0])>0: selected=(version,archive)
+if selected is None:
+    print("no-candidate",channel,sep="\t")
+    raise SystemExit(0)
+newest_text,archive=selected
+order=compare(newest_text,current_text)
+needs=(order>0 or local_coherent!="1")
+if order<0 or not needs: print("no-update",newest_text,sep="\t"); raise SystemExit(0)
 print("update",newest_text,sep="\t")
-print(archive_name,selected[0],selected[1],sep="\t")
+print(*archive,sep="\t")
 PY
 }
 download_asset() {
@@ -3714,9 +4053,30 @@ readonly_transaction_check() {
     fi
 }
 
+# Local metadata selection never initializes state, replays a journal,
+# downloads an asset, changes a channel, or enters the install path.
+if [[ "$ACTION" == select-release ]]; then
+    select_release "$SELECTION_METADATA" "$SELECTION_CURRENT" "$SELECTION_COHERENT" "$SELECTION_CHANNEL"
+    exit
+fi
+
 # Read-only actions intentionally run before all mutating initialization: no
 # state directories, lock file, journal replay, or control-state write is
 # permitted for status/readback.
+if [[ "$ACTION" == get-update-channel ]]; then show_update_channel; exit; fi
+if [[ "$ACTION" == set-update-channel ]]; then
+    update_channel_record >/dev/null || exit 1
+    initialize_mutating_action
+    update_channel_record write "$UPDATE_CHANNEL_VALUE" >/dev/null || exit 1
+    show_update_channel
+    exit
+fi
+if [[ "$ACTION" == install || "$ACTION" == update || "$ACTION" == timer-update ]]; then
+    update_channel_snapshot="$(update_channel_record)" || exit 1
+    update_channel="${update_channel_snapshot%%$'\t'*}"
+    [[ -z "${CODEX_INFO_UPDATE_CHANNEL_SNAPSHOT:-}" || "$update_channel_snapshot" == "$CODEX_INFO_UPDATE_CHANNEL_SNAPSHOT" ]] || safe_blocked 'update channel changed before apply'
+fi
+
 if [[ "$ACTION" == startup-condition ]]; then
     readonly_transaction_check
     load_control_state
@@ -3872,4 +4232,11 @@ if [[ "${CODEX_INFO_RELEASE_DIGEST_VERIFIED:-}" == 1 ]]; then
 else
     [[ -n "$CHECKSUM" ]] || CHECKSUM="$ARCHIVE.sha256"
 fi
+update_channel_snapshot="$(update_channel_record)" || exit 1
+update_channel="${update_channel_snapshot%%$'\t'*}"
+if [[ -L "$current_link" ]]; then
+    current_info="$(manifest_record)" || safe_blocked 'installed channel identity is unavailable before apply'
+    IFS=$'\t' read -r current_installed_version _ _ _ <<<"$current_info"
+fi
+
 perform_install
