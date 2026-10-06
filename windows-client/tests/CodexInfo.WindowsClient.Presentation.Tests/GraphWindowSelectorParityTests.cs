@@ -14,7 +14,6 @@ public sealed class GraphWindowSelectorParityTests
         var graph = XDocument.Parse(Load("GraphWindow.axaml"));
         var selectors = new[]
         {
-            (Name: "AccountSelector", Id: "Graph.AccountSelector"),
             (Name: "PeriodSelector", Id: "Graph.PeriodSelector"),
             (Name: "MetricSelector", Id: "Graph.MetricSelector")
         };
@@ -47,15 +46,8 @@ public sealed class GraphWindowSelectorParityTests
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "BorderBrush")
             .Attribute("Value")?.Value);
 
-        var accountSelector = graph.Descendants().Single(element =>
-            element.Name.LocalName == "GraphSelect" && element.Attribute(xamlName)?.Value == "AccountSelector");
-        var accountOption = accountSelector.Descendants().Single(element =>
-            element.Name.LocalName == "TextBlock" &&
-            element.Attribute("AutomationProperties.Name") is not null);
-        foreach (var attribute in new[] { "Text", "ToolTip.Tip", "AutomationProperties.Name", "AutomationProperties.HelpText" })
-        {
-            Assert.Equal("{Binding MainDisplayLabel}", accountOption.Attribute(attribute)?.Value);
-        }
+        Assert.DoesNotContain(graph.Descendants(), element =>
+            element.Attribute(xamlName)?.Value == "AccountSelector");
 
         Assert.DoesNotContain(graph.Descendants(), element =>
             element.Attribute(xamlName)?.Value

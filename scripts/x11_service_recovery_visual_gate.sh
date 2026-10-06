@@ -56,7 +56,6 @@ ready_threads="$temp_root/ready-threads.json"
 current_headers="$temp_root/ready-current.headers"
 threads_headers="$temp_root/ready-threads.headers"
 reference_frame="$temp_root/thread-summary-reference.xwd"
-account_frame="$temp_root/account-menu.xwd"
 idle_frame="$temp_root/idle.xwd"
 auth_frame="$temp_root/auth.xwd"
 full_frame="$temp_root/full.xwd"
@@ -463,56 +462,6 @@ print(f"x11-service-recovery-visual-gate: activity {expected} PASS")
 PY
 }
 
-assert_account_visual_state() {
-    local closed_frame="$1" open_frame="$2"
-    python3 - "$closed_frame" "$open_frame" <<'PY'
-import pathlib
-import struct
-import sys
-from math import sqrt
-
-def image(path):
-    data = pathlib.Path(path).read_bytes()
-    header = struct.unpack(">25I", data[:100])
-    if (header[4], header[5]) != (900, 498):
-        raise SystemExit("account Main image size differs")
-    offset = header[0] + header[19] * 12
-    stride = header[12] // header[4]
-    def rgb(x, y):
-        index = offset + y * header[12] + x * stride
-        return data[index + 2], data[index + 1], data[index]
-    return rgb
-
-def near(value, target, tolerance=18):
-    return sqrt(sum((value[index] - target[index]) ** 2 for index in range(3))) <= tolerance
-
-closed = image(sys.argv[1])
-opened = image(sys.argv[2])
-green = (93, 201, 138)
-closed_green = sum(
-    near(closed(x, y), green)
-    for y in range(18, 62)
-    for x in range(242, 272)
-)
-open_green = sum(
-    near(opened(x, y), green)
-    for y in range(62, 96)
-    for x in range(242, 278)
-)
-selected = sum(
-    near(opened(x, y), (36, 77, 116))
-    for y in range(62, 96)
-    for x in range(242, 662)
-)
-if closed_green < 5:
-    raise SystemExit(f"current account marker is missing from Header: pixels={closed_green}")
-if open_green < 5 or selected < 1000:
-    raise SystemExit(
-        f"account menu/current marker is missing: green={open_green} selected={selected}"
-    )
-print("x11-service-recovery-visual-gate: account current/menu PASS")
-PY
-}
 
 assert_main_fixture_detail() {
     local frame_path="$1" fixture_kind="$2"
@@ -1187,25 +1136,7 @@ assert_activity_visual_state "$reference_frame" active \
 assert_main_fixture_detail "$reference_frame" normal \
     || fail 'Linux seven-day/reset/observed/model details did not render'
 
-# MainAccountSelect is the Linux identity authority. Capture both its closed
-# Header marker and its open one-row menu from the same current-account
-# fixture; opening the popup must not resize or move the 900x498 Main client.
-window_action "$reference_window_id" 367 40 click
-account_ready=0
-for _ in $(seq 1 40); do
-    if xwd -silent -id "$reference_window_id" -out "$account_frame" 2>/dev/null &&
-        assert_account_visual_state "$reference_frame" "$account_frame" >/dev/null 2>&1; then
-        account_ready=1
-        break
-    fi
-    sleep 0.1
-done
-if ((account_ready != 1)); then
-    assert_account_visual_state "$reference_frame" "$account_frame" || true
-    fail 'current account marker/menu did not render at the fixed Header position'
-fi
-assert_account_visual_state "$reference_frame" "$account_frame"
-rm -- "$account_frame" "$reference_frame"
+rm -- "$reference_frame"
 terminate_owned "$reference_ui_pid" reference-UI "$reference_ui_starttime" "$binary" \
     || fail 'reference UI did not stop cleanly'
 reference_ui_pid=''

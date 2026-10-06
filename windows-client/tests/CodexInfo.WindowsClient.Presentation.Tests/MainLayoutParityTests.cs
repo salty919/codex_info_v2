@@ -23,14 +23,12 @@ public sealed class MainLayoutParityTests
             .ToArray();
 
         Assert.DoesNotContain("Main.OpenThreads", ids);
-        Assert.True(IndexOf(source, "Main.UsageStatus") < IndexOf(source, "Main.AccountSelector"));
-        Assert.True(IndexOf(source, "Main.AccountSelector") < IndexOf(source, "Main.OpenGraph"));
+        Assert.DoesNotContain("Main.AccountSelector", ids);
+        Assert.DoesNotContain("Main.AccountMenu", ids);
+        Assert.True(IndexOf(source, "Main.UsageStatus") < IndexOf(source, "Main.OpenGraph"));
         Assert.True(IndexOf(source, "Main.OpenGraph") < IndexOf(source, "Main.OpenLegal"));
         Assert.True(IndexOf(source, "Main.OpenLegal") < IndexOf(source, "Main.OpenSettings"));
 
-        AssertCurrentMarker(document, "Main.SelectedAccountCurrentMarker", "{Binding SelectedAccount.IsCurrent}");
-        AssertCurrentMarker(document, "Main.AccountCurrentMarker", "{Binding IsCurrent}");
-        Assert.Contains("Text=\"{Binding MainDisplayLabel}\"", source, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -91,12 +89,21 @@ public sealed class MainLayoutParityTests
     }
 
     [Fact]
-    public void MainClosedAccountSelectorMatchesLinuxReference()
+    public void SettingsAccountSelectorPreservesCurrentMarkerAndLabels()
     {
         var document = XDocument.Parse(LoadRepositoryFile(
-            "windows-client", "src", "CodexInfo.WindowsClient", "MainWindow.axaml"));
+            "windows-client", "src", "CodexInfo.WindowsClient", "SettingsWindow.axaml"));
+        AssertCurrentMarker(document, "Settings.SelectedAccountCurrentMarker", "{Binding SelectedAccount.IsCurrent}");
+        AssertCurrentMarker(document, "Settings.AccountCurrentMarker", "{Binding IsCurrent}");
+        Assert.Contains(document.Descendants(), element => element.Attribute("Text")?.Value == "{Binding MainDisplayLabel}");
         var selector = document.Descendants().Single(element =>
-            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.AccountSelector");
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountSelector");
+        Assert.Equal("1", selector.Attribute("Grid.Row")?.Value);
+        Assert.Null(selector.Attribute("Grid.Column"));
+        var menu = document.Descendants().Single(element =>
+            element.Name.LocalName == "ListBox" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountMenu").Parent!;
+        Assert.Equal("3", menu.Attribute("Grid.RowSpan")?.Value);
         var content = selector.Elements().Single(element => element.Name.LocalName == "Grid");
         var labelColumn = content.Descendants().Single(element =>
             element.Name.LocalName == "StackPanel" && element.Attribute("Grid.Column")?.Value == "1");
@@ -113,6 +120,19 @@ public sealed class MainLayoutParityTests
             element.Attribute("Text")?.Value == "{Binding SelectedAccountText}");
         Assert.Equal("2", chevron.Attribute("Grid.Column")?.Value);
         Assert.Equal("Center", chevron.Attribute("HorizontalAlignment")?.Value);
+
+        var accountStyle = document.Descendants().Single(element =>
+            element.Name.LocalName == "Style" &&
+            element.Attribute("Selector")?.Value == "ToggleButton.account-selector");
+        Assert.Equal("{DynamicResource Theme18283A}", accountStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "Background").Attribute("Value")?.Value);
+        Assert.Equal("{DynamicResource Theme304A63}", accountStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "BorderBrush").Attribute("Value")?.Value);
+        Assert.Equal("6", accountStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "CornerRadius").Attribute("Value")?.Value);
     }
 
     [Fact]
@@ -258,19 +278,6 @@ public sealed class MainLayoutParityTests
             element.Attribute("IsVisible")?.Value == "{Binding ShowLastReceived}");
         Assert.Equal("2", showLastReceived.Attribute("Grid.RowSpan")?.Value);
         Assert.Equal("0,0,4,0", showLastReceived.Attribute("Margin")?.Value);
-
-        var accountStyle = document.Descendants().Single(element =>
-            element.Name.LocalName == "Style" &&
-            element.Attribute("Selector")?.Value == "ToggleButton.account-selector");
-        Assert.Equal("{DynamicResource Theme18283A}", accountStyle.Descendants().Single(element =>
-            element.Name.LocalName == "Setter" &&
-            element.Attribute("Property")?.Value == "Background").Attribute("Value")?.Value);
-        Assert.Equal("{DynamicResource Theme304A63}", accountStyle.Descendants().Single(element =>
-            element.Name.LocalName == "Setter" &&
-            element.Attribute("Property")?.Value == "BorderBrush").Attribute("Value")?.Value);
-        Assert.Equal("6", accountStyle.Descendants().Single(element =>
-            element.Name.LocalName == "Setter" &&
-            element.Attribute("Property")?.Value == "CornerRadius").Attribute("Value")?.Value);
 
         var legalCommand = document.Descendants().Single(element =>
             element.Name.LocalName == "Button" &&

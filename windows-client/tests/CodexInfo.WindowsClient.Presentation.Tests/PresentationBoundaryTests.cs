@@ -481,19 +481,14 @@ public sealed class PresentationBoundaryTests
         var controlGroupWidth = (buttons.Length * buttonWidth) + ((buttons.Length - 1) * spacing);
         Assert.Equal(controlGroupWidth, int.Parse(columns[3]));
 
-        var accountSelector = document.Descendants()
-            .Single(element => element.Name.LocalName == "GraphSelect" &&
-                element.Attribute(xamlName)?.Value == "AccountSelector");
-        Assert.Equal("0,6,0,0", accountSelector.Attribute("Margin")?.Value);
-        Assert.Equal("{Binding SelectedAccountValueText}", accountSelector.Attribute("ValueText")?.Value);
-        Assert.Equal("Graph.AccountSelector", accountSelector.Attribute("AutomationProperties.AutomationId")?.Value);
+        Assert.DoesNotContain(document.Descendants(), element =>
+            element.Attribute(xamlName)?.Value == "AccountSelector");
 
         var periodSelector = document.Descendants()
             .Single(element => element.Name.LocalName == "GraphSelect" &&
                 element.Attribute(xamlName)?.Value == "PeriodSelector");
         Assert.Equal("0,12,0,0", periodSelector.Attribute("Margin")?.Value);
         Assert.Equal("2", periodSelector.Attribute("Grid.Row")?.Value);
-        Assert.Equal("1", accountSelector.Attribute("Grid.Row")?.Value);
         Assert.Equal("{Binding SelectedPeriodValueText}", periodSelector.Attribute("ValueText")?.Value);
         Assert.Equal("Graph.PeriodSelector", periodSelector.Attribute("AutomationProperties.AutomationId")?.Value);
 
