@@ -214,8 +214,11 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   betaのN/Aは正canonical十進整数、Aはmanifestのrun_attemptと一致する。source_sha、run_id、既存schemaを保持し、
   run_idをbetaのN（run_number）へ読み替えない。非canonical・長すぎるbeta・attempt不一致は出力前に拒否する。
   同beta名のarchive/checksum/manifestが一つでも存在すれば再発行・置換せず拒否する。stableの既存入力・出力契約を維持する。
-  これは既存のtrusted prebuilt inputをlocal packageへ渡す責務だけであり、compiled full identity、Linux parser/installer、
-  公開5asset、channel選択・stable復帰・実機は後続責務とする。fixture packageの成功を公開・実binaryの成功としない。
+  incoming archive validatorも同じstable/beta形状とA/run_attempt一致を検証し、内部/外部manifestのfull version、
+  source_sha、run_id、archive名/digest、member bytes/modeを保持した同一snapshotをprivate candidateへstageする。
+  非canonical・長すぎるbeta・attempt不一致は既存payload/current/service意図のmutation前に拒否する。
+  compiled full identity、実導入のgeneration/launcher/journal、Linux更新比較、公開5asset、channel選択・stable復帰・実機は
+  後続責務とする。local package/private stagingの成功を公開・実binary・実導入の成功としない。
 - Windows製品版とX版は単一のstable `X.Y.Z`を共有する。バイナリ影響ありのPRはmajor/minorを変更せず、mergeごとに
   自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
   `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。
