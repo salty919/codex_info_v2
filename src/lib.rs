@@ -1,5 +1,6 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
+// Rebuild the release after the publication workflow repair (Refs #535).
 
 #![deny(unsafe_code)]
 

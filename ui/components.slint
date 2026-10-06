@@ -490,10 +490,7 @@ export component GraphSelect inherits Rectangle {
 export component Header inherits Rectangle {
     in property <UiStrings> strings;
     in property <bool> show-graph: false;
-    in property <[MainAccountOption]> account-options;
-    in property <int> selected-account-index: 0;
     callback open-graph();
-    callback select-account(string);
     callback open-legal-notice();
     callback open-settings();
     callback begin-window-drag();
@@ -502,10 +499,7 @@ export component Header inherits Rectangle {
     property <length> settings-button-width: 70px;
     property <length> legal-button-width: 84px;
     property <length> graph-button-width: 70px;
-    property <length> account-select-width: 250px;
     property <length> window-control-width: 60px;
-    private property <bool> show-account-selector: root.account-options.length > 0;
-    private property <length> account-x: 220px;
     private property <length> settings-x: root.width - root.window-control-width - 16px - root.settings-button-width;
     private property <length> legal-x: root.settings-x - 4px - root.legal-button-width;
     private property <length> graph-x: root.legal-x - 4px - root.graph-button-width;
@@ -560,18 +554,6 @@ export component Header inherits Rectangle {
         font-size: 12px;
         vertical-alignment: center;
         overflow: elide;
-    }
-    MainAccountSelect {
-        x: root.account-x;
-        y: 4px;
-        width: 250px;
-        height: 44px;
-        visible: root.show-account-selector;
-        model: root.account-options;
-        empty-label: root.strings.account-selector-heading;
-        field-label: root.strings.account-selector-heading;
-        current-index: root.selected-account-index;
-        selected(value) => { root.select-account(value); }
     }
     Rectangle {
         x: root.graph-x;
@@ -1771,13 +1753,16 @@ export component StatusBanner inherits Rectangle {
 
 export component TimeZoneSettingsWindow inherits Window {
     preferred-width: 440px;
-    preferred-height: 300px;
+    preferred-height: 356px;
     min-width: 440px;
     max-width: 440px;
-    min-height: 300px;
-    max-height: 300px;
+    min-height: 356px;
+    max-height: 356px;
     in-out property <string> window-title;
     in property <UiStrings> strings;
+    in property <[MainAccountOption]> account-options;
+    in property <int> selected-account-index: -1;
+    callback select-account(string);
     in property <[string]> time-zone-options;
     in-out property <string> selected-time-zone: "local";
     in-out property <string> save-error;
@@ -1815,36 +1800,44 @@ export component TimeZoneSettingsWindow inherits Window {
             minimize => { root.minimize-window(); }
             close => { root.cancel-settings(); }
         }
+        MainAccountSelect {
+            x: 18px; y: 57px; width: 250px; height: 44px;
+            model: root.account-options;
+            field-label: root.strings.account-selector-heading;
+            empty-label: root.strings.account-selector-heading;
+            current-index: root.selected-account-index;
+            selected(value) => { root.select-account(value); }
+        }
         Text {
-            x: 18px; y: 57px; width: 112px; height: 36px;
+            x: 18px; y: 113px; width: 112px; height: 36px;
             text: root.strings.time-zone; color: DesignTokens.text-secondary;
             font-size: DesignTokens.text-body; vertical-alignment: center;
         }
         GraphSelect {
-            x: 132px; y: 57px; width: parent.width - 150px; height: 36px;
+            x: 132px; y: 113px; width: parent.width - 150px; height: 36px;
             model: root.time-zone-options;
             empty-label: "local";
             current-index: root.selected-time-zone == "UTC" ? 1 : 0;
             selected(value) => { root.selected-time-zone = value; }
         }
         Text {
-            x: 18px; y: 98px; width: parent.width - 36px; height: 68px;
+            x: 18px; y: 154px; width: parent.width - 36px; height: 68px;
             text: root.runtime-versions-text;
             color: DesignTokens.text-secondary; font-size: 11px;
         }
         Text {
-            x: 18px; y: 174px; width: parent.width - 36px; height: 24px;
+            x: 18px; y: 230px; width: parent.width - 36px; height: 24px;
             text: root.save-error; visible: root.save-error != "";
             color: DesignTokens.danger; font-size: 11px; vertical-alignment: center;
             overflow: elide;
         }
         ActionButton {
-            x: parent.width - 206px; y: 212px; width: 88px; height: 34px;
+            x: parent.width - 206px; y: 268px; width: 88px; height: 34px;
             text: root.strings.cancel;
             clicked => { root.cancel-settings(); }
         }
         ActionButton {
-            x: parent.width - 108px; y: 212px; width: 90px; height: 34px;
+            x: parent.width - 108px; y: 268px; width: 90px; height: 34px;
             text: root.strings.save; primary: true;
             clicked => { root.save-time-zone(root.selected-time-zone); }
         }
@@ -1952,8 +1945,6 @@ export component GraphWindow inherits Window {
     in property <[string]> history-period-options;
     in property <bool> open-history-on-start: false;
     in property <int> selected-history-index: 0;
-    in property <[string]> account-options;
-    in property <int> selected-account-index: 0;
     in property <[string]> metric-options;
     in property <int> selected-metric-index: 0;
     out property <bool> history-popup-open: history-select.popup-open;
@@ -1989,7 +1980,6 @@ export component GraphWindow inherits Window {
     callback toggle-maximize-window();
     callback close-window();
     callback select-history(string);
-    callback select-account(string);
     callback select-metric(string);
     callback toggle-remaining();
     callback toggle-luna();
@@ -2070,19 +2060,6 @@ export component GraphWindow inherits Window {
             minimize => { root.minimize-window(); }
             toggle-maximize => { root.toggle-maximize-window(); }
             close => { root.close-window(); }
-        }
-        GraphSelect {
-            x: 0px;
-            y: 42px;
-            width: parent.width;
-            height: 36px;
-            model: root.account-options;
-            empty-label: "アカウントなし";
-            field-label: root.strings.account-selector-heading;
-            current-index: root.selected-account-index;
-            popup-width: 560px;
-            z: 2;
-            selected(value) => { root.select-account(value); }
         }
         GraphSelect {
             x: parent.width - 244px;
