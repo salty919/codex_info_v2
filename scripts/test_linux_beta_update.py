@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
 """Finite real installer/update commands against closed fixture homes only."""
 
 import hashlib
 import json
 import os
 import stat
-import subprocess
+import subprocess  # nosec B404 # Fixed /bin/bash in private offline fixtures only.
 import tempfile
 import unittest
 from pathlib import Path
@@ -120,7 +119,7 @@ class LinuxBetaUpdateIntegrationTests(unittest.TestCase):
     def prepare(self):
         if self.prepared:
             return
-        result = subprocess.run(["/bin/bash", str(self.setup_script)], env=self.environment,
+        result = subprocess.run(["/bin/bash", str(self.setup_script)], env=self.environment,  # nosec B603 # Owned offline setup; shell=False default.
                                 capture_output=True, text=True, timeout=15, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.environment["PATH"] = str(self.case / "fake-bin") + os.pathsep + os.environ["PATH"]
@@ -145,7 +144,7 @@ class LinuxBetaUpdateIntegrationTests(unittest.TestCase):
         self.prepare()
         installed = self.home / ".local/libexec/codex-info-install.sh"
         script = SOURCE_INSTALLER if source or not installed.is_symlink() else installed
-        return subprocess.run(["/bin/bash", str(script), *arguments], env=self.environment,
+        return subprocess.run(["/bin/bash", str(script), *arguments], env=self.environment,  # nosec B603 # Private HOME/proc and stubbed transports; shell=False default.
                               capture_output=True, text=True, timeout=35, check=False)
 
     def channel(self, value):
@@ -165,7 +164,7 @@ class LinuxBetaUpdateIntegrationTests(unittest.TestCase):
         self.prepare()
         environment = dict(self.environment, SOURCE_SHA=source_digit * 40, RUN_ID="92001",
                            RUN_ATTEMPT=str(attempt), OBJDUMP_BIN=str(self.case / "fake-bin/objdump"))
-        result = subprocess.run(["/bin/bash", str(ROOT / "scripts/build_linux_bundle.sh"),
+        result = subprocess.run(["/bin/bash", str(ROOT / "scripts/build_linux_bundle.sh"),  # nosec B603 # Fixed producer/argv and inert payloads; shell=False default.
             "--ui-binary", str(self.case / "fixture/codex_info"),
             "--recorder-binary", str(self.case / "fixture/codex_info_recorder"),
             "--rest-binary", str(self.case / "fixture/codex_info_rest"),
