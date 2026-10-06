@@ -30,6 +30,7 @@ VER-SERIES-FIXED-01
 VER-BETA-IDENTITY-467
 VER-BETA-BUILD-CORE-467
 VER-BETA-LINUX-BUNDLE-467
+VER-BETA-LINUX-CHANNEL-467
 WF-SERIAL-01
 LINUX-BUNDLE-TARGET-01
 LINUX-BUNDLE-RELEASE-01
@@ -224,6 +225,17 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   非canonical・長すぎるbeta・attempt不一致は既存payload/current/service意図のmutation前に拒否する。
   compiled full identity、実導入のgeneration/launcher/journal、Linux更新比較、公開5asset、channel選択・stable復帰・実機は
   後続責務とする。local package/private stagingの成功を公開・実binary・実導入の成功としない。
+- `VER-BETA-LINUX-CHANNEL-467`: Linux installerの選択channelはinstallationごとの
+  `~/.local/share/codex-info/update-channel.json`へ`codex-info-update-channel-v1`のexact schema/channel/revisionで保存する。
+  未設定はstable、app directory0700/file0600・同一owner・regular single-link・atomic replaceとし、既存presentation settingsへkeyを追加しない。
+  `--set-update-channel`/`--get-update-channel`は選択意図を保存/読戻しし、installed channel/versionはverified current manifestから別表示する。
+  既存normal updaterは同じlease下でこの意図を読み、stable latestまたは最大5page/100件の完全なbeta release listから既存selectorを呼ぶ。
+  channel snapshotをdiscovery/download/child applyへ固定し、途中変更・partial enumeration・候補なしの暗黙fallbackを拒否する。
+  明示beta選択のみ、manifest-bound共有module付きbetaを既存staging/journal/current/readiness/rollbackへ渡し、modern identity consumerは同じcanonical32 oracleを使う。
+  legacy形式は従来のstable限定を維持し、同channel downgradeや通常操作でのbeta→stable復帰は許さない。
+  このsource接続の直接検証は合成HOME/proc/fake transportsとfixture identityに限定する。初期対応beta SHA、固定stable復帰、実DB reader/writer互換、
+  両OS設定UI、公開assets/実機は未成立であり、dummy data sentinelの保全を実互換証明にしない。
+
 - Windows製品版とX版は単一のstable `X.Y.Z`を共有する。バイナリ影響ありのPRはmajor/minorを変更せず、mergeごとに
   自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
   `1.0.10`とする。major/minorは利用者の明示指示を要する別変更でだけ更新し、自動採番処理は変更しない。
