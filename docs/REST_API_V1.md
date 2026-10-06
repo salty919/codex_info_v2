@@ -571,6 +571,7 @@ schema-validなdetailsの`state=auth_required|initializing|error,authenticated=f
 ## 稼働プロセスのバージョン（Issue #481）
 
 `RUNTIME-VERSION-481`: `GET /v1/runtime` はaccount、DB snapshot、認証状態に依存しない診断メタデータである。HTTP 200のexact keysは `api_version`, `rest_version`, `recorder_version`, `recorder_status`。`api_version` は `v1`、RESTは応答中のprocessにcompileされた配布version、Recorderはfreshな状態公開と同一PID/starttimeの生存processが公開したcompile済みversionである。公開が旧schema・取得不可・失効の場合、Recorder値はnull、statusは `unavailable`。両値が等しければ `available`、異なれば `mismatch` とする。UI版や実行時のmanifestで値を補完しない。
+配布versionはPRODUCTの既存beta契約に従う32文字以内のcanonical `X.Y.Z` または `X.Y.Z-beta.N.A` とし、N/Aは正canonical十進整数とする。共有`valid_runtime_version`をRESTのRecorder版採用、runtime DTO検証、Linux healthで使い、非canonical・未知suffix・上限超過を拒否する。full versionを保持し、beta同士/ stableとの不一致とnull/unavailableを区別する。文字列受理だけで実processのfresh schema/PID/starttime/生存を成立扱いしない。
 既存healthの3-key schemaを維持する。runtime応答は共通JSON/no-store headerを持ち、snapshot published-pair headerを持たない。Settingsの表示意味はUX owner `RUNTIME-SETTINGS-481` が所有する。
 
 ## REST失敗の診断（Issue #482）

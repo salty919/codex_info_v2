@@ -53,14 +53,32 @@ impl PublicRuntimeVersions {
 }
 
 pub fn valid_runtime_version(version: &str) -> bool {
-    let parts = version.split('.').collect::<Vec<_>>();
-    version.len() <= 32
-        && parts.len() == 3
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && (part.len() == 1 || !part.starts_with('0'))
-                && part.bytes().all(|byte| byte.is_ascii_digit())
-        })
+    if version.len() > 32 {
+        return false;
+    }
+    let (basis, beta) = version
+        .split_once("-beta.")
+        .map_or((version, None), |(basis, beta)| (basis, Some(beta)));
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && (component == "0" || !component.starts_with('0'))
+            && component.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let mut components = basis.split('.');
+    if !(components.next().is_some_and(valid_component)
+        && components.next().is_some_and(valid_component)
+        && components.next().is_some_and(valid_component)
+        && components.next().is_none())
+    {
+        return false;
+    }
+    beta.is_none_or(|beta| {
+        let valid_positive = |component: &str| component != "0" && valid_component(component);
+        let mut components = beta.split('.');
+        components.next().is_some_and(valid_positive)
+            && components.next().is_some_and(valid_positive)
+            && components.next().is_none()
+    })
 }
 pub const MAX_PUBLIC_MODELS: usize = 3;
 pub const MAX_PUBLIC_MODELS_V3: usize = 1_024;
@@ -918,6 +936,118 @@ fn legacy_model(model: &str, total_tokens: u64, total_dollars: f64) -> PublicHis
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue467_runtime_contract_accepts_beta_diagnostics() {
+        for (body, rest, recorder, status) in [
+            (
+                r#"{"api_version":"v1","rest_version":"1.0.110-beta.7.1","recorder_version":"1.0.110-beta.7.1","recorder_status":"available"}"#,
+                "1.0.110-beta.7.1",
+                Some("1.0.110-beta.7.1"),
+                "available",
+            ),
+            (
+                r#"{"api_version":"v1","rest_version":"1.0.110-beta.7.1","recorder_version":"1.0.110-beta.7.2","recorder_status":"mismatch"}"#,
+                "1.0.110-beta.7.1",
+                Some("1.0.110-beta.7.2"),
+                "mismatch",
+            ),
+            (
+                r#"{"api_version":"v1","rest_version":"1.0.110-beta.7.1","recorder_version":"1.0.109","recorder_status":"mismatch"}"#,
+                "1.0.110-beta.7.1",
+                Some("1.0.109"),
+                "mismatch",
+            ),
+            (
+                r#"{"api_version":"v1","rest_version":"1.0.109","recorder_version":"1.0.110-beta.7.1","recorder_status":"mismatch"}"#,
+                "1.0.109",
+                Some("1.0.110-beta.7.1"),
+                "mismatch",
+            ),
+            (
+                r#"{"api_version":"v1","rest_version":"1.0.110-beta.7.1","recorder_version":null,"recorder_status":"unavailable"}"#,
+                "1.0.110-beta.7.1",
+                None,
+                "unavailable",
+            ),
+            (
+                r#"{"api_version":"v1","rest_version":"1.0.110-beta.12345678901234567.1","recorder_version":null,"recorder_status":"unavailable"}"#,
+                "1.0.110-beta.12345678901234567.1",
+                None,
+                "unavailable",
+            ),
+            (
+                r#"{"api_version":"v1","rest_version":"1.2.3","recorder_version":"1.2.3","recorder_status":"available"}"#,
+                "1.2.3",
+                Some("1.2.3"),
+                "available",
+            ),
+        ] {
+            let runtime: PublicRuntimeVersions =
+                serde_json::from_str(body).expect("literal runtime DTO");
+            runtime
+                .validate()
+                .expect("canonical stable/beta diagnostics");
+            assert_eq!(runtime.api_version, "v1");
+            assert_eq!(runtime.rest_version, rest);
+            assert_eq!(runtime.recorder_version.as_deref(), recorder);
+            assert_eq!(runtime.recorder_status, status);
+            assert_eq!(
+                serde_json::to_value(&runtime).unwrap(),
+                serde_json::from_str::<serde_json::Value>(body).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn issue467_runtime_contract_rejects_invalid_identity_and_status() {
+        for version in [
+            "1.0.110-beta.0.1",
+            "1.0.110-beta.07.1",
+            "1.0.110-beta.7.0",
+            "1.0.110-beta.7.01",
+            "01.0.110-beta.7.1",
+            "1.0.110-beta.123456789012345678.1",
+            "1.0.110-rc.7.1",
+            "1.0.110-beta.7.1+source",
+            "1.0.110-beta.7.1-beta.8.1",
+            "1.2.3.4",
+        ] {
+            let rest_invalid = PublicRuntimeVersions {
+                api_version: "v1".into(),
+                rest_version: version.into(),
+                recorder_version: None,
+                recorder_status: "unavailable".into(),
+            };
+            assert!(
+                rest_invalid.validate().is_err(),
+                "invalid REST identity: {version}"
+            );
+            let recorder_invalid = PublicRuntimeVersions {
+                api_version: "v1".into(),
+                rest_version: "1.2.3".into(),
+                recorder_version: Some(version.into()),
+                recorder_status: "mismatch".into(),
+            };
+            assert!(
+                recorder_invalid.validate().is_err(),
+                "invalid Recorder identity: {version}"
+            );
+        }
+        for body in [
+            r#"{"api_version":"v2","rest_version":"1.2.3","recorder_version":null,"recorder_status":"unavailable"}"#,
+            r#"{"api_version":"v1","rest_version":"1.0.110-beta.7.1","recorder_version":"1.0.110-beta.7.2","recorder_status":"available"}"#,
+            r#"{"api_version":"v1","rest_version":"1.2.3","recorder_version":null,"recorder_status":"available"}"#,
+        ] {
+            let runtime: PublicRuntimeVersions = serde_json::from_str(body).unwrap();
+            assert!(
+                runtime.validate().is_err(),
+                "inconsistent runtime DTO: {body}"
+            );
+        }
+        let unknown = r#"{"api_version":"v1","rest_version":"1.2.3","recorder_version":null,"recorder_status":"unavailable","extra":true}"#;
+        assert!(serde_json::from_str::<PublicRuntimeVersions>(unknown).is_err());
+    }
 
     #[test]
     fn default_details_are_bounded_and_serializable() {
