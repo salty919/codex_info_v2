@@ -2312,7 +2312,7 @@ public sealed class LoopbackStatusClient :
 
             var normalizedSource = modelSource switch
             {
-                ApiHistorySample.ConfirmedModelSource when modelsComplete && modelSamples is { Count: > 0 } =>
+                ApiHistorySample.ConfirmedModelSource when modelsComplete && modelSamples is not null =>
                     ApiHistorySample.ConfirmedModelSource,
                 ApiHistorySample.ConfirmedModelSource when modelSamples is { Count: > 0 } =>
                     ApiHistorySample.LegacyUnknownModelSource,
