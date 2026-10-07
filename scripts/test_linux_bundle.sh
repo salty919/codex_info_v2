@@ -528,11 +528,15 @@ PY
 }
 
 extract_installer() {
-    local archive="$1" version destination
+    local archive="$1" version destination bootstrap_dir
     version="$(archive_version "$archive")"
-    destination="$TEST_ROOT/install-$version.sh"
-    tar -xOf "$archive" install.sh > "$destination"
+    bootstrap_dir="$TEST_ROOT/bootstrap-$version"
+    mkdir -p -- "$bootstrap_dir"
+    destination="$bootstrap_dir/install.sh"
+    tar -xOf "$archive" install.sh > "$destination" || return
+    tar -xOf "$archive" product_version.py > "$bootstrap_dir/product_version.py" || return
     chmod 0755 "$destination"
+    chmod 0644 "$bootstrap_dir/product_version.py"
     printf '%s\n' "$destination"
 }
 
@@ -606,6 +610,7 @@ printf 'case read-only empty-home: PASS\n'
 write_stopped_state() {
     local home="$1"
     mkdir -p -- "$home/.local/share/codex-info"
+    chmod 0700 "$home/.local/share/codex-info"
     printf '{"schema":"codex-info-control-state-v1","desired_state":"stopped","boot_id":"%s","operation_id":"fixture","generation_id":"","updated_at_unix":1}\n' \
         "$boot_id_value" > "$home/.local/share/codex-info/control-state.json"
     chmod 0600 "$home/.local/share/codex-info/control-state.json"
