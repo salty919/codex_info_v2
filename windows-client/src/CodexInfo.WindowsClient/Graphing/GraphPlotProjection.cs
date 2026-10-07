@@ -503,7 +503,7 @@ internal static class GraphPlotProjection
                 continue;
             }
 
-            var label = localTime.ToString("MM/dd", CultureInfo.InvariantCulture) + "\n▽";
+            var label = localTime.ToString("MM/dd", CultureInfo.InvariantCulture);
             var longestLineLength = label.Split('\n').Max(line => line.Length);
             var halfWidth = (longestLineLength * TopDateLabelCharacterWidth + TopDateLabelPadding) / 2;
             var position = (timestamp - scene.PeriodStartAt) / span * plotWidth;

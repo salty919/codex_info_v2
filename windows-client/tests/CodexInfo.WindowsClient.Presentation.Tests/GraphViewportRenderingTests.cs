@@ -8,6 +8,7 @@ using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
+using SkiaSharp;
 using Xunit;
 
 namespace CodexInfo.WindowsClient.Presentation.Tests;
@@ -311,9 +312,9 @@ public sealed class GraphViewportRenderingTests
         var end = Unix("2026-03-09T16:00:00Z");
         var expected = new[]
         {
-            (Timestamp: Unix("2026-03-07T05:00:00Z"), Label: "03/07\n▽"),
-            (Timestamp: Unix("2026-03-08T05:00:00Z"), Label: "03/08\n▽"),
-            (Timestamp: Unix("2026-03-09T04:00:00Z"), Label: "03/09\n▽"),
+            (Timestamp: Unix("2026-03-07T05:00:00Z"), Label: "03/07"),
+            (Timestamp: Unix("2026-03-08T05:00:00Z"), Label: "03/08"),
+            (Timestamp: Unix("2026-03-09T04:00:00Z"), Label: "03/09"),
         };
         var scene = GraphScene.Create(
         [
@@ -336,7 +337,9 @@ public sealed class GraphViewportRenderingTests
             using var rendered = control.Plot.GetImage(940, 480);
 
             // ScottPlot's Top axis is the horizontal panel above its DataRect.
-            // The midnight labels must be ticks on that axis, not data labels.
+            // Midnight dates remain ticks on that axis, not data labels. The
+            // font-independent vector marker is drawn by GraphPlotControl's
+            // custom Skia operation and is tested separately below.
             var topAxis = control.Plot.Axes.Top;
             Assert.True(topAxis.IsVisible);
             var ticks = topAxis.TickGenerator.Ticks;
@@ -344,6 +347,84 @@ public sealed class GraphViewportRenderingTests
             {
                 var tick = Assert.Single(ticks, item => Math.Abs(item.Position - timestamp) < 1e-8);
                 Assert.Equal(date, tick.Label);
+            }
+        }
+        finally
+        {
+            setter.Invoke(null, [priorZone]);
+        }
+    }
+
+    [Fact]
+    public void TopDateMarkersRenderAsVectorPixelsAboveTheDataRectangle()
+    {
+        var zone = FindEasternTimeZone();
+        var start = Unix("2026-03-06T17:00:00Z");
+        var end = Unix("2026-03-09T16:00:00Z");
+        var scene = GraphScene.Create(
+        [
+            Sample(Unix("2026-03-08T04:50:00Z"), periodEnd: end, sol: 10, taskActiveSincePrevious: false),
+            Sample(Unix("2026-03-08T05:10:00Z"), periodEnd: end, sol: 10, taskActiveSincePrevious: false),
+        ],
+        GraphMetric.Dollars,
+        start,
+        end);
+
+        var timeZoneProperty = typeof(LocalizationService).GetProperty(nameof(LocalizationService.DisplayTimeZone));
+        Assert.NotNull(timeZoneProperty);
+        var setter = timeZoneProperty.GetSetMethod(nonPublic: true);
+        Assert.NotNull(setter);
+        var priorZone = LocalizationService.DisplayTimeZone;
+        try
+        {
+            setter.Invoke(null, [zone]);
+            var control = new GraphPlotControl { Scene = scene };
+            const int width = 940;
+            const int height = 480;
+            using var bitmap = new SKBitmap(width, height, SKColorType.Rgba8888, SKAlphaType.Premul);
+            using var canvas = new SKCanvas(bitmap);
+            control.Plot.Render(canvas, new ScottPlot.PixelRect(0, width, height, 0));
+
+            var topAxis = control.Plot.Axes.Top;
+            var dataRect = control.Plot.LastRender.DataRect;
+            var ticks = topAxis.TickGenerator.Ticks.ToArray();
+            Assert.Equal(3, ticks.Length);
+            Assert.All(ticks, tick => Assert.DoesNotContain('\n', tick.Label));
+            var baseline = new SKColor[width * height];
+            for (var y = 0; y < height; y++)
+            {
+                for (var x = 0; x < width; x++)
+                {
+                    baseline[y * width + x] = bitmap.GetPixel(x, y);
+                }
+            }
+
+            GraphPlotControl.DrawTopDateMarkers(control.Plot, canvas);
+
+            foreach (var tick in ticks)
+            {
+                var centerX = topAxis.GetPixel(tick.Position, dataRect);
+                var left = Math.Max(0, (int)Math.Floor(centerX - 6));
+                var right = Math.Min(width, (int)Math.Ceiling(centerX + 6));
+                var top = Math.Max(0, (int)Math.Floor(dataRect.Top - 7));
+                var bottom = Math.Min(height, (int)Math.Ceiling(dataRect.Top));
+                var changed = new List<(int X, int Y)>();
+                for (var y = top; y < bottom; y++)
+                {
+                    for (var x = left; x < right; x++)
+                    {
+                        if (bitmap.GetPixel(x, y) != baseline[y * width + x])
+                        {
+                            changed.Add((x, y));
+                        }
+                    }
+                }
+
+                Assert.True(changed.Count >= 4, $"Expected a visible vector marker at midnight tick {tick.Position}.");
+                Assert.All(changed, pixel => Assert.True(pixel.Y + 0.5f < dataRect.Top));
+                Assert.Contains(changed, pixel => pixel.Y + 0.5f < dataRect.Top - 3 && pixel.X + 0.5f < centerX - 1.5f);
+                Assert.Contains(changed, pixel => pixel.Y + 0.5f < dataRect.Top - 3 && pixel.X + 0.5f > centerX + 1.5f);
+                Assert.Contains(changed, pixel => pixel.Y + 0.5f >= dataRect.Top - 3 && Math.Abs(pixel.X + 0.5f - centerX) <= 1.5f);
             }
         }
         finally

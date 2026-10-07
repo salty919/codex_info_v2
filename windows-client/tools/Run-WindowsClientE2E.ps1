@@ -3621,8 +3621,22 @@ function Invoke-E2EGraphThemes {
         $series = if ($theme -eq 'light' -or $theme.EndsWith('-light')) {
             @('#176AAB','#985F08','#16794B','#6A4BCC','#B23553')
         } else { @('#56B2F5','#E6A23C','#5DC98A','#A88CF5','#EF6A6A') }
-        foreach ($hex in @($colors.Plot,$colors.Idle) + $series) {
+        foreach ($hex in @($colors.Plot,$colors.Idle)) {
             Assert-E2EThemePixel $capture $graph.Handle $hex "$theme/Graph/$hex" -Element $plot -Tolerance 2 -MinimumPixels 8
+        }
+        # The middle 40% spans the fixture's confirmed idle strokes and
+        # excludes both the left axis and right endpoint labels/connectors.
+        # Colored endpoint text alone must never prove a series stroke color.
+        $plotBounds = $plot.Current.BoundingRectangle
+        $strokeBounds = [pscustomobject]@{
+            Left = $plotBounds.Left + $plotBounds.Width * 0.2
+            Top = $plotBounds.Top
+            Right = $plotBounds.Left + $plotBounds.Width * 0.6
+            Bottom = $plotBounds.Bottom
+        }
+        foreach ($hex in $series) {
+            Assert-E2EThemePixel $capture $graph.Handle $hex "$theme/Graph/stroke/$hex" `
+                -ScreenBounds $strokeBounds -Tolerance 2 -MinimumPixels 8
         }
     }
     foreach ($mode in @('Day','Week','Period')) {
@@ -3634,6 +3648,11 @@ function Invoke-E2EGraphThemes {
             $root = Get-E2EUiaRoot $graph.Handle
             $modeButton = Find-E2EElementByAutomationId $root "Graph.Range.$mode"
             $range = if ($mode -eq 'Period') { Find-E2EElementByAutomationId $root 'Graph.PeriodSelector' } else { Find-E2EElementByAutomationId $root 'Graph.Range.Label' }
+            if ($mode -ne 'Period') {
+                $expectedModeLabel = if ($mode -eq 'Day') { '24 hours' } else { '1 week' }
+                Assert-E2E ($null -ne $range -and $range.Current.Name.StartsWith($expectedModeLabel)) `
+                    "Graph $mode click did not display the requested range mode."
+            }
             $previous = Find-E2EElementByAutomationId $root 'Graph.Range.Previous'
             $next = Find-E2EElementByAutomationId $root 'Graph.Range.Next'
             foreach ($control in @($range,$previous,$next)) {
@@ -3644,11 +3663,16 @@ function Invoke-E2EGraphThemes {
             $null = Capture-E2EWindow $graph.Handle "graph-$mode-${width}x$height"
         }
         if ($mode -ne 'Period') {
+            $latestRangeLabel = [string]$range.Current.Name
             Invoke-E2EElement $previous
             Wait-E2EGraphLoadSettled $root
             Assert-E2E $next.Current.IsEnabled 'Fixed-range previous action must enable next.'
+            Assert-E2E ($range.Current.Name -cne $latestRangeLabel) 'Previous must change the displayed fixed range.'
+            $pastRangeLabel = [string]$range.Current.Name
             Invoke-E2EElement $next
             Wait-E2EGraphLoadSettled $root
+            Assert-E2E (-not $next.Current.IsEnabled -and $range.Current.Name -cne $pastRangeLabel) `
+                'Next must return to the latest fixed range and disable further forward navigation.'
         }
     }
     Write-E2E 'graph-themes: PASS themes=16 series=5 modes=3 sizes=700x480,940x640 navigation=previous,next'

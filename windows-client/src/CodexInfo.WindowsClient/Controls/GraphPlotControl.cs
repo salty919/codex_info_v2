@@ -51,6 +51,10 @@ public sealed class GraphPlotControl : Control
     internal const float MeasuredRemainingLineWidth = 3f;
     internal const float IdleLineWidth = 1f;
     internal const float InferredLineWidth = 1f;
+    internal const float TopDateMarkerHalfWidth = 3.5f;
+    internal const float TopDateMarkerHeight = 4.5f;
+    internal const float TopDateMarkerInsetFromData = 1f;
+    internal const float TopDateMarkerLineWidth = 1.5f;
     internal static string ResolvedIdleBandColorHex => BlendOpaqueHalfUp(
         ThemePalette.Resolve(PlotColorHex),
         ThemePalette.Resolve(IdleBandColorHex));
@@ -105,6 +109,43 @@ public sealed class GraphPlotControl : Control
 
     protected override AutomationPeer OnCreateAutomationPeer() =>
         new GraphPlotAutomationPeer(this);
+
+    internal static void DrawTopDateMarkers(ScottPlot.Plot plot, SkiaSharp.SKCanvas canvas)
+    {
+        ArgumentNullException.ThrowIfNull(plot);
+        ArgumentNullException.ThrowIfNull(canvas);
+
+        var topAxis = plot.Axes.Top;
+        var ticks = topAxis.TickGenerator.Ticks;
+        if (!ticks.Any())
+        {
+            return;
+        }
+
+        var dataRect = plot.LastRender.DataRect;
+        using var paint = new SkiaSharp.SKPaint
+        {
+            Color = topAxis.TickLabelStyle.ForeColor.ToSKColor(),
+            IsAntialias = true,
+            StrokeCap = SkiaSharp.SKStrokeCap.Round,
+            StrokeJoin = SkiaSharp.SKStrokeJoin.Round,
+            StrokeWidth = TopDateMarkerLineWidth,
+            Style = SkiaSharp.SKPaintStyle.Stroke,
+        };
+        var tipY = dataRect.Top - TopDateMarkerInsetFromData;
+        foreach (var tick in ticks)
+        {
+            var centerX = topAxis.GetPixel(tick.Position, dataRect);
+            if (!float.IsFinite(centerX))
+            {
+                continue;
+            }
+
+            var topY = tipY - TopDateMarkerHeight;
+            canvas.DrawLine(centerX - TopDateMarkerHalfWidth, topY, centerX, tipY, paint);
+            canvas.DrawLine(centerX, tipY, centerX + TopDateMarkerHalfWidth, topY, paint);
+        }
+    }
 
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
     {
@@ -727,6 +768,7 @@ public sealed class GraphPlotControl : Control
             using var canvasState = new SkiaSharp.SKAutoCanvasRestore(lease.SkCanvas, false);
             lease.SkCanvas.SaveLayer();
             plot.Render(lease.SkCanvas, new ScottPlot.PixelRect(0, (float)Bounds.Width, (float)Bounds.Height, 0));
+            DrawTopDateMarkers(plot, lease.SkCanvas);
         }
     }
 
