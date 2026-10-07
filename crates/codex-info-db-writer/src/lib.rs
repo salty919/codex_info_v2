@@ -672,6 +672,7 @@ const OBSERVATION_JSON_KEYS: &[&str] = &[
     "model_source",
 ];
 const OBSERVATION_SOURCE_TIMESTAMP_KEY: &str = "source_timestamp";
+const OBSERVATION_EMPTY_MODEL_SET_COMPLETE_KEY: &str = "empty_model_set_complete";
 const MAX_RECORDED_ROOT_IDENTITY_BYTES: usize = 256;
 const MAX_RECORDED_RELATIVE_PATH_BYTES: usize = 4_096;
 /// Maximum minute buckets materialized by a single one-month history read.
@@ -5692,6 +5693,11 @@ fn upsert_observation_model_totals(
                 |row| row.get(0),
             )?;
             if exists {
+                if model_totals.is_empty() {
+                    return Err(UsageStoreError::InvalidImport(
+                        "empty observation model set conflicts with preserved model history".into(),
+                    ));
+                }
                 continue;
             }
         }
@@ -6654,6 +6660,15 @@ fn observation_json_value(
                 serde_json::Value::from(source_timestamp),
             );
     }
+    if observation.model_totals.as_ref().is_some_and(Vec::is_empty) {
+        value
+            .as_object_mut()
+            .expect("observation JSON is an object")
+            .insert(
+                OBSERVATION_EMPTY_MODEL_SET_COMPLETE_KEY.to_owned(),
+                serde_json::Value::Bool(observation.model_totals_complete),
+            );
+    }
     value
 }
 
@@ -6702,7 +6717,15 @@ fn validate_observation_json(snapshot_json: &str) -> Result<serde_json::Value> {
         .collect::<BTreeSet<_>>();
     let mut expected_with_source = expected.clone();
     expected_with_source.insert(OBSERVATION_SOURCE_TIMESTAMP_KEY);
-    if actual != expected && actual != expected_with_source {
+    let mut expected_with_empty_model_set = expected.clone();
+    expected_with_empty_model_set.insert(OBSERVATION_EMPTY_MODEL_SET_COMPLETE_KEY);
+    let mut expected_with_source_and_empty_model_set = expected_with_source.clone();
+    expected_with_source_and_empty_model_set.insert(OBSERVATION_EMPTY_MODEL_SET_COMPLETE_KEY);
+    if actual != expected
+        && actual != expected_with_source
+        && actual != expected_with_empty_model_set
+        && actual != expected_with_source_and_empty_model_set
+    {
         return Err(UsageStoreError::InvalidDurableRecord(
             "observation JSON fields differ from the strict contract".into(),
         ));
@@ -6719,6 +6742,46 @@ fn validate_observation_json(snapshot_json: &str) -> Result<serde_json::Value> {
         {
             return Err(UsageStoreError::InvalidDurableRecord(
                 "observation source timestamp is invalid".into(),
+            ));
+        }
+    }
+    if let Some(empty_model_set_complete) = object.get(OBSERVATION_EMPTY_MODEL_SET_COMPLETE_KEY) {
+        if empty_model_set_complete.as_bool().is_none() {
+            return Err(UsageStoreError::InvalidDurableRecord(
+                "observation empty model set completeness is invalid".into(),
+            ));
+        }
+        if object
+            .get("model_source")
+            .and_then(serde_json::Value::as_str)
+            == Some("unavailable")
+        {
+            return Err(UsageStoreError::InvalidDurableRecord(
+                "unavailable observation declares an empty model set".into(),
+            ));
+        }
+        let fixed_values_are_zero = [
+            ("sol_dollars", false),
+            ("terra_dollars", false),
+            ("luna_dollars", false),
+            ("sol_tokens", true),
+            ("terra_tokens", true),
+            ("luna_tokens", true),
+        ]
+        .into_iter()
+        .all(|(name, is_integer)| {
+            let Some(value) = object.get(name) else {
+                return false;
+            };
+            if is_integer {
+                value.as_u64() == Some(0)
+            } else {
+                value.as_f64() == Some(0.0)
+            }
+        });
+        if !fixed_values_are_zero {
+            return Err(UsageStoreError::InvalidDurableRecord(
+                "empty observation model set conflicts with fixed model values".into(),
             ));
         }
     }
@@ -6813,6 +6876,13 @@ fn observation_from_sql(
         .ok_or_else(|| {
             UsageStoreError::InvalidDurableRecord("observation model_source is invalid".into())
         })?;
+    let (model_totals, model_totals_complete) = match value
+        .get(OBSERVATION_EMPTY_MODEL_SET_COMPLETE_KEY)
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(complete) => (Some(Vec::new()), complete),
+        None => (None, false),
+    };
     let observation = UsageHistoryObservation {
         timestamp,
         reset_at,
@@ -6824,8 +6894,8 @@ fn observation_from_sql(
         terra_tokens: optional_u64("terra_tokens")?,
         luna_tokens: optional_u64("luna_tokens")?,
         model_source,
-        model_totals: None,
-        model_totals_complete: false,
+        model_totals,
+        model_totals_complete,
     };
     observation.validate()?;
     Ok(observation)
@@ -9435,6 +9505,13 @@ impl UsageStore {
             }
         }
         for (key, (totals, complete)) in model_rows {
+            if observations.get(&key).is_some_and(|observation| {
+                observation.model_totals.as_ref().is_some_and(Vec::is_empty)
+            }) {
+                return Err(UsageStoreError::InvalidImport(
+                    "empty observation model set conflicts with history model rows".into(),
+                ));
+            }
             let canonical = canonicalize_model_totals(&totals)?;
             if let Some(observation) = observations.get_mut(&key) {
                 observation.model_totals = Some(canonical);
@@ -17003,6 +17080,209 @@ mod tests {
             Some(expected.luna_dollars.to_bits())
         );
         assert!(observation_matches_sample(&decoded, &expected));
+    }
+
+    #[test]
+    fn weekly_empty_model_set_survives_commit_reopen_and_replay() {
+        let path = database_path("weekly-empty-model-set-replay");
+        let first_timestamp = 1_700_000_040;
+        let reset_at = first_timestamp + 604_800;
+        let mut samples = (0..4)
+            .map(|index| sample(first_timestamp + index * 60, reset_at, Some(95.0), 0.0))
+            .collect::<Vec<_>>();
+        for sample in &mut samples[..3] {
+            sample.sol_dollars = 0.0;
+            sample.terra_dollars = 0.0;
+            sample.luna_dollars = 0.0;
+            sample.sol_tokens = 0;
+            sample.terra_tokens = 0;
+            sample.luna_tokens = 0;
+        }
+        samples[3].sol_dollars = 1.0;
+        samples[3].terra_dollars = 0.0;
+        samples[3].luna_dollars = 0.0;
+        samples[3].sol_tokens = 5;
+        samples[3].terra_tokens = 0;
+        samples[3].luna_tokens = 0;
+
+        let model = SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 5,
+            input_tokens: 4,
+            cached_input_tokens: 1,
+            output_tokens: 1,
+            cache_write_input_tokens: Some(0),
+        };
+        let mut observations = samples
+            .iter()
+            .map(UsageHistoryObservation::confirmed)
+            .collect::<Vec<_>>();
+        observations[1].model_totals = Some(Vec::new());
+        observations[1].model_totals_complete = true;
+        observations[2].model_totals = Some(Vec::new());
+        observations[3].model_totals = Some(vec![model.clone()]);
+        observations[3].model_totals_complete = true;
+        let commit = || SessionCollectionCommit {
+            reset_at,
+            window_seconds: 604_800,
+            collector_epoch: 550,
+            cycle_seq: 1,
+            samples: &samples,
+            checkpoints: &[],
+            ranges: &[],
+            model_totals: std::slice::from_ref(&model),
+            recorded_sessions: &[],
+        };
+        let expected = observations.clone();
+        let now = Utc.timestamp_opt(first_timestamp + 600, 0).unwrap();
+
+        {
+            let mut store =
+                UsageStore::create_partitioned(&path, &partition_identity('a', 1)).unwrap();
+            let committed = store
+                .commit_session_collection_with_observations(commit(), &observations)
+                .unwrap();
+            assert_eq!(committed.data_generation, 1);
+            assert_eq!(committed.canonical_observations, expected);
+
+            let missing_model_json: String = store
+                .connection
+                .query_row(
+                    "SELECT snapshot_json FROM durable_state WHERE data_hash = ?1",
+                    [observation_data_hash(
+                        observations[0].reset_at,
+                        observations[0].timestamp,
+                    )],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let old_contract = validate_observation_json(&missing_model_json).unwrap();
+            assert!(old_contract.get("empty_model_set_complete").is_none());
+            assert_eq!(
+                observation_from_sql(
+                    observations[0].timestamp,
+                    observation_data_hash(observations[0].reset_at, observations[0].timestamp),
+                    missing_model_json,
+                )
+                .unwrap()
+                .model_totals,
+                None,
+                "legacy JSON without empty-set metadata remains unspecified"
+            );
+
+            let complete_empty_json: String = store
+                .connection
+                .query_row(
+                    "SELECT snapshot_json FROM durable_state WHERE data_hash = ?1",
+                    [observation_data_hash(
+                        observations[1].reset_at,
+                        observations[1].timestamp,
+                    )],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let complete_empty_json: serde_json::Value =
+                serde_json::from_str(&complete_empty_json).unwrap();
+            assert_eq!(
+                complete_empty_json
+                    .get("empty_model_set_complete")
+                    .and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+
+            let incomplete_empty_json: String = store
+                .connection
+                .query_row(
+                    "SELECT snapshot_json FROM durable_state WHERE data_hash = ?1",
+                    [observation_data_hash(
+                        observations[2].reset_at,
+                        observations[2].timestamp,
+                    )],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let incomplete_empty_json: serde_json::Value =
+                serde_json::from_str(&incomplete_empty_json).unwrap();
+            assert_eq!(
+                incomplete_empty_json
+                    .get("empty_model_set_complete")
+                    .and_then(serde_json::Value::as_bool),
+                Some(false)
+            );
+
+            let mut wrong_type = complete_empty_json.clone();
+            wrong_type.as_object_mut().unwrap().insert(
+                "empty_model_set_complete".into(),
+                serde_json::Value::String("true".into()),
+            );
+            assert!(validate_observation_json(&wrong_type.to_string()).is_err());
+
+            let mut contradictory = complete_empty_json.clone();
+            contradictory
+                .as_object_mut()
+                .unwrap()
+                .insert("sol_tokens".into(), serde_json::Value::from(1));
+            assert!(validate_observation_json(&contradictory.to_string()).is_err());
+
+            let unavailable =
+                UsageHistoryObservation::unavailable(first_timestamp + 240, reset_at, Some(95.0));
+            let mut unavailable_json: serde_json::Value =
+                serde_json::from_str(&observation_json(&unavailable).unwrap()).unwrap();
+            unavailable_json.as_object_mut().unwrap().insert(
+                "empty_model_set_complete".into(),
+                serde_json::Value::Bool(false),
+            );
+            assert!(validate_observation_json(&unavailable_json.to_string()).is_err());
+        }
+
+        let mut store = UsageStore::open(&path).unwrap();
+        assert_eq!(
+            store.load_recent_observations(now).unwrap(),
+            expected,
+            "the committed durable observation must distinguish absent and complete/incomplete empty model sets"
+        );
+        let replay = store
+            .commit_session_collection_with_observations(commit(), &observations)
+            .unwrap();
+        assert_eq!(replay.data_generation, 1, "replay keeps its generation");
+        assert_eq!(replay.canonical_observations, expected);
+        assert_eq!(store.load_recent_observations(now).unwrap(), expected);
+        drop(store);
+
+        let reopened = UsageStore::open(&path).unwrap();
+        assert_eq!(reopened.load_recent_observations(now).unwrap(), expected);
+        drop(reopened);
+
+        let mut conflicted_store = UsageStore::open(&path).unwrap();
+        conflicted_store
+            .connection
+            .execute(
+                "INSERT INTO usage_model_history (
+                    reset_at, timestamp, model, total_tokens, input_tokens,
+                    cached_input_tokens, output_tokens, cache_write_input_tokens,
+                    model_set_complete
+                 ) VALUES (?1, ?2, 'SOL', '1', '1', '0', '0', NULL, 1)",
+                params![reset_at, observations[1].timestamp],
+            )
+            .unwrap();
+        assert!(matches!(
+            conflicted_store.load_recent_observations_raw(now),
+            Err(UsageStoreError::InvalidImport(_))
+        ));
+        let transaction = conflicted_store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(upsert_observation_model_totals(
+            &transaction,
+            std::slice::from_ref(&observations[1]),
+            true,
+            None,
+        )
+        .is_err());
+        drop(transaction);
+        drop(conflicted_store);
+        remove_database(&path);
     }
 
     #[test]

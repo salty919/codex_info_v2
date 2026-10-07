@@ -3823,7 +3823,12 @@ impl Recorder {
                         .cloned()
                         .unwrap_or_default()
                 };
-                UsageHistoryObservation::confirmed_with_models(sample, models)
+                let mut observation =
+                    UsageHistoryObservation::confirmed_with_models(sample, models);
+                // Known model facts survive a partial scan, but an unresolved
+                // source cannot establish the complete set, including empty.
+                observation.model_totals_complete = pending_ranges == 0;
+                observation
             })
             .collect::<Vec<_>>();
         let model_totals = totals.to_totals();
@@ -8208,6 +8213,67 @@ mod tests {
         );
         assert_eq!(recorder.state().unwrap().reset_at, now + 3600);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn weekly_empty_model_collection_requires_complete_sources() {
+        const BEFORE: i64 = 1_800_000_000;
+        const AFTER: i64 = BEFORE + 120;
+        const WINDOW: i64 = 604_800;
+        for failed_source in [false, true] {
+            let (root, database) = prepare(if failed_source {
+                "weekly-empty-incomplete"
+            } else {
+                "weekly-empty-complete"
+            });
+            Connection::open(&database).unwrap().execute(
+                "UPDATE collection_generation SET reset_at=0, latest_quota_reset_at=0, window_seconds=0", []
+            ).unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+            recorder
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at: BEFORE,
+                    reset_at: BEFORE + 60,
+                    window_seconds: WINDOW,
+                    remaining_percent: Some(5.0),
+                }))
+                .unwrap()
+                .unwrap();
+            if failed_source {
+                // A malformed source is positive evidence that the empty
+                // collection is incomplete, independent of the model vector.
+                fs::write(root.join("sessions/broken.jsonl"), "{broken}\n").unwrap();
+            }
+            let report = recorder
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at: AFTER,
+                    reset_at: AFTER + WINDOW,
+                    window_seconds: WINDOW,
+                    remaining_percent: Some(100.0),
+                }))
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.pending_ranges > 0, failed_source);
+            assert_eq!(recorder.state().unwrap().reset_at, AFTER + WINDOW);
+            drop(recorder);
+            let store = UsageStore::open_partitioned(&database, &identity()).unwrap();
+            let rows = store
+                .load_recent_observations(chrono::DateTime::from_timestamp(AFTER + 60, 0).unwrap())
+                .unwrap();
+            let old = rows.iter().find(|row| row.timestamp == BEFORE).unwrap();
+            assert_eq!(old.reset_at, BEFORE + 60);
+            assert!(old.model_totals_complete);
+            let current = rows.iter().find(|row| row.timestamp == AFTER).unwrap();
+            assert_eq!(current.model_totals, Some(Vec::new()));
+            assert_eq!(current.remaining_percent, Some(100.0));
+            assert_eq!(
+                current.model_totals_complete, !failed_source,
+                "an unresolved source cannot certify an empty weekly model set"
+            );
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
