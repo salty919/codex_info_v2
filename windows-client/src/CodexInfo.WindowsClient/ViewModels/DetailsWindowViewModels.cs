@@ -2860,7 +2860,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             EffectiveGraphEnd(period, now),
             confirmedGaps,
             hiddenModelNames,
-            accountOwnershipIntervals);
+            accountOwnershipIntervals,
+            period.ResetAt);
         GraphPlotProjection.PrepareGeometry(graphScene);
         return new GraphProjection(
             diagnosticSamples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
