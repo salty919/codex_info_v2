@@ -11,12 +11,17 @@ param(
     [switch]$FixtureContractTest,
     [switch]$ThemePresets,
     [switch]$GraphThemes,
+    [switch]$GraphHoverOnly,
     [switch]$CompatibilitySmoke,
     [switch]$RequireCurrentPresentation,
     [string]$SourceSha = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($GraphHoverOnly -and (-not $Fixture -or $ThemePresets -or $GraphThemes -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation)) {
+    throw 'Graph hover validation requires only -Fixture -GraphHoverOnly.'
+}
 
 if (($ThemePresets -or $GraphThemes) -and -not $Fixture) {
     throw 'Theme validation requires -Fixture.'
@@ -166,6 +171,9 @@ using System.Text;
 public static class CodexInfoWindowsE2EWin32 {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
@@ -3703,13 +3711,48 @@ function Assert-E2EGraphHoverClosed {
 }
 
 function Get-E2EGraphHoverHandle {
-    param($Element, [int]$ProcessId)
-    $native = $Element
-    while ($null -ne $native -and $native.Current.NativeWindowHandle -eq 0) {
-        $native = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($native)
+    param($Element, [int]$ProcessId, [IntPtr]$GraphHandle)
+    # Avalonia's logical UIA parent can be Graph even when the tooltip is a
+    # separate native popup. Resolve its actual HWND from the visible bounds.
+    $script:e2eHoverRect = $Element.Current.BoundingRectangle
+    $script:e2eHoverProcessId = [uint32]$ProcessId
+    $script:e2eHoverGraphHandle = $GraphHandle
+    $script:e2eHoverWindows = [System.Collections.Generic.List[object]]::new()
+    $callback = [CodexInfoWindowsE2EWin32+EnumWindowsProc] {
+        param([IntPtr]$Handle, [IntPtr]$Extra)
+        [uint32]$owner = 0
+        [CodexInfoWindowsE2EWin32]::GetWindowThreadProcessId($Handle, [ref]$owner) | Out-Null
+        if ($owner -ne $script:e2eHoverProcessId -or $Handle -eq $script:e2eHoverGraphHandle -or
+            -not [CodexInfoWindowsE2EWin32]::IsWindowVisible($Handle)) { return $true }
+        $bounds = Get-E2EWindowBounds $Handle
+        $rect = $script:e2eHoverRect
+        if ($rect.Width -gt 0 -and $rect.Height -gt 0 -and
+            $bounds.Left -le $rect.Left -and $bounds.Top -le $rect.Top -and
+            $bounds.Left + $bounds.Width -ge $rect.Right -and $bounds.Top + $bounds.Height -ge $rect.Bottom) {
+            $script:e2eHoverWindows.Add([pscustomobject]@{ Handle=$Handle; Area=($bounds.Width * $bounds.Height) })
+        }
+        return $true
     }
-    Assert-E2E ($null -ne $native -and $native.Current.ProcessId -eq $ProcessId) 'Tooltip capture must belong to the fixture client.'
-    return [IntPtr]$native.Current.NativeWindowHandle
+    [CodexInfoWindowsE2EWin32]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+    $matches = @($script:e2eHoverWindows | Sort-Object Area)
+    Assert-E2E ($matches.Count -gt 0) 'No visible fixture-owned native popup encloses the hover content.'
+    Assert-E2E ($matches.Count -eq 1 -or $matches[0].Area -lt $matches[1].Area) 'Tooltip native popup ownership is ambiguous.'
+    return [IntPtr]$matches[0].Handle
+}
+
+function Move-E2EGraphHoverPointer {
+    param([int]$OutsideX, [int]$OutsideY, [int]$HoverX, [int]$HoverY, [IntPtr]$GraphHandle)
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $GraphHandle) 'Graph must own foreground input for hover validation.'
+    [CodexInfoWindowsE2EWin32]::SetCursorPos($OutsideX, $OutsideY) | Out-Null
+    Start-Sleep -Milliseconds 100
+    # A distinct in-plot move makes re-hover observable even if the OS
+    # coalesces a leave/enter pair ending at the previous cursor position.
+    [CodexInfoWindowsE2EWin32]::SetCursorPos($HoverX - 3, $HoverY) | Out-Null
+    Start-Sleep -Milliseconds 100
+    [CodexInfoWindowsE2EWin32]::SetCursorPos($HoverX, $HoverY) | Out-Null
+    $cursor = New-Object CodexInfoWindowsE2EWin32+POINT
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::GetCursorPos([ref]$cursor)) 'Cannot observe hover pointer.'
+    Assert-E2E ($cursor.X -eq $HoverX -and $cursor.Y -eq $HoverY) 'Hover pointer was moved away from the requested observation.'
 }
 
 function Invoke-E2EGraphHover {
@@ -3731,11 +3774,7 @@ function Invoke-E2EGraphHover {
         Select-E2EGraphMetric $root $metric
         Wait-E2EGraphLoadSettled $root
         Assert-E2EGraphHoverClosed $ProcessId "Tooltip cleared on $metric selection"
-        [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
-        # Let the client consume the outside move before the inside move,
-        # preventing Windows from coalescing them into a stationary event.
-        Start-Sleep -Milliseconds 100
-        [CodexInfoWindowsE2EWin32]::SetCursorPos($hoverX, $hoverY) | Out-Null
+        Move-E2EGraphHoverPointer $outsideX $outsideY $hoverX $hoverY $Graph.Handle
         $timestamp = Wait-E2E -Description "Graph $metric hover observation" -Probe {
             $candidate = Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp'
             if ($null -ne $candidate -and $candidate.Current.Name -ceq $expectedTimestamp) { return $candidate }
@@ -3746,12 +3785,12 @@ function Invoke-E2EGraphHover {
         } else {
             @{ Remaining='Remaining quota: 94%'; SOL='SOL: $0.40'; TERRA='TERRA: $0.80'; LUNA='LUNA: $1.20'; ASTRA=('ASTRA: ' + [char]0x2014) }
         }
-        $tooltipHandle = Get-E2EGraphHoverHandle $timestamp $ProcessId
+        $tooltipHandle = Get-E2EGraphHoverHandle $timestamp $ProcessId $Graph.Handle
         foreach ($series in @('Remaining','SOL','TERRA','LUNA','ASTRA')) {
             $row = Find-E2EGraphHoverElement $ProcessId "Graph.Hover.$series"
             Assert-E2E ($null -ne $row -and $row.Current.Name -ceq $expected[$series]) `
                 "Graph $metric hover must show the same observation's $series value: '$($expected[$series])'."
-            Assert-E2E ((Get-E2EGraphHoverHandle $row $ProcessId) -eq $tooltipHandle) `
+            Assert-E2E ((Get-E2EGraphHoverHandle $row $ProcessId $Graph.Handle) -eq $tooltipHandle) `
                 "Graph $series hover must share its timestamp's popup."
         }
         $null = Capture-E2EWindow $tooltipHandle "graph-hover-$metric"
@@ -3760,24 +3799,18 @@ function Invoke-E2EGraphHover {
         # tooltip invalidation by the toggle itself, not by pointer leave.
         $solToggle = Find-E2EElementByAutomationId $root 'Graph.Toggle.SOL'
         Toggle-E2EElement $solToggle
+        Wait-E2E -Description 'SOL toggle OFF applied' -Probe { (Get-E2EToggleState $solToggle) -eq [System.Windows.Automation.ToggleState]::Off } | Out-Null
         Assert-E2EGraphHoverClosed $ProcessId 'Tooltip cleared after hiding SOL'
-        [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
-        # Let the client consume the outside move before the inside move,
-        # preventing Windows from coalescing them into a stationary event.
-        Start-Sleep -Milliseconds 100
-        [CodexInfoWindowsE2EWin32]::SetCursorPos($hoverX, $hoverY) | Out-Null
+        Move-E2EGraphHoverPointer $outsideX $outsideY $hoverX $hoverY $Graph.Handle
         Wait-E2E -Description 'Tooltip after hiding SOL' -Probe {
             return $null -ne (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp')
         } | Out-Null
         Assert-E2E ($null -eq (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.SOL')) 'Hidden SOL must not appear in the tooltip.'
         Assert-E2E ($null -ne (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.LUNA')) 'Other visible series must remain in the tooltip.'
         Toggle-E2EElement $solToggle
+        Wait-E2E -Description 'SOL toggle ON applied' -Probe { (Get-E2EToggleState $solToggle) -eq [System.Windows.Automation.ToggleState]::On } | Out-Null
         Assert-E2EGraphHoverClosed $ProcessId 'Tooltip cleared after showing SOL'
-        [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
-        # Let the client consume the outside move before the inside move,
-        # preventing Windows from coalescing them into a stationary event.
-        Start-Sleep -Milliseconds 100
-        [CodexInfoWindowsE2EWin32]::SetCursorPos($hoverX, $hoverY) | Out-Null
+        Move-E2EGraphHoverPointer $outsideX $outsideY $hoverX $hoverY $Graph.Handle
         Wait-E2E -Description 'Tooltip restored after showing SOL' -Probe {
             return $null -ne (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.SOL')
         } | Out-Null
@@ -3786,7 +3819,7 @@ function Invoke-E2EGraphHover {
     }
     Select-E2EGraphMetric $root 'Tokens'
     Wait-E2EGraphLoadSettled $root
-    [CodexInfoWindowsE2EWin32]::SetCursorPos($hoverX, $hoverY) | Out-Null
+    Move-E2EGraphHoverPointer $outsideX $outsideY $hoverX $hoverY $Graph.Handle
     Wait-E2E -Description 'Past tooltip before period change' -Probe {
         $candidate = Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp'
         return $null -ne $candidate -and $candidate.Current.Name -ceq $expectedTimestamp
@@ -4283,6 +4316,10 @@ try {
             -ExpectedStartFraction $script:e2eFixturePastIdleStartFraction `
             -ExpectedEndFraction $script:e2eFixturePastIdleEndFraction
         Invoke-E2EGraphHover -Graph $graph -ProcessId $clientPid -Measurement $pastMeasurement
+        if ($GraphHoverOnly) {
+            Write-E2E 'windows-client-e2e: PASS focused native graph hover capture and lifecycle'
+            return
+        }
     }
 
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
