@@ -165,6 +165,7 @@ using System.Text;
 
 public static class CodexInfoWindowsE2EWin32 {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
@@ -201,6 +202,39 @@ public sealed class CodexInfoGraphPixelMeasurement {
 }
 
 public static class CodexInfoGraphPixelScanner {
+    public static bool MatchesCompositedStroke(Color actual, Color foreground, Color background) {
+        double dr = foreground.R - background.R;
+        double dg = foreground.G - background.G;
+        double db = foreground.B - background.B;
+        double norm = dr * dr + dg * dg + db * db;
+        if (norm == 0) return false;
+        double alpha = ((actual.R - background.R) * dr +
+            (actual.G - background.G) * dg + (actual.B - background.B) * db) / norm;
+        // A confirmed-idle 1px stroke has at least one pixel row with
+        // >= half coverage: 0.5 * 0.95 opacity = 0.475 before quantization.
+        if (alpha < 0.45) return false;
+        alpha = Math.Min(1.0, alpha);
+        return Math.Abs(actual.R - (background.R + alpha * dr)) <= 2 &&
+            Math.Abs(actual.G - (background.G + alpha * dg)) <= 2 &&
+            Math.Abs(actual.B - (background.B + alpha * db)) <= 2;
+    }
+
+    public static int CountCompositedStrokePixels(Bitmap bitmap, int left, int top, int right, int bottom,
+        Color foreground, Color[] backgrounds, int minimum) {
+        int count = 0;
+        for (int y = top; y < bottom && count < minimum; y++) {
+            for (int x = left; x < right && count < minimum; x++) {
+                Color actual = bitmap.GetPixel(x, y);
+                foreach (Color background in backgrounds) {
+                    if (!MatchesCompositedStroke(actual, foreground, background)) continue;
+                    count++;
+                    break;
+                }
+            }
+        }
+        return count;
+    }
+
     private static readonly Color GridColor = ColorTranslator.FromHtml("#263850");
     private static readonly Color ResetGuideColor = ColorTranslator.FromHtml("#D6A45C");
     private static readonly Color IdleColor = ColorTranslator.FromHtml("#162232");
@@ -1712,17 +1746,15 @@ function Get-E2EGraphMeasurement {
     }
     $seriesNames = @('Remaining', 'SOL', 'TERRA', 'LUNA')
     if ($AllowUnusedSeries) {
-        Assert-E2E ($measurement.SeriesPixelCount[0] -gt 0 -and
-            $measurement.SeriesGutterPixelCount[0] -gt 0) `
-            "$Description has no visible Remaining series and endpoint."
+        Assert-E2E ($measurement.SeriesPixelCount[0] -gt 0) `
+            "$Description has no visible Remaining series."
         $visibleModelEndpoints = @(1..3 | Where-Object {
-            $measurement.SeriesPixelCount[$_] -gt 0 -and
-            $measurement.SeriesGutterPixelCount[$_] -gt 0
+            $measurement.SeriesPixelCount[$_] -gt 0
         })
         Assert-E2E ($visibleModelEndpoints.Count -gt 0) `
-            "$Description has no visible used-model series and endpoint."
+            "$Description has no visible used-model series."
         foreach ($index in @(0) + $visibleModelEndpoints) {
-            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
+            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 2) `
                 "$Description clips $($seriesNames[$index]) at the right plot edge."
         }
     }
@@ -1730,13 +1762,13 @@ function Get-E2EGraphMeasurement {
         for ($index = 0; $index -lt $seriesNames.Count; $index++) {
             Assert-E2E ($measurement.SeriesPixelCount[$index] -gt 0) `
                 "$Description has no visible $($seriesNames[$index]) color pixels."
-            Assert-E2E ($measurement.SeriesGutterPixelCount[$index] -gt 0) `
-                "$Description has no $($seriesNames[$index]) leader/glyph pixels in the endpoint gutter."
-            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
+            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 2) `
                 "$Description clips $($seriesNames[$index]) at the right plot edge."
         }
     }
-    Write-E2E ("graph-resize-measurement: state={0} plot={1}x{2} grids={3} start={4} end={5} span={6} gutter={7}" -f
+    Assert-E2E (@($measurement.SeriesGutterPixelCount | Where-Object { $_ -gt 0 }).Count -eq 0) `
+        "$Description still paints persistent endpoint labels or connectors beyond the period."
+    Write-E2E ("graph-resize-measurement: state={0} plot={1}x{2} grids={3} start={4} end={5} span={6} right-margin={7}" -f
         $Description, $plotWidth, $plotHeight, ($measurement.GridCenters -join ','),
         $measurement.PeriodStartX, $measurement.PeriodEndX,
         $measurement.PlotSpan, $measurement.GutterWidth)
@@ -3037,6 +3069,23 @@ function Invoke-E2EGraphIdleBandSelfTest {
 }
 
 function Invoke-E2EFixtureContractTests {
+    # One-pixel lines cover one or two pixel rows and retain their specified
+    # opacity. Verify color after composition, without accepting other hues.
+    $foreground = [System.Drawing.ColorTranslator]::FromHtml('#A88CF5')
+    $background = [System.Drawing.ColorTranslator]::FromHtml('#162232')
+    foreach ($alpha in @(1.0, 0.95, 0.475)) {
+        $actual = [System.Drawing.Color]::FromArgb(
+            [int][Math]::Round($background.R + ($foreground.R - $background.R) * $alpha),
+            [int][Math]::Round($background.G + ($foreground.G - $background.G) * $alpha),
+            [int][Math]::Round($background.B + ($foreground.B - $background.B) * $alpha))
+        Assert-E2E ([CodexInfoGraphPixelScanner]::MatchesCompositedStroke($actual, $foreground, $background)) `
+            "Stroke color oracle rejected valid opacity/coverage $alpha."
+    }
+    foreach ($wrong in @($background, [System.Drawing.ColorTranslator]::FromHtml('#EF6A6A'), [System.Drawing.ColorTranslator]::FromHtml('#263850'))) {
+        Assert-E2E (-not [CodexInfoGraphPixelScanner]::MatchesCompositedStroke($wrong, $foreground, $background)) `
+            'Stroke color oracle accepted a background, grid or different series hue.'
+    }
+    Write-E2E 'graph-stroke-color-self-test: PASS opacity/antialias accepted; background/grid/other-series rejected'
     $documents = New-E2EFixtureDocuments
     $healthBody = '{"api_version":"v1","service":"codex-info","product_version":"' + $script:e2eProductVersion + '"}'
     $health = New-E2EContractTestResponse -StatusCode 200 -Body $healthBody -Headers ([ordered]@{})
@@ -3332,7 +3381,8 @@ function Assert-E2EThemePixel {
         [System.Windows.Automation.AutomationElement]$Element = $null,
         [psobject]$ScreenBounds = $null,
         [int]$Tolerance = 8,
-        [int]$MinimumPixels = 1
+        [int]$MinimumPixels = 1,
+        [string[]]$StrokeBackgrounds = @()
     )
 
     $target = [System.Drawing.ColorTranslator]::FromHtml($Hex)
@@ -3353,7 +3403,14 @@ function Assert-E2EThemePixel {
         }
         Assert-E2E ($left -lt $right -and $top -lt $bottom) "$Role pixel region is empty."
         $matches = 0
-        for ($y = $top; $y -lt $bottom -and $matches -lt $MinimumPixels; $y++) {
+        if ($StrokeBackgrounds.Count -gt 0) {
+            [System.Drawing.Color[]]$backgrounds = @($StrokeBackgrounds | ForEach-Object {
+                [System.Drawing.ColorTranslator]::FromHtml($_)
+            })
+            $matches = [CodexInfoGraphPixelScanner]::CountCompositedStrokePixels(
+                $bitmap, $left, $top, $right, $bottom, $target, $backgrounds, $MinimumPixels)
+        }
+        for ($y = $top; $StrokeBackgrounds.Count -eq 0 -and $y -lt $bottom -and $matches -lt $MinimumPixels; $y++) {
             for ($x = $left; $x -lt $right -and $matches -lt $MinimumPixels; $x++) {
                 $actual = $bitmap.GetPixel($x, $y)
                 if ([Math]::Abs([int]$actual.R - [int]$target.R) -le $Tolerance -and
@@ -3585,6 +3642,131 @@ function Assert-E2EThemeSurfaces {
 
 # Graph-only visual matrix: the five graph roles are measured inside the plot,
 # and navigation is exercised on the same visible window at the minimum width.
+function Find-E2EGraphHoverElement {
+    param([int]$ProcessId, [string]$AutomationId)
+    # ToolTip may use its own popup HWND. Restrict the desktop query to the
+    # fixture client process so another running client's tooltip is excluded.
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ProcessId),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $AutomationId))
+    $elements = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants, $condition)
+    foreach ($element in $elements) {
+        if (-not $element.Current.IsOffscreen) { return $element }
+    }
+    return $null
+}
+
+function Assert-E2EGraphHoverClosed {
+    param([int]$ProcessId, [string]$Description)
+    Wait-E2E -Description $Description -Probe {
+        return $null -eq (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp')
+    } | Out-Null
+}
+
+function Get-E2EGraphHoverHandle {
+    param($Element, [int]$ProcessId)
+    $native = $Element
+    while ($null -ne $native -and $native.Current.NativeWindowHandle -eq 0) {
+        $native = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($native)
+    }
+    Assert-E2E ($null -ne $native -and $native.Current.ProcessId -eq $ProcessId) 'Tooltip capture must belong to the fixture client.'
+    return [IntPtr]$native.Current.NativeWindowHandle
+}
+
+function Invoke-E2EGraphHover {
+    param($Graph, [int]$ProcessId, $Measurement)
+    $root = Get-E2EUiaRoot $Graph.Handle
+    $plot = Find-E2EElementByAutomationId $root 'Graph.Plot'
+    $windowBounds = Get-E2EWindowBounds $Graph.Handle
+    $plotBounds = $plot.Current.BoundingRectangle
+    $hoverX = [int]($plotBounds.Left + $Measurement.Pixels.PeriodStartX + 0.35 * $Measurement.Pixels.PlotSpan)
+    $hoverY = [int]($plotBounds.Top + $plotBounds.Height * 0.5)
+    $outsideX = [int]($windowBounds.Left + 100)
+    $outsideY = [int]($windowBounds.Top + 20)
+    $history = Get-Content -Raw -LiteralPath (Join-Path $script:e2eOutput 'fixture-v3-past-history.json') | ConvertFrom-Json
+    # 35% is nearer the real 25% sample than the 50% sample. Values are
+    # literal fixture expectations; the timestamp comes from its wire input.
+    $expectedTimestamp = [DateTimeOffset]::FromUnixTimeSeconds([Int64]$history.history_samples[1].timestamp).ToString(
+        'yyyy/MM/dd HH:mm:ss zzz', [Globalization.CultureInfo]::InvariantCulture)
+    foreach ($metric in @('Tokens','Dollars')) {
+        Select-E2EGraphMetric $root $metric
+        Wait-E2EGraphLoadSettled $root
+        Assert-E2EGraphHoverClosed $ProcessId "Tooltip cleared on $metric selection"
+        [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
+        # Let the client consume the outside move before the inside move,
+        # preventing Windows from coalescing them into a stationary event.
+        Start-Sleep -Milliseconds 100
+        [CodexInfoWindowsE2EWin32]::SetCursorPos($hoverX, $hoverY) | Out-Null
+        $timestamp = Wait-E2E -Description "Graph $metric hover observation" -Probe {
+            $candidate = Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp'
+            if ($null -ne $candidate -and $candidate.Current.Name -ceq $expectedTimestamp) { return $candidate }
+            return $false
+        }
+        $expected = if ($metric -eq 'Tokens') {
+            @{ Remaining='Remaining quota: 94%'; SOL='SOL: 100 Tokens'; TERRA='TERRA: 200 Tokens'; LUNA='LUNA: 300 Tokens'; ASTRA=('ASTRA: ' + [char]0x2014 + ' Tokens') }
+        } else {
+            @{ Remaining='Remaining quota: 94%'; SOL='SOL: $0.40'; TERRA='TERRA: $0.80'; LUNA='LUNA: $1.20'; ASTRA=('ASTRA: ' + [char]0x2014) }
+        }
+        $tooltipHandle = Get-E2EGraphHoverHandle $timestamp $ProcessId
+        foreach ($series in @('Remaining','SOL','TERRA','LUNA','ASTRA')) {
+            $row = Find-E2EGraphHoverElement $ProcessId "Graph.Hover.$series"
+            Assert-E2E ($null -ne $row -and $row.Current.Name -ceq $expected[$series]) `
+                "Graph $metric hover must show the same observation's $series value: '$($expected[$series])'."
+            Assert-E2E ((Get-E2EGraphHoverHandle $row $ProcessId) -eq $tooltipHandle) `
+                "Graph $series hover must share its timestamp's popup."
+        }
+        $null = Capture-E2EWindow $tooltipHandle "graph-hover-$metric"
+
+        # UIA invocation keeps the pointer on the graph, so this tests stale
+        # tooltip invalidation by the toggle itself, not by pointer leave.
+        $solToggle = Find-E2EElementByAutomationId $root 'Graph.Toggle.SOL'
+        Toggle-E2EElement $solToggle
+        Assert-E2EGraphHoverClosed $ProcessId 'Tooltip cleared after hiding SOL'
+        [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
+        # Let the client consume the outside move before the inside move,
+        # preventing Windows from coalescing them into a stationary event.
+        Start-Sleep -Milliseconds 100
+        [CodexInfoWindowsE2EWin32]::SetCursorPos($hoverX, $hoverY) | Out-Null
+        Wait-E2E -Description 'Tooltip after hiding SOL' -Probe {
+            return $null -ne (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp')
+        } | Out-Null
+        Assert-E2E ($null -eq (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.SOL')) 'Hidden SOL must not appear in the tooltip.'
+        Assert-E2E ($null -ne (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.LUNA')) 'Other visible series must remain in the tooltip.'
+        Toggle-E2EElement $solToggle
+        Assert-E2EGraphHoverClosed $ProcessId 'Tooltip cleared after showing SOL'
+        [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
+        # Let the client consume the outside move before the inside move,
+        # preventing Windows from coalescing them into a stationary event.
+        Start-Sleep -Milliseconds 100
+        [CodexInfoWindowsE2EWin32]::SetCursorPos($hoverX, $hoverY) | Out-Null
+        Wait-E2E -Description 'Tooltip restored after showing SOL' -Probe {
+            return $null -ne (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.SOL')
+        } | Out-Null
+        [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
+        Assert-E2EGraphHoverClosed $ProcessId 'Tooltip closed on pointer leave'
+    }
+    Select-E2EGraphMetric $root 'Tokens'
+    Wait-E2EGraphLoadSettled $root
+    [CodexInfoWindowsE2EWin32]::SetCursorPos($hoverX, $hoverY) | Out-Null
+    Wait-E2E -Description 'Past tooltip before period change' -Probe {
+        $candidate = Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp'
+        return $null -ne $candidate -and $candidate.Current.Name -ceq $expectedTimestamp
+    } | Out-Null
+    Invoke-E2EElement (Find-E2EElementByAutomationId $root 'Graph.Range.Next')
+    Wait-E2EGraphLoadSettled $root
+    Assert-E2E (-not (Find-E2EElementByAutomationId $root 'Graph.Range.Next').Current.IsEnabled) 'Period next must reach the current period.'
+    Assert-E2EGraphHoverClosed $ProcessId 'Tooltip cleared after period data change'
+    Invoke-E2EElement (Find-E2EElementByAutomationId $root 'Graph.Range.Previous')
+    Wait-E2EGraphLoadSettled $root
+    Assert-E2E (Find-E2EElementByAutomationId $root 'Graph.Range.Next').Current.IsEnabled 'Period previous must restore the past period.'
+    [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
+    Assert-E2EGraphHoverClosed $ProcessId 'Tooltip closed after restoring past period'
+    Write-E2E 'graph-hover: PASS nearest-observation=25% series=5 metrics=Tokens,Dollars missing=unknown hidden=excluded leave=closed scene-change=closed'
+}
+
 function Invoke-E2EGraphThemes {
     param($MainRoot, [IntPtr]$MainHandle, [int]$ProcessId)
     $graph = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Graph' `
@@ -3636,7 +3818,7 @@ function Invoke-E2EGraphThemes {
         }
         foreach ($hex in $series) {
             Assert-E2EThemePixel $capture $graph.Handle $hex "$theme/Graph/stroke/$hex" `
-                -ScreenBounds $strokeBounds -Tolerance 2 -MinimumPixels 8
+                -ScreenBounds $strokeBounds -Tolerance 2 -MinimumPixels 8 -StrokeBackgrounds @($colors.Plot,$colors.Idle)
         }
     }
     foreach ($mode in @('Day','Week','Period')) {
@@ -4064,6 +4246,7 @@ try {
         Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast $pastMeasurement `
             -ExpectedStartFraction $script:e2eFixturePastIdleStartFraction `
             -ExpectedEndFraction $script:e2eFixturePastIdleEndFraction
+        Invoke-E2EGraphHover -Graph $graph -ProcessId $clientPid -Measurement $pastMeasurement
     }
 
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
@@ -4088,7 +4271,7 @@ try {
     $graphInitialMetricAgain = Capture-E2EWindow $graph.Handle '06-graph-initial-metric'
     Assert-E2EImageChanged $graphOtherMetric $graphInitialMetricAgain "Metric selection '$initialMetric'"
 
-    Write-E2E 'case-4: fixed endpoint gutter across finite horizontal resize states'
+    Write-E2E 'case-4: full-width plot without endpoint labels across finite resize states'
     $allMetricMeasurements = @{}
     $resizeMetricLabels = @($initialMetric, $otherMetric)
     for ($metricIndex = 0; $metricIndex -lt $resizeMetricLabels.Count; $metricIndex++) {
@@ -4129,11 +4312,6 @@ try {
         }
 
         $target = $measurements['940x640']
-        foreach ($stateName in @('700x640', '940x640', '1000x640', '700x480')) {
-            $actual = $measurements[$stateName]
-            Assert-E2E ([Math]::Abs($actual.Pixels.GutterWidth - $target.Pixels.GutterWidth) -le 2) `
-                "$metricLabel endpoint gutter changed at ${stateName}: target=$($target.Pixels.GutterWidth) actual=$($actual.Pixels.GutterWidth)."
-        }
         Assert-E2E ($measurements['700x640'].Pixels.PlotSpan -lt $target.Pixels.PlotSpan -and
             $target.Pixels.PlotSpan -lt $measurements['1000x640'].Pixels.PlotSpan) `
             "$metricLabel plot span did not grow monotonically with same-height window width."
@@ -4146,23 +4324,11 @@ try {
             Assert-E2E ([Math]::Abs($spanIncrease - $uiaWidthIncrease) -le 3) `
                 "$metricLabel plot span increase $spanIncrease does not match Graph.Plot width increase $uiaWidthIncrease."
         }
-        foreach ($sameHeightState in @('700x640', '1000x640')) {
-            for ($seriesIndex = 0; $seriesIndex -lt 4; $seriesIndex++) {
-                Assert-E2E ([Math]::Abs(
-                    $measurements[$sameHeightState].Pixels.SeriesGutterTop[$seriesIndex] -
-                    $target.Pixels.SeriesGutterTop[$seriesIndex]) -le 2) `
-                    "$metricLabel series $seriesIndex endpoint top changed at $sameHeightState."
-                Assert-E2E ([Math]::Abs(
-                    $measurements[$sameHeightState].Pixels.SeriesGutterBottom[$seriesIndex] -
-                    $target.Pixels.SeriesGutterBottom[$seriesIndex]) -le 2) `
-                    "$metricLabel series $seriesIndex endpoint bottom changed at $sameHeightState."
-            }
-        }
         $restored = $measurements['restore-940x640']
         Assert-E2E ([Math]::Abs($restored.Pixels.GutterWidth - $target.Pixels.GutterWidth) -le 2 -and
             [Math]::Abs($restored.Pixels.PlotSpan - $target.Pixels.PlotSpan) -le 2) `
-            "$metricLabel did not restore its 940x640 gutter/plot span after 1000x640."
-        Write-E2E ("graph-resize: PASS metric={0} gutter={1}px states=700x640,940x640,1000x640,700x480 restore=PASS" -f
+            "$metricLabel did not restore its 940x640 axis margin/plot span after 1000x640."
+        Write-E2E ("graph-resize: PASS metric={0} right-margin={1}px states=700x640,940x640,1000x640,700x480 restore=PASS no-endpoint-labels=PASS" -f
             $metricLabel, $target.Pixels.GutterWidth)
         $allMetricMeasurements[$metricLabel] = $measurements
     }

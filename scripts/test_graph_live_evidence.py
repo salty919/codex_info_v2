@@ -1067,6 +1067,8 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         windows["platform"] = "windows"
         for contract in windows["render_contracts"].values():
             contract["styles"]["idle_band"] = "#162232"
+            contract["endpoint_labels"] = []
+            contract["layout"].update(plot_width=786, gutter_width=0, label_gap=0, label_width=0, right_padding=2)
         if mutate_linux is not None:
             mutate_linux(linux)
         mutate(windows)
@@ -1120,9 +1122,31 @@ class GraphLiveEvidenceTests(unittest.TestCase):
 
     def test_verify_rejects_display_label_mismatch(self):
         self._assert_verify_result(
-            lambda document: document["render_contracts"]["dollars"]["endpoint_labels"][0].update(
+            lambda document: None,
+            mutate_linux=lambda document: document["render_contracts"]["dollars"]["endpoint_labels"][0].update(
                 series="SOLX"
             )
+        )
+
+    def test_windows_uses_full_width_without_rendered_endpoint_labels(self):
+        contracts = oracle.build_expected_render_contracts(self.document["parity_v3"], platform="windows")
+        for contract in contracts.values():
+            self.assertEqual([], contract["endpoint_labels"])
+            self.assertEqual(786, contract["layout"]["plot_width"])
+            self.assertEqual(2, contract["layout"]["right_padding"])
+            self.assertEqual(0, contract["layout"]["gutter_width"])
+            self.assertEqual(0, contract["layout"]["label_gap"])
+            self.assertEqual(0, contract["layout"]["label_width"])
+            self.assertTrue(contract["endpoint_values"])
+
+    def test_verify_rejects_windows_endpoint_labels(self):
+        self._assert_verify_result(
+            lambda document: document["render_contracts"]["tokens"]["endpoint_labels"].append({"series": "SOL"})
+        )
+
+    def test_verify_rejects_windows_reserved_label_gutter(self):
+        self._assert_verify_result(
+            lambda document: document["render_contracts"]["tokens"]["layout"].update(plot_width=662, gutter_width=126)
         )
 
     def test_verify_rejects_missing_endpoint_values_instead_of_passing_old_schema(self):

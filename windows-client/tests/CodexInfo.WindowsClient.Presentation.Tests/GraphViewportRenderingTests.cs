@@ -434,10 +434,10 @@ public sealed class GraphViewportRenderingTests
     }
 
     [Fact]
-    public void TopDateAxisSkipsMonthLabelsThatWouldOverlapOrExtendPastPlotEdges()
+    public void TopDateAxisUsesTheFullWidthWhenSelectingDayLabels()
     {
         var start = Unix("2026-01-01T00:00:00Z");
-        var end = Unix("2026-02-01T00:00:00Z");
+        var end = Unix("2026-01-18T00:00:00Z");
         var scene = GraphScene.Create(
         [
             Sample(start + 60, periodEnd: end, sol: 10, taskActiveSincePrevious: false),
@@ -447,19 +447,18 @@ public sealed class GraphViewportRenderingTests
         start,
         end);
         const double dataAreaWidth = 800;
-        var plotWidth = dataAreaWidth - GraphPlotProjection.DollarLabelGutterWidth;
+        var plotWidth = dataAreaWidth - 2;
         var axes = GraphPlotProjection.BuildAxes(
             scene,
             TimeZoneInfo.Utc,
             CultureInfo.InvariantCulture,
-            dataAreaWidth,
             dataAreaWidth);
         var labelPositions = axes.TopDateValues
             .Select(timestamp => (timestamp - start) / (end - (double)start) * plotWidth)
             .ToArray();
 
         Assert.Equal(axes.TopDateValues.Count, axes.TopDateLabels.Count);
-        Assert.InRange(labelPositions.Length, 3, 20);
+        Assert.Equal(16, labelPositions.Length);
         Assert.DoesNotContain((double)start, axes.TopDateValues);
         Assert.DoesNotContain((double)end, axes.TopDateValues);
         Assert.All(labelPositions, position => Assert.InRange(position, 20, plotWidth - 20));
@@ -541,14 +540,12 @@ public sealed class GraphViewportRenderingTests
             scene,
             TimeZoneInfo.Utc,
             CultureInfo.InvariantCulture,
-            narrowDataAreaWidth,
-            referenceDataAreaWidth);
+            narrowDataAreaWidth);
         var expandedAxes = GraphPlotProjection.BuildAxes(
             scene,
             TimeZoneInfo.Utc,
             CultureInfo.InvariantCulture,
-            expandedDataAreaWidth,
-            referenceDataAreaWidth);
+            expandedDataAreaWidth);
         Assert.True(narrowAxes.TopDateValues.Count < expandedAxes.TopDateValues.Count);
 
         var timeZoneProperty = typeof(LocalizationService).GetProperty(nameof(LocalizationService.DisplayTimeZone));
@@ -564,9 +561,19 @@ public sealed class GraphViewportRenderingTests
             control.Measure(new Size(referenceControlWidth, plotHeight));
             control.Arrange(new Rect(0, 0, referenceControlWidth, plotHeight));
             using var referenceImage = control.Plot.GetImage((int)referenceControlWidth, (int)plotHeight);
+            var referenceDataRect = control.Plot.LastRender.DataRect;
+            var hoverX = control.Plot.GetPixel(
+                new ScottPlot.Coordinates(start + 60, 0),
+                control.Plot.Axes.Bottom,
+                control.Plot.Axes.Left).X;
+            control.UpdateHoverAt(new Point(hoverX, (referenceDataRect.Top + referenceDataRect.Bottom) / 2));
+            Assert.True(Avalonia.Controls.ToolTip.GetIsOpen(control));
+            Assert.NotNull(Avalonia.Controls.ToolTip.GetTip(control));
 
             control.Measure(new Size(narrowControlWidth, plotHeight));
             control.Arrange(new Rect(0, 0, narrowControlWidth, plotHeight));
+            Assert.False(Avalonia.Controls.ToolTip.GetIsOpen(control));
+            Assert.Null(Avalonia.Controls.ToolTip.GetTip(control));
             using var narrowImage = control.Plot.GetImage((int)narrowControlWidth, (int)plotHeight);
             var narrowTicksAfterResize = TopDateTickPositions(control);
 

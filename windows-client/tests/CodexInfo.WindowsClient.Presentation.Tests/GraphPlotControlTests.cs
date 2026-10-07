@@ -4,11 +4,13 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Graphing;
+using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
 using CodexInfo.WindowsClient.Theme;
 using CodexInfo.WindowsClient.ViewModels;
@@ -159,39 +161,6 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void EndpointLabelsStayNearTheirSeriesAndResolveOnlyActualCollisions()
-    {
-        var arranged = GraphScene.ArrangeEndpointLabelTops(
-            [10, 80, 84, 170],
-            top: 0,
-            bottom: 200,
-            labelHeight: 14,
-            gap: 2);
-
-        Assert.Equal(10, arranged[0]);
-        Assert.Equal(80, arranged[1]);
-        Assert.Equal(96, arranged[2]);
-        Assert.Equal(170, arranged[3]);
-        Assert.All(arranged, value => Assert.InRange(value, 0, 186));
-        Assert.True(arranged.Zip(arranged.Skip(1)).All(pair => pair.Second - pair.First >= 16));
-    }
-
-    [Fact]
-    public void EndpointLabelsAtBottomRemainBoundedAndNonCrossing()
-    {
-        var arranged = GraphScene.ArrangeEndpointLabelTops(
-            [180, 181, 182, 183],
-            top: 0,
-            bottom: 200,
-            labelHeight: 14,
-            gap: 2);
-
-        Assert.Equal(186, arranged[^1]);
-        Assert.All(arranged, value => Assert.InRange(value, 0, 186));
-        Assert.True(arranged.Zip(arranged.Skip(1)).All(pair => pair.Second - pair.First >= 16));
-    }
-
-    [Fact]
     public void PlotProjectionBuildsFrameworkIndependentAxisTicks()
     {
         var projection = GraphPlotProjection.BuildAxes(
@@ -217,7 +186,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionReservesNativeHeadroomAndEndpointLabelGutter()
+    public void PlotProjectionReservesNativeHeadroomAndUsesPeriodEndForDisplay()
     {
         var scene = Scene(
             [
@@ -236,13 +205,189 @@ public sealed class GraphPlotControlTests
             (projection.ModelDisplayMaximum - projection.ModelDisplayMinimum), precision: 12);
         Assert.Equal(0.99, (scene.ModelMaximum - projection.ModelDisplayMinimum) /
             (projection.ModelDisplayMaximum - projection.ModelDisplayMinimum), precision: 12);
-        Assert.True(projection.EndpointLabelAt > scene.PeriodEndAt);
-        Assert.True(projection.DisplayEndAt > projection.EndpointLabelAt);
+        Assert.Equal(scene.PeriodEndAt, projection.DisplayEndAt);
+        Assert.Equal(
+            scene.PeriodStartAt + (scene.PeriodEndAt - scene.PeriodStartAt) * 788 / 786d,
+            projection.PlotLimitEndAt,
+            precision: 9);
         Assert.Equal(scene.PeriodEndAt, projection.BottomValues[^1]);
     }
 
     [Fact]
-    public void Hidden_models_do_not_change_axis_scale_idle_or_endpoint_candidates()
+    public void WindowsRenderContractRemovesOnlyTheEndpointDisplayAndKeepsEndpointValues()
+    {
+        var scene = Scene(
+        [
+            Point(1_000, 100, 1, 2, 3),
+            Point(2_000, 94, 4, 8, 12),
+        ]);
+
+        var contract = BuildLiveRenderContract(scene);
+
+        Assert.Empty(contract.EndpointLabels);
+        Assert.Equal(scene.PeriodEndAt, contract.LatestTimestamp);
+        Assert.Contains(contract.EndpointValues, value =>
+            value.Series == "SOL" && value.Timestamp == scene.PeriodEndAt && value.Value == 4);
+        Assert.Contains(contract.EndpointValues, value =>
+            value.Series == "remaining" && value.Timestamp == scene.PeriodEndAt && value.Value == 94);
+        Assert.Equal(788, contract.Layout.ReferenceDataWidth);
+        Assert.Equal(786, contract.Layout.PlotWidth);
+        Assert.Equal(0, contract.Layout.GutterWidth);
+        Assert.Equal(0, contract.Layout.LabelGap);
+        Assert.Equal(0, contract.Layout.LabelWidth);
+        Assert.Equal(2, contract.Layout.RightPadding);
+        Assert.Equal(GraphPlotProjection.MinimumPlotHeight, contract.Layout.MinimumPlotHeight);
+    }
+
+    [Fact]
+    public void PlotOmitsEndpointLabelsAndLeaderConnectors()
+    {
+        var scene = Scene(
+        [
+            Point(1_000, 100, 1, 2, 3),
+            Point(2_000, 94, 4, 8, 12),
+        ]);
+        var control = new GraphPlotControl { Scene = scene };
+
+        Assert.Empty(control.Plot.GetPlottables<ScottPlot.Plottables.Text>());
+        Assert.DoesNotContain(
+            control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>(),
+            line =>
+            {
+                var points = line.Data.GetScatterPoints();
+                return points.Count == 2 &&
+                    Math.Abs(points[0].X - scene.PeriodEndAt) < 1e-9 &&
+                    points[1].X > scene.PeriodEndAt;
+            });
+    }
+
+    [Fact]
+    public void HoverShowsOneObservedTimeAndEveryVisibleSeriesWithUnits()
+    {
+        var observedAt = new DateTimeOffset(2026, 10, 7, 21, 30, 0, TimeSpan.Zero).ToUnixTimeSeconds();
+        var scene = GraphScene.Create(
+        [
+            Point(observedAt, 94, 100, 200, 300),
+            Point(observedAt + 60, 93, 120, 210, 330),
+        ],
+        GraphMetric.Tokens,
+        observedAt,
+        observedAt + 60);
+        var control = new GraphPlotControl { Scene = scene };
+        using var rendered = control.Plot.GetImage(940, 480);
+        var dataRect = control.Plot.LastRender.DataRect;
+        var pointerX = control.Plot.GetPixel(
+            new ScottPlot.Coordinates(observedAt, 0),
+            control.Plot.Axes.Bottom,
+            control.Plot.Axes.Left).X;
+        var pointer = new Avalonia.Point(pointerX, (dataRect.Top + dataRect.Bottom) / 2);
+        control.UpdateHoverAt(pointer);
+
+        var tooltip = Assert.IsType<Avalonia.Controls.StackPanel>(Avalonia.Controls.ToolTip.GetTip(control));
+        Assert.Equal("Graph.Hover", AutomationId(tooltip));
+        var firstRows = tooltip.Children.OfType<Avalonia.Controls.TextBlock>().ToArray();
+        Assert.Equal(6, firstRows.Length);
+        var firstById = firstRows.ToDictionary(AutomationId);
+        var expectedTimestamp = TimeZoneInfo.ConvertTime(
+                DateTimeOffset.FromUnixTimeSeconds(observedAt),
+                LocalizationService.DisplayTimeZone)
+            .ToString("yyyy/MM/dd HH:mm:ss zzz", CultureInfo.CurrentCulture);
+        Assert.Equal(expectedTimestamp, firstById["Graph.Hover.Timestamp"].Text);
+        Assert.Equal(
+            $"{LocalizationService.Current.RemainingQuota}: 94%",
+            firstById["Graph.Hover.Remaining"].Text);
+        Assert.Equal($"SOL: 100 {LocalizationService.Current.Tokens}", firstById["Graph.Hover.SOL"].Text);
+        Assert.Equal($"TERRA: 200 {LocalizationService.Current.Tokens}", firstById["Graph.Hover.TERRA"].Text);
+        Assert.Equal($"LUNA: 300 {LocalizationService.Current.Tokens}", firstById["Graph.Hover.LUNA"].Text);
+        Assert.Equal($"ASTRA: — {LocalizationService.Current.Tokens}", firstById["Graph.Hover.ASTRA"].Text);
+        Assert.All(firstRows, row =>
+            Assert.Equal(row.Text, row.GetValue(Avalonia.Automation.AutomationProperties.NameProperty)));
+        Assert.True(Avalonia.Controls.ToolTip.GetIsOpen(control));
+
+        control.UpdateHoverAt(pointer);
+        Assert.Same(tooltip, Avalonia.Controls.ToolTip.GetTip(control));
+        control.UpdateHoverAt(new Avalonia.Point(dataRect.Right + 1, pointer.Y));
+        Assert.False(Avalonia.Controls.ToolTip.GetIsOpen(control));
+        Assert.Null(Avalonia.Controls.ToolTip.GetTip(control));
+        control.UpdateHoverAt(pointer);
+        Assert.Same(tooltip, Avalonia.Controls.ToolTip.GetTip(control));
+        Assert.True(Avalonia.Controls.ToolTip.GetIsOpen(control));
+
+        control.ShowSol = false;
+        Assert.False(Avalonia.Controls.ToolTip.GetIsOpen(control));
+        Assert.Null(Avalonia.Controls.ToolTip.GetTip(control));
+        control.UpdateHoverAt(pointer);
+        var visibleRows = Assert.IsType<Avalonia.Controls.StackPanel>(Avalonia.Controls.ToolTip.GetTip(control))
+            .Children.OfType<Avalonia.Controls.TextBlock>()
+            .ToArray();
+        Assert.DoesNotContain(visibleRows, row => AutomationId(row) == "Graph.Hover.SOL");
+
+        control.UpdateHoverAt(new Avalonia.Point(dataRect.Right + 1, pointer.Y));
+        Assert.False(Avalonia.Controls.ToolTip.GetIsOpen(control));
+        Assert.Null(Avalonia.Controls.ToolTip.GetTip(control));
+
+        control.ShowSol = true;
+        control.UpdateHoverAt(pointer);
+        Assert.True(Avalonia.Controls.ToolTip.GetIsOpen(control));
+        control.Scene = GraphScene.Create(
+        [
+            new ApiHistorySample(
+                observedAt,
+                2_000,
+                94,
+                0.4,
+                0.8,
+                1.2,
+                100,
+                200,
+                300,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                TaskActiveSincePrevious = false,
+            },
+            new ApiHistorySample(
+                observedAt + 60,
+                2_000,
+                93,
+                0.5,
+                0.9,
+                1.3,
+                120,
+                210,
+                330,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                TaskActiveSincePrevious = false,
+            },
+        ],
+        GraphMetric.Dollars,
+        observedAt,
+        observedAt + 60);
+        Assert.False(Avalonia.Controls.ToolTip.GetIsOpen(control));
+        Assert.Null(Avalonia.Controls.ToolTip.GetTip(control));
+        using var dollarRendered = control.Plot.GetImage(940, 480);
+        dataRect = control.Plot.LastRender.DataRect;
+        pointerX = control.Plot.GetPixel(
+            new ScottPlot.Coordinates(observedAt, 0),
+            control.Plot.Axes.Bottom,
+            control.Plot.Axes.Left).X;
+        control.UpdateHoverAt(new Avalonia.Point(pointerX, (dataRect.Top + dataRect.Bottom) / 2));
+        var dollarRows = Assert.IsType<Avalonia.Controls.StackPanel>(Avalonia.Controls.ToolTip.GetTip(control))
+            .Children.OfType<Avalonia.Controls.TextBlock>()
+            .ToDictionary(AutomationId);
+        Assert.Equal("SOL: $0.40", dollarRows["Graph.Hover.SOL"].Text);
+        Assert.Equal("TERRA: $0.80", dollarRows["Graph.Hover.TERRA"].Text);
+        Assert.Equal("LUNA: $1.20", dollarRows["Graph.Hover.LUNA"].Text);
+        Assert.Equal("ASTRA: —", dollarRows["Graph.Hover.ASTRA"].Text);
+    }
+
+    private static string AutomationId(Avalonia.Controls.Control control) =>
+        (string)control.GetValue(Avalonia.Automation.AutomationProperties.AutomationIdProperty)!;
+
+    [Fact]
+    public void Hidden_models_do_not_change_axis_scale_idle_or_model_data()
     {
         var samples = Enumerable.Range(0, 31)
             .Select(minute =>
@@ -297,18 +442,11 @@ public sealed class GraphPlotControlTests
         Assert.Equal(expectedIdle, hiddenDollars.IdleIntervals);
         Assert.Contains("TERRA", dollars.ModelSeries.Keys);
         Assert.DoesNotContain("TERRA", hiddenDollars.ModelSeries.Keys);
-        Assert.Contains(
-            GraphPlotProjection.BuildEndpointLabels(dollars, CultureInfo.InvariantCulture),
-            label => label.Series == GraphSeries.Terra);
-        Assert.DoesNotContain(
-            GraphPlotProjection.BuildEndpointLabels(hiddenDollars, CultureInfo.InvariantCulture),
-            label => label.Series == GraphSeries.Terra);
     }
 
     [Fact]
-    public void PlotProjectionKeepsNativePixelEndpointGutterFixedAcrossUnboundedWidths()
+    public void PlotProjectionUsesFullDataWidthAcrossResponsiveLayouts()
     {
-        const double referenceWidth = 800;
         double[] currentWidths = [320, 800, 1_200, 10_000];
         var points = new[]
         {
@@ -316,10 +454,10 @@ public sealed class GraphPlotControlTests
             Point(2_000, 75, 2, 4, 6),
         };
 
-        foreach (var (metric, expectedGutter) in new[]
+        foreach (var metric in new[]
         {
-            (GraphMetric.Dollars, 94d),
-            (GraphMetric.Tokens, 126d),
+            GraphMetric.Dollars,
+            GraphMetric.Tokens,
         })
         {
             var scene = GraphScene.Create(points, metric, points[0].Timestamp, points[^1].Timestamp);
@@ -330,16 +468,13 @@ public sealed class GraphPlotControlTests
                     scene,
                     TimeZoneInfo.Utc,
                     CultureInfo.InvariantCulture,
-                    currentWidth,
-                    referenceWidth);
-                var displaySpan = projection.DisplayEndAt - scene.PeriodStartAt;
-                var plotWidth = currentWidth *
-                    (scene.PeriodEndAt - scene.PeriodStartAt) / displaySpan;
-                var labelGap = currentWidth *
-                    (projection.EndpointLabelAt - scene.PeriodEndAt) / displaySpan;
-
-                Assert.Equal(expectedGutter, currentWidth - plotWidth, precision: 9);
-                Assert.Equal(10d, labelGap, precision: 9);
+                    currentWidth);
+                Assert.Equal(scene.PeriodEndAt, projection.DisplayEndAt);
+                Assert.Equal(
+                    scene.PeriodStartAt + (scene.PeriodEndAt - scene.PeriodStartAt) * currentWidth /
+                        (currentWidth - 2),
+                    projection.PlotLimitEndAt,
+                    precision: 9);
             }
         }
     }
@@ -364,11 +499,12 @@ public sealed class GraphPlotControlTests
                 scene,
                 TimeZoneInfo.Utc,
                 CultureInfo.InvariantCulture,
-                788,
                 788);
 
             Assert.Equal(legacy.DisplayEndAt, sameWidth.DisplayEndAt);
-            Assert.Equal(legacy.EndpointLabelAt, sameWidth.EndpointLabelAt);
+            Assert.Equal(legacy.PlotLimitEndAt, sameWidth.PlotLimitEndAt);
+            Assert.Equal(scene.PeriodEndAt, legacy.DisplayEndAt);
+            Assert.Equal(scene.PeriodEndAt, sameWidth.DisplayEndAt);
         }
     }
 
@@ -453,24 +589,15 @@ public sealed class GraphPlotControlTests
         Assert.Empty(sol.Dashed.X);
         Assert.Empty(scene.IdleIntervals);
 
-        var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
-        foreach (var series in new[] { GraphSeries.Remaining, GraphSeries.Sol, GraphSeries.Luna, GraphSeries.Astra })
-            Assert.Contains(labels, label => label.Series == series);
-
         var control = new GraphPlotControl { Scene = scene };
-        var rendered = control.Plot.GetImage(940, 480);
-        var pixels = rendered.GetArrayRGB();
-        var gutterStart = (int)Math.Ceiling(control.Plot.GetPixel(new ScottPlot.Coordinates(1_120, 0)).X);
-        foreach (var color in new[] { (86, 178, 245), (168, 140, 245), (230, 162, 60), (239, 106, 106) })
-        {
-            var found = false;
-            for (var x = gutterStart + 1; x < pixels.GetLength(1) && !found; x++)
-                for (var y = 0; y < pixels.GetLength(0) && !found; y++)
-                    found = Math.Abs(pixels[y, x, 0] - color.Item1) <= 24 &&
-                            Math.Abs(pixels[y, x, 1] - color.Item2) <= 24 &&
-                            Math.Abs(pixels[y, x, 2] - color.Item3) <= 24;
-            Assert.True(found, $"Missing endpoint gutter pixels for {color}; start={gutterStart}, dimensions={pixels.GetLength(0)}x{pixels.GetLength(1)}");
-        }
+        using var rendered = control.Plot.GetImage(940, 480);
+        var dataRect = control.Plot.LastRender.DataRect;
+        var endpointPixel = control.Plot.GetPixel(
+            new ScottPlot.Coordinates(1_120, 0),
+            control.Plot.Axes.Bottom,
+            control.Plot.Axes.Left);
+        Assert.InRange(dataRect.Right - endpointPixel.X, 1.5f, 2.5f);
+        Assert.Empty(control.Plot.GetPlottables<ScottPlot.Plottables.Text>());
     }
 
     [Fact]
@@ -623,8 +750,6 @@ public sealed class GraphPlotControlTests
 
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
-        var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
-
         Assert.Equal(2, samples.Count);
         Assert.Equal(1_000, samples[0].Timestamp);
         Assert.Equal(2_000, samples[^1].Timestamp);
@@ -636,8 +761,8 @@ public sealed class GraphPlotControlTests
         Assert.Empty(remaining.Solid.X);
         Assert.Equal([1_000d, 2_000d], remaining.Dashed.X);
         Assert.Equal([80d, 80d], remaining.Dashed.Y);
-        Assert.Contains(labels, label => label.Series == GraphSeries.Sol && label.Text == "$5.00");
-        Assert.Contains(labels, label => label.Series == GraphSeries.Remaining && label.Text == "80%");
+        Assert.Equal(5d, scene.Sol[0]);
+        Assert.Equal(80d, scene.ObservedRemainingValues[0]);
     }
 
     [Fact]
@@ -1230,38 +1355,9 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionOrdersEndpointCandidatesAndReturnsAxisValues()
-    {
-        var scene = Scene(
-            [
-                Point(1_000, 100, 1, 2, 3),
-                Point(1_100, 75, 2, 4, 6),
-            ]);
-
-        var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
-
-        Assert.Equal(
-            [GraphSeries.Luna, GraphSeries.Remaining, GraphSeries.Terra, GraphSeries.Sol],
-            labels.Select(label => label.Series));
-        Assert.Equal(["$6.00", "75%", "$4.00", "$2.00"], labels.Select(label => label.Text));
-        Assert.Equal(0.01d, labels[0].NormalizedTop, precision: 7);
-        Assert.Equal(0.255d, labels[1].NormalizedTop, precision: 7);
-        Assert.Equal((double)(float)(0.99d - 0.98d * 4d / 6d), labels[2].NormalizedTop);
-        Assert.Equal((double)(float)(0.99d - 0.98d * 2d / 6d), labels[3].NormalizedTop);
-        Assert.Equal((0.99d - labels[0].ArrangedTop) / 0.98d * 6d, labels[0].AxisValue, precision: 7);
-        Assert.Equal((0.99d - labels[1].ArrangedTop) / 0.98d * 100d, labels[1].AxisValue, precision: 7);
-        Assert.Equal((0.99d - labels[2].ArrangedTop) / 0.98d * 6d, labels[2].AxisValue, precision: 7);
-        Assert.Equal((0.99d - labels[3].ArrangedTop) / 0.98d * 6d, labels[3].AxisValue, precision: 7);
-        Assert.True(labels.Zip(labels.Skip(1)).All(pair =>
-            pair.Second.ArrangedTop - pair.First.ArrangedTop >= 16d / 204d - 1e-7));
-    }
-
-    [Fact]
     public void PlotProjectionHandlesEmptyScenesAndRejectsNullInputs()
     {
-        Assert.Empty(GraphPlotProjection.BuildEndpointLabels(GraphScene.Empty(), CultureInfo.InvariantCulture));
         Assert.Throws<ArgumentNullException>(() => GraphPlotProjection.BuildAxes(null!, TimeZoneInfo.Utc, CultureInfo.InvariantCulture));
-        Assert.Throws<ArgumentNullException>(() => GraphPlotProjection.BuildEndpointLabels(GraphScene.Empty(), null!));
         Assert.Throws<ArgumentNullException>(() => GraphPlotProjection.FormatAxisValue(1, GraphMetric.Dollars, null!));
     }
 
@@ -1678,13 +1774,6 @@ public sealed class GraphPlotControlTests
         Assert.Equal(
             SegmentPairs(expectedRemainingSegments.GetProperty("dashed")),
             SegmentPairs(remainingLines.Dashed));
-        var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
-        Assert.Contains(labels, label =>
-            label.Series == GraphSeries.Sol &&
-            label.Text == expected.GetProperty("latest_labels").GetProperty("SOL").GetString());
-        Assert.Contains(labels, label =>
-            label.Series == GraphSeries.Remaining &&
-            label.Text == expected.GetProperty("latest_labels").GetProperty("remaining").GetString());
     }
 
     [Fact]
@@ -1741,13 +1830,6 @@ public sealed class GraphPlotControlTests
             GraphMetric.Dollars,
             period.StartAt,
             period.EndAt);
-        var dollarLabels = GraphPlotProjection.BuildEndpointLabels(
-            dollars,
-            CultureInfo.InvariantCulture);
-        Assert.Contains(dollarLabels, label =>
-            label.Series == GraphSeries.Sol && label.Text == "$370.81");
-        Assert.Contains(dollarLabels, label =>
-            label.Series == GraphSeries.Luna && label.Text == "$1.61");
         Assert.Equal(370.814975, dollars.ModelSeries["SOL"][^1], precision: 8);
         Assert.Equal(1.61063484, dollars.ModelSeries["LUNA"][^1], precision: 8);
 
@@ -2269,13 +2351,6 @@ public sealed class GraphPlotControlTests
             GraphPlotControl.MeasuredRemainingLineWidth,
             expectedLineWidths.GetProperty("remaining_solid").GetSingle());
 
-        var labels = GraphPlotProjection.BuildEndpointLabels(dollarScene!, CultureInfo.InvariantCulture);
-        Assert.Contains(labels, label =>
-            label.Series == GraphSeries.Sol &&
-            label.Text == expected.GetProperty("latest_labels").GetProperty("SOL").GetString());
-        Assert.Contains(labels, label =>
-            label.Series == GraphSeries.Remaining &&
-            label.Text == expected.GetProperty("latest_labels").GetProperty("remaining").GetString());
     }
 
     [Fact]
@@ -2411,26 +2486,6 @@ public sealed class GraphPlotControlTests
         Assert.NotNull(tokenScene);
         Assert.Equal(dollarScene.IdleIntervals, tokenScene.IdleIntervals);
         Assert.Equal(dollarScene.Remaining, tokenScene.Remaining);
-        foreach (var (labelScene, labelProperty) in new[]
-                 {
-                     (dollarScene, "latest_labels"),
-                     (tokenScene, "latest_token_labels"),
-                 })
-        {
-            var labels = GraphPlotProjection.BuildEndpointLabels(labelScene, CultureInfo.InvariantCulture);
-            foreach (var (name, series) in new[]
-                     {
-                         ("ASTRA", GraphSeries.Astra),
-                         ("LUNA", GraphSeries.Luna),
-                         ("SOL", GraphSeries.Sol),
-                         ("TERRA", GraphSeries.Terra),
-                     })
-            {
-                Assert.Contains(labels, label =>
-                    label.Series == series &&
-                    label.Text == expected.GetProperty(labelProperty).GetProperty(name).GetString());
-            }
-        }
     }
 
     [Fact]
@@ -2695,13 +2750,6 @@ public sealed class GraphPlotControlTests
         var acceptedLatestSol = expected.GetProperty("accepted_sol").EnumerateArray().Last().GetDouble();
         Assert.Equal(acceptedLatestSol, scene.Sol[^2], precision: 6);
         Assert.Equal(acceptedLatestSol, scene.Sol[^1], precision: 6);
-        var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
-        Assert.Contains(labels, label =>
-            label.Series == GraphSeries.Sol &&
-            label.Text == expected.GetProperty("latest_labels").GetProperty("SOL").GetString());
-        Assert.Contains(labels, label =>
-            label.Series == GraphSeries.Remaining &&
-            label.Text == expected.GetProperty("latest_labels").GetProperty("remaining").GetString());
     }
 
     [Fact]
@@ -2813,10 +2861,6 @@ public sealed class GraphPlotControlTests
             SegmentPairs(quotaExpected.GetProperty("remaining_dashed")),
             SegmentPairs(GraphPlotProjection.BuildRemainingLines(quotaScene).Dashed));
         Assert.Empty(quotaScene.IdleIntervals);
-        Assert.Contains(
-            GraphPlotProjection.BuildEndpointLabels(quotaScene, CultureInfo.InvariantCulture),
-            label => label.Series == GraphSeries.Remaining &&
-                     label.Text == quotaExpected.GetProperty("latest_label").GetString());
     }
 
     [Fact]
@@ -4514,15 +4558,7 @@ public sealed class GraphPlotControlTests
             scene,
             TimeZoneInfo.Utc,
             CultureInfo.InvariantCulture);
-        var endpointLabels = GraphPlotProjection.BuildEndpointLabels(
-                scene,
-                CultureInfo.InvariantCulture)
-            .Select(label => new LiveEndpointLabel(
-                label.Series == GraphSeries.Remaining ? "remaining" : label.Series.ToString().ToUpperInvariant(),
-                label.Text,
-                label.NormalizedTop.ToString("F9", CultureInfo.InvariantCulture),
-                label.ArrangedTop.ToString("F9", CultureInfo.InvariantCulture)))
-            .ToArray();
+        var endpointLabels = Array.Empty<LiveEndpointLabel>();
         var endpointValues = scene.ModelSeries
             .Where(pair => IsRenderableModel(pair.Key))
             .OrderBy(pair => pair.Key, StringComparer.Ordinal)
@@ -4542,9 +4578,6 @@ public sealed class GraphPlotControlTests
                  (axes.ModelDisplayMaximum - axes.ModelDisplayMinimum))
                 .ToString("F12", CultureInfo.InvariantCulture))
             .ToArray();
-        var gutterWidth = scene.Metric == GraphMetric.Tokens
-            ? GraphPlotProjection.TokenLabelGutterWidth
-            : GraphPlotProjection.DollarLabelGutterWidth;
         var remainingPoints = scene.Timestamps
             .Select((timestamp, index) => new LiveRemainingPoint(
                 (long)timestamp,
@@ -4575,11 +4608,11 @@ public sealed class GraphPlotControlTests
             scene.PeriodEndAt,
             new LiveGraphLayout(
                 788,
-                788 - gutterWidth,
-                gutterWidth,
-                GraphPlotProjection.EndpointLabelGapWidth,
-                gutterWidth - GraphPlotProjection.EndpointLabelGapWidth - 4,
-                4,
+                786,
+                0,
+                0,
+                0,
+                2,
                 GraphPlotProjection.MinimumPlotHeight),
             new LiveGraphStyles(
                 ThemePalette.Resolve(GraphPlotControl.PlotColorHex),

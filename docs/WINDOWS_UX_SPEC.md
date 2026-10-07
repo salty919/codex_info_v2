@@ -452,10 +452,11 @@ component順や表示所有者を変更しない。
   `reset_at`はリセット時刻表示の別項目である。current periodの
   `end_at`は同じatomic published rootのaccepted観測終端であり、UI取得後のlocal現在時刻へ延ばさない。
   completed periodは保存された固定`end_at`までを右端とする。
-- 週期間モードの期間欄、横軸、折れ線、右端値は同じselected reset IDだけから一括投影する。poll後の
+- 週期間モードの期間欄、横軸、折れ線、ホバー値は同じselected reset IDだけから一括投影する。poll後の
   bounded reset aliasは60秒以内だけ同一期間として選択を維持し、欄だけ旧期間・plotだけ現在期間の
   混在を禁止する。
-- 右端現在値の表示域は、初期940×640 logical表示時に各metricで確保される幅をドル／トークン別に固定する。Graphを横へリサイズした差分はplotへ割り当て、現在値、系列色、leader、縦位置を変えない。
+- Windowsでは右端の常時数値ラベル・leader・専用gutterを置かず、その横幅をplotへ割り当てる。線端の切れを避ける通常の描画余白と軸ラベルの余白は、数値表示の専用領域とは分離する。横方向のresize差分はplotへ割り当て、縦軸の意味と期間の端点は変えない。Linuxの右端ラベルは従来どおり維持する。
+- Windowsのplot内でマウスを動かすと、近い一つの実観測時刻の日時と表示中の全系列をまとめたツールチップを出す。日時は表示timezone、Tokensは元の整数精度、Dollarsはその観測点のaccepted/read-time補正値、Remainingはraw観測値を用い、単位を明示する。欠けた系列は`—`とし、補間・hold・synthetic tailを実観測値として出さない。viewport内の同じreset期間だけを探索し、confirmed gapや非所有区間を越えて別時刻の値を拾わない。非表示系列は除外し、pointer離脱・scene/metric/表示系列の変更・リサイズ時に旧ツールチップを残さない。観測索引はscene生成時に保持し、pointer移動で全履歴の再投影や全件走査を行わない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
 - `reconstructed-from-session`、`unknown`、`unavailable`および（`legacy-unknown`を除く）`models_complete=false`ではモデル数値を表示せず、
@@ -503,7 +504,7 @@ component順や表示所有者を変更しない。
   idle色のない疎grid、または複数のgrid解はfail-closedで拒否する。
 
   既知の不完全ASTRAが途中まで増加した後に確定値へ移る場合、左側の増加を消して最初の確定値だけを
-  水平表示してはならない。開始・中間・終端値、線種、period ID、右端ラベルを一つの表示candidateとして
+  水平表示してはならない。開始・中間・終端値、線種、period ID、値表示（Linuxは右端ラベル、Windowsはホバー）を一つの表示candidateとして
   検証し、一項目でも不一致ならその表示を受入れない。
 - X版とWindows版は`G137-1`..`G137-10`を参照する同一の履歴fixtureと固定期待値（period/pair、
   累積model、raw/effective Remaining、gap、metric別anomaly、partial/unavailable、未使用区間、期間末）を通過しなければならない。
@@ -515,7 +516,7 @@ component順や表示所有者を変更しない。
   今回観測した同じ到達経路へ統合し、別の全直積を作らない。
   X/Windowsは同じfixtureの固定期待値を独立に検査し、値形状による100%・7日・quota-only除外、
   platform helperから期待値を生成する循環oracle、新workflow gate、全test/all-suite/全直積を追加しない。
-- 操作帯を開閉してもplotの位置・高さを変えず、ラベルや右端値を隠さない。
+- 操作帯を開閉してもplotの位置・高さを変えず、軸ラベルや値を確認する操作を隠さない。
 - 記録なし、欠測、アイドル、活動、0/中間/100を明示的な設計状態として扱う。
 
 ### 4.3 Threads

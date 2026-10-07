@@ -5,6 +5,7 @@ using System.Globalization;
 using Avalonia;
 using Avalonia.Automation.Peers;
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Media;
 using Avalonia.Platform;
 using Avalonia.Rendering.SceneGraph;
@@ -20,7 +21,7 @@ namespace CodexInfo.WindowsClient.Controls;
 /// <summary>
 /// Thin Avalonia/ScottPlot adapter. All graph calculations are owned by the
 /// framework-independent Graphing layer; this control only applies theme,
-/// axes, visibility, and projected labels.
+/// axes, visibility, and pointer feedback.
 /// </summary>
 public sealed class GraphPlotControl : Control
 {
@@ -68,6 +69,11 @@ public sealed class GraphPlotControl : Control
     private PlotPresentation presentation = new(GraphScene.Empty());
     private double? referenceControlWidth;
     private readonly Dictionary<GraphMetric, double> referenceDataAreaWidths = [];
+    private StackPanel? hoverTip;
+    private GraphScene? hoverScene;
+    private long? hoverTimestamp;
+    private GraphMetric hoverMetric;
+    private readonly HashSet<GraphSeries> hoverVisibleSeries = [];
     private int sceneRevision;
 
     public GraphPlotControl()
@@ -106,6 +112,18 @@ public sealed class GraphPlotControl : Control
     public bool ShowTerra { get => GetValue(ShowTerraProperty); set => SetValue(ShowTerraProperty, value); }
     public bool ShowLuna { get => GetValue(ShowLunaProperty); set => SetValue(ShowLunaProperty, value); }
     public bool ShowAstra { get => GetValue(ShowAstraProperty); set => SetValue(ShowAstraProperty, value); }
+
+    protected override void OnPointerMoved(PointerEventArgs e)
+    {
+        base.OnPointerMoved(e);
+        UpdateHoverAt(e.GetPosition(this));
+    }
+
+    protected override void OnPointerExited(PointerEventArgs e)
+    {
+        base.OnPointerExited(e);
+        CloseHover();
+    }
 
     protected override AutomationPeer OnCreateAutomationPeer() =>
         new GraphPlotAutomationPeer(this);
@@ -167,6 +185,7 @@ public sealed class GraphPlotControl : Control
 
     private void ApplyScene()
     {
+        CloseHover();
         // Build away from the plot held by previously submitted draw operations.
         // Neither a slow preparation nor a failure can expose a partial plot.
         var next = new PlotPresentation(Scene);
@@ -220,10 +239,8 @@ public sealed class GraphPlotControl : Control
         }
         AddBoundaryGuides(presentation, scene, axes);
 
-        // Match the native graph's painter order: endpoint leaders sit below
-        // the data strokes, inferred model paths precede measured paths, and
-        // Remaining is painted last over its boundary markers.
-        AddEndpointLabels(presentation, scene, axes);
+        // Inferred model paths precede measured paths, and Remaining is
+        // painted last over its boundary markers.
         var lunaLines = BuildModelLines(scene, GraphSeries.Luna);
         var terraLines = BuildModelLines(scene, GraphSeries.Terra);
         var solLines = BuildModelLines(scene, GraphSeries.Sol);
@@ -291,8 +308,7 @@ public sealed class GraphPlotControl : Control
                     scene,
                     LocalizationService.DisplayTimeZone,
                     CultureInfo.CurrentCulture,
-                    currentDataAreaWidth,
-                    referenceDataAreaWidth);
+                    currentDataAreaWidth);
             }
         }
 
@@ -352,9 +368,8 @@ public sealed class GraphPlotControl : Control
         presentation.Plot.Axes.FrameColor(GridColor);
         presentation.Plot.Grid.MajorLineColor = GridColor;
         presentation.Plot.Grid.MinorLineColor = GridColor.WithOpacity(0.35);
-        // ScottPlot's built-in horizontal grid spans the endpoint-label
-        // gutter. X keeps the gutter clear, so bounded grid segments are
-        // painted explicitly by AddPlotGrid(presentation).
+        // The graph keeps grid endpoints aligned with the observed period.
+        // Paint its bounded grid segments explicitly for the same reason.
         presentation.Plot.Grid.MajorLineWidth = 0;
         presentation.Plot.Grid.MinorLineWidth = 0;
         presentation.Plot.Font.Set("Noto Sans JP Medium");
@@ -433,9 +448,8 @@ public sealed class GraphPlotControl : Control
         presentation.Plot.Axes.Right.TickGenerator = new NumericManual(
             axes.RemainingValues.ToArray(),
             axes.RemainingLabels.ToArray());
-        // The native graph owns remaining-percent semantics with its coloured
-        // endpoint label. A second set of frame ticks steals the dedicated
-        // label gutter and is not part of the X graph.
+        // The right axis supplies Remaining's percent scale to its line while
+        // keeping duplicate frame labels out of the chart.
         presentation.Plot.Axes.Right.IsVisible = false;
     }
 
@@ -457,14 +471,14 @@ public sealed class GraphPlotControl : Control
     {
         presentation.Plot.Axes.SetLimits(
             scene.PeriodStartAt,
-            axes.DisplayEndAt,
+            axes.PlotLimitEndAt,
             axes.ModelDisplayMinimum,
             axes.ModelDisplayMaximum,
             presentation.Plot.Axes.Bottom,
             presentation.Plot.Axes.Left);
         presentation.Plot.Axes.SetLimits(
             scene.PeriodStartAt,
-            axes.DisplayEndAt,
+            axes.PlotLimitEndAt,
             axes.ModelDisplayMinimum,
             axes.ModelDisplayMaximum,
             presentation.Plot.Axes.Top,
@@ -584,6 +598,7 @@ public sealed class GraphPlotControl : Control
 
     private void ApplyResponsiveLayout(GraphScene scene)
     {
+        CloseHover();
         if (referenceControlWidth is not { } controlWidth ||
             !referenceDataAreaWidths.TryGetValue(scene.Metric, out var referenceDataAreaWidth))
         {
@@ -598,90 +613,143 @@ public sealed class GraphPlotControl : Control
             scene,
             LocalizationService.DisplayTimeZone,
             CultureInfo.CurrentCulture,
-            currentDataAreaWidth,
-            referenceDataAreaWidth);
+            currentDataAreaWidth);
         lock (presentation.Plot.Sync)
         {
             ApplyLimits(presentation, scene, axes);
             ApplyTopDateAxis(presentation, axes);
-            UpdateEndpointLayout(presentation.RemainingConnectorX, presentation.RemainingLabel, axes.EndpointLabelAt);
-            UpdateEndpointLayout(presentation.SolConnectorX, presentation.SolLabel, axes.EndpointLabelAt);
-            UpdateEndpointLayout(presentation.TerraConnectorX, presentation.TerraLabel, axes.EndpointLabelAt);
-            UpdateEndpointLayout(presentation.LunaConnectorX, presentation.LunaLabel, axes.EndpointLabelAt);
-            UpdateEndpointLayout(presentation.AstraConnectorX, presentation.AstraLabel, axes.EndpointLabelAt);
         }
         InvalidateVisual();
     }
 
-    private static void UpdateEndpointLayout(
-        double[] connectorX,
-        ScottPlot.Plottables.Text? label,
-        double endpointLabelAt)
+    internal void UpdateHoverAt(Point pointer)
     {
-        if (connectorX.Length == 2)
+        var current = presentation;
+        var dataRect = current.Plot.LastRender.DataRect;
+        if (!double.IsFinite(pointer.X) || !double.IsFinite(pointer.Y) ||
+            pointer.X < dataRect.Left || pointer.X >= dataRect.Right ||
+            pointer.Y < dataRect.Top || pointer.Y >= dataRect.Bottom)
         {
-            connectorX[1] = endpointLabelAt;
+            CloseHover();
+            return;
         }
-        if (label is not null)
+
+        var visibleSeries = VisibleHoverSeries();
+        if (visibleSeries.Count == 0)
         {
-            label.Location = new ScottPlot.Coordinates(endpointLabelAt, label.Location.Y);
+            CloseHover();
+            return;
         }
+
+        var coordinates = current.Plot.GetCoordinates(
+            new ScottPlot.Pixel((float)pointer.X, (float)pointer.Y),
+            current.Plot.Axes.Bottom,
+            current.Plot.Axes.Left);
+        var snapshot = GraphHoverProjection.Find(current.Scene, coordinates.X, visibleSeries);
+        if (snapshot is null)
+        {
+            CloseHover();
+            return;
+        }
+
+        if (ReferenceEquals(hoverScene, current.Scene) &&
+            hoverTimestamp == snapshot.Timestamp &&
+            hoverMetric == current.Scene.Metric &&
+            hoverVisibleSeries.SetEquals(visibleSeries) &&
+            hoverTip is not null)
+        {
+            ToolTip.SetTip(this, hoverTip);
+            ToolTip.SetIsOpen(this, true);
+            return;
+        }
+
+        CloseHover();
+        hoverScene = current.Scene;
+        hoverTimestamp = snapshot.Timestamp;
+        hoverMetric = current.Scene.Metric;
+        hoverVisibleSeries.Clear();
+        hoverVisibleSeries.UnionWith(visibleSeries);
+        hoverTip = CreateHoverTip(snapshot, current.Scene.Metric);
+        ToolTip.SetTip(this, hoverTip);
+        ToolTip.SetIsOpen(this, true);
     }
 
-    private void AddEndpointLabels(PlotPresentation presentation, GraphScene scene, GraphAxisProjection axes)
+    private HashSet<GraphSeries> VisibleHoverSeries()
     {
-        foreach (var endpoint in GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.CurrentCulture))
-        {
-            var axis = endpoint.Series == GraphSeries.Remaining ? presentation.Plot.Axes.Right : presentation.Plot.Axes.Left;
-            var color = endpoint.Series switch
-            {
-                GraphSeries.Remaining => RemainingColor,
-                GraphSeries.Sol => SolColor,
-                GraphSeries.Terra => TerraColor,
-                GraphSeries.Luna => LunaColor,
-                GraphSeries.Astra => AstraColor,
-                _ => MutedColor,
-            };
-            var connectorX = new double[] { scene.PeriodEndAt, axes.EndpointLabelAt };
-            var connector = presentation.Plot.Add.Scatter(
-                connectorX,
-                new double[] { endpoint.PointAxisValue, endpoint.AxisValue },
-                color.WithOpacity(0.8));
-            connector.Axes.YAxis = axis;
-            connector.LineWidth = 1;
-            connector.MarkerSize = 0;
+        var visible = new HashSet<GraphSeries>();
+        if (ShowRemaining) visible.Add(GraphSeries.Remaining);
+        if (ShowModels && ShowSol) visible.Add(GraphSeries.Sol);
+        if (ShowModels && ShowTerra) visible.Add(GraphSeries.Terra);
+        if (ShowModels && ShowLuna) visible.Add(GraphSeries.Luna);
+        if (ShowModels && ShowAstra) visible.Add(GraphSeries.Astra);
+        return visible;
+    }
 
-            var label = presentation.Plot.Add.Text(endpoint.Text, axes.EndpointLabelAt, endpoint.AxisValue);
-            label.Axes.YAxis = axis;
-            label.Alignment = ScottPlot.Alignment.MiddleLeft;
-            label.OffsetX = 0;
-            label.LabelFontColor = color;
-            label.LabelFontName = "Noto Sans JP Medium";
-            label.LabelFontSize = 10;
-            label.LabelBackgroundColor = PlotColor.WithOpacity(0);
-            label.LabelPadding = 0;
-            switch (endpoint.Series)
+    private static StackPanel CreateHoverTip(GraphHoverSnapshot snapshot, GraphMetric metric)
+    {
+        var culture = CultureInfo.CurrentCulture;
+        var displayedTimestamp = TimeZoneInfo.ConvertTime(
+                DateTimeOffset.FromUnixTimeSeconds(snapshot.Timestamp),
+                LocalizationService.DisplayTimeZone)
+            .ToString("yyyy/MM/dd HH:mm:ss zzz", culture);
+        var panel = new StackPanel
+        {
+            Spacing = 2,
+            Margin = new Thickness(8),
+        };
+        panel.SetValue(Avalonia.Automation.AutomationProperties.AutomationIdProperty, "Graph.Hover");
+        AddHoverRow(panel, "Graph.Hover.Timestamp", displayedTimestamp);
+        foreach (var row in snapshot.Rows)
+        {
+            var name = row.Series switch
             {
-                case GraphSeries.Remaining:
-                    presentation.RemainingLabel = label; presentation.RemainingConnector = connector; presentation.RemainingConnectorX = connectorX; break;
-                case GraphSeries.Sol:
-                    presentation.SolLabel = label; presentation.SolConnector = connector; presentation.SolConnectorX = connectorX; break;
-                case GraphSeries.Terra:
-                    presentation.TerraLabel = label; presentation.TerraConnector = connector; presentation.TerraConnectorX = connectorX; break;
-                case GraphSeries.Luna:
-                    presentation.LunaLabel = label; presentation.LunaConnector = connector; presentation.LunaConnectorX = connectorX; break;
-                case GraphSeries.Astra:
-                    presentation.AstraLabel = label; presentation.AstraConnector = connector; presentation.AstraConnectorX = connectorX; break;
-                default:
-                    connector.IsVisible = false;
-                    label.IsVisible = false;
-                    break;
-            }
+                GraphSeries.Remaining => LocalizationService.Current.RemainingQuota,
+                GraphSeries.Sol => "SOL",
+                GraphSeries.Terra => "TERRA",
+                GraphSeries.Luna => "LUNA",
+                GraphSeries.Astra => "ASTRA",
+                _ => row.Series.ToString().ToUpperInvariant(),
+            };
+            var value = row.Series switch
+            {
+                GraphSeries.Remaining => row.NumericValue is { } remaining
+                    ? FormatRemainingPercent(remaining, culture)
+                    : "—%",
+                _ when metric == GraphMetric.Tokens => row.TokenValue is { } tokens
+                    ? $"{tokens.ToString("N0", culture)} {LocalizationService.Current.Tokens}"
+                    : $"— {LocalizationService.Current.Tokens}",
+                _ => row.NumericValue is { } amount
+                    ? GraphPlotProjection.FormatAxisValue(amount, GraphMetric.Dollars, culture)
+                    : "—",
+            };
+            var seriesId = row.Series == GraphSeries.Remaining
+                ? "Remaining"
+                : row.Series.ToString().ToUpperInvariant();
+            AddHoverRow(panel, $"Graph.Hover.{seriesId}", $"{name}: {value}");
         }
+        return panel;
+    }
+
+    private static void AddHoverRow(StackPanel panel, string automationId, string text)
+    {
+        var row = new TextBlock { Text = text };
+        row.SetValue(Avalonia.Automation.AutomationProperties.AutomationIdProperty, automationId);
+        row.SetValue(Avalonia.Automation.AutomationProperties.NameProperty, text);
+        panel.Children.Add(row);
+    }
+
+    private static string FormatRemainingPercent(double value, CultureInfo culture) =>
+        $"{value.ToString("0.#", culture)}%";
+
+    private void CloseHover()
+    {
+        ToolTip.SetIsOpen(this, false);
+        ToolTip.SetTip(this, null);
     }
 
     private void ApplyVisibility()
     {
+        CloseHover();
         lock (presentation.Plot.Sync)
         {
             ApplyVisibility(presentation);
@@ -696,13 +764,11 @@ public sealed class GraphPlotControl : Control
             presentation.RemainingIdleSeries,
             presentation.RemainingDashedSeries,
             presentation.RemainingMarkers,
-            presentation.RemainingConnector,
-            presentation.RemainingLabel,
             ShowRemaining);
-        SetVisible(presentation.SolSeries, presentation.SolConnector, presentation.SolLabel, ShowModels && ShowSol);
-        SetVisible(presentation.TerraSeries, presentation.TerraConnector, presentation.TerraLabel, ShowModels && ShowTerra);
-        SetVisible(presentation.LunaSeries, presentation.LunaConnector, presentation.LunaLabel, ShowModels && ShowLuna);
-        SetVisible(presentation.AstraSeries, presentation.AstraConnector, presentation.AstraLabel, ShowModels && ShowAstra);
+        SetVisible(presentation.SolSeries, ShowModels && ShowSol);
+        SetVisible(presentation.TerraSeries, ShowModels && ShowTerra);
+        SetVisible(presentation.LunaSeries, ShowModels && ShowLuna);
+        SetVisible(presentation.AstraSeries, ShowModels && ShowAstra);
     }
 
     private static void SetVisible(
@@ -710,30 +776,22 @@ public sealed class GraphPlotControl : Control
         ScottPlot.Plottables.Scatter? idleSeries,
         ScottPlot.Plottables.Scatter? dashedSeries,
         ScottPlot.Plottables.Scatter? markers,
-        ScottPlot.Plottables.Scatter? connector,
-        ScottPlot.Plottables.Text? label,
         bool visible)
     {
         if (series is not null) series.IsVisible = visible;
         if (idleSeries is not null) idleSeries.IsVisible = visible;
         if (dashedSeries is not null) dashedSeries.IsVisible = visible;
         if (markers is not null) markers.IsVisible = visible;
-        if (connector is not null) connector.IsVisible = visible;
-        if (label is not null) label.IsVisible = visible;
     }
 
     private static void SetVisible(
         ModelSeriesVisual? series,
-        ScottPlot.Plottables.Scatter? connector,
-        ScottPlot.Plottables.Text? label,
         bool visible)
     {
         if (series?.Idle is not null) series.Idle.IsVisible = visible;
         if (series?.Flat is not null) series.Flat.IsVisible = visible;
         if (series?.Rising is not null) series.Rising.IsVisible = visible;
         if (series?.Dashed is not null) series.Dashed.IsVisible = visible;
-        if (connector is not null) connector.IsVisible = visible;
-        if (label is not null) label.IsVisible = visible;
     }
 
     public override void Render(DrawingContext context)
@@ -786,21 +844,6 @@ public sealed class GraphPlotControl : Control
         public ModelSeriesVisual? TerraSeries;
         public ModelSeriesVisual? LunaSeries;
         public ModelSeriesVisual? AstraSeries;
-        public ScottPlot.Plottables.Scatter? RemainingConnector;
-        public ScottPlot.Plottables.Scatter? SolConnector;
-        public ScottPlot.Plottables.Scatter? TerraConnector;
-        public ScottPlot.Plottables.Scatter? LunaConnector;
-        public ScottPlot.Plottables.Scatter? AstraConnector;
-        public ScottPlot.Plottables.Text? RemainingLabel;
-        public ScottPlot.Plottables.Text? SolLabel;
-        public ScottPlot.Plottables.Text? TerraLabel;
-        public ScottPlot.Plottables.Text? LunaLabel;
-        public ScottPlot.Plottables.Text? AstraLabel;
-        public double[] RemainingConnectorX = [];
-        public double[] SolConnectorX = [];
-        public double[] TerraConnectorX = [];
-        public double[] LunaConnectorX = [];
-        public double[] AstraConnectorX = [];
     }
 
     private sealed record ModelSeriesVisual(

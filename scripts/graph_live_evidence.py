@@ -1517,8 +1517,9 @@ def _endpoint_labels(
 def build_expected_render_contracts(
     fixture: dict[str, Any], *, platform: str = "linux"
 ) -> dict[str, Any]:
-    # The saved v1 envelope retains its Linux baseline. Windows WG14 changes
-    # only its final opaque idle role; data and all other render rules match.
+    # The saved v1 envelope retains its Linux baseline. Windows changes its
+    # idle role and replaces persistent endpoint labels with hover values.
+    # Endpoint data evidence remains strict and shared across platforms.
     if platform not in {"linux", "windows"}:
         raise EvidenceError("render contract platform must be linux or windows")
     period, samples, gaps = _validate_fixture(fixture)
@@ -1650,7 +1651,7 @@ def build_expected_render_contracts(
             "time_ticks": time_ticks,
             "axis_labels": axis_labels,
             "axis_grid_y": [f"{fraction:.12f}" for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)],
-            "endpoint_labels": _endpoint_labels(
+            "endpoint_labels": [] if platform == "windows" else _endpoint_labels(
                 renderable_projections,
                 maximum,
                 metric,
@@ -1660,11 +1661,11 @@ def build_expected_render_contracts(
             "latest_timestamp": period["end_at"],
             "layout": {
                 "reference_data_width": 788,
-                "plot_width": 694 if metric == "dollars" else 662,
-                "gutter_width": 94 if metric == "dollars" else 126,
-                "label_gap": 10,
-                "label_width": 80 if metric == "dollars" else 112,
-                "right_padding": 4,
+                "plot_width": 786 if platform == "windows" else (694 if metric == "dollars" else 662),
+                "gutter_width": 0 if platform == "windows" else (94 if metric == "dollars" else 126),
+                "label_gap": 0 if platform == "windows" else 10,
+                "label_width": 0 if platform == "windows" else (80 if metric == "dollars" else 112),
+                "right_padding": 2 if platform == "windows" else 4,
                 "minimum_plot_height": 204,
             },
             "styles": {

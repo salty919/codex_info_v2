@@ -23,11 +23,11 @@ internal readonly record struct GraphAxisProjection(
     IReadOnlyList<double> RemainingValues,
     IReadOnlyList<string> RemainingLabels,
     double DisplayEndAt,
+    double PlotLimitEndAt,
     double ModelDisplayMinimum,
     double ModelDisplayMaximum,
     double RemainingDisplayMinimum,
-    double RemainingDisplayMaximum,
-    double EndpointLabelAt);
+    double RemainingDisplayMaximum);
 
 /// <summary>
 /// A line path projected without a rendering framework. NaN separators split
@@ -94,19 +94,6 @@ internal sealed class GraphPreparedGeometry(
     internal IReadOnlyList<GraphCanonicalRemainingMarker> RemainingMarkers { get; } = remainingMarkers;
 }
 
-/// <summary>
-/// A final endpoint label projection.  <see cref="NormalizedTop"/> is the
-/// collision-free semantic position and <see cref="AxisValue"/> is the value
-/// the rendering adapter should pass to its selected y-axis.
-/// </summary>
-internal readonly record struct GraphEndpointLabel(
-    GraphSeries Series,
-    string Text,
-    double NormalizedTop,
-    double ArrangedTop,
-    double AxisValue,
-    double PointAxisValue);
-
 internal enum GraphSeries
 {
     Remaining,
@@ -122,14 +109,11 @@ internal enum GraphSeries
 /// </summary>
 internal static class GraphPlotProjection
 {
-    // X keeps zero/maximum one percent inside the clipped path. These values
+    // Y keeps zero/maximum one percent inside the clipped path. These values
     // are the equivalent data-axis expansion: [0, maximum] maps to [1%, 99%].
     private const double AxisPaddingRatio = 1d / 98d;
     private const double CanonicalReferenceDataAreaWidth = 788;
-    internal const double DollarLabelGutterWidth = 94;
-    internal const double TokenLabelGutterWidth = 126;
-    internal const double EndpointLabelGapWidth = 10;
-    internal const double EndpointLabelHeight = 16;
+    internal const double PlotStrokeEdgeClearance = 2;
     internal const double MinimumPlotHeight = 204;
     internal const double CanonicalDashLength = 0.45;
     internal const double CanonicalDashGap = 0.30;
@@ -150,21 +134,18 @@ internal static class GraphPlotProjection
             scene,
             displayTimeZone,
             culture,
-            CanonicalReferenceDataAreaWidth,
             CanonicalReferenceDataAreaWidth);
     }
 
     /// <summary>
-    /// Builds axes whose endpoint-label gutter keeps the physical width it
-    /// has at <paramref name="referenceDataAreaWidth"/> while the current
-    /// data area grows or shrinks horizontally.
+    /// Builds axes across the full data area. The plotted period ends two
+    /// pixels before the right frame so a three-pixel stroke remains visible.
     /// </summary>
     public static GraphAxisProjection BuildAxes(
         GraphScene scene,
         TimeZoneInfo displayTimeZone,
         CultureInfo culture,
-        double currentDataAreaWidth,
-        double referenceDataAreaWidth)
+        double currentDataAreaWidth)
     {
         ArgumentNullException.ThrowIfNull(scene);
         ArgumentNullException.ThrowIfNull(displayTimeZone);
@@ -173,11 +154,6 @@ internal static class GraphPlotProjection
         {
             throw new ArgumentOutOfRangeException(nameof(currentDataAreaWidth));
         }
-        if (!double.IsFinite(referenceDataAreaWidth) || referenceDataAreaWidth <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(referenceDataAreaWidth));
-        }
-
         var modelPadding = scene.ModelMaximum * AxisPaddingRatio;
         var remainingPadding = 100d * AxisPaddingRatio;
         var modelDisplayRange = scene.ModelMaximum + modelPadding * 2;
@@ -213,20 +189,16 @@ internal static class GraphPlotProjection
         }
 
         var span = Math.Max(1d, scene.PeriodEndAt - scene.PeriodStartAt);
-        var gutterWidth = scene.Metric == GraphMetric.Tokens
-            ? TokenLabelGutterWidth
-            : DollarLabelGutterWidth;
-        var currentPlotWidth = currentDataAreaWidth - gutterWidth;
+        var currentPlotWidth = currentDataAreaWidth - PlotStrokeEdgeClearance;
         if (currentPlotWidth <= 0)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(currentDataAreaWidth),
-                "The current data area must be wider than the fixed endpoint-label gutter.");
+                "The current data area must leave room for the plotted period and its stroke clearance.");
         }
         var midnightGuideTimestamps = BuildLocalMidnightGuides(scene, displayTimeZone);
         var topDateAxis = BuildTopDateAxis(scene, displayTimeZone, midnightGuideTimestamps, currentPlotWidth);
-        var currentGutterRatio = gutterWidth / currentPlotWidth;
-        var currentLabelGapRatio = EndpointLabelGapWidth / currentPlotWidth;
+        var plotLimitEndAt = scene.PeriodStartAt + span * currentDataAreaWidth / currentPlotWidth;
 
         return new GraphAxisProjection(
             bottomValues,
@@ -239,12 +211,12 @@ internal static class GraphPlotProjection
             modelLabels,
             remainingValues,
             ["0%", "25%", "50%", "75%", "100%"],
-            scene.PeriodEndAt + span * currentGutterRatio,
+            scene.PeriodEndAt,
+            plotLimitEndAt,
             -modelPadding,
             scene.ModelMaximum + modelPadding,
             -remainingPadding,
-            100d + remainingPadding,
-            scene.PeriodEndAt + span * currentLabelGapRatio);
+            100d + remainingPadding);
     }
 
     /// <summary>
@@ -1252,140 +1224,6 @@ internal static class GraphPlotProjection
         return merged;
     }
 
-    public static IReadOnlyList<GraphEndpointLabel> BuildEndpointLabels(
-        GraphScene scene,
-        CultureInfo culture)
-    {
-        ArgumentNullException.ThrowIfNull(scene);
-        ArgumentNullException.ThrowIfNull(culture);
-        if (!scene.HasPoints)
-        {
-            return Array.Empty<GraphEndpointLabel>();
-        }
-
-        var candidates = new List<EndpointCandidate>();
-        if (scene.IsViewport)
-        {
-            AddViewportModelCandidate(scene, GraphSeries.Astra, scene.Astra, culture, candidates);
-            AddViewportModelCandidate(scene, GraphSeries.Luna, scene.Luna, culture, candidates);
-            AddViewportModelCandidate(scene, GraphSeries.Terra, scene.Terra, culture, candidates);
-            AddViewportModelCandidate(scene, GraphSeries.Sol, scene.Sol, culture, candidates);
-            var remainingLines = BuildViewportRemainingLines(scene);
-            var remainingPoint = LatestPoint(
-                remainingLines.Idle,
-                remainingLines.Solid,
-                remainingLines.Dashed);
-            if (remainingPoint.Found && scene.PeriodScenes.Any(period => period.RemainingObserved.Any(observed => observed)))
-            {
-                candidates.Add(new EndpointCandidate(
-                    GraphSeries.Remaining,
-                    FormatRemaining(remainingPoint.Y, culture),
-                    NativeGraphY(remainingPoint.Y, 100),
-                    remainingPoint.Y));
-            }
-            else
-            {
-                AddLatestRemainingCandidate(scene, culture, candidates);
-            }
-        }
-        else
-        {
-            AddLatestModelCandidate(scene, scene.Astra, GraphSeries.Astra, culture, candidates);
-            AddLatestModelCandidate(scene, scene.Luna, GraphSeries.Luna, culture, candidates);
-            AddLatestModelCandidate(scene, scene.Terra, GraphSeries.Terra, culture, candidates);
-            AddLatestModelCandidate(scene, scene.Sol, GraphSeries.Sol, culture, candidates);
-            AddLatestRemainingCandidate(scene, culture, candidates);
-        }
-
-        var ordered = candidates
-            .OrderBy(candidate => candidate.NormalizedTop)
-            .ThenBy(candidate => EndpointSortRank(candidate.Series))
-            .ToArray();
-        var tops = GraphScene.ArrangeEndpointLabelTops(
-            ordered.Select(candidate => candidate.NormalizedTop - EndpointLabelHeight / MinimumPlotHeight / 2).ToArray(),
-            0,
-            1,
-            EndpointLabelHeight / MinimumPlotHeight,
-            0);
-        var labels = new GraphEndpointLabel[ordered.Length];
-        for (var index = 0; index < ordered.Length; index++)
-        {
-            var candidate = ordered[index];
-            var maximum = candidate.Series == GraphSeries.Remaining ? 100 : scene.ModelMaximum;
-            var arrangedCenter = (double)(float)(tops[index] + EndpointLabelHeight / MinimumPlotHeight / 2);
-            labels[index] = new GraphEndpointLabel(
-                candidate.Series,
-                candidate.Text,
-                candidate.NormalizedTop,
-                arrangedCenter,
-                NormalizedTopToAxisValue(arrangedCenter, maximum),
-                candidate.PointAxisValue);
-        }
-
-        return labels;
-    }
-
-    private static void AddViewportModelCandidate(
-        GraphScene scene,
-        GraphSeries series,
-        IReadOnlyList<double> visibleValues,
-        CultureInfo culture,
-        ICollection<EndpointCandidate> candidates)
-    {
-        var lines = BuildViewportModelLines(scene, series);
-        var point = LatestPoint(lines.Idle, lines.Flat, lines.Rising, lines.Dashed);
-        if (point.Found)
-        {
-            AddModelCandidate(point.Y, scene.ModelMaximum, scene.Metric, series, culture, candidates);
-        }
-        else
-        {
-            AddLatestModelCandidate(scene, visibleValues, series, culture, candidates);
-        }
-    }
-
-    private static void AddLatestRemainingCandidate(
-        GraphScene scene,
-        CultureInfo culture,
-        ICollection<EndpointCandidate> candidates)
-    {
-        var lastRemaining = scene.Remaining
-            .Select((value, index) => double.IsFinite(value) ? index : -1)
-            .LastOrDefault(index => index >= 0, -1);
-        if (lastRemaining < 0 || !scene.RemainingObserved.Any(observed => observed))
-        {
-            return;
-        }
-        var remainingAtEndpoint = RemainingValue(scene, lastRemaining);
-        candidates.Add(new EndpointCandidate(
-            GraphSeries.Remaining,
-            FormatRemaining(remainingAtEndpoint, culture),
-            NativeGraphY(remainingAtEndpoint, 100),
-            remainingAtEndpoint));
-    }
-
-    private static (bool Found, double X, double Y) LatestPoint(params GraphCanonicalLineProjection[] lines)
-    {
-        var found = false;
-        var latestX = double.NegativeInfinity;
-        var latestY = double.NaN;
-        foreach (var projection in lines)
-        {
-            var line = projection.Line;
-            for (var index = 0; index < line.X.Count && index < line.Y.Count; index++)
-            {
-                if (!double.IsFinite(line.X[index]) || !double.IsFinite(line.Y[index]) || line.X[index] < latestX)
-                {
-                    continue;
-                }
-                found = true;
-                latestX = line.X[index];
-                latestY = line.Y[index];
-            }
-        }
-        return (found, latestX, latestY);
-    }
-
     internal static string FormatAxisValue(double value, GraphMetric metric, CultureInfo culture)
     {
         ArgumentNullException.ThrowIfNull(culture);
@@ -1412,25 +1250,6 @@ internal static class GraphPlotProjection
         return RoundUnsignedCount(value).ToString("N0", culture);
     }
 
-    private static double NativeGraphY(double value, double maximum) =>
-        (double)(float)Math.Clamp(
-            (99 - value / Math.Max(maximum, 1) * 98) / 100,
-            0.01,
-            0.99);
-
-    private static double NormalizedTopToAxisValue(double normalizedTop, double maximum) =>
-        Math.Clamp((0.99 - normalizedTop) / 0.98 * maximum, 0, maximum);
-
-    private static int EndpointSortRank(GraphSeries series) => series switch
-    {
-        GraphSeries.Remaining => 0,
-        GraphSeries.Luna => 1,
-        GraphSeries.Terra => 2,
-        GraphSeries.Sol => 3,
-        GraphSeries.Astra => 4,
-        _ => int.MaxValue,
-    };
-
     private static ulong RoundUnsignedCount(double value)
     {
         var rounded = Math.Round(Math.Max(0, value), MidpointRounding.AwayFromZero);
@@ -1446,11 +1265,6 @@ internal static class GraphPlotProjection
                 displayTimeZone)
             .ToString("MM/dd HH:mm", culture);
 
-    private static string FormatRemaining(double value, CultureInfo culture) =>
-        Math.Abs(value - Math.Truncate(value)) < 0.0001
-            ? FormatExactBinary(value, 0, culture) + "%"
-            : FormatExactBinary(value, 1, culture) + "%";
-
     private static double RemainingValue(GraphScene scene, int index)
     {
         var effective = scene.Remaining[index];
@@ -1463,45 +1277,6 @@ internal static class GraphPlotProjection
         // smoothing. Reintroducing a lower raw pulse here would draw the exact
         // false valley that the evidence projection rejected.
         return double.IsFinite(effective) ? effective : observed;
-    }
-
-    private static void AddModelCandidate(
-        double value,
-        double maximum,
-        GraphMetric metric,
-        GraphSeries series,
-        CultureInfo culture,
-        ICollection<EndpointCandidate> candidates)
-    {
-        if (!double.IsFinite(value) || value < 0)
-        {
-            return;
-        }
-
-        candidates.Add(new EndpointCandidate(
-            series,
-            metric == GraphMetric.Tokens
-                ? RoundUnsignedCount(value).ToString("N0", culture)
-                : "$" + FormatExactBinary(value, 2, culture),
-            NativeGraphY(value, maximum),
-            value));
-    }
-
-    private static void AddLatestModelCandidate(
-        GraphScene scene,
-        IReadOnlyList<double> values,
-        GraphSeries series,
-        CultureInfo culture,
-        ICollection<EndpointCandidate> candidates)
-    {
-        var last = values
-            .Select((value, index) => double.IsFinite(value) ? index : -1)
-            .LastOrDefault(index => index >= 0, -1);
-        if (last < 0)
-        {
-            return;
-        }
-        AddModelCandidate(values[last], scene.ModelMaximum, scene.Metric, series, culture, candidates);
     }
 
     private static GraphCanonicalLineProjection CanonicalizeLine(
@@ -2088,12 +1863,6 @@ internal static class GraphPlotProjection
         x.Add(x2);
         y.Add(y2);
     }
-
-    private readonly record struct EndpointCandidate(
-        GraphSeries Series,
-        string Text,
-        double NormalizedTop,
-        double PointAxisValue);
 
     private enum ProjectionStyle
     {
