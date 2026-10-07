@@ -117,36 +117,68 @@ public sealed record UiText(
 
     public string GraphPeriodRange => LanguageCode switch
     {
-        "ja" => "週期間", "zh-Hans" => "重置周期", "ko" => "초기화 기간",
-        "es" => "Período", "fr" => "Période", "de" => "Zeitraum",
-        "pt" => "Período", "it" => "Periodo", "ru" => "Период", _ => "Reset period",
+        "ja" => "週期間",
+        "zh-Hans" => "重置周期",
+        "ko" => "초기화 기간",
+        "es" => "Período",
+        "fr" => "Période",
+        "de" => "Zeitraum",
+        "pt" => "Período",
+        "it" => "Periodo",
+        "ru" => "Период",
+        _ => "Reset period",
     };
 
     public string GraphDayRange => LanguageCode switch
     {
-        "ja" => "24時間", "zh-Hans" => "24小时", "ko" => "24시간",
-        "es" or "fr" or "de" or "pt" or "it" => "24 h", "ru" => "24 ч", _ => "24 hours",
+        "ja" => "24時間",
+        "zh-Hans" => "24小时",
+        "ko" => "24시간",
+        "es" or "fr" or "de" or "pt" or "it" => "24 h",
+        "ru" => "24 ч",
+        _ => "24 hours",
     };
 
     public string GraphWeekRange => LanguageCode switch
     {
-        "ja" => "1週間", "zh-Hans" => "1周", "ko" => "1주",
-        "es" => "1 semana", "fr" => "1 semaine", "de" => "1 Woche",
-        "pt" => "1 semana", "it" => "1 settimana", "ru" => "1 неделя", _ => "1 week",
+        "ja" => "1週間",
+        "zh-Hans" => "1周",
+        "ko" => "1주",
+        "es" => "1 semana",
+        "fr" => "1 semaine",
+        "de" => "1 Woche",
+        "pt" => "1 semana",
+        "it" => "1 settimana",
+        "ru" => "1 неделя",
+        _ => "1 week",
     };
 
     public string GraphPreviousRange => LanguageCode switch
     {
-        "ja" => "前の範囲", "zh-Hans" => "上一区间", "ko" => "이전 범위",
-        "es" => "Anterior", "fr" => "Précédent", "de" => "Zurück",
-        "pt" => "Anterior", "it" => "Precedente", "ru" => "Назад", _ => "Previous range",
+        "ja" => "前の範囲",
+        "zh-Hans" => "上一区间",
+        "ko" => "이전 범위",
+        "es" => "Anterior",
+        "fr" => "Précédent",
+        "de" => "Zurück",
+        "pt" => "Anterior",
+        "it" => "Precedente",
+        "ru" => "Назад",
+        _ => "Previous range",
     };
 
     public string GraphNextRange => LanguageCode switch
     {
-        "ja" => "次の範囲", "zh-Hans" => "下一区间", "ko" => "다음 범위",
-        "es" => "Siguiente", "fr" => "Suivant", "de" => "Weiter",
-        "pt" => "Seguinte", "it" => "Successivo", "ru" => "Вперёд", _ => "Next range",
+        "ja" => "次の範囲",
+        "zh-Hans" => "下一区间",
+        "ko" => "다음 범위",
+        "es" => "Siguiente",
+        "fr" => "Suivant",
+        "de" => "Weiter",
+        "pt" => "Seguinte",
+        "it" => "Successivo",
+        "ru" => "Вперёд",
+        _ => "Next range",
     };
 
     public string GraphWindowTitle => LanguageCode switch

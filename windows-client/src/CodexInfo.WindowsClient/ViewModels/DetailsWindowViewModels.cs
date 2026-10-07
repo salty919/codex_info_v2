@@ -2556,16 +2556,15 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         NotifyTimeRangeProperties();
     }
 
-    private bool DrainDeferredStaticDetailsRebuild()
+    private void DrainDeferredStaticDetailsRebuild()
     {
         if (resourceClient is not null || timeWindowRequestPending || !staticDetailsRebuildDeferred)
         {
-            return false;
+            return;
         }
 
         staticDetailsRebuildDeferred = false;
         Rebuild();
-        return true;
     }
 
     private void ReformatPeriodLabels()
