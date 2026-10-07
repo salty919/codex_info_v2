@@ -238,15 +238,59 @@ public sealed class GraphViewportRenderingTests
             foreach (var scene in new[] { idlePeriod, viewport })
             {
                 var control = new GraphPlotControl { Scene = scene };
+                var midnightGuides = control.Plot.GetPlottables()
+                    .OfType<ScottPlot.Plottables.Scatter>()
+                    .Where(line => line.LineWidth == 1.5f)
+                    .ToArray();
+                Assert.Equal(expected.Length, midnightGuides.Length);
+                var guidePoints = midnightGuides
+                    .Select(line => line.Data.GetScatterPoints())
+                    .ToArray();
+                Assert.All(midnightGuides, line =>
+                {
+                    Assert.True(line.IsVisible);
+                    Assert.Equal("#FFFFFF", line.LineColor.ToHex());
+                });
+                Assert.All(guidePoints, points =>
+                {
+                    Assert.Equal(2, points.Count);
+                    Assert.Equal(points[0].X, points[1].X);
+                });
+                Assert.Equal(
+                    expected.Select(timestamp => (double)timestamp).OrderBy(timestamp => timestamp),
+                    guidePoints.Select(points => points[0].X).OrderBy(timestamp => timestamp));
+
                 using var rendered = control.Plot.GetImage(940, 480);
-                var pixels = rendered.GetArrayRGB();
+                var withGuides = rendered.GetArrayRGB();
+                var mappedGuides = expected
+                    .Select(timestamp => control.Plot.GetPixel(new ScottPlot.Coordinates(timestamp, 5)))
+                    .Select(pixel => ((int)Math.Round(pixel.X), (int)Math.Round(pixel.Y)))
+                    .ToArray();
+                var previousVisibility = midnightGuides.Select(line => line.IsVisible).ToArray();
+                byte[,,] withoutGuides;
+                try
+                {
+                    foreach (var guide in midnightGuides)
+                    {
+                        guide.IsVisible = false;
+                    }
+                    using var baseline = control.Plot.GetImage(940, 480);
+                    withoutGuides = baseline.GetArrayRGB();
+                }
+                finally
+                {
+                    for (var index = 0; index < midnightGuides.Length; index++)
+                    {
+                        midnightGuides[index].IsVisible = previousVisibility[index];
+                    }
+                }
+
                 foreach (var timestamp in expected)
                 {
-                    var mapped = control.Plot.GetPixel(new ScottPlot.Coordinates(timestamp, 5));
-                    var x = (int)Math.Round(mapped.X);
-                    var y = (int)Math.Round(mapped.Y);
-                    Assert.True(HasNearWhitePixel(pixels, x, y),
-                        $"Expected a white local-midnight guide over the idle band for viewport={GetViewportFlag(scene)} at {timestamp} ({x},{y}).");
+                    var index = Array.IndexOf(expected, timestamp);
+                    var (x, y) = mappedGuides[index];
+                    Assert.True(HasWhiteGuideDifference(withGuides, withoutGuides, x, y),
+                        $"Expected the opaque white local-midnight guide to change rendered pixels for viewport={GetViewportFlag(scene)} at {timestamp} ({x},{y}).");
                 }
             }
         }
@@ -440,13 +484,19 @@ public sealed class GraphViewportRenderingTests
         }
     }
 
-    private static bool HasNearWhitePixel(byte[,,] pixels, int centerX, int centerY)
+    private static bool HasWhiteGuideDifference(
+        byte[,,] withGuides,
+        byte[,,] withoutGuides,
+        int centerX,
+        int centerY)
     {
-        for (var y = Math.Max(0, centerY - 1); y <= Math.Min(pixels.GetLength(0) - 1, centerY + 1); y++)
+        for (var y = Math.Max(0, centerY - 1); y <= Math.Min(withGuides.GetLength(0) - 1, centerY + 1); y++)
         {
-            for (var x = Math.Max(0, centerX - 1); x <= Math.Min(pixels.GetLength(1) - 1, centerX + 1); x++)
+            for (var x = Math.Max(0, centerX - 1); x <= Math.Min(withGuides.GetLength(1) - 1, centerX + 1); x++)
             {
-                if (pixels[y, x, 0] >= 230 && pixels[y, x, 1] >= 230 && pixels[y, x, 2] >= 230)
+                if (withGuides[y, x, 0] > withoutGuides[y, x, 0] &&
+                    withGuides[y, x, 1] > withoutGuides[y, x, 1] &&
+                    withGuides[y, x, 2] > withoutGuides[y, x, 2])
                 {
                     return true;
                 }
