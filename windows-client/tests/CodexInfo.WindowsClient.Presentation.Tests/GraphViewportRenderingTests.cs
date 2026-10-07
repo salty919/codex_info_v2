@@ -591,6 +591,96 @@ public sealed class GraphViewportRenderingTests
         }
     }
 
+    [Theory]
+    [InlineData(700)]
+    [InlineData(940)]
+    public void RightmostBottomDateLabelRendersFullyInsideFigure(int width)
+    {
+        const int height = 480;
+        var start = Unix("2026-10-01T00:00:00Z");
+        var end = Unix("2026-10-08T00:00:00Z");
+        var scene = Scene(
+            start,
+            end,
+            (start + 60, 10),
+            (end - 60, 12));
+        var priorCulture = CultureInfo.CurrentCulture;
+        var timeZoneProperty = typeof(LocalizationService).GetProperty(nameof(LocalizationService.DisplayTimeZone));
+        Assert.NotNull(timeZoneProperty);
+        var setter = timeZoneProperty.GetSetMethod(nonPublic: true);
+        Assert.NotNull(setter);
+        var priorZone = LocalizationService.DisplayTimeZone;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+            setter.Invoke(null, [TimeZoneInfo.Utc]);
+            var control = new GraphPlotControl { Scene = scene };
+            using var rendered = control.Plot.GetImage(width, height);
+
+            var bottomAxis = control.Plot.Axes.Bottom;
+            var originalGenerator = bottomAxis.TickGenerator;
+            var ticks = originalGenerator.Ticks.ToArray();
+            var lastTick = ticks[^1];
+            Assert.Equal("10/08 00:00", lastTick.Label);
+            Assert.Contains("Center", bottomAxis.TickLabelStyle.Alignment.ToString());
+
+            using var typeface = SKTypeface.FromFamilyName(bottomAxis.TickLabelStyle.FontName);
+            using var labelFont = new SKFont(typeface, bottomAxis.TickLabelStyle.FontSize);
+            var labelHalfWidth = labelFont.MeasureText(lastTick.Label) / 2;
+            var dataRect = control.Plot.LastRender.DataRect;
+            var tickPixel = bottomAxis.GetPixel(lastTick.Position, dataRect);
+            var rightmostLabelPixel = tickPixel + labelHalfWidth;
+            var pixelsWithLabel = rendered.GetArrayRGB();
+            var rightAxis = control.Plot.Axes.Right;
+            Assert.True(rightAxis.IsVisible);
+            Assert.All(rightAxis.TickGenerator.Ticks, tick => Assert.Empty(tick.Label));
+
+            bottomAxis.TickGenerator = new ScottPlot.TickGenerators.NumericManual(
+                ticks.Select((tick, index) => new ScottPlot.Tick(
+                    tick.Position,
+                    index == ticks.Length - 1 ? string.Empty : tick.Label,
+                    tick.IsMajor)).ToArray());
+            byte[,,] pixelsWithoutLastLabel;
+            try
+            {
+                using var withoutLastLabel = control.Plot.GetImage(width, height);
+                pixelsWithoutLastLabel = withoutLastLabel.GetArrayRGB();
+                Assert.Equal(dataRect.Right, control.Plot.LastRender.DataRect.Right);
+            }
+            finally
+            {
+                bottomAxis.TickGenerator = originalGenerator;
+            }
+
+            Assert.True(
+                rightmostLabelPixel <= width - GraphPlotProjection.PlotStrokeEdgeClearance,
+                $"The final date label ends at x={rightmostLabelPixel:0.##}; it needs {GraphPlotProjection.PlotStrokeEdgeClearance}px of clear canvas space before width={width}.");
+
+            var labelInkToRightOfTick = false;
+            var firstTextPixel = (int)Math.Ceiling(tickPixel + 3);
+            for (var y = (int)Math.Ceiling(dataRect.Bottom); y < height && !labelInkToRightOfTick; y++)
+            {
+                for (var x = firstTextPixel; x < width; x++)
+                {
+                    if (pixelsWithLabel[y, x, 0] != pixelsWithoutLastLabel[y, x, 0] ||
+                        pixelsWithLabel[y, x, 1] != pixelsWithoutLastLabel[y, x, 1] ||
+                        pixelsWithLabel[y, x, 2] != pixelsWithoutLastLabel[y, x, 2])
+                    {
+                        labelInkToRightOfTick = true;
+                        break;
+                    }
+                }
+            }
+
+            Assert.True(labelInkToRightOfTick, "The right-hand half of the final timestamp label must be present in the rendered bitmap.");
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = priorCulture;
+            setter.Invoke(null, [priorZone]);
+        }
+    }
+
     [Fact]
     public void ResetGuideUsesActualBoundaryAndOverridesAnOverlappingMidnight()
     {

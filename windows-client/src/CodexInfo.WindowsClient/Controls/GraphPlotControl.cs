@@ -35,6 +35,7 @@ public sealed class GraphPlotControl : Control
     internal const string MidnightGuideColorHex = "#FFFFFF";
     internal const string ResetGuideColorHex = "#D6A45C";
     internal const string PlotColorHex = "#121c2c";
+    private const string PlotFontFamily = "Noto Sans JP Medium";
     internal const string RemainingColorRole = ThemePalette.GraphRemaining;
     internal const string SolColorRole = ThemePalette.GraphSol;
     internal const string TerraColorRole = ThemePalette.GraphTerra;
@@ -372,7 +373,7 @@ public sealed class GraphPlotControl : Control
         // Paint its bounded grid segments explicitly for the same reason.
         presentation.Plot.Grid.MajorLineWidth = 0;
         presentation.Plot.Grid.MinorLineWidth = 0;
-        presentation.Plot.Font.Set("Noto Sans JP Medium");
+        presentation.Plot.Font.Set(PlotFontFamily);
     }
 
     private void AddPlotGrid(PlotPresentation presentation, GraphScene scene, GraphAxisProjection axes)
@@ -442,15 +443,23 @@ public sealed class GraphPlotControl : Control
         presentation.Plot.Axes.Bottom.TickGenerator = new NumericManual(
             axes.BottomValues.ToArray(),
             axes.BottomLabels.ToArray());
+        presentation.Plot.Axes.Bottom.TickLabelStyle.FontName = PlotFontFamily;
         presentation.Plot.Axes.Left.TickGenerator = new NumericManual(
             axes.ModelValues.ToArray(),
             axes.ModelLabels.ToArray());
-        presentation.Plot.Axes.Right.TickGenerator = new NumericManual(
+        var rightAxis = presentation.Plot.Axes.Right;
+        rightAxis.TickGenerator = new NumericManual(
             axes.RemainingValues.ToArray(),
-            axes.RemainingLabels.ToArray());
-        // The right axis supplies Remaining's percent scale to its line while
-        // keeping duplicate frame labels out of the chart.
-        presentation.Plot.Axes.Right.IsVisible = false;
+            axes.RemainingLabels.Select(_ => string.Empty).ToArray());
+        using var tickTypeface = SkiaSharp.SKTypeface.FromFamilyName(PlotFontFamily);
+        using var tickFont = new SkiaSharp.SKFont(tickTypeface, presentation.Plot.Axes.Bottom.TickLabelStyle.FontSize);
+        var finalDateLabelHalfWidth = Math.Ceiling(tickFont.MeasureText(axes.BottomLabels[^1]) / 2d + 1d);
+        rightAxis.MinimumSize = (float)finalDateLabelHalfWidth;
+        rightAxis.IsVisible = true;
+        // The right axis remains attached to Remaining's percent scale. Its
+        // invisible panel supplies only the measured outside room required by
+        // the centered final timestamp tick; it has no duplicate labels/frame.
+        ((ScottPlot.AxisPanels.AxisBase)rightAxis).Color(PlotColor);
     }
 
     private static void ApplyTopDateAxis(PlotPresentation presentation, GraphAxisProjection axes)

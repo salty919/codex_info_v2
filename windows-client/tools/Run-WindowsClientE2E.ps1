@@ -483,7 +483,7 @@ public static class CodexInfoGraphPixelScanner {
                         if (step < 4) continue;
                         double start = centers[first] - (firstGrid * step);
                         double end = start + (4 * step);
-                        if (start < 0 || end >= plotWidth - 4) continue;
+                        if (start < 0 || end >= plotWidth - 1) continue;
 
                         var candidate = new int[5];
                         bool increasing = true;
@@ -567,7 +567,7 @@ public static class CodexInfoGraphPixelScanner {
 
         var candidate = (int[])expected.Clone();
         for (int index = 0; index < candidate.Length; index++) {
-            if (candidate[index] < 0 || candidate[index] >= plotWidth - 4 ||
+            if (candidate[index] < 0 || candidate[index] >= plotWidth - 1 ||
                 (index > 0 && candidate[index] <= candidate[index - 1])) {
                 return null;
             }
@@ -2003,6 +2003,15 @@ function Invoke-E2EGraphPixelScannerSelfTest {
             $resetGuideMeasurement.GutterWidth -eq 69) `
             'Graph pixel scanner did not preserve the unanchored period geometry with a reset guide at its endpoint.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS endpoint reset guide supports only the unique unanchored five-grid lattice'
+        # A full-width plot keeps only the 2px stroke safety margin. This is a
+        # cropped independent fixture, not a product-provided expected lattice.
+        $fullWidth = [CodexInfoGraphPixelScanner]::Scan($resetGuidePath, 0, 0, 173, 140)
+        Assert-E2E ($fullWidth.PeriodStartX -eq 10 -and $fullWidth.PeriodEndX -eq 170 -and
+            $fullWidth.GutterWidth -eq 2) 'Full-width reset endpoint geometry was rejected.'
+        [int[]]$fullWidthCenters = @(10, 50, 90, 130, 170)
+        $fullWidthAnchored = [CodexInfoGraphPixelScanner]::Scan($validPath, 0, 0, 173, 140, $fullWidthCenters)
+        Assert-E2E ($fullWidthAnchored.GutterWidth -eq 2) 'Full-width anchored geometry was rejected.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS full-width geometry retains two pixel stroke safety'
 
         $valid = [CodexInfoGraphPixelScanner]::Scan($validPath, 0, 0, 240, 140)
         Assert-E2E ($valid.PeriodStartX -eq 10 -and $valid.PeriodEndX -eq 170 -and

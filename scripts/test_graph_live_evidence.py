@@ -234,6 +234,12 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         self.assertTrue(remaining_dashed)
         self.assertNotEqual(straight_remaining, remaining_dashed)
 
+    def test_canonical_dashes_terminates_on_terminal_sub_epsilon_remainder(self):
+        self.assertEqual(
+            ["M0.00 0.00 L0.45 0.00"],
+            oracle._canonical_dashes((0.0, 0.0), (0.7500000000005, 0.0)),
+        )
+
     def test_parity_fixture_matches_existing_dollar_remaining_and_idle_oracles(self):
         fixture = self.document["parity_v3"]
         expected = fixture["expected"]
@@ -1065,10 +1071,10 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         linux["platform"] = "linux"
         windows = copy.deepcopy(actual)
         windows["platform"] = "windows"
-        for contract in windows["render_contracts"].values():
-            contract["styles"]["idle_band"] = "#162232"
-            contract["endpoint_labels"] = []
-            contract["layout"].update(plot_width=786, gutter_width=0, label_gap=0, label_width=0, right_padding=2)
+        windows["render_contracts"] = oracle.build_expected_render_contracts(
+            fixture,
+            platform="windows",
+        )
         if mutate_linux is not None:
             mutate_linux(linux)
         mutate(windows)
@@ -1138,6 +1144,89 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             self.assertEqual(0, contract["layout"]["label_gap"])
             self.assertEqual(0, contract["layout"]["label_width"])
             self.assertTrue(contract["endpoint_values"])
+
+    def test_windows_smoothing_density_matches_native_export_and_keeps_linux_baseline(self):
+        fixture = self.document["parity_v3"]
+        linux = oracle.build_expected_render_contracts(fixture, platform="linux")
+        windows = oracle.build_expected_render_contracts(fixture, platform="windows")
+        self.assertEqual(oracle.build_expected_render_contracts(fixture), linux)
+
+        role_colors = {
+            "remaining": "#56b2f5",
+            "sol": "#a88cf5",
+            "terra": "#5dc98a",
+            "luna": "#e6a23c",
+            "astra": "#ef6a6a",
+        }
+        for metric in ("dollars", "tokens"):
+            self.assertTrue(
+                linux[metric]["models"][0]["flat"].startswith("M0.00 92.00 L0.25 92.00")
+            )
+            self.assertTrue(
+                windows[metric]["models"][0]["flat"].startswith("M0.00 92.00 L0.10 92.00")
+            )
+            self.assertEqual(
+                role_colors,
+                {
+                    key: linux[metric]["styles"][key]
+                    for key in role_colors
+                },
+            )
+            self.assertEqual(
+                {key: value.upper() for key, value in role_colors.items()},
+                {
+                    key: windows[metric]["styles"][key]
+                    for key in role_colors
+                },
+            )
+
+    def test_windows_keeps_dash_phase_across_adjacent_dashed_intervals_only(self):
+        fixture = v3_fixture(
+            [
+                {"timestamp": 0, "remaining_percent": 90, "tokens": 10},
+                {
+                    "timestamp": 120,
+                    "remaining_percent": 90,
+                    "models": None,
+                    "models_complete": False,
+                    "model_source": "unavailable",
+                },
+                {"timestamp": 240, "remaining_percent": 90, "tokens": 10},
+                {
+                    "timestamp": 360,
+                    "remaining_percent": 90,
+                    "models": None,
+                    "models_complete": False,
+                    "model_source": "unavailable",
+                },
+                {"timestamp": 480, "remaining_percent": 90, "tokens": 10},
+            ],
+            period_id="adjacent-dash-phase",
+        )
+        segments, _ = oracle.build_expected(fixture)
+        self.assertEqual(
+            [[0, 240], [240, 480]],
+            pairs(segments, "dashed", "tokens", "SOL"),
+        )
+        linux = oracle.build_expected_render_contracts(fixture, platform="linux")
+        windows = oracle.build_expected_render_contracts(fixture, platform="windows")
+        linux_path = next(
+            model["dashed"]
+            for model in linux["tokens"]["models"]
+            if model["series"] == "SOL"
+        )
+        windows_path = next(
+            model["dashed"]
+            for model in windows["tokens"]["models"]
+            if model["series"] == "SOL"
+        )
+
+        self.assertIn(
+            "M50.00 1.00 L50.25 1.00 M50.25 1.00 L50.45 1.00",
+            linux_path,
+        )
+        self.assertIn("M50.25 1.00 L50.30 1.00", windows_path)
+        self.assertNotIn("M50.00 1.00 L50.10 1.00", windows_path)
 
     def test_verify_rejects_windows_endpoint_labels(self):
         self._assert_verify_result(
