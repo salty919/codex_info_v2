@@ -141,6 +141,26 @@ public sealed class LoopbackStatusClientTests
         Assert.Null(result.Snapshot.HistorySamples[0].TaskActiveSincePrevious);
     }
 
+    [Fact]
+    public async Task DetailsV3PreservesConfirmedEmptyModelSet()
+    {
+        var json = ValidDetailsV3Json().Replace(
+            "\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}]",
+            "\"models\":[]",
+            StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistorySamples);
+        Assert.NotNull(sample.ModelSamples);
+        Assert.Empty(sample.ModelSamples);
+        Assert.Equal(ApiHistorySample.ConfirmedModelSource, sample.ModelSource);
+        Assert.True(sample.ModelsComplete);
+    }
+
     [Theory]
     [InlineData("false", false)]
     [InlineData("true", true)]

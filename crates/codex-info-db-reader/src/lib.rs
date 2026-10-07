@@ -1426,6 +1426,7 @@ struct StoredHistoryObservation {
     reset_at: i64,
     remaining_percent: Option<f64>,
     model_source: HistoryModelSource,
+    empty_model_set_complete: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1963,7 +1964,19 @@ fn read_history_projection_for_intervals(
             .get(&(sample.reset_at, sample.timestamp))
             .copied();
         let group = model_groups.get(&(sample.reset_at, sample.timestamp));
-        let model_source = if quota_only {
+        let empty_set = stored.and_then(|observation| observation.empty_model_set_complete);
+        // A sparse model table cannot represent zero cardinality. Its exact
+        // observation carries that fact; neither representation may override
+        // contradictory numerics in the other.
+        let empty_conflict = empty_set.is_some()
+            && (group.is_some()
+                || sample.sol_tokens != 0
+                || sample.terra_tokens != 0
+                || sample.luna_tokens != 0
+                || sample.sol_dollars != 0.0
+                || sample.terra_dollars != 0.0
+                || sample.luna_dollars != 0.0);
+        let model_source = if quota_only || empty_conflict {
             HistoryModelSource::Unavailable
         } else {
             stored
@@ -1980,7 +1993,8 @@ fn read_history_projection_for_intervals(
                     }
                 })
         };
-        let group_models_complete = group.is_some_and(HistoryModelGroup::model_set_complete);
+        let group_models_complete =
+            empty_set.unwrap_or_else(|| group.is_some_and(HistoryModelGroup::model_set_complete));
         let source = if model_source == HistoryModelSource::Unavailable {
             HistoryModelSource::Unavailable
         } else if model_source == HistoryModelSource::ReconstructedFromSession {
@@ -2001,6 +2015,8 @@ fn read_history_projection_for_intervals(
             HistoryModelSource::ReconstructedFromSession | HistoryModelSource::Unavailable
         ) {
             None
+        } else if empty_set.is_some() {
+            Some(Vec::new())
         } else {
             history_models_v3(group, sample, models_complete)
         };
@@ -2394,7 +2410,7 @@ fn suppress_regressing_history_models(
             observation.model_source = "legacy-unknown".to_owned();
         }
         models.sort_by(|left, right| left.model.cmp(&right.model));
-        if models.is_empty() {
+        if models.is_empty() && !suppressed.is_empty() {
             observation.models = None;
         }
     }
@@ -2624,11 +2640,33 @@ fn parse_stored_history_observation(
         "legacy-unknown" => HistoryModelSource::LegacyUnknown,
         _ => return None,
     };
+    let empty_model_set_complete = match object.get("empty_model_set_complete") {
+        None => None,
+        Some(value) => {
+            let complete = value.as_bool()?;
+            if model_source == HistoryModelSource::Unavailable
+                || [
+                    "sol_dollars",
+                    "terra_dollars",
+                    "luna_dollars",
+                    "sol_tokens",
+                    "terra_tokens",
+                    "luna_tokens",
+                ]
+                .iter()
+                .any(|field| object.get(*field).and_then(serde_json::Value::as_f64) != Some(0.0))
+            {
+                return None;
+            }
+            Some(complete)
+        }
+    };
     Some(StoredHistoryObservation {
         timestamp,
         reset_at,
         remaining_percent,
         model_source,
+        empty_model_set_complete,
     })
 }
 
@@ -2843,7 +2881,7 @@ fn history_models_v3(
         }
     }
     models.sort_by(|left, right| left.model.cmp(&right.model));
-    (!models.is_empty()).then_some(models)
+    (models_complete || !models.is_empty()).then_some(models)
 }
 
 fn legacy_history_models_v3(sample: &PublicHistorySample) -> Vec<PublicHistoryModelUsageV3> {
@@ -4588,6 +4626,95 @@ mod tests {
 
     fn active_thread_json(id: &str, updated_at: i64) -> String {
         serde_json::json!([active_thread_value(id, updated_at)]).to_string()
+    }
+
+    #[test]
+    fn weekly_empty_model_sets_remain_distinct_in_public_history() {
+        let path = temp_db("weekly-empty-model-sets");
+        make_db(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "UPDATE usage_history SET sol_dollars=0, terra_dollars=0, luna_dollars=0,
+                sol_tokens=0, terra_tokens=0, luna_tokens=0;
+             CREATE TABLE durable_state(singleton INTEGER PRIMARY KEY,
+                data_generation INTEGER NOT NULL, snapshot_json TEXT NOT NULL);
+             CREATE TABLE usage_model_history(reset_at INTEGER, timestamp INTEGER,
+                model TEXT, total_tokens TEXT, input_tokens TEXT, cached_input_tokens TEXT,
+                output_tokens TEXT, cache_write_input_tokens TEXT, model_set_complete INTEGER);",
+            )
+            .unwrap();
+        // Literal storage facts, independent of the writer encoder. Legacy
+        // zero columns do not prove either an empty or a complete model set.
+        let base = serde_json::json!({
+            "kind": "codex-info-usage-observation-v1", "timestamp": 1800000000,
+            "reset_at": 1800000060, "remaining_percent": 50.0,
+            "model_source": "confirmed", "sol_dollars": 0.0,
+            "terra_dollars": 0.0, "luna_dollars": 0.0,
+            "sol_tokens": 0, "terra_tokens": 0, "luna_tokens": 0,
+        });
+        for (marker, source, complete, count) in [
+            (Some(serde_json::json!(true)), "confirmed", true, Some(0)),
+            (
+                Some(serde_json::json!(false)),
+                "legacy-unknown",
+                false,
+                Some(0),
+            ),
+            (None, "legacy-unknown", false, Some(3)),
+            (Some(serde_json::json!("true")), "unavailable", false, None),
+        ] {
+            let mut value = base.clone();
+            if let Some(marker) = marker {
+                value["empty_model_set_complete"] = marker;
+            }
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO durable_state VALUES(2,1800000000,?1)",
+                    [value.to_string()],
+                )
+                .unwrap();
+            let before = fs::read(&path).unwrap();
+            let snapshot = DbReader::open(&path).unwrap().read_snapshot().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let row = &snapshot.history_samples_v3[0];
+            assert_eq!(
+                (row.reset_at, row.timestamp, row.remaining_percent),
+                (1_800_000_060, 1_800_000_000, Some(50.0))
+            );
+            assert_eq!(row.model_source, source);
+            assert_eq!(row.models_complete, complete);
+            assert_eq!(row.models.as_ref().map(Vec::len), count);
+        }
+        // A zero-cardinality declaration cannot override contradictory facts.
+        let mut empty = base;
+        empty["empty_model_set_complete"] = serde_json::json!(true);
+        connection
+            .execute(
+                "UPDATE durable_state SET snapshot_json=?1",
+                [empty.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO usage_model_history VALUES
+            (1800000060,1800000000,'SOL','1','1','0','0','0',1);",
+            )
+            .unwrap();
+        let snapshot = DbReader::open(&path).unwrap().read_snapshot().unwrap();
+        assert_eq!(snapshot.history_samples_v3[0].model_source, "unavailable");
+        assert!(snapshot.history_samples_v3[0].models.is_none());
+        connection
+            .execute_batch(
+                "DELETE FROM usage_model_history;
+            UPDATE usage_history SET sol_tokens=1;",
+            )
+            .unwrap();
+        let snapshot = DbReader::open(&path).unwrap().read_snapshot().unwrap();
+        assert_eq!(snapshot.history_samples_v3[0].model_source, "unavailable");
+        assert!(snapshot.history_samples_v3[0].models.is_none());
+        drop(connection);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
