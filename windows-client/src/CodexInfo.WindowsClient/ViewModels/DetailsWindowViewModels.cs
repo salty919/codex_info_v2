@@ -228,11 +228,32 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool IsWeekView => SelectedTimeRange == GraphTimeRange.Last7Days;
 
-    public bool CanGoBack => SelectedTimeRange != GraphTimeRange.ResetPeriod &&
-        windowPeriodDirectory.Any(period => period.StartAt < scene.PeriodStartAt);
+    public bool CanGoBack
+    {
+        get
+        {
+            if (SelectedTimeRange == GraphTimeRange.ResetPeriod)
+            {
+                var selectedIndex = GetSelectedPeriodIndex();
+                return selectedIndex >= 0 && selectedIndex < periods.Count - 1;
+            }
 
-    public bool CanGoForward => SelectedTimeRange != GraphTimeRange.ResetPeriod &&
-        pinnedWindowEndAt != long.MinValue && pinnedWindowEndAt < getUnixTimeSeconds();
+            return windowPeriodDirectory.Any(period => period.StartAt < scene.PeriodStartAt);
+        }
+    }
+
+    public bool CanGoForward
+    {
+        get
+        {
+            if (SelectedTimeRange == GraphTimeRange.ResetPeriod)
+            {
+                return GetSelectedPeriodIndex() > 0;
+            }
+
+            return pinnedWindowEndAt != long.MinValue && pinnedWindowEndAt < getUnixTimeSeconds();
+        }
+    }
 
     public bool HasPlot => SelectedTimeRange != GraphTimeRange.ResetPeriod || HasPoints;
 
@@ -782,7 +803,17 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     public void GoBack()
     {
         var range = SelectedTimeRange;
-        if (range == GraphTimeRange.ResetPeriod || !CanGoBack)
+        if (range == GraphTimeRange.ResetPeriod)
+        {
+            if (CanGoBack)
+            {
+                SelectedPeriod = periods[GetSelectedPeriodIndex() + 1];
+            }
+
+            return;
+        }
+
+        if (!CanGoBack)
         {
             return;
         }
@@ -802,7 +833,17 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     public void GoForward()
     {
         var range = SelectedTimeRange;
-        if (range == GraphTimeRange.ResetPeriod || pinnedWindowEndAt == long.MinValue)
+        if (range == GraphTimeRange.ResetPeriod)
+        {
+            if (CanGoForward)
+            {
+                SelectedPeriod = periods[GetSelectedPeriodIndex() - 1];
+            }
+
+            return;
+        }
+
+        if (pinnedWindowEndAt == long.MinValue)
         {
             return;
         }
@@ -819,6 +860,25 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             pinnedWindowEndAt,
             windowNavigationOriginAt);
         RequestTimeRange(range, nextEndAt, nextEndAt is null ? null : windowNavigationOriginAt, now);
+    }
+
+    private int GetSelectedPeriodIndex()
+    {
+        var selectedId = selectedPeriod?.Id;
+        if (selectedId is null)
+        {
+            return -1;
+        }
+
+        for (var index = 0; index < periods.Count; index++)
+        {
+            if (periods[index].Id == selectedId)
+            {
+                return index;
+            }
+        }
+
+        return -1;
     }
 
     public void Dispose()
