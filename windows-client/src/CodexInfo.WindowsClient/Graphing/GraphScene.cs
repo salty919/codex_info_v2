@@ -92,7 +92,10 @@ public sealed class GraphScene
         IReadOnlySet<long> tokenCorrectionStarts,
         IReadOnlyDictionary<string, IReadOnlyList<GraphIdleInterval>> modelIdleIntervals,
         IReadOnlyList<GraphIdleInterval> idleIntervals,
-        double modelMaximum)
+        double modelMaximum,
+        bool isViewport = false,
+        IReadOnlyList<GraphScene>? periodScenes = null,
+        bool hasViewportPoints = false)
     {
         PeriodStartAt = periodStartAt;
         PeriodEndAt = periodEndAt;
@@ -123,6 +126,9 @@ public sealed class GraphScene
         ModelIdleIntervals = modelIdleIntervals;
         IdleIntervals = idleIntervals;
         ModelMaximum = modelMaximum;
+        IsViewport = isViewport;
+        PeriodScenes = Array.AsReadOnly((periodScenes ?? Array.Empty<GraphScene>()).ToArray());
+        HasViewportPoints = isViewport && hasViewportPoints;
     }
 
     public long PeriodStartAt { get; }
@@ -197,7 +203,14 @@ public sealed class GraphScene
 
     public double ModelMaximum { get; }
 
-    public bool HasPoints => Timestamps.Count > 0;
+    public bool IsViewport { get; }
+
+    /// <summary>The original reset-period scenes displayed inside this viewport.</summary>
+    public IReadOnlyList<GraphScene> PeriodScenes { get; }
+
+    private bool HasViewportPoints { get; }
+
+    public bool HasPoints => IsViewport ? HasViewportPoints : Timestamps.Count > 0;
 
     public static GraphScene Empty(GraphMetric metric = GraphMetric.Dollars) =>
         new(
@@ -230,6 +243,103 @@ public sealed class GraphScene
             new Dictionary<string, IReadOnlyList<GraphIdleInterval>>(StringComparer.Ordinal),
             [],
             1);
+
+    /// <summary>
+    /// Combines original reset-period scenes into a display window. The child
+    /// periods retain their own reset bounds; only this scene owns the viewport
+    /// bounds used by the axes.
+    /// </summary>
+    public static GraphScene CreateViewport(
+        long startAt,
+        long endAt,
+        GraphMetric metric,
+        IReadOnlyList<GraphScene> periodScenes)
+    {
+        ArgumentNullException.ThrowIfNull(periodScenes);
+        if (endAt <= startAt)
+        {
+            throw new ArgumentOutOfRangeException(nameof(endAt), "A viewport must have a positive time span.");
+        }
+
+        var children = periodScenes.ToArray();
+        if (children.Any(scene => scene is null))
+        {
+            throw new ArgumentException("A viewport cannot contain a null period scene.", nameof(periodScenes));
+        }
+        if (children.Any(scene => scene.Metric != metric))
+        {
+            throw new ArgumentException("Every child period must use the viewport metric.", nameof(periodScenes));
+        }
+
+        var visible = children
+            .SelectMany((scene, periodIndex) => Enumerable.Range(0, scene.Timestamps.Count)
+                .Where(index => scene.Timestamps[index] >= startAt && scene.Timestamps[index] <= endAt)
+                .Select(index => (Scene: scene, PeriodIndex: periodIndex, Index: index, Timestamp: scene.Timestamps[index])))
+            .OrderBy(point => point.Timestamp)
+            .ThenBy(point => point.PeriodIndex)
+            .ToArray();
+
+        double[] Series(Func<GraphScene, int, double> selector) =>
+            visible.Select(point => selector(point.Scene, point.Index)).ToArray();
+
+        var modelNames = children
+            .SelectMany(scene => scene.ModelSeries.Keys)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var modelSeries = modelNames.ToDictionary(
+            name => name,
+            name => (IReadOnlyList<double>)visible.Select(point =>
+                point.Scene.ModelSeries.TryGetValue(name, out var values) && point.Index < values.Count
+                    ? values[point.Index]
+                    : double.NaN).ToArray(),
+            StringComparer.Ordinal);
+
+        var idleIntervals = children
+            .SelectMany(scene => scene.IdleIntervals)
+            .Where(interval => interval.StartAt < endAt && interval.EndAt > startAt)
+            .Select(interval => new GraphIdleInterval(
+                Math.Max(startAt, interval.StartAt),
+                Math.Min(endAt, interval.EndAt),
+                interval.PreserveBoundary))
+            .OrderBy(interval => interval.StartAt)
+            .ToArray();
+
+        var hasVisiblePoints = GraphPlotProjection.HasVisibleViewportPoints(children, startAt, endAt);
+        var visibleModelMaximum = GraphPlotProjection.CalculateViewportModelMaximum(children, startAt, endAt);
+        return new GraphScene(
+            startAt,
+            endAt,
+            metric,
+            visible.Select(point => point.Timestamp).ToArray(),
+            Series((scene, index) => scene.Remaining[index]),
+            Series((scene, index) => scene.Sol[index]),
+            Series((scene, index) => scene.Terra[index]),
+            Series((scene, index) => scene.Luna[index]),
+            Series((scene, index) => scene.Astra[index]),
+            modelSeries,
+            new Dictionary<string, IReadOnlyList<double>>(StringComparer.Ordinal),
+            new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal),
+            new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal),
+            new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal),
+            visible.Select(point => point.Scene.PublishedModelNames[point.Index]).ToArray(),
+            visible.Select(point => point.Scene.ModelVectorAvailable[point.Index]).ToArray(),
+            visible.Select(point => point.Scene.ModelSynthetic[point.Index]).ToArray(),
+            visible.Select(point => point.Scene.RemainingObserved[point.Index]).ToArray(),
+            Series((scene, index) => scene.ObservedRemainingValues[index]),
+            visible.Select(point => point.Scene.RemainingInterpolated[point.Index]).ToArray(),
+            visible.Select(point => point.Scene.RemainingOrigins[point.Index]).ToArray(),
+            [],
+            [],
+            new Dictionary<string, IReadOnlySet<long>>(StringComparer.Ordinal),
+            new HashSet<long>(),
+            new HashSet<long>(),
+            new Dictionary<string, IReadOnlyList<GraphIdleInterval>>(StringComparer.Ordinal),
+            idleIntervals,
+            visibleModelMaximum,
+            isViewport: true,
+            periodScenes: children,
+            hasViewportPoints: hasVisiblePoints);
+    }
 
     public static GraphScene Create(
         IReadOnlyList<ApiHistorySample> samples,

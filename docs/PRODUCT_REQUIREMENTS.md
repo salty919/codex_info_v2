@@ -575,6 +575,8 @@ Remainingの配分または線種へ波及させず、直接観測anchor間は3p
 
 ## グラフ表示への参照
 
+Windowsのみ、既定のreset週期間に加えて現在を右端とする固定24時間／7日間の表示窓と全幅の過去移動を提供する。窓に重なる各resetは同一account/published pairで完全受理した別系列として投影し、観測終端から現在までを実測で埋めない。縦軸とreset別累計の意味は変更せず、Linux画面は対象外とする（#554）。詳細は`docs/WINDOWS_UX_SPEC.md` §4.2を正本とする。
+
 一般のグラフgeometry、操作、色と線幅はUX ownerの`CUM-138-06`が
 `docs/WINDOWS_UX_SPEC.md`で所有する。Issue #137で確定したcross-platformの値・線種・連続区間・
 未使用・cursor回復・failure isolationは`G137-GRAPH-01`を正本とし、下流仕様とtestは

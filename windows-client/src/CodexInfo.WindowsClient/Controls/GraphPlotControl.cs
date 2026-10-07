@@ -31,6 +31,7 @@ public sealed class GraphPlotControl : Control
     internal const string AstraColorHex = "#ef6a6a";
     internal const string AxisTextColorHex = "#78879c";
     internal const string GridColorHex = "#263850";
+    internal const string MidnightGuideColorHex = "#FFFFFF";
     internal const string PlotColorHex = "#121c2c";
     private ScottPlot.Color RemainingColor => new(ThemePalette.Resolve(RemainingColorHex));
     private ScottPlot.Color SolColor => new(ThemePalette.Resolve(SolColorHex));
@@ -47,6 +48,7 @@ public sealed class GraphPlotControl : Control
     private ScottPlot.Color IdleBandColor => new(ThemePalette.Resolve(IdleBandColorHex));
     private ScottPlot.Color MutedColor => new(ThemePalette.Resolve(AxisTextColorHex));
     private ScottPlot.Color GridColor => new(ThemePalette.Resolve(GridColorHex));
+    private ScottPlot.Color MidnightGuideColor => new(MidnightGuideColorHex);
     private ScottPlot.Color PlotColor => new(ThemePalette.Resolve(PlotColorHex));
 
     private PlotPresentation presentation = new(GraphScene.Empty());
@@ -145,14 +147,17 @@ public sealed class GraphPlotControl : Control
         ApplyTheme(presentation);
 
         var scene = presentation.Scene;
-        if (!scene.HasPoints)
+        if (!scene.HasPoints && !scene.IsViewport)
         {
             return;
         }
 
         var axes = BuildAxesForCurrentWidth(scene);
         AddPlotGrid(presentation, scene, axes);
-        foreach (var interval in GraphPlotProjection.BuildVisibleUnusedIntervals(scene))
+        var idleIntervals = scene.IsViewport
+            ? GraphPlotProjection.BuildViewportUnusedIntervals(scene)
+            : GraphPlotProjection.BuildVisibleUnusedIntervals(scene);
+        foreach (var interval in idleIntervals)
         {
             var band = presentation.Plot.Add.Rectangle(
                 interval.StartAt,
@@ -162,15 +167,16 @@ public sealed class GraphPlotControl : Control
             band.FillColor = IdleBandColor.WithOpacity(IdleBandOpacity);
             band.LineWidth = 0;
         }
+        AddMidnightGuides(presentation, scene, axes);
 
         // Match the native graph's painter order: endpoint leaders sit below
         // the data strokes, inferred model paths precede measured paths, and
         // Remaining is painted last over its boundary markers.
         AddEndpointLabels(presentation, scene, axes);
-        var lunaLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Luna);
-        var terraLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Terra);
-        var solLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
-        var astraLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Astra);
+        var lunaLines = BuildModelLines(scene, GraphSeries.Luna);
+        var terraLines = BuildModelLines(scene, GraphSeries.Terra);
+        var solLines = BuildModelLines(scene, GraphSeries.Sol);
+        var astraLines = BuildModelLines(scene, GraphSeries.Astra);
         var lunaDashed = AddLine(presentation, lunaLines.Dashed.Line, LunaColor.WithOpacity(0.72), presentation.Plot.Axes.Left, InferredLineWidth);
         var terraDashed = AddLine(presentation, terraLines.Dashed.Line, TerraColor.WithOpacity(0.72), presentation.Plot.Axes.Left, InferredLineWidth);
         var solDashed = AddLine(presentation, solLines.Dashed.Line, SolColor.WithOpacity(0.72), presentation.Plot.Axes.Left, InferredLineWidth);
@@ -191,9 +197,9 @@ public sealed class GraphPlotControl : Control
         presentation.TerraSeries = new ModelSeriesVisual(terraIdle, terraFlat, terraRising, terraDashed);
         presentation.SolSeries = new ModelSeriesVisual(solIdle, solFlat, solRising, solDashed);
         presentation.AstraSeries = new ModelSeriesVisual(astraIdle, astraFlat, astraRising, astraDashed);
-        var remainingLines = GraphPlotProjection.BuildCanonicalRemainingLines(
-            scene,
-            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        var remainingLines = scene.IsViewport
+            ? GraphPlotProjection.BuildViewportRemainingLines(scene)
+            : GraphPlotProjection.PrepareGeometry(scene).RemainingLines;
         presentation.RemainingDashedSeries = AddLine(
             presentation,
             remainingLines.Dashed.Line,
@@ -216,6 +222,11 @@ public sealed class GraphPlotControl : Control
         ApplyAxes(presentation, scene, axes);
         ApplyVisibility(presentation);
     }
+
+    private static GraphCanonicalModelLineProjection BuildModelLines(GraphScene scene, GraphSeries series) =>
+        scene.IsViewport
+            ? GraphPlotProjection.BuildViewportModelLines(scene, series)
+            : GraphPlotProjection.PrepareGeometry(scene).ModelLines[series];
 
     private GraphAxisProjection BuildAxesForCurrentWidth(GraphScene scene)
     {
@@ -260,7 +271,9 @@ public sealed class GraphPlotControl : Control
 
     private ScottPlot.Plottables.Scatter? AddRemainingMarkers(PlotPresentation presentation, GraphScene scene)
     {
-        var markers = GraphPlotProjection.BuildCanonicalRemainingMarkers(scene);
+        var markers = scene.IsViewport
+            ? GraphPlotProjection.BuildViewportRemainingMarkers(scene)
+            : GraphPlotProjection.PrepareGeometry(scene).RemainingMarkers;
         if (markers.Count == 0)
         {
             return null;
@@ -322,6 +335,26 @@ public sealed class GraphPlotControl : Control
         }
     }
 
+    private void AddMidnightGuides(
+        PlotPresentation presentation,
+        GraphScene scene,
+        GraphAxisProjection axes)
+    {
+        foreach (var timestamp in GraphPlotProjection.BuildLocalMidnightGuides(
+                     scene,
+                     LocalizationService.DisplayTimeZone))
+        {
+            AddLine(
+                presentation,
+                new GraphLineProjection(
+                    new double[] { timestamp, timestamp },
+                    new double[] { axes.ModelDisplayMinimum, axes.ModelDisplayMaximum }),
+                MidnightGuideColor,
+                presentation.Plot.Axes.Left,
+                1.5f);
+        }
+    }
+
     private void ApplyAxes(PlotPresentation presentation, GraphScene scene, GraphAxisProjection axes)
     {
         ApplyLimits(presentation, scene, axes);
@@ -373,7 +406,7 @@ public sealed class GraphPlotControl : Control
         }
 
         var scene = presentation.Scene;
-        if (!scene.HasPoints || referenceControlWidth is null)
+        if ((!scene.HasPoints && !scene.IsViewport) || referenceControlWidth is null)
         {
             return;
         }

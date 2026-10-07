@@ -420,6 +420,11 @@ component順や表示所有者を変更しない。
 
 ### 4.2 Trends / Graph（master: `CUM-138-06`）
 
+- Windowsの表示モードは「週期間」（既定）、「24時間」、「1週間」とする。「週期間」は以下の既存reset期間の範囲を維持する。固定時間モードは表示窓だけを独立させ、右端を現在時刻、幅をそれぞれ86,400秒／604,800秒とする。未観測の終端から現在時刻までは空白であり、観測値を延長しない。Linuxの表示・操作は変更しない（Issue #554）。
+- 固定時間モードの「＜」「＞」は窓の全幅だけ移動する。過去へ移動した右端は更新中も固定し、24時間／1週間間の変更でも維持する。現在へ到達すると現在追従へ戻り、未来へは進めない。既定の週期間選択は既存selectorで行う。
+- 表示窓に重なる全reset期間を同じaccount・published pairから完全に受理する。各期間を既存の累計・残量・欠測規則で個別投影してから表示窓に切り出し、期間をまたぐ線・idle帯・累計の足算を作らない。縦軸の単位と既存スケール規則は維持する。空の時間窓でも固定幅の軸を保つ。
+- 全モードで表示タイムゾーンの日付が変わる0時に白い細線を引く。夏時間のある地域も現地暦の日付境界を用い、86,400秒ごとの線で代用しない。上部はタイトル／単位、モード／移動、期間または日時、凡例の順に配置し、空の固定高さ行を置かない。940×640と最小700×480で操作とplotが重ならない。
+- 更新では受理済みの画面・軸・日時を保持し、全候補の準備後にまとめて切り替える。失敗と遅延応答によって部分的な期間や古い表示窓を公開しない。account変更では別accountの画面を保持しない。期間ごとの描画用geometryを再利用し、固定窓では範囲内と境界の描画点だけを渡す。元履歴を間引き・書換えせず、滑らかさのために観測値を変更しない。
 - 期間、ドル/トークン、Remaining/LUNA/TERRA/SOL/ASTRAの操作を上部固定帯に置く。
   model名と累積値は同じaccepted v3 rootから取得し、ASTRAを「その他」へ集約しない。
 - 期間・metricのリストはpointer pressの1回で展開し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。7日1分bucket由来の10,080点と契約最大1暦月由来の44,640点は対象データ規模であって、通常データを拒否する任意の上限ではない。最低動作環境と承認baselineが定義されるまでは、根拠のない絶対ms値やcold maxをUX合否条件にしない。
@@ -435,13 +440,13 @@ component順や表示所有者を変更しない。
 - 期間を連続選択した場合は旧候補をcancelし、最新revisionだけをpublishする。失敗・timeout・cancelを
   空graphや部分graphへ変換せず、直前graphを保持してbounded errorを表示する。キャッシュ済みで次paint
   までに切替できる場合はprogressを点滅させない。入力への反応と期間データ完成は別条件として確認する。
-- current期間の`start_at/end_at`はCOREが同じ最新quota観測から動的に投影したpairを唯一のauthorityとする。
+- 週期間モードのcurrent期間の`start_at/end_at`はCOREが同じ最新quota観測から動的に投影したpairを唯一のauthorityとする。
   期間欄、メイン画面の利用期間、selected period start、plotの横軸左端・右端はaccepted periods resourceの
   同じpairをそのまま使い、Windowsで再計算しない。completed/historical期間は保存済みpairを使う。quotaの
   `reset_at`はリセット時刻表示の別項目である。current periodの
   `end_at`は同じatomic published rootのaccepted観測終端であり、UI取得後のlocal現在時刻へ延ばさない。
   completed periodは保存された固定`end_at`までを右端とする。
-- 期間欄、横軸、折れ線、右端値は同じselected reset IDだけから一括投影する。poll後の
+- 週期間モードの期間欄、横軸、折れ線、右端値は同じselected reset IDだけから一括投影する。poll後の
   bounded reset aliasは60秒以内だけ同一期間として選択を維持し、欄だけ旧期間・plotだけ現在期間の
   混在を禁止する。
 - 右端現在値の表示域は、初期940×640 logical表示時に各metricで確保される幅をドル／トークン別に固定する。Graphを横へリサイズした差分はplotへ割り当て、現在値、系列色、leader、縦位置を変えない。

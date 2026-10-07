@@ -3,6 +3,7 @@
 
 using System.Globalization;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace CodexInfo.WindowsClient.Graphing;
@@ -77,6 +78,19 @@ internal readonly record struct GraphCanonicalRemainingMarker(
     double YTop,
     int Boundary);
 
+/// <summary>Canonical immutable geometry prepared for one accepted period scene.</summary>
+internal sealed class GraphPreparedGeometry(
+    IReadOnlyDictionary<GraphSeries, GraphCanonicalModelLineProjection> modelLines,
+    GraphCanonicalRemainingLineProjection remainingLines,
+    IReadOnlyList<GraphCanonicalRemainingMarker> remainingMarkers)
+{
+    internal IReadOnlyDictionary<GraphSeries, GraphCanonicalModelLineProjection> ModelLines { get; } = modelLines;
+
+    internal GraphCanonicalRemainingLineProjection RemainingLines { get; } = remainingLines;
+
+    internal IReadOnlyList<GraphCanonicalRemainingMarker> RemainingMarkers { get; } = remainingMarkers;
+}
+
 /// <summary>
 /// A final endpoint label projection.  <see cref="NormalizedTop"/> is the
 /// collision-free semantic position and <see cref="AxisValue"/> is the value
@@ -118,6 +132,8 @@ internal static class GraphPlotProjection
     internal const double CanonicalDashGap = 0.30;
     private const double CurveMaximumViewboxStep = 0.25;
     private const double CanonicalGeometryEpsilon = 1e-12;
+    private static readonly ConditionalWeakTable<GraphScene, Lazy<GraphPreparedGeometry>> PreparedGeometryCache = new();
+    private static readonly object PreparedGeometryCacheLock = new();
 
     public static GraphAxisProjection BuildAxes(
         GraphScene scene,
@@ -261,6 +277,502 @@ internal static class GraphPlotProjection
         // second line and are intentionally not rendered.
         return Array.Empty<GraphCanonicalRemainingMarker>();
     }
+
+    /// <summary>
+    /// Prepares the expensive canonical curves once for this immutable period
+    /// scene. Viewport redraws reuse these arrays and only clip their vertices.
+    /// </summary>
+    internal static GraphPreparedGeometry PrepareGeometry(GraphScene scene)
+    {
+        ArgumentNullException.ThrowIfNull(scene);
+        if (scene.IsViewport)
+        {
+            throw new ArgumentException("Prepare each reset-period child, not its composite viewport.", nameof(scene));
+        }
+
+        Lazy<GraphPreparedGeometry> prepared;
+        lock (PreparedGeometryCacheLock)
+        {
+            if (!PreparedGeometryCache.TryGetValue(scene, out prepared!))
+            {
+                prepared = new Lazy<GraphPreparedGeometry>(
+                    () => CreatePreparedGeometry(scene),
+                    LazyThreadSafetyMode.ExecutionAndPublication);
+                PreparedGeometryCache.Add(scene, prepared);
+            }
+        }
+        return prepared.Value;
+    }
+
+    private static GraphPreparedGeometry CreatePreparedGeometry(GraphScene scene) =>
+        new(
+            new Dictionary<GraphSeries, GraphCanonicalModelLineProjection>
+            {
+                [GraphSeries.Astra] = BuildCanonicalModelLines(scene, scene.Astra),
+                [GraphSeries.Luna] = BuildCanonicalModelLines(scene, scene.Luna),
+                [GraphSeries.Sol] = BuildCanonicalModelLines(scene, scene.Sol),
+                [GraphSeries.Terra] = BuildCanonicalModelLines(scene, scene.Terra),
+            },
+            BuildCanonicalRemainingLines(scene, GraphRemainingBaselineMode.PeriodStartAtFullQuota),
+            BuildCanonicalRemainingMarkers(scene));
+
+    internal static GraphCanonicalModelLineProjection BuildViewportModelLines(
+        GraphScene viewport,
+        GraphSeries series)
+    {
+        EnsureViewport(viewport);
+        if (series is GraphSeries.Remaining)
+        {
+            throw new ArgumentOutOfRangeException(nameof(series), "Remaining has a separate projection.");
+        }
+
+        var periods = new List<GraphCanonicalModelLineProjection>();
+        foreach (var child in viewport.PeriodScenes)
+        {
+            var prepared = PrepareGeometry(child);
+            if (!prepared.ModelLines.TryGetValue(series, out var lines))
+            {
+                continue;
+            }
+            periods.Add(new GraphCanonicalModelLineProjection(
+                ClipPeriodLine(viewport, child, lines.Idle),
+                ClipPeriodLine(viewport, child, lines.Flat),
+                ClipPeriodLine(viewport, child, lines.Rising),
+                ClipPeriodLine(viewport, child, lines.Dashed)));
+        }
+
+        return new GraphCanonicalModelLineProjection(
+            MergePeriodLines(viewport, periods.Select(lines => lines.Idle)),
+            MergePeriodLines(viewport, periods.Select(lines => lines.Flat)),
+            MergePeriodLines(viewport, periods.Select(lines => lines.Rising)),
+            MergePeriodLines(viewport, periods.Select(lines => lines.Dashed)));
+    }
+
+    internal static GraphCanonicalRemainingLineProjection BuildViewportRemainingLines(GraphScene viewport)
+    {
+        EnsureViewport(viewport);
+        var periods = viewport.PeriodScenes
+            .Select(child =>
+            {
+                var lines = PrepareGeometry(child).RemainingLines;
+                return new GraphCanonicalRemainingLineProjection(
+                    ClipPeriodLine(viewport, child, lines.Idle, remaining: true),
+                    ClipPeriodLine(viewport, child, lines.Solid, remaining: true),
+                    ClipPeriodLine(viewport, child, lines.Dashed, remaining: true));
+            })
+            .ToArray();
+        return new GraphCanonicalRemainingLineProjection(
+            MergePeriodLines(viewport, periods.Select(lines => lines.Idle), remaining: true),
+            MergePeriodLines(viewport, periods.Select(lines => lines.Solid), remaining: true),
+            MergePeriodLines(viewport, periods.Select(lines => lines.Dashed), remaining: true));
+    }
+
+    internal static IReadOnlyList<GraphCanonicalRemainingMarker> BuildViewportRemainingMarkers(GraphScene viewport)
+    {
+        EnsureViewport(viewport);
+        var span = viewport.PeriodEndAt - viewport.PeriodStartAt;
+        var markers = new List<GraphCanonicalRemainingMarker>();
+        foreach (var child in viewport.PeriodScenes)
+        {
+            var endAt = VisiblePeriodEnd(viewport, child);
+            if (endAt < viewport.PeriodStartAt)
+            {
+                continue;
+            }
+            var childSpan = child.PeriodEndAt - child.PeriodStartAt;
+            foreach (var marker in PrepareGeometry(child).RemainingMarkers)
+            {
+                var timestamp = child.PeriodStartAt + marker.X / 100 * childSpan;
+                if (timestamp < viewport.PeriodStartAt || timestamp > endAt)
+                {
+                    continue;
+                }
+                markers.Add(marker with
+                {
+                    X = Math.Clamp((timestamp - viewport.PeriodStartAt) / span * 100, 0, 100),
+                });
+            }
+        }
+        return markers;
+    }
+
+    internal static IReadOnlyList<GraphUnusedInterval> BuildViewportUnusedIntervals(GraphScene viewport)
+    {
+        EnsureViewport(viewport);
+        var intervals = new List<GraphUnusedInterval>();
+        foreach (var child in viewport.PeriodScenes)
+        {
+            foreach (var interval in BuildVisibleUnusedIntervals(child))
+            {
+                var startAt = Math.Max(viewport.PeriodStartAt, interval.StartAt);
+                var endAt = Math.Min(viewport.PeriodEndAt, interval.EndAt);
+                if (endAt > startAt)
+                {
+                    intervals.Add(new GraphUnusedInterval(startAt, endAt));
+                }
+            }
+        }
+        return intervals.OrderBy(interval => interval.StartAt).ToArray();
+    }
+
+    internal static IReadOnlyList<long> BuildLocalMidnightGuides(GraphScene scene, TimeZoneInfo displayTimeZone)
+    {
+        ArgumentNullException.ThrowIfNull(scene);
+        ArgumentNullException.ThrowIfNull(displayTimeZone);
+
+        var startAt = scene.PeriodStartAt;
+        var endAt = scene.PeriodEndAt;
+        DateTimeOffset localStart;
+        DateTimeOffset localEnd;
+        try
+        {
+            localStart = TimeZoneInfo.ConvertTime(DateTimeOffset.FromUnixTimeSeconds(startAt), displayTimeZone);
+            localEnd = TimeZoneInfo.ConvertTime(DateTimeOffset.FromUnixTimeSeconds(endAt), displayTimeZone);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return Array.Empty<long>();
+        }
+
+        var guides = new List<long>();
+        for (var date = localStart.Date; date <= localEnd.Date; date = date.AddDays(1))
+        {
+            var localMidnight = DateTime.SpecifyKind(date, DateTimeKind.Unspecified);
+            if (displayTimeZone.IsInvalidTime(localMidnight))
+            {
+                continue;
+            }
+
+            DateTime utcMidnight;
+            try
+            {
+                utcMidnight = TimeZoneInfo.ConvertTimeToUtc(localMidnight, displayTimeZone);
+            }
+            catch (ArgumentException)
+            {
+                continue;
+            }
+            var timestamp = new DateTimeOffset(utcMidnight, TimeSpan.Zero).ToUnixTimeSeconds();
+            if (timestamp >= startAt && timestamp <= endAt)
+            {
+                guides.Add(timestamp);
+            }
+        }
+        return guides;
+    }
+
+    internal static bool HasVisibleViewportPoints(
+        IReadOnlyList<GraphScene> periodScenes,
+        long startAt,
+        long endAt)
+    {
+        foreach (var child in periodScenes)
+        {
+            if (!child.HasPoints || child.PeriodStartAt > endAt || child.Timestamps[^1] < startAt)
+            {
+                continue;
+            }
+            if (HasTimestampInRange(child.Timestamps, startAt, endAt))
+            {
+                return true;
+            }
+
+            var prepared = PrepareGeometry(child);
+            var visibleStart = Math.Max(startAt, child.PeriodStartAt);
+            var visibleEnd = VisiblePeriodEnd(startAt, endAt, child);
+            foreach (var lines in prepared.ModelLines.Values)
+            {
+                if (visibleEnd >= visibleStart &&
+                    (AnyClippedPath(visibleStart, visibleEnd, lines.Idle) ||
+                     AnyClippedPath(visibleStart, visibleEnd, lines.Flat) ||
+                     AnyClippedPath(visibleStart, visibleEnd, lines.Rising) ||
+                     AnyClippedPath(visibleStart, visibleEnd, lines.Dashed)))
+                {
+                    return true;
+                }
+            }
+            var remaining = prepared.RemainingLines;
+            if (visibleEnd >= visibleStart &&
+                (AnyClippedPath(visibleStart, visibleEnd, remaining.Idle) ||
+                 AnyClippedPath(visibleStart, visibleEnd, remaining.Solid) ||
+                 AnyClippedPath(visibleStart, visibleEnd, remaining.Dashed)))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    internal static double CalculateViewportModelMaximum(
+        IReadOnlyList<GraphScene> periodScenes,
+        long startAt,
+        long endAt)
+    {
+        var maximum = 0d;
+        foreach (var child in periodScenes)
+        {
+            foreach (var values in child.ModelSeries.Values)
+            {
+                var firstVisible = FirstTimestampAtOrAfter(child.Timestamps, startAt);
+                for (var index = firstVisible; index < values.Count && child.Timestamps[index] <= endAt; index++)
+                {
+                    if (double.IsFinite(values[index]))
+                    {
+                        maximum = Math.Max(maximum, values[index]);
+                    }
+                }
+            }
+
+            var visibleEnd = VisiblePeriodEnd(startAt, endAt, child);
+            if (visibleEnd < startAt)
+            {
+                continue;
+            }
+            foreach (var lines in PrepareGeometry(child).ModelLines.Values)
+            {
+                maximum = MaxLineY(maximum, ClipLine(lines.Idle.Line, startAt, visibleEnd));
+                maximum = MaxLineY(maximum, ClipLine(lines.Flat.Line, startAt, visibleEnd));
+                maximum = MaxLineY(maximum, ClipLine(lines.Rising.Line, startAt, visibleEnd));
+                maximum = MaxLineY(maximum, ClipLine(lines.Dashed.Line, startAt, visibleEnd));
+            }
+        }
+        return Math.Max(1, maximum);
+    }
+
+    private static bool HasTimestampInRange(IReadOnlyList<double> timestamps, long startAt, long endAt)
+    {
+        var index = FirstTimestampAtOrAfter(timestamps, startAt);
+        return index < timestamps.Count && timestamps[index] <= endAt;
+    }
+
+    private static int FirstTimestampAtOrAfter(IReadOnlyList<double> timestamps, long timestamp)
+    {
+        var low = 0;
+        var high = timestamps.Count;
+        while (low < high)
+        {
+            var middle = low + (high - low) / 2;
+            if (timestamps[middle] < timestamp)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+        return low;
+    }
+
+    private static void EnsureViewport(GraphScene viewport)
+    {
+        ArgumentNullException.ThrowIfNull(viewport);
+        if (!viewport.IsViewport)
+        {
+            throw new ArgumentException("A viewport projection requires a composite viewport scene.", nameof(viewport));
+        }
+    }
+
+    private static long VisiblePeriodEnd(GraphScene viewport, GraphScene child) =>
+        VisiblePeriodEnd(viewport.PeriodStartAt, viewport.PeriodEndAt, child);
+
+    private static long VisiblePeriodEnd(long startAt, long endAt, GraphScene child)
+    {
+        if (!child.HasPoints)
+        {
+            return long.MinValue;
+        }
+        var observedEnd = (long)Math.Floor(child.Timestamps[^1]);
+        if (observedEnd < startAt || child.PeriodStartAt > endAt)
+        {
+            return long.MinValue;
+        }
+        return Math.Min(endAt, Math.Min(child.PeriodEndAt, observedEnd));
+    }
+
+    private static GraphCanonicalLineProjection ClipPeriodLine(
+        GraphScene viewport,
+        GraphScene child,
+        GraphCanonicalLineProjection source,
+        bool remaining = false)
+    {
+        var startAt = Math.Max(viewport.PeriodStartAt, child.PeriodStartAt);
+        var endAt = VisiblePeriodEnd(viewport, child);
+        if (endAt < startAt)
+        {
+            return new GraphCanonicalLineProjection(new GraphLineProjection([], []), string.Empty);
+        }
+        var line = ClipLine(source.Line, startAt, endAt);
+        return new GraphCanonicalLineProjection(
+            line,
+            BuildViewportPath(line, viewport, remaining));
+    }
+
+    private static GraphCanonicalLineProjection MergePeriodLines(
+        GraphScene viewport,
+        IEnumerable<GraphCanonicalLineProjection> source,
+        bool remaining = false)
+    {
+        var x = new List<double>();
+        var y = new List<double>();
+        foreach (var projection in source)
+        {
+            var line = projection.Line;
+            if (!line.X.Any(double.IsFinite))
+            {
+                continue;
+            }
+            if (x.Count > 0 && double.IsFinite(x[^1]))
+            {
+                x.Add(double.NaN);
+                y.Add(double.NaN);
+            }
+            x.AddRange(line.X);
+            y.AddRange(line.Y);
+            while (x.Count > 0 && !double.IsFinite(x[^1]))
+            {
+                x.RemoveAt(x.Count - 1);
+                y.RemoveAt(y.Count - 1);
+            }
+        }
+        var merged = new GraphLineProjection(x, y);
+        return new GraphCanonicalLineProjection(merged, BuildViewportPath(merged, viewport, remaining));
+    }
+
+    private static GraphLineProjection ClipLine(
+        GraphLineProjection source,
+        double startAt,
+        double endAt)
+    {
+        if (source.X.Count != source.Y.Count)
+        {
+            throw new ArgumentException("Line coordinate arrays must have the same length.", nameof(source));
+        }
+
+        var runs = new List<List<CanonicalPoint>>();
+        List<CanonicalPoint>? current = null;
+
+        void CloseRun()
+        {
+            if (current is { Count: >= 2 })
+            {
+                runs.Add(current);
+            }
+            current = null;
+        }
+
+        for (var index = 0; index + 1 < source.X.Count; index++)
+        {
+            var x0 = source.X[index];
+            var y0 = source.Y[index];
+            var x1 = source.X[index + 1];
+            var y1 = source.Y[index + 1];
+            if (!double.IsFinite(x0) || !double.IsFinite(y0) ||
+                !double.IsFinite(x1) || !double.IsFinite(y1))
+            {
+                CloseRun();
+                continue;
+            }
+
+            var leftX = Math.Max(startAt, Math.Min(x0, x1));
+            var rightX = Math.Min(endAt, Math.Max(x0, x1));
+            if (rightX < leftX)
+            {
+                CloseRun();
+                continue;
+            }
+
+            var deltaX = x1 - x0;
+            var leftRatio = Math.Abs(deltaX) <= CanonicalGeometryEpsilon ? 0 : (leftX - x0) / deltaX;
+            var rightRatio = Math.Abs(deltaX) <= CanonicalGeometryEpsilon ? 1 : (rightX - x0) / deltaX;
+            var leftPoint = new CanonicalPoint(leftX, y0 + (y1 - y0) * leftRatio);
+            var rightPoint = new CanonicalPoint(rightX, y0 + (y1 - y0) * rightRatio);
+
+            if (current is null || !SamePoint(current[^1], leftPoint))
+            {
+                CloseRun();
+                current = [leftPoint];
+            }
+            if (!SamePoint(current[^1], rightPoint))
+            {
+                current.Add(rightPoint);
+            }
+
+            if (rightX < Math.Max(x0, x1))
+            {
+                CloseRun();
+            }
+        }
+        CloseRun();
+
+        var outputX = new List<double>();
+        var outputY = new List<double>();
+        foreach (var run in runs)
+        {
+            if (outputX.Count > 0)
+            {
+                outputX.Add(double.NaN);
+                outputY.Add(double.NaN);
+            }
+            foreach (var point in run)
+            {
+                outputX.Add(point.X);
+                outputY.Add(point.YTop);
+            }
+        }
+        return new GraphLineProjection(outputX, outputY);
+    }
+
+    private static bool SamePoint(CanonicalPoint left, CanonicalPoint right) =>
+        Math.Abs(left.X - right.X) <= CanonicalGeometryEpsilon &&
+        Math.Abs(left.YTop - right.YTop) <= CanonicalGeometryEpsilon;
+
+    private static bool AnyClippedPath(double startAt, double endAt, GraphCanonicalLineProjection line) =>
+        AnyClippedPath(startAt, endAt, line.Line);
+
+    private static bool AnyClippedPath(double startAt, double endAt, GraphLineProjection line) =>
+        ClipLine(line, startAt, endAt).X.Count >= 2;
+
+    private static double MaxLineY(double maximum, GraphLineProjection line) =>
+        Math.Max(maximum, line.Y.Where(double.IsFinite).DefaultIfEmpty(0).Max());
+
+    private static string BuildViewportPath(GraphLineProjection line, GraphScene viewport, bool remaining)
+    {
+        var span = viewport.PeriodEndAt - viewport.PeriodStartAt;
+        var maximum = remaining ? 100 : Math.Max(viewport.ModelMaximum, 1);
+        var path = new StringBuilder();
+        var startRun = true;
+        for (var index = 0; index < line.X.Count; index++)
+        {
+            var x = line.X[index];
+            var y = line.Y[index];
+            if (!double.IsFinite(x) || !double.IsFinite(y))
+            {
+                startRun = true;
+                continue;
+            }
+            var normalizedX = Math.Clamp((x - viewport.PeriodStartAt) / span * 100, 0, 100);
+            var yTop = remaining
+                ? Math.Clamp(99 - Math.Clamp(y, 0, 100) * 0.98, 1, 99)
+                : Math.Clamp(99 - Math.Max(y, 0) / maximum * 98, 1, 99);
+            var roundedX = RoundCanonicalValue(normalizedX);
+            var roundedY = RoundCanonicalValue(yTop);
+            if (path.Length > 0)
+            {
+                path.Append(' ');
+            }
+            path.Append(CultureInfo.InvariantCulture,
+                $"{(startRun ? "M" : "L")}{roundedX:0.00} {roundedY:0.00}");
+            startRun = false;
+        }
+        return path.ToString();
+    }
+
+    private static bool AnyClippedPath(double startAt, double endAt, GraphCanonicalModelLineProjection lines) =>
+        AnyClippedPath(startAt, endAt, lines.Idle) ||
+        AnyClippedPath(startAt, endAt, lines.Flat) ||
+        AnyClippedPath(startAt, endAt, lines.Rising) ||
+        AnyClippedPath(startAt, endAt, lines.Dashed);
 
     /// <summary>
     /// Builds the quota path while keeping remote observations independent
@@ -684,21 +1196,37 @@ internal static class GraphPlotProjection
         }
 
         var candidates = new List<EndpointCandidate>();
-        AddLatestModelCandidate(scene, scene.Astra, GraphSeries.Astra, culture, candidates);
-        AddLatestModelCandidate(scene, scene.Luna, GraphSeries.Luna, culture, candidates);
-        AddLatestModelCandidate(scene, scene.Terra, GraphSeries.Terra, culture, candidates);
-        AddLatestModelCandidate(scene, scene.Sol, GraphSeries.Sol, culture, candidates);
-        var lastRemaining = scene.Remaining
-            .Select((value, index) => double.IsFinite(value) ? index : -1)
-            .LastOrDefault(index => index >= 0, -1);
-        if (lastRemaining >= 0 && scene.RemainingObserved.Any(observed => observed))
+        if (scene.IsViewport)
         {
-            var remainingAtEndpoint = RemainingValue(scene, lastRemaining);
-            candidates.Add(new EndpointCandidate(
-                GraphSeries.Remaining,
-                FormatRemaining(remainingAtEndpoint, culture),
-                NativeGraphY(remainingAtEndpoint, 100),
-                remainingAtEndpoint));
+            AddViewportModelCandidate(scene, GraphSeries.Astra, scene.Astra, culture, candidates);
+            AddViewportModelCandidate(scene, GraphSeries.Luna, scene.Luna, culture, candidates);
+            AddViewportModelCandidate(scene, GraphSeries.Terra, scene.Terra, culture, candidates);
+            AddViewportModelCandidate(scene, GraphSeries.Sol, scene.Sol, culture, candidates);
+            var remainingLines = BuildViewportRemainingLines(scene);
+            var remainingPoint = LatestPoint(
+                remainingLines.Idle,
+                remainingLines.Solid,
+                remainingLines.Dashed);
+            if (remainingPoint.Found && scene.PeriodScenes.Any(period => period.RemainingObserved.Any(observed => observed)))
+            {
+                candidates.Add(new EndpointCandidate(
+                    GraphSeries.Remaining,
+                    FormatRemaining(remainingPoint.Y, culture),
+                    NativeGraphY(remainingPoint.Y, 100),
+                    remainingPoint.Y));
+            }
+            else
+            {
+                AddLatestRemainingCandidate(scene, culture, candidates);
+            }
+        }
+        else
+        {
+            AddLatestModelCandidate(scene, scene.Astra, GraphSeries.Astra, culture, candidates);
+            AddLatestModelCandidate(scene, scene.Luna, GraphSeries.Luna, culture, candidates);
+            AddLatestModelCandidate(scene, scene.Terra, GraphSeries.Terra, culture, candidates);
+            AddLatestModelCandidate(scene, scene.Sol, GraphSeries.Sol, culture, candidates);
+            AddLatestRemainingCandidate(scene, culture, candidates);
         }
 
         var ordered = candidates
@@ -727,6 +1255,67 @@ internal static class GraphPlotProjection
         }
 
         return labels;
+    }
+
+    private static void AddViewportModelCandidate(
+        GraphScene scene,
+        GraphSeries series,
+        IReadOnlyList<double> visibleValues,
+        CultureInfo culture,
+        ICollection<EndpointCandidate> candidates)
+    {
+        var lines = BuildViewportModelLines(scene, series);
+        var point = LatestPoint(lines.Idle, lines.Flat, lines.Rising, lines.Dashed);
+        if (point.Found)
+        {
+            AddModelCandidate(point.Y, scene.ModelMaximum, scene.Metric, series, culture, candidates);
+        }
+        else
+        {
+            AddLatestModelCandidate(scene, visibleValues, series, culture, candidates);
+        }
+    }
+
+    private static void AddLatestRemainingCandidate(
+        GraphScene scene,
+        CultureInfo culture,
+        ICollection<EndpointCandidate> candidates)
+    {
+        var lastRemaining = scene.Remaining
+            .Select((value, index) => double.IsFinite(value) ? index : -1)
+            .LastOrDefault(index => index >= 0, -1);
+        if (lastRemaining < 0 || !scene.RemainingObserved.Any(observed => observed))
+        {
+            return;
+        }
+        var remainingAtEndpoint = RemainingValue(scene, lastRemaining);
+        candidates.Add(new EndpointCandidate(
+            GraphSeries.Remaining,
+            FormatRemaining(remainingAtEndpoint, culture),
+            NativeGraphY(remainingAtEndpoint, 100),
+            remainingAtEndpoint));
+    }
+
+    private static (bool Found, double X, double Y) LatestPoint(params GraphCanonicalLineProjection[] lines)
+    {
+        var found = false;
+        var latestX = double.NegativeInfinity;
+        var latestY = double.NaN;
+        foreach (var projection in lines)
+        {
+            var line = projection.Line;
+            for (var index = 0; index < line.X.Count && index < line.Y.Count; index++)
+            {
+                if (!double.IsFinite(line.X[index]) || !double.IsFinite(line.Y[index]) || line.X[index] < latestX)
+                {
+                    continue;
+                }
+                found = true;
+                latestX = line.X[index];
+                latestY = line.Y[index];
+            }
+        }
+        return (found, latestX, latestY);
     }
 
     internal static string FormatAxisValue(double value, GraphMetric metric, CultureInfo culture)
