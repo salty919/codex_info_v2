@@ -2646,9 +2646,12 @@ function Assert-E2EFixtureV3PreflightResponses {
         [Int64]$pastSamples[2].timestamp -eq $expectedIdleEnd -and
         [Int64]$pastSamples[3].timestamp -eq $pastEnd) `
         'Fixture past history does not place its confirmed idle interval at the declared period fractions.'
+    # The normal fixture proves the exact admission threshold; the theme
+    # fixture spans multiple days to exercise date labels and their layout.
+    [Int64]$expectedIdleSeconds = if ($GraphThemes) { 86400 } else { $script:e2eFixtureUnusedMinimumSeconds }
     Assert-E2E (([Int64]$pastSamples[2].timestamp - [Int64]$pastSamples[1].timestamp) -eq
-        $script:e2eFixtureUnusedMinimumSeconds) `
-        'Fixture past history must prove the exact 10-minute unused threshold.'
+        $expectedIdleSeconds) `
+        "Fixture past history must prove its exact $expectedIdleSeconds-second unused interval."
     Assert-E2E (@($pastSamples[1..2] | Where-Object {
             -not $_.models_complete -or $_.model_source -cne 'confirmed' -or
             [Int64]$_.reset_at -ne [Int64]$pastPeriod[0].reset_at
@@ -2656,7 +2659,13 @@ function Assert-E2EFixtureV3PreflightResponses {
         [double]$pastSamples[1].remaining_percent -eq [double]$pastSamples[2].remaining_percent -and
         @($json['past-history'].history_gaps).Count -eq 0) `
         'Fixture past idle interval is not backed by complete direct observations without gaps.'
-    foreach ($model in @('SOL', 'TERRA', 'LUNA')) {
+    $expectedHistoryModels = @('SOL', 'TERRA', 'LUNA')
+    if ($GraphThemes) { $expectedHistoryModels += 'ASTRA' }
+    foreach ($model in $expectedHistoryModels) {
+        foreach ($sample in $pastSamples) {
+            Assert-E2E (@($sample.models | Where-Object { $_.model -ceq $model }).Count -eq 1) `
+                "Fixture past history must contain exactly one $model observation per sample."
+        }
         $idleTotals = @(1..2 | ForEach-Object {
             [Int64](($pastSamples[$_].models | Where-Object { $_.model -ceq $model }).total_tokens)
         } | Select-Object -Unique)

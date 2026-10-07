@@ -388,6 +388,55 @@ public sealed class GraphViewportRenderingTests
     }
 
     [Fact]
+    public void SameDayPeriodKeepsUpperModelTickInsideFigureWithoutDateHeader()
+    {
+        var start = Unix("2026-10-07T21:10:00Z");
+        var end = Unix("2026-10-07T21:50:00Z");
+        var scene = GraphScene.Create(
+        [
+            Sample(start, end, sol: 100, taskActiveSincePrevious: false),
+            Sample(start + 1_200, end, sol: 600, taskActiveSincePrevious: false),
+            Sample(end, end, sol: 1_800, taskActiveSincePrevious: false),
+        ],
+        GraphMetric.Tokens,
+        start,
+        end);
+        var timeZoneProperty = typeof(LocalizationService).GetProperty(nameof(LocalizationService.DisplayTimeZone));
+        Assert.NotNull(timeZoneProperty);
+        var setter = timeZoneProperty.GetSetMethod(nonPublic: true);
+        Assert.NotNull(setter);
+        var priorZone = LocalizationService.DisplayTimeZone;
+        try
+        {
+            setter.Invoke(null, [TimeZoneInfo.Utc]);
+            var control = new GraphPlotControl { Scene = scene };
+            using var rendered = control.Plot.GetImage(940, 480);
+            var axes = GraphPlotProjection.BuildAxes(scene, TimeZoneInfo.Utc, CultureInfo.InvariantCulture);
+            var topAxis = control.Plot.Axes.Top;
+            var leftAxis = control.Plot.Axes.Left;
+            var upperTick = Assert.Single(
+                leftAxis.TickGenerator.Ticks,
+                tick => Math.Abs(tick.Position - axes.ModelValues[^1]) < 1e-8);
+            var dataTop = control.Plot.LastRender.DataRect.Top;
+            var halfTickFontHeight = Math.Ceiling(leftAxis.TickLabelStyle.FontSize / 2d);
+            var oneTickFontHeight = Math.Ceiling(leftAxis.TickLabelStyle.FontSize);
+            var pixels = rendered.GetArrayRGB();
+
+            Assert.Empty(axes.TopDateValues);
+            Assert.Empty(topAxis.TickGenerator.Ticks);
+            Assert.Equal(axes.ModelLabels[^1], upperTick.Label);
+            Assert.Equal("1.8K", upperTick.Label);
+            Assert.Equal(480, pixels.GetLength(0));
+            Assert.Equal(940, pixels.GetLength(1));
+            Assert.InRange((double)dataTop, halfTickFontHeight, oneTickFontHeight + 4);
+        }
+        finally
+        {
+            setter.Invoke(null, [priorZone]);
+        }
+    }
+
+    [Fact]
     public void TopDateAxisTracksControlWidthAfterResizeAndExpansion()
     {
         var start = Unix("2026-01-01T00:00:00Z");

@@ -401,7 +401,10 @@ public sealed class GraphPlotControl : Control
     private static void ApplyTopDateAxis(PlotPresentation presentation, GraphAxisProjection axes)
     {
         var topAxis = presentation.Plot.Axes.Top;
-        topAxis.IsVisible = axes.TopDateValues.Count > 0;
+        // Keep the empty panel's measured tick-label padding so the maximum
+        // left-axis label is not clipped when this period has no midnight.
+        // The empty manual generator adds no date labels or header text.
+        topAxis.IsVisible = true;
         topAxis.TickGenerator = new NumericManual(
             axes.TopDateValues.ToArray(),
             axes.TopDateLabels.ToArray());
