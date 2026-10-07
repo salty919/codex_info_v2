@@ -43,6 +43,155 @@ public sealed class GraphWindowRangeTests
         Assert.Equal(period.EndAt, graph.Scene.PeriodEndAt);
     }
 
+    [Fact]
+    public async Task ResetPeriodNavigationUsesPublishedOrderForThreePeriodRoundTrip()
+    {
+        var current = CreatePeriod(
+            "current",
+            FixedNow - WeekSeconds,
+            FixedNow - 60,
+            resetAt: FixedNow + 3_600,
+            current: true,
+            sol: 17);
+        var middle = CreatePeriod(
+            "middle",
+            FixedNow - 4 * 3_600,
+            FixedNow - 2 * 3_600,
+            resetAt: FixedNow - 3_600,
+            current: false,
+            sol: 18);
+        var oldest = CreatePeriod(
+            "oldest",
+            FixedNow - 10 * 3_600,
+            FixedNow - 8 * 3_600,
+            resetAt: FixedNow - 7 * 3_600,
+            current: false,
+            sol: 19);
+        using var main = await StartMainAsync([current, middle, oldest]);
+        using var graph = CreateGraph(main, () => FixedNow);
+        var changed = new ConcurrentQueue<string?>();
+        graph.PropertyChanged += (_, eventArgs) => changed.Enqueue(eventArgs.PropertyName);
+
+        Assert.Equal("current", graph.SelectedPeriod?.Id);
+        Assert.True(graph.CanGoBack);
+        Assert.False(graph.CanGoForward);
+
+        graph.GoBack();
+        Assert.Equal("middle", graph.SelectedPeriod?.Id);
+        Assert.Equal(middle.StartAt, graph.Scene.PeriodStartAt);
+        Assert.Equal(middle.EndAt, graph.Scene.PeriodEndAt);
+        Assert.True(graph.CanGoBack);
+        Assert.True(graph.CanGoForward);
+
+        graph.GoBack();
+        Assert.Equal("oldest", graph.SelectedPeriod?.Id);
+        Assert.Equal(oldest.StartAt, graph.Scene.PeriodStartAt);
+        Assert.Equal(oldest.EndAt, graph.Scene.PeriodEndAt);
+        Assert.False(graph.CanGoBack);
+        Assert.True(graph.CanGoForward);
+
+        var oldestScene = graph.Scene;
+        graph.GoBack();
+        Assert.Same(oldestScene, graph.Scene);
+        Assert.Equal("oldest", graph.SelectedPeriod?.Id);
+
+        graph.GoForward();
+        Assert.Equal("middle", graph.SelectedPeriod?.Id);
+        graph.GoForward();
+        Assert.Equal("current", graph.SelectedPeriod?.Id);
+        Assert.True(graph.CanGoBack);
+        Assert.False(graph.CanGoForward);
+        Assert.Contains(nameof(GraphWindowViewModel.CanGoBack), changed);
+        Assert.Contains(nameof(GraphWindowViewModel.CanGoForward), changed);
+    }
+
+    [Fact]
+    public async Task ResetPeriodNavigationDisablesEmptyAndSinglePeriodBoundaries()
+    {
+        using var emptyMain = await StartMainAsync(Array.Empty<ApiHistoryPeriod>());
+        using var emptyGraph = CreateGraph(emptyMain, () => FixedNow);
+        var emptyScene = emptyGraph.Scene;
+
+        Assert.Null(emptyGraph.SelectedPeriod);
+        Assert.False(emptyGraph.CanGoBack);
+        Assert.False(emptyGraph.CanGoForward);
+        emptyGraph.GoBack();
+        emptyGraph.GoForward();
+        Assert.Same(emptyScene, emptyGraph.Scene);
+
+        var only = CreatePeriod(
+            "only",
+            FixedNow - WeekSeconds,
+            FixedNow - 60,
+            resetAt: FixedNow + 3_600,
+            current: true,
+            sol: 17);
+        using var singleMain = await StartMainAsync([only]);
+        using var singleGraph = CreateGraph(singleMain, () => FixedNow);
+        var singleScene = singleGraph.Scene;
+
+        Assert.Equal("only", singleGraph.SelectedPeriod?.Id);
+        Assert.False(singleGraph.CanGoBack);
+        Assert.False(singleGraph.CanGoForward);
+        singleGraph.GoBack();
+        singleGraph.GoForward();
+        Assert.Same(singleScene, singleGraph.Scene);
+    }
+
+    [Fact]
+    public async Task FailedResetPeriodNavigationKeepsAcceptedSelectionAndSceneAndCanRetry()
+    {
+        var current = CreatePeriod(
+            "current",
+            FixedNow - WeekSeconds,
+            FixedNow - 60,
+            resetAt: FixedNow + 3_600,
+            current: true,
+            sol: 17);
+        var past = CreatePeriod(
+            "past",
+            FixedNow - 4 * 3_600,
+            FixedNow - 2 * 3_600,
+            resetAt: FixedNow - 3_600,
+            current: false,
+            sol: 18);
+        var client = new RangeResourceClient([current, past], Pair);
+        using var main = CreateResourceMain(client);
+        using var graph = CreateGraph(main, () => FixedNow);
+        await EventuallyAsync(() => graph.HasPoints && !graph.IsLoading);
+        var acceptedPeriod = graph.SelectedPeriod;
+        var acceptedLabel = graph.SelectedPeriodText;
+        var acceptedScene = graph.Scene;
+        client.FailPeriodId = "past";
+        client.FailPages = true;
+
+        graph.GoBack();
+
+        Assert.Same(acceptedPeriod, graph.SelectedPeriod);
+        Assert.Equal(acceptedLabel, graph.SelectedPeriodText);
+        Assert.Same(acceptedScene, graph.Scene);
+        await EventuallyAsync(() => !graph.IsLoading && graph.HasLoadError);
+        Assert.Same(acceptedPeriod, graph.SelectedPeriod);
+        Assert.Equal(acceptedLabel, graph.SelectedPeriodText);
+        Assert.Same(acceptedScene, graph.Scene);
+        Assert.True(graph.CanGoBack);
+        Assert.False(graph.CanGoForward);
+
+        client.FailPages = false;
+        graph.GoBack();
+        await EventuallyAsync(() => !graph.IsLoading && graph.SelectedPeriod?.Id == "past");
+        Assert.False(graph.HasLoadError);
+        Assert.Equal(past.StartAt, graph.Scene.PeriodStartAt);
+        Assert.Equal(past.EndAt, graph.Scene.PeriodEndAt);
+        Assert.False(graph.CanGoBack);
+        Assert.True(graph.CanGoForward);
+
+        graph.GoForward();
+        await EventuallyAsync(() => !graph.IsLoading && graph.SelectedPeriod?.Id == "current");
+        Assert.True(graph.CanGoBack);
+        Assert.False(graph.CanGoForward);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
