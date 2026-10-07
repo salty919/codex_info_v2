@@ -1236,13 +1236,10 @@ fn build_details_for_intervals(
         if raw.len() > MAX_HISTORY_ROWS {
             return Err(ReaderError::TooManyRows(raw.len()));
         }
-        let mut samples = raw
-            .iter()
+        raw.iter()
             .filter(|row| row.timestamp > cutoff && row.timestamp <= observed_at)
             .map(public_sample_from_raw)
-            .collect::<Vec<_>>();
-        normalize_current_period_samples(&mut samples, current_reset_at, window_seconds);
-        samples
+            .collect::<Vec<_>>()
     } else {
         canonicalize_history_for_public_window(raw, current_reset_at, window_seconds)?
     };
@@ -1294,7 +1291,14 @@ fn build_details_for_intervals(
     clip_history_periods(&mut periods, intervals);
     let quota = latest_quota_reset_at
         .and_then(|latest_reset_at| {
-            latest_quota_row(raw, current_reset_at, window_seconds).and_then(|row| {
+            latest_quota_row(
+                raw,
+                current_reset_at,
+                current_window_reset_at,
+                window_seconds,
+                history_is_canonical,
+            )
+            .and_then(|row| {
                 row.remaining_percent.map(|remaining_percent| PublicQuota {
                     remaining_percent,
                     reset_at: latest_reset_at,
@@ -1308,6 +1312,7 @@ fn build_details_for_intervals(
         connection,
         intervals,
         current_reset_at,
+        current_window_reset_at,
         window_seconds,
         history_is_canonical,
     )?;
@@ -1319,6 +1324,7 @@ fn build_details_for_intervals(
         current_reset_at,
         current_window_reset_at,
         window_seconds,
+        history_is_canonical,
     };
     let history_samples_v3 = read_history_projection_for_intervals(
         connection,
@@ -1885,6 +1891,7 @@ struct HistoryProjectionContext<'a> {
     current_reset_at: Option<i64>,
     current_window_reset_at: Option<i64>,
     window_seconds: i64,
+    history_is_canonical: bool,
 }
 
 /// Build the v3 graph rows from the durable observation JSON and model-history
@@ -1899,12 +1906,17 @@ fn read_history_projection_for_intervals(
     cutoff: i64,
     context: HistoryProjectionContext<'_>,
 ) -> Result<Vec<PublicHistoryObservationV3>, ReaderError> {
+    // Canonical partitions already have writer-owned period keys. Only a
+    // nonpartition legacy source needs read-time alias normalization.
+    let legacy_alias_reset_at = context
+        .current_reset_at
+        .filter(|_| !context.history_is_canonical);
     let (observations, provenance_generations) = read_stored_history_observations_for_intervals(
         connection,
         cutoff,
         observed_at,
         context.intervals,
-        context.current_reset_at,
+        legacy_alias_reset_at,
         context.window_seconds,
     )?;
     let model_groups = read_history_model_groups_for_intervals(
@@ -1912,15 +1924,13 @@ fn read_history_projection_for_intervals(
         cutoff,
         observed_at,
         context.intervals,
-        context.current_reset_at,
+        legacy_alias_reset_at,
         context.window_seconds,
     )?;
 
-    // Durable observation provenance and model totals are authoritative for
-    // the canonical period key.  During a provider transition, a row may
-    // retain the previous reset value even though its timestamp is inside the
-    // current window; the readers below normalize that timestamp to the
-    // current reset before joining the sidecars.
+    // A canonical row and its sidecars keep the same committed period key.
+    // A later provider window must not move an old confirmed model vector
+    // into the new period's regression watermark.
     let mut observations_by_key = BTreeMap::<(i64, i64), &StoredHistoryObservation>::new();
     for observation in &observations {
         observations_by_key.insert((observation.reset_at, observation.timestamp), observation);
@@ -3265,8 +3275,24 @@ fn civil_date_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
 fn latest_quota_row(
     rows: &[RawSample],
     current_reset_at: Option<i64>,
+    current_window_reset_at: Option<i64>,
     window_seconds: i64,
+    history_is_canonical: bool,
 ) -> Option<&RawSample> {
+    if history_is_canonical {
+        let authority = current_reset_at?;
+        let window_reset = current_window_reset_at.unwrap_or(authority);
+        let start = quota_period_start(window_reset, window_seconds)?;
+        return rows
+            .iter()
+            .filter(|row| {
+                row.reset_at == authority
+                    && row.remaining_percent.is_some()
+                    && row.timestamp >= start
+                    && row.timestamp <= window_reset
+            })
+            .max_by_key(|row| row.timestamp);
+    }
     if let Some(authority) = current_reset_at {
         if let Some(start) = quota_period_start(authority, window_seconds) {
             if let Some(row) = rows
@@ -4056,6 +4082,7 @@ fn read_model_projection_for_intervals(
     connection: &Connection,
     intervals: &ReadIntervals,
     current_reset_at: Option<i64>,
+    current_window_reset_at: Option<i64>,
     window_seconds: i64,
     history_is_canonical: bool,
 ) -> Result<ModelProjection, ReaderError> {
@@ -4086,8 +4113,11 @@ fn read_model_projection_for_intervals(
     if !table_exists(connection, "usage_model_history")? {
         return Ok(ModelProjection::default());
     }
+    let window_reset_at = current_window_reset_at
+        .filter(|_| history_is_canonical)
+        .or(current_scope);
     let authoritative_start =
-        current_scope.and_then(|reset_at| quota_period_start(reset_at, window_seconds));
+        window_reset_at.and_then(|reset_at| quota_period_start(reset_at, window_seconds));
     let has_cache_write = table_has_column(
         connection,
         "usage_model_history",
@@ -4142,8 +4172,12 @@ fn read_model_projection_for_intervals(
             continue;
         }
         if let Some(authority) = current_scope {
-            let in_current_window = authoritative_start
-                .is_some_and(|start| timestamp >= start && timestamp <= authority);
+            if history_is_canonical && reset_at != authority {
+                continue;
+            }
+            let in_current_window = authoritative_start.is_some_and(|start| {
+                timestamp >= start && timestamp <= window_reset_at.unwrap_or(authority)
+            });
             if (!in_current_window
                 && reset_at.abs_diff(authority) > RESET_AT_TOLERANCE_SECONDS as u64)
                 || authoritative_start.is_some_and(|start| timestamp < start)
@@ -4151,8 +4185,11 @@ fn read_model_projection_for_intervals(
                 continue;
             }
         }
-        let canonical_reset =
-            canonical_period_reset_at(reset_at, timestamp, current_scope, window_seconds);
+        let canonical_reset = if history_is_canonical {
+            reset_at
+        } else {
+            canonical_period_reset_at(reset_at, timestamp, current_scope, window_seconds)
+        };
         let key = (timestamp, canonical_reset);
         if group_key.is_some_and(|current| current != key) {
             if group_complete && !group.is_empty() {
@@ -4551,6 +4588,193 @@ mod tests {
 
     fn active_thread_json(id: &str, updated_at: i64) -> String {
         serde_json::json!([active_thread_value(id, updated_at)]).to_string()
+    }
+
+    #[test]
+    fn weekly_rollover_preserves_canonical_period_ownership() {
+        // Fixed observations reproduce the period overlap independently of
+        // reader normalization: the last old-period observation is inside
+        // the new provider window, but retains its committed period key.
+        const OLD_RESET: i64 = 1_800_236_506;
+        const RESET: i64 = 1_800_604_818;
+        const PREFIX: i64 = 1_800_000_000;
+        const OLD_TAIL: i64 = 1_800_000_060;
+        const EMPTY: i64 = 1_800_000_120;
+        const FIRST_USAGE: i64 = 1_800_000_420;
+        let path = temp_db("weekly-period-ownership");
+        make_boundary_db(&path, PREFIX);
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 13,
+            partition_id: "33".repeat(32),
+        };
+        add_partition_identity(&path, &identity);
+        let connection = Connection::open(&path).expect("rollover fixture DB");
+        connection
+            .execute_batch(
+                "DELETE FROM usage_model_history;
+                 DELETE FROM usage_history;
+                 ALTER TABLE collection_generation
+                    ADD COLUMN latest_quota_reset_at INTEGER NOT NULL DEFAULT 0;",
+            )
+            .expect("rollover fixture rows");
+        connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1,
+                    latest_quota_reset_at=?2, window_seconds=604800 WHERE singleton=1",
+                params![RESET, RESET - 1],
+            )
+            .expect("stable period and rolling provider deadline");
+        let insert_observation = |timestamp: i64, reset: i64, singleton: i64, old: bool| {
+            let (remaining, sol_dollars, luna_dollars, sol_tokens, luna_tokens) = if old {
+                (1.0, 119.201_816, 13.128_262_44, 135_888_894, 359_286_199)
+            } else if timestamp == FIRST_USAGE {
+                (100.0, 0.223_328, 0.0, 97_555, 0)
+            } else {
+                (100.0, 0.0, 0.0, 0, 0)
+            };
+            connection
+                .execute(
+                    "INSERT INTO usage_history VALUES(?1,?2,?3,?4,0.0,?5,?6,0,?7)",
+                    params![
+                        timestamp,
+                        reset,
+                        remaining,
+                        sol_dollars,
+                        luna_dollars,
+                        sol_tokens,
+                        luna_tokens
+                    ],
+                )
+                .expect("literal usage observation");
+            let observation = serde_json::json!({
+                "kind": "codex-info-usage-observation-v1",
+                "timestamp": timestamp,
+                "reset_at": reset,
+                "remaining_percent": remaining,
+                "model_source": "confirmed",
+            });
+            connection
+                .execute(
+                    "INSERT INTO durable_state VALUES(?1,?2,?3)",
+                    params![singleton, timestamp, observation.to_string()],
+                )
+                .expect("exact period provenance");
+            let models = if old {
+                vec![
+                    ("SOL", 135_888_894, 134_789_644, 130_605_312, 1_099_250),
+                    ("LUNA", 359_286_199, 356_082_873, 344_068_352, 3_203_326),
+                    ("ASTRA", 97_830_996, 97_473_777, 94_499_072, 357_219),
+                ]
+            } else if timestamp == FIRST_USAGE {
+                vec![("SOL", 97_555, 97_258, 60_416, 297)]
+            } else {
+                Vec::new()
+            };
+            for (model, total, input, cached, output) in models {
+                connection
+                    .execute(
+                        "INSERT INTO usage_model_history VALUES(?1,?2,?3,?4,?5,?6,?7,'0',1)",
+                        params![
+                            reset,
+                            timestamp,
+                            model,
+                            total.to_string(),
+                            input.to_string(),
+                            cached.to_string(),
+                            output.to_string()
+                        ],
+                    )
+                    .expect("complete literal model group");
+            }
+        };
+        insert_observation(PREFIX, OLD_RESET, 2, true);
+        insert_observation(OLD_TAIL, OLD_RESET, 3, true);
+        insert_observation(EMPTY, RESET, 4, false);
+        let reader = DbReader::open_partitioned(&path, &identity).expect("canonical reader");
+
+        for first_usage in [false, true] {
+            if first_usage {
+                insert_observation(FIRST_USAGE, RESET, 5, false);
+            }
+            let before = fs::read(&path).expect("original canonical DB bytes");
+            let snapshot = reader.read_snapshot().expect("complete rollover snapshot");
+            assert_eq!(fs::read(&path).expect("DB after read"), before);
+            let quota = snapshot.details.quota.as_ref().expect("current quota");
+            assert_eq!(quota.remaining_percent, 100.0);
+            assert_eq!(quota.reset_at, RESET - 1);
+            let current_period = snapshot
+                .details
+                .history_periods
+                .iter()
+                .find(|period| period.current)
+                .expect("current period");
+            assert_eq!(current_period.reset_at, RESET);
+            assert_eq!(current_period.start_at, 1_800_000_017);
+            assert_eq!(
+                current_period.end_at,
+                if first_usage { FIRST_USAGE } else { EMPTY }
+            );
+            let old_tail = snapshot
+                .history_samples_v3
+                .iter()
+                .find(|sample| sample.timestamp == OLD_TAIL)
+                .expect("retained old observation");
+            assert_eq!(
+                old_tail.reset_at, OLD_RESET,
+                "committed period ownership must not change"
+            );
+            assert_eq!(old_tail.remaining_percent, Some(1.0));
+            assert_eq!(old_tail.model_source, "confirmed");
+            assert!(old_tail.models_complete);
+            assert_eq!(old_tail.models.as_ref().expect("old models").len(), 3);
+            assert!(snapshot
+                .history_samples_v3
+                .iter()
+                .filter(|sample| sample.reset_at == RESET)
+                .all(|sample| sample.timestamp >= EMPTY && sample.remaining_percent != Some(1.0)));
+            if first_usage {
+                assert_eq!(snapshot.models_v3.len(), 1);
+                assert_eq!(snapshot.models_v3[0].model, "SOL");
+                assert_eq!(snapshot.models_v3[0].total_tokens, 97_555);
+                assert!(
+                    (snapshot.models_v3[0]
+                        .estimated_cost
+                        .as_ref()
+                        .expect("SOL price")
+                        .total_dollars
+                        - 0.223_328)
+                        .abs()
+                        < 1e-12
+                );
+                let new_usage = snapshot
+                    .history_samples_v3
+                    .iter()
+                    .find(|sample| sample.timestamp == FIRST_USAGE)
+                    .expect("new period usage");
+                assert_eq!(new_usage.reset_at, RESET);
+                assert_eq!(new_usage.model_source, "confirmed");
+                assert!(new_usage.models_complete);
+                let models = new_usage
+                    .models
+                    .as_ref()
+                    .expect("new SOL must not be suppressed");
+                assert_eq!(models.len(), 1);
+                assert_eq!(models[0].model, "SOL");
+                assert_eq!(models[0].total_tokens, 97_555);
+                assert_eq!(models[0].total_dollars, Some(0.223_328));
+            } else {
+                assert!(
+                    snapshot.details.models.is_empty(),
+                    "new empty period must not revive old models"
+                );
+                assert!(snapshot.models_v3.is_empty());
+            }
+        }
+        drop(connection);
+        fs::remove_file(path).expect("cleanup rollover fixture");
     }
 
     #[test]
@@ -6037,6 +6261,7 @@ mod tests {
             &connection,
             &intervals,
             Some(reset_at),
+            Some(reset_at),
             window_seconds,
             false,
         )
@@ -6050,6 +6275,7 @@ mod tests {
             &connection,
             &intervals,
             Some(reset_at),
+            Some(reset_at),
             window_seconds,
             false,
         )
@@ -6057,9 +6283,15 @@ mod tests {
         assert_eq!(current.v3.len(), 1);
         assert_eq!(current.v3[0].model, "SOL");
         assert_eq!(current.v3[0].total_tokens, 12);
-        let invalid_window =
-            read_model_projection_for_intervals(&connection, &intervals, Some(reset_at), 0, false)
-                .expect("invalid-window projection");
+        let invalid_window = read_model_projection_for_intervals(
+            &connection,
+            &intervals,
+            Some(reset_at),
+            Some(reset_at),
+            0,
+            false,
+        )
+        .expect("invalid-window projection");
         assert!(invalid_window.v1.is_empty());
         assert!(invalid_window.v3.is_empty());
         fs::remove_file(path).expect("cleanup timestamped fixture");
@@ -6080,15 +6312,22 @@ mod tests {
             &session_connection,
             &intervals,
             Some(reset_at),
+            Some(reset_at),
             window_seconds,
             false,
         )
         .expect("unscoped projection");
         assert!(unscoped.v1.is_empty());
         assert!(unscoped.v3.is_empty());
-        let canonical_without_authority =
-            read_model_projection_for_intervals(&session_connection, &intervals, None, 0, true)
-                .expect("canonical authority fail-closed projection");
+        let canonical_without_authority = read_model_projection_for_intervals(
+            &session_connection,
+            &intervals,
+            None,
+            None,
+            0,
+            true,
+        )
+        .expect("canonical authority fail-closed projection");
         assert!(canonical_without_authority.v1.is_empty());
         assert!(canonical_without_authority.v3.is_empty());
         fs::remove_file(session_path).expect("cleanup timestamp-less fixture");
