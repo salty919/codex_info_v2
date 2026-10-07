@@ -247,6 +247,11 @@ public static class CodexInfoGraphPixelScanner {
         ColorTranslator.FromHtml("#E6A23C"),
     };
 
+    private static bool MatchesSeriesStroke(Color actual, Color foreground) {
+        return MatchesCompositedStroke(actual, foreground, PlotColor) ||
+            MatchesCompositedStroke(actual, foreground, IdleColor);
+    }
+
     public static CodexInfoGraphPixelMeasurement Scan(
         string path,
         int plotLeft,
@@ -363,7 +368,7 @@ public static class CodexInfoGraphPixelScanner {
                     bool hasBoundarySeriesPixel = false;
                     for (int localY = 0; localY < plotHeight; localY++) {
                         Color pixel = bitmap.GetPixel(plotLeft + localX, plotTop + localY);
-                        if (Matches(pixel, SeriesColors[series], 24)) {
+                        if (MatchesSeriesStroke(pixel, SeriesColors[series])) {
                             hasBoundarySeriesPixel = true;
                             break;
                         }
@@ -382,7 +387,7 @@ public static class CodexInfoGraphPixelScanner {
                 for (int localY = 0; localY < plotHeight; localY++) {
                     Color pixel = bitmap.GetPixel(plotLeft + localX, plotTop + localY);
                     for (int series = 0; series < SeriesColors.Length; series++) {
-                        if (!Matches(pixel, SeriesColors[series], 24)) continue;
+                        if (!MatchesSeriesStroke(pixel, SeriesColors[series])) continue;
                         count[series]++;
                         rightmost[series] = Math.Max(rightmost[series], localX);
                         // A measured series terminates on the period-end grid,
@@ -1965,6 +1970,28 @@ function Invoke-E2EGraphPixelScannerSelfTest {
             $bitmap.Dispose()
         }
     }
+
+    $thinPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-thin-strokes.png'
+    $bitmap = New-Object System.Drawing.Bitmap(240, 140)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.Clear($background)
+        $gridPen = New-Object System.Drawing.Pen($gridColor, 1)
+        try { foreach ($x in @(10, 50, 90, 130, 170)) { $graphics.DrawLine($gridPen, $x, 5, $x, 135) } }
+        finally { $gridPen.Dispose() }
+        # Fixed independent half-covered 95%-opaque role colors over #121C2C.
+        $thinColors = @('#32638B', '#59518B', '#366E59', '#775C34')
+        for ($index = 0; $index -lt $thinColors.Count; $index++) {
+            $color = [System.Drawing.ColorTranslator]::FromHtml($thinColors[$index])
+            foreach ($x in 20..160) { $bitmap.SetPixel($x, 30 + $index * 20, $color) }
+        }
+        $bitmap.Save($thinPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally { $graphics.Dispose(); $bitmap.Dispose() }
+    $thin = [CodexInfoGraphPixelScanner]::Scan($thinPath, 0, 0, 240, 140)
+    Assert-E2E (@($thin.SeriesPixelCount | Where-Object { $_ -lt 100 }).Count -eq 0) `
+        'Scanner must recognize each anti-aliased thin series without endpoint labels.'
+    Write-E2E 'graph-pixel-scanner-self-test: PASS anti-aliased thin lines without endpoint labels'
 
     try {
         $resetGuideMeasurement = $null
