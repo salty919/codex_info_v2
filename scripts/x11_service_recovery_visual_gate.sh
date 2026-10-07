@@ -716,7 +716,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as stream:
     # The last context is the active-thread model authority. Keep it SOL and
     # leave the lifecycle open so the exact one-thread Main fixture is live.
     stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol"}) + "\n")
-    stream.write(json.dumps({"type": "task_started"}) + "\n")
+    stream.write(json.dumps({"type": "task_started", "timestamp": timestamp}) + "\n")
 PY
 chmod 600 "$session_fixture"
 
@@ -935,7 +935,8 @@ with open(sys.argv[1], "a", encoding="utf-8") as stream:
             },
         }) + "\n")
     stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol"}) + "\n")
-    stream.write(json.dumps({"type": "task_started"}) + "\n")
+    # An untimed lifecycle event leaves the scanned source incomplete.
+    stream.write(json.dumps({"type": "task_started", "timestamp": timestamp}) + "\n")
 PY
 }
 service_models_ready() {
