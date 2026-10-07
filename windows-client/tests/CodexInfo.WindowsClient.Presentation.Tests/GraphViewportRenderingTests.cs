@@ -240,7 +240,7 @@ public sealed class GraphViewportRenderingTests
                 var control = new GraphPlotControl { Scene = scene };
                 var midnightGuides = control.Plot.GetPlottables()
                     .OfType<ScottPlot.Plottables.Scatter>()
-                    .Where(line => line.LineWidth == 1.5f)
+                    .Where(line => line.LineColor.ToStringRGB() == "#FFFFFF")
                     .ToArray();
                 Assert.Equal(expected.Length, midnightGuides.Length);
                 var guidePoints = midnightGuides
@@ -249,7 +249,8 @@ public sealed class GraphViewportRenderingTests
                 Assert.All(midnightGuides, line =>
                 {
                     Assert.True(line.IsVisible);
-                    Assert.Equal("#FFFFFF", line.LineColor.ToHex());
+                    Assert.Equal(0.5f, line.LineWidth);
+                    AssertOpacity(line.LineColor, 0.30);
                 });
                 Assert.All(guidePoints, points =>
                 {
@@ -290,9 +291,60 @@ public sealed class GraphViewportRenderingTests
                     var index = Array.IndexOf(expected, timestamp);
                     var (x, y) = mappedGuides[index];
                     Assert.True(HasWhiteGuideDifference(withGuides, withoutGuides, x, y),
-                        $"Expected the opaque white local-midnight guide to change rendered pixels for viewport={GetViewportFlag(scene)} at {timestamp} ({x},{y}).");
+                        $"Expected the translucent local-midnight guide to change rendered pixels for viewport={GetViewportFlag(scene)} at {timestamp} ({x},{y}).");
                 }
             }
+        }
+        finally
+        {
+            setter.Invoke(null, [priorZone]);
+        }
+    }
+
+    [Fact]
+    public void ResetGuideUsesActualBoundaryAndOverridesAnOverlappingMidnight()
+    {
+        var midnight = Unix("2026-03-08T00:00:00Z");
+        var start = midnight - 1_800;
+        var end = midnight + 1_800;
+        var period = CreateResetPeriodScene(start, midnight + 300, midnight);
+        var viewport = CreateViewport(start, end, GraphMetric.Dollars,
+        [
+            period,
+            period,
+            CreateResetPeriodScene(start, end, null),
+            CreateResetPeriodScene(start, end, start - 1),
+            CreateResetPeriodScene(start, end, end + 1),
+            CreateResetPeriodScene(start, end, midnight + 600, empty: true),
+        ]);
+
+        Assert.NotEqual(period.PeriodEndAt, midnight);
+
+        var timeZoneProperty = typeof(LocalizationService).GetProperty(nameof(LocalizationService.DisplayTimeZone));
+        Assert.NotNull(timeZoneProperty);
+        var setter = timeZoneProperty.GetSetMethod(nonPublic: true);
+        Assert.NotNull(setter);
+        var priorZone = LocalizationService.DisplayTimeZone;
+        try
+        {
+            setter.Invoke(null, [TimeZoneInfo.Utc]);
+            var control = new GraphPlotControl { Scene = viewport };
+            var lines = control.Plot.GetPlottables()
+                .OfType<ScottPlot.Plottables.Scatter>()
+                .ToArray();
+            var resetGuides = lines.Where(line => line.LineColor.ToStringRGB() == "#D6A45C").ToArray();
+            Assert.Equal(new double[] { midnight, midnight + 600 },
+                resetGuides.Select(line => line.Data.GetScatterPoints().First().X).Order());
+            Assert.All(resetGuides, line =>
+            {
+                Assert.True(line.IsVisible);
+                Assert.Equal(1f, line.LineWidth);
+                AssertOpacity(line.LineColor, 0.70);
+                var points = line.Data.GetScatterPoints();
+                Assert.Equal(2, points.Count);
+                Assert.Equal(points[0].X, points[1].X);
+            });
+            Assert.DoesNotContain(lines, line => line.LineColor.ToStringRGB() == "#FFFFFF");
         }
         finally
         {
@@ -359,6 +411,31 @@ public sealed class GraphViewportRenderingTests
             modifiers: null);
         Assert.NotNull(method);
         return Assert.IsAssignableFrom<IReadOnlyList<long>>(method.Invoke(null, [scene, zone]));
+    }
+
+    private static GraphScene CreateResetPeriodScene(long periodStartAt, long periodEndAt, long? resetAt, bool empty = false)
+    {
+        var samples = empty ? Array.Empty<ApiHistorySample>() : new[]
+        {
+            Sample(periodStartAt, periodEndAt, 1, taskActiveSincePrevious: false),
+            Sample(periodEndAt, periodEndAt, 2, taskActiveSincePrevious: false),
+        };
+        var method = typeof(GraphScene).GetMethods(StaticMembers).SingleOrDefault(candidate =>
+        {
+            var parameters = candidate.GetParameters();
+            return candidate.Name == nameof(GraphScene.Create) &&
+                parameters.Length == 8 &&
+                parameters[^1].Name == "resetAt" &&
+                parameters[^1].ParameterType == typeof(long?);
+        });
+        if (method is null)
+        {
+            return GraphScene.Create(samples, GraphMetric.Dollars, periodStartAt, periodEndAt);
+        }
+
+        return Assert.IsType<GraphScene>(method.Invoke(
+            null,
+            [samples, GraphMetric.Dollars, periodStartAt, periodEndAt, null, null, null, resetAt]));
     }
 
     private static bool GetViewportFlag(GraphScene scene)
@@ -503,6 +580,15 @@ public sealed class GraphViewportRenderingTests
             }
         }
         return false;
+    }
+
+    private static void AssertOpacity(ScottPlot.Color color, double expectedOpacity)
+    {
+        var hex = color.ToHex();
+        Assert.Equal(9, hex.Length);
+        var actualAlpha = Convert.ToByte(hex[^2..], 16);
+        var expectedAlpha = expectedOpacity * byte.MaxValue;
+        Assert.InRange((double)actualAlpha, Math.Floor(expectedAlpha), Math.Ceiling(expectedAlpha));
     }
 
     private static TimeZoneInfo FindEasternTimeZone() => TimeZoneInfo.FindSystemTimeZoneById(

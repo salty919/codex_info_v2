@@ -415,6 +415,17 @@ internal static class GraphPlotProjection
         return intervals.OrderBy(interval => interval.StartAt).ToArray();
     }
 
+    internal static IReadOnlyList<long> BuildResetGuides(GraphScene scene)
+    {
+        IReadOnlyList<GraphScene> periods = scene.IsViewport ? scene.PeriodScenes : [scene];
+        return periods.Select(period => period.ResetAt)
+            .Where(reset => reset.HasValue && reset.Value >= scene.PeriodStartAt && reset.Value <= scene.PeriodEndAt)
+            .Select(reset => reset!.Value)
+            .Distinct()
+            .Order()
+            .ToArray();
+    }
+
     internal static IReadOnlyList<long> BuildLocalMidnightGuides(GraphScene scene, TimeZoneInfo displayTimeZone)
     {
         ArgumentNullException.ThrowIfNull(scene);
