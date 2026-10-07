@@ -392,7 +392,22 @@ public sealed class GraphWindowRangeTests
     [Fact]
     public async Task TimeWindowBuildsResetScopedScenesFromEveryIntersectingPeriod()
     {
-        var periods = CreateTwoResetPeriods(FixedNow, accountOffset: 0);
+        var periods = CreateTwoResetPeriods(FixedNow, accountOffset: 0)
+            .Select((period, index) =>
+            {
+                if (index != 0)
+                {
+                    return period;
+                }
+
+                var resetAt = period.EndAt + 30;
+                return period with
+                {
+                    ResetAt = resetAt,
+                    Samples = period.Samples.Select(sample => sample with { ResetAt = resetAt }).ToArray(),
+                };
+            })
+            .ToArray();
         var client = new RangeResourceClient(periods, Pair);
         using var main = CreateResourceMain(client);
         using var graph = CreateGraph(main, () => FixedNow);
@@ -413,6 +428,8 @@ public sealed class GraphWindowRangeTests
         AssertViewport(graph.Scene, FixedNow - WeekSeconds, FixedNow);
         var children = ReadPeriodScenes(graph.Scene);
         Assert.Equal(2, children.Count);
+        Assert.NotEqual(periods[0].EndAt, periods[0].ResetAt);
+        Assert.Equal(periods[0].ResetAt, ReadNullableLong(children[0], "ResetAt"));
         Assert.Contains(100d, children[0].Sol);
         Assert.Contains(5d, children[1].Sol);
         Assert.DoesNotContain((double)FixedNow, children[1].Timestamps);
@@ -914,6 +931,9 @@ public sealed class GraphWindowRangeTests
 
     private static string ReadString(object instance, string name) =>
         Assert.IsType<string>(RequiredProperty(instance, name).GetValue(instance));
+
+    private static long? ReadNullableLong(object instance, string name) =>
+        RequiredProperty(instance, name).GetValue(instance) is long value ? value : null;
 
     private static IReadOnlyList<GraphScene> ReadPeriodScenes(GraphScene scene)
     {

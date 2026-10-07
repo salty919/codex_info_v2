@@ -95,10 +95,12 @@ public sealed class GraphScene
         double modelMaximum,
         bool isViewport = false,
         IReadOnlyList<GraphScene>? periodScenes = null,
-        bool hasViewportPoints = false)
+        bool hasViewportPoints = false,
+        long? resetAt = null)
     {
         PeriodStartAt = periodStartAt;
         PeriodEndAt = periodEndAt;
+        ResetAt = resetAt;
         Metric = metric;
         Timestamps = timestamps;
         Remaining = remaining;
@@ -134,6 +136,9 @@ public sealed class GraphScene
     public long PeriodStartAt { get; }
 
     public long PeriodEndAt { get; }
+
+    /// <summary>The API reset boundary, independent of the clipped display end.</summary>
+    public long? ResetAt { get; }
 
     public GraphMetric Metric { get; }
 
@@ -212,7 +217,9 @@ public sealed class GraphScene
 
     public bool HasPoints => IsViewport ? HasViewportPoints : Timestamps.Count > 0;
 
-    public static GraphScene Empty(GraphMetric metric = GraphMetric.Dollars) =>
+    public static GraphScene Empty(GraphMetric metric = GraphMetric.Dollars) => Empty(metric, null);
+
+    private static GraphScene Empty(GraphMetric metric, long? resetAt) =>
         new(
             0,
             1,
@@ -242,7 +249,8 @@ public sealed class GraphScene
             new HashSet<long>(),
             new Dictionary<string, IReadOnlyList<GraphIdleInterval>>(StringComparer.Ordinal),
             [],
-            1);
+            1,
+            resetAt: resetAt);
 
     /// <summary>
     /// Combines original reset-period scenes into a display window. The child
@@ -372,12 +380,23 @@ public sealed class GraphScene
         long periodEndAt,
         IReadOnlyList<GraphConfirmedGap>? confirmedGaps,
         IReadOnlySet<string>? hiddenModelNames,
-        IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals)
+        IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals) =>
+        Create(samples, metric, periodStartAt, periodEndAt, confirmedGaps, hiddenModelNames, accountOwnershipIntervals, null);
+
+    internal static GraphScene Create(
+        IReadOnlyList<ApiHistorySample> samples,
+        GraphMetric metric,
+        long periodStartAt,
+        long periodEndAt,
+        IReadOnlyList<GraphConfirmedGap>? confirmedGaps,
+        IReadOnlySet<string>? hiddenModelNames,
+        IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals,
+        long? resetAt)
     {
         ArgumentNullException.ThrowIfNull(samples);
         if (samples.Count == 0)
         {
-            return Empty(metric);
+            return Empty(metric, resetAt);
         }
 
         var start = periodStartAt >= 0 ? periodStartAt : samples[0].Timestamp;
@@ -548,7 +567,8 @@ public sealed class GraphScene
             tokenCorrectionStarts,
             modelIdleIntervals,
             idleIntervals,
-            maximum);
+            maximum,
+            resetAt: resetAt);
     }
 
     private static IReadOnlyList<GraphUnusedInterval> BuildNonOwnedIntervals(

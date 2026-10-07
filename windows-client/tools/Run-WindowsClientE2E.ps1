@@ -201,8 +201,10 @@ public sealed class CodexInfoGraphPixelMeasurement {
 
 public static class CodexInfoGraphPixelScanner {
     private static readonly Color GridColor = ColorTranslator.FromHtml("#263850");
+    private static readonly Color ResetGuideColor = ColorTranslator.FromHtml("#D6A45C");
     private static readonly Color IdleColor = ColorTranslator.FromHtml("#1A2838");
     private static readonly Color PlotColor = ColorTranslator.FromHtml("#121C2C");
+    private const double ResetGuideOpacity = 178.0 / 255.0;
     private static readonly Color[] SeriesColors = new[] {
         ColorTranslator.FromHtml("#56B2F5"),
         ColorTranslator.FromHtml("#A88CF5"),
@@ -239,12 +241,15 @@ public static class CodexInfoGraphPixelScanner {
             int requiredIdlePixels = (int)Math.Ceiling(sampledHeight * 0.90);
             var gridColumns = new bool[plotWidth];
             var idleColumns = new bool[plotWidth];
+            var resetGuideColumns = new bool[plotWidth];
             for (int localX = 0; localX < plotWidth; localX++) {
                 int matches = 0;
                 int idleMatches = 0;
+                int resetGuideMatches = 0;
                 for (int y = yStart; y < yEnd; y++) {
                     Color pixel = bitmap.GetPixel(plotLeft + localX, y);
                     if (Matches(pixel, IdleColor, 8)) idleMatches++;
+                    if (MatchesResetGuidePixel(pixel)) resetGuideMatches++;
                     bool grid = Matches(pixel, GridColor, 8);
                     if (!grid && localX + 1 < plotWidth) {
                         Color next = bitmap.GetPixel(plotLeft + localX + 1, y);
@@ -254,6 +259,7 @@ public static class CodexInfoGraphPixelScanner {
                 }
                 gridColumns[localX] = matches >= requiredGridPixels;
                 idleColumns[localX] = idleMatches >= requiredIdlePixels;
+                resetGuideColumns[localX] = resetGuideMatches >= requiredIdlePixels;
             }
 
             var centers = new List<int>();
@@ -295,9 +301,10 @@ public static class CodexInfoGraphPixelScanner {
                 // An opaque measured-idle band deliberately paints over the
                 // grid below it. Recover only a unique five-grid lattice for
                 // which at least two positions remain visibly measured and
-                // every other position has full-height idle-color evidence.
+                // every other position has full-height idle-color evidence,
+                // or the final position has the documented reset overlay.
                 bestGridCenters = ReconstructOpaqueIdleObscuredGrid(
-                    centers, idleColumns, plotWidth, out bestScore);
+                    centers, idleColumns, resetGuideColumns, plotWidth, out bestScore);
             }
             if (bestGridCenters == null || bestScore > 3) {
                 throw new InvalidOperationException(
@@ -424,6 +431,7 @@ public static class CodexInfoGraphPixelScanner {
     private static int[] ReconstructOpaqueIdleObscuredGrid(
         List<int> centers,
         bool[] idleColumns,
+        bool[] resetGuideColumns,
         int plotWidth,
         out double bestScore) {
         bestScore = double.PositiveInfinity;
@@ -462,6 +470,12 @@ public static class CodexInfoGraphPixelScanner {
                             }
                             else if (HasOpaqueIdleRunNear(idleColumns, candidate[grid], 3)) {
                                 obscured++;
+                            }
+                            else if (grid == candidate.Length - 1 &&
+                                HasResetGuideRunNear(resetGuideColumns, candidate[grid], 3)) {
+                                // Only the period-end reset guide may mask the
+                                // final grid. It supports the anchored lattice
+                                // without becoming a visible-grid seed.
                             }
                             else {
                                 valid = false;
@@ -590,6 +604,25 @@ public static class CodexInfoGraphPixelScanner {
         return false;
     }
 
+    private static bool HasResetGuideRunNear(bool[] resetGuideColumns, int expected, int radius) {
+        int expectedStart = Math.Max(0, expected - radius);
+        int expectedEnd = Math.Min(resetGuideColumns.Length - 1, expected + radius);
+        int runStart = -1;
+        for (int column = 0; column <= resetGuideColumns.Length; column++) {
+            bool isResetGuide = column < resetGuideColumns.Length && resetGuideColumns[column];
+            if (isResetGuide && runStart < 0) runStart = column;
+            if (!isResetGuide && runStart >= 0) {
+                int runEnd = column - 1;
+                int runWidth = runEnd - runStart + 1;
+                if (runWidth <= 2 && runEnd >= expectedStart && runStart <= expectedEnd) {
+                    return true;
+                }
+                runStart = -1;
+            }
+        }
+        return false;
+    }
+
     private static bool SameGrid(int[] left, int[] right, int tolerance) {
         if (left.Length != right.Length) return false;
         for (int index = 0; index < left.Length; index++) {
@@ -651,6 +684,45 @@ public static class CodexInfoGraphPixelScanner {
             Math.Abs(left.R + right.R - PlotColor.R - GridColor.R) <= 3 &&
             Math.Abs(left.G + right.G - PlotColor.G - GridColor.G) <= 3 &&
             Math.Abs(left.B + right.B - PlotColor.B - GridColor.B) <= 3;
+    }
+
+    private static bool MatchesResetGuidePixel(Color pixel) {
+        if (pixel.R <= GridColor.R || !(pixel.R > pixel.G && pixel.G > pixel.B)) return false;
+
+        // The same 1px raster coverage c first paints the grid over the
+        // plot, then the 70% reset guide over it. Thus each channel is
+        // P + ((G-P) + a*(R-P))*c - a*(G-P)*c*c. Recover c from red and
+        // independently check green/blue, including split-pixel edges.
+        double plot = PlotColor.R;
+        double grid = GridColor.R;
+        double guide = ResetGuideColor.R;
+        double linear = (grid - plot) + ResetGuideOpacity * (guide - plot);
+        double quadratic = ResetGuideOpacity * (grid - plot);
+        double discriminant = linear * linear -
+            (4 * quadratic * (pixel.R - plot));
+        if (quadratic <= 0 || discriminant < 0) return false;
+
+        double coverage = (linear - Math.Sqrt(discriminant)) / (2 * quadratic);
+        if (coverage < 0) coverage = 0;
+        else if (coverage > 1) coverage = 1;
+
+        int expectedRed = CompositeResetGuideChannel(PlotColor.R, GridColor.R, ResetGuideColor.R, coverage);
+        int expectedGreen = CompositeResetGuideChannel(PlotColor.G, GridColor.G, ResetGuideColor.G, coverage);
+        int expectedBlue = CompositeResetGuideChannel(PlotColor.B, GridColor.B, ResetGuideColor.B, coverage);
+        return Math.Abs(pixel.R - expectedRed) <= 3 &&
+            Math.Abs(pixel.G - expectedGreen) <= 3 &&
+            Math.Abs(pixel.B - expectedBlue) <= 3;
+    }
+
+    private static int CompositeResetGuideChannel(
+        int plot,
+        int grid,
+        int guide,
+        double coverage) {
+        double value = plot +
+            ((grid - plot) + ResetGuideOpacity * (guide - plot)) * coverage -
+            ResetGuideOpacity * (grid - plot) * coverage * coverage;
+        return (int)Math.Round(value);
     }
 
     private static bool Matches(Color actual, Color expected, int tolerance) {
@@ -1702,9 +1774,15 @@ function Invoke-E2EGraphPixelScannerSelfTest {
     $unprovenSparsePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-unproven-sparse.png'
     $ambiguousIdlePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-ambiguous-idle.png'
     $partialHeightIdlePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-partial-height-idle.png'
+    $resetGuidePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-reset-guide.png'
+    $resetGuideAbsentPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-reset-guide-absent.png'
+    $resetGuideOffPositionPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-reset-guide-off-position.png'
+    $resetGuideShortPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-reset-guide-short.png'
+    $resetGuideOnlyPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-reset-guide-only.png'
     $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263850')
     $idleColor = [System.Drawing.ColorTranslator]::FromHtml('#1A2838')
     $background = [System.Drawing.ColorTranslator]::FromHtml('#121C2C')
+    $resetGuideColor = [System.Drawing.Color]::FromArgb(92, 84, 72)
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
         ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
     foreach ($case in @(
@@ -1811,7 +1889,88 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         $bitmap.Dispose()
     }
 
+    $resetGuideCases = @(
+        @{ Name = 'endpoint'; Path = $resetGuidePath; GridXs = @(10, 130, 170, 171); MaskEndpointGrid = $false; IdleStart = 50; IdleEnd = 90; GuideXs = @(170, 171); GuideYStart = 5; GuideYEnd = 135; ExpectAccepted = $true },
+        @{ Name = 'absent'; Path = $resetGuideAbsentPath; GridXs = @(10, 130, 170, 171); MaskEndpointGrid = $true; IdleStart = 50; IdleEnd = 90; GuideXs = @(); GuideYStart = 5; GuideYEnd = 135; ExpectAccepted = $false },
+        @{ Name = 'off-position'; Path = $resetGuideOffPositionPath; GridXs = @(10, 130, 170, 171); MaskEndpointGrid = $true; IdleStart = 50; IdleEnd = 90; GuideXs = @(150, 151); GuideYStart = 5; GuideYEnd = 135; ExpectAccepted = $false },
+        @{ Name = 'short-height'; Path = $resetGuideShortPath; GridXs = @(10, 130, 170, 171); MaskEndpointGrid = $true; IdleStart = 50; IdleEnd = 90; GuideXs = @(170, 171); GuideYStart = 40; GuideYEnd = 95; ExpectAccepted = $false },
+        @{ Name = 'guide-only'; Path = $resetGuideOnlyPath; GridXs = @(); MaskEndpointGrid = $false; IdleStart = -1; IdleEnd = -1; GuideXs = @(170, 171); GuideYStart = 5; GuideYEnd = 135; ExpectAccepted = $false }
+    )
+    foreach ($case in $resetGuideCases) {
+        $bitmap = New-Object System.Drawing.Bitmap(240, 140)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $graphics.Clear($background)
+            $gridPen = New-Object System.Drawing.Pen($gridColor, 1)
+            try {
+                foreach ($x in $case.GridXs) { $graphics.DrawLine($gridPen, $x, 5, $x, 135) }
+            }
+            finally { $gridPen.Dispose() }
+            if ($case.IdleStart -ge 0) {
+                foreach ($y in 5..135) {
+                    foreach ($x in $case.IdleStart..$case.IdleEnd) {
+                        $bitmap.SetPixel($x, $y, $idleColor)
+                    }
+                }
+            }
+            if ($case.MaskEndpointGrid) {
+                foreach ($y in 5..135) {
+                    foreach ($x in @(170, 171)) { $bitmap.SetPixel($x, $y, $background) }
+                }
+            }
+            foreach ($y in $case.GuideYStart..$case.GuideYEnd) {
+                foreach ($x in $case.GuideXs) {
+                    # Independent fixed RGB observed on the Windows reset guide;
+                    # it is deliberately not promoted to a grid-color match.
+                    $bitmap.SetPixel($x, $y, $resetGuideColor)
+                }
+            }
+            $bitmap.Save($case.Path, [System.Drawing.Imaging.ImageFormat]::Png)
+        }
+        finally {
+            $graphics.Dispose()
+            $bitmap.Dispose()
+        }
+    }
+
     try {
+        $resetGuideMeasurement = $null
+        $resetGuideFailure = $null
+        $unexpectedGuideAcceptances = @()
+        foreach ($case in $resetGuideCases) {
+            $measurement = $null
+            try {
+                $measurement = [CodexInfoGraphPixelScanner]::Scan($case.Path, 0, 0, 240, 140)
+            }
+            catch {
+                $message = $_.Exception.Message
+                if ($case.ExpectAccepted) {
+                    $resetGuideFailure = $message
+                    Write-E2E "graph-pixel-scanner-self-test: RED reset-guide unanchored endpoint rejected: $message"
+                }
+                else {
+                    Write-E2E "graph-pixel-scanner-self-test: PASS reset-guide unanchored $($case.Name) rejected: $message"
+                }
+            }
+            if ($case.ExpectAccepted) {
+                $resetGuideMeasurement = $measurement
+            }
+            elseif ($null -ne $measurement) {
+                $unexpectedGuideAcceptances += $case.Name
+                Write-E2E "graph-pixel-scanner-self-test: FAIL reset-guide unanchored $($case.Name) was accepted"
+            }
+        }
+        Assert-E2E ($unexpectedGuideAcceptances.Count -eq 0) `
+            "Graph pixel scanner accepted invalid unanchored reset-guide evidence: $($unexpectedGuideAcceptances -join ',')."
+        Assert-E2E ($null -ne $resetGuideMeasurement) `
+            "Graph pixel scanner rejected two visible grids, idle coverage at 50..90, and a full-height endpoint reset guide: $resetGuideFailure"
+        Assert-E2E ($resetGuideMeasurement.PeriodStartX -eq 10 -and
+            $resetGuideMeasurement.PeriodEndX -eq 170 -and
+            $resetGuideMeasurement.PlotSpan -eq 160 -and
+            $resetGuideMeasurement.GutterWidth -eq 69) `
+            'Graph pixel scanner did not preserve the unanchored period geometry with a reset guide at its endpoint.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS endpoint reset guide supports only the unique unanchored five-grid lattice'
+
         $valid = [CodexInfoGraphPixelScanner]::Scan($validPath, 0, 0, 240, 140)
         Assert-E2E ($valid.PeriodStartX -eq 10 -and $valid.PeriodEndX -eq 170 -and
             $valid.PlotSpan -eq 160 -and $valid.GutterWidth -eq 69) `
@@ -1913,7 +2072,7 @@ function Invoke-E2EGraphPixelScannerSelfTest {
             'Graph pixel scanner accepted partial-height idle pixels as an opaque full-height band.'
     }
     finally {
-        foreach ($path in @($validPath, $opaqueIdlePrefixPath, $shiftedOpaqueIdlePrefixPath, $missingInteriorPath, $endpointFallbackPath, $unprovenSparsePath, $ambiguousIdlePath, $partialHeightIdlePath)) {
+        foreach ($path in @($validPath, $opaqueIdlePrefixPath, $shiftedOpaqueIdlePrefixPath, $missingInteriorPath, $endpointFallbackPath, $unprovenSparsePath, $ambiguousIdlePath, $partialHeightIdlePath, $resetGuidePath, $resetGuideAbsentPath, $resetGuideOffPositionPath, $resetGuideShortPath, $resetGuideOnlyPath)) {
             if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
         }
     }

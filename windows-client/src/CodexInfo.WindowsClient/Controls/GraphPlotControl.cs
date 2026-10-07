@@ -32,6 +32,7 @@ public sealed class GraphPlotControl : Control
     internal const string AxisTextColorHex = "#78879c";
     internal const string GridColorHex = "#263850";
     internal const string MidnightGuideColorHex = "#FFFFFF";
+    internal const string ResetGuideColorHex = "#D6A45C";
     internal const string PlotColorHex = "#121c2c";
     private ScottPlot.Color RemainingColor => new(ThemePalette.Resolve(RemainingColorHex));
     private ScottPlot.Color SolColor => new(ThemePalette.Resolve(SolColorHex));
@@ -48,7 +49,8 @@ public sealed class GraphPlotControl : Control
     private ScottPlot.Color IdleBandColor => new(ThemePalette.Resolve(IdleBandColorHex));
     private ScottPlot.Color MutedColor => new(ThemePalette.Resolve(AxisTextColorHex));
     private ScottPlot.Color GridColor => new(ThemePalette.Resolve(GridColorHex));
-    private ScottPlot.Color MidnightGuideColor => new(MidnightGuideColorHex);
+    private ScottPlot.Color MidnightGuideColor => new ScottPlot.Color(MidnightGuideColorHex).WithOpacity(0.30);
+    private ScottPlot.Color ResetGuideColor => new ScottPlot.Color(ResetGuideColorHex).WithOpacity(0.70);
     private ScottPlot.Color PlotColor => new(ThemePalette.Resolve(PlotColorHex));
 
     private PlotPresentation presentation = new(GraphScene.Empty());
@@ -167,7 +169,7 @@ public sealed class GraphPlotControl : Control
             band.FillColor = IdleBandColor.WithOpacity(IdleBandOpacity);
             band.LineWidth = 0;
         }
-        AddMidnightGuides(presentation, scene, axes);
+        AddBoundaryGuides(presentation, scene, axes);
 
         // Match the native graph's painter order: endpoint leaders sit below
         // the data strokes, inferred model paths precede measured paths, and
@@ -335,15 +337,20 @@ public sealed class GraphPlotControl : Control
         }
     }
 
-    private void AddMidnightGuides(
+    private void AddBoundaryGuides(
         PlotPresentation presentation,
         GraphScene scene,
         GraphAxisProjection axes)
     {
+        var resetGuides = GraphPlotProjection.BuildResetGuides(scene);
         foreach (var timestamp in GraphPlotProjection.BuildLocalMidnightGuides(
                      scene,
                      LocalizationService.DisplayTimeZone))
         {
+            if (resetGuides.Contains(timestamp))
+            {
+                continue;
+            }
             AddLine(
                 presentation,
                 new GraphLineProjection(
@@ -351,7 +358,18 @@ public sealed class GraphPlotControl : Control
                     new double[] { axes.ModelDisplayMinimum, axes.ModelDisplayMaximum }),
                 MidnightGuideColor,
                 presentation.Plot.Axes.Left,
-                1.5f);
+                0.5f);
+        }
+        foreach (var timestamp in resetGuides)
+        {
+            AddLine(
+                presentation,
+                new GraphLineProjection(
+                    new double[] { timestamp, timestamp },
+                    new double[] { axes.ModelDisplayMinimum, axes.ModelDisplayMaximum }),
+                ResetGuideColor,
+                presentation.Plot.Axes.Left,
+                1f);
         }
     }
 
