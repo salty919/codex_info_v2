@@ -487,19 +487,19 @@ public sealed class PresentationBoundaryTests
         var periodSelector = document.Descendants()
             .Single(element => element.Name.LocalName == "GraphSelect" &&
                 element.Attribute(xamlName)?.Value == "PeriodSelector");
-        Assert.Equal("0,12,0,0", periodSelector.Attribute("Margin")?.Value);
+        Assert.Equal("0", periodSelector.Attribute("Margin")?.Value);
         Assert.Equal("2", periodSelector.Attribute("Grid.Row")?.Value);
         Assert.Equal("{Binding SelectedPeriodValueText}", periodSelector.Attribute("ValueText")?.Value);
         Assert.Equal("Graph.PeriodSelector", periodSelector.Attribute("AutomationProperties.AutomationId")?.Value);
 
         var controlSurface = document.Descendants()
             .Single(element => element.Name.LocalName == "Border" &&
-                element.Attribute("Grid.RowSpan")?.Value == "4");
-        Assert.Equal("0,6,0,0", controlSurface.Attribute("Margin")?.Value);
+                element.Attribute("Grid.RowSpan")?.Value == "3");
+        Assert.Equal("0,2,0,0", controlSurface.Attribute("Margin")?.Value);
 
         var legend = document.Descendants().Single(element =>
             element.Name.LocalName == "Grid" &&
-            element.Attribute("Grid.Row")?.Value == "4" &&
+            element.Attribute("Grid.Row")?.Value == "3" &&
             element.Attribute("Width")?.Value == "504");
         Assert.Equal("120,90,90,90,90", legend.Attribute("ColumnDefinitions")?.Value);
 

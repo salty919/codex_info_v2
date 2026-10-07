@@ -109,6 +109,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private const int BackgroundBuildThreshold = 2_048;
     private readonly MainWindowViewModel main;
     private readonly Action<Action> postToUi;
+    private readonly Func<long> getUnixTimeSeconds;
     private readonly ILoopbackResourceClient? resourceClient;
     private readonly ILoopbackAccountResourceClient? accountResourceClient;
     private readonly SemaphoreSlim resourceRefreshGate = new(1, 1);
@@ -135,21 +136,42 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private bool applyingSplitResourceState;
     private bool resourceCursorResetRequired;
     private CancellationTokenSource? resourcePollingCancellation;
+    private CancellationTokenSource? timeWindowRequestCancellation;
     private string? resourceNextCursor;
     private PublishedPairIdentity? resourcePublishedPair;
     private ApiHistoryPeriod? resourcePeriod;
     private IReadOnlyList<ApiHistorySample> resourceSamples = Array.Empty<ApiHistorySample>();
     private IReadOnlyList<ApiHistoryGap> resourceGaps = Array.Empty<ApiHistoryGap>();
+    private int selectedTimeRangeValue = (int)GraphTimeRange.ResetPeriod;
+    private long pinnedWindowEndAt = long.MinValue;
+    private long? windowNavigationOriginAt;
+    private long timeWindowRevision;
+    private long resetRangeCommitRevision = -1;
+    private bool timeWindowRequestPending;
+    private bool staticDetailsRebuildDeferred;
+    private bool rebuildingPeriodDirectory;
+    private IReadOnlyList<GraphWindowPeriodData> staticWindowPeriodData = Array.Empty<GraphWindowPeriodData>();
+    private IReadOnlyList<ApiHistoryPeriod> windowPeriodDirectory = Array.Empty<ApiHistoryPeriod>();
+    private IReadOnlyDictionary<string, GraphWindowPeriodData> windowPeriodData =
+        new Dictionary<string, GraphWindowPeriodData>(StringComparer.Ordinal);
+    private PublishedPairIdentity? windowPublishedPair;
+    private Dictionary<WindowProjectionCacheKey, CachedWindowProjection> windowProjectionCache = [];
 
     public GraphWindowViewModel(MainWindowViewModel main)
-        : this(main, action => Dispatcher.UIThread.Post(action))
+        : this(main, action => Dispatcher.UIThread.Post(action), static () => DateTimeOffset.UtcNow.ToUnixTimeSeconds())
     {
     }
 
     internal GraphWindowViewModel(MainWindowViewModel main, Action<Action> postToUi)
+        : this(main, postToUi, static () => DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+    {
+    }
+
+    internal GraphWindowViewModel(MainWindowViewModel main, Action<Action> postToUi, Func<long> getUnixTimeSeconds)
     {
         this.main = main;
         this.postToUi = postToUi;
+        this.getUnixTimeSeconds = getUnixTimeSeconds;
         Periods = new ReadOnlyObservableCollection<ApiHistoryPeriod>(periods);
         RebuildMetricOptions();
         main.PropertyChanged += OnMainPropertyChanged;
@@ -174,6 +196,68 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     public IReadOnlyList<GraphPointViewModel> Points => points;
 
     public GraphScene Scene => scene;
+
+    public GraphTimeRange SelectedTimeRange
+    {
+        get => (GraphTimeRange)Volatile.Read(ref selectedTimeRangeValue);
+        set
+        {
+            if (!Enum.IsDefined(value))
+            {
+                throw new ArgumentOutOfRangeException(nameof(value));
+            }
+
+            var acceptedRange = SelectedTimeRange;
+            if (value == acceptedRange && !timeWindowRequestPending)
+            {
+                return;
+            }
+
+            var pinnedEnd = value != GraphTimeRange.ResetPeriod &&
+                acceptedRange != GraphTimeRange.ResetPeriod && pinnedWindowEndAt != long.MinValue
+                    ? pinnedWindowEndAt
+                    : (long?)null;
+            var navigationOriginAt = pinnedEnd is null ? null : windowNavigationOriginAt;
+            RequestTimeRange(value, pinnedEnd, navigationOriginAt);
+        }
+    }
+
+    public bool IsPeriodView => SelectedTimeRange == GraphTimeRange.ResetPeriod;
+
+    public bool Is24HourView => SelectedTimeRange == GraphTimeRange.Last24Hours;
+
+    public bool IsWeekView => SelectedTimeRange == GraphTimeRange.Last7Days;
+
+    public bool CanGoBack => SelectedTimeRange != GraphTimeRange.ResetPeriod &&
+        windowPeriodDirectory.Any(period => period.StartAt < scene.PeriodStartAt);
+
+    public bool CanGoForward => SelectedTimeRange != GraphTimeRange.ResetPeriod &&
+        pinnedWindowEndAt != long.MinValue && pinnedWindowEndAt < getUnixTimeSeconds();
+
+    public bool HasPlot => SelectedTimeRange != GraphTimeRange.ResetPeriod || HasPoints;
+
+    public string RangeLabel
+    {
+        get
+        {
+            var range = SelectedTimeRange;
+            var title = range switch
+            {
+                GraphTimeRange.Last24Hours => Texts.GraphDayRange,
+                GraphTimeRange.Last7Days => Texts.GraphWeekRange,
+                _ => Texts.GraphPeriodRange,
+            };
+            var startAt = range == GraphTimeRange.ResetPeriod
+                ? selectedPeriod?.StartAt ?? (scene.HasPoints ? scene.PeriodStartAt : 0)
+                : scene.PeriodStartAt;
+            var endAt = range == GraphTimeRange.ResetPeriod
+                ? selectedPeriod?.EndAt ?? (scene.HasPoints ? scene.PeriodEndAt : 0)
+                : scene.PeriodEndAt;
+            return startAt > 0 && endAt > startAt
+                ? $"{title} · {FormatPeriodStart(startAt)} – {FormatPeriodStart(endAt)}"
+                : title;
+        }
+    }
 
     public UiText Texts => LocalizationService.Current;
 
@@ -221,6 +305,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         get => selectedPeriod;
         set
         {
+            if (value is null && (rebuildingPeriodDirectory || applyingSplitResourceState))
+            {
+                return;
+            }
+
             if (ReferenceEquals(selectedPeriod, value))
             {
                 return;
@@ -257,7 +346,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    public bool HasPoints => points.Count > 0;
+    public bool HasPoints => scene.IsViewport ? scene.HasPoints : points.Count > 0;
 
     public bool HasNoPoints => !IsLoading && !HasLoadError && !HasPoints;
 
@@ -271,9 +360,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string SelectedPeriodValueText => selectedPeriod?.Label ?? Texts.UnavailableValue;
 
-    public long SelectedPeriodStartAt => scene.HasPoints ? scene.PeriodStartAt : displayedPeriod?.StartAt ?? 0;
+    public long SelectedPeriodStartAt => SelectedTimeRange != GraphTimeRange.ResetPeriod
+        ? scene.PeriodStartAt
+        : scene.HasPoints ? scene.PeriodStartAt : displayedPeriod?.StartAt ?? 0;
 
-    public long SelectedPeriodEndAt => scene.HasPoints ? scene.PeriodEndAt : 0;
+    public long SelectedPeriodEndAt => SelectedTimeRange != GraphTimeRange.ResetPeriod
+        ? scene.PeriodEndAt
+        : scene.HasPoints ? scene.PeriodEndAt : 0;
 
     // The accepted periods resource owns the graph boundary. Local clock skew
     // must not make Windows project a different X range than the X client.
@@ -686,6 +779,48 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
+    public void GoBack()
+    {
+        var range = SelectedTimeRange;
+        if (range == GraphTimeRange.ResetPeriod || !CanGoBack)
+        {
+            return;
+        }
+
+        var now = getUnixTimeSeconds();
+        long? pinnedEndAt = pinnedWindowEndAt == long.MinValue ? null : pinnedWindowEndAt;
+        var navigationOriginAt = windowNavigationOriginAt ?? (pinnedEndAt is { } pinned
+            ? pinned + GraphTimeWindow.GetDurationSeconds(range)
+            : now);
+        RequestTimeRange(
+            range,
+            GraphTimeWindow.StepBack(range, now, pinnedEndAt),
+            navigationOriginAt,
+            now);
+    }
+
+    public void GoForward()
+    {
+        var range = SelectedTimeRange;
+        if (range == GraphTimeRange.ResetPeriod || pinnedWindowEndAt == long.MinValue)
+        {
+            return;
+        }
+
+        var now = getUnixTimeSeconds();
+        if (pinnedWindowEndAt >= now)
+        {
+            return;
+        }
+
+        var nextEndAt = GraphTimeWindow.StepForward(
+            range,
+            now,
+            pinnedWindowEndAt,
+            windowNavigationOriginAt);
+        RequestTimeRange(range, nextEndAt, nextEndAt is null ? null : windowNavigationOriginAt, now);
+    }
+
     public void Dispose()
     {
         if (disposed)
@@ -694,6 +829,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         disposed = true;
+        timeWindowRequestCancellation?.Cancel();
+        timeWindowRequestCancellation?.Dispose();
+        timeWindowRequestCancellation = null;
         pointBuildCancellation.Cancel();
         pointBuildCancellation.Dispose();
         if (resourcePollingCancellation is not null)
@@ -763,6 +901,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(SelectedPeriodValueText));
             Notify(nameof(MetricAxisText));
             Notify(nameof(GraphGapHintText));
+            Notify(nameof(RangeLabel));
         }
     }
 
@@ -774,6 +913,21 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         Interlocked.Increment(ref periodSelectionRevision);
+        Interlocked.Increment(ref timeWindowRevision);
+        resetRangeCommitRevision = -1;
+        timeWindowRequestPending = false;
+        staticDetailsRebuildDeferred = false;
+        timeWindowRequestCancellation?.Cancel();
+        timeWindowRequestCancellation?.Dispose();
+        timeWindowRequestCancellation = null;
+        Volatile.Write(ref selectedTimeRangeValue, (int)GraphTimeRange.ResetPeriod);
+        pinnedWindowEndAt = long.MinValue;
+        windowNavigationOriginAt = null;
+        windowPeriodDirectory = Array.Empty<ApiHistoryPeriod>();
+        windowPeriodData = new Dictionary<string, GraphWindowPeriodData>(StringComparer.Ordinal);
+        windowPublishedPair = null;
+        staticWindowPeriodData = Array.Empty<GraphWindowPeriodData>();
+        windowProjectionCache.Clear();
         pointBuildCancellation.Cancel();
         pointBuildCancellation.Dispose();
         pointBuildCancellation = new CancellationTokenSource();
@@ -797,11 +951,705 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(SelectedPeriodValueText));
         Notify(nameof(SelectedPeriodStartAt));
         Notify(nameof(SelectedPeriodEndAt));
+        Notify(nameof(HasPlot));
+        Notify(nameof(RangeLabel));
+        Notify(nameof(CanGoBack));
+        Notify(nameof(CanGoForward));
         Notify(nameof(Points));
         Notify(nameof(Scene));
         Notify(nameof(HasPoints));
         Notify(nameof(HasNoPoints));
         Notify(nameof(HasBlockingLoadError));
+        NotifyTimeRangeProperties();
+    }
+
+    private void RequestTimeRange(
+        GraphTimeRange range,
+        long? requestedPinnedEndAt,
+        long? requestedNavigationOriginAt = null,
+        long? requestNow = null)
+    {
+        if (disposed)
+        {
+            return;
+        }
+
+        var revision = Interlocked.Increment(ref timeWindowRevision);
+        Interlocked.Increment(ref periodSelectionRevision);
+        pointBuildCancellation.Cancel();
+        pointBuildCancellation.Dispose();
+        pointBuildCancellation = new CancellationTokenSource();
+        Interlocked.Increment(ref pointBuildRevision);
+        resetRangeCommitRevision = -1;
+        timeWindowRequestCancellation?.Cancel();
+        timeWindowRequestCancellation?.Dispose();
+        timeWindowRequestCancellation = null;
+
+        if (range == GraphTimeRange.ResetPeriod)
+        {
+            timeWindowRequestPending = true;
+            resetRangeCommitRevision = revision;
+            SetLoadError(false);
+            SetLoading(true);
+            NotifyTimeRangeProperties();
+
+            if (resourceClient is not null && SelectedTimeRange != GraphTimeRange.ResetPeriod)
+            {
+                _ = RefreshSplitResourceCoreAsync(
+                    initial: true,
+                    requestedPeriodId: null,
+                    Interlocked.Read(ref periodSelectionRevision),
+                    resourcePollingCancellation?.Token ?? main.LifetimeToken);
+                return;
+            }
+
+            RebuildPoints();
+            return;
+        }
+
+        var now = requestNow ?? getUnixTimeSeconds();
+        var pinnedEndAt = requestedPinnedEndAt is { } requested && requested < now
+            ? requested
+            : (long?)null;
+        var navigationOriginAt = pinnedEndAt is null
+            ? null
+            : requestedNavigationOriginAt ?? windowNavigationOriginAt ??
+                pinnedEndAt + GraphTimeWindow.GetDurationSeconds(range);
+        var bounds = GraphTimeWindow.GetBounds(range, now, pinnedEndAt);
+        timeWindowRequestPending = true;
+        SetLoadError(false);
+        SetLoading(true);
+        NotifyTimeRangeProperties();
+
+        if (resourceClient is null)
+        {
+            var data = staticWindowPeriodData
+                .Where(item => Intersects(item.Period, bounds))
+                .ToArray();
+            var options = CaptureWindowBuildOptions();
+            var cache = new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>(windowProjectionCache);
+            if (data.Sum(item => item.Samples.Count) <= BackgroundBuildThreshold)
+            {
+                try
+                {
+                    PublishTimeWindow(range, pinnedEndAt, navigationOriginAt, revision, data, windowPeriodDirectory,
+                        windowPublishedPair, BuildWindowProjection(bounds, data, options, cache),
+                        accountId: null, accountGeneration: 0);
+                }
+                catch
+                {
+                    PublishTimeWindowFailure(revision, accountId: null, accountGeneration: 0);
+                }
+                return;
+            }
+
+            var buildSnapshot = new WindowBuildSnapshot(
+                options,
+                cache,
+                Interlocked.Read(ref pointBuildRevision));
+            BuildAndPublishWindowCandidate(
+                range,
+                bounds,
+                pinnedEndAt,
+                navigationOriginAt,
+                revision,
+                explicitRequest: true,
+                candidateData: data,
+                directory: windowPeriodDirectory,
+                pair: windowPublishedPair,
+                accountId: null,
+                accountGeneration: 0,
+                buildSnapshot: buildSnapshot);
+            return;
+        }
+
+        if (TryPublishCachedWindow(range, bounds, pinnedEndAt, navigationOriginAt, revision))
+        {
+            return;
+        }
+
+        var cancellationToken = resourcePollingCancellation?.Token ?? main.LifetimeToken;
+        timeWindowRequestCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _ = RefreshTimeWindowCoreAsync(
+            range,
+            bounds,
+            pinnedEndAt,
+            navigationOriginAt,
+            revision,
+            forceRefresh: false,
+            explicitRequest: true,
+            timeWindowRequestCancellation.Token);
+    }
+
+    private void RebuildAcceptedWindowProjection()
+    {
+        var range = SelectedTimeRange;
+        if (range == GraphTimeRange.ResetPeriod)
+        {
+            return;
+        }
+
+        var now = getUnixTimeSeconds();
+        var pinnedEndAt = this.pinnedWindowEndAt == long.MinValue
+            ? (long?)null
+            : this.pinnedWindowEndAt;
+        var bounds = GraphTimeWindow.GetBounds(range, now, pinnedEndAt);
+        var data = resourceClient is null
+            ? staticWindowPeriodData.Where(item => Intersects(item.Period, bounds)).ToArray()
+            : GetCachedWindowData(bounds);
+        if (resourceClient is not null &&
+            data.Count != windowPeriodDirectory.Count(period => Intersects(period, bounds)))
+        {
+            RequestTimeRange(range, pinnedEndAt, windowNavigationOriginAt);
+            return;
+        }
+        var revision = Interlocked.Increment(ref pointBuildRevision);
+        var rangeRevision = Interlocked.Read(ref timeWindowRevision);
+        var options = CaptureWindowBuildOptions();
+        var cache = new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>(windowProjectionCache);
+        var build = () => BuildWindowProjection(bounds, data, options, cache);
+        if (data.Sum(item => item.Samples.Count) <= BackgroundBuildThreshold)
+        {
+            try
+            {
+                var projection = build();
+                if (!disposed && revision == pointBuildRevision && rangeRevision == Interlocked.Read(ref timeWindowRevision))
+                {
+                    PublishWindowProjection(projection, range, pinnedEndAt, data, windowPeriodDirectory,
+                        windowPublishedPair, accountId: main.SelectedAccountId,
+                        accountGeneration: main.AccountSelectionGeneration, rangeRevision);
+                }
+            }
+            catch
+            {
+                PublishLoadFailure(revision);
+            }
+            return;
+        }
+
+        SetLoadError(false);
+        SetLoading(true);
+        _ = Task.Run(build)
+            .ContinueWith(
+                task =>
+                {
+                    if (disposed || revision != pointBuildRevision || rangeRevision != Interlocked.Read(ref timeWindowRevision))
+                    {
+                        return;
+                    }
+                    postToUi(() =>
+                    {
+                        if (disposed || revision != pointBuildRevision || rangeRevision != Interlocked.Read(ref timeWindowRevision))
+                        {
+                            return;
+                        }
+                        if (task.Status == TaskStatus.RanToCompletion)
+                        {
+                            PublishWindowProjection(task.Result, range, pinnedEndAt, data, windowPeriodDirectory,
+                                windowPublishedPair, main.SelectedAccountId,
+                                main.AccountSelectionGeneration, rangeRevision);
+                        }
+                        else
+                        {
+                            PublishLoadFailure(revision);
+                        }
+                    });
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+    }
+
+    private bool TryPublishCachedWindow(
+        GraphTimeRange range,
+        GraphTimeBounds bounds,
+        long? pinnedEndAt,
+        long? navigationOriginAt,
+        long revision)
+    {
+        if (windowPublishedPair is null)
+        {
+            return false;
+        }
+
+        var requiredCount = windowPeriodDirectory.Count(period => Intersects(period, bounds));
+        var data = GetCachedWindowData(bounds);
+        if (data.Count != requiredCount)
+        {
+            return false;
+        }
+
+        var accountId = main.SelectedAccountId;
+        var accountGeneration = main.AccountSelectionGeneration;
+        if (accountResourceClient is not null && accountId is null)
+        {
+            return false;
+        }
+        var options = CaptureWindowBuildOptions();
+        var cache = new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>(windowProjectionCache);
+        if (data.Sum(item => item.Samples.Count) <= BackgroundBuildThreshold)
+        {
+            try
+            {
+                var projection = BuildWindowProjection(bounds, data, options, cache);
+                PublishTimeWindow(
+                    range,
+                    pinnedEndAt,
+                    navigationOriginAt,
+                    revision,
+                    data,
+                    windowPeriodDirectory,
+                    windowPublishedPair,
+                    projection,
+                    accountId,
+                    accountGeneration);
+            }
+            catch
+            {
+                PublishTimeWindowFailure(revision, accountId, accountGeneration);
+            }
+            return true;
+        }
+
+        BuildAndPublishWindowCandidate(
+            range,
+            bounds,
+            pinnedEndAt,
+            navigationOriginAt,
+            revision,
+            explicitRequest: true,
+            candidateData: data,
+            directory: windowPeriodDirectory,
+            pair: windowPublishedPair,
+            accountId: accountId,
+            accountGeneration: accountGeneration,
+            buildSnapshot: new WindowBuildSnapshot(
+                options,
+                cache,
+                Interlocked.Read(ref pointBuildRevision)));
+        return true;
+    }
+
+    private IReadOnlyList<GraphWindowPeriodData> GetCachedWindowData(GraphTimeBounds bounds)
+    {
+        var directory = windowPeriodDirectory;
+        var cached = windowPeriodData;
+        var required = directory.Where(period => Intersects(period, bounds)).ToArray();
+        return required
+            .Where(period => cached.TryGetValue(period.Id, out var item) && SamePeriodBounds(item.Period, period))
+            .Select(period => cached[period.Id])
+            .ToArray();
+    }
+
+    private IReadOnlyList<GraphWindowPeriodData> BuildStaticWindowPeriodData(
+        IEnumerable<ApiHistoryPeriod> source)
+    {
+        var gaps = main.DetailsSnapshot?.HistoryGaps ?? Array.Empty<ApiHistoryGap>();
+        return source.Select(period => new GraphWindowPeriodData(
+            period,
+            period.Samples,
+            gaps.Where(gap => GapBelongsToPeriod(gap, period)).ToArray()))
+            .ToArray();
+    }
+
+    private WindowBuildOptions CaptureWindowBuildOptions() => new(
+        selectedMetric,
+        showModels,
+        showSol,
+        showTerra,
+        showLuna,
+        showAstra,
+        main.SelectedAccount?.OwnershipIntervals?
+            .Select(interval => new GraphAccountOwnershipInterval(interval.StartAt, interval.EndAt))
+            .ToArray());
+
+    private async Task<WindowBuildSnapshot> CaptureWindowBuildSnapshotAsync(
+        CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<WindowBuildSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        postToUi(() =>
+        {
+            if (cancellationToken.IsCancellationRequested || disposed)
+            {
+                completion.TrySetCanceled(cancellationToken);
+                return;
+            }
+
+            completion.TrySetResult(new WindowBuildSnapshot(
+                CaptureWindowBuildOptions(),
+                new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>(windowProjectionCache),
+                Interlocked.Read(ref pointBuildRevision)));
+        });
+        return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private void BuildAndPublishWindowCandidate(
+        GraphTimeRange range,
+        GraphTimeBounds bounds,
+        long? pinnedEndAt,
+        long? navigationOriginAt,
+        long revision,
+        bool explicitRequest,
+        IReadOnlyList<GraphWindowPeriodData> candidateData,
+        IReadOnlyList<ApiHistoryPeriod> directory,
+        PublishedPairIdentity? pair,
+        string? accountId,
+        long accountGeneration,
+        WindowBuildSnapshot buildSnapshot)
+    {
+        _ = Task.Run(() => BuildWindowProjection(
+                bounds,
+                candidateData,
+                buildSnapshot.Options,
+                buildSnapshot.Cache))
+            .ContinueWith(
+                task =>
+                {
+                    if (disposed || revision != Interlocked.Read(ref timeWindowRevision) ||
+                        accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
+                    {
+                        return;
+                    }
+
+                    postToUi(() =>
+                    {
+                        if (!IsCurrentWindowRequest(revision, accountId, accountGeneration, explicitRequest))
+                        {
+                            return;
+                        }
+
+                        if (buildSnapshot.PointBuildRevision != Interlocked.Read(ref pointBuildRevision))
+                        {
+                            // A metric, series visibility, or account setting
+                            // changed while this immutable candidate was being
+                            // projected. Rebuild from the same fetched pair
+                            // using the newest UI-owned settings; never publish
+                            // the stale visual generation.
+                            var latest = new WindowBuildSnapshot(
+                                CaptureWindowBuildOptions(),
+                                new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>(windowProjectionCache),
+                                Interlocked.Read(ref pointBuildRevision));
+                            BuildAndPublishWindowCandidate(
+                                range,
+                                bounds,
+                                pinnedEndAt,
+                                navigationOriginAt,
+                                revision,
+                                explicitRequest,
+                                candidateData,
+                                directory,
+                                pair,
+                                accountId,
+                                accountGeneration,
+                                latest);
+                            return;
+                        }
+
+                        if (task.Status == TaskStatus.RanToCompletion)
+                        {
+                            PublishTimeWindowOnUi(
+                                range,
+                                pinnedEndAt,
+                                navigationOriginAt,
+                                revision,
+                                candidateData,
+                                directory,
+                                pair,
+                                task.Result,
+                                accountId,
+                                accountGeneration);
+                        }
+                        else
+                        {
+                            PublishTimeWindowFailure(revision, accountId, accountGeneration);
+                        }
+                    });
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+    }
+
+    private static bool Intersects(ApiHistoryPeriod period, GraphTimeBounds bounds) =>
+        period.StartAt < bounds.EndAt && period.EndAt > bounds.StartAt;
+
+    private static bool SamePeriodBounds(ApiHistoryPeriod left, ApiHistoryPeriod right) =>
+        left.Id == right.Id && left.StartAt == right.StartAt && left.EndAt == right.EndAt &&
+        left.ResetAt == right.ResetAt && left.Current == right.Current;
+
+    private static bool AreWindowPeriodDataEqual(
+        GraphWindowPeriodData left,
+        GraphWindowPeriodData right) =>
+        SamePeriodBounds(left.Period, right.Period) &&
+        left.Gaps.SequenceEqual(right.Gaps) &&
+        left.Samples.Count == right.Samples.Count &&
+        left.Samples.Zip(right.Samples).All(pair => AreWindowSamplesEqual(pair.First, pair.Second));
+
+    private static bool AreWindowSamplesEqual(ApiHistorySample left, ApiHistorySample right) =>
+        left.Timestamp == right.Timestamp &&
+        left.ResetAt == right.ResetAt &&
+        left.RemainingPercent == right.RemainingPercent &&
+        left.SolDollars == right.SolDollars &&
+        left.TerraDollars == right.TerraDollars &&
+        left.LunaDollars == right.LunaDollars &&
+        left.SolTokens == right.SolTokens &&
+        left.TerraTokens == right.TerraTokens &&
+        left.LunaTokens == right.LunaTokens &&
+        left.ModelSource == right.ModelSource &&
+        left.ModelsComplete == right.ModelsComplete &&
+        left.TaskActiveSincePrevious == right.TaskActiveSincePrevious &&
+        left.IsSyntheticTail == right.IsSyntheticTail &&
+        (left.ModelSamples is null) == (right.ModelSamples is null) &&
+        (left.ModelSamples is null || left.ModelSamples.SequenceEqual(right.ModelSamples!));
+
+    private static WindowGraphProjection BuildWindowProjection(
+        GraphTimeBounds bounds,
+        IReadOnlyList<GraphWindowPeriodData> data,
+        WindowBuildOptions options,
+        IReadOnlyDictionary<WindowProjectionCacheKey, CachedWindowProjection> priorCache)
+    {
+        var points = new List<GraphPointViewModel>();
+        var children = new List<GraphScene>();
+        var nextCache = new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>();
+        foreach (var item in data.OrderBy(item => item.Period.StartAt).ThenBy(item => item.Period.ResetAt))
+        {
+            var hiddenNames = BuildHiddenModelNames(
+                item.Samples,
+                options.ShowModels,
+                options.ShowSol,
+                options.ShowTerra,
+                options.ShowLuna,
+                options.ShowAstra);
+            var key = new WindowProjectionCacheKey(
+                item.Period.Id,
+                item.Period.ResetAt,
+                options.Metric,
+                string.Join("\u001f", hiddenNames.OrderBy(name => name, StringComparer.Ordinal)),
+                FormatOwnershipKey(options.AccountOwnershipIntervals));
+            GraphProjection projection;
+            if (priorCache.TryGetValue(key, out var cached) && ReferenceEquals(cached.Data, item))
+            {
+                projection = cached.Projection;
+            }
+            else
+            {
+                var period = item.Period with { Samples = item.Samples };
+                projection = BuildProjection(
+                    period,
+                    options.Metric,
+                    item.Gaps.Select(gap => new GraphConfirmedGap(gap.StartAt, gap.EndAt)).ToArray(),
+                    hiddenNames,
+                    options.AccountOwnershipIntervals,
+                    appendPeriodTail: false);
+            }
+
+            nextCache[key] = new CachedWindowProjection(item, projection);
+            foreach (var point in projection.Points)
+            {
+                if (point.Timestamp >= bounds.StartAt && point.Timestamp <= bounds.EndAt)
+                {
+                    points.Add(point);
+                }
+            }
+            if (projection.Scene.HasPoints)
+            {
+                children.Add(projection.Scene);
+            }
+        }
+
+        var viewport = GraphScene.CreateViewport(bounds.StartAt, bounds.EndAt, options.Metric, children);
+        return new WindowGraphProjection(
+            points.OrderBy(point => point.Timestamp).ToArray(),
+            viewport,
+            nextCache);
+    }
+
+    private static IReadOnlySet<string> BuildHiddenModelNames(
+        IReadOnlyList<ApiHistorySample> samples,
+        bool showModels,
+        bool showSol,
+        bool showTerra,
+        bool showLuna,
+        bool showAstra)
+    {
+        var hidden = new HashSet<string>(StringComparer.Ordinal);
+        if (!showModels)
+        {
+            foreach (var model in samples.SelectMany(sample => sample.Models))
+            {
+                hidden.Add(model.Name);
+            }
+        }
+        if (!showSol) hidden.Add("SOL");
+        if (!showTerra) hidden.Add("TERRA");
+        if (!showLuna) hidden.Add("LUNA");
+        if (!showAstra) hidden.Add("ASTRA");
+        return hidden;
+    }
+
+    private static string FormatOwnershipKey(IReadOnlyList<GraphAccountOwnershipInterval>? intervals) =>
+        intervals is null
+            ? string.Empty
+            : string.Join(";", intervals.Select(interval => $"{interval.StartAt?.ToString(CultureInfo.InvariantCulture) ?? "_"}:{interval.EndAt?.ToString(CultureInfo.InvariantCulture) ?? "_"}"));
+
+    private void PublishTimeWindow(
+        GraphTimeRange range,
+        long? pinnedEndAt,
+        long? navigationOriginAt,
+        long revision,
+        IReadOnlyList<GraphWindowPeriodData> data,
+        IReadOnlyList<ApiHistoryPeriod> directory,
+        PublishedPairIdentity? pair,
+        WindowGraphProjection projection,
+        string? accountId,
+        long accountGeneration)
+    {
+        postToUi(() => PublishTimeWindowOnUi(
+            range,
+            pinnedEndAt,
+            navigationOriginAt,
+            revision,
+            data,
+            directory,
+            pair,
+            projection,
+            accountId,
+            accountGeneration));
+    }
+
+    private void PublishTimeWindowOnUi(
+        GraphTimeRange range,
+        long? pinnedEndAt,
+        long? navigationOriginAt,
+        long revision,
+        IReadOnlyList<GraphWindowPeriodData> data,
+        IReadOnlyList<ApiHistoryPeriod> directory,
+        PublishedPairIdentity? pair,
+        WindowGraphProjection projection,
+        string? accountId,
+        long accountGeneration)
+    {
+        if (disposed || revision != Interlocked.Read(ref timeWindowRevision) ||
+            accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
+        {
+            return;
+        }
+
+        if (resourceClient is not null)
+        {
+            var nextData = pair == windowPublishedPair
+                ? windowPeriodData.ToDictionary(item => item.Key, item => item.Value, StringComparer.Ordinal)
+                : new Dictionary<string, GraphWindowPeriodData>(StringComparer.Ordinal);
+            foreach (var item in data)
+            {
+                nextData[item.Period.Id] = item;
+            }
+            windowPeriodData = nextData;
+            windowPeriodDirectory = directory.ToArray();
+            windowPublishedPair = pair;
+        }
+        else
+        {
+            windowPeriodDirectory = directory.ToArray();
+        }
+
+        windowProjectionCache = projection.Cache;
+        Volatile.Write(ref selectedTimeRangeValue, (int)range);
+        pinnedWindowEndAt = pinnedEndAt ?? long.MinValue;
+        windowNavigationOriginAt = pinnedEndAt is null ? null : navigationOriginAt;
+        timeWindowRequestPending = false;
+        if (timeWindowRequestCancellation is not null && revision == Interlocked.Read(ref timeWindowRevision))
+        {
+            timeWindowRequestCancellation.Dispose();
+            timeWindowRequestCancellation = null;
+        }
+        PublishWindowGraphProjection(projection, range, pinnedEndAt);
+        NotifyTimeRangeProperties();
+        DrainDeferredStaticDetailsRebuild();
+    }
+
+    private void PublishWindowProjection(
+        WindowGraphProjection projection,
+        GraphTimeRange range,
+        long? pinnedEndAt,
+        IReadOnlyList<GraphWindowPeriodData> data,
+        IReadOnlyList<ApiHistoryPeriod> directory,
+        PublishedPairIdentity? pair,
+        string? accountId,
+        long accountGeneration,
+        long rangeRevision)
+    {
+        if (disposed || rangeRevision != Interlocked.Read(ref timeWindowRevision) ||
+            accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
+        {
+            return;
+        }
+
+        windowProjectionCache = projection.Cache;
+        PublishWindowGraphProjection(projection, range, pinnedEndAt);
+        NotifyTimeRangeProperties();
+        DrainDeferredStaticDetailsRebuild();
+    }
+
+    private void PublishWindowGraphProjection(
+        WindowGraphProjection projection,
+        GraphTimeRange range,
+        long? pinnedEndAt)
+    {
+        points = projection.Points;
+        scene = projection.Scene;
+        displayedMetric = projection.Scene.Metric;
+        displayedPeriod = selectedPeriod;
+        Volatile.Write(ref selectedTimeRangeValue, (int)range);
+        this.pinnedWindowEndAt = pinnedEndAt ?? long.MinValue;
+        SetLoadError(false);
+        SetLoading(false);
+        Notify(nameof(Points));
+        Notify(nameof(Scene));
+        Notify(nameof(HasPoints));
+        Notify(nameof(HasNoPoints));
+        Notify(nameof(HasBlockingLoadError));
+        Notify(nameof(HasPlot));
+        Notify(nameof(MetricAxisText));
+        Notify(nameof(IsDollars));
+        Notify(nameof(SelectedPeriodStartAt));
+        Notify(nameof(SelectedPeriodEndAt));
+        Notify(nameof(RangeLabel));
+    }
+
+    private void PublishTimeWindowFailure(long revision, string? accountId, long accountGeneration)
+    {
+        postToUi(() =>
+        {
+            if (disposed || revision != Interlocked.Read(ref timeWindowRevision) ||
+                accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
+            {
+                return;
+            }
+
+            timeWindowRequestPending = false;
+            if (timeWindowRequestCancellation is not null)
+            {
+                timeWindowRequestCancellation.Dispose();
+                timeWindowRequestCancellation = null;
+            }
+            SetLoadError(true);
+            SetLoading(false);
+            NotifyTimeRangeProperties();
+            DrainDeferredStaticDetailsRebuild();
+        });
+    }
+
+    private void NotifyTimeRangeProperties()
+    {
+        Notify(nameof(SelectedTimeRange));
+        Notify(nameof(IsPeriodView));
+        Notify(nameof(Is24HourView));
+        Notify(nameof(IsWeekView));
+        Notify(nameof(CanGoBack));
+        Notify(nameof(CanGoForward));
+        Notify(nameof(HasPlot));
+        Notify(nameof(RangeLabel));
     }
 
     private void RebuildMetricOptions()
@@ -838,12 +1686,315 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private async Task RefreshSplitResourceAsync(
         bool initial,
         string? requestedPeriodId,
-        CancellationToken cancellationToken) =>
+        CancellationToken cancellationToken)
+    {
+        if (timeWindowRequestPending)
+        {
+            return;
+        }
+
+        var range = SelectedTimeRange;
+        if (range != GraphTimeRange.ResetPeriod)
+        {
+            var now = getUnixTimeSeconds();
+            var pinnedEndAt = this.pinnedWindowEndAt == long.MinValue
+                ? (long?)null
+                : this.pinnedWindowEndAt;
+            await RefreshTimeWindowCoreAsync(
+                    range,
+                    GraphTimeWindow.GetBounds(range, now, pinnedEndAt),
+                    pinnedEndAt,
+                    windowNavigationOriginAt,
+                    Interlocked.Read(ref timeWindowRevision),
+                    forceRefresh: true,
+                    explicitRequest: false,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
         await RefreshSplitResourceCoreAsync(
-            initial,
-            requestedPeriodId,
-            Interlocked.Read(ref periodSelectionRevision),
-            cancellationToken).ConfigureAwait(false);
+                initial,
+                requestedPeriodId,
+                Interlocked.Read(ref periodSelectionRevision),
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async Task RefreshTimeWindowCoreAsync(
+        GraphTimeRange range,
+        GraphTimeBounds bounds,
+        long? pinnedEndAt,
+        long? navigationOriginAt,
+        long revision,
+        bool forceRefresh,
+        bool explicitRequest,
+        CancellationToken cancellationToken)
+    {
+        if (resourceClient is null || disposed || cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            await resourceRefreshGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        string? accountId = null;
+        var accountGeneration = 0L;
+        var pageBudget = new WindowPageBudget();
+        try
+        {
+            accountId = main.SelectedAccountId;
+            accountGeneration = main.AccountSelectionGeneration;
+            if (accountResourceClient is not null && accountId is null ||
+                accountResourceClient is null && main.HasAccounts)
+            {
+                if (explicitRequest)
+                {
+                    PublishTimeWindowFailure(revision, accountId, accountGeneration);
+                }
+                return;
+            }
+
+            var allowCached = !forceRefresh && windowPublishedPair is not null;
+            for (var alignmentAttempt = 0;
+                alignmentAttempt < MaxSplitGenerationAlignmentAttempts;
+                alignmentAttempt++)
+            {
+                if (!IsCurrentWindowRequest(revision, accountId, accountGeneration, explicitRequest))
+                {
+                    return;
+                }
+
+                var periodsResult = accountId is not null && accountResourceClient is not null
+                    ? await accountResourceClient.FetchHistoryPeriodsAsync(accountId, cancellationToken).ConfigureAwait(false)
+                    : await resourceClient.FetchHistoryPeriodsAsync(cancellationToken).ConfigureAwait(false);
+                if (!IsCurrentWindowRequest(revision, accountId, accountGeneration, explicitRequest))
+                {
+                    return;
+                }
+                if (!periodsResult.IsSuccess || periodsResult.Snapshot is not { } periodsSnapshot ||
+                    accountId is not null && periodsSnapshot.AccountId != accountId)
+                {
+                    PublishTimeWindowFailure(revision, accountId, accountGeneration);
+                    return;
+                }
+
+                var sameAcceptedPair = periodsSnapshot.PublishedPair == windowPublishedPair;
+                var priorPairData = sameAcceptedPair
+                    ? windowPeriodData
+                    : new Dictionary<string, GraphWindowPeriodData>(StringComparer.Ordinal);
+                var reusable = allowCached && sameAcceptedPair
+                    ? priorPairData
+                    : new Dictionary<string, GraphWindowPeriodData>(StringComparer.Ordinal);
+                var candidateData = new List<GraphWindowPeriodData>();
+                var needsRealignment = false;
+                foreach (var period in periodsSnapshot.Periods
+                    .Where(period => Intersects(period, bounds))
+                    .OrderBy(period => period.StartAt)
+                    .ThenBy(period => period.ResetAt))
+                {
+                    if (reusable.TryGetValue(period.Id, out var cached) && SamePeriodBounds(cached.Period, period))
+                    {
+                        candidateData.Add(cached);
+                        continue;
+                    }
+                    if (sameAcceptedPair && priorPairData.TryGetValue(period.Id, out cached) &&
+                        !SamePeriodBounds(cached.Period, period))
+                    {
+                        PublishTimeWindowFailure(revision, accountId, accountGeneration);
+                        return;
+                    }
+
+                    var fetched = await FetchWindowPeriodAsync(
+                            period,
+                            periodsSnapshot.PublishedPair,
+                            accountId,
+                            accountGeneration,
+                            pageBudget,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!IsCurrentWindowRequest(revision, accountId, accountGeneration, explicitRequest))
+                    {
+                        return;
+                    }
+
+                    if (fetched.Status == WindowPeriodFetchStatus.PairMismatch)
+                    {
+                        needsRealignment = true;
+                        break;
+                    }
+                    if (fetched.Status != WindowPeriodFetchStatus.Success || fetched.Data is null)
+                    {
+                        PublishTimeWindowFailure(revision, accountId, accountGeneration);
+                        return;
+                    }
+                    if (sameAcceptedPair && priorPairData.TryGetValue(period.Id, out cached))
+                    {
+                        if (!AreWindowPeriodDataEqual(cached, fetched.Data))
+                        {
+                            PublishTimeWindowFailure(revision, accountId, accountGeneration);
+                            return;
+                        }
+                        candidateData.Add(cached);
+                    }
+                    else
+                    {
+                        candidateData.Add(fetched.Data);
+                    }
+                }
+
+                if (needsRealignment)
+                {
+                    if (alignmentAttempt + 1 >= MaxSplitGenerationAlignmentAttempts)
+                    {
+                        PublishTimeWindowFailure(revision, accountId, accountGeneration);
+                        return;
+                    }
+                    // A published pair advanced mid-candidate. Discard every
+                    // staged period and make one complete candidate from a
+                    // newly fetched periods root.
+                    allowCached = false;
+                    continue;
+                }
+
+                if (!IsCurrentWindowRequest(revision, accountId, accountGeneration, explicitRequest))
+                {
+                    return;
+                }
+
+                var buildSnapshot = await CaptureWindowBuildSnapshotAsync(cancellationToken).ConfigureAwait(false);
+                if (!IsCurrentWindowRequest(revision, accountId, accountGeneration, explicitRequest))
+                {
+                    return;
+                }
+
+                BuildAndPublishWindowCandidate(
+                    range,
+                    bounds,
+                    pinnedEndAt,
+                    navigationOriginAt,
+                    revision,
+                    explicitRequest,
+                    candidateData,
+                    periodsSnapshot.Periods,
+                    periodsSnapshot.PublishedPair,
+                    accountId,
+                    accountGeneration,
+                    buildSnapshot);
+                return;
+            }
+
+            PublishTimeWindowFailure(revision, accountId, accountGeneration);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // A newer range, account boundary, or graph close owns cancellation.
+        }
+        catch
+        {
+            PublishTimeWindowFailure(revision, accountId, accountGeneration);
+        }
+        finally
+        {
+            resourceRefreshGate.Release();
+        }
+    }
+
+    private async Task<WindowPeriodFetchResult> FetchWindowPeriodAsync(
+        ApiHistoryPeriod period,
+        PublishedPairIdentity expectedPair,
+        string? accountId,
+        long accountGeneration,
+        WindowPageBudget pageBudget,
+        CancellationToken cancellationToken)
+    {
+        var samples = new List<ApiHistorySample>();
+        var gaps = new List<ApiHistoryGap>();
+        string? cursor = null;
+        string? requestedCursor = null;
+        var firstPage = true;
+        while (true)
+        {
+            if (++pageBudget.PageRequests > MaxSplitHistoryPageRequests)
+            {
+                return WindowPeriodFetchResult.Failure;
+            }
+
+            var pageResult = accountId is not null && accountResourceClient is not null
+                ? await accountResourceClient.FetchHistoryPageAsync(
+                        accountId,
+                        period.Id,
+                        cursor,
+                        cancellationToken)
+                    .ConfigureAwait(false)
+                : await resourceClient!.FetchHistoryPageAsync(
+                        period.Id,
+                        cursor,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            if (accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
+            {
+                return WindowPeriodFetchResult.Stale;
+            }
+            if (!pageResult.IsSuccess || pageResult.Page is not { } page ||
+                accountId is not null && page.AccountId != accountId ||
+                page.PeriodId != period.Id)
+            {
+                return WindowPeriodFetchResult.Failure;
+            }
+            if (page.PublishedPair != expectedPair)
+            {
+                return WindowPeriodFetchResult.PairMismatch;
+            }
+            if (!ValidateHistoryPage(period, page) || (!firstPage && page.HistoryGaps.Count != 0))
+            {
+                return WindowPeriodFetchResult.Failure;
+            }
+
+            samples.AddRange(page.Samples);
+            if (firstPage)
+            {
+                gaps.AddRange(page.HistoryGaps);
+            }
+            firstPage = false;
+            if (page.NextCursor is null)
+            {
+                var mergedSamples = MergeHistorySamples(Array.Empty<ApiHistorySample>(), samples);
+                var mergedGaps = MergeHistoryGaps(Array.Empty<ApiHistoryGap>(), gaps);
+                if (mergedSamples is null || mergedGaps is null)
+                {
+                    return WindowPeriodFetchResult.Failure;
+                }
+
+                return WindowPeriodFetchResult.Success(new GraphWindowPeriodData(
+                    period with { Samples = mergedSamples },
+                    mergedSamples,
+                    mergedGaps));
+            }
+
+            if (page.NextCursor == cursor || page.NextCursor == requestedCursor && samples.Count == 0)
+            {
+                return WindowPeriodFetchResult.Failure;
+            }
+            requestedCursor = cursor = page.NextCursor;
+        }
+    }
+
+    private bool IsCurrentWindowRequest(
+        long revision,
+        string? accountId,
+        long accountGeneration,
+        bool explicitRequest) =>
+        !disposed && revision == Interlocked.Read(ref timeWindowRevision) &&
+        (accountId is null || main.IsAccountSelectionCurrent(accountId, accountGeneration)) &&
+        (explicitRequest || !timeWindowRequestPending);
 
     private async Task RefreshSplitResourceCoreAsync(
         bool initial,
@@ -1244,6 +2395,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 Notify(nameof(SelectedPeriodValueText));
                 Notify(nameof(SelectedPeriodStartAt));
                 Notify(nameof(SelectedPeriodEndAt));
+                NotifyTimeRangeProperties();
             }
             finally
             {
@@ -1273,8 +2425,14 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             }
 
             resourceCursorResetRequired = nextCursorResetRequired;
+            if (resetRangeCommitRevision == Interlocked.Read(ref timeWindowRevision))
+            {
+                resetRangeCommitRevision = -1;
+                timeWindowRequestPending = false;
+            }
             SetLoadError(true);
             SetLoading(false);
+            NotifyTimeRangeProperties();
         });
     }
 
@@ -1352,19 +2510,42 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void Rebuild()
     {
-        var previousId = selectedPeriod?.Id;
-        periods.Clear();
-        if (main.DetailsSnapshot is { } details)
+        if (resourceClient is null && timeWindowRequestPending)
         {
-            foreach (var period in FormatPeriodsForDisplay(details.History))
-            {
-                periods.Add(period);
-            }
+            staticDetailsRebuildDeferred = true;
+            return;
         }
 
-        selectedPeriod = periods.FirstOrDefault(period => period.Id == previousId)
-            ?? periods.FirstOrDefault(period => period.Current)
-            ?? periods.FirstOrDefault();
+        var previousId = selectedPeriod?.Id;
+        rebuildingPeriodDirectory = true;
+        try
+        {
+            periods.Clear();
+            if (main.DetailsSnapshot is { } details)
+            {
+                foreach (var period in FormatPeriodsForDisplay(details.History))
+                {
+                    periods.Add(period);
+                }
+            }
+
+            selectedPeriod = periods.FirstOrDefault(period => period.Id == previousId)
+                ?? periods.FirstOrDefault(period => period.Current)
+                ?? periods.FirstOrDefault();
+        }
+        finally
+        {
+            rebuildingPeriodDirectory = false;
+        }
+
+        windowProjectionCache.Clear();
+        if (resourceClient is null)
+        {
+            Interlocked.Increment(ref timeWindowRevision);
+            timeWindowRequestPending = false;
+            staticWindowPeriodData = BuildStaticWindowPeriodData(periods);
+            windowPeriodDirectory = periods.ToArray();
+        }
 
         RebuildPoints();
         Notify(nameof(HasPeriods));
@@ -1372,6 +2553,18 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(SelectedPeriodText));
         Notify(nameof(SelectedPeriodStartAt));
         Notify(nameof(SelectedPeriodEndAt));
+        NotifyTimeRangeProperties();
+    }
+
+    private void DrainDeferredStaticDetailsRebuild()
+    {
+        if (resourceClient is not null || timeWindowRequestPending || !staticDetailsRebuildDeferred)
+        {
+            return;
+        }
+
+        staticDetailsRebuildDeferred = false;
+        Rebuild();
     }
 
     private void ReformatPeriodLabels()
@@ -1445,6 +2638,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void RebuildPoints()
     {
+        var resetRangePending = resetRangeCommitRevision == Interlocked.Read(ref timeWindowRevision);
+        if (SelectedTimeRange != GraphTimeRange.ResetPeriod && !resetRangePending)
+        {
+            RebuildAcceptedWindowProjection();
+            return;
+        }
+
         pointBuildCancellation.Cancel();
         pointBuildCancellation.Dispose();
         pointBuildCancellation = new CancellationTokenSource();
@@ -1585,32 +2785,53 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         GraphMetric metric,
         IReadOnlyList<GraphConfirmedGap> confirmedGaps,
         IReadOnlySet<string> hiddenModelNames,
-        IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals)
+        IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals,
+        bool appendPeriodTail = true)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var samples = BuildGraphSamples(period, now);
+        var samples = appendPeriodTail
+            ? BuildGraphSamples(period, now)
+            : BuildWindowGraphSamples(period);
         var diagnosticSamples = ReduceGraphSamples(samples, MaxRenderedGraphPoints, confirmedGaps);
+        var graphScene = GraphScene.Create(
+            samples,
+            metric,
+            period.StartAt,
+            EffectiveGraphEnd(period, now),
+            confirmedGaps,
+            hiddenModelNames,
+            accountOwnershipIntervals);
+        GraphPlotProjection.PrepareGeometry(graphScene);
         return new GraphProjection(
             diagnosticSamples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
-            GraphScene.Create(
-                samples,
-                metric,
-                period.StartAt,
-                EffectiveGraphEnd(period, now),
-                confirmedGaps,
-                hiddenModelNames,
-                accountOwnershipIntervals));
+            graphScene);
     }
+
+    private static IReadOnlyList<ApiHistorySample> BuildWindowGraphSamples(ApiHistoryPeriod period) =>
+        period.Samples
+            .Where(sample => !sample.IsSyntheticTail &&
+                sample.Timestamp >= period.StartAt && sample.Timestamp <= period.EndAt)
+            .OrderBy(sample => sample.Timestamp)
+            .ToArray();
 
     private void PublishPoints(
         GraphProjection next,
         ApiHistoryPeriod? period,
         GraphMetric metric)
     {
+        var commitsResetRange = resetRangeCommitRevision == Interlocked.Read(ref timeWindowRevision);
         points = next.Points;
         scene = next.Scene;
         displayedPeriod = period;
         displayedMetric = metric;
+        if (commitsResetRange)
+        {
+            resetRangeCommitRevision = -1;
+            timeWindowRequestPending = false;
+            Volatile.Write(ref selectedTimeRangeValue, (int)GraphTimeRange.ResetPeriod);
+            pinnedWindowEndAt = long.MinValue;
+            windowNavigationOriginAt = null;
+        }
         SetLoadError(false);
         SetLoading(false);
         Notify(nameof(Points));
@@ -1622,11 +2843,82 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(IsDollars));
         Notify(nameof(SelectedPeriodStartAt));
         Notify(nameof(SelectedPeriodEndAt));
+        Notify(nameof(HasPlot));
+        Notify(nameof(RangeLabel));
+        if (commitsResetRange)
+        {
+            NotifyTimeRangeProperties();
+            DrainDeferredStaticDetailsRebuild();
+        }
+        Notify(nameof(CanGoBack));
+        Notify(nameof(CanGoForward));
     }
 
     private readonly record struct GraphProjection(
         IReadOnlyList<GraphPointViewModel> Points,
         GraphScene Scene);
+
+    private sealed record GraphWindowPeriodData(
+        ApiHistoryPeriod Period,
+        IReadOnlyList<ApiHistorySample> Samples,
+        IReadOnlyList<ApiHistoryGap> Gaps);
+
+    private sealed record WindowBuildOptions(
+        GraphMetric Metric,
+        bool ShowModels,
+        bool ShowSol,
+        bool ShowTerra,
+        bool ShowLuna,
+        bool ShowAstra,
+        IReadOnlyList<GraphAccountOwnershipInterval>? AccountOwnershipIntervals);
+
+    private sealed record WindowBuildSnapshot(
+        WindowBuildOptions Options,
+        Dictionary<WindowProjectionCacheKey, CachedWindowProjection> Cache,
+        long PointBuildRevision);
+
+    private readonly record struct WindowProjectionCacheKey(
+        string PeriodId,
+        long ResetAt,
+        GraphMetric Metric,
+        string HiddenModelNames,
+        string OwnershipIntervals);
+
+    private sealed record CachedWindowProjection(
+        GraphWindowPeriodData Data,
+        GraphProjection Projection);
+
+    private sealed record WindowGraphProjection(
+        IReadOnlyList<GraphPointViewModel> Points,
+        GraphScene Scene,
+        Dictionary<WindowProjectionCacheKey, CachedWindowProjection> Cache);
+
+    private enum WindowPeriodFetchStatus
+    {
+        Success,
+        PairMismatch,
+        Failure,
+        Stale,
+    }
+
+    private sealed record WindowPeriodFetchResult(
+        WindowPeriodFetchStatus Status,
+        GraphWindowPeriodData? Data)
+    {
+        public static WindowPeriodFetchResult Failure { get; } = new(WindowPeriodFetchStatus.Failure, null);
+
+        public static WindowPeriodFetchResult PairMismatch { get; } = new(WindowPeriodFetchStatus.PairMismatch, null);
+
+        public static WindowPeriodFetchResult Stale { get; } = new(WindowPeriodFetchStatus.Stale, null);
+
+        public static WindowPeriodFetchResult Success(GraphWindowPeriodData data) =>
+            new(WindowPeriodFetchStatus.Success, data);
+    }
+
+    private sealed class WindowPageBudget
+    {
+        public int PageRequests { get; set; }
+    }
 
     private void PublishLoadFailure(long revision)
     {
@@ -1634,8 +2926,19 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             return;
         }
+        var resetRangeFailed = resetRangeCommitRevision == Interlocked.Read(ref timeWindowRevision);
+        if (resetRangeFailed)
+        {
+            resetRangeCommitRevision = -1;
+            timeWindowRequestPending = false;
+        }
         SetLoadError(true);
         SetLoading(false);
+        if (resetRangeFailed)
+        {
+            NotifyTimeRangeProperties();
+            DrainDeferredStaticDetailsRebuild();
+        }
     }
 
     private void SetLoading(bool value)
