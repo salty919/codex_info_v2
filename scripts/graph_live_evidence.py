@@ -1514,7 +1514,13 @@ def _endpoint_labels(
     ]
 
 
-def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
+def build_expected_render_contracts(
+    fixture: dict[str, Any], *, platform: str = "linux"
+) -> dict[str, Any]:
+    # The saved v1 envelope retains its Linux baseline. Windows WG14 changes
+    # only its final opaque idle role; data and all other render rules match.
+    if platform not in {"linux", "windows"}:
+        raise EvidenceError("render contract platform must be linux or windows")
     period, samples, gaps = _validate_fixture(fixture)
     rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
     universe = _period_model_universe(samples)
@@ -1665,7 +1671,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                 "plot_surface": "#121c2c",
                 "grid": "#263850",
                 "axis_text": "#78879c",
-                "idle_band": "#1a2838",
+                "idle_band": "#162232" if platform == "windows" else "#1a2838",
                 "remaining": "#56b2f5",
                 "sol": "#a88cf5",
                 "terra": "#5dc98a",
@@ -2053,7 +2059,7 @@ def verify(evidence_path: Path, linux_path: Path, windows_path: Path) -> None:
         or artifact["cross_platform_mismatches"]
         or any(
             actual_by_platform[platform]["render_contracts"]
-            != artifact["expected_render_contracts"]
+            != build_expected_render_contracts(artifact["fixture"], platform=platform)
             for platform in ("linux", "windows")
         )
         or any(

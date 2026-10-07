@@ -11,7 +11,7 @@ param(
     [ValidateRange(0, 7)][int]$ThreadCount = 6,
     [switch]$ConfiguredService,
     [switch]$OpenGraphPeriodMenu,
-    [switch]$OpenGraphMetricMenu
+    [ValidateSet('Tokens', 'Dollars')][string]$GraphMetric
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,8 +41,9 @@ public static class CodexInfoCaptureWin32 {
 [CodexInfoCaptureWin32]::SetProcessDPIAware() | Out-Null
 
 if ($ConfiguredService) {
-    if ($PSBoundParameters.ContainsKey('Preview') -or $OpenGraphPeriodMenu -or $OpenGraphMetricMenu) {
-        throw 'ConfiguredService captures only the live Main window without preview or Graph menu options'
+    if ($PSBoundParameters.ContainsKey('Preview') -or $OpenGraphPeriodMenu -or
+        $PSBoundParameters.ContainsKey('GraphMetric')) {
+        throw 'ConfiguredService captures only the live Main window without preview or Graph selector options'
     }
     # The launched client must use its persisted service settings and real
     # account state, even when this shell previously ran a preview capture.
@@ -145,23 +146,115 @@ try {
             throw "Configured authenticated Main is not ready: generation=$generationState authenticatedContentVisible=$authenticatedContentVisible"
         }
     }
-    if ($OpenGraphPeriodMenu -or $OpenGraphMetricMenu) {
-        # Locate the semantic control instead of scaling stale pixel
-        # coordinates. This remains correct across DPI and responsive widths.
+    $graphMetricBound = $PSBoundParameters.ContainsKey('GraphMetric')
+    if ($OpenGraphPeriodMenu -or $graphMetricBound) {
+        # Locate semantic controls instead of scaling stale pixel coordinates.
+        # This remains correct across DPI and responsive widths.
         $automationRoot = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-        $automationId = if ($OpenGraphMetricMenu) { 'Graph.MetricSelector' } else { 'Graph.PeriodSelector' }
-        $condition = New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
-            $automationId)
-        $selector = $automationRoot.FindFirst(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            $condition)
-        if ($null -eq $selector) { throw "Graph selector is missing: $automationId" }
-        $toggle = $null
-        if (-not $selector.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggle)) {
-            throw "Graph selector has no TogglePattern: $automationId"
+        if ($graphMetricBound) {
+            $metricAutomationId = "Graph.Metric.$GraphMetric"
+            $metricCondition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+                $metricAutomationId)
+            $metricButton = $automationRoot.FindFirst(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $metricCondition)
+            if ($null -eq $metricButton) { throw "Graph metric button is missing: $metricAutomationId" }
+            if (-not $metricButton.Current.IsEnabled -or $metricButton.Current.IsOffscreen) {
+                throw "Graph metric button is not available: $metricAutomationId"
+            }
+            $priorSelectedState = $metricButton.Current.HelpText
+            if ($priorSelectedState -notin @('True', 'False')) {
+                throw "Graph metric button has an unknown selected state: $metricAutomationId"
+            }
+            $wasSelected = $priorSelectedState -eq 'True'
+            $plotAutomationId = 'Graph.Plot'
+            $plotCondition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+                $plotAutomationId)
+            $plot = $automationRoot.FindFirst(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $plotCondition)
+            $priorPlotHelpText = if ($null -eq $plot) { $null } else { $plot.Current.HelpText }
+            $invoke = $null
+            if (-not $metricButton.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
+                throw "Graph metric button has no InvokePattern: $metricAutomationId"
+            }
+            $invoke.Invoke()
+            $selected = $false
+            for ($attempt = 0; $attempt -lt 40; $attempt++) {
+                $metricButton = $automationRoot.FindFirst(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    $metricCondition)
+                if ($null -ne $metricButton -and $metricButton.Current.HelpText -eq 'True') {
+                    $selected = $true
+                    break
+                }
+                Start-Sleep -Milliseconds 50
+            }
+            if (-not $selected) { throw "Graph metric button did not become selected: $metricAutomationId" }
+            # The selected button can update before the asynchronous graph scene.
+            # Always wait for a visible plot and a hidden loading indicator; when
+            # switching metrics, also require the plot's metric-axis UIA value to
+            # change before capturing the accepted frame.
+            $sceneReady = $false
+            $sceneWaitDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            $progressCondition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::ProgressBar)
+            while ([DateTime]::UtcNow -lt $sceneWaitDeadline) {
+                $plot = $automationRoot.FindFirst(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    $plotCondition)
+                $plotVisible = $false
+                $plotHelpTextChanged = $wasSelected
+                if ($null -ne $plot) {
+                    $plotState = $plot.Current
+                    $plotBounds = $plotState.BoundingRectangle
+                    $plotVisible = -not $plotState.IsOffscreen -and
+                        $plotBounds.Width -gt 0 -and $plotBounds.Height -gt 0
+                    $plotHelpTextChanged = $wasSelected -or
+                        $plotState.HelpText -cne $priorPlotHelpText
+                }
+                if ($plotVisible -and $plotHelpTextChanged) {
+                    $progressBars = $automationRoot.FindAll(
+                        [System.Windows.Automation.TreeScope]::Descendants,
+                        $progressCondition)
+                    $visibleProgressBar = $false
+                    foreach ($progressBar in $progressBars) {
+                        $progressBounds = $progressBar.Current.BoundingRectangle
+                        if (-not $progressBar.Current.IsOffscreen -and
+                            $progressBounds.Width -gt 0 -and $progressBounds.Height -gt 0) {
+                            $visibleProgressBar = $true
+                            break
+                        }
+                    }
+                    if (-not $visibleProgressBar) {
+                        $sceneReady = $true
+                        break
+                    }
+                }
+                Start-Sleep -Milliseconds 50
+            }
+            if (-not $sceneReady) {
+                throw "Graph metric scene did not settle after selecting $GraphMetric within 10 seconds"
+            }
         }
-        $toggle.Toggle()
+        if ($OpenGraphPeriodMenu) {
+            $periodAutomationId = 'Graph.PeriodSelector'
+            $periodCondition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+                $periodAutomationId)
+            $periodSelector = $automationRoot.FindFirst(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $periodCondition)
+            if ($null -eq $periodSelector) { throw "Graph selector is missing: $periodAutomationId" }
+            $toggle = $null
+            if (-not $periodSelector.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggle)) {
+                throw "Graph selector has no TogglePattern: $periodAutomationId"
+            }
+            $toggle.Toggle()
+        }
         [CodexInfoCaptureWin32]::SetWindowPos($window, [IntPtr](-1), 80, 80, 0, 0, 0x0001) | Out-Null
         Start-Sleep -Milliseconds 250
     } else {

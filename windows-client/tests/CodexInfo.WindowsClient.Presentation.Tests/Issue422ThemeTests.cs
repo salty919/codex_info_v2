@@ -5,7 +5,9 @@ using System.Collections;
 using System.Reflection;
 using System.Text.Json;
 using System.Xml.Linq;
+using Avalonia.Media;
 using CodexInfo.WindowsClient;
+using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
 using CodexInfo.WindowsClient.Theme;
@@ -148,6 +150,60 @@ public sealed class Issue422ThemeTests
             }
 
             Assert.Throws<ArgumentOutOfRangeException>(() => ThemePalette.Resolve("#010203"));
+        }
+        finally
+        {
+            ThemePalette.Apply(originalTheme);
+        }
+    }
+
+    [Fact]
+    public void GraphRoleResourcesUseFixedDarkAndLightColorsAndContrastWithPlotAndIdleAcrossAllThemes()
+    {
+        var originalTheme = ThemePalette.CurrentId;
+        var lightThemes = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "light", "paper-light", "sand-light", "steel-light", "lavender-light", "mint-light",
+        };
+        var darkRoles = new[]
+        {
+            (Key: "GraphRemaining", Color: "#56B2F5"),
+            (Key: "GraphLuna", Color: "#E6A23C"),
+            (Key: "GraphTerra", Color: "#5DC98A"),
+            (Key: "GraphSol", Color: "#A88CF5"),
+            (Key: "GraphAstra", Color: "#EF6A6A"),
+        };
+        var lightRoles = new[]
+        {
+            (Key: "GraphRemaining", Color: "#176AAB"),
+            (Key: "GraphLuna", Color: "#985F08"),
+            (Key: "GraphTerra", Color: "#16794B"),
+            (Key: "GraphSol", Color: "#6A4BCC"),
+            (Key: "GraphAstra", Color: "#B23553"),
+        };
+
+        try
+        {
+            Assert.Equal(16, ThemePalette.PresetIds.Count);
+            foreach (var theme in ThemePalette.PresetIds)
+            {
+                ThemePalette.Apply(theme);
+                var roles = lightThemes.Contains(theme) ? lightRoles : darkRoles;
+                var actualRoles = roles
+                    .Select(role => (role.Key, Expected: role.Color, Actual: ReadGraphRoleResource(role.Key)))
+                    .ToArray();
+                Assert.Equal(5, actualRoles.Select(role => role.Actual).Distinct(StringComparer.OrdinalIgnoreCase).Count());
+
+                var plot = ThemePalette.Resolve(GraphPlotControl.PlotColorHex);
+                var idleBaseline = ThemePalette.Resolve(GraphPlotControl.IdleBandColorHex);
+                var idle = BlendHalfUp(plot, idleBaseline);
+                foreach (var role in actualRoles)
+                {
+                    Assert.Equal(role.Expected, role.Actual);
+                    AssertGraphContrast(theme, role.Key, role.Actual, plot, "plot background");
+                    AssertGraphContrast(theme, role.Key, role.Actual, idle, "idle background");
+                }
+            }
         }
         finally
         {
@@ -346,6 +402,49 @@ public sealed class Issue422ThemeTests
         var b = Luminance(ThemePalette.Resolve(background));
         var contrast = (Math.Max(a, b) + 0.05) / (Math.Min(a, b) + 0.05);
         Assert.True(contrast >= minimum, $"{id}: {foreground}/{background} contrast {contrast:F2} < {minimum}");
+    }
+
+    private static string ReadGraphRoleResource(string key)
+    {
+        var brush = Assert.IsType<SolidColorBrush>(ThemePalette.Brush(key));
+        return $"#{brush.Color.R:X2}{brush.Color.G:X2}{brush.Color.B:X2}";
+    }
+
+    private static void AssertGraphContrast(string theme, string role, string foreground, string background, string surface)
+    {
+        var contrast = ContrastRatio(foreground, background);
+        Assert.True(contrast >= 3,
+            $"{theme}: {role} {foreground} has {contrast:F2}:1 contrast against {surface} {background}; expected >= 3:1.");
+    }
+
+    private static double ContrastRatio(string first, string second)
+    {
+        static double Luminance(string hex)
+        {
+            static double Linear(int channel)
+            {
+                var value = channel / 255.0;
+                return value <= 0.04045 ? value / 12.92 : Math.Pow((value + 0.055) / 1.055, 2.4);
+            }
+
+            return 0.2126 * Linear(Convert.ToInt32(hex.Substring(1, 2), 16))
+                + 0.7152 * Linear(Convert.ToInt32(hex.Substring(3, 2), 16))
+                + 0.0722 * Linear(Convert.ToInt32(hex.Substring(5, 2), 16));
+        }
+
+        var a = Luminance(first);
+        var b = Luminance(second);
+        return (Math.Max(a, b) + 0.05) / (Math.Min(a, b) + 0.05);
+    }
+
+    private static string BlendHalfUp(string first, string second)
+    {
+        static int Channel(string color, int offset) => Convert.ToInt32(color.Substring(offset, 2), 16);
+        static int Average(int left, int right) => (left + right + 1) / 2;
+
+        return $"#{Average(Channel(first, 1), Channel(second, 1)):X2}" +
+            $"{Average(Channel(first, 3), Channel(second, 3)):X2}" +
+            $"{Average(Channel(first, 5), Channel(second, 5)):X2}";
     }
 
     private static string ReadThemeOptionId(object option)

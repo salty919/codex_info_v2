@@ -435,89 +435,99 @@ public sealed class PresentationBoundaryTests
     }
 
     [Fact]
-    public void GraphHeaderSeparatesMetricSelectorFromWindowControls()
+    public void GraphHeaderUsesVisibleMetricButtonsAndCompactRangeRow()
     {
         var document = XDocument.Parse(LoadRepositoryFile(
             "windows-client", "src", "CodexInfo.WindowsClient", "GraphWindow.axaml"));
         var xamlName = XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml");
-        var metricSelector = document.Descendants()
-            .Single(element => element.Name.LocalName == "GraphSelect" &&
-                element.Attribute(xamlName)?.Value == "MetricSelector");
-        var header = metricSelector.Parent;
-        Assert.NotNull(header);
-        Assert.Equal("Grid", header.Name.LocalName);
+        var graphContent = document.Descendants().Single(element =>
+            element.Attribute(xamlName)?.Value == "GraphContent");
+        Assert.Equal(4, graphContent.Attribute("RowDefinitions")!.Value.Split(',').Length);
+        var titleRow = graphContent.Elements().Single(element => element.Attribute("Grid.Row")?.Value == "0");
 
-        var columns = header.Attribute("ColumnDefinitions")!.Value.Split(',');
-        Assert.Equal(["*", "128", "8", "108"], columns);
-
-        var controls = header.Elements()
-            .Single(element => element.Name.LocalName == "StackPanel" &&
-                element.Elements().Any(button =>
-                    button.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.Window.Minimize"));
-        Assert.Equal("3", controls.Attribute("Grid.Column")?.Value);
-        var spacing = int.Parse(controls.Attribute("Spacing")!.Value);
-        Assert.Equal(0, spacing);
-
-        var buttons = controls.Elements()
-            .Where(element => element.Name.LocalName == "Button")
-            .ToArray();
-        Assert.Equal(
-            new string?[] { "Graph.Window.Minimize", "Graph.Window.Maximize", "Graph.Window.Close" },
-            buttons.Select(button => button.Attribute("AutomationProperties.AutomationId")?.Value).ToArray());
-
-        var controlStyle = document.Descendants()
-            .Single(element => element.Name.LocalName == "Style" &&
-                element.Attribute("Selector")?.Value == "Button.window-control");
-        Assert.Equal("Center", controlStyle.Descendants().Single(element =>
-            element.Name.LocalName == "Setter" &&
-            element.Attribute("Property")?.Value == "HorizontalContentAlignment").Attribute("Value")?.Value);
-        Assert.Equal("Center", controlStyle.Descendants().Single(element =>
-            element.Name.LocalName == "Setter" &&
-            element.Attribute("Property")?.Value == "VerticalContentAlignment").Attribute("Value")?.Value);
-        var buttonWidth = int.Parse(controlStyle.Descendants()
-            .Single(element => element.Name.LocalName == "Setter" &&
-                element.Attribute("Property")?.Value == "Width")
-            .Attribute("Value")!.Value);
-        var controlGroupWidth = (buttons.Length * buttonWidth) + ((buttons.Length - 1) * spacing);
-        Assert.Equal(controlGroupWidth, int.Parse(columns[3]));
+        foreach (var (id, label, selected) in new[]
+                 {
+                     ("Graph.Metric.Tokens", "{Binding Texts.GraphTokenMetric}", "{Binding IsTokensMetric}"),
+                     ("Graph.Metric.Dollars", "{Binding Texts.GraphDollarMetric}", "{Binding IsDollarsMetric}")
+                 })
+        {
+            var button = document.Descendants().Single(element =>
+                element.Name.LocalName == "Button" &&
+                element.Attribute("AutomationProperties.AutomationId")?.Value == id);
+            Assert.Equal(label, button.Attribute("Content")?.Value);
+            Assert.Equal(selected, button.Attribute("Classes.selected")?.Value);
+            Assert.Equal(selected, button.Attribute("AutomationProperties.HelpText")?.Value);
+            Assert.Equal(label, button.Attribute("AutomationProperties.Name")?.Value);
+            Assert.Equal("Press", button.Attribute("ClickMode")?.Value);
+            Assert.Equal("OnMetricClick", button.Attribute("Click")?.Value);
+            Assert.True(button.Attribute("IsVisible")?.Value is null or "True");
+            Assert.Contains(button.AncestorsAndSelf(), element => ReferenceEquals(element, titleRow));
+        }
 
         Assert.DoesNotContain(document.Descendants(), element =>
-            element.Attribute(xamlName)?.Value == "AccountSelector");
+            element.Name.LocalName == "GraphSelect" &&
+            element.Attribute(xamlName)?.Value == "MetricSelector");
 
         var periodSelector = document.Descendants()
             .Single(element => element.Name.LocalName == "GraphSelect" &&
                 element.Attribute(xamlName)?.Value == "PeriodSelector");
-        Assert.Equal("0", periodSelector.Attribute("Margin")?.Value);
-        Assert.Equal("2", periodSelector.Attribute("Grid.Row")?.Value);
+        var rangeRow = periodSelector.Parent!;
+        Assert.Equal("Grid", rangeRow.Name.LocalName);
+        Assert.Equal("1", rangeRow.Attribute("Grid.Row")?.Value);
+        Assert.Equal(3, rangeRow.Attribute("ColumnDefinitions")!.Value.Split(',').Length);
+        Assert.Equal("8,0", periodSelector.Attribute("Margin")?.Value);
+        Assert.Equal("30", periodSelector.Attribute("Height")?.Value);
+        Assert.Equal("False", periodSelector.Attribute("HasFieldLabel")?.Value);
+        Assert.Null(periodSelector.Attribute("FieldLabel"));
+        Assert.Equal("0", periodSelector.Attribute("ValueMargin")?.Value);
+        Assert.Equal("1", periodSelector.Attribute("Grid.Column")?.Value);
         Assert.Equal("{Binding SelectedPeriodValueText}", periodSelector.Attribute("ValueText")?.Value);
         Assert.Equal("Graph.PeriodSelector", periodSelector.Attribute("AutomationProperties.AutomationId")?.Value);
+        Assert.Equal("{Binding Texts.PeriodSelectorHeading}", periodSelector.Attribute("AutomationProperties.Name")?.Value);
+        Assert.Equal("{Binding SelectedPeriodText}", periodSelector.Attribute("AutomationProperties.HelpText")?.Value);
 
-        var controlSurface = document.Descendants()
-            .Single(element => element.Name.LocalName == "Border" &&
-                element.Attribute("Grid.RowSpan")?.Value == "3");
-        Assert.Equal("0,2,0,0", controlSurface.Attribute("Margin")?.Value);
+        var rangeLabel = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.Range.Label");
+        Assert.Equal("1", rangeLabel.Attribute("Grid.Column")?.Value);
+        Assert.Same(rangeRow, rangeLabel.Parent);
+        Assert.Same(rangeRow, periodSelector.Parent);
+        Assert.Equal("{Binding !IsPeriodView}", rangeLabel.Attribute("IsVisible")?.Value);
+
+        foreach (var (id, label, visible, enabled) in new[]
+                 {
+                     ("Graph.Range.Previous", "{Binding Texts.GraphPreviousRange}", "{Binding Texts.GraphPreviousRangeShort}", "{Binding CanGoBack}"),
+                     ("Graph.Range.Next", "{Binding Texts.GraphNextRange}", "{Binding Texts.GraphNextRangeShort}", "{Binding CanGoForward}")
+                 })
+        {
+            var button = document.Descendants().Single(element =>
+                element.Attribute("AutomationProperties.AutomationId")?.Value == id);
+            Assert.Equal(label, button.Attribute("AutomationProperties.Name")?.Value);
+            Assert.Equal(label, button.Attribute("ToolTip.Tip")?.Value);
+            Assert.Equal(enabled, button.Attribute("IsEnabled")?.Value);
+            Assert.Contains(button.DescendantsAndSelf(), element =>
+                element.Attribute("Text")?.Value == visible ||
+                element.Attribute("Content")?.Value == visible);
+            Assert.Contains(button.AncestorsAndSelf(), element => ReferenceEquals(element, rangeRow));
+        }
+
+        var japanese = LocalizationService.Languages.Single(language => language.LanguageCode == "ja");
+        var english = LocalizationService.Languages.Single(language => language.LanguageCode == "en");
+        Assert.Equal("前へ", japanese.GraphPreviousRangeShort);
+        Assert.Equal("次へ", japanese.GraphNextRangeShort);
+        Assert.Equal("Prev", english.GraphPreviousRangeShort);
+        Assert.Equal("Next", english.GraphNextRangeShort);
 
         var legend = document.Descendants().Single(element =>
             element.Name.LocalName == "Grid" &&
-            element.Attribute("Grid.Row")?.Value == "3" &&
+            element.Attribute("Grid.Row")?.Value == "2" &&
             element.Attribute("Width")?.Value == "504");
         Assert.Equal("120,90,90,90,90", legend.Attribute("ColumnDefinitions")?.Value);
 
-        Assert.Equal("Graph.MetricSelector", metricSelector.Attribute("AutomationProperties.AutomationId")?.Value);
-        Assert.Equal("Graph.MetricMenu", metricSelector.Attribute("MenuAutomationId")?.Value);
-        Assert.Equal("128", metricSelector.Attribute("PopupWidth")?.Value);
-        Assert.Equal("True", metricSelector.Attribute("PopupOnLeft")?.Value);
-
-        var field = XDocument.Parse(LoadRepositoryFile(
-            "windows-client", "src", "CodexInfo.WindowsClient", "Controls", "GraphSelect.axaml"));
-        var fieldGrid = field.Descendants().Single(element =>
-            element.Name.LocalName == "Grid" &&
-            element.Attribute("ColumnDefinitions")?.Value == "Auto,*,14");
-        Assert.Equal("12,0", fieldGrid.Attribute("Margin")?.Value);
-        var labelGrid = fieldGrid.Elements().Single(element =>
-            element.Name.LocalName == "Grid" &&
-            element.Attribute("ColumnDefinitions")?.Value == "82,1");
-        Assert.Equal("{Binding HasFieldLabel, ElementName=Root}", labelGrid.Attribute("IsVisible")?.Value);
+        var plot = document.Descendants().Single(element => element.Name.LocalName == "GraphPlotControl");
+        Assert.Equal("{Binding MetricAxisText}", plot.Attribute("AutomationProperties.HelpText")?.Value);
+        Assert.DoesNotContain(document.Descendants(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            element.Attribute("Text")?.Value == "{Binding MetricAxisText}");
     }
 
     [Fact]

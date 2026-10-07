@@ -1026,7 +1026,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             self.assertEqual("account-2", artifact["account_id"])
             self.assertEqual("account-2", artifact["fixture"]["account_id"])
 
-    def _assert_verify_rejects_windows_mutation(self, mutate, *, artifact_account_id=None):
+    def _assert_verify_result(self, mutate, *, artifact_account_id=None, expect_failure=True, mutate_linux=None):
         fixture = copy.deepcopy(self.document["parity_v3"])
         expected_segments, expected_idle = oracle.build_expected(fixture)
         actual_segments = [
@@ -1065,6 +1065,10 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         linux["platform"] = "linux"
         windows = copy.deepcopy(actual)
         windows["platform"] = "windows"
+        for contract in windows["render_contracts"].values():
+            contract["styles"]["idle_band"] = "#162232"
+        if mutate_linux is not None:
+            mutate_linux(linux)
         mutate(windows)
         with tempfile.TemporaryDirectory() as directory:
             evidence_path = Path(directory) / "evidence.json"
@@ -1073,11 +1077,28 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             evidence_path.write_text(json.dumps(artifact), encoding="utf-8")
             linux_path.write_text(json.dumps(linux), encoding="utf-8")
             windows_path.write_text(json.dumps(windows), encoding="utf-8")
-            with self.assertRaises(oracle.EvidenceError):
+            if expect_failure:
+                with self.assertRaises(oracle.EvidenceError):
+                    oracle.verify(evidence_path, linux_path, windows_path)
+            else:
                 oracle.verify(evidence_path, linux_path, windows_path)
 
+    def test_verify_accepts_windows_subtle_idle_without_changing_linux(self):
+        self._assert_verify_result(lambda document: None, expect_failure=False)
+
+    def test_verify_rejects_old_windows_idle_color(self):
+        self._assert_verify_result(
+            lambda document: document["render_contracts"]["tokens"]["styles"].update(idle_band="#1a2838")
+        )
+
+    def test_verify_rejects_windows_idle_color_on_linux(self):
+        self._assert_verify_result(
+            lambda document: None,
+            mutate_linux=lambda document: document["render_contracts"]["tokens"]["styles"].update(idle_band="#162232"),
+        )
+
     def test_verify_rejects_raw_endpoint_value_mismatch_hidden_by_display_rounding(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: next(
                 value
                 for value in document["render_contracts"]["dollars"]["endpoint_values"]
@@ -1086,31 +1107,31 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         )
 
     def test_verify_rejects_latest_timestamp_mismatch(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: document["render_contracts"]["dollars"].update(
                 latest_timestamp=document["render_contracts"]["dollars"]["latest_timestamp"] + 60
             )
         )
 
     def test_verify_rejects_published_pair_mismatch(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: document.update(published_pair="v1:" + "f" * 64)
         )
 
     def test_verify_rejects_display_label_mismatch(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: document["render_contracts"]["dollars"]["endpoint_labels"][0].update(
                 series="SOLX"
             )
         )
 
     def test_verify_rejects_missing_endpoint_values_instead_of_passing_old_schema(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: document["render_contracts"]["dollars"].pop("endpoint_values")
         )
 
     def test_verify_rejects_missing_account_provenance_instead_of_mixing_accounts(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: None,
             artifact_account_id="account-2",
         )

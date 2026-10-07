@@ -28,6 +28,12 @@ public static class ThemePalette
     public const string TangerineDark = "tangerine-dark";
     public const string RoseDark = "rose-dark";
 
+    public const string GraphRemaining = "GraphRemaining";
+    public const string GraphLuna = "GraphLuna";
+    public const string GraphTerra = "GraphTerra";
+    public const string GraphSol = "GraphSol";
+    public const string GraphAstra = "GraphAstra";
+
     public static IReadOnlyList<string> PresetIds { get; } =
     [
         ClassicDark, GraphiteDark, Light, PaperLight, SandLight, SteelLight,
@@ -121,6 +127,21 @@ public static class ThemePalette
         "#111B2C", "#244D74", "#8BD4FF",
     ];
 
+    private static readonly IReadOnlyDictionary<string, (string Dark, string Light)> GraphRoleColors =
+        new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase)
+        {
+            [GraphRemaining] = ("#56B2F5", "#176AAB"),
+            [GraphLuna] = ("#E6A23C", "#985F08"),
+            [GraphTerra] = ("#5DC98A", "#16794B"),
+            [GraphSol] = ("#A88CF5", "#6A4BCC"),
+            [GraphAstra] = ("#EF6A6A", "#B23553"),
+        };
+
+    private static readonly HashSet<string> LightThemeIds = new(StringComparer.Ordinal)
+    {
+        Light, PaperLight, SandLight, SteelLight, LavenderLight, MintLight,
+    };
+
     private sealed record AdditionalPreset(
         bool UsesLightBase,
         int RedDelta,
@@ -187,7 +208,19 @@ public static class ThemePalette
         or PaperLight or SandLight or SteelLight or OceanDark or TealDark or EmberDark or InkDark
         or NeonDark or LavenderLight or MintLight or ForestDark or TangerineDark or RoseDark;
 
-    public static string Resolve(string classicColor) => ResolveFor(CurrentId, classicColor);
+    public static string Resolve(string classicColor) => GraphRoleColors.ContainsKey(classicColor)
+        ? ResolveGraphRoleFor(CurrentId, classicColor)
+        : ResolveFor(CurrentId, classicColor);
+
+    private static string ResolveGraphRoleFor(string id, string roleKey)
+    {
+        if (!GraphRoleColors.TryGetValue(roleKey, out var colors))
+        {
+            throw new ArgumentOutOfRangeException(nameof(roleKey), roleKey, "Unknown graph color role.");
+        }
+
+        return LightThemeIds.Contains(id) ? colors.Light : colors.Dark;
+    }
 
     private static string ResolveFor(string id, string classicColor)
     {
@@ -225,11 +258,19 @@ public static class ThemePalette
             ? brush
             : throw new ArgumentOutOfRangeException(nameof(classicColor), classicColor, "Unregistered theme color.");
 
-    private static IReadOnlyDictionary<string, IBrush> CreateBrushes(string id) =>
-        Colors.Keys.ToDictionary(
+    private static IReadOnlyDictionary<string, IBrush> CreateBrushes(string id)
+    {
+        var result = Colors.Keys.ToDictionary(
             key => key,
             key => (IBrush)new SolidColorBrush(Color.Parse(ResolveFor(id, key))),
             StringComparer.OrdinalIgnoreCase);
+        foreach (var roleKey in GraphRoleColors.Keys)
+        {
+            result[roleKey] = new SolidColorBrush(Color.Parse(ResolveGraphRoleFor(id, roleKey)));
+        }
+
+        return result;
+    }
 
     public static void Apply(string id)
     {
@@ -239,12 +280,19 @@ public static class ThemePalette
         CurrentId = id;
         if (Application.Current is { } app)
         {
-            app.RequestedThemeVariant = id is Light or PaperLight or SandLight or SteelLight or LavenderLight or MintLight
+            app.RequestedThemeVariant = LightThemeIds.Contains(id)
                 ? ThemeVariant.Light
                 : ThemeVariant.Dark;
             foreach (var (classic, brush) in brushes)
             {
-                app.Resources["Theme" + classic[1..].ToUpperInvariant()] = brush;
+                if (GraphRoleColors.ContainsKey(classic))
+                {
+                    app.Resources[classic] = brush;
+                }
+                else
+                {
+                    app.Resources["Theme" + classic[1..].ToUpperInvariant()] = brush;
+                }
             }
         }
         if (changed) Changed?.Invoke(null, EventArgs.Empty);

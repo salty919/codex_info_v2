@@ -15,6 +15,9 @@ internal readonly record struct GraphAxisProjection(
     IReadOnlyList<double> BottomValues,
     IReadOnlyList<long> BottomTimestampValues,
     IReadOnlyList<string> BottomLabels,
+    IReadOnlyList<long> MidnightGuideTimestamps,
+    IReadOnlyList<double> TopDateValues,
+    IReadOnlyList<string> TopDateLabels,
     IReadOnlyList<double> ModelValues,
     IReadOnlyList<string> ModelLabels,
     IReadOnlyList<double> RemainingValues,
@@ -130,7 +133,10 @@ internal static class GraphPlotProjection
     internal const double MinimumPlotHeight = 204;
     internal const double CanonicalDashLength = 0.45;
     internal const double CanonicalDashGap = 0.30;
-    private const double CurveMaximumViewboxStep = 0.25;
+    private const double CurveMaximumViewboxStep = 0.1;
+    private const double TopDateLabelCharacterWidth = 7;
+    private const double TopDateLabelPadding = 4;
+    private const double TopDateLabelGap = 6;
     private const double CanonicalGeometryEpsilon = 1e-12;
     private static readonly ConditionalWeakTable<GraphScene, Lazy<GraphPreparedGeometry>> PreparedGeometryCache = new();
     private static readonly object PreparedGeometryCacheLock = new();
@@ -217,6 +223,8 @@ internal static class GraphPlotProjection
                 nameof(currentDataAreaWidth),
                 "The current data area must be wider than the fixed endpoint-label gutter.");
         }
+        var midnightGuideTimestamps = BuildLocalMidnightGuides(scene, displayTimeZone);
+        var topDateAxis = BuildTopDateAxis(scene, displayTimeZone, midnightGuideTimestamps, currentPlotWidth);
         var currentGutterRatio = gutterWidth / currentPlotWidth;
         var currentLabelGapRatio = EndpointLabelGapWidth / currentPlotWidth;
 
@@ -224,6 +232,9 @@ internal static class GraphPlotProjection
             bottomValues,
             bottomTimestampValues,
             bottomLabels,
+            midnightGuideTimestamps,
+            topDateAxis.Values,
+            topDateAxis.Labels,
             modelValues,
             modelLabels,
             remainingValues,
@@ -470,6 +481,52 @@ internal static class GraphPlotProjection
             }
         }
         return guides;
+    }
+
+    private static (IReadOnlyList<double> Values, IReadOnlyList<string> Labels) BuildTopDateAxis(
+        GraphScene scene,
+        TimeZoneInfo displayTimeZone,
+        IReadOnlyList<long> midnightGuideTimestamps,
+        double plotWidth)
+    {
+        var span = Math.Max(1d, scene.PeriodEndAt - scene.PeriodStartAt);
+        var selected = new List<(double Position, double HalfWidth, long Timestamp, string Label)>();
+        foreach (var timestamp in midnightGuideTimestamps)
+        {
+            DateTimeOffset localTime;
+            try
+            {
+                localTime = TimeZoneInfo.ConvertTime(DateTimeOffset.FromUnixTimeSeconds(timestamp), displayTimeZone);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                continue;
+            }
+
+            var label = localTime.ToString("MM/dd", CultureInfo.InvariantCulture) + "\n▽";
+            var longestLineLength = label.Split('\n').Max(line => line.Length);
+            var halfWidth = (longestLineLength * TopDateLabelCharacterWidth + TopDateLabelPadding) / 2;
+            var position = (timestamp - scene.PeriodStartAt) / span * plotWidth;
+            if (position < halfWidth || plotWidth - position < halfWidth)
+            {
+                continue;
+            }
+
+            if (selected.Count > 0)
+            {
+                var previous = selected[^1];
+                if (position - previous.Position < previous.HalfWidth + halfWidth + TopDateLabelGap)
+                {
+                    continue;
+                }
+            }
+
+            selected.Add((position, halfWidth, timestamp, label));
+        }
+
+        return (
+            selected.Select(item => (double)item.Timestamp).ToArray(),
+            selected.Select(item => item.Label).ToArray());
     }
 
     internal static bool HasVisibleViewportPoints(
@@ -1561,6 +1618,22 @@ internal static class GraphPlotProjection
                 var advance = Math.Min(phaseEnd - phase, length - offset);
                 if (advance <= CanonicalGeometryEpsilon)
                 {
+                    var residualLength = length - offset;
+                    if (residualLength <= CanonicalGeometryEpsilon)
+                    {
+                        phase += residualLength;
+                        if (phase >= period - CanonicalGeometryEpsilon)
+                        {
+                            phase = 0;
+                        }
+                        else if (Math.Abs(phase - CanonicalDashLength) <= CanonicalGeometryEpsilon)
+                        {
+                            phase = CanonicalDashLength;
+                        }
+                        offset = length;
+                        continue;
+                    }
+
                     phase = phaseEnd >= period ? 0 : phaseEnd;
                     continue;
                 }

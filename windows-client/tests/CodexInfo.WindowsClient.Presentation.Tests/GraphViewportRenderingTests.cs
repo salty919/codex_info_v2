@@ -1,7 +1,9 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
+using System.Globalization;
 using System.Reflection;
+using Avalonia;
 using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Graphing;
@@ -302,6 +304,157 @@ public sealed class GraphViewportRenderingTests
     }
 
     [Fact]
+    public void TopAxisLabelsLocalMidnightsOutsideTheDataRectangleAcrossDaylightSavingTime()
+    {
+        var zone = FindEasternTimeZone();
+        var start = Unix("2026-03-06T17:00:00Z");
+        var end = Unix("2026-03-09T16:00:00Z");
+        var expected = new[]
+        {
+            (Timestamp: Unix("2026-03-07T05:00:00Z"), Label: "03/07\n▽"),
+            (Timestamp: Unix("2026-03-08T05:00:00Z"), Label: "03/08\n▽"),
+            (Timestamp: Unix("2026-03-09T04:00:00Z"), Label: "03/09\n▽"),
+        };
+        var scene = GraphScene.Create(
+        [
+            Sample(expected[1].Timestamp - 600, periodEnd: end, sol: 10, taskActiveSincePrevious: false),
+            Sample(expected[1].Timestamp + 600, periodEnd: end, sol: 10, taskActiveSincePrevious: false),
+        ],
+        GraphMetric.Dollars,
+        start,
+        end);
+
+        var timeZoneProperty = typeof(LocalizationService).GetProperty(nameof(LocalizationService.DisplayTimeZone));
+        Assert.NotNull(timeZoneProperty);
+        var setter = timeZoneProperty.GetSetMethod(nonPublic: true);
+        Assert.NotNull(setter);
+        var priorZone = LocalizationService.DisplayTimeZone;
+        try
+        {
+            setter.Invoke(null, [zone]);
+            var control = new GraphPlotControl { Scene = scene };
+            using var rendered = control.Plot.GetImage(940, 480);
+
+            // ScottPlot's Top axis is the horizontal panel above its DataRect.
+            // The midnight labels must be ticks on that axis, not data labels.
+            var topAxis = control.Plot.Axes.Top;
+            Assert.True(topAxis.IsVisible);
+            var ticks = topAxis.TickGenerator.Ticks;
+            foreach (var (timestamp, date) in expected)
+            {
+                var tick = Assert.Single(ticks, item => Math.Abs(item.Position - timestamp) < 1e-8);
+                Assert.Equal(date, tick.Label);
+            }
+        }
+        finally
+        {
+            setter.Invoke(null, [priorZone]);
+        }
+    }
+
+    [Fact]
+    public void TopDateAxisSkipsMonthLabelsThatWouldOverlapOrExtendPastPlotEdges()
+    {
+        var start = Unix("2026-01-01T00:00:00Z");
+        var end = Unix("2026-02-01T00:00:00Z");
+        var scene = GraphScene.Create(
+        [
+            Sample(start + 60, periodEnd: end, sol: 10, taskActiveSincePrevious: false),
+            Sample(end - 60, periodEnd: end, sol: 12, taskActiveSincePrevious: false),
+        ],
+        GraphMetric.Dollars,
+        start,
+        end);
+        const double dataAreaWidth = 800;
+        var plotWidth = dataAreaWidth - GraphPlotProjection.DollarLabelGutterWidth;
+        var axes = GraphPlotProjection.BuildAxes(
+            scene,
+            TimeZoneInfo.Utc,
+            CultureInfo.InvariantCulture,
+            dataAreaWidth,
+            dataAreaWidth);
+        var labelPositions = axes.TopDateValues
+            .Select(timestamp => (timestamp - start) / (end - (double)start) * plotWidth)
+            .ToArray();
+
+        Assert.Equal(axes.TopDateValues.Count, axes.TopDateLabels.Count);
+        Assert.InRange(labelPositions.Length, 3, 20);
+        Assert.DoesNotContain((double)start, axes.TopDateValues);
+        Assert.DoesNotContain((double)end, axes.TopDateValues);
+        Assert.All(labelPositions, position => Assert.InRange(position, 20, plotWidth - 20));
+        Assert.All(
+            labelPositions.Zip(labelPositions.Skip(1), (left, right) => right - left),
+            distance => Assert.True(distance >= 45, $"Adjacent month labels are only {distance:F1} px apart."));
+    }
+
+    [Fact]
+    public void TopDateAxisTracksControlWidthAfterResizeAndExpansion()
+    {
+        var start = Unix("2026-01-01T00:00:00Z");
+        var end = Unix("2026-02-01T00:00:00Z");
+        var scene = GraphScene.Create(
+        [
+            Sample(start + 60, periodEnd: end, sol: 10, taskActiveSincePrevious: false),
+            Sample(end - 60, periodEnd: end, sol: 12, taskActiveSincePrevious: false),
+        ],
+        GraphMetric.Dollars,
+        start,
+        end);
+        const double referenceControlWidth = 940;
+        const double referenceDataAreaWidth = 788;
+        const double narrowControlWidth = 640;
+        const double expandedControlWidth = 1_300;
+        const double plotHeight = 480;
+        var narrowDataAreaWidth = referenceDataAreaWidth + narrowControlWidth - referenceControlWidth;
+        var expandedDataAreaWidth = referenceDataAreaWidth + expandedControlWidth - referenceControlWidth;
+        var narrowAxes = GraphPlotProjection.BuildAxes(
+            scene,
+            TimeZoneInfo.Utc,
+            CultureInfo.InvariantCulture,
+            narrowDataAreaWidth,
+            referenceDataAreaWidth);
+        var expandedAxes = GraphPlotProjection.BuildAxes(
+            scene,
+            TimeZoneInfo.Utc,
+            CultureInfo.InvariantCulture,
+            expandedDataAreaWidth,
+            referenceDataAreaWidth);
+        Assert.True(narrowAxes.TopDateValues.Count < expandedAxes.TopDateValues.Count);
+
+        var timeZoneProperty = typeof(LocalizationService).GetProperty(nameof(LocalizationService.DisplayTimeZone));
+        Assert.NotNull(timeZoneProperty);
+        var setter = timeZoneProperty.GetSetMethod(nonPublic: true);
+        Assert.NotNull(setter);
+        var priorZone = LocalizationService.DisplayTimeZone;
+        try
+        {
+            setter.Invoke(null, [TimeZoneInfo.Utc]);
+            var control = new GraphPlotControl { Scene = scene };
+            SeedResponsiveReferenceLayout(control, referenceControlWidth, scene.Metric, referenceDataAreaWidth);
+            control.Measure(new Size(referenceControlWidth, plotHeight));
+            control.Arrange(new Rect(0, 0, referenceControlWidth, plotHeight));
+            using var referenceImage = control.Plot.GetImage((int)referenceControlWidth, (int)plotHeight);
+
+            control.Measure(new Size(narrowControlWidth, plotHeight));
+            control.Arrange(new Rect(0, 0, narrowControlWidth, plotHeight));
+            using var narrowImage = control.Plot.GetImage((int)narrowControlWidth, (int)plotHeight);
+            var narrowTicksAfterResize = TopDateTickPositions(control);
+
+            control.Measure(new Size(expandedControlWidth, plotHeight));
+            control.Arrange(new Rect(0, 0, expandedControlWidth, plotHeight));
+            using var expandedImage = control.Plot.GetImage((int)expandedControlWidth, (int)plotHeight);
+            var expandedTicksAfterResize = TopDateTickPositions(control);
+
+            Assert.Equal(narrowAxes.TopDateValues, narrowTicksAfterResize);
+            Assert.Equal(expandedAxes.TopDateValues, expandedTicksAfterResize);
+        }
+        finally
+        {
+            setter.Invoke(null, [priorZone]);
+        }
+    }
+
+    [Fact]
     public void ResetGuideUsesActualBoundaryAndOverridesAnOverlappingMidnight()
     {
         var midnight = Unix("2026-03-08T00:00:00Z");
@@ -412,6 +565,30 @@ public sealed class GraphViewportRenderingTests
         Assert.NotNull(method);
         return Assert.IsAssignableFrom<IReadOnlyList<long>>(method.Invoke(null, [scene, zone]));
     }
+
+    private static void SeedResponsiveReferenceLayout(
+        GraphPlotControl control,
+        double referenceControlWidth,
+        GraphMetric metric,
+        double referenceDataAreaWidth)
+    {
+        var referenceWidthField = typeof(GraphPlotControl).GetField(
+            "referenceControlWidth",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(referenceWidthField);
+        referenceWidthField.SetValue(control, referenceControlWidth);
+
+        var referenceAreaWidthsField = typeof(GraphPlotControl).GetField(
+            "referenceDataAreaWidths",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(referenceAreaWidthsField);
+        var referenceAreaWidths = Assert.IsType<Dictionary<GraphMetric, double>>(
+            referenceAreaWidthsField.GetValue(control));
+        referenceAreaWidths[metric] = referenceDataAreaWidth;
+    }
+
+    private static double[] TopDateTickPositions(GraphPlotControl control) =>
+        control.Plot.Axes.Top.TickGenerator.Ticks.Select(tick => tick.Position).ToArray();
 
     private static GraphScene CreateResetPeriodScene(long periodStartAt, long periodEndAt, long? resetAt, bool empty = false)
     {

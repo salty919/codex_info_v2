@@ -34,11 +34,16 @@ public sealed class GraphPlotControl : Control
     internal const string MidnightGuideColorHex = "#FFFFFF";
     internal const string ResetGuideColorHex = "#D6A45C";
     internal const string PlotColorHex = "#121c2c";
-    private ScottPlot.Color RemainingColor => new(ThemePalette.Resolve(RemainingColorHex));
-    private ScottPlot.Color SolColor => new(ThemePalette.Resolve(SolColorHex));
-    private ScottPlot.Color TerraColor => new(ThemePalette.Resolve(TerraColorHex));
-    private ScottPlot.Color LunaColor => new(ThemePalette.Resolve(LunaColorHex));
-    private ScottPlot.Color AstraColor => new(ThemePalette.Resolve(AstraColorHex));
+    internal const string RemainingColorRole = ThemePalette.GraphRemaining;
+    internal const string SolColorRole = ThemePalette.GraphSol;
+    internal const string TerraColorRole = ThemePalette.GraphTerra;
+    internal const string LunaColorRole = ThemePalette.GraphLuna;
+    internal const string AstraColorRole = ThemePalette.GraphAstra;
+    private ScottPlot.Color RemainingColor => new(ThemePalette.Resolve(RemainingColorRole));
+    private ScottPlot.Color SolColor => new(ThemePalette.Resolve(SolColorRole));
+    private ScottPlot.Color TerraColor => new(ThemePalette.Resolve(TerraColorRole));
+    private ScottPlot.Color LunaColor => new(ThemePalette.Resolve(LunaColorRole));
+    private ScottPlot.Color AstraColor => new(ThemePalette.Resolve(AstraColorRole));
     internal const string IdleBandColorHex = "#1A2838";
     internal const double IdleBandOpacity = 1.0;
     internal const float MeasuredModelLineWidth = 3f;
@@ -46,7 +51,10 @@ public sealed class GraphPlotControl : Control
     internal const float MeasuredRemainingLineWidth = 3f;
     internal const float IdleLineWidth = 1f;
     internal const float InferredLineWidth = 1f;
-    private ScottPlot.Color IdleBandColor => new(ThemePalette.Resolve(IdleBandColorHex));
+    internal static string ResolvedIdleBandColorHex => BlendOpaqueHalfUp(
+        ThemePalette.Resolve(PlotColorHex),
+        ThemePalette.Resolve(IdleBandColorHex));
+    private ScottPlot.Color IdleBandColor => new(ResolvedIdleBandColorHex);
     private ScottPlot.Color MutedColor => new(ThemePalette.Resolve(AxisTextColorHex));
     private ScottPlot.Color GridColor => new(ThemePalette.Resolve(GridColorHex));
     private ScottPlot.Color MidnightGuideColor => new ScottPlot.Color(MidnightGuideColorHex).WithOpacity(0.30);
@@ -343,9 +351,7 @@ public sealed class GraphPlotControl : Control
         GraphAxisProjection axes)
     {
         var resetGuides = GraphPlotProjection.BuildResetGuides(scene);
-        foreach (var timestamp in GraphPlotProjection.BuildLocalMidnightGuides(
-                     scene,
-                     LocalizationService.DisplayTimeZone))
+        foreach (var timestamp in axes.MidnightGuideTimestamps)
         {
             if (resetGuides.Contains(timestamp))
             {
@@ -376,6 +382,7 @@ public sealed class GraphPlotControl : Control
     private void ApplyAxes(PlotPresentation presentation, GraphScene scene, GraphAxisProjection axes)
     {
         ApplyLimits(presentation, scene, axes);
+        ApplyTopDateAxis(presentation, axes);
         presentation.Plot.Axes.Bottom.TickGenerator = new NumericManual(
             axes.BottomValues.ToArray(),
             axes.BottomLabels.ToArray());
@@ -391,6 +398,17 @@ public sealed class GraphPlotControl : Control
         presentation.Plot.Axes.Right.IsVisible = false;
     }
 
+    private static void ApplyTopDateAxis(PlotPresentation presentation, GraphAxisProjection axes)
+    {
+        var topAxis = presentation.Plot.Axes.Top;
+        topAxis.IsVisible = axes.TopDateValues.Count > 0;
+        topAxis.TickGenerator = new NumericManual(
+            axes.TopDateValues.ToArray(),
+            axes.TopDateLabels.ToArray());
+        topAxis.TickLabelStyle.FontName = "Noto Sans JP Medium";
+        topAxis.TickLabelStyle.FontSize = 10;
+    }
+
     private void ApplyLimits(PlotPresentation presentation, GraphScene scene, GraphAxisProjection axes)
     {
         presentation.Plot.Axes.SetLimits(
@@ -400,10 +418,27 @@ public sealed class GraphPlotControl : Control
             axes.ModelDisplayMaximum,
             presentation.Plot.Axes.Bottom,
             presentation.Plot.Axes.Left);
+        presentation.Plot.Axes.SetLimits(
+            scene.PeriodStartAt,
+            axes.DisplayEndAt,
+            axes.ModelDisplayMinimum,
+            axes.ModelDisplayMaximum,
+            presentation.Plot.Axes.Top,
+            presentation.Plot.Axes.Left);
         presentation.Plot.Axes.SetLimitsY(
             axes.RemainingDisplayMinimum,
             axes.RemainingDisplayMaximum,
             presentation.Plot.Axes.Right);
+    }
+
+    private static string BlendOpaqueHalfUp(string first, string second)
+    {
+        static int Channel(string color, int offset) => Convert.ToInt32(color.Substring(offset, 2), 16);
+        static int Average(int left, int right) => (left + right + 1) / 2;
+
+        return $"#{Average(Channel(first, 1), Channel(second, 1)):X2}" +
+            $"{Average(Channel(first, 3), Channel(second, 3)):X2}" +
+            $"{Average(Channel(first, 5), Channel(second, 5)):X2}";
     }
 
     private void OnControlSizeChanged(object? sender, SizeChangedEventArgs change)
@@ -524,6 +559,7 @@ public sealed class GraphPlotControl : Control
         lock (presentation.Plot.Sync)
         {
             ApplyLimits(presentation, scene, axes);
+            ApplyTopDateAxis(presentation, axes);
             UpdateEndpointLayout(presentation.RemainingConnectorX, presentation.RemainingLabel, axes.EndpointLabelAt);
             UpdateEndpointLayout(presentation.SolConnectorX, presentation.SolLabel, axes.EndpointLabelAt);
             UpdateEndpointLayout(presentation.TerraConnectorX, presentation.TerraLabel, axes.EndpointLabelAt);

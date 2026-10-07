@@ -10,6 +10,7 @@ using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Settings;
+using CodexInfo.WindowsClient.Theme;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
 
@@ -777,8 +778,18 @@ public sealed class GraphPlotControlTests
     [Fact]
     public void IdleBandsUseTheDedicatedVisibleNeutralColor()
     {
-        Assert.Equal("#1A2838", GraphPlotControl.IdleBandColorHex);
-        Assert.Equal(1.0, GraphPlotControl.IdleBandOpacity);
+        var originalTheme = ThemePalette.CurrentId;
+        try
+        {
+            ThemePalette.Apply(ThemePalette.ClassicDark);
+            Assert.Equal("#1A2838", GraphPlotControl.IdleBandColorHex);
+            Assert.Equal("#162232", GraphPlotControl.ResolvedIdleBandColorHex);
+            Assert.Equal(1.0, GraphPlotControl.IdleBandOpacity);
+        }
+        finally
+        {
+            ThemePalette.Apply(originalTheme);
+        }
     }
 
     [Fact]
@@ -797,7 +808,7 @@ public sealed class GraphPlotControlTests
         var control = new GraphPlotControl { Scene = scene };
         var rendered = control.Plot.GetImage(940, 480);
         var pixels = rendered.GetArrayRGB();
-        var expected = (Red: (byte)0x1A, Green: (byte)0x28, Blue: (byte)0x38);
+        var expected = (Red: (byte)0x16, Green: (byte)0x22, Blue: (byte)0x32);
         foreach (var timestamp in new[] { 1_045d, 1_050d })
         {
             var pixel = control.Plot.GetPixel(new ScottPlot.Coordinates(timestamp, 0.75));
@@ -808,6 +819,47 @@ public sealed class GraphPlotControlTests
             Assert.Equal(expected.Red, pixels[y, x, 0]);
             Assert.Equal(expected.Green, pixels[y, x, 1]);
             Assert.Equal(expected.Blue, pixels[y, x, 2]);
+        }
+    }
+
+    [Fact]
+    public void IdleBandRasterUsesHalfUpPlotAndBaselineBlendInEveryTheme()
+    {
+        var originalTheme = ThemePalette.CurrentId;
+        try
+        {
+            var scene = Scene(
+            [
+                Point(1_000, 100, 1, 0, 0),
+                Point(2_800, 100, 1, 0, 0),
+                Point(2_860, 99, 2, 0, 0),
+            ]);
+            Assert.Equal(
+                [new GraphIdleInterval(1_000, 2_800, PreserveBoundary: false)],
+                scene.IdleIntervals);
+
+            foreach (var theme in ThemePalette.PresetIds)
+            {
+                ThemePalette.Apply(theme);
+                var plot = ThemePalette.Resolve(GraphPlotControl.PlotColorHex);
+                var baseline = ThemePalette.Resolve(GraphPlotControl.IdleBandColorHex);
+                var expected = BlendHalfUp(plot, baseline);
+                var control = new GraphPlotControl { Scene = scene };
+                using var rendered = control.Plot.GetImage(940, 480);
+                var pixels = rendered.GetArrayRGB();
+                var pixel = control.Plot.GetPixel(new ScottPlot.Coordinates(1_045, 0.75));
+                var x = (int)Math.Round(pixel.X);
+                var y = (int)Math.Round(pixel.Y);
+                Assert.InRange(x, 0, pixels.GetLength(1) - 1);
+                Assert.InRange(y, 0, pixels.GetLength(0) - 1);
+                Assert.Equal(Convert.ToByte(expected.Substring(1, 2), 16), pixels[y, x, 0]);
+                Assert.Equal(Convert.ToByte(expected.Substring(3, 2), 16), pixels[y, x, 1]);
+                Assert.Equal(Convert.ToByte(expected.Substring(5, 2), 16), pixels[y, x, 2]);
+            }
+        }
+        finally
+        {
+            ThemePalette.Apply(originalTheme);
         }
     }
 
@@ -975,6 +1027,30 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void SmoothedRenderGeometryUsesAtMostOneTenthPercentNormalizedXStepsAndKeepsObservedKnots()
+    {
+        var scene = Scene(
+            [
+                Point(0, 100, 1, 2, 3),
+                Point(50, 95, 2, 3, 4),
+                Point(100, 90, 4, 5, 6),
+            ],
+            0,
+            100);
+        var line = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol).Rising.Line;
+        var finiteX = line.X.Where(double.IsFinite).ToArray();
+        var maximumStep = finiteX
+            .Zip(finiteX.Skip(1), (left, right) => Math.Abs(right - left))
+            .Max();
+
+        Assert.True(maximumStep <= 0.1 + 1e-10,
+            $"Expected maximum normalized x step <= 0.1, got {maximumStep:R}.");
+        Assert.Contains(0d, finiteX);
+        Assert.Contains(50d, finiteX);
+        Assert.Contains(100d, finiteX);
+    }
+
+    [Fact]
     public void BoundedMissingIntervalUsesTheSameSmoothedAnchorGeometry()
     {
         var scene = GraphScene.Create(
@@ -999,7 +1075,7 @@ public sealed class GraphPlotControlTests
                 StringComparison.Ordinal),
             "a bounded missing interval must retain the PCHIP curve defined by valid anchors");
         Assert.NotEmpty(remaining.Solid.Path);
-        Assert.StartsWith("M0.00 1.00 L0.25 1.00", remaining.Dashed.Path);
+        Assert.StartsWith("M0.00 1.00 L0.10 1.00", remaining.Dashed.Path);
     }
 
     [Fact]
@@ -1017,11 +1093,13 @@ public sealed class GraphPlotControlTests
 
         var model = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildCanonicalRemainingLines(scene);
+        var rawModelGap = GraphPlotProjection.BuildModelLines(scene, scene.Sol).Dashed;
 
-        Assert.StartsWith("M0.00 1.00 L0.25 1.00", model.Dashed.Path);
+        Assert.StartsWith("M0.00 1.00 L0.10 1.00", model.Dashed.Path);
         Assert.Contains("L0.45 1.00 M0.75", model.Dashed.Path, StringComparison.Ordinal);
-        Assert.StartsWith("M0.00 1.00 L0.25", remaining.Dashed.Path);
+        Assert.StartsWith("M0.00 1.00 L0.10", remaining.Dashed.Path);
         Assert.Contains("M0.75", remaining.Dashed.Path, StringComparison.Ordinal);
+        Assert.Equal([1_000d, 1_600d], rawModelGap.X);
         Assert.True(model.Dashed.Line.X.Count > 100);
         Assert.True(remaining.Dashed.Line.X.Count > 100);
         Assert.All(
@@ -1050,9 +1128,9 @@ public sealed class GraphPlotControlTests
         var lowRemaining = GraphPlotProjection.BuildCanonicalRemainingLines(lowScene);
         var highRemaining = GraphPlotProjection.BuildCanonicalRemainingLines(highScene);
 
-        Assert.StartsWith("M0.00 3.65 L0.25 3.65", lowRemaining.Solid.Path);
+        Assert.StartsWith("M0.00 3.65 L0.10 3.65", lowRemaining.Solid.Path);
         Assert.EndsWith("L100.00 3.69", lowRemaining.Solid.Path);
-        Assert.StartsWith("M0.00 18.35 L0.25 18.35", highRemaining.Solid.Path);
+        Assert.StartsWith("M0.00 18.35 L0.10 18.35", highRemaining.Solid.Path);
         Assert.EndsWith("L100.00 18.39", highRemaining.Solid.Path);
     }
 
@@ -2580,6 +2658,7 @@ public sealed class GraphPlotControlTests
         await EventuallyAsync(() => ReferenceEquals(main.DetailsSnapshot, snapshot));
 
         using var graph = new GraphWindowViewModel(main, static action => action());
+        graph.SelectedMetric = graph.Texts.GraphDollarMetric;
         var scene = graph.Scene;
         Assert.Contains(false, scene.ModelVectorAvailable);
         Assert.Equal(
@@ -2770,6 +2849,7 @@ public sealed class GraphPlotControlTests
         main.Start();
         await EventuallyAsync(() => ReferenceEquals(main.DetailsSnapshot, first));
         using var graph = new GraphWindowViewModel(main, static action => action());
+        graph.SelectedMetric = graph.Texts.GraphDollarMetric;
         using var threads = new ThreadsWindowViewModel(main);
 
         Assert.Equal(100, main.RemainingPercentValue);
@@ -4502,15 +4582,15 @@ public sealed class GraphPlotControlTests
                 4,
                 GraphPlotProjection.MinimumPlotHeight),
             new LiveGraphStyles(
-                GraphPlotControl.PlotColorHex,
-                GraphPlotControl.GridColorHex,
-                GraphPlotControl.AxisTextColorHex,
-                GraphPlotControl.IdleBandColorHex.ToLowerInvariant(),
-                GraphPlotControl.RemainingColorHex,
-                GraphPlotControl.SolColorHex,
-                GraphPlotControl.TerraColorHex,
-                GraphPlotControl.LunaColorHex,
-                GraphPlotControl.AstraColorHex,
+                ThemePalette.Resolve(GraphPlotControl.PlotColorHex),
+                ThemePalette.Resolve(GraphPlotControl.GridColorHex),
+                ThemePalette.Resolve(GraphPlotControl.AxisTextColorHex),
+                GraphPlotControl.ResolvedIdleBandColorHex,
+                ThemePalette.Resolve(GraphPlotControl.RemainingColorRole),
+                ThemePalette.Resolve(GraphPlotControl.SolColorRole),
+                ThemePalette.Resolve(GraphPlotControl.TerraColorRole),
+                ThemePalette.Resolve(GraphPlotControl.LunaColorRole),
+                ThemePalette.Resolve(GraphPlotControl.AstraColorRole),
                 GraphPlotControl.IdleLineWidth,
                 GraphPlotControl.MeasuredFlatModelLineWidth,
                 GraphPlotControl.MeasuredModelLineWidth,
@@ -4861,6 +4941,16 @@ public sealed class GraphPlotControlTests
             response.Headers.TryAddWithoutValidation(PublishedPairHeader, pair);
             return Task.FromResult(response);
         }
+    }
+
+    private static string BlendHalfUp(string first, string second)
+    {
+        static int Channel(string color, int offset) => Convert.ToInt32(color.Substring(offset, 2), 16);
+        static int Average(int left, int right) => (left + right + 1) / 2;
+
+        return $"#{Average(Channel(first, 1), Channel(second, 1)):X2}" +
+            $"{Average(Channel(first, 3), Channel(second, 3)):X2}" +
+            $"{Average(Channel(first, 5), Channel(second, 5)):X2}";
     }
 
     private static GraphScene Scene(IReadOnlyList<ApiHistorySample> points, long? start = null, long? end = null) =>

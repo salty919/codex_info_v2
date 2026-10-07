@@ -566,6 +566,10 @@ public sealed class GraphWindowRangeTests
         using var main = CreateResourceMain(client);
         using var graph = CreateGraph(main, () => FixedNow);
         await EventuallyAsync(() => graph.HasPoints);
+        graph.SelectedMetric = graph.Texts.GraphDollarMetric;
+        await EventuallyAsync(() =>
+            !graph.IsLoading &&
+            graph.Scene.Metric == GraphMetric.Dollars);
         blockingModels.Arm();
 
         try
@@ -637,7 +641,11 @@ public sealed class GraphWindowRangeTests
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
         using var graph = CreateGraph(main, () => FixedNow);
-        await EventuallyAsync(() => graph.HasPoints && !graph.IsLoading);
+        graph.SelectedMetric = graph.Texts.GraphDollarMetric;
+        await EventuallyAsync(() =>
+            graph.HasPoints &&
+            !graph.IsLoading &&
+            graph.Scene.Metric == GraphMetric.Dollars);
         var acceptedScene = graph.Scene;
         blockingModels.Arm();
 
@@ -656,12 +664,17 @@ public sealed class GraphWindowRangeTests
             blockingModels.Release();
         }
 
-        await EventuallyAsync(() => !graph.IsLoading && graph.HasPoints);
+        await EventuallyAsync(() =>
+            !graph.IsLoading &&
+            graph.HasPoints &&
+            graph.Scene.Metric == GraphMetric.Dollars &&
+            ReadPeriodScenes(graph.Scene).Any(period => period.Sol.Contains(777d)));
 
         Assert.Equal("Last24Hours", RequiredProperty(graph, "SelectedTimeRange").GetValue(graph)!.ToString());
         Assert.True(sceneStayedAcceptedWhileRefreshing, "A details refresh must not replace the accepted scene while a range candidate is pending.");
         Assert.True(IsViewport(graph.Scene));
         Assert.NotEmpty(ReadString(graph, "RangeLabel"));
+        Assert.Equal(GraphMetric.Dollars, graph.Scene.Metric);
         Assert.Contains(777d, Assert.Single(ReadPeriodScenes(graph.Scene)).Sol);
     }
 
@@ -686,7 +699,9 @@ public sealed class GraphWindowRangeTests
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
         using var graph = CreateGraph(main, () => FixedNow);
+        graph.SelectedMetric = graph.Texts.GraphDollarMetric;
         Assert.True(graph.HasPoints);
+        Assert.Equal(GraphMetric.Dollars, graph.Scene.Metric);
         var acceptedScene = graph.Scene;
         var acceptedLabel = graph.SelectedPeriodText;
         var transientNullClearedState = false;
@@ -709,6 +724,7 @@ public sealed class GraphWindowRangeTests
         Assert.False(transientNullClearedState, "A directory reset's transient null must not clear the accepted selector or scene.");
         Assert.Equal("current", graph.SelectedPeriod?.Id);
         Assert.NotSame(acceptedScene, graph.Scene);
+        Assert.Equal(GraphMetric.Dollars, graph.Scene.Metric);
         Assert.Contains(73d, graph.Scene.Sol);
     }
 

@@ -68,14 +68,15 @@
     </Style>
     <Style Selector="Button.range-mode">
       <Setter Property="Height" Value="30" />
-      <Setter Property="Padding" Value="12,0" />
+      <Setter Property="Padding" Value="9,0" />
       <Setter Property="VerticalContentAlignment" Value="Center" />
       <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="CornerRadius" Value="5" />
+      <Setter Property="CornerRadius" Value="7" />
       <Setter Property="Background" Value="{DynamicResource Theme111B2C}" />
       <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
       <Setter Property="BorderThickness" Value="1" />
       <Setter Property="BorderBrush" Value="{DynamicResource Theme2D3D56}" />
+      <Setter Property="FontSize" Value="12" />
     </Style>
     <Style Selector="Button.range-mode.selected">
       <Setter Property="Background" Value="{DynamicResource Theme244D74}" />
@@ -84,6 +85,44 @@
     </Style>
     <Style Selector="Button.range-mode:pointerover">
       <Setter Property="Background" Value="{DynamicResource Theme263548}" />
+    </Style>
+    <Style Selector="Button.metric-choice">
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Padding" Value="11,0" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+    <Style Selector="Button.metric-choice.selected">
+      <Setter Property="Background" Value="{DynamicResource Theme244D74}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme56B2F5}" />
+    </Style>
+    <Style Selector="Button.metric-choice:pointerover">
+      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
+    </Style>
+    <Style Selector="Button.range-nav">
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Padding" Value="8,0" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="CornerRadius" Value="7" />
+      <Setter Property="Background" Value="{DynamicResource Theme111B2C}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme2D3D56}" />
+      <Setter Property="FontSize" Value="12" />
+    </Style>
+    <Style Selector="Button.range-nav:pointerover">
+      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
     </Style>
     <Style Selector="Button.window-control">
       <Setter Property="Width" Value="36" />
@@ -105,30 +144,38 @@
   </Window.Styles>
 
   <Grid>
-    <Grid x:Name="GraphContent" Margin="30,16" RowDefinitions="32,36,36,28,*">
-      <Border Grid.Row="1" Grid.RowSpan="3" Margin="0,2,0,0" Background="{DynamicResource Theme111B2C}" />
+    <Grid x:Name="GraphContent" Margin="30,16" RowDefinitions="36,40,28,*">
+      <Border Grid.Row="1" Grid.RowSpan="2" Background="{DynamicResource Theme111B2C}" CornerRadius="10" />
 
-      <Grid Grid.Row="0" ColumnDefinitions="*,128,8,108" Background="Transparent">
-        <TextBlock Margin="0,0,8,0" FontSize="24" FontWeight="Bold" VerticalAlignment="Center" Text="{Binding Texts.GraphWindowTitle}" />
-        <controls:GraphSelect x:Name="MetricSelector" Grid.Column="1"
-                              ValueText="{Binding SelectedMetric}"
-                              ItemsSource="{Binding MetricOptions}"
-                              SelectedItem="{Binding SelectedMetric, Mode=TwoWay}"
-                              MenuAutomationId="Graph.MetricMenu"
-                              PopupWidth="128" PopupOnLeft="True" MaxVisibleItems="4"
-                              AutomationProperties.Name="{Binding Texts.ModelUsage}"
-                              AutomationProperties.AutomationId="Graph.MetricSelector"
-                              AutomationProperties.HelpText="{Binding SelectedMetric}"
-                              ToolTip.Tip="{Binding Texts.ModelUsage}" />
-        <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="0" VerticalAlignment="Top">
+      <Grid Grid.Row="0" ColumnDefinitions="*,Auto,8,Auto" Background="Transparent">
+        <TextBlock Margin="0,0,8,0" FontSize="22" FontWeight="Bold" VerticalAlignment="Center"
+                   Text="{Binding Texts.GraphWindowTitle}" TextTrimming="CharacterEllipsis" />
+        <Border Grid.Column="1" Padding="2" CornerRadius="9" Background="{DynamicResource Theme111B2C}"
+                BorderBrush="{DynamicResource Theme405779}" BorderThickness="1" VerticalAlignment="Center">
+          <StackPanel Orientation="Horizontal" Spacing="2">
+            <Button Classes="metric-choice" Classes.selected="{Binding IsTokensMetric}"
+                    ClickMode="Press" Tag="Tokens" Click="OnMetricClick"
+                    Content="{Binding Texts.GraphTokenMetric}"
+                    AutomationProperties.Name="{Binding Texts.GraphTokenMetric}"
+                    AutomationProperties.HelpText="{Binding IsTokensMetric}"
+                    AutomationProperties.AutomationId="Graph.Metric.Tokens" />
+            <Button Classes="metric-choice" Classes.selected="{Binding IsDollarsMetric}"
+                    ClickMode="Press" Tag="Dollars" Click="OnMetricClick"
+                    Content="{Binding Texts.GraphDollarMetric}"
+                    AutomationProperties.Name="{Binding Texts.GraphDollarMetric}"
+                    AutomationProperties.HelpText="{Binding IsDollarsMetric}"
+                    AutomationProperties.AutomationId="Graph.Metric.Dollars" />
+          </StackPanel>
+        </Border>
+        <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="0" VerticalAlignment="Center">
           <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Graph.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
           <Button Classes="window-control" Click="OnMaximizeWindow" AutomationProperties.Name="{Binding Texts.Maximize}" AutomationProperties.AutomationId="Graph.Window.Maximize" Content="□" ToolTip.Tip="{Binding Texts.Maximize}" />
           <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Graph.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
         </StackPanel>
       </Grid>
 
-      <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto" Margin="0,2,0,2">
-        <StackPanel Orientation="Horizontal" Spacing="4">
+      <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto" Margin="0,4,0,4">
+        <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
           <Button Classes="range-mode" Classes.selected="{Binding IsPeriodView}" Tag="Period" Click="OnTimeRangeClick"
                   Content="{Binding Texts.GraphPeriodRange}" AutomationProperties.AutomationId="Graph.Range.Period" />
           <Button Classes="range-mode" Classes.selected="{Binding Is24HourView}" Tag="Day" Click="OnTimeRangeClick"
@@ -136,70 +183,79 @@
           <Button Classes="range-mode" Classes.selected="{Binding IsWeekView}" Tag="Week" Click="OnTimeRangeClick"
                   Content="{Binding Texts.GraphWeekRange}" AutomationProperties.AutomationId="Graph.Range.Week" />
         </StackPanel>
-        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4">
-          <Button Classes="range-mode" Width="36" Padding="0" Content="‹" FontSize="22" Click="OnPreviousRange"
-                  IsEnabled="{Binding CanGoBack}" AutomationProperties.Name="{Binding Texts.GraphPreviousRange}"
-                  ToolTip.Tip="{Binding Texts.GraphPreviousRange}" AutomationProperties.AutomationId="Graph.Range.Previous" />
-          <Button Classes="range-mode" Width="36" Padding="0" Content="›" FontSize="22" Click="OnNextRange"
-                  IsEnabled="{Binding CanGoForward}" AutomationProperties.Name="{Binding Texts.GraphNextRange}"
-                  ToolTip.Tip="{Binding Texts.GraphNextRange}" AutomationProperties.AutomationId="Graph.Range.Next" />
+        <TextBlock Grid.Column="1" Margin="12,0" VerticalAlignment="Center" FontWeight="SemiBold"
+                   Text="{Binding RangeLabel}" TextTrimming="CharacterEllipsis" IsVisible="{Binding !IsPeriodView}"
+                   AutomationProperties.Name="{Binding RangeLabel}" AutomationProperties.AutomationId="Graph.Range.Label"
+                   ToolTip.Tip="{Binding RangeLabel}" />
+        <controls:GraphSelect x:Name="PeriodSelector" Grid.Column="1" Grid.Row="0" Margin="8,0"
+                              MinWidth="0" Height="30" HorizontalAlignment="Stretch" IsVisible="{Binding IsPeriodView}"
+                              HasFieldLabel="False" ValueMargin="0"
+                              ValueText="{Binding SelectedPeriodValueText}"
+                              ItemsSource="{Binding Periods}" SelectedItem="{Binding SelectedPeriod, Mode=TwoWay}"
+                              MenuAutomationId="Graph.PeriodMenu" PopupWidth="620" LimitPopupToField="True" MaxVisibleItems="10"
+                              IsEnabled="{Binding HasPeriods}"
+                              AutomationProperties.Name="{Binding Texts.PeriodSelectorHeading}"
+                              AutomationProperties.AutomationId="Graph.PeriodSelector"
+                              AutomationProperties.HelpText="{Binding SelectedPeriodText}"
+                              ToolTip.Tip="{Binding SelectedPeriodText}">
+          <controls:GraphSelect.ItemTemplate>
+            <DataTemplate x:DataType="core:ApiHistoryPeriod">
+              <TextBlock Text="{Binding Label}" TextWrapping="Wrap"
+                         ToolTip.Tip="{Binding Label}"
+                         AutomationProperties.Name="{Binding Label}"
+                         AutomationProperties.HelpText="{Binding Label}" />
+            </DataTemplate>
+          </controls:GraphSelect.ItemTemplate>
+        </controls:GraphSelect>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+          <Button Classes="range-nav" Click="OnPreviousRange" IsEnabled="{Binding CanGoBack}"
+                  AutomationProperties.Name="{Binding Texts.GraphPreviousRange}"
+                  ToolTip.Tip="{Binding Texts.GraphPreviousRange}" AutomationProperties.AutomationId="Graph.Range.Previous">
+            <StackPanel Orientation="Horizontal" Spacing="4">
+              <TextBlock FontSize="16" Text="‹" VerticalAlignment="Center" />
+              <TextBlock Text="{Binding Texts.GraphPreviousRangeShort}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+            </StackPanel>
+          </Button>
+          <Button Classes="range-nav" Click="OnNextRange" IsEnabled="{Binding CanGoForward}"
+                  AutomationProperties.Name="{Binding Texts.GraphNextRange}"
+                  ToolTip.Tip="{Binding Texts.GraphNextRange}" AutomationProperties.AutomationId="Graph.Range.Next">
+            <StackPanel Orientation="Horizontal" Spacing="4">
+              <TextBlock Text="{Binding Texts.GraphNextRangeShort}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+              <TextBlock FontSize="16" Text="›" VerticalAlignment="Center" />
+            </StackPanel>
+          </Button>
         </StackPanel>
       </Grid>
 
-      <TextBlock Grid.Row="2" Margin="12,0" VerticalAlignment="Center" FontWeight="SemiBold"
-                 Text="{Binding RangeLabel}" TextTrimming="CharacterEllipsis" IsVisible="{Binding !IsPeriodView}"
-                 AutomationProperties.Name="{Binding RangeLabel}" AutomationProperties.AutomationId="Graph.Range.Label"
-                 ToolTip.Tip="{Binding RangeLabel}" />
-      <controls:GraphSelect x:Name="PeriodSelector" Grid.Row="2" Margin="0" IsVisible="{Binding IsPeriodView}"
-                            FieldLabel="{Binding Texts.PeriodSelectorHeading}" HasFieldLabel="True" ValueMargin="17,0,0,0"
-                            ValueText="{Binding SelectedPeriodValueText}"
-                            ItemsSource="{Binding Periods}" SelectedItem="{Binding SelectedPeriod, Mode=TwoWay}"
-                            MenuAutomationId="Graph.PeriodMenu" PopupWidth="620" LimitPopupToField="True" MaxVisibleItems="10"
-                            IsEnabled="{Binding HasPeriods}"
-                            AutomationProperties.Name="{Binding Texts.PeriodSelectorHeading}"
-                            AutomationProperties.AutomationId="Graph.PeriodSelector"
-                            AutomationProperties.HelpText="{Binding SelectedPeriodText}"
-                            ToolTip.Tip="{Binding SelectedPeriodText}">
-        <controls:GraphSelect.ItemTemplate>
-          <DataTemplate x:DataType="core:ApiHistoryPeriod">
-            <TextBlock Text="{Binding Label}" TextWrapping="Wrap"
-                       ToolTip.Tip="{Binding Label}"
-                       AutomationProperties.Name="{Binding Label}"
-                       AutomationProperties.HelpText="{Binding Label}" />
-          </DataTemplate>
-        </controls:GraphSelect.ItemTemplate>
-      </controls:GraphSelect>
-
-      <Grid Grid.Row="3" Width="504" Height="24" HorizontalAlignment="Left"
+      <Grid Grid.Row="2" Width="504" Height="24" Margin="4,1,0,1" HorizontalAlignment="Left"
             ColumnDefinitions="120,90,90,90,90" ColumnSpacing="6">
       <ToggleButton Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowRemaining}" AutomationProperties.Name="{Binding Texts.RemainingQuota}" AutomationProperties.AutomationId="Graph.Toggle.Remaining" ToolTip.Tip="{Binding Texts.RemainingQuota}">
-        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource Theme56B2F5}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="{Binding Texts.RemainingQuota}" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource GraphRemaining}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="{Binding Texts.RemainingQuota}" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="1" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowLuna}" AutomationProperties.Name="LUNA" AutomationProperties.AutomationId="Graph.Toggle.LUNA" ToolTip.Tip="LUNA">
-        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource ThemeE6A23C}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="LUNA" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource GraphLuna}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="LUNA" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="2" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowTerra}" AutomationProperties.Name="TERRA" AutomationProperties.AutomationId="Graph.Toggle.TERRA" ToolTip.Tip="TERRA">
-        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource Theme5DC98A}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="TERRA" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource GraphTerra}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="TERRA" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="3" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowSol}" AutomationProperties.Name="SOL" AutomationProperties.AutomationId="Graph.Toggle.SOL" ToolTip.Tip="SOL">
-        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource ThemeA88CF5}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="SOL" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource GraphSol}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="SOL" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="4" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowAstra}" AutomationProperties.Name="ASTRA" AutomationProperties.AutomationId="Graph.Toggle.ASTRA" ToolTip.Tip="ASTRA">
-        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource ThemeEF6A6A}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="ASTRA" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource GraphAstra}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="ASTRA" /></Grid>
       </ToggleButton>
       </Grid>
 
-      <Border Grid.Row="4" Background="{DynamicResource Theme121C2C}" BorderBrush="{DynamicResource Theme3B506F}" BorderThickness="1" CornerRadius="10" ClipToBounds="True">
+      <Border Grid.Row="3" Background="{DynamicResource Theme121C2C}" BorderBrush="{DynamicResource Theme3B506F}" BorderThickness="1" CornerRadius="10" ClipToBounds="True">
         <Grid>
           <plot:GraphPlotControl Scene="{Binding Scene}"
                                ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}"
                                ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}"
                                ShowAstra="{Binding ShowAstra}"
                                AutomationProperties.Name="{Binding Texts.Graph}"
+                               AutomationProperties.HelpText="{Binding MetricAxisText}"
                                AutomationProperties.AutomationId="Graph.Plot"
                                IsVisible="{Binding HasPlot}" />
-          <TextBlock Classes="label" Margin="92,6,0,0" HorizontalAlignment="Left" VerticalAlignment="Top"
-                     FontWeight="SemiBold" Text="{Binding MetricAxisText}" IsHitTestVisible="False" />
           <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8"
                       IsVisible="{Binding IsLoading}" IsHitTestVisible="False">
             <ProgressBar Width="72" Height="4" IsIndeterminate="True" />
