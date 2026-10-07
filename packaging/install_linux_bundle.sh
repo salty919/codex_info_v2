@@ -4234,8 +4234,17 @@ else
 fi
 update_channel_snapshot="$(update_channel_record)" || exit 1
 update_channel="${update_channel_snapshot%%$'\t'*}"
-if [[ -L "$current_link" ]]; then
-    current_info="$(manifest_record)" || safe_blocked 'installed channel identity is unavailable before apply'
+installed_current_id="$(current_generation)" || safe_blocked 'installed generation identity is unavailable before apply'
+current_info=
+if legacy_combined_present; then
+    legacy_combined_mixed_split_present && safe_blocked 'legacy combined and split installation states are mixed'
+    current_info="$(legacy_combined_record)" || safe_blocked 'legacy combined identity is unavailable before apply'
+elif [[ -n "$installed_current_id" ]]; then
+    current_info="$(manifest_record "$generations_dir/$installed_current_id/manifest.json")" || safe_blocked 'installed channel identity is unavailable before apply'
+elif legacy_flat_present; then
+    current_info="$(legacy_flat_record)" || safe_blocked 'flat predecessor identity is unavailable before apply'
+fi
+if [[ -n "$current_info" ]]; then
     IFS=$'\t' read -r current_installed_version _ _ _ <<<"$current_info"
 fi
 
