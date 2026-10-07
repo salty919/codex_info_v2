@@ -9,6 +9,41 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphWindowSelectorParityTests
 {
     [Fact]
+    public void GraphTimeWindowsExposeModesAndBoundedNavigation()
+    {
+        var graph = XDocument.Parse(Load("GraphWindow.axaml"));
+        foreach (var id in new[] { "Graph.Range.Period", "Graph.Range.Day", "Graph.Range.Week",
+                     "Graph.Range.Previous", "Graph.Range.Next", "Graph.Range.Label" })
+        {
+            Assert.Single(graph.Descendants(), element =>
+                element.Attribute("AutomationProperties.AutomationId")?.Value == id);
+        }
+        foreach (var (id, enabled) in new[] { ("Previous", "CanGoBack"), ("Next", "CanGoForward") })
+        {
+            var button = graph.Descendants().Single(element =>
+                element.Attribute("AutomationProperties.AutomationId")?.Value == $"Graph.Range.{id}");
+            Assert.Equal($"{{Binding {enabled}}}", button.Attribute("IsEnabled")?.Value);
+        }
+        var plot = graph.Descendants().Single(element => element.Name.LocalName == "GraphPlotControl");
+        Assert.Equal("{Binding HasPlot}", plot.Attribute("IsVisible")?.Value);
+    }
+
+    [Fact]
+    public void GraphHeaderUsesEveryFixedRowForVisibleControls()
+    {
+        var graph = XDocument.Parse(Load("GraphWindow.axaml"));
+        var content = graph.Descendants().Single(element =>
+            element.Attribute(XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml"))?.Value == "GraphContent");
+        var rows = content.Attribute("RowDefinitions")!.Value.Split(',');
+        for (var row = 0; row < rows.Length - 1; row++)
+        {
+            Assert.Contains(content.Elements(), element =>
+                (element.Attribute("Grid.Row")?.Value ?? "0") == row.ToString() &&
+                (element.Name.LocalName != "Border" || element.HasElements));
+        }
+    }
+
+    [Fact]
     public void GraphSelectorsUseOneAnchoredPopupComponent()
     {
         var graph = XDocument.Parse(Load("GraphWindow.axaml"));

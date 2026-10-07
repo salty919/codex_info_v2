@@ -8,6 +8,7 @@ using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.VisualTree;
 using CodexInfo.WindowsClient.ViewModels;
+using CodexInfo.WindowsClient.Graphing;
 
 namespace CodexInfo.WindowsClient;
 
@@ -38,7 +39,30 @@ public partial class GraphWindow : Window
     private void UpdateContentMargin()
     {
         var horizontal = Math.Clamp(20d + ((Bounds.Width - 700d) / 24d), 20d, 30d);
-        GraphContent.Margin = new Thickness(horizontal, 24d, horizontal, 24d);
+        GraphContent.Margin = new Thickness(horizontal, 16d, horizontal, 16d);
+    }
+
+    private void OnTimeRangeClick(object? sender, RoutedEventArgs eventArgs)
+    {
+        if (DataContext is GraphWindowViewModel viewModel && sender is Button button)
+        {
+            viewModel.SelectedTimeRange = (button.Tag as string) switch
+            {
+                "Day" => GraphTimeRange.Last24Hours,
+                "Week" => GraphTimeRange.Last7Days,
+                _ => GraphTimeRange.ResetPeriod,
+            };
+        }
+    }
+
+    private void OnPreviousRange(object? sender, RoutedEventArgs eventArgs)
+    {
+        if (DataContext is GraphWindowViewModel viewModel) viewModel.GoBack();
+    }
+
+    private void OnNextRange(object? sender, RoutedEventArgs eventArgs)
+    {
+        if (DataContext is GraphWindowViewModel viewModel) viewModel.GoForward();
     }
 
     private void OnMinimizeWindow(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs)
