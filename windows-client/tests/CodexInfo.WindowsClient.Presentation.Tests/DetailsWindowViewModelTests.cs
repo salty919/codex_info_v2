@@ -220,7 +220,7 @@ public sealed class DetailsWindowViewModelTests
     }
 
     [Fact]
-    public async Task GraphKeepsPeriodsAndSwitchesDollarAndTokenSeries()
+    public async Task GraphDefaultsToTokensAndSwitchesDollarAndTokenSeries()
     {
         var resetAt = DateTimeOffset.UtcNow.AddDays(3).ToUnixTimeSeconds();
         var observedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -249,13 +249,20 @@ public sealed class DetailsWindowViewModelTests
         using var graph = new GraphWindowViewModel(main);
         Assert.Single(graph.Periods);
         Assert.Equal(3, graph.Points.Count);
-        Assert.Equal(3.75, graph.Points[0].LunaValue);
-        Assert.Equal(4.5, graph.Points[1].LunaValue);
-        Assert.Equal(period.EndAt, graph.Points[^1].Timestamp);
-
-        graph.SelectedMetric = graph.Texts.Tokens;
+        Assert.Equal(graph.Texts.GraphTokenMetric, graph.SelectedMetric);
+        Assert.Equal(GraphMetric.Tokens, graph.Scene.Metric);
+        Assert.True(graph.IsTokensMetric);
+        Assert.False(graph.IsDollarsMetric);
         Assert.Equal(300, graph.Points[0].LunaValue);
         Assert.Equal(360, graph.Points[1].LunaValue);
+        Assert.Equal(period.EndAt, graph.Points[^1].Timestamp);
+
+        graph.SelectedMetric = graph.Texts.GraphDollarMetric;
+        Assert.Equal(GraphMetric.Dollars, graph.Scene.Metric);
+        Assert.True(graph.IsDollarsMetric);
+        Assert.False(graph.IsTokensMetric);
+        Assert.Equal(3.75, graph.Points[0].LunaValue);
+        Assert.Equal(4.5, graph.Points[1].LunaValue);
         graph.ShowLuna = false;
         Assert.False(graph.ShowLuna);
         Assert.DoesNotContain("LUNA", graph.Scene.ModelSeries.Keys);

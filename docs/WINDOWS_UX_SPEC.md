@@ -44,7 +44,7 @@ Linux timezone設定、Issue #422で利用者が選択したWindows版の`WIN-TH
 
 Windows Settingsの外観欄は`classic-dark`（従来配色・既定）、`graphite-dark`、`light`、`paper-light`、`sand-light`、`steel-light`、`ocean-dark`、`teal-dark`、`ember-dark`、`ink-dark`、`neon-dark`、`lavender-light`、`mint-light`、`forest-dark`、`tangerine-dark`、`rose-dark`の順に16種類の組込みpresetを選択できる。新規presetの表示名は順にPaper Light、Sand Light、Steel Light、Ocean Dark、Teal Dark、Ember Dark、Ink Darkとし、日本語では順にペーパー ライト、サンド ライト、スチール ライト、オーシャン ダーク、ティール ダーク、エンバー ダーク、インク ダークとする。これらは独自の配色であり、他製品の同名themeとの色互換を表明しない。VS Codeのように利用者がpresetを切り替える操作を提供し、外部themeの取込みや任意色編集は含めない。選択中は現在表示を変えず、既存の保存操作がDATA ownerの`WIN-THEME-PREF-422`に従って成功した後に、開いているMain、Settings、Setup、Graph、Threads、Legalの全Windowへ反映する。取消または保存失敗時は表示中の色と永続設定を変えない。次回起動時は保存したpresetをMain表示前に適用する。theme変更によってquota、Graph系列データ、Threadsの状態、接続、取得要求を変更しない。
 
-| preset | window背景 | card面 | 主要文字 | 補助文字 | accent | Graph背景 | grid | idle band |
+| preset | window背景 | card面 | 主要文字 | 補助文字 | accent | Graph背景 | grid | idle基準色 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `classic-dark` | `#0E141E` | `#151F2D` | `#E9EFF8` | `#A8B7CA` | `#56B2F5` | `#121C2C` | `#263850` | `#1A2838` |
 | `graphite-dark` | `#181A1F` | `#242830` | `#F1F3F5` | `#B5BEC9` | `#69B5F7` | `#20242B` | `#3C4652` | `#303944` |
@@ -62,7 +62,7 @@ E2Eで画面内の色を判定する追加roleは次のexact値とする。`stat
 | role | `classic-dark` | `graphite-dark` | `light` |
 | --- | --- | --- | --- |
 | quota gaugeの未充填面 | `#326799` | `#4A6B89` | `#A9CDE8` |
-| quota gaugeの充填面・Graph Remaining線 | `#56B2F5` | `#69B5F7` | `#176AAB` |
+| quota gaugeの充填面 | `#56B2F5` | `#69B5F7` | `#176AAB` |
 | Main ready status背景 | `#143426` | `#18362A` | `#E5F5EC` |
 | Main ready status枠 | `#276C49` | `#327653` | `#4A9469` |
 | Main ready status強調 | `#4FB878` | `#5CC88A` | `#176E42` |
@@ -80,7 +80,7 @@ E2Eで画面内の色を判定する追加roleは次のexact値とする。`stat
 | role | `paper-light` | `sand-light` | `steel-light` | `ocean-dark` | `teal-dark` | `ember-dark` | `ink-dark` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | quota gaugeの未充填面 | `#B7CDD8` | `#B3C9C5` | `#A9C4E1` | `#3D668B` | `#3C7583` | `#77725F` | `#808080` |
-| quota gaugeの充填面・Graph Remaining線 | `#356C91` | `#1B748A` | `#275FA8` | `#56B8F2` | `#4FB3C3` | `#E7BC62` | `#6DD3FF` |
+| quota gaugeの充填面 | `#356C91` | `#1B748A` | `#275FA8` | `#56B8F2` | `#4FB3C3` | `#E7BC62` | `#6DD3FF` |
 | Main ready status背景 | `#E6F3EB` | `#E3F0E2` | `#E5F2EA` | `#16372F` | `#124B40` | `#244437` | `#002B17` |
 | Main ready status枠 | `#5C9976` | `#6D9B72` | `#6EAA83` | `#3A8266` | `#47866A` | `#5D9974` | `#78E8A4` |
 | Main ready status強調 | `#216543` | `#2B714A` | `#1E7047` | `#72CDA3` | `#79CAA3` | `#9FDC9E` | `#78E8A4` |
@@ -93,7 +93,7 @@ E2Eで画面内の色を判定する追加roleは次のexact値とする。`stat
 | Graph selector popup選択行 | `#DAE9EE` | `#DCE8DB` | `#D7E5F7` | `#284B70` | `#1E5B67` | `#555147` | `#174A66` |
 | キーボードfocus枠 | `#276A91` | `#126A7F` | `#275FA8` | `#7CD2FF` | `#74D2DB` | `#F2CB78` | `#FFFFFF` |
 
-上の2表に記した21表示roleは、同じclassic色を共有するcard面／Threads子cardとaccent／quota充填／Graph Remainingをまとめると19個のclassic色キーになる。既存paletteの72キー全件について、新規presetの色は次の決定的な規則で定める。19キーは上表のexact値を優先する。残り53キーは現行`ThemePalette.Colors`の`light`列または`graphite-dark`列のRGB 8-bit値へ、下表の符号付き差分を各channelに加えて0..255へclampし、大文字`#RRGGBB`にする。`ink-dark`だけは各channel `c`に対して`c < 128`なら`floor(3c/4)`、それ以外なら`min(255, floor(5c/4))`とする。未知のclassic色キーは例外で拒否し、元の暗色へのfallbackを行わない。
+上の2表に記した21表示roleは、同じclassic色を共有するcard面／Threads子cardとaccent／quota充填をまとめると19個のclassic色キーになる。既存paletteの72キー全件について、新規presetの色は次の決定的な規則で定める。19キーは上表のexact値を優先する。残り53キーは現行`ThemePalette.Colors`の`light`列または`graphite-dark`列のRGB 8-bit値へ、下表の符号付き差分を各channelに加えて0..255へclampし、大文字`#RRGGBB`にする。`ink-dark`だけは各channel `c`に対して`c < 128`なら`floor(3c/4)`、それ以外なら`min(255, floor(5c/4))`とする。未知のclassic色キーは例外で拒否し、元の暗色へのfallbackを行わない。
 
 | preset | 基準列 | R差分 | G差分 | B差分 |
 | --- | --- | ---: | ---: | ---: |
@@ -420,16 +420,22 @@ component順や表示所有者を変更しない。
 
 ### 4.2 Trends / Graph（master: `CUM-138-06`）
 
+- Windowsの単位切替は「トークン」「ドル」を常時見える選択ボタンとして置き、Graphを開いたときはトークンを選択する。選択中の面・枠・文字で状態を明示し、pointer press、キーボード、UI Automationで同じ選択操作を行える。単位変更中は選択ボタンを先に更新し、完成まで既存の描画を保持する。
+- 上部はタイトル／単位切替、表示タイプ・期間情報・前後移動を一つにまとめた行、凡例の3段とする。週期間のselectorと固定時間の日時情報は同じ中央領域を使い、前後移動には方向と短い文字を表示する。ボタン群の角丸・高さ・余白・選択状態を揃え、通常940×640／最小700×480で情報や操作を重ねない。長い期間名は省略表示と全文tooltipを併用する。グラフに被る「時間ごとの累計…」説明文は表示せず、数値軸・単位ボタン・凡例を維持する。
+- ローカル日付の境界は、data rectangleの上に確保した日付軸で「月/日」と下向きの目印を表示する。日付文字をデータ線へ重ねず、画面外の境界や重なる日付ラベルを描かない。既存の現地0時の細線・reset線の意味とDST処理は維持する。
+- 滑らかさは既存の単調PCHIPを維持し、描画用の曲線分割を1000px級のplotで1px以下の横刻みへ細分化する。accepted raw、変化点、極値、idle、欠測、補正、reset境界の位置と値は変更しない。欠測を実測線で結ぶ、曲線が観測範囲を越える、別reset間を結ぶことを禁止する。
+- Graph専用の系列色は、暗色presetでRemaining `#56B2F5`、LUNA `#E6A23C`、TERRA `#5DC98A`、SOL `#A88CF5`、ASTRA `#EF6A6A`、明色preset（light/paper-light/sand-light/steel-light/lavender-light/mint-light）で順に `#176AAB`、`#985F08`、`#16794B`、`#6A4BCC`、`#B23553` とする。凡例・線・末尾値に同じ役割色を用い、themeのaccent色を系列の代用にしない。全16 presetのplot面とidle面に対して系列は3:1以上の輝度コントラストを保つ。Main/Threads等の共有色キーは変更しない。
+- Windowsのidle面はWIN-THEME-422表のGraph背景とidle基準色を各RGB channelで半分ずつ混合し、0.5を切り上げた最終不透明色を使う。classic-darkは `#162232`、teal-darkは `#0F3E49`、lightは `#F2F6FA` となる。旧面より控えめにしつつ背景と区別できる帯として表示し、idleの判定や時間範囲は変えない。上表のidle色および他節の固定idle色はWindowsではこの最終色へ置換する。Linux/Xの色・描画契約は変更しない。
 - Windowsの表示モードは「週期間」（既定）、「24時間」、「1週間」とする。「週期間」は以下の既存reset期間の範囲を維持する。固定時間モードは表示窓だけを独立させ、右端を現在時刻、幅をそれぞれ86,400秒／604,800秒とする。未観測の終端から現在時刻までは空白であり、観測値を延長しない。Linuxの表示・操作は変更しない（Issue #554）。
 - 固定時間モードの「＜」「＞」は窓の全幅だけ移動する。過去へ移動した右端は更新中も固定し、24時間／1週間間の変更でも維持する。現在へ到達すると現在追従へ戻り、未来へは進めない。週期間モードの「＜」「＞」は、公開済み期間一覧の隣接する古い／新しいリセット期間へ移動する。固定日数を加減せず、既存selectorと同じ期間選択・取得・失敗時保持を使う。最古では「＜」、現在では「＞」を無効にし、一覧が空または1期間だけの場合は両方を無効にする。selectorからも引き続き任意の期間を選択できる。
 - 表示窓に重なる全reset期間を同じaccount・published pairから完全に受理する。各期間を既存の累計・残量・欠測規則で個別投影してから表示窓に切り出し、期間をまたぐ線・idle帯・累計の足算を作らない。縦軸の単位と既存スケール規則は維持する。空の時間窓でも固定幅の軸を保つ。
-- 全モードで表示タイムゾーンの日付が変わる0時に、幅0.5px・不透明度30%の白い細線を引く。表示窓内の各期間の実際の`reset_at`には幅1px・不透明度70%の琥珀色（`#D6A45C`）の区切り線を描く。区切り時刻をサンプルの増減や欠測から推定せず、同じresetは1本にまとめ、日付境界と重なった場合はreset線を優先する。夏時間のある地域も現地暦の日付境界を用い、86,400秒ごとの線で代用しない。上部はタイトル／単位、モード／移動、期間または日時、凡例の順に配置し、空の固定高さ行を置かない。940×640と最小700×480で操作とplotが重ならない。
+- 全モードで表示タイムゾーンの日付が変わる0時に、幅0.5px・不透明度30%の白い細線を引く。表示窓内の各期間の実際の`reset_at`には幅1px・不透明度70%の琥珀色（`#D6A45C`）の区切り線を描く。区切り時刻をサンプルの増減や欠測から推定せず、同じresetは1本にまとめ、日付境界と重なった場合はreset線を優先する。夏時間のある地域も現地暦の日付境界を用い、86,400秒ごとの線で代用しない。上部は本節の3段構成とし、空の固定高さ行を置かない。940×640と最小700×480で操作とplotが重ならない。
 - 更新では受理済みの画面・軸・日時を保持し、全候補の準備後にまとめて切り替える。失敗と遅延応答によって部分的な期間や古い表示窓を公開しない。account変更では別accountの画面を保持しない。期間ごとの描画用geometryを再利用し、固定窓では範囲内と境界の描画点だけを渡す。元履歴を間引き・書換えせず、滑らかさのために観測値を変更しない。
 - 期間、ドル/トークン、Remaining/LUNA/TERRA/SOL/ASTRAの操作を上部固定帯に置く。
   model名と累積値は同じaccepted v3 rootから取得し、ASTRAを「その他」へ集約しない。
-- 期間・metricのリストはpointer pressの1回で展開し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。7日1分bucket由来の10,080点と契約最大1暦月由来の44,640点は対象データ規模であって、通常データを拒否する任意の上限ではない。最低動作環境と承認baselineが定義されるまでは、根拠のない絶対ms値やcold maxをUX合否条件にしない。
+- 期間リストはpointer pressの1回で展開し、metricボタンはpointer pressの1回で選択し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。7日1分bucket由来の10,080点と契約最大1暦月由来の44,640点は対象データ規模であって、通常データを拒否する任意の上限ではない。最低動作環境と承認baselineが定義されるまでは、根拠のない絶対ms値やcold maxをUX合否条件にしない。
 - 系列ON/OFFはpointer pressで状態とボタン面を先に更新する。同じ入力でplot画像も必ず変化する。物理入力、UI状態、実描画を別経路で確認する。
-- 期間・metricのリストはユーザーの選択で状態を変え、pollやlocale通知による同値候補の再公開では選択へ読み替えない。開いているリストを自動で閉じない。
+- 期間リストとmetricボタンはユーザーの選択で状態を変え、pollやlocale通知による同値候補の再公開では選択へ読み替えない。開いているリストを自動で閉じない。
 - 期間変更は`idle → loading → ready|confirmed-empty|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
   accepted same-pair history page集合のparseとpresentation projectionはUI thread外で行う。SQLite再読込やsampleの
   canonicalization/merge/recalculationは行わない。既存の遅延残量補間と終端保持はpresentation-onlyで行い、
@@ -446,10 +452,11 @@ component順や表示所有者を変更しない。
   `reset_at`はリセット時刻表示の別項目である。current periodの
   `end_at`は同じatomic published rootのaccepted観測終端であり、UI取得後のlocal現在時刻へ延ばさない。
   completed periodは保存された固定`end_at`までを右端とする。
-- 週期間モードの期間欄、横軸、折れ線、右端値は同じselected reset IDだけから一括投影する。poll後の
+- 週期間モードの期間欄、横軸、折れ線、ホバー値は同じselected reset IDだけから一括投影する。poll後の
   bounded reset aliasは60秒以内だけ同一期間として選択を維持し、欄だけ旧期間・plotだけ現在期間の
   混在を禁止する。
-- 右端現在値の表示域は、初期940×640 logical表示時に各metricで確保される幅をドル／トークン別に固定する。Graphを横へリサイズした差分はplotへ割り当て、現在値、系列色、leader、縦位置を変えない。
+- Windowsでは右端の常時数値ラベル・leader・専用gutterを置かず、その横幅をplotへ割り当てる。線端の切れを避ける通常の描画余白と軸ラベルの余白は、数値表示の専用領域とは分離する。横方向のresize差分はplotへ割り当て、縦軸の意味と期間の端点は変えない。Linuxの右端ラベルは従来どおり維持する。
+- Windowsのplot内でマウスを動かすと、近い一つの実観測時刻の日時と表示中の全系列をまとめたツールチップを出す。日時は表示timezone、Tokensは元の整数精度、Dollarsはその観測点のaccepted/read-time補正値、Remainingはraw観測値を用い、単位を明示する。欠けた系列は`—`とし、補間・hold・synthetic tailを実観測値として出さない。viewport内の同じreset期間だけを探索し、confirmed gapや非所有区間を越えて別時刻の値を拾わない。非表示系列は除外し、pointer離脱・scene/metric/表示系列の変更・リサイズ時に旧ツールチップを残さない。観測索引はscene生成時に保持し、pointer移動で全履歴の再投影や全件走査を行わない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
 - `reconstructed-from-session`、`unknown`、`unavailable`および（`legacy-unknown`を除く）`models_complete=false`ではモデル数値を表示せず、
@@ -487,9 +494,9 @@ component順や表示所有者を変更しない。
   X版では1px、Windows版では1px相当とする。通常のmodel／Remaining実測は3px、確定idle実線は1px、欠測・予測破線は1pxとし、solid/dashedで意味を区別する。
   破線は幅の広いplotでも切替点が判別できる短く密な周期とし、長い線片・隙間で通常線に見せない。
 
-  plotの描画layerは`background/grid → idle band → series/labels`とする。idle bandは最終合成色`#1A2838`を
+  plotの描画layerは`background/grid → idle band → boundary guides → series/labels`とする。idle bandはX版で最終合成色`#1A2838`、Windowsでは本節のGraph専用最終色を
   opacity 1でplot全高へ置き、gridを透過させない。既知idle band内のseriesとedgeを避けた同一Yで、major gridの
-  X pixelと左右のnon-grid X pixelがいずれもexact `#1A2838`となり、background色またはgrid色の縦columnがbandを
+  X pixelと左右のnon-grid X pixelがいずれもそのplatform/themeの最終idle色となり、background色またはgrid色の縦columnがbandを
   分断しないことをX screenshotとWindows rasterで検査する。band geometryは時間intervalだけから決め、画面幅や
   pixel幅を理由にintervalを除外しない。Releaseのperiod geometry oracleは、不透明bandに隠れたgridを可視gridとして
   要求してはならない。2点以上の可視gridと、隠れた全grid位置で上下20pxを除く走査高の90%以上を占めるidle色
@@ -497,7 +504,7 @@ component順や表示所有者を変更しない。
   idle色のない疎grid、または複数のgrid解はfail-closedで拒否する。
 
   既知の不完全ASTRAが途中まで増加した後に確定値へ移る場合、左側の増加を消して最初の確定値だけを
-  水平表示してはならない。開始・中間・終端値、線種、period ID、右端ラベルを一つの表示candidateとして
+  水平表示してはならない。開始・中間・終端値、線種、period ID、値表示（Linuxは右端ラベル、Windowsはホバー）を一つの表示candidateとして
   検証し、一項目でも不一致ならその表示を受入れない。
 - X版とWindows版は`G137-1`..`G137-10`を参照する同一の履歴fixtureと固定期待値（period/pair、
   累積model、raw/effective Remaining、gap、metric別anomaly、partial/unavailable、未使用区間、期間末）を通過しなければならない。
@@ -509,7 +516,7 @@ component順や表示所有者を変更しない。
   今回観測した同じ到達経路へ統合し、別の全直積を作らない。
   X/Windowsは同じfixtureの固定期待値を独立に検査し、値形状による100%・7日・quota-only除外、
   platform helperから期待値を生成する循環oracle、新workflow gate、全test/all-suite/全直積を追加しない。
-- 操作帯を開閉してもplotの位置・高さを変えず、ラベルや右端値を隠さない。
+- 操作帯を開閉してもplotの位置・高さを変えず、軸ラベルや値を確認する操作を隠さない。
 - 記録なし、欠測、アイドル、活動、0/中間/100を明示的な設計状態として扱う。
 
 ### 4.3 Threads

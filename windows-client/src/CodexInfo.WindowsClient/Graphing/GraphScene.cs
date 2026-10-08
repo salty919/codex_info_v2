@@ -50,6 +50,26 @@ internal enum GraphModelOrigin
     Rejected,
 }
 
+/// <summary>A raw, nonsynthetic observation aligned to its accepted scene row.</summary>
+internal readonly record struct GraphObservedSample(
+    long Timestamp,
+    long ResetAt,
+    int SceneIndex,
+    ulong? SolTokens,
+    ulong? TerraTokens,
+    ulong? LunaTokens,
+    ulong? AstraTokens)
+{
+    internal ulong? TokensFor(GraphSeries series) => series switch
+    {
+        GraphSeries.Sol => SolTokens,
+        GraphSeries.Terra => TerraTokens,
+        GraphSeries.Luna => LunaTokens,
+        GraphSeries.Astra => AstraTokens,
+        _ => null,
+    };
+}
+
 /// <summary>
 /// Framework-independent graph projection. It is the single owner of graph
 /// data semantics; XAML owns layout and the ScottPlot adapter only paints the
@@ -96,7 +116,8 @@ public sealed class GraphScene
         bool isViewport = false,
         IReadOnlyList<GraphScene>? periodScenes = null,
         bool hasViewportPoints = false,
-        long? resetAt = null)
+        long? resetAt = null,
+        IReadOnlyList<GraphObservedSample>? hoverObservations = null)
     {
         PeriodStartAt = periodStartAt;
         PeriodEndAt = periodEndAt;
@@ -131,6 +152,10 @@ public sealed class GraphScene
         IsViewport = isViewport;
         PeriodScenes = Array.AsReadOnly((periodScenes ?? Array.Empty<GraphScene>()).ToArray());
         HasViewportPoints = isViewport && hasViewportPoints;
+        HoverObservations = Array.AsReadOnly((hoverObservations ?? Array.Empty<GraphObservedSample>()).ToArray());
+        HoverResetAt = resetAt ?? (HoverObservations.Count > 0 ? HoverObservations[0].ResetAt : null);
+        HasUnambiguousHoverResetAt = HoverObservations.Count == 0 ||
+            HoverObservations.All(observation => observation.ResetAt == HoverResetAt);
     }
 
     public long PeriodStartAt { get; }
@@ -212,6 +237,13 @@ public sealed class GraphScene
 
     /// <summary>The original reset-period scenes displayed inside this viewport.</summary>
     public IReadOnlyList<GraphScene> PeriodScenes { get; }
+
+    /// <summary>Sorted nonsynthetic raw observations retained for nearest-point hover lookup.</summary>
+    internal IReadOnlyList<GraphObservedSample> HoverObservations { get; }
+
+    internal long? HoverResetAt { get; }
+
+    internal bool HasUnambiguousHoverResetAt { get; }
 
     private bool HasViewportPoints { get; }
 
@@ -568,7 +600,51 @@ public sealed class GraphScene
             modelIdleIntervals,
             idleIntervals,
             maximum,
-            resetAt: resetAt);
+            resetAt: resetAt,
+            hoverObservations: BuildHoverObservations(samples, points));
+    }
+
+    private static IReadOnlyList<GraphObservedSample> BuildHoverObservations(
+        IReadOnlyList<ApiHistorySample> samples,
+        IReadOnlyList<ScenePoint> points)
+    {
+        var observations = new List<GraphObservedSample>(samples.Count);
+        for (var index = 0; index < samples.Count; index++)
+        {
+            var sample = samples[index];
+            if (sample.IsSyntheticTail || sample.Timestamp != points[index].Timestamp)
+            {
+                continue;
+            }
+
+            observations.Add(new GraphObservedSample(
+                sample.Timestamp,
+                sample.ResetAt,
+                index,
+                ObservedModelTokens(sample, "SOL"),
+                ObservedModelTokens(sample, "TERRA"),
+                ObservedModelTokens(sample, "LUNA"),
+                ObservedModelTokens(sample, "ASTRA")));
+        }
+        return observations;
+    }
+
+    private static ulong? ObservedModelTokens(ApiHistorySample sample, string modelName)
+    {
+        ApiHistoryModelSample? match = null;
+        foreach (var model in PublishedModels(sample))
+        {
+            if (!string.Equals(model.Name, modelName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (match is not null)
+            {
+                return null;
+            }
+            match = model;
+        }
+        return match?.TotalTokens;
     }
 
     private static IReadOnlyList<GraphUnusedInterval> BuildNonOwnedIntervals(

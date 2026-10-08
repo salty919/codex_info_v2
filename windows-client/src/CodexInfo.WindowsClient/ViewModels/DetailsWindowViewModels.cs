@@ -115,12 +115,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private readonly SemaphoreSlim resourceRefreshGate = new(1, 1);
     private readonly ObservableCollection<ApiHistoryPeriod> periods = [];
     private IReadOnlyList<GraphPointViewModel> points = Array.Empty<GraphPointViewModel>();
-    private GraphScene scene = GraphScene.Empty();
+    private GraphScene scene = GraphScene.Empty(GraphMetric.Tokens);
     private ApiHistoryPeriod? selectedPeriod;
     private ApiHistoryPeriod? displayedPeriod;
-    private GraphMetric selectedMetric = GraphMetric.Dollars;
-    private GraphMetric displayedMetric = GraphMetric.Dollars;
-    private IReadOnlyList<string> metricOptions = Array.Empty<string>();
+    private GraphMetric selectedMetric = GraphMetric.Tokens;
+    private GraphMetric displayedMetric = GraphMetric.Tokens;
     private bool showRemaining = true;
     private bool showModels = true;
     private bool showSol = true;
@@ -173,7 +172,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         this.postToUi = postToUi;
         this.getUnixTimeSeconds = getUnixTimeSeconds;
         Periods = new ReadOnlyObservableCollection<ApiHistoryPeriod>(periods);
-        RebuildMetricOptions();
         main.PropertyChanged += OnMainPropertyChanged;
         resourceClient = main.SplitResourceClient;
         accountResourceClient = main.AccountResourceClient;
@@ -302,8 +300,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string SelectedAccountValueText => main.SelectedAccountText;
 
-    public IReadOnlyList<string> MetricOptions => metricOptions;
-
     public string SelectedMetric
     {
         get => selectedMetric == GraphMetric.Dollars ? Texts.GraphDollarMetric : Texts.GraphTokenMetric;
@@ -316,10 +312,16 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             }
 
             selectedMetric = metric;
-            RebuildPoints();
+            Notify(nameof(IsTokensMetric));
+            Notify(nameof(IsDollarsMetric));
             Notify();
+            RebuildPoints();
         }
     }
+
+    public bool IsTokensMetric => selectedMetric == GraphMetric.Tokens;
+
+    public bool IsDollarsMetric => selectedMetric == GraphMetric.Dollars;
 
     public ApiHistoryPeriod? SelectedPeriod
     {
@@ -949,11 +951,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         if (eventArgs.PropertyName == nameof(MainWindowViewModel.Texts))
         {
-            RebuildMetricOptions();
             ReformatPeriodLabels();
             RebuildPoints();
             Notify(nameof(Texts));
-            Notify(nameof(MetricOptions));
             Notify(nameof(SelectedMetric));
             Notify(nameof(SelectedAccountText));
             Notify(nameof(SelectedAccountValueText));
@@ -1710,11 +1710,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(CanGoForward));
         Notify(nameof(HasPlot));
         Notify(nameof(RangeLabel));
-    }
-
-    private void RebuildMetricOptions()
-    {
-        metricOptions = [Texts.GraphDollarMetric, Texts.GraphTokenMetric];
     }
 
     private async Task RunSplitResourcePollingAsync(CancellationToken cancellationToken)

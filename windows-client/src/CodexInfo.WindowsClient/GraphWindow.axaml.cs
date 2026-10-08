@@ -55,6 +55,29 @@ public partial class GraphWindow : Window
         }
     }
 
+    private void OnMetricClick(object? sender, RoutedEventArgs eventArgs)
+    {
+        if (DataContext is not GraphWindowViewModel viewModel || sender is not Button button)
+        {
+            return;
+        }
+
+        if (button.Tag is not string metric)
+        {
+            return;
+        }
+
+        switch (metric)
+        {
+            case "Tokens":
+                viewModel.SelectedMetric = viewModel.Texts.GraphTokenMetric;
+                break;
+            case "Dollars":
+                viewModel.SelectedMetric = viewModel.Texts.GraphDollarMetric;
+                break;
+        }
+    }
+
     private void OnPreviousRange(object? sender, RoutedEventArgs eventArgs)
     {
         if (DataContext is GraphWindowViewModel viewModel) viewModel.GoBack();
@@ -96,8 +119,7 @@ public partial class GraphWindow : Window
             return;
         }
 
-        if (IsWithin(eventArgs.Source, PeriodSelector) ||
-            IsWithin(eventArgs.Source, MetricSelector))
+        if (IsWithin(eventArgs.Source, PeriodSelector))
         {
             return;
         }
@@ -128,7 +150,6 @@ public partial class GraphWindow : Window
     private void CloseMenus()
     {
         PeriodSelector.Close();
-        MetricSelector.Close();
     }
 
     private static bool IsWithin(object? source, Visual ancestor)
