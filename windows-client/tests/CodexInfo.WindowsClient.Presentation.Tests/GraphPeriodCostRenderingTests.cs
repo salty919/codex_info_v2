@@ -1,7 +1,6 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
-using System.Globalization;
 using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Graphing;
@@ -14,7 +13,7 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphPeriodCostRenderingTests
 {
     [Fact]
-    public void EmbeddedPeriodCostFontAliasesResolveJapaneseAndKoreanGlyphs()
+    public void EmbeddedPeriodCostFontAliasesResolveAmountGlyphs()
     {
         var originalLanguage = LocalizationService.Current.LanguageCode;
         GraphPeriodCostFontResolver.EnsureRegistered();
@@ -26,24 +25,32 @@ public sealed class GraphPeriodCostRenderingTests
 
             var japanese = ScottPlot.Fonts.GetTypeface(GraphPeriodCostFontResolver.JapaneseAlias, false, false);
             var korean = ScottPlot.Fonts.GetTypeface(GraphPeriodCostFontResolver.KoreanAlias, false, false);
-
-            AssertGlyphsAvailable(japanese, "期間合計 未取得");
-            AssertGlyphsAvailable(korean, "기간 합계 가져오지 못함");
+            AssertGlyphsAvailable(japanese, "$1");
+            AssertGlyphsAvailable(korean, "$1");
 
             var scene = GraphScene.Create(
                 [Sample(1_000, Model("gpt-6-sol", 1.0))],
                 GraphMetric.Dollars,
                 1_000,
                 1_060);
+
             LocalizationService.SetLanguage("ja");
-            var japaneseLabel = Labels(new GraphPlotControl { Scene = scene }).Single();
-            Assert.Equal(GraphPeriodCostFontResolver.JapaneseAlias, japaneseLabel.LabelFontName);
-            AssertLabelPaintUsesFontWithGlyphs(japaneseLabel, japanese, "期間合計");
+            var japaneseControl = new GraphPlotControl { Scene = scene };
+            var japanesePanel = Panel(japaneseControl);
+            using var japaneseImage = japaneseControl.Plot.GetImage(900, 542);
+            var japaneseAmount = Assert.Single(japanesePanel.Amounts);
+            Assert.Equal("$1", japaneseAmount.LabelStyle.Text);
+            Assert.Equal(GraphPeriodCostFontResolver.JapaneseAlias, japaneseAmount.LabelStyle.FontName);
+            AssertLabelPaintUsesFontWithGlyphs(japaneseAmount, japanese, "$1");
 
             LocalizationService.SetLanguage("ko");
-            var koreanLabel = Labels(new GraphPlotControl { Scene = scene }).Single();
-            Assert.Equal(GraphPeriodCostFontResolver.KoreanAlias, koreanLabel.LabelFontName);
-            AssertLabelPaintUsesFontWithGlyphs(koreanLabel, korean, "기간 합계");
+            var koreanControl = new GraphPlotControl { Scene = scene };
+            var koreanPanel = Panel(koreanControl);
+            using var koreanImage = koreanControl.Plot.GetImage(900, 542);
+            var koreanAmount = Assert.Single(koreanPanel.Amounts);
+            Assert.Equal("$1", koreanAmount.LabelStyle.Text);
+            Assert.Equal(GraphPeriodCostFontResolver.KoreanAlias, koreanAmount.LabelStyle.FontName);
+            AssertLabelPaintUsesFontWithGlyphs(koreanAmount, korean, "$1");
         }
         finally
         {
@@ -52,20 +59,63 @@ public sealed class GraphPeriodCostRenderingTests
     }
 
     [Fact]
-    public void CurrentPeriodAddsItsPersistedDollarSummaryToThePlot()
+    public void CurrentPeriodAmountIsRoundedAndCenteredInTheBottomFooter()
     {
         var scene = GraphScene.Create(
         [
-            Sample(1_000, Model("gpt-6-sol", 0.10), Model("gpt-5.6-sol", 0.20)),
-            Sample(1_060, Model("gpt-6-sol", 0.375), Model("gpt-5.6-sol", 0.625)),
+            Sample(1_000, Model("gpt-6-sol", 30.10), Model("gpt-5.6-sol", 44.52)),
+            Sample(1_060, Model("gpt-6-sol", 30.10), Model("gpt-5.6-sol", 44.52)),
         ], GraphMetric.Dollars, 1_000, 2_000);
         var control = new GraphPlotControl { Scene = scene };
+        var panel = Panel(control);
 
-        Assert.Equal("期間合計 $1.00", Labels(control).Single().LabelText);
+        using var rendered = control.Plot.GetImage(900, 542);
+        var amount = Assert.Single(panel.Amounts);
+        var dataRect = control.Plot.LastRender.DataRect;
+        var footerRect = AssertRenderedRect(panel.LastRenderBounds);
+        var amountRect = AssertRenderedRect(amount.LastRenderBounds);
+
+        Assert.Equal("$75", amount.LabelStyle.Text);
+        Assert.Equal(GraphPeriodCostPanel.BaseFontSize, amount.LabelStyle.FontSize);
+        Assert.Equal(ScottPlot.Edge.Bottom, panel.Edge);
+        Assert.InRange(Math.Abs(footerRect.Height - GraphPeriodCostPanel.FooterHeight), 0, 0.5f);
+        Assert.True(footerRect.Top >= dataRect.Bottom);
+        Assert.True(footerRect.Bottom <= 542);
+        Assert.True(amountRect.Left >= footerRect.Left + 8);
+        Assert.True(amountRect.Right <= footerRect.Right - 8);
+        Assert.True(amountRect.Top >= footerRect.Top);
+        Assert.True(amountRect.Bottom <= footerRect.Bottom);
+        Assert.InRange(
+            Math.Abs(amount.LastRenderCenterX!.Value - control.Plot.Axes.Bottom.GetPixel(1_500, dataRect)),
+            0,
+            0.1f);
+        Assert.Empty(control.Plot.GetPlottables<ScottPlot.Plottables.Text>());
+
+        // Inspect actual painted glyph pixels: ScottPlot label layout bounds
+        // do not establish the visible distance from the footer divider.
+        using var bitmap = SkiaSharp.SKBitmap.Decode(rendered.GetImageBytes());
+        var amountColor = SkiaSharp.SKColor.Parse(ThemePalette.Resolve("#E6B85C"));
+        var inkRows = new List<int>();
+        for (var y = (int)Math.Ceiling(dataRect.Bottom); y < bitmap.Height; y++)
+        {
+            for (var x = (int)Math.Ceiling(dataRect.Left); x < (int)dataRect.Right; x++)
+            {
+                if (bitmap.GetPixel(x, y) == amountColor)
+                {
+                    inkRows.Add(y);
+                    break;
+                }
+            }
+        }
+        Assert.NotEmpty(inkRows);
+        Assert.True(inkRows.Min() >= footerRect.Top + 8,
+            $"Amount ink starts at {inkRows.Min()}, footer divider is at {footerRect.Top}");
+        Assert.True(inkRows.Max() <= footerRect.Bottom - 8);
+
     }
 
     [Fact]
-    public void PartialUnavailableAndConfirmedZeroHaveDistinctSummaryLabels()
+    public void PartialUnavailableAndConfirmedZeroRenderOnlyTheirAmounts()
     {
         var originalLanguage = LocalizationService.Current.LanguageCode;
         LocalizationService.SetLanguage("ja");
@@ -89,9 +139,9 @@ public sealed class GraphPeriodCostRenderingTests
                 Sample(1_000),
             ], GraphMetric.Tokens, 1_000, 1_060);
 
-            Assert.Equal("記録分 $1.25（未確定）", Labels(new GraphPlotControl { Scene = partial }).Single().LabelText);
-            Assert.Equal("期間合計 未取得", Labels(new GraphPlotControl { Scene = unavailable }).Single().LabelText);
-            Assert.Equal("期間合計 $0.00", Labels(new GraphPlotControl { Scene = zero }).Single().LabelText);
+            Assert.Equal("$1", Assert.Single(Panel(new GraphPlotControl { Scene = partial }).Amounts).LabelStyle.Text);
+            Assert.Equal("—", Assert.Single(Panel(new GraphPlotControl { Scene = unavailable }).Amounts).LabelStyle.Text);
+            Assert.Equal("$0", Assert.Single(Panel(new GraphPlotControl { Scene = zero }).Amounts).LabelStyle.Text);
         }
         finally
         {
@@ -121,8 +171,10 @@ public sealed class GraphPeriodCostRenderingTests
             ShowAstra = false,
         };
 
-        Assert.Equal("期間合計 $2.00", Labels(visible).Single().LabelText);
-        Assert.Equal("期間合計 $2.00", Labels(hidden).Single().LabelText);
+        using var visibleImage = visible.Plot.GetImage(900, 542);
+        using var hiddenImage = hidden.Plot.GetImage(900, 542);
+        Assert.Equal("$2", Assert.Single(Panel(visible).Amounts).LabelStyle.Text);
+        Assert.Equal("$2", Assert.Single(Panel(hidden).Amounts).LabelStyle.Text);
         var hiddenModelLines = hidden.Plot.GetPlottables<ScottPlot.Plottables.Scatter>()
             .Where(series => series.LineWidth >= GraphPlotControl.MeasuredModelLineWidth);
         Assert.NotEmpty(hiddenModelLines);
@@ -130,7 +182,7 @@ public sealed class GraphPeriodCostRenderingTests
     }
 
     [Fact]
-    public void SummaryUsesSelectedLocaleAndResolvedThemeColors()
+    public void SummaryUsesThemeAmountColorAndUnchangedPlotBackground()
     {
         var originalLanguage = LocalizationService.Current.LanguageCode;
         var originalTheme = ThemePalette.CurrentId;
@@ -143,15 +195,16 @@ public sealed class GraphPeriodCostRenderingTests
                 GraphMetric.Dollars,
                 1_000,
                 1_060);
-            var label = Labels(new GraphPlotControl { Scene = scene }).Single();
+            var control = new GraphPlotControl { Scene = scene };
+            var panel = Panel(control);
+            using var rendered = control.Plot.GetImage(900, 542);
+            var amount = Assert.Single(panel.Amounts);
 
-            Assert.Equal("Period total $1.00", label.LabelText);
+            Assert.Equal("$1", amount.LabelStyle.Text);
+            Assert.Equal(new ScottPlot.Color(ThemePalette.Resolve("#E6B85C")), amount.LabelStyle.ForeColor);
             Assert.Equal(
                 new ScottPlot.Color(ThemePalette.Resolve(GraphPlotControl.PlotColorHex)),
-                label.LabelBackgroundColor);
-            Assert.Equal(
-                new ScottPlot.Color(ThemePalette.Resolve(GraphPlotControl.AxisTextColorHex)),
-                label.LabelFontColor);
+                panel.BackgroundColor);
         }
         finally
         {
@@ -161,23 +214,29 @@ public sealed class GraphPeriodCostRenderingTests
     }
 
     [Fact]
-    public void ViewportOmitsOnlyTheLeftClippedPeriodLabelAndKeepsTheRightPartialAnchor()
+    public void ViewportOmitsOnlyTheLeftClippedPeriodAmountAndKeepsTheRightPartialPeriod()
     {
         var first = Period(0, 100, 0.10, 0.20);
         var second = Period(100, 200, 0.40, 0.60);
         var third = Period(200, 300, 0.75, 1.25);
         var viewport = GraphScene.CreateViewport(50, 280, GraphMetric.Dollars, [first, second, third]);
         var control = new GraphPlotControl { Scene = viewport };
+        var panel = Panel(control);
 
-        var labels = Labels(control);
-        Assert.Equal(2, labels.Length);
-        Assert.Equal(
-            [
-                StartLabel(second.PeriodStartAt) + "\n期間合計 $1.00",
-                StartLabel(third.PeriodStartAt) + "\n期間合計 $2.00",
-            ],
-            labels.Select(label => label.LabelText));
-        Assert.Equal(280, labels[^1].Location.X);
+        using var rendered = control.Plot.GetImage(900, 542);
+        var amounts = panel.Amounts;
+        var dataRect = control.Plot.LastRender.DataRect;
+
+        Assert.Equal(["$1", "$2"], amounts.Select(amount => amount.LabelStyle.Text));
+        Assert.Equal([150d, 240d], amounts.Select(amount => amount.CenterAt));
+        Assert.InRange(
+            Math.Abs(amounts[0].LastRenderCenterX!.Value - control.Plot.Axes.Bottom.GetPixel(150, dataRect)),
+            0,
+            1);
+        Assert.InRange(
+            Math.Abs(amounts[1].LastRenderCenterX!.Value - control.Plot.Axes.Bottom.GetPixel(240, dataRect)),
+            0,
+            1);
         Assert.Contains(control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>()
             .Where(series => series.LineWidth >= GraphPlotControl.MeasuredModelLineWidth)
             .SelectMany(series => series.Data.GetScatterPoints()),
@@ -185,7 +244,7 @@ public sealed class GraphPeriodCostRenderingTests
     }
 
     [Fact]
-    public void FirstAndResizedNarrowRendersKeepThreeDatedPeriodLabelsInsideSeparateLanes()
+    public void FirstAndResizedNarrowRendersKeepAmountsInsideOneFooterRow()
     {
         var periods = new[]
         {
@@ -195,46 +254,48 @@ public sealed class GraphPeriodCostRenderingTests
         };
         var viewport = GraphScene.CreateViewport(0, 300, GraphMetric.Dollars, periods);
         var control = new GraphPlotControl { Scene = viewport };
-        var labels = Labels(control);
 
-        Assert.Equal(3, labels.Length);
-        Assert.Equal(
-            periods.Select(period => StartLabel(period.PeriodStartAt) + "\n"),
-            labels.Select(label => label.LabelText[..(label.LabelText.IndexOf('\n') + 1)]));
+        AssertAmountsFitFooter(control, width: 360, height: 260);
+        AssertAmountsFitFooter(control, width: 480, height: 320);
 
-        AssertLabelsFitAndUseSeparateLanes(control, width: 360, height: 260);
-        AssertLabelsFitAndUseSeparateLanes(control, width: 480, height: 320);
+        var clusteredPeriods = new[]
+        {
+            Period(0, 100, 1_234.5, 2_345.5),
+            Period(100, 990, 2_345.5, 3_456.5),
+            Period(990, 1_000, 3_456.5, 4_567.5),
+        };
+        var clusteredViewport = GraphScene.CreateViewport(0, 1_000, GraphMetric.Dollars, clusteredPeriods);
+        var clusteredControl = new GraphPlotControl { Scene = clusteredViewport };
+        AssertAmountsFitFooter(clusteredControl, width: 360, height: 260);
     }
 
-    private static void AssertLabelsFitAndUseSeparateLanes(GraphPlotControl control, int width, int height)
+    private static void AssertAmountsFitFooter(GraphPlotControl control, int width, int height)
     {
         using var rendered = control.Plot.GetImage(width, height);
-        var dataRect = control.Plot.LastRender.DataRect;
-        var labels = Labels(control).OrderBy(label => label.Location.X).ToArray();
-        var previousBottom = float.NegativeInfinity;
+        var panel = Panel(control);
+        var footerRect = AssertRenderedRect(panel.LastRenderBounds);
+        var amounts = panel.Amounts.OrderBy(amount => amount.LastRenderCenterX).ToArray();
+        var previousRight = float.NegativeInfinity;
 
-        foreach (var label in labels)
+        Assert.Equal(3, amounts.Length);
+        Assert.InRange(panel.Amounts[0].LabelStyle.FontSize, 5, GraphPeriodCostPanel.BaseFontSize);
+        foreach (var amount in amounts)
         {
-            // LabelLastRenderPixelRect is written inside Text.Render after
-            // layout runs, so this checks the box actually painted on the
-            // first raster rather than offsets mutated later in the frame.
-            var drawnRect = label.LabelLastRenderPixelRect;
-            Assert.True(drawnRect.Left >= dataRect.Left + 3,
-                $"left={drawnRect.Left}, data-left={dataRect.Left}, text={label.LabelText}");
-            Assert.True(drawnRect.Right <= dataRect.Right - 3,
-                $"right={drawnRect.Right}, data-right={dataRect.Right}, text={label.LabelText}");
-            Assert.True(drawnRect.Top >= dataRect.Top + 3,
-                $"top={drawnRect.Top}, data-top={dataRect.Top}, text={label.LabelText}");
-            Assert.True(drawnRect.Bottom <= dataRect.Bottom - 2,
-                $"bottom={drawnRect.Bottom}, data-bottom={dataRect.Bottom}, text={label.LabelText}");
-            Assert.True(drawnRect.Top >= previousBottom + 2,
-                $"period labels overlap vertically at {drawnRect.Top}");
-            previousBottom = drawnRect.Bottom;
+            var rect = AssertRenderedRect(amount.LastRenderBounds);
+            Assert.True(rect.Left >= footerRect.Left + 8, $"left={rect.Left}, footer-left={footerRect.Left}");
+            Assert.True(rect.Right <= footerRect.Right - 8, $"right={rect.Right}, footer-right={footerRect.Right}");
+            Assert.True(rect.Top >= footerRect.Top, $"top={rect.Top}, footer-top={footerRect.Top}");
+            Assert.True(rect.Bottom <= footerRect.Bottom, $"bottom={rect.Bottom}, footer-bottom={footerRect.Bottom}");
+            Assert.True(rect.Left >= previousRight + 8, $"footer amounts overlap at {rect.Left}");
+            previousRight = rect.Right;
         }
     }
 
-    private static ScottPlot.Plottables.Text[] Labels(GraphPlotControl control) =>
-        control.Plot.GetPlottables<ScottPlot.Plottables.Text>().ToArray();
+    private static GraphPeriodCostPanel Panel(GraphPlotControl control) =>
+        Assert.Single(control.Plot.Axes.GetPanels().OfType<GraphPeriodCostPanel>());
+
+    private static ScottPlot.PixelRect AssertRenderedRect(ScottPlot.PixelRect? rect) =>
+        rect ?? throw new InvalidOperationException("The amount footer was not rendered.");
 
     private static void AssertGlyphsAvailable(SkiaSharp.SKTypeface typeface, string text)
     {
@@ -244,12 +305,12 @@ public sealed class GraphPeriodCostRenderingTests
     }
 
     private static void AssertLabelPaintUsesFontWithGlyphs(
-        ScottPlot.Plottables.Text label,
+        GraphPeriodCostAmount amount,
         SkiaSharp.SKTypeface expectedTypeface,
         string text)
     {
         using var paint = ScottPlot.Paint.NewDisposablePaint();
-        label.LabelStyle.ApplyToPaint(paint);
+        amount.LabelStyle.ApplyToPaint(paint);
 
         var renderedTypeface = paint.SKTypeface ??
             throw new InvalidOperationException("LabelStyle.ApplyToPaint did not choose a typeface.");
@@ -257,18 +318,17 @@ public sealed class GraphPeriodCostRenderingTests
         AssertGlyphsAvailable(renderedTypeface, text);
     }
 
-    private static string StartLabel(long periodStartAt) =>
-        TimeZoneInfo.ConvertTime(
-                DateTimeOffset.FromUnixTimeSeconds(periodStartAt),
-                LocalizationService.DisplayTimeZone)
-            .ToString("MM/dd HH:mm", CultureInfo.CurrentCulture) + "～";
-
-    private static GraphScene Period(long startAt, long endAt, double firstDollars, double secondDollars) =>
-        GraphScene.Create(
+    private static GraphScene Period(long startAt, long endAt, double firstDollars, double secondDollars)
+    {
+        var duration = endAt - startAt;
+        var firstOffset = duration / 2;
+        var secondOffset = Math.Min(duration - 1, Math.Max(firstOffset + 1, (duration * 4) / 5));
+        return GraphScene.Create(
         [
-            Sample(startAt + 50, Model("gpt-6-sol", firstDollars / 2), Model("gpt-5.6-sol", secondDollars / 2)),
-            Sample(startAt + 80, Model("gpt-6-sol", firstDollars), Model("gpt-5.6-sol", secondDollars)),
+            Sample(startAt + firstOffset, Model("gpt-6-sol", firstDollars / 2), Model("gpt-5.6-sol", secondDollars / 2)),
+            Sample(startAt + secondOffset, Model("gpt-6-sol", firstDollars), Model("gpt-5.6-sol", secondDollars)),
         ], GraphMetric.Dollars, startAt, endAt);
+    }
 
     private static ApiHistorySample Sample(long timestamp, params ApiHistoryModelSample[] models) =>
         new(timestamp, 1_000, 99, null, null, null, null, null, null)
