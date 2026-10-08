@@ -2168,21 +2168,26 @@ function Assert-E2EImageChanged {
 
 function Get-E2EGraphMetric {
     param([System.Windows.Automation.AutomationElement]$Root)
-    $selected = @()
-    foreach ($metric in @('Tokens', 'Dollars')) {
-        $button = Find-E2EElementByAutomationId $Root "Graph.Metric.$metric"
-        Assert-E2E ($null -ne $button -and -not $button.Current.IsOffscreen) "Graph $metric button is missing."
-        if ([string]$button.Current.HelpText -ceq 'True') { $selected += $metric }
-    }
-    Assert-E2E ($selected.Count -eq 1) 'Exactly one graph metric button must be selected.'
-    return $selected[0]
+    $switch = Find-E2EElementByAutomationId $Root 'Graph.Metric.Switch'
+    Assert-E2E ($null -ne $switch -and -not $switch.Current.IsOffscreen) 'Graph metric switch is missing.'
+    $toggle = $null
+    Assert-E2E ($switch.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggle)) `
+        'Graph metric switch has no TogglePattern.'
+    $state = $toggle.Current.ToggleState
+    Assert-E2E ($state -ne [System.Windows.Automation.ToggleState]::Indeterminate) 'Graph metric switch is indeterminate.'
+    if ($state -eq [System.Windows.Automation.ToggleState]::On) { return 'Tokens' }
+    return 'Dollars'
 }
 
 function Select-E2EGraphMetric {
     param([System.Windows.Automation.AutomationElement]$Root, [ValidateSet('Tokens', 'Dollars')][string]$Metric)
-    $button = Find-E2EElementByAutomationId $Root "Graph.Metric.$Metric"
-    Assert-E2E ($null -ne $button) "Graph $Metric button is missing."
-    Invoke-E2EElement $button
+    if ((Get-E2EGraphMetric $Root) -cne $Metric) {
+        $switch = Find-E2EElementByAutomationId $Root 'Graph.Metric.Switch'
+        $toggle = $null
+        Assert-E2E ($switch.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggle)) `
+            'Graph metric switch has no TogglePattern.'
+        $toggle.Toggle()
+    }
     Wait-E2E -Description "Graph metric $Metric selected" -Probe {
         return (Get-E2EGraphMetric $Root) -ceq $Metric
     } | Out-Null

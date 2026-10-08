@@ -1,5 +1,5 @@
 # Measures the installed Graph preview through the same input actions exposed
-# to a user. Toggle and metric-button latency ends after the expected UIA state
+# to a user. Toggle and metric-switch latency ends after the expected UIA state
 # and changed control surface; each sample also requires a changed Graph.Plot
 # GDI frame within the bounded timeout. Period menu samples retain their
 # screen-change plus UIA postcondition contract.
@@ -1084,52 +1084,51 @@ function Assert-GraphMetricSelectionState {
         [Parameter(Mandatory = $true)][ValidateSet('Tokens', 'Dollars')][string]$SelectedMetric
     )
 
-    $otherMetric = if ($SelectedMetric -eq 'Tokens') { 'Dollars' } else { 'Tokens' }
-    $selectedButton = Wait-GraphElementByAutomationId $Handle "Graph.Metric.$SelectedMetric"
-    $otherButton = Wait-GraphElementByAutomationId $Handle "Graph.Metric.$otherMetric"
-    Assert-GraphLatency ([string]$selectedButton.Current.HelpText -eq 'True') `
+    $switch = Wait-GraphElementByAutomationId $Handle 'Graph.Metric.Switch'
+    $expected = if ($SelectedMetric -eq 'Tokens') { 'True' } else { 'False' }
+    Assert-GraphLatency ([string]$switch.Current.HelpText -ceq $expected) `
         "Graph metric $SelectedMetric is not selected."
-    Assert-GraphLatency ([string]$otherButton.Current.HelpText -eq 'False') `
-        "Graph metric $otherMetric is not unselected."
+
 }
 
-function Measure-GraphMetricButtonSwitch {
+function Measure-GraphMetricSwitch {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Handle,
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$PlotElement,
         [int]$Count = 30
     )
 
-    $metricAutomationIds = @('Graph.Metric.Tokens', 'Graph.Metric.Dollars')
+    $metricAutomationIds = @('Graph.Metric.Switch')
     $samples = [System.Collections.Generic.List[object]]::new()
     $activeControl = [ordered]@{
         name = 'metric'
-        automation_id = 'Graph.Metric.Tokens'
+        automation_id = 'Graph.Metric.Switch'
         automation_ids = $metricAutomationIds
         plot_automation_id = 'Graph.Plot'
-        kind = 'metric-button-switch'
+        kind = 'metric-switch'
         phase = 'starting'
         samples = @()
         stats = Get-GraphLatencyDiagnosticStats -Samples @()
     }
     if ($null -ne $script:graphLatencyActiveCase) {
         $script:graphLatencyActiveCase['controls'] = @($script:graphLatencyActiveCase['controls']) + @($activeControl)
-        $script:graphLatencyActiveCase['phase'] = 'metric-button-switch'
-        Save-GraphLatencyCheckpoint 'metric-button-switch-start'
+        $script:graphLatencyActiveCase['phase'] = 'metric-switch'
+        Save-GraphLatencyCheckpoint 'metric-switch-start'
     }
 
     Assert-GraphMetricSelectionState -Handle $Handle -SelectedMetric 'Tokens'
     $selectedMetric = 'Tokens'
     for ($index = 1; $index -le $Count; $index++) {
         $expectedMetric = if ($selectedMetric -eq 'Tokens') { 'Dollars' } else { 'Tokens' }
-        $automationId = "Graph.Metric.$expectedMetric"
+        $automationId = 'Graph.Metric.Switch'
+        $expectedHelpText = if ($expectedMetric -eq 'Tokens') { 'True' } else { 'False' }
         $element = Wait-GraphElementByAutomationId $Handle $automationId
-        Assert-GraphLatency ([string]$element.Current.HelpText -eq 'False') `
+        Assert-GraphLatency ([string]$element.Current.HelpText -cne $expectedHelpText) `
             "$automationId was already selected before sample $index."
 
         $activeControl['phase'] = "sample-$index-input"
         $sample = Measure-GraphControlStateAction -Handle $Handle -Element $element -PlotElement $PlotElement `
-            -AutomationId $automationId -ExpectedHelpText 'True' `
+            -AutomationId $automationId -ExpectedHelpText $expectedHelpText `
             -Description "metric $expectedMetric sample $index" -TimeoutMilliseconds $PaintTimeoutMilliseconds
         Assert-GraphMetricSelectionState -Handle $Handle -SelectedMetric $expectedMetric
 
@@ -1153,30 +1152,30 @@ function Measure-GraphMetricButtonSwitch {
         $activeControl['stats'] = Get-GraphLatencyDiagnosticStats -Samples @($activeControl['samples'])
         $activeControl['completed_samples'] = $index
         $activeControl['phase'] = "sample-$index-observed"
-        Write-GraphLatencyLog ("sample: kind=metric-button-switch index={0} metric={1} latency_ms={2} help_text={3} graph_plot_changed={4}" -f
+        Write-GraphLatencyLog ("sample: kind=metric-switch index={0} metric={1} latency_ms={2} help_text={3} graph_plot_changed={4}" -f
             $index, $expectedMetric, $sample.latency_ms, $sample.observed_help_text, $sample.graph_plot_changed)
         $selectedMetric = $expectedMetric
         Complete-GraphPhysicalClickCycle
     }
 
-    $stats = Get-GraphLatencyStats -Samples @($samples) -Description 'metric button switches'
+    $stats = Get-GraphLatencyStats -Samples @($samples) -Description 'metric switches'
     $coldMilliseconds = [double]$samples[0].latency_ms
     $activeControl['stats'] = $stats
     $activeControl['cold_ms'] = $coldMilliseconds
     $activeControl['phase'] = 'budget-check'
-    Write-GraphLatencyLog ("metric-button-switch-stats: count={0} p90_ms={1} p95_ms={2} cold_ms={3}" -f
+    Write-GraphLatencyLog ("metric-switch-stats: count={0} p90_ms={1} p95_ms={2} cold_ms={3}" -f
         $stats.count, $stats.p90_ms, $stats.p95_ms, $coldMilliseconds)
-    Save-GraphLatencyCheckpoint 'metric-button-switch-stats'
-    # Retain the existing metric control limits while measuring its new direct-button action.
+    Save-GraphLatencyCheckpoint 'metric-switch-stats'
+    # Retain the existing metric control limits while measuring its switch action.
     Assert-GraphLatencyBudget -Stats $stats -P90Limit 100 -P95Limit 150 `
-        -ColdLimit 250 -ColdMilliseconds $coldMilliseconds -Description 'metric button switches'
+        -ColdLimit 250 -ColdMilliseconds $coldMilliseconds -Description 'metric switches'
     $activeControl['phase'] = 'pass'
     return [pscustomobject]@{
         name = 'metric'
-        automation_id = 'Graph.Metric.Tokens'
+        automation_id = 'Graph.Metric.Switch'
         automation_ids = $metricAutomationIds
         plot_automation_id = 'Graph.Plot'
-        kind = 'metric-button-switch'
+        kind = 'metric-switch'
         samples = @($samples)
         stats = $stats
         cold_ms = $coldMilliseconds
@@ -1237,7 +1236,7 @@ function Invoke-GraphPointCase {
         $controls = [System.Collections.Generic.List[object]]::new()
         $controls.Add((Measure-GraphMenu -Handle $window -AutomationId 'Graph.PeriodSelector' `
             -MenuAutomationId 'Graph.PeriodMenu' -Name 'period' -Count $Iterations))
-        $controls.Add((Measure-GraphMetricButtonSwitch -Handle $window -PlotElement $plot -Count $Iterations))
+        $controls.Add((Measure-GraphMetricSwitch -Handle $window -PlotElement $plot -Count $Iterations))
         $toggleCases = @(
             @{ Id = 'Graph.Toggle.Remaining'; Name = 'Remaining' },
             @{ Id = 'Graph.Toggle.LUNA'; Name = 'LUNA' },
@@ -1254,7 +1253,7 @@ function Invoke-GraphPointCase {
             ForEach-Object { $_.samples })
         $menuSamples = @($controls | Where-Object { $_.kind -eq 'menu' } |
             ForEach-Object { $_.samples })
-        $metricButtonSamples = @($controls | Where-Object { $_.kind -eq 'metric-button-switch' } |
+        $metricButtonSamples = @($controls | Where-Object { $_.kind -eq 'metric-switch' } |
             ForEach-Object { $_.samples })
         $toggleStats = Get-GraphLatencyStats -Samples $toggleSamples -Description 'all toggle samples'
         $menuStats = Get-GraphLatencyStats -Samples $menuSamples -Description 'all menu samples'
@@ -1263,14 +1262,14 @@ function Invoke-GraphPointCase {
             ForEach-Object { [double]$_.cold_ms } | Measure-Object -Maximum).Maximum)
         $menuColdMax = (@($controls | Where-Object { $_.kind -eq 'menu' } |
             ForEach-Object { [double]$_.cold_ms } | Measure-Object -Maximum).Maximum)
-        $metricButtonColdMax = (@($controls | Where-Object { $_.kind -eq 'metric-button-switch' } |
+        $metricButtonColdMax = (@($controls | Where-Object { $_.kind -eq 'metric-switch' } |
             ForEach-Object { [double]$_.cold_ms } | Measure-Object -Maximum).Maximum)
         Assert-GraphLatencyBudget -Stats $toggleStats -P90Limit 75 -P95Limit 100 `
             -ColdLimit 250 -ColdMilliseconds $toggleColdMax -Description 'all toggles'
         Assert-GraphLatencyBudget -Stats $menuStats -P90Limit 100 -P95Limit 150 `
             -ColdLimit 250 -ColdMilliseconds $menuColdMax -Description 'all menus'
         Assert-GraphLatencyBudget -Stats $metricButtonStats -P90Limit 100 -P95Limit 150 `
-            -ColdLimit 250 -ColdMilliseconds $metricButtonColdMax -Description 'metric button switches'
+            -ColdLimit 250 -ColdMilliseconds $metricButtonColdMax -Description 'metric switches'
         $script:graphLatencyActiveCase['phase'] = 'pass'
         $script:graphLatencyActiveCase['aggregate'] = [ordered]@{
             toggles = $toggleStats
@@ -1382,7 +1381,7 @@ try {
                 if ($control.kind -eq 'toggle') {
                     $allToggleSamples.Add($sample)
                 }
-                elseif ($control.kind -eq 'metric-button-switch') {
+                elseif ($control.kind -eq 'metric-switch') {
                     $allMetricButtonSamples.Add($sample)
                 }
                 else {
@@ -1401,14 +1400,14 @@ try {
         $_.controls | Where-Object { $_.kind -eq 'menu' } | ForEach-Object { [double]$_.cold_ms }
     } | Measure-Object -Maximum).Maximum)
     $globalMetricButtonColdMax = (@($script:graphLatencyReport['cases'] | ForEach-Object {
-        $_.controls | Where-Object { $_.kind -eq 'metric-button-switch' } | ForEach-Object { [double]$_.cold_ms }
+        $_.controls | Where-Object { $_.kind -eq 'metric-switch' } | ForEach-Object { [double]$_.cold_ms }
     } | Measure-Object -Maximum).Maximum)
     Assert-GraphLatencyBudget -Stats $globalToggleStats -P90Limit 75 -P95Limit 100 `
         -ColdLimit 250 -ColdMilliseconds $globalToggleColdMax -Description 'all points toggles'
     Assert-GraphLatencyBudget -Stats $globalMenuStats -P90Limit 100 -P95Limit 150 `
         -ColdLimit 250 -ColdMilliseconds $globalMenuColdMax -Description 'all points menus'
     Assert-GraphLatencyBudget -Stats $globalMetricButtonStats -P90Limit 100 -P95Limit 150 `
-        -ColdLimit 250 -ColdMilliseconds $globalMetricButtonColdMax -Description 'all points metric button switches'
+        -ColdLimit 250 -ColdMilliseconds $globalMetricButtonColdMax -Description 'all points metric switches'
     $script:graphLatencyReport['aggregate'] = [ordered]@{
         toggles = $globalToggleStats
         menus = $globalMenuStats

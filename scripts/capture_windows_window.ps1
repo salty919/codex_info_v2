@@ -152,22 +152,23 @@ try {
         # This remains correct across DPI and responsive widths.
         $automationRoot = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         if ($graphMetricBound) {
-            $metricAutomationId = "Graph.Metric.$GraphMetric"
+            $metricAutomationId = 'Graph.Metric.Switch'
+            $expectedState = if ($GraphMetric -eq 'Tokens') { 'True' } else { 'False' }
             $metricCondition = New-Object System.Windows.Automation.PropertyCondition(
                 [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
                 $metricAutomationId)
-            $metricButton = $automationRoot.FindFirst(
+            $metricSwitch = $automationRoot.FindFirst(
                 [System.Windows.Automation.TreeScope]::Descendants,
                 $metricCondition)
-            if ($null -eq $metricButton) { throw "Graph metric button is missing: $metricAutomationId" }
-            if (-not $metricButton.Current.IsEnabled -or $metricButton.Current.IsOffscreen) {
-                throw "Graph metric button is not available: $metricAutomationId"
+            if ($null -eq $metricSwitch) { throw "Graph metric switch is missing: $metricAutomationId" }
+            if (-not $metricSwitch.Current.IsEnabled -or $metricSwitch.Current.IsOffscreen) {
+                throw "Graph metric switch is not available: $metricAutomationId"
             }
-            $priorSelectedState = $metricButton.Current.HelpText
+            $priorSelectedState = $metricSwitch.Current.HelpText
             if ($priorSelectedState -notin @('True', 'False')) {
-                throw "Graph metric button has an unknown selected state: $metricAutomationId"
+                throw "Graph metric switch has an unknown selected state: $metricAutomationId"
             }
-            $wasSelected = $priorSelectedState -eq 'True'
+            $wasSelected = $priorSelectedState -ceq $expectedState
             $plotAutomationId = 'Graph.Plot'
             $plotCondition = New-Object System.Windows.Automation.PropertyCondition(
                 [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
@@ -176,24 +177,24 @@ try {
                 [System.Windows.Automation.TreeScope]::Descendants,
                 $plotCondition)
             $priorPlotHelpText = if ($null -eq $plot) { $null } else { $plot.Current.HelpText }
-            $invoke = $null
-            if (-not $metricButton.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
-                throw "Graph metric button has no InvokePattern: $metricAutomationId"
+            $toggle = $null
+            if (-not $metricSwitch.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggle)) {
+                throw "Graph metric switch has no TogglePattern: $metricAutomationId"
             }
-            $invoke.Invoke()
+            if (-not $wasSelected) { $toggle.Toggle() }
             $selected = $false
             for ($attempt = 0; $attempt -lt 40; $attempt++) {
-                $metricButton = $automationRoot.FindFirst(
+                $metricSwitch = $automationRoot.FindFirst(
                     [System.Windows.Automation.TreeScope]::Descendants,
                     $metricCondition)
-                if ($null -ne $metricButton -and $metricButton.Current.HelpText -eq 'True') {
+                if ($null -ne $metricSwitch -and $metricSwitch.Current.HelpText -ceq $expectedState) {
                     $selected = $true
                     break
                 }
                 Start-Sleep -Milliseconds 50
             }
-            if (-not $selected) { throw "Graph metric button did not become selected: $metricAutomationId" }
-            # The selected button can update before the asynchronous graph scene.
+            if (-not $selected) { throw "Graph metric switch did not become selected: $metricAutomationId" }
+            # The switch state can update before the asynchronous graph scene.
             # Always wait for a visible plot and a hidden loading indicator; when
             # switching metrics, also require the plot's metric-axis UIA value to
             # change before capturing the accepted frame.

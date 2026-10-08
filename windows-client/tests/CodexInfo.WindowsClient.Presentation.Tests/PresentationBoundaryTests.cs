@@ -435,7 +435,7 @@ public sealed class PresentationBoundaryTests
     }
 
     [Fact]
-    public void GraphHeaderUsesVisibleMetricButtonsAndCompactRangeRow()
+    public void GraphHeaderUsesMetricSwitchAndCompactRangeRow()
     {
         var document = XDocument.Parse(LoadRepositoryFile(
             "windows-client", "src", "CodexInfo.WindowsClient", "GraphWindow.axaml"));
@@ -444,25 +444,43 @@ public sealed class PresentationBoundaryTests
             element.Attribute(xamlName)?.Value == "GraphContent");
         Assert.Equal(4, graphContent.Attribute("RowDefinitions")!.Value.Split(',').Length);
         var titleRow = graphContent.Elements().Single(element => element.Attribute("Grid.Row")?.Value == "0");
+        Assert.Equal("*,Auto,16,Auto", titleRow.Attribute("ColumnDefinitions")?.Value);
 
-        foreach (var (id, label, selected) in new[]
-                 {
-                     ("Graph.Metric.Tokens", "{Binding Texts.GraphTokenMetric}", "{Binding IsTokensMetric}"),
-                     ("Graph.Metric.Dollars", "{Binding Texts.GraphDollarMetric}", "{Binding IsDollarsMetric}")
-                 })
-        {
-            var button = document.Descendants().Single(element =>
-                element.Name.LocalName == "Button" &&
-                element.Attribute("AutomationProperties.AutomationId")?.Value == id);
-            Assert.Equal(label, button.Attribute("Content")?.Value);
-            Assert.Equal(selected, button.Attribute("Classes.selected")?.Value);
-            Assert.Equal(selected, button.Attribute("AutomationProperties.HelpText")?.Value);
-            Assert.Equal(label, button.Attribute("AutomationProperties.Name")?.Value);
-            Assert.Equal("Press", button.Attribute("ClickMode")?.Value);
-            Assert.Equal("OnMetricClick", button.Attribute("Click")?.Value);
-            Assert.True(button.Attribute("IsVisible")?.Value is null or "True");
-            Assert.Contains(button.AncestorsAndSelf(), element => ReferenceEquals(element, titleRow));
-        }
+        var metricSwitch = document.Descendants().Single(element =>
+            element.Name.LocalName == "ToggleSwitch" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.Metric.Switch");
+        Assert.Equal("{Binding IsTokensMetric, Mode=TwoWay}", metricSwitch.Attribute("IsChecked")?.Value);
+        Assert.Equal("{Binding IsTokensMetric}", metricSwitch.Attribute("AutomationProperties.HelpText")?.Value);
+        Assert.True(metricSwitch.Attribute("IsVisible")?.Value is null or "True");
+        Assert.Contains(metricSwitch.AncestorsAndSelf(), element => ReferenceEquals(element, titleRow));
+        Assert.Equal("8", metricSwitch.Parent?.Attribute("Spacing")?.Value);
+
+        var automationName = metricSwitch.Elements().Single(element =>
+            element.Name.LocalName == "AutomationProperties.Name");
+        var automationNameBinding = automationName.Elements().Single();
+        Assert.Equal("MultiBinding", automationNameBinding.Name.LocalName);
+        Assert.Equal("{}{0} / {1}", automationNameBinding.Attribute("StringFormat")?.Value);
+        Assert.Collection(automationNameBinding.Elements(),
+            binding => Assert.Equal("Texts.GraphDollarMetric", binding.Attribute("Path")?.Value),
+            binding => Assert.Equal("Texts.GraphTokenMetric", binding.Attribute("Path")?.Value));
+
+        var metricLabels = metricSwitch.Parent!.Elements()
+            .Where(element => element.Name.LocalName == "TextBlock")
+            .ToArray();
+        Assert.Collection(metricLabels,
+            label =>
+            {
+                Assert.Equal("{Binding Texts.GraphDollarMetric}", label.Attribute("Text")?.Value);
+                Assert.True(label.Attribute("IsVisible")?.Value is null or "True");
+            },
+            label =>
+            {
+                Assert.Equal("{Binding Texts.GraphTokenMetric}", label.Attribute("Text")?.Value);
+                Assert.True(label.Attribute("IsVisible")?.Value is null or "True");
+            });
+        Assert.DoesNotContain(document.Descendants(), element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value is
+                "Graph.Metric.Tokens" or "Graph.Metric.Dollars");
 
         Assert.DoesNotContain(document.Descendants(), element =>
             element.Name.LocalName == "GraphSelect" &&

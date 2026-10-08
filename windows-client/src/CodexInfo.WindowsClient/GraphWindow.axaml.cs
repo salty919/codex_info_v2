@@ -55,29 +55,6 @@ public partial class GraphWindow : Window
         }
     }
 
-    private void OnMetricClick(object? sender, RoutedEventArgs eventArgs)
-    {
-        if (DataContext is not GraphWindowViewModel viewModel || sender is not Button button)
-        {
-            return;
-        }
-
-        if (button.Tag is not string metric)
-        {
-            return;
-        }
-
-        switch (metric)
-        {
-            case "Tokens":
-                viewModel.SelectedMetric = viewModel.Texts.GraphTokenMetric;
-                break;
-            case "Dollars":
-                viewModel.SelectedMetric = viewModel.Texts.GraphDollarMetric;
-                break;
-        }
-    }
-
     private void OnPreviousRange(object? sender, RoutedEventArgs eventArgs)
     {
         if (DataContext is GraphWindowViewModel viewModel) viewModel.GoBack();
