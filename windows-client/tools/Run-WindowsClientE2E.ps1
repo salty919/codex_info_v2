@@ -260,6 +260,55 @@ public static class CodexInfoGraphPixelScanner {
             MatchesCompositedStroke(actual, foreground, IdleColor);
     }
 
+    private static bool IsGridPixel(Bitmap bitmap, int x, int y, int right) {
+        Color pixel = bitmap.GetPixel(x, y);
+        return Matches(pixel, GridColor, 8) ||
+            (x + 1 < right && MatchesSplitGrid(pixel, bitmap.GetPixel(x + 1, y)));
+    }
+
+    private static bool[] FindGridRows(Bitmap bitmap, int left, int width, int top, int bottom) {
+        int height = bottom - top;
+        int requiredGridPixels = (int)Math.Ceiling(height * 0.40);
+        var pixels = new bool[width, height];
+        var columns = new bool[width];
+        for (int x = 0; x < width; x++) {
+            int count = 0;
+            for (int y = 0; y < height; y++) {
+                pixels[x, y] = IsGridPixel(bitmap, left + x, top + y, left + width);
+                if (pixels[x, y]) count++;
+            }
+            columns[x] = count >= requiredGridPixels;
+        }
+
+        // Only narrow, independently visible vertical grids establish the
+        // rows to inspect. Idle colors cannot select their own denominator.
+        var rowVotes = new int[height];
+        int runStart = -1;
+        for (int x = 0; x <= width; x++) {
+            bool grid = x < width && columns[x];
+            if (grid && runStart < 0) runStart = x;
+            if (!grid && runStart >= 0) {
+                if (x - runStart <= 2) {
+                    int center = (runStart + x - 1) / 2;
+                    for (int y = 0; y < height; y++) {
+                        if (pixels[center, y]) rowVotes[y]++;
+                    }
+                }
+                runStart = -1;
+            }
+        }
+        var rows = new bool[height];
+        int supported = 0;
+        for (int y = 0; y < height; y++) {
+            rows[y] = rowVotes[y] >= 2;
+            if (rows[y]) supported++;
+        }
+        if (supported < requiredGridPixels) {
+            throw new InvalidOperationException("Visible vertical grids do not establish the graph data rows.");
+        }
+        return rows;
+    }
+
     public static CodexInfoGraphPixelMeasurement Scan(
         string path,
         int plotLeft,
@@ -284,7 +333,11 @@ public static class CodexInfoGraphPixelScanner {
 
             int yStart = plotTop + 20;
             int yEnd = plotTop + plotHeight - 20;
-            int sampledHeight = yEnd - yStart;
+            // Graph.Plot includes axes and the amount footer. Measure grid
+            // and idle coverage only on rows supported by visible grids;
+            // retain the original full widget for series/gutter checks below.
+            bool[] gridRows = FindGridRows(bitmap, plotLeft, plotWidth, yStart, yEnd);
+            int sampledHeight = Array.FindAll(gridRows, row => row).Length;
             int requiredGridPixels = (int)Math.Ceiling(sampledHeight * 0.40);
             int requiredIdlePixels = (int)Math.Ceiling(sampledHeight * 0.90);
             var gridColumns = new bool[plotWidth];
@@ -295,15 +348,11 @@ public static class CodexInfoGraphPixelScanner {
                 int idleMatches = 0;
                 int resetGuideMatches = 0;
                 for (int y = yStart; y < yEnd; y++) {
+                    if (!gridRows[y - yStart]) continue;
                     Color pixel = bitmap.GetPixel(plotLeft + localX, y);
                     if (Matches(pixel, IdleColor, 2)) idleMatches++;
                     if (MatchesResetGuidePixel(pixel)) resetGuideMatches++;
-                    bool grid = Matches(pixel, GridColor, 8);
-                    if (!grid && localX + 1 < plotWidth) {
-                        Color next = bitmap.GetPixel(plotLeft + localX + 1, y);
-                        grid = MatchesSplitGrid(pixel, next);
-                    }
-                    if (grid) matches++;
+                    if (IsGridPixel(bitmap, plotLeft + localX, y, plotLeft + plotWidth)) matches++;
                 }
                 gridColumns[localX] = matches >= requiredGridPixels;
                 idleColumns[localX] = idleMatches >= requiredIdlePixels;
@@ -2076,6 +2125,34 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         Assert-E2E (($opaqueIdlePrefix.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
             'Graph pixel scanner missed endpoints after recovering an opaque idle prefix.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS opaque idle prefix recovered from two visible grids'
+
+        # The amount footer reserves 48px inside Graph.Plot without extending
+        # its data grid or idle band. Expected geometry remains unchanged.
+        $footerPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-amount-footer.png'
+        $footerBitmap = New-Object System.Drawing.Bitmap(240, 188)
+        $footerGraphics = [System.Drawing.Graphics]::FromImage($footerBitmap)
+        $sourceBitmap = New-Object System.Drawing.Bitmap($opaqueIdlePrefixPath)
+        $footerPen = New-Object System.Drawing.Pen($gridColor, 1)
+        try {
+            $footerGraphics.Clear($background)
+            $footerGraphics.DrawImageUnscaled($sourceBitmap, 0, 0)
+            $footerGraphics.DrawLine($footerPen, 10, 140, 170, 140)
+            $footerBitmap.Save($footerPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        }
+        finally {
+            $footerPen.Dispose()
+            $sourceBitmap.Dispose()
+            $footerGraphics.Dispose()
+            $footerBitmap.Dispose()
+        }
+        $footer = [CodexInfoGraphPixelScanner]::Scan($footerPath, 0, 0, 240, 188)
+        Assert-E2E ($footer.PeriodStartX -eq 10 -and $footer.PeriodEndX -eq 170 -and
+            $footer.PlotSpan -eq 160 -and $footer.GutterWidth -eq 69) `
+            'Amount footer changed the measured period geometry.'
+        Assert-E2E (($footer.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
+            'Amount footer excluded endpoint pixels from the full-widget scan.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS amount footer preserves grid and endpoint evidence'
+
 
         $unanchoredShiftedRejected = $false
         try {
