@@ -525,6 +525,12 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    raw観測時刻におけるeffective値を表示する。Windowsは右端ラベルを廃止し、選択した近傍実観測時刻の
    全表示系列をホバーで確認する。整数Tokens・accepted/read-time補正Dollars・raw Remainingの表示条件は
    UX ownerの§4.2に従い、欠測を補間や0として表示しない。
+
+   Windowsのfamily表示・hoverは、同一reset period内でその時点までに掲載されたmodel keyを対象にする。
+   後から初掲載された正確なmodel IDを過去のfamily集合へ遡及追加して、保存済みの旧familyや旧版の値を消さない。
+   一度掲載されたmemberの後続欠測・価格不明はunknownのままとし、未掲載をrawの0へ変換しない。
+   旧familyと正確なIDの独立した保存値は既存の価格契約に従って表示上だけ合算する。
+   tokens/dollars、週期間/24h/7d、hoverへ同じ表示membershipを適用し、raw token、idle・予測authority、DB/APIは変更しない。
 8. `G137-8`: Graph candidateのpairはperiods応答のexact
    `Codex-Info-Published-Pair`を`P`とし、全history success pageの同headerがASCII
    case-sensitiveで`P`と一致した場合だけ全pageをatomic publishする。欠落、malformed、別値`Q`、

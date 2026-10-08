@@ -1160,19 +1160,28 @@ internal static class GraphPlotProjection
             }
         }
 
+        var firstAnchor = anchors.Length > 0 ? anchors[0] : -1;
+        var modelName = scene.ModelSeries
+            .FirstOrDefault(pair => ReferenceEquals(pair.Value, values))
+            .Key;
+        var firstAnchorIsDirect = firstAnchor >= 0 &&
+            modelName is not null &&
+            scene.ModelReliability.TryGetValue(modelName, out var modelReliability) &&
+            firstAnchor < modelReliability.Count &&
+            modelReliability[firstAnchor];
         if (scene.IsVerifiedCurrentResetStart &&
-            anchors.Length > 0 &&
-            scene.Timestamps[anchors[0]] > scene.PeriodStartAt &&
+            firstAnchorIsDirect &&
+            scene.Timestamps[firstAnchor] > scene.PeriodStartAt &&
             !scene.HasModelHardBreakBetween(
                 values,
                 scene.PeriodStartAt,
-                scene.Timestamps[anchors[0]]) &&
-            !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[anchors[0]]))
+                scene.Timestamps[firstAnchor]) &&
+            !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[firstAnchor]))
         {
-            // The zero origin is a presentation boundary supported by the
-            // authoritative current period. It never becomes a model sample
-            // or a hover observation.
-            var (baselineX, baselineY) = values[anchors[0]] == 0
+            // The zero origin is a presentation boundary supported by both
+            // the verified current period and this series' direct first
+            // anchor. It never becomes a model sample or hover observation.
+            var (baselineX, baselineY) = values[firstAnchor] == 0
                 ? (flatX, flatY)
                 : (risingX, risingY);
             AppendSegment(
@@ -1180,8 +1189,8 @@ internal static class GraphPlotProjection
                 baselineY,
                 scene.PeriodStartAt,
                 0,
-                scene.Timestamps[anchors[0]],
-                values[anchors[0]]);
+                scene.Timestamps[firstAnchor],
+                values[firstAnchor]);
         }
 
         var previous = anchors.LastOrDefault(-1);

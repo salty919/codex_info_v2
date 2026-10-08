@@ -501,9 +501,11 @@ public sealed class GraphScene
             ? dollarProjection
             : tokenProjection;
         var rawDisplayProjection = semanticProjection.Filter(visibleModelNames);
+        var firstModelPublications = FirstModelPublications(samples);
         var displayProjection = GroupDisplayProjection(
             rawDisplayProjection,
             visibleModelNames,
+            firstModelPublications,
             samples.Count,
             out var displayModelNames);
         var publishedModelNames = samples
@@ -621,13 +623,33 @@ public sealed class GraphScene
             idleIntervals,
             maximum,
             resetAt: resetAt,
-            hoverObservations: BuildHoverObservations(samples, points, allModelNames),
+            hoverObservations: BuildHoverObservations(samples, points, firstModelPublications),
             isVerifiedCurrentResetStart: isVerifiedCurrentResetStart);
+    }
+
+    private static IReadOnlyDictionary<string, int> FirstModelPublications(IReadOnlyList<ApiHistorySample> samples)
+    {
+        var firstPublications = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var index = 0; index < samples.Count; index++)
+        {
+            var sample = samples[index];
+            if (sample.IsSyntheticTail || sample.ModelSource is not
+                (ApiHistorySample.ConfirmedModelSource or ApiHistorySample.LegacyUnknownModelSource))
+            {
+                continue;
+            }
+            foreach (var model in PublishedModels(sample))
+            {
+                firstPublications.TryAdd(model.Name, index);
+            }
+        }
+        return firstPublications;
     }
 
     private static ModelProjection GroupDisplayProjection(
         ModelProjection source,
         IReadOnlyList<string> rawModelNames,
+        IReadOnlyDictionary<string, int> firstModelPublications,
         int sampleCount,
         out string[] displayModelNames)
     {
@@ -652,9 +674,15 @@ public sealed class GraphScene
             var groupOrigins = new GraphModelOrigin[sampleCount];
             for (var index = 0; index < sampleCount; index++)
             {
+                // A later first publication must not erase earlier family
+                // observations. This scopes display membership only; it does
+                // not fill absent raw model values with zero. Once published,
+                // a missing member retains the existing unknown/held rules.
+                var publishedMembers = members.Where(name =>
+                    firstModelPublications.TryGetValue(name, out var first) && first <= index).ToArray();
                 var total = 0d;
-                var complete = true;
-                foreach (var name in members)
+                var complete = publishedMembers.Length > 0;
+                foreach (var name in publishedMembers)
                 {
                     var value = source.Values[name][index];
                     if (!double.IsFinite(value) || value < 0)
@@ -671,9 +699,9 @@ public sealed class GraphScene
                 }
 
                 groupValues[index] = complete ? total : double.NaN;
-                groupReliability[index] = complete && members.All(name => source.Reliability[name][index]);
-                groupLineReliability[index] = complete && members.All(name => source.LineReliability[name][index]);
-                var memberOrigins = members.Select(name => source.Origins[name][index]).Distinct().ToArray();
+                groupReliability[index] = complete && publishedMembers.All(name => source.Reliability[name][index]);
+                groupLineReliability[index] = complete && publishedMembers.All(name => source.LineReliability[name][index]);
+                var memberOrigins = publishedMembers.Select(name => source.Origins[name][index]).Distinct().ToArray();
                 groupOrigins[index] = memberOrigins.Length == 1 ? memberOrigins[0] : GraphModelOrigin.Unknown;
             }
 
@@ -701,7 +729,7 @@ public sealed class GraphScene
     private static IReadOnlyList<GraphObservedSample> BuildHoverObservations(
         IReadOnlyList<ApiHistorySample> samples,
         IReadOnlyList<ScenePoint> points,
-        IReadOnlyList<string> allModelNames)
+        IReadOnlyDictionary<string, int> firstModelPublications)
     {
         var observations = new List<GraphObservedSample>(samples.Count);
         for (var index = 0; index < samples.Count; index++)
@@ -716,21 +744,23 @@ public sealed class GraphScene
                 sample.Timestamp,
                 sample.ResetAt,
                 index,
-                ObservedModelTokens(sample, allModelNames, "SOL"),
-                ObservedModelTokens(sample, allModelNames, "TERRA"),
-                ObservedModelTokens(sample, allModelNames, "LUNA"),
-                ObservedModelTokens(sample, allModelNames, "ASTRA")));
+                ObservedModelTokens(sample, firstModelPublications, index, "SOL"),
+                ObservedModelTokens(sample, firstModelPublications, index, "TERRA"),
+                ObservedModelTokens(sample, firstModelPublications, index, "LUNA"),
+                ObservedModelTokens(sample, firstModelPublications, index, "ASTRA")));
         }
         return observations;
     }
 
     private static ulong? ObservedModelTokens(
         ApiHistorySample sample,
-        IReadOnlyList<string> allModelNames,
+        IReadOnlyDictionary<string, int> firstModelPublications,
+        int sampleIndex,
         string modelName)
     {
-        var familyMembers = allModelNames
-            .Where(name => ModelUsageViewModel.DisplayFamilyName(name) == modelName)
+        var familyMembers = firstModelPublications
+            .Where(pair => pair.Value <= sampleIndex && ModelUsageViewModel.DisplayFamilyName(pair.Key) == modelName)
+            .Select(pair => pair.Key)
             .ToArray();
         if (familyMembers.Length == 0)
         {

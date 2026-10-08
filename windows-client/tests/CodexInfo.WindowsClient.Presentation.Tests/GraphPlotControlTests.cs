@@ -3677,6 +3677,59 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void Verified_current_reset_baseline_is_model_specific_when_other_model_is_missing()
+    {
+        const long periodStart = 1_200;
+        const long firstObservation = 1_260;
+        const long secondObservation = 1_320;
+
+        static ApiHistoryModelSample Model(string name, double dollars, ulong tokens) =>
+            new(name, null, null, null, dollars)
+            {
+                TotalTokens = tokens,
+            };
+
+        var samples = new[]
+        {
+            CompleteModelSample(firstObservation, 95, 1.5, 10) with
+            {
+                ModelSamples = [Model("SOL", 1.5, 10)],
+            },
+            CompleteModelSample(secondObservation, 94, 2.5, 20) with
+            {
+                ModelSamples = [Model("SOL", 2.5, 20), Model("ASTRA", 0.75, 5)],
+            },
+        };
+
+        GraphScene CreateScene(bool current) => GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            periodStart,
+            secondObservation,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: null,
+            resetAt: 2_000,
+            isVerifiedCurrentResetStart: current);
+
+        var currentScene = CreateScene(current: true);
+        Assert.False(currentScene.ModelVectorAvailable[0]);
+        var currentSol = GraphPlotProjection.BuildCanonicalModelLines(currentScene, currentScene.Sol).Rising.Line;
+        var currentStartIndex = Array.IndexOf(currentSol.X.ToArray(), periodStart);
+        var currentObservationIndex = Array.IndexOf(currentSol.X.ToArray(), firstObservation);
+        Assert.True(currentStartIndex >= 0);
+        Assert.True(currentObservationIndex >= 0);
+        Assert.Equal(0d, currentSol.Y[currentStartIndex]);
+        Assert.Equal(1.5d, currentSol.Y[currentObservationIndex], precision: 8);
+
+        var historicalScene = CreateScene(current: false);
+        var historicalSol = GraphPlotProjection.BuildCanonicalModelLines(
+            historicalScene,
+            historicalScene.Sol).Rising.Line;
+        Assert.DoesNotContain((double)periodStart, historicalSol.X);
+    }
+
+    [Fact]
     public void Period_start_equal_to_first_raw_observation_keeps_raw_point_without_synthetic_segment()
     {
         const long periodStart = 1_000;

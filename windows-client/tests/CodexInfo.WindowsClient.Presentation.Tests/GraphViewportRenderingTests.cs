@@ -828,18 +828,32 @@ public sealed class GraphViewportRenderingTests
         {
             var parameters = candidate.GetParameters();
             return candidate.Name == nameof(GraphScene.Create) &&
-                parameters.Length == 8 &&
-                parameters[^1].Name == "resetAt" &&
-                parameters[^1].ParameterType == typeof(long?);
+                parameters.Any(parameter =>
+                    parameter.Name == "resetAt" && parameter.ParameterType == typeof(long?));
         });
-        if (method is null)
+        Assert.NotNull(method);
+
+        var parameters = method.GetParameters();
+        var arguments = new object?[parameters.Length];
+        arguments[0] = samples;
+        arguments[1] = GraphMetric.Dollars;
+        arguments[2] = periodStartAt;
+        arguments[3] = periodEndAt;
+        for (var index = 4; index < parameters.Length; index++)
         {
-            return GraphScene.Create(samples, GraphMetric.Dollars, periodStartAt, periodEndAt);
+            var parameter = parameters[index];
+            arguments[index] = parameter.Name switch
+            {
+                "confirmedGaps" => null,
+                "hiddenModelNames" => null,
+                "accountOwnershipIntervals" => null,
+                "resetAt" => resetAt,
+                _ when parameter.HasDefaultValue => parameter.DefaultValue,
+                _ => null,
+            };
         }
 
-        return Assert.IsType<GraphScene>(method.Invoke(
-            null,
-            [samples, GraphMetric.Dollars, periodStartAt, periodEndAt, null, null, null, resetAt]));
+        return Assert.IsType<GraphScene>(method.Invoke(null, arguments));
     }
 
     private static bool GetViewportFlag(GraphScene scene)

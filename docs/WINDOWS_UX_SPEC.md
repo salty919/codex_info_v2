@@ -516,6 +516,8 @@ component順や表示所有者を変更しない。
   既知の不完全ASTRAが途中まで増加した後に確定値へ移る場合、左側の増加を消して最初の確定値だけを
   水平表示してはならない。開始・中間・終端値、線種、period ID、値表示（Linuxは右端ラベル、Windowsはホバー）を一つの表示candidateとして
   検証し、一項目でも不一致ならその表示を受入れない。
+  familyの表示・hoverは`G137-7`の時点別membershipを使い、後から追加された版名によってそれ以前の保存値を
+  消さない。一度掲載されたmemberの欠測・価格不明は0へ補完せず、rawの完全性やidle authorityも昇格させない。
 - X版とWindows版は`G137-1`..`G137-10`を参照する同一の履歴fixtureと固定期待値（period/pair、
   累積model、raw/effective Remaining、gap、metric別anomaly、partial/unavailable、未使用区間、期間末）を通過しなければならない。
   片方の描画ヘルパーが生成した値をもう片方の期待値には使用せず、fixtureのliteral oracleを独立に使う。

@@ -16675,6 +16675,10 @@ mod tests {
             .unwrap();
         store
             .connection
+            .execute("DROP TABLE session_token_anchor_recoveries", [])
+            .unwrap();
+        store
+            .connection
             .pragma_update(None, "user_version", 0)
             .unwrap();
         drop(store);
@@ -17778,6 +17782,7 @@ mod tests {
             .execute_batch(
                 "DROP TABLE session_task_events;
                  DROP TABLE session_task_indexed_ranges;
+                 DROP TABLE session_token_anchor_recoveries;
                  PRAGMA user_version = 7;",
             )
             .unwrap();
@@ -23318,7 +23323,7 @@ mod wave_b_correction_tests {
 
     #[test]
     fn issue_362_checkpoint_schema_accepts_only_supported_legacy_shapes() {
-        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
         const SHAPE_MATRIX: &[(usize, &[i64])] = &[
             (22, SUPPORTED_VERSIONS),
             (21, &[]),
