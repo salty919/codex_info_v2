@@ -101,6 +101,78 @@ public sealed class DetailsPresentationCoverageTests
         }
     }
 
+    [Fact]
+    public async Task GraphWindow_CurrentDataErrorIsVisibleWhilePlotIsRetainedAndClearsOnRecovery()
+    {
+        var period = CreateSmallPeriod("current", 2_050_000, 2_050_120, current: true, remaining: 80, token: 100);
+        var ready = CreateDetails([period], Array.Empty<ApiThreadDetails>());
+        var apiError = ready with { State = ApiState.Error, ObservedAt = ready.ObservedAt + 1 };
+        var recovered = ready with { ObservedAt = ready.ObservedAt + 4 };
+        var client = new SequenceCombinedClient(
+            DetailsFetchResult.Success(ready),
+            DetailsFetchResult.Success(apiError),
+            DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport),
+            DetailsFetchResult.FromFailure(DetailsFetchFailure.Response),
+            DetailsFetchResult.Success(recovered));
+        using var main = new MainWindowViewModel(client);
+
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
+        using var graph = new GraphWindowViewModel(main);
+        await EventuallyAsync(() => graph.HasPoints && !graph.IsLoading);
+
+        var acceptedPointCount = graph.Points.Count;
+        var acceptedPeriodId = graph.SelectedPeriod?.Id;
+        var statusNotifications = 0;
+        graph.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(GraphWindowViewModel.DetailsStatusText))
+            {
+                statusNotifications++;
+            }
+        };
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot?.State == ApiState.Error);
+
+        Assert.Equal("error", main.DetailsStatusAutomationText);
+        Assert.Contains(main.Texts.ApiErrorSnapshotNotice, graph.DetailsStatusText, StringComparison.Ordinal);
+        Assert.True(graph.HasPoints);
+        Assert.False(graph.HasBlockingLoadError);
+        Assert.Equal(acceptedPointCount, graph.Points.Count);
+        Assert.Equal(acceptedPeriodId, graph.SelectedPeriod?.Id);
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => graph.DetailsStatusText.Contains(main.Texts.TransportError, StringComparison.Ordinal));
+
+        Assert.Equal(main.DetailsStatusText, graph.DetailsStatusText);
+        Assert.True(graph.HasPoints);
+        Assert.False(graph.HasBlockingLoadError);
+        Assert.Equal(acceptedPointCount, graph.Points.Count);
+
+        main.RefreshCommand.Execute(null);
+        var responseErrorText = main.Texts.LanguageCode == "ja"
+            ? "詳細データ: 前回値を表示（応答エラー）"
+            : $"{main.Texts.Details}: {main.Texts.Unavailable} ({main.Texts.ApiError})";
+        await EventuallyAsync(() => graph.DetailsStatusText == responseErrorText);
+
+        Assert.Equal("error", main.DetailsStatusAutomationText);
+        Assert.True(graph.HasPoints);
+        Assert.False(graph.HasBlockingLoadError);
+        Assert.Equal(acceptedPointCount, graph.Points.Count);
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot?.ObservedAt == recovered.ObservedAt);
+
+        Assert.Equal("ready", main.DetailsStatusAutomationText);
+        Assert.Contains(main.Texts.Latest, graph.DetailsStatusText, StringComparison.Ordinal);
+        Assert.True(graph.HasPoints);
+        Assert.False(graph.HasBlockingLoadError);
+        Assert.Equal(acceptedPointCount, graph.Points.Count);
+        Assert.Equal(acceptedPeriodId, graph.SelectedPeriod?.Id);
+        Assert.True(statusNotifications >= 4);
+    }
+
     [Theory]
     [InlineData(GraphMetric.Tokens)]
     [InlineData(GraphMetric.Dollars)]
@@ -402,6 +474,489 @@ public sealed class DetailsPresentationCoverageTests
         Assert.False(graph.HasLoadError);
         Assert.Contains(graph.Points, point => point.Timestamp == firstSample.Timestamp && point.SolValue == 1);
         Assert.Contains(graph.Points, point => point.Timestamp == secondSample.Timestamp && point.SolValue == 20);
+    }
+
+    [Fact]
+    public async Task GraphWindow_MainQuotaBoundaryChangeRefreshesAndFollowsCurrentWithoutStaleOverwrite()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        const long windowSeconds = 7 * 24 * 60 * 60;
+        var oldResetAt = now + 300;
+        var newResetAt = oldResetAt + windowSeconds;
+        var oldCurrent = CreateSmallPeriod(
+            "old-current",
+            oldResetAt - windowSeconds,
+            oldResetAt,
+            current: true,
+            remaining: 80,
+            token: 100);
+        var historical = CreateSmallPeriod(
+            "historical",
+            oldResetAt - 2 * windowSeconds,
+            oldResetAt - windowSeconds,
+            current: false,
+            remaining: 70,
+            token: 50);
+        var newCurrent = CreateSmallPeriod(
+            "new-current",
+            oldResetAt,
+            newResetAt,
+            current: true,
+            remaining: 95,
+            token: 300);
+        var firstPair = PublishedPairIdentity.Create($"v1:{new string('f', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"v1:{new string('a', 64)}");
+        var initialDetails = CreateDetails([oldCurrent, historical], Array.Empty<ApiThreadDetails>()) with
+        {
+            Quota = new ApiQuota(80, oldResetAt, windowSeconds, false),
+            PublishedPair = firstPair,
+        };
+        var resetDetails = initialDetails with
+        {
+            ObservedAt = initialDetails.ObservedAt + 1,
+            Quota = new ApiQuota(100, newResetAt, windowSeconds, false),
+            PublishedPair = nextPair,
+        };
+        var staleOldSamples = oldCurrent.Samples
+            .Select((sample, index) => sample with
+            {
+                SolTokens = (ulong)(200 + index * 10),
+            })
+            .ToArray();
+        var resourceClient = new DeferredQuotaBoundaryHistoryResourceClient(
+            initialDetails,
+            resetDetails,
+            oldCurrent,
+            historical,
+            newCurrent,
+            staleOldSamples,
+            firstPair,
+            nextPair);
+        using var main = new MainWindowViewModel(resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+        Assert.Equal(oldCurrent.Id, graph.SelectedPeriod?.Id);
+        var acceptedOldScene = graph.Scene;
+        Assert.Contains(graph.Points, point => point.Timestamp == oldCurrent.Samples[1].Timestamp && point.SolValue == 110);
+
+        var inFlightOldRefresh = StartGraphResourceRefresh(graph, oldCurrent.Id);
+        await EventuallyAsync(() => resourceClient.SecondOldPageStarted);
+
+        Assert.True(main.CanRefresh);
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot is { Quota.ResetAt: var observedResetAt } &&
+            observedResetAt == newResetAt);
+        resourceClient.ReleaseSecondOldPage();
+        await inFlightOldRefresh;
+        var currentPageStarted = resourceClient.NewCurrentPageStartedSignal;
+        Assert.True(
+            await Task.WhenAny(currentPageStarted, Task.Delay(TimeSpan.FromSeconds(5))) == currentPageStarted,
+            "A Main quota reset/window change must trigger a current-period refresh without waiting for the timer.");
+
+        while (pendingUi.TryDequeue(out var action))
+        {
+            action();
+        }
+
+        Assert.Same(acceptedOldScene, graph.Scene);
+        Assert.Equal(oldCurrent.Id, graph.SelectedPeriod?.Id);
+
+        resourceClient.ReleaseNewCurrentPage();
+        await PumpUiUntilAsync(
+            pendingUi,
+            () => !graph.IsLoading && graph.SelectedPeriod?.Id == newCurrent.Id);
+
+        Assert.Equal(newCurrent.Id, graph.SelectedPeriod?.Id);
+        Assert.Contains(graph.Periods, period => period.Id == newCurrent.Id && period.Current);
+        Assert.Contains(graph.Points, point => point.Timestamp == newCurrent.Samples[1].Timestamp && point.SolValue == 310);
+        Assert.Equal(3, resourceClient.HistoryPeriodsCalls);
+        Assert.Equal(3, resourceClient.HistoryPageCalls);
+    }
+
+    [Fact]
+    public async Task GraphWindow_QuotaBoundaryDuringPendingWindowRequestRestartsLatestRangeAndFencesOldCandidate()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        const long windowSeconds = 7 * 24 * 60 * 60;
+        var oldResetAt = now - 60;
+        var newResetAt = oldResetAt + windowSeconds;
+        var oldCurrent = CreateSmallPeriod(
+            "window-old-current",
+            oldResetAt - windowSeconds,
+            oldResetAt,
+            current: true,
+            remaining: 80,
+            token: 100);
+        var historical = CreateSmallPeriod(
+            "window-historical",
+            oldResetAt - 2 * windowSeconds,
+            oldResetAt - windowSeconds,
+            current: false,
+            remaining: 70,
+            token: 50);
+        var newCurrent = CreateSmallPeriod(
+            "window-new-current",
+            oldResetAt,
+            newResetAt,
+            current: true,
+            remaining: 95,
+            token: 300);
+        var firstPair = PublishedPairIdentity.Create($"v1:{new string('7', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"v1:{new string('8', 64)}");
+        var initialDetails = CreateDetails([oldCurrent, historical], Array.Empty<ApiThreadDetails>()) with
+        {
+            Quota = new ApiQuota(80, oldResetAt, windowSeconds, false),
+            PublishedPair = firstPair,
+        };
+        var resetDetails = initialDetails with
+        {
+            ObservedAt = initialDetails.ObservedAt + 1,
+            Quota = new ApiQuota(100, newResetAt, windowSeconds, false),
+            PublishedPair = nextPair,
+        };
+        var staleOldSamples = oldCurrent.Samples
+            .Select((sample, index) => sample with
+            {
+                SolTokens = (ulong)(800 + index * 10),
+            })
+            .ToArray();
+        var resourceClient = new DeferredWindowQuotaBoundaryHistoryResourceClient(
+            initialDetails,
+            resetDetails,
+            oldCurrent,
+            historical,
+            newCurrent,
+            staleOldSamples,
+            firstPair,
+            nextPair);
+        using var main = new MainWindowViewModel(resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+        var acceptedResetScene = graph.Scene;
+        Assert.Equal(oldCurrent.Id, graph.SelectedPeriod?.Id);
+
+        graph.SelectedTimeRange = GraphTimeRange.Last24Hours;
+        await EventuallyAsync(() => resourceClient.PendingOldWindowPageStarted);
+
+        Assert.True(main.CanRefresh);
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot is { Quota.ResetAt: var observedResetAt } &&
+            observedResetAt == newResetAt);
+
+        resourceClient.ReleasePendingOldWindowPage();
+        await PumpUiUntilAsync(
+            pendingUi,
+            () => resourceClient.NewCurrentPageStarted || !graph.IsLoading);
+        Assert.True(
+            resourceClient.NewCurrentPageStarted,
+            "A quota boundary must invalidate the pending window candidate and refetch the latest user range against the new current period.");
+        Assert.Same(acceptedResetScene, graph.Scene);
+        Assert.Equal(GraphTimeRange.ResetPeriod, graph.SelectedTimeRange);
+
+        resourceClient.ReleaseNewCurrentPage();
+        await PumpUiUntilAsync(
+            pendingUi,
+            () => graph.SelectedTimeRange == GraphTimeRange.Last24Hours &&
+                graph.Points.Any(point => point.Timestamp == newCurrent.Samples[0].Timestamp && point.SolValue == 300));
+
+        Assert.Equal(GraphTimeRange.Last24Hours, graph.SelectedTimeRange);
+        Assert.Contains(graph.Points, point =>
+            point.Timestamp == newCurrent.Samples[1].Timestamp && point.SolValue == 310);
+        Assert.Equal(3, resourceClient.HistoryPeriodsCalls);
+        Assert.Equal(4, resourceClient.HistoryPageCalls);
+    }
+
+    [Fact]
+    public async Task GraphWindow_ManualHistoricalSelectionSurvivesMainQuotaBoundaryChange()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        const long windowSeconds = 7 * 24 * 60 * 60;
+        var oldResetAt = now + 300;
+        var newResetAt = oldResetAt + windowSeconds;
+        var oldCurrent = CreateSmallPeriod("old-current", oldResetAt - windowSeconds, oldResetAt, true, 80, 100);
+        var historical = CreateSmallPeriod("historical", oldResetAt - 2 * windowSeconds, oldResetAt - windowSeconds, false, 70, 50);
+        var newCurrent = CreateSmallPeriod("new-current", oldResetAt, newResetAt, true, 95, 300);
+        var firstPair = PublishedPairIdentity.Create($"v1:{new string('b', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"v1:{new string('c', 64)}");
+        var initialDetails = CreateDetails([oldCurrent, historical], Array.Empty<ApiThreadDetails>()) with
+        {
+            Quota = new ApiQuota(80, oldResetAt, windowSeconds, false),
+            PublishedPair = firstPair,
+        };
+        var resetDetails = initialDetails with
+        {
+            ObservedAt = initialDetails.ObservedAt + 1,
+            Quota = new ApiQuota(100, newResetAt, windowSeconds, false),
+            PublishedPair = nextPair,
+        };
+        var periodSnapshots = new[]
+        {
+            new ApiHistoryPeriodsSnapshot([oldCurrent, historical], firstPair),
+            new ApiHistoryPeriodsSnapshot([oldCurrent, historical], firstPair),
+            new ApiHistoryPeriodsSnapshot([newCurrent, oldCurrent with { Current = false }, historical], nextPair),
+        };
+        var resourceClient = new SequencedHistoryResourceClient(
+            [initialDetails, resetDetails],
+            periodSnapshots,
+            new Dictionary<string, IReadOnlyList<ApiHistorySample>>(StringComparer.Ordinal)
+            {
+                [oldCurrent.Id] = oldCurrent.Samples,
+                [historical.Id] = historical.Samples,
+                [newCurrent.Id] = newCurrent.Samples,
+            });
+        using var main = new MainWindowViewModel(resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+        graph.SelectedPeriod = Assert.Single(graph.Periods, period => period.Id == historical.Id);
+        await PumpUiUntilAsync(
+            pendingUi,
+            () => !graph.IsLoading && graph.SelectedPeriod?.Id == historical.Id);
+
+        Assert.True(main.CanRefresh);
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot is { Quota.ResetAt: var observedResetAt } &&
+            observedResetAt == newResetAt);
+        var directoryRefreshStarted = resourceClient.ThirdHistoryPeriodsCallStarted;
+        Assert.True(
+            await Task.WhenAny(directoryRefreshStarted, Task.Delay(TimeSpan.FromSeconds(5))) == directoryRefreshStarted,
+            "A Main quota boundary must refresh the current-period directory even while a past period is selected.");
+        await PumpUiUntilAsync(
+            pendingUi,
+            () => !graph.IsLoading && graph.SelectedPeriod?.Id == historical.Id &&
+                graph.Periods.Any(period => period.Id == newCurrent.Id));
+
+        Assert.Equal(historical.Id, graph.SelectedPeriod?.Id);
+        Assert.Contains(graph.Periods, period => period.Id == newCurrent.Id && period.Current);
+        Assert.Contains(graph.Points, point => point.Timestamp == historical.Samples[1].Timestamp && point.SolValue == 60);
+        Assert.Equal(3, resourceClient.HistoryPeriodsCalls);
+    }
+
+    [Fact]
+    public async Task GraphWindow_SameQuotaPairAdvanceDoesNotTriggerBoundaryRefresh()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        const long windowSeconds = 7 * 24 * 60 * 60;
+        var resetAt = now + 300;
+        var current = CreateSmallPeriod("current", resetAt - windowSeconds, resetAt, true, 80, 100);
+        var firstPair = PublishedPairIdentity.Create($"v1:{new string('d', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"v1:{new string('e', 64)}");
+        var initialDetails = CreateDetails([current], Array.Empty<ApiThreadDetails>()) with
+        {
+            Quota = new ApiQuota(80, resetAt, windowSeconds, false),
+            PublishedPair = firstPair,
+        };
+        var pairOnlyAdvance = initialDetails with
+        {
+            ObservedAt = initialDetails.ObservedAt + 1,
+            PublishedPair = nextPair,
+        };
+        var resourceClient = new SequencedHistoryResourceClient(
+            [initialDetails, pairOnlyAdvance],
+            [new ApiHistoryPeriodsSnapshot([current], firstPair)],
+            new Dictionary<string, IReadOnlyList<ApiHistorySample>>(StringComparer.Ordinal)
+            {
+                [current.Id] = current.Samples,
+            });
+        using var main = new MainWindowViewModel(resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+        Assert.Equal(1, resourceClient.HistoryPeriodsCalls);
+        Assert.Equal(1, resourceClient.HistoryPageCalls);
+
+        Assert.True(main.CanRefresh);
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot is { PublishedPair: var observedPair } &&
+            observedPair == nextPair);
+        await Task.Delay(100);
+
+        var acceptedDetails = Assert.IsType<ApiDetailsSnapshot>(main.DetailsSnapshot);
+        Assert.Equal(resetAt, acceptedDetails.Quota?.ResetAt);
+        Assert.Equal(windowSeconds, acceptedDetails.Quota?.WindowSeconds);
+        Assert.Equal(1, resourceClient.HistoryPeriodsCalls);
+        Assert.Equal(1, resourceClient.HistoryPageCalls);
+        Assert.Equal(current.Id, graph.SelectedPeriod?.Id);
+    }
+
+    [Fact]
+    public async Task GraphWindow_VerifiedCurrentResetBaselineConnectsZeroAndFullQuotaToFirstNonzero95Percent()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        const long start = 1_800_000_000;
+        const long firstObservation = start + 60;
+        const long end = start + 3_600;
+        var period = CreateSingleAstraPeriod("current", start, end, current: true, firstObservation, 95, 257, 42.5);
+        var details = CreateDetails([period], Array.Empty<ApiThreadDetails>()) with
+        {
+            Quota = new ApiQuota(95, end, end - start, false),
+            ObservedAt = now,
+        };
+        var pair = PublishedPairIdentity.Create($"v1:{new string('1', 64)}");
+        var resourceClient = new CountingHistoryResourceClient(details, period, pair);
+        using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+
+        var geometry = GraphPlotProjection.PrepareGeometry(graph.Scene);
+        var model = geometry.ModelLines[GraphSeries.Astra].Rising.Line;
+        var quota = geometry.RemainingLines;
+        Assert.Contains((double)start, model.X);
+        Assert.Equal(0d, model.Y[Array.IndexOf(model.X.ToArray(), start)]);
+        Assert.InRange(model.X.Max(), firstObservation - 4d, firstObservation + 4d);
+        Assert.InRange(model.Y[^1], 256d, 258d);
+        Assert.Contains((double)start, quota.Solid.Line.X);
+        Assert.Equal(100d, quota.Solid.Line.Y[Array.IndexOf(quota.Solid.Line.X.ToArray(), start)]);
+        Assert.InRange(quota.Solid.Line.X.Max(), firstObservation - 4d, firstObservation + 4d);
+        Assert.InRange(quota.Solid.Line.Y[^1], 94.9d, 95.1d);
+        Assert.DoesNotContain((double)start, quota.Dashed.Line.X);
+        Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
+        Assert.Single(graph.Scene.HoverObservations);
+        Assert.Equal(firstObservation, graph.Scene.HoverObservations[0].Timestamp);
+        Assert.Contains(95d, graph.Scene.ObservedRemainingValues);
+        Assert.DoesNotContain(100d, graph.Scene.ObservedRemainingValues);
+        Assert.Contains(257d, graph.Scene.Astra);
+        Assert.DoesNotContain(0d, graph.Scene.Astra);
+    }
+
+    [Fact]
+    public async Task GraphWindow_VerifiedCurrentResetBaselineConnectsObservedZeroWithoutAddingRawBaselineRows()
+    {
+        const long start = 1_805_000_000;
+        const long firstObservation = start + 60;
+        const long end = start + 3_600;
+        var period = CreateSingleAstraPeriod("current-zero", start, end, current: true, firstObservation, 100, 0, 0);
+        var details = CreateDetails([period], Array.Empty<ApiThreadDetails>()) with
+        {
+            Quota = new ApiQuota(100, end, end - start, false),
+        };
+        var pair = PublishedPairIdentity.Create($"v1:{new string('5', 64)}");
+        var resourceClient = new CountingHistoryResourceClient(details, period, pair);
+        using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+
+        var geometry = GraphPlotProjection.PrepareGeometry(graph.Scene);
+        var model = geometry.ModelLines[GraphSeries.Astra].Flat.Line;
+        var quota = geometry.RemainingLines.Solid.Line;
+        Assert.Contains((double)start, model.X);
+        Assert.All(model.Y.Where(double.IsFinite), value => Assert.Equal(0d, value));
+        Assert.InRange(model.X.Max(), firstObservation - 4d, firstObservation + 4d);
+        Assert.Contains((double)start, quota.X);
+        Assert.All(quota.Y.Where(double.IsFinite), value => Assert.Equal(100d, value));
+        Assert.InRange(quota.X.Max(), firstObservation - 4d, firstObservation + 4d);
+        Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
+        Assert.Single(graph.Scene.HoverObservations);
+        Assert.Equal(firstObservation, graph.Scene.HoverObservations[0].Timestamp);
+        Assert.Contains(0d, graph.Scene.Astra);
+        Assert.Contains(100d, graph.Scene.ObservedRemainingValues);
+    }
+
+    [Fact]
+    public async Task GraphWindow_VerifiedCurrentResetBaselineSupportsLateFirstObservationWithoutRawZeroHundred()
+    {
+        const long start = 1_810_000_000;
+        const long firstObservation = start + 300;
+        const long end = start + 3_600;
+        var period = CreateSingleAstraPeriod("late-current", start, end, current: true, firstObservation, 95, 257, 42.5);
+        var details = CreateDetails([period], Array.Empty<ApiThreadDetails>()) with
+        {
+            Quota = new ApiQuota(95, end, end - start, false),
+        };
+        var pair = PublishedPairIdentity.Create($"v1:{new string('2', 64)}");
+        var resourceClient = new CountingHistoryResourceClient(details, period, pair);
+        using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+
+        var geometry = GraphPlotProjection.PrepareGeometry(graph.Scene);
+        var model = geometry.ModelLines[GraphSeries.Astra].Rising.Line;
+        var quota = geometry.RemainingLines.Solid.Line;
+        Assert.Contains((double)start, model.X);
+        Assert.InRange(model.X.Max(), firstObservation - 4d, firstObservation + 4d);
+        Assert.Contains((double)start, quota.X);
+        Assert.InRange(quota.X.Max(), firstObservation - 4d, firstObservation + 4d);
+        Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
+        Assert.Single(graph.Scene.HoverObservations);
+        Assert.Equal(firstObservation, graph.Scene.HoverObservations[0].Timestamp);
+        Assert.DoesNotContain(0d, graph.Scene.Astra);
+        Assert.DoesNotContain(100d, graph.Scene.ObservedRemainingValues);
+    }
+
+    [Fact]
+    public async Task GraphWindow_HistoricalAndUnknownPeriodsHaveNoResetStartBaseline()
+    {
+        const long start = 1_820_000_000;
+        const long firstObservation = start + 300;
+        const long end = start + 3_600;
+        var period = CreateSingleAstraPeriod("historical", start, end, current: false, firstObservation, 95, 257, 42.5);
+        var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
+        var pair = PublishedPairIdentity.Create($"v1:{new string('3', 64)}");
+        var resourceClient = new CountingHistoryResourceClient(details, period, pair);
+        using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+
+        var geometry = GraphPlotProjection.PrepareGeometry(graph.Scene);
+        Assert.DoesNotContain((double)start, geometry.ModelLines[GraphSeries.Astra].Rising.Line.X);
+        Assert.DoesNotContain((double)start, geometry.RemainingLines.Solid.Line.X);
+        Assert.DoesNotContain((double)start, geometry.RemainingLines.Dashed.Line.X);
+        Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
+        Assert.Single(graph.Scene.HoverObservations);
+    }
+
+    [Fact]
+    public async Task GraphWindow_WindowViewportStartDoesNotBecomeResetBaseline()
+    {
+        const long start = 1_830_000_000;
+        const long firstObservation = start + 300;
+        const long viewportStart = start + 60;
+        const long end = start + 3_600;
+        var period = CreateSingleAstraPeriod("current-window", start, end, current: true, firstObservation, 95, 257, 42.5);
+        var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
+        var pair = PublishedPairIdentity.Create($"v1:{new string('4', 64)}");
+        var resourceClient = new CountingHistoryResourceClient(details, period, pair);
+        using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+
+        var viewport = GraphScene.CreateViewport(viewportStart, end, GraphMetric.Tokens, [graph.Scene]);
+        var model = GraphPlotProjection.BuildViewportModelLines(viewport, GraphSeries.Astra).Rising.Line;
+        var remaining = GraphPlotProjection.BuildViewportRemainingLines(viewport).Solid.Line;
+
+        Assert.Contains((double)viewportStart, model.X);
+        var modelStartIndex = model.X.ToList().IndexOf(viewportStart);
+        Assert.True(model.Y[modelStartIndex] > 0d);
+        Assert.Contains((double)viewportStart, remaining.X);
+        var remainingStartIndex = remaining.X.ToList().IndexOf(viewportStart);
+        Assert.InRange(remaining.Y[remainingStartIndex], 95d, 100d);
+        Assert.True(remaining.Y[remainingStartIndex] < 100d);
+        Assert.DoesNotContain((double)viewportStart, graph.Scene.Timestamps);
+        Assert.DoesNotContain(100d, graph.Scene.ObservedRemainingValues);
     }
 
     [Fact]
@@ -814,6 +1369,22 @@ public sealed class DetailsPresentationCoverageTests
         };
     }
 
+    private static ApiCurrentSnapshot ToCurrentSnapshot(ApiDetailsSnapshot details) =>
+        new(
+            details.State,
+            details.ObservedAt,
+            details.Authenticated,
+            details.PlanLabel,
+            details.Quota,
+            details.Models,
+            details.ActiveThreadCount,
+            details.PublishedPair ?? default)
+        {
+            OpenSessionThreadCount = details.OpenSessionThreadCount,
+            ApiVersion = details.ApiVersion,
+            AccountId = details.AccountId,
+        };
+
     private static string LoadRepositoryFile(params string[] segments)
     {
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
@@ -848,6 +1419,44 @@ public sealed class DetailsPresentationCoverageTests
                 new ApiHistorySample(start + 1, end, remaining, 1, 2, 3, (ulong)token, (ulong)token + 1, (ulong)token + 2),
                 new ApiHistorySample(start + 60, end, remaining - 1, 2, 3, 4, (ulong)token + 10, (ulong)token + 11, (ulong)token + 12),
             ],
+        };
+    }
+
+    private static ApiHistoryPeriod CreateSingleAstraPeriod(
+        string id,
+        long start,
+        long end,
+        bool current,
+        long timestamp,
+        double remaining,
+        ulong tokens,
+        double dollars)
+    {
+        var sample = new ApiHistorySample(
+            timestamp,
+            end,
+            remaining,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            ApiHistorySample.ConfirmedModelSource)
+        {
+            ModelsComplete = true,
+            ModelSamples =
+            [
+                new ApiHistoryModelSample("ASTRA", null, null, null, dollars)
+                {
+                    TotalTokens = tokens,
+                },
+            ],
+        };
+        return new ApiHistoryPeriod(id, start, end, current, id)
+        {
+            ResetAt = end,
+            Samples = [sample],
         };
     }
 
@@ -920,14 +1529,18 @@ public sealed class DetailsPresentationCoverageTests
 
     private static async Task RefreshGraphResourceAsync(GraphWindowViewModel graph, string periodId)
     {
+        await StartGraphResourceRefresh(graph, periodId);
+    }
+
+    private static Task StartGraphResourceRefresh(GraphWindowViewModel graph, string periodId)
+    {
         var method = typeof(GraphWindowViewModel).GetMethod(
             "RefreshSplitResourceAsync",
             BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(method);
-        var task = Assert.IsAssignableFrom<Task>(method!.Invoke(
+        return Assert.IsAssignableFrom<Task>(method!.Invoke(
             graph,
             [false, periodId, CancellationToken.None]));
-        await task;
     }
 
     private sealed class StaticCombinedClient(DetailsFetchResult result) : HealthyDetailsClientBase
@@ -936,10 +1549,319 @@ public sealed class DetailsPresentationCoverageTests
             Task.FromResult(result);
     }
 
+    private sealed class SequenceCombinedClient(params DetailsFetchResult[] results) : HealthyDetailsClientBase
+    {
+        private int calls;
+
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
+        {
+            var index = Math.Min(Interlocked.Increment(ref calls) - 1, results.Length - 1);
+            return Task.FromResult(results[index]);
+        }
+    }
+
     private sealed class StaticDetailsClient(DetailsFetchResult result) : ILoopbackDetailsClient
     {
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
+    }
+
+    private sealed class SequencedHistoryResourceClient(
+        IReadOnlyList<ApiDetailsSnapshot> detailSnapshots,
+        IReadOnlyList<ApiHistoryPeriodsSnapshot> periodSnapshots,
+        IReadOnlyDictionary<string, IReadOnlyList<ApiHistorySample>> samplesByPeriod)
+        : HealthyDetailsClientBase, ILoopbackResourceClient
+    {
+        private readonly TaskCompletionSource thirdHistoryPeriodsCall =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int currentCalls;
+        private int historyPeriodsCalls;
+        private int historyPageCalls;
+
+        public int HistoryPeriodsCalls => Volatile.Read(ref historyPeriodsCalls);
+
+        public int HistoryPageCalls => Volatile.Read(ref historyPageCalls);
+
+        public Task ThirdHistoryPeriodsCallStarted => thirdHistoryPeriodsCall.Task;
+
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
+            CancellationToken cancellationToken = default)
+            => throw new InvalidOperationException("Main must use the split current resource in this fixture.");
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default)
+        {
+            var index = Math.Min(Interlocked.Increment(ref currentCalls) - 1, detailSnapshots.Count - 1);
+            return Task.FromResult(CurrentFetchResult.Success(ToCurrentSnapshot(detailSnapshots[index])));
+        }
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default)
+        {
+            var index = Math.Min(Interlocked.Increment(ref historyPeriodsCalls) - 1, periodSnapshots.Count - 1);
+            if (index >= 2)
+            {
+                thirdHistoryPeriodsCall.TrySetResult();
+            }
+            return Task.FromResult(HistoryPeriodsFetchResult.Success(periodSnapshots[index]));
+        }
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref historyPageCalls);
+            var snapshotIndex = Math.Min(Volatile.Read(ref historyPeriodsCalls) - 1, periodSnapshots.Count - 1);
+            var pair = periodSnapshots[snapshotIndex].PublishedPair;
+            var samples = samplesByPeriod.TryGetValue(periodId, out var periodSamples)
+                ? periodSamples
+                : Array.Empty<ApiHistorySample>();
+            return Task.FromResult(HistoryPageFetchResult.Success(new ApiHistoryPage(
+                periodId,
+                samples,
+                Array.Empty<ApiHistoryGap>(),
+                NextCursor: null,
+                ResumeCursor: null,
+                pair)));
+        }
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Threads are outside this graph regression test.");
+    }
+
+    private sealed class DeferredWindowQuotaBoundaryHistoryResourceClient(
+        ApiDetailsSnapshot initialDetails,
+        ApiDetailsSnapshot resetDetails,
+        ApiHistoryPeriod oldCurrent,
+        ApiHistoryPeriod historical,
+        ApiHistoryPeriod newCurrent,
+        IReadOnlyList<ApiHistorySample> staleOldSamples,
+        PublishedPairIdentity firstPair,
+        PublishedPairIdentity nextPair)
+        : HealthyDetailsClientBase, ILoopbackResourceClient
+    {
+        private readonly TaskCompletionSource pendingOldWindowPageStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource releasePendingOldWindowPage =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource newCurrentPageStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource releaseNewCurrentPage =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int currentCalls;
+        private int historyPeriodsCalls;
+        private int historyPageCalls;
+        private int oldCurrentPageCalls;
+
+        public int HistoryPeriodsCalls => Volatile.Read(ref historyPeriodsCalls);
+
+        public int HistoryPageCalls => Volatile.Read(ref historyPageCalls);
+
+        public bool PendingOldWindowPageStarted => pendingOldWindowPageStarted.Task.IsCompleted;
+
+        public bool NewCurrentPageStarted => newCurrentPageStarted.Task.IsCompleted;
+
+        public void ReleasePendingOldWindowPage() => releasePendingOldWindowPage.TrySetResult();
+
+        public void ReleaseNewCurrentPage() => releaseNewCurrentPage.TrySetResult();
+
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
+            CancellationToken cancellationToken = default)
+            => throw new InvalidOperationException("Main must use the split current resource in this fixture.");
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default)
+        {
+            var snapshot = Interlocked.Increment(ref currentCalls) == 1 ? initialDetails : resetDetails;
+            return Task.FromResult(CurrentFetchResult.Success(ToCurrentSnapshot(snapshot)));
+        }
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default)
+        {
+            var call = Interlocked.Increment(ref historyPeriodsCalls);
+            var periods = call < 3
+                ? new[] { oldCurrent, historical }
+                : new[] { newCurrent, oldCurrent with { Current = false }, historical };
+            var pair = call < 3 ? firstPair : nextPair;
+            return Task.FromResult(HistoryPeriodsFetchResult.Success(
+                new ApiHistoryPeriodsSnapshot(periods, pair)));
+        }
+
+        public async Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref historyPageCalls);
+            IReadOnlyList<ApiHistorySample> samples;
+            PublishedPairIdentity pair;
+            if (periodId == oldCurrent.Id)
+            {
+                var oldCall = Interlocked.Increment(ref oldCurrentPageCalls);
+                if (oldCall == 1)
+                {
+                    samples = oldCurrent.Samples;
+                    pair = firstPair;
+                }
+                else if (oldCall == 2)
+                {
+                    pendingOldWindowPageStarted.TrySetResult();
+                    // Deliberately return after cancellation so the test proves
+                    // that publication fencing, not transport cooperation,
+                    // rejects this old generation.
+                    await releasePendingOldWindowPage.Task;
+                    samples = staleOldSamples;
+                    pair = firstPair;
+                }
+                else
+                {
+                    samples = staleOldSamples;
+                    pair = nextPair;
+                }
+            }
+            else if (periodId == newCurrent.Id)
+            {
+                newCurrentPageStarted.TrySetResult();
+                await releaseNewCurrentPage.Task;
+                samples = newCurrent.Samples;
+                pair = nextPair;
+            }
+            else if (periodId == historical.Id)
+            {
+                samples = historical.Samples;
+                pair = Volatile.Read(ref historyPeriodsCalls) < 3 ? firstPair : nextPair;
+            }
+            else
+            {
+                return HistoryPageFetchResult.FromFailure(DetailsFetchFailure.Response);
+            }
+
+            return HistoryPageFetchResult.Success(new ApiHistoryPage(
+                periodId,
+                samples,
+                Array.Empty<ApiHistoryGap>(),
+                NextCursor: null,
+                ResumeCursor: null,
+                pair));
+        }
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Threads are outside this graph regression test.");
+    }
+
+    private sealed class DeferredQuotaBoundaryHistoryResourceClient(
+        ApiDetailsSnapshot initialDetails,
+        ApiDetailsSnapshot resetDetails,
+        ApiHistoryPeriod oldCurrent,
+        ApiHistoryPeriod historical,
+        ApiHistoryPeriod newCurrent,
+        IReadOnlyList<ApiHistorySample> staleOldSamples,
+        PublishedPairIdentity firstPair,
+        PublishedPairIdentity nextPair)
+        : HealthyDetailsClientBase, ILoopbackResourceClient
+    {
+        private readonly TaskCompletionSource secondOldPageStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource releaseSecondOldPage =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource newCurrentPageStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource releaseNewCurrentPage =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int currentCalls;
+        private int historyPeriodsCalls;
+        private int historyPageCalls;
+        private int oldPageCalls;
+
+        public int HistoryPeriodsCalls => Volatile.Read(ref historyPeriodsCalls);
+
+        public int HistoryPageCalls => Volatile.Read(ref historyPageCalls);
+
+        public bool SecondOldPageStarted => secondOldPageStarted.Task.IsCompleted;
+
+        public Task NewCurrentPageStartedSignal => newCurrentPageStarted.Task;
+
+        public void ReleaseSecondOldPage() => releaseSecondOldPage.TrySetResult();
+
+        public void ReleaseNewCurrentPage() => releaseNewCurrentPage.TrySetResult();
+
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
+            CancellationToken cancellationToken = default)
+            => throw new InvalidOperationException("Main must use the split current resource in this fixture.");
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default)
+        {
+            var snapshot = Interlocked.Increment(ref currentCalls) == 1 ? initialDetails : resetDetails;
+            return Task.FromResult(CurrentFetchResult.Success(ToCurrentSnapshot(snapshot)));
+        }
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default)
+        {
+            var call = Interlocked.Increment(ref historyPeriodsCalls);
+            var periods = call < 3
+                ? new[] { oldCurrent, historical }
+                : new[] { newCurrent, oldCurrent with { Current = false }, historical };
+            var pair = call < 3 ? firstPair : nextPair;
+            return Task.FromResult(HistoryPeriodsFetchResult.Success(
+                new ApiHistoryPeriodsSnapshot(periods, pair)));
+        }
+
+        public async Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref historyPageCalls);
+            IReadOnlyList<ApiHistorySample> samples;
+            PublishedPairIdentity pair;
+            if (periodId == oldCurrent.Id)
+            {
+                var oldCall = Interlocked.Increment(ref oldPageCalls);
+                if (oldCall == 1)
+                {
+                    samples = oldCurrent.Samples;
+                    pair = firstPair;
+                }
+                else
+                {
+                    if (oldCall == 2)
+                    {
+                        secondOldPageStarted.TrySetResult();
+                        await releaseSecondOldPage.Task.WaitAsync(cancellationToken);
+                    }
+                    samples = staleOldSamples;
+                    pair = firstPair;
+                }
+            }
+            else if (periodId == newCurrent.Id)
+            {
+                newCurrentPageStarted.TrySetResult();
+                await releaseNewCurrentPage.Task.WaitAsync(cancellationToken);
+                samples = newCurrent.Samples;
+                pair = nextPair;
+            }
+            else if (periodId == historical.Id)
+            {
+                samples = historical.Samples;
+                pair = historyPeriodsCalls < 3 ? firstPair : nextPair;
+            }
+            else
+            {
+                return HistoryPageFetchResult.FromFailure(DetailsFetchFailure.Response);
+            }
+
+            return HistoryPageFetchResult.Success(new ApiHistoryPage(
+                periodId,
+                samples,
+                Array.Empty<ApiHistoryGap>(),
+                NextCursor: null,
+                ResumeCursor: null,
+                pair));
+        }
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Threads are outside this graph regression test.");
     }
 
     private sealed class CountingHistoryResourceClient(

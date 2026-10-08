@@ -25,6 +25,18 @@ namespace CodexInfo.WindowsClient.ViewModels;
 public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 {
     private const int MaxSplitGenerationAlignmentAttempts = 2;
+    private const string OtherModelIdentity = "Other";
+    private static readonly IReadOnlyDictionary<string, string> MainModelDisplayNames =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["gpt-6-astra"] = "6 Astra",
+            ["gpt-6.1-sol"] = "6.1 Sol",
+            ["gpt-6-sol"] = "6 Sol",
+            ["gpt-5.6-sol"] = "5.6 Sol",
+            ["gpt-5.6-terra"] = "5.6 Tera",
+            ["gpt-6-luna"] = "6 Luna",
+            ["gpt-5.6-luna"] = "5.6 Luna",
+        };
     private static IBrush NormalBackground => ThemePalette.Brush("#143426");
     private static IBrush NormalBorder => ThemePalette.Brush("#276C49");
     private static IBrush NormalAccent => ThemePalette.Brush("#4FB878");
@@ -426,6 +438,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         detailsSnapshot is { State: ApiState.Ready, Authenticated: true, AccountId: var snapshotAccountId } &&
         snapshotAccountId == accountId;
 
+    private bool HasCurrentDataApiError =>
+        HasDetails && detailsSnapshot?.State == ApiState.Error;
+
     public ApiDetailsSnapshot? DetailsSnapshot => HasDetails ? detailsSnapshot : null;
 
     internal ulong AcceptedWireOpenSessionThreadCount => acceptedWireOpenSessionThreadCount;
@@ -441,6 +456,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 return detailsFailure switch
                 {
                     null when IsHistoricalDetails => "詳細データ: 過去記録",
+                    null when HasCurrentDataApiError => $"詳細データ: {Texts.ApiErrorSnapshotNotice}",
                     null when HasDetails => "詳細データ: 最新",
                     DetailsFetchFailure.Transport when HasDetails => "詳細データ: 前回値を表示（接続エラー）",
                     DetailsFetchFailure.Response when HasDetails => "詳細データ: 前回値を表示（応答エラー）",
@@ -452,6 +468,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             return detailsFailure switch
             {
                 null when IsHistoricalDetails => $"{Texts.Details}: recorded",
+                null when HasCurrentDataApiError => $"{Texts.Details}: {Texts.ApiErrorSnapshotNotice}",
                 null when HasDetails => $"{Texts.Details}: {Texts.Latest}",
                 DetailsFetchFailure.Transport when HasDetails => $"{Texts.Details}: {Texts.Unavailable} ({Texts.TransportError})",
                 DetailsFetchFailure.Response when HasDetails => $"{Texts.Details}: {Texts.Unavailable} ({Texts.ApiError})",
@@ -467,11 +484,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// The visible status remains localized, while UI tests consume this
     /// stable value instead of decoding rendered text.
     /// </summary>
-    public string DetailsStatusAutomationText => HasDetails && detailsFailure is null
-        ? "ready"
-        : detailsFailure is null
-            ? "pending"
-            : "error";
+    public string DetailsStatusAutomationText =>
+        detailsFailure is not null || HasCurrentDataApiError
+            ? "error"
+            : HasDetails
+                ? "ready"
+                : "pending";
 
     public string RemainingPercentText
     {
@@ -1651,7 +1669,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         else
         {
-            ReplaceModels(validatedDetails.Models.OrderBy(ModelOrder));
+            ReplaceModels(validatedDetails.Models);
         }
         RebuildQuotaSegments();
 
@@ -1897,7 +1915,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void ReplaceModels(IEnumerable<ApiDetailsModelUsage> source)
     {
-        var usages = GroupModelsForDisplay(source);
+        var usages = ProjectModelsForMainDisplay(source);
         if (usages.Length == models.Count &&
             usages.Select(usage => usage.Name).SequenceEqual(models.Select(model => model.Name), StringComparer.Ordinal))
         {
@@ -1908,7 +1926,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             return;
         }
 
-        var next = usages.Select(static model => new ModelUsageViewModel(model)).ToArray();
+        var next = usages.Select(static model =>
+        {
+            var identity = MainModelIdentityFor(model.Name);
+            return new ModelUsageViewModel(
+                model,
+                MainModelDisplayName(identity),
+                string.Equals(identity, OtherModelIdentity, StringComparison.Ordinal));
+        }).ToArray();
         var previous = models.ToArray();
         models.ReplaceAll(next);
         foreach (var model in previous)
@@ -1917,11 +1942,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    private static ApiDetailsModelUsage[] GroupModelsForDisplay(
+    private static ApiDetailsModelUsage[] ProjectModelsForMainDisplay(
         IEnumerable<ApiDetailsModelUsage> source)
     {
         var groups = source.GroupBy(
-            model => ModelUsageViewModel.DisplayFamilyName(model.Name) ?? model.Name,
+            model => MainModelIdentityFor(model.Name),
             StringComparer.Ordinal);
         var result = new List<ApiDetailsModelUsage>();
         foreach (var group in groups)
@@ -1940,38 +1965,37 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 !TrySumTokens(rows.Select(row => row.OutputTokens), out var outputTokens) ||
                 !TrySumTokens(rows.Select(row => row.TotalTokens), out var totalTokens))
             {
-                // Keep exact raw rows if the family bucket cannot represent
-                // every token fact without overflow.
                 result.AddRange(rows);
                 continue;
             }
-
-            var allPricesKnown = rows.All(row =>
-                row.HasEstimatedCost &&
-                row.EstimatedTotalDollars is { } amount &&
-                double.IsFinite(amount) && amount >= 0);
+            var amounts = rows.Select(CurrentModelTotalDollars).ToArray();
+            var allAmountsKnown = amounts.All(static amount => amount is not null);
             var cacheWriteValues = rows.Select(row => row.CacheWriteInputTokens).ToArray();
             ulong? cacheWriteTokens = null;
-            if (cacheWriteValues.All(value => value is not null) &&
-                TrySumTokens(cacheWriteValues.Select(value => value!.Value), out var writes))
+            if (cacheWriteValues.All(value => value is not null))
             {
-                cacheWriteTokens = writes;
+                if (!TrySumTokens(cacheWriteValues.Select(value => value!.Value), out var summedCacheWriteTokens))
+                {
+                    result.AddRange(rows);
+                    continue;
+                }
+                cacheWriteTokens = summedCacheWriteTokens;
             }
 
-            var inputDollars = allPricesKnown
+            var inputDollars = allAmountsKnown
                 ? SumDollars(rows.Select(row => row.InputDollars))
                 : double.NaN;
-            var cachedInputDollars = allPricesKnown
+            var cachedInputDollars = allAmountsKnown
                 ? SumDollars(rows.Select(row => row.CachedInputDollars))
                 : double.NaN;
-            var outputDollars = allPricesKnown
+            var outputDollars = allAmountsKnown
                 ? SumDollars(rows.Select(row => row.OutputDollars))
                 : double.NaN;
-            var cacheWriteInputDollars = allPricesKnown
+            var cacheWriteInputDollars = allAmountsKnown
                 ? SumDollars(rows.Select(row => row.CacheWriteInputDollars))
                 : double.NaN;
-            var estimatedTotalDollars = allPricesKnown
-                ? SumDollars(rows.Select(row => row.EstimatedTotalDollars!.Value))
+            var estimatedTotalDollars = allAmountsKnown
+                ? SumDollars(amounts.Select(amount => amount!.Value))
                 : double.NaN;
 
             result.Add(new ApiDetailsModelUsage(
@@ -1992,8 +2016,35 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             });
         }
 
-        return result.OrderBy(ModelOrder).ToArray();
+        return result
+            .OrderByDescending(CurrentModelTotalDollars)
+            .ThenBy(static model => model.Name, StringComparer.Ordinal)
+            .ToArray();
     }
+
+    private static string MainModelIdentityFor(string modelName)
+    {
+        if (MainModelDisplayNames.ContainsKey(modelName))
+        {
+            return modelName;
+        }
+
+        return modelName.Trim().ToUpperInvariant() switch
+        {
+            "SOL" => "SOL",
+            "TERRA" => "TERRA",
+            "LUNA" => "LUNA",
+            "ASTRA" => "ASTRA",
+            _ => OtherModelIdentity,
+        };
+    }
+
+    private static string MainModelDisplayName(string identity) =>
+        MainModelDisplayNames.TryGetValue(identity, out var label)
+            ? label
+            : string.Equals(identity, OtherModelIdentity, StringComparison.Ordinal)
+                ? LocalizationService.Current.Other
+                : identity;
 
     private static bool TrySumTokens(IEnumerable<ulong> values, out ulong total)
     {
@@ -2002,12 +2053,20 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             if (ulong.MaxValue - total < value)
             {
+                total = 0;
                 return false;
             }
-
             total += value;
         }
         return true;
+    }
+
+    private static double? CurrentModelTotalDollars(ApiDetailsModelUsage model)
+    {
+        var value = model.HasEstimatedCost ? model.EstimatedTotalDollars : model.TotalDollars;
+        return value is { } amount && double.IsFinite(amount) && amount >= 0
+            ? amount
+            : null;
     }
 
     private static double SumDollars(IEnumerable<double> values)
@@ -2093,23 +2152,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             .Distinct(StringComparer.Ordinal)
             .ToArray();
         return tokens.Length == 1 ? tokens[0] : "その他";
-    }
-
-    private static int ModelOrder(ApiDetailsModelUsage model)
-    {
-        return ModelOrder(model.Name);
-    }
-
-    private static int ModelOrder(string name)
-    {
-        return name switch
-        {
-            "SOL" => 0,
-            "TERRA" => 1,
-            "LUNA" => 2,
-            "ASTRA" => 3,
-            _ => int.MaxValue,
-        };
     }
 
     private static ClientPresentationState GetReadyPresentationState(ApiDetailsSnapshot validatedDetails)

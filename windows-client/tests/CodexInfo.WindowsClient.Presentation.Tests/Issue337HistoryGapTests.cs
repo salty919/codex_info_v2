@@ -28,7 +28,12 @@ public sealed class Issue337HistoryGapTests
             ],
             GraphMetric.Dollars,
             periodStart,
-            periodEnd);
+            periodEnd,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: null,
+            resetAt: resetAt,
+            isVerifiedCurrentResetStart: true);
 
         var axes = GraphPlotProjection.BuildAxes(
             scene,
@@ -50,24 +55,27 @@ public sealed class Issue337HistoryGapTests
         var displayRemaining = GraphPlotProjection.BuildCanonicalRemainingLines(
             scene,
             GraphRemainingBaselineMode.PeriodStartAtFullQuota);
-        Assert.Equal((double)periodStart, displayRemaining.Dashed.Line.X[0]);
-        Assert.Equal(100d, displayRemaining.Dashed.Line.Y[0]);
-        Assert.StartsWith("M0.00 1.00", displayRemaining.Dashed.Path);
+        Assert.Equal((double)periodStart, displayRemaining.Solid.Line.X[0]);
+        Assert.Equal(100d, displayRemaining.Solid.Line.Y[0]);
+        Assert.Contains(89d, displayRemaining.Solid.Line.Y);
+        Assert.Contains(displayRemaining.Solid.Line.X, timestamp =>
+            timestamp >= firstObservation - 4d && timestamp <= firstObservation + 4d);
+        Assert.Empty(displayRemaining.Dashed.Line.X);
 
-        var sol = GraphPlotProjection.BuildModelLines(scene, scene.ModelSeries["SOL"]);
-        Assert.DoesNotContain(
-            sol.Idle.X
-                .Concat(sol.Flat.X)
-                .Concat(sol.Rising.X)
-                .Concat(sol.Dashed.X)
-                .Where(double.IsFinite),
-            timestamp => timestamp < firstObservation);
+        Assert.DoesNotContain((double)periodStart, scene.Timestamps);
+        Assert.Equal(0d, scene.ModelSeries["SOL"][0]);
+
+        var displaySol = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.ModelSeries["SOL"]);
+        Assert.Equal((double)periodStart, displaySol.Flat.Line.X[0]);
+        Assert.Equal(0d, displaySol.Flat.Line.Y[0]);
+        Assert.InRange(displaySol.Flat.Line.X[1], firstObservation - 4d, firstObservation + 4d);
+        Assert.Equal(0d, displaySol.Flat.Line.Y[1]);
 
         var control = new GraphPlotControl { Scene = scene };
         Assert.Contains(
             control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>(),
             line => line.Axes.YAxis == control.Plot.Axes.Right &&
-                line.LineWidth == GraphPlotControl.InferredLineWidth &&
+                line.LineWidth == GraphPlotControl.MeasuredRemainingLineWidth &&
                 line.Data.GetScatterPoints().Any(point => point.X == periodStart && point.Y == 100));
     }
 

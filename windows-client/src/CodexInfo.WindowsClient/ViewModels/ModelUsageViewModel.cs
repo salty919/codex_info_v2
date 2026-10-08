@@ -22,8 +22,15 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
         };
 
     public ModelUsageViewModel(ApiDetailsModelUsage usage)
+        : this(usage, usage.Name, string.Equals(usage.Name, "Other", StringComparison.Ordinal))
+    {
+    }
+
+    internal ModelUsageViewModel(ApiDetailsModelUsage usage, string displayName, bool isOther)
         : this(
             usage.Name,
+            displayName,
+            isOther,
             usage.InputTokens,
             usage.CachedInputTokens,
             usage.OutputTokens,
@@ -39,6 +46,8 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
 
     private ModelUsageViewModel(
         string name,
+        string displayName,
+        bool isOther,
         ulong inputTokens,
         ulong cachedInputTokens,
         ulong outputTokens,
@@ -51,6 +60,8 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
         double? totalDollars)
     {
         Name = name;
+        this.displayName = displayName;
+        this.isOther = isOther;
         this.inputTokens = inputTokens;
         this.cachedInputTokens = cachedInputTokens;
         this.outputTokens = outputTokens;
@@ -74,11 +85,15 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
     private double? outputDollars;
     private double cacheWriteInputDollars;
     private double? totalDollars;
+    private readonly string displayName;
+    private readonly bool isOther;
     private bool disposed;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public string Name { get; }
+
+    public string DisplayName => isOther ? LocalizationService.Current.Other : displayName;
 
     public string InputTokensText => FormatTokens(inputTokens);
 
@@ -176,6 +191,10 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(OutputLabel));
         Notify(nameof(CacheWriteInputLabel));
         Notify(nameof(TotalLabel));
+        if (isOther)
+        {
+            Notify(nameof(DisplayName));
+        }
     }
 
     public void Dispose()

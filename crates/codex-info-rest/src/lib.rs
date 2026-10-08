@@ -1111,6 +1111,8 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
                     "incomplete_source_or_acquisition"
                 } else if degraded {
                     "last_good_after_refresh_failure"
+                } else if snapshot.details.authenticated {
+                    "incomplete_source_or_acquisition"
                 } else {
                     "account_boundary_error"
                 };
@@ -3160,6 +3162,223 @@ mod tests {
 
         server.shutdown();
         fs::remove_file(path).expect("account boundary cleanup");
+    }
+
+    #[test]
+    fn issue_575_latest_partial_models_and_recovery_share_one_publication() {
+        let log_root = tempfile::tempdir().unwrap();
+        let path = temp_db("current-model-integrity");
+        fixture(&path, 10);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE usage_model_history(
+                reset_at INTEGER, timestamp INTEGER, model TEXT, total_tokens TEXT,
+                input_tokens TEXT, cached_input_tokens TEXT, output_tokens TEXT,
+                cache_write_input_tokens TEXT, model_set_complete INTEGER);
+             INSERT INTO usage_model_history VALUES
+                (1800000060,1800000000,'ASTRA','14534996','14493439','14201984','41557','0',1);
+             UPDATE durable_state SET snapshot_json=replace(snapshot_json,'legacy-unknown','confirmed');"
+        ).unwrap();
+        // Exercise the production canonical-account reader: legacy aliases may
+        // legitimately reassign a prior reset's boundary sample to a new window.
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                codex_info_db_reader::HISTORY_CANONICAL_SCHEMA_VERSION,
+            )
+            .unwrap();
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX usage_history_canonical_timestamp_idx ON usage_history(timestamp);
+             CREATE UNIQUE INDEX usage_model_history_canonical_timestamp_model_idx ON usage_model_history(timestamp,model);
+             CREATE TABLE storage_partition(singleton INTEGER, schema_version TEXT,
+                 profile_scope_id TEXT, account_scope_id TEXT, storage_epoch TEXT, partition_id TEXT);"
+        ).unwrap();
+        for (name, table, operation) in [
+            (
+                "usage_history_canonical_insert_guard",
+                "usage_history",
+                "INSERT",
+            ),
+            (
+                "usage_history_canonical_update_guard",
+                "usage_history",
+                "UPDATE",
+            ),
+            (
+                "usage_model_history_canonical_insert_guard",
+                "usage_model_history",
+                "INSERT",
+            ),
+            (
+                "usage_model_history_canonical_update_guard",
+                "usage_model_history",
+                "UPDATE",
+            ),
+            (
+                "durable_history_observation_insert_guard",
+                "durable_state",
+                "INSERT",
+            ),
+            (
+                "durable_history_observation_update_guard",
+                "durable_state",
+                "UPDATE",
+            ),
+            (
+                "usage_history_sidecar_update_guard",
+                "usage_history",
+                "UPDATE",
+            ),
+            (
+                "usage_history_sidecar_delete_guard",
+                "usage_history",
+                "DELETE",
+            ),
+        ] {
+            connection
+                .execute_batch(&format!(
+                "CREATE TRIGGER {name} BEFORE {operation} ON {table} WHEN 0 BEGIN SELECT 1; END;"
+            ))
+                .unwrap();
+        }
+        let identity = codex_info_db_reader::StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 2,
+            partition_id: "33".repeat(32),
+        };
+        connection
+            .execute(
+                "INSERT INTO storage_partition VALUES(1,?1,?2,?3,'2',?4)",
+                rusqlite::params![
+                    identity.schema_version,
+                    identity.profile_scope_id,
+                    identity.account_scope_id,
+                    identity.partition_id
+                ],
+            )
+            .unwrap();
+        let reader = DbReader::open_partitioned(&path, &identity).unwrap();
+        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
+        server.store().set_log_data_root(log_root.path());
+        let get = |route: &str| {
+            request(
+                server.local_addr(),
+                &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            )
+        };
+        let initial: Value = serde_json::from_str(body(&get("/v3/current"))).unwrap();
+        assert_eq!(initial["state"], "ready");
+        assert_eq!(initial["models"][0]["total_tokens"], 14_534_996);
+        connection.execute_batch(
+            "INSERT INTO usage_history VALUES(1800000060,1800000060,5,0,0,0,0,0,0);
+             INSERT INTO usage_model_history VALUES
+                (1800000060,1800000060,'ASTRA','201416126','200878864','197512320','537262','0',0);
+             INSERT INTO durable_state VALUES(3,1800000060,'partial',
+                '{\"kind\":\"codex-info-usage-observation-v1\",\"timestamp\":1800000060,\"reset_at\":1800000060,\"remaining_percent\":5,\"model_source\":\"confirmed\"}');
+             CREATE TABLE session_pending_ranges(source_id TEXT, range_start INTEGER, complete INTEGER);
+             INSERT INTO session_pending_ranges VALUES('anchor-evidence',0,1);
+             UPDATE collection_generation SET data_generation='2';"
+        ).unwrap();
+        let mut error_pair = String::new();
+        for route in ["/v1/details", "/v2/details", "/v3/details", "/v3/current"] {
+            let response = get(route);
+            let value: Value = serde_json::from_str(body(&response)).unwrap();
+            assert_eq!(value["state"], "error", "{route}");
+            assert_eq!(value["observed_at"], 1_800_000_060);
+            assert_eq!(value["quota"]["remaining_percent"], 5.0);
+            if route.starts_with("/v3/") {
+                assert_eq!(value["models"][0]["total_tokens"], 201_416_126);
+                let dollars = value["models"][0]["estimated_cost"]["total_dollars"]
+                    .as_f64()
+                    .unwrap();
+                assert!((dollars - 258.04086).abs() < 1e-9);
+            }
+            let pair = published_pair(&response);
+            if error_pair.is_empty() {
+                error_pair = pair.to_owned();
+            }
+            assert_eq!(pair, error_pair);
+        }
+        let history = get("/v3/history?period=1800000060");
+        assert_eq!(published_pair(&history), error_pair);
+        let history: Value = serde_json::from_str(body(&history)).unwrap();
+        let tail = history["history_samples"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(tail["models_complete"], false);
+        assert_eq!(tail["models"][0]["total_tokens"], 201_416_126);
+        let log = fs::read_dir(log_root.path().join("logs/rest"))
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        let publications: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["stage"] == "publication_state")
+            .collect();
+        assert_eq!(publications.len(), 4);
+        for row in publications {
+            assert_eq!(row["reason"], "incomplete_source_or_acquisition");
+        }
+        connection
+            .execute_batch(
+                "UPDATE usage_model_history SET model_set_complete=1 WHERE timestamp=1800000060;
+             DELETE FROM session_pending_ranges;
+             UPDATE collection_generation SET data_generation='3';",
+            )
+            .unwrap();
+        let recovered = request(
+            server.local_addr(),
+            &format!(
+                "GET /v3/current HTTP/1.1\r\nHost:x\r\nIf-None-Match: \"{error_pair}\"\r\n\r\n"
+            ),
+        );
+        assert!(recovered.starts_with("HTTP/1.1 200"));
+        assert_ne!(published_pair(&recovered), error_pair);
+        let recovered: Value = serde_json::from_str(body(&recovered)).unwrap();
+        assert_eq!(recovered["state"], "ready");
+        assert_eq!(recovered["models"][0]["total_tokens"], 201_416_126);
+        // The first new-period observation is already used: no zero-token or
+        // 100% sample is required to switch authority away from the old week.
+        connection.execute_batch(
+            "UPDATE collection_generation SET data_generation='4', reset_at=1800003660;
+             INSERT INTO usage_history VALUES(1800000120,1800003660,98,0,0,0,0,0,0);
+             INSERT INTO usage_model_history VALUES
+                (1800003660,1800000120,'ASTRA','440','400','0','40','0',1);
+             INSERT INTO durable_state VALUES(4,1800000120,'new-period',
+                '{\"kind\":\"codex-info-usage-observation-v1\",\"timestamp\":1800000120,\"reset_at\":1800003660,\"remaining_percent\":98,\"model_source\":\"confirmed\"}');"
+        ).unwrap();
+        let next = get("/v3/current");
+        let next_value: Value = serde_json::from_str(body(&next)).unwrap();
+        assert_eq!(next_value["state"], "ready");
+        assert_eq!(next_value["quota"]["reset_at"], 1_800_003_660);
+        assert_eq!(next_value["quota"]["remaining_percent"], 98.0);
+        assert_eq!(next_value["models"][0]["total_tokens"], 440);
+        let periods = get("/v3/history/periods");
+        assert_eq!(published_pair(&periods), published_pair(&next));
+        let periods: Value = serde_json::from_str(body(&periods)).unwrap();
+        let current = periods["history_periods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|period| period["current"] == true)
+            .unwrap();
+        assert_eq!(current["reset_at"], 1_800_003_660);
+        let next_history = get("/v3/history?period=1800003660");
+        assert_eq!(published_pair(&next_history), published_pair(&next));
+        let next_history: Value = serde_json::from_str(body(&next_history)).unwrap();
+        assert_eq!(next_history["history_samples"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            next_history["history_samples"][0]["models"][0]["total_tokens"],
+            440
+        );
+        server.shutdown();
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

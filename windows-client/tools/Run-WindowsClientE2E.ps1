@@ -3593,13 +3593,13 @@ function Assert-E2EThemeSurfaces {
     # fixed footer rectangle is specified independently by WINDOWS_UX_SPEC.
     $mainBounds = Get-E2EWindowBounds $main.Handle
     $mainScaleX = $mainBounds.Width / 900.0
-    $mainScaleY = $mainBounds.Height / 498.0
+    $mainScaleY = $mainBounds.Height / 542.0
     Assert-E2E ([Math]::Abs($mainScaleX - $mainScaleY) -le 0.02) 'Main window has no single logical-to-physical scale.'
     $statusBounds = [pscustomobject]@{
         Left = $mainBounds.Left + [int][Math]::Round(22 * $mainScaleX)
-        Top = $mainBounds.Top + [int][Math]::Round(442 * $mainScaleY)
+        Top = $mainBounds.Top + [int][Math]::Round(486 * $mainScaleY)
         Right = $mainBounds.Left + [int][Math]::Round(878 * $mainScaleX)
-        Bottom = $mainBounds.Top + [int][Math]::Round(484 * $mainScaleY)
+        Bottom = $mainBounds.Top + [int][Math]::Round(528 * $mainScaleY)
     }
     Assert-E2E (@(Get-E2ETextValues $main.Root | Where-Object { $_ -ceq 'Ready' }).Count -eq 1) `
         'Theme fixture Main status is not visibly Ready.'

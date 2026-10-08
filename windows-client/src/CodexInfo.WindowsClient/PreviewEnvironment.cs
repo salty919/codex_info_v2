@@ -197,6 +197,30 @@ public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDeta
         })
             .Take(PreviewEnvironment.ThreadCount)
             .ToArray();
+        var modelBreakdownPreview = scenario == "model-breakdown";
+        ApiDetailsModelUsage[] previewModels = modelBreakdownPreview
+            ?
+            [
+                PreviewPricedModel("gpt-5.6-terra", 7_000, 0.70),
+                PreviewPricedModel("gpt-6-astra", 6_000, 0.60),
+                PreviewPricedModel("gpt-6.1-sol", 5_000, 0.50),
+                PreviewPricedModel("gpt-6-sol", 4_000, 0.40),
+                PreviewPricedModel("gpt-5.6-sol", 3_000, 0.30),
+                PreviewPricedModel("gpt-6-luna", 2_000, 0.20),
+                PreviewPricedModel("gpt-5.6-luna", 1_000, 0.10),
+                new ApiDetailsModelUsage(
+                    "gpt-6-terra", 800, 0, 0,
+                    double.NaN, double.NaN, double.NaN) { TotalTokens = 800 },
+                new ApiDetailsModelUsage(
+                    "future-preview-model", 600, 0, 0,
+                    double.NaN, double.NaN, double.NaN) { TotalTokens = 600 },
+            ]
+            :
+            [
+                new ApiDetailsModelUsage("SOL", 8_400, 1_500, 900, 8.75, 1.50, 2.25),
+                new ApiDetailsModelUsage("TERRA", 4_200, 900, 500, 4.50, 0.90, 1.35),
+                new ApiDetailsModelUsage("LUNA", 2_100, 600, 240, 2.75, 0.60, 0.90),
+            ];
 
         details = new ApiDetailsSnapshot(
             previewState,
@@ -204,18 +228,15 @@ public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDeta
             authenticated,
             "Pro",
             new ApiQuota(remainingPercent, reset, windowSeconds, false),
-            [
-                new ApiDetailsModelUsage("SOL", 8_400, 1_500, 900, 8.75, 1.50, 2.25),
-                new ApiDetailsModelUsage("TERRA", 4_200, 900, 500, 4.50, 0.90, 1.35),
-                new ApiDetailsModelUsage("LUNA", 2_100, 600, 240, 2.75, 0.60, 0.90),
-            ],
+            previewModels,
             (ulong)threads.Length,
             [period, pastPeriod],
             [.. samples, .. pastSamples],
             threads,
-            "概算 $25.20")
+            modelBreakdownPreview ? "概算 —" : "概算 $25.20")
         {
             PublishedPair = PreviewPublishedPair,
+            ApiVersion = modelBreakdownPreview ? "v3" : "v1",
         };
     }
 
@@ -228,6 +249,13 @@ public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDeta
     public void Dispose()
     {
     }
+
+    private static ApiDetailsModelUsage PreviewPricedModel(string name, ulong tokens, double dollars) =>
+        new(name, tokens, 0, 0, dollars, 0, 0)
+        {
+            TotalTokens = tokens,
+            EstimatedTotalDollars = dollars,
+        };
 
     private static ApiThreadDetails[] BuildPreviewThreads(long now) =>
     [

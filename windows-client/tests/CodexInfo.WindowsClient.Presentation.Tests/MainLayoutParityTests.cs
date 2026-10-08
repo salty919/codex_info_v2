@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Reflection;
+using System.Globalization;
 using System.Xml.Linq;
 using CodexInfo.WindowsClient.Core;
 using Xunit;
@@ -182,14 +183,58 @@ public sealed class MainLayoutParityTests
     }
 
     [Fact]
+    public void MainModelUsageDeclaresSixRowScrollViewport()
+    {
+        const double rowHeight = 22;
+        const double visibleRows = 6;
+        var source = LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "MainWindow.axaml");
+        var document = XDocument.Parse(source);
+        var table = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.ModelUsageTable");
+        var scroll = table.Descendants().Single(element =>
+            element.Name.LocalName == "ScrollViewer" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.ModelUsageScroll");
+
+        Assert.Equal("1", scroll.Attribute("Grid.Row")?.Value);
+        Assert.Equal((rowHeight * visibleRows).ToString(CultureInfo.InvariantCulture),
+            scroll.Attribute("MaxHeight")?.Value);
+        Assert.Equal("Auto", scroll.Attribute("VerticalScrollBarVisibility")?.Value);
+        var items = Assert.Single(scroll.Descendants(), element =>
+            element.Name.LocalName == "ItemsControl");
+        Assert.Equal("{Binding Models}", items.Attribute("ItemsSource")?.Value);
+        Assert.Equal("0,0,16,0", items.Attribute("Margin")?.Value);
+        var header = table.Descendants().Single(element =>
+            element.Name.LocalName == "Grid" &&
+            element.Elements().Any(child => child.Attribute("Text")?.Value == "{Binding Texts.ModelLabel}"));
+        Assert.Equal(items.Attribute("Margin")?.Value, header.Attribute("Margin")?.Value);
+        var row = items.Descendants().Single(element =>
+            element.Name.LocalName == "Grid" && element.Attribute("Height")?.Value == "22");
+        Assert.Contains(row.Descendants(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            element.Attribute("Text")?.Value == "{Binding DisplayName}");
+
+        // Runtime extent and actual row visibility belong to the Windows
+        // capture: a standalone unthemed control is not the Main visual tree.
+        var capture = LoadRepositoryFile("scripts", "capture_windows_window.ps1");
+        Assert.Contains("$scrollPattern.SetScrollPercent(", capture, StringComparison.Ordinal);
+        Assert.Contains("[System.Windows.Automation.ScrollPattern]::NoScroll, 100)", capture, StringComparison.Ordinal);
+
+    }
+
+    [Fact]
     public void MainUsesTheIssue360FixedQuotaGaugeAndStatusGeometry()
     {
         var source = LoadRepositoryFile(
             "windows-client", "src", "CodexInfo.WindowsClient", "MainWindow.axaml");
         var document = XDocument.Parse(source);
+        var window = Assert.IsType<XElement>(document.Root);
+        Assert.Equal("542", window.Attribute("Height")?.Value);
+        Assert.Equal("542", window.Attribute("MinHeight")?.Value);
+        Assert.Equal("542", window.Attribute("MaxHeight")?.Value);
         var surface = document.Descendants()
             .Single(element => element.Name.LocalName == "Grid" &&
-                element.Attribute("RowDefinitions")?.Value == "52,82,78,56,120,42");
+                element.Attribute("RowDefinitions")?.Value == "52,82,78,56,164,42");
 
         Assert.Equal("22,14", surface.Attribute("Margin")?.Value);
         Assert.Equal("8", surface.Attribute("RowSpacing")?.Value);
@@ -239,6 +284,10 @@ public sealed class MainLayoutParityTests
 
         var status = document.Descendants().Single(element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.StatusBanner");
+        var e2eSource = LoadRepositoryFile("windows-client", "tools", "Run-WindowsClientE2E.ps1");
+        Assert.Contains("$mainScaleY = $mainBounds.Height / 542.0", e2eSource, StringComparison.Ordinal);
+        Assert.Contains("Round(486 * $mainScaleY)", e2eSource, StringComparison.Ordinal);
+        Assert.Contains("Round(528 * $mainScaleY)", e2eSource, StringComparison.Ordinal);
 
         var updateButton = status.Descendants().Single(element =>
             element.Name.LocalName == "Button" &&

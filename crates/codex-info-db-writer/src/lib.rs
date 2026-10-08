@@ -210,6 +210,14 @@ CREATE TABLE session_pending_ranges (
     )
 ) WITHOUT ROWID;
 
+CREATE TABLE session_token_anchor_recoveries (
+    recovery_id TEXT PRIMARY KEY CHECK (
+        length(recovery_id) = 64
+        AND recovery_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    payload_json TEXT NOT NULL CHECK (length(payload_json) BETWEEN 2 AND 1048576)
+) WITHOUT ROWID;
+
 CREATE TABLE session_events (
     root_identity TEXT NOT NULL,
     relative_path TEXT NOT NULL,
@@ -654,6 +662,7 @@ pub const MAX_SESSION_MODEL_BYTES: usize = 512;
 const ACCOUNT_DB_SCHEMA_VERSION: i64 = HISTORY_CANONICAL_SCHEMA_VERSION;
 const LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION: i64 = 10;
 const MODEL_PRICING_PREVIOUS_SCHEMA_VERSION: i64 = 11;
+const SESSION_TOKEN_ANCHOR_PREVIOUS_SCHEMA_VERSION: i64 = 12;
 const MAX_LOGIN_ID_SCALARS: usize = 254;
 const MAX_ACTIVE_THREADS: usize = 256;
 const MAX_ACTIVE_THREAD_ID_SCALARS: usize = 512;
@@ -1318,6 +1327,62 @@ pub struct SessionPendingRange {
     pub complete: bool,
 }
 
+/// The durable token vector from the last source checkpoint whose bytes were
+/// fully attributed. It remains immutable while a replacement source is
+/// inspected, so an untrusted replacement prefix can never become a new
+/// recovery baseline after restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionTokenAnchor {
+    pub root_identity: String,
+    pub relative_path: String,
+    pub file_device: u64,
+    pub file_inode: u64,
+    pub prefix_generation: u128,
+    pub committed_offset: u64,
+    pub prefix_sha256: String,
+    pub collector_epoch: u128,
+    pub cycle_seq: u64,
+    pub fully_attributed_from_zero: bool,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_write_input_tokens: Option<u64>,
+}
+
+/// Original anchor and pending evidence plus the exact current source cursor.
+/// The anchor and pending range never change; only cursor fields advance as
+/// more bytes are inspected without an exact counter match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionTokenAnchorRecovery {
+    pub recovery_id: String,
+    pub pending: SessionPendingRange,
+    pub anchor: SessionTokenAnchor,
+    pub current_root_identity: String,
+    pub current_relative_path: String,
+    pub current_file_device: u64,
+    pub current_file_inode: u64,
+    pub cursor_offset: u64,
+    pub cursor_prefix_generation: u128,
+    pub cursor_collector_epoch: u128,
+    pub cursor_cycle_seq: u64,
+}
+
+/// Exact equality with the immutable anchor at a byte position covered by a
+/// source range committed in the same collection transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionTokenAnchorResolution {
+    pub recovery_id: String,
+    pub matched_start_offset: u64,
+    pub matched_end_offset: u64,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_write_input_tokens: Option<u64>,
+    pub accepted_range: SessionRange,
+}
+
 /// A source-proven token delta retained independently of quota period
 /// authority.  The range key makes the event idempotent across process
 /// restarts while its timestamp lets a later accepted quota boundary
@@ -1591,6 +1656,8 @@ pub struct SessionCollectionCommit<'a> {
 pub struct SessionTaskEvidenceInput<'a> {
     pub events: &'a [SessionEvent],
     pub pending_ranges: &'a [SessionPendingRange],
+    pub token_anchor_recoveries: &'a [SessionTokenAnchorRecovery],
+    pub token_anchor_resolutions: &'a [SessionTokenAnchorResolution],
     pub task_events: &'a [SessionTaskEvent],
     pub task_indexed_ranges: &'a [SessionTaskIndexedRange],
 }
@@ -1599,6 +1666,8 @@ struct CollectionEvidence<'a> {
     cumulative_recovery: Option<&'a SessionCumulativeRecovery>,
     timeline_recovery: Option<&'a SessionTimelineRecovery>,
     pending_ranges: Option<&'a [SessionPendingRange]>,
+    token_anchor_recoveries: Option<&'a [SessionTokenAnchorRecovery]>,
+    token_anchor_resolutions: Option<&'a [SessionTokenAnchorResolution]>,
     events: Option<&'a [SessionEvent]>,
     task_events: Option<&'a [SessionTaskEvent]>,
     task_indexed_ranges: Option<&'a [SessionTaskIndexedRange]>,
@@ -2230,6 +2299,347 @@ fn validate_session_pending_range(range: &SessionPendingRange) -> Result<()> {
     }
     validate_sha256(&range.record_sha256, "session pending range record")?;
     Ok(())
+}
+
+pub fn session_token_anchor_recovery_id(
+    pending: &SessionPendingRange,
+    anchor: &SessionTokenAnchor,
+) -> String {
+    fn update_text(hasher: &mut Sha256, value: &str) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    fn update_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update(value.to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-info-session-token-anchor-recovery-v1\0");
+    for value in [
+        pending.root_identity.as_str(),
+        pending.relative_path.as_str(),
+        pending.record_sha256.as_str(),
+        pending.parser_version.as_str(),
+        pending.reason.as_str(),
+    ] {
+        update_text(&mut hasher, value);
+    }
+    for value in [
+        pending.file_device,
+        pending.file_inode,
+        pending.start_offset,
+        pending.end_offset,
+        pending.cycle_seq,
+    ] {
+        hasher.update(value.to_be_bytes());
+    }
+    hasher.update(pending.collector_epoch.to_be_bytes());
+    hasher.update(pending.prefix_generation.to_be_bytes());
+    hasher.update([u8::from(pending.complete)]);
+
+    for value in [anchor.root_identity.as_str(), anchor.relative_path.as_str()] {
+        update_text(&mut hasher, value);
+    }
+    update_text(&mut hasher, anchor.prefix_sha256.as_str());
+    for value in [
+        anchor.file_device,
+        anchor.file_inode,
+        anchor.committed_offset,
+        anchor.cycle_seq,
+        anchor.total_tokens,
+        anchor.input_tokens,
+        anchor.cached_input_tokens,
+        anchor.output_tokens,
+    ] {
+        hasher.update(value.to_be_bytes());
+    }
+    hasher.update(anchor.prefix_generation.to_be_bytes());
+    hasher.update(anchor.collector_epoch.to_be_bytes());
+    hasher.update([u8::from(anchor.fully_attributed_from_zero)]);
+    update_optional_u64(&mut hasher, anchor.cache_write_input_tokens);
+    format!("{:x}", hasher.finalize())
+}
+
+fn validate_session_token_anchor(anchor: &SessionTokenAnchor) -> Result<()> {
+    validate_session_key(&anchor.root_identity, &anchor.relative_path)?;
+    if anchor.committed_offset > i64::MAX as u64
+        || anchor.collector_epoch == 0
+        || anchor.cycle_seq == 0
+        || anchor.prefix_generation == 0
+        || anchor.cached_input_tokens > anchor.input_tokens
+        || anchor.cache_write_input_tokens.is_some_and(|writes| {
+            anchor
+                .cached_input_tokens
+                .checked_add(writes)
+                .is_none_or(|total| total > anchor.input_tokens)
+        })
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "session token anchor is invalid".into(),
+        ));
+    }
+    validate_sha256(&anchor.prefix_sha256, "session token anchor prefix")
+}
+
+fn validate_session_token_anchor_recovery(recovery: &SessionTokenAnchorRecovery) -> Result<()> {
+    validate_session_pending_range(&recovery.pending)?;
+    validate_session_token_anchor(&recovery.anchor)?;
+    if recovery.pending.reason != "checkpoint-token-anchor-missing"
+        || !recovery.pending.complete
+        || recovery.current_root_identity != recovery.pending.root_identity
+        || recovery.current_relative_path != recovery.pending.relative_path
+        || recovery.current_file_device != recovery.pending.file_device
+        || recovery.current_file_inode != recovery.pending.file_inode
+        || recovery.cursor_offset < recovery.pending.end_offset
+        || recovery.cursor_offset > i64::MAX as u64
+        || recovery.cursor_prefix_generation == 0
+        || recovery.cursor_collector_epoch == 0
+        || recovery.cursor_cycle_seq == 0
+        || recovery.cursor_collector_epoch != recovery.anchor.collector_epoch
+        || recovery.pending.collector_epoch != recovery.anchor.collector_epoch
+        || recovery.pending.prefix_generation != recovery.cursor_prefix_generation
+        || recovery.anchor.root_identity != recovery.current_root_identity
+        || recovery.anchor.relative_path != recovery.current_relative_path
+        || recovery.recovery_id
+            != session_token_anchor_recovery_id(&recovery.pending, &recovery.anchor)
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "session token anchor recovery is invalid".into(),
+        ));
+    }
+    validate_sha256(&recovery.recovery_id, "session token anchor recovery")
+}
+
+fn encode_session_token_anchor_recovery(recovery: &SessionTokenAnchorRecovery) -> Result<String> {
+    validate_session_token_anchor_recovery(recovery)?;
+    let pending = &recovery.pending;
+    let anchor = &recovery.anchor;
+    let value = serde_json::json!({
+        "version": 1,
+        "recovery_id": recovery.recovery_id,
+        "pending": {
+            "root_identity": pending.root_identity,
+            "relative_path": pending.relative_path,
+            "file_device": pending.file_device.to_string(),
+            "file_inode": pending.file_inode.to_string(),
+            "start_offset": pending.start_offset.to_string(),
+            "end_offset": pending.end_offset.to_string(),
+            "collector_epoch": format!("{:032x}", pending.collector_epoch),
+            "cycle_seq": pending.cycle_seq.to_string(),
+            "prefix_generation": format!("{:032x}", pending.prefix_generation),
+            "record_sha256": pending.record_sha256,
+            "parser_version": pending.parser_version,
+            "reason": pending.reason,
+            "complete": pending.complete,
+        },
+        "anchor": {
+            "root_identity": anchor.root_identity,
+            "relative_path": anchor.relative_path,
+            "file_device": anchor.file_device.to_string(),
+            "file_inode": anchor.file_inode.to_string(),
+            "prefix_generation": format!("{:032x}", anchor.prefix_generation),
+            "committed_offset": anchor.committed_offset.to_string(),
+            "prefix_sha256": anchor.prefix_sha256,
+            "collector_epoch": format!("{:032x}", anchor.collector_epoch),
+            "cycle_seq": anchor.cycle_seq.to_string(),
+            "fully_attributed_from_zero": anchor.fully_attributed_from_zero,
+            "total_tokens": anchor.total_tokens.to_string(),
+            "input_tokens": anchor.input_tokens.to_string(),
+            "cached_input_tokens": anchor.cached_input_tokens.to_string(),
+            "output_tokens": anchor.output_tokens.to_string(),
+            "cache_write_input_tokens": anchor.cache_write_input_tokens.map(|value| value.to_string()),
+        },
+        "current": {
+            "root_identity": recovery.current_root_identity,
+            "relative_path": recovery.current_relative_path,
+            "file_device": recovery.current_file_device.to_string(),
+            "file_inode": recovery.current_file_inode.to_string(),
+            "cursor_offset": recovery.cursor_offset.to_string(),
+            "cursor_prefix_generation": format!("{:032x}", recovery.cursor_prefix_generation),
+            "cursor_collector_epoch": format!("{:032x}", recovery.cursor_collector_epoch),
+            "cursor_cycle_seq": recovery.cursor_cycle_seq.to_string(),
+        },
+    });
+    let encoded = serde_json::to_string(&value).map_err(|error| {
+        UsageStoreError::InvalidImport(format!("session token anchor encoding failed: {error}"))
+    })?;
+    if encoded.len() > 1_048_576 {
+        return Err(UsageStoreError::InvalidImport(
+            "session token anchor recovery exceeds the storage limit".into(),
+        ));
+    }
+    Ok(encoded)
+}
+
+fn decode_session_token_anchor_recovery(
+    recovery_id: &str,
+    payload_json: &str,
+) -> Result<SessionTokenAnchorRecovery> {
+    fn object<'a>(
+        value: &'a serde_json::Value,
+        field: &str,
+    ) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                UsageStoreError::InvalidImport("session token anchor payload is malformed".into())
+            })
+    }
+
+    fn string(object: &serde_json::Map<String, serde_json::Value>, field: &str) -> Result<String> {
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                UsageStoreError::InvalidImport("session token anchor payload is malformed".into())
+            })
+    }
+
+    fn decimal<T>(object: &serde_json::Map<String, serde_json::Value>, field: &str) -> Result<T>
+    where
+        T: std::str::FromStr + ToString,
+    {
+        let value = string(object, field)?;
+        let parsed = value.parse::<T>().map_err(|_| {
+            UsageStoreError::InvalidImport("session token anchor payload is malformed".into())
+        })?;
+        if parsed.to_string() != value {
+            return Err(UsageStoreError::InvalidImport(
+                "session token anchor payload is not canonical".into(),
+            ));
+        }
+        Ok(parsed)
+    }
+
+    fn hexadecimal<T>(object: &serde_json::Map<String, serde_json::Value>, field: &str) -> Result<T>
+    where
+        T: std::str::FromStr + ToString,
+    {
+        let value = string(object, field)?;
+        let parsed = u128::from_str_radix(&value, 16).map_err(|_| {
+            UsageStoreError::InvalidImport("session token anchor payload is malformed".into())
+        })?;
+        if format!("{parsed:032x}") != value {
+            return Err(UsageStoreError::InvalidImport(
+                "session token anchor payload is not canonical".into(),
+            ));
+        }
+        let converted = parsed.to_string().parse::<T>().map_err(|_| {
+            UsageStoreError::InvalidImport("session token anchor payload is malformed".into())
+        })?;
+        Ok(converted)
+    }
+
+    fn boolean(object: &serde_json::Map<String, serde_json::Value>, field: &str) -> Result<bool> {
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                UsageStoreError::InvalidImport("session token anchor payload is malformed".into())
+            })
+    }
+
+    fn optional_decimal(
+        object: &serde_json::Map<String, serde_json::Value>,
+        field: &str,
+    ) -> Result<Option<u64>> {
+        match object.get(field) {
+            Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => {
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    UsageStoreError::InvalidImport(
+                        "session token anchor payload is malformed".into(),
+                    )
+                })?;
+                if parsed.to_string() != *value {
+                    return Err(UsageStoreError::InvalidImport(
+                        "session token anchor payload is not canonical".into(),
+                    ));
+                }
+                Ok(Some(parsed))
+            }
+            _ => Err(UsageStoreError::InvalidImport(
+                "session token anchor payload is malformed".into(),
+            )),
+        }
+    }
+
+    let value: serde_json::Value = serde_json::from_str(payload_json).map_err(|error| {
+        UsageStoreError::InvalidImport(format!(
+            "session token anchor payload is malformed: {error}"
+        ))
+    })?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+        || string(
+            value.as_object().ok_or_else(|| {
+                UsageStoreError::InvalidImport("session token anchor payload is malformed".into())
+            })?,
+            "recovery_id",
+        )? != recovery_id
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "session token anchor payload version or identity mismatch".into(),
+        ));
+    }
+    let pending_value = object(&value, "pending")?;
+    let pending = SessionPendingRange {
+        root_identity: string(pending_value, "root_identity")?,
+        relative_path: string(pending_value, "relative_path")?,
+        file_device: decimal(pending_value, "file_device")?,
+        file_inode: decimal(pending_value, "file_inode")?,
+        start_offset: decimal(pending_value, "start_offset")?,
+        end_offset: decimal(pending_value, "end_offset")?,
+        collector_epoch: hexadecimal(pending_value, "collector_epoch")?,
+        cycle_seq: decimal(pending_value, "cycle_seq")?,
+        prefix_generation: hexadecimal(pending_value, "prefix_generation")?,
+        record_sha256: string(pending_value, "record_sha256")?,
+        parser_version: string(pending_value, "parser_version")?,
+        reason: string(pending_value, "reason")?,
+        complete: boolean(pending_value, "complete")?,
+    };
+    let anchor_value = object(&value, "anchor")?;
+    let anchor = SessionTokenAnchor {
+        root_identity: string(anchor_value, "root_identity")?,
+        relative_path: string(anchor_value, "relative_path")?,
+        file_device: decimal(anchor_value, "file_device")?,
+        file_inode: decimal(anchor_value, "file_inode")?,
+        prefix_generation: hexadecimal(anchor_value, "prefix_generation")?,
+        committed_offset: decimal(anchor_value, "committed_offset")?,
+        prefix_sha256: string(anchor_value, "prefix_sha256")?,
+        collector_epoch: hexadecimal(anchor_value, "collector_epoch")?,
+        cycle_seq: decimal(anchor_value, "cycle_seq")?,
+        fully_attributed_from_zero: boolean(anchor_value, "fully_attributed_from_zero")?,
+        total_tokens: decimal(anchor_value, "total_tokens")?,
+        input_tokens: decimal(anchor_value, "input_tokens")?,
+        cached_input_tokens: decimal(anchor_value, "cached_input_tokens")?,
+        output_tokens: decimal(anchor_value, "output_tokens")?,
+        cache_write_input_tokens: optional_decimal(anchor_value, "cache_write_input_tokens")?,
+    };
+    let current_value = object(&value, "current")?;
+    let recovery = SessionTokenAnchorRecovery {
+        recovery_id: recovery_id.to_owned(),
+        pending,
+        anchor,
+        current_root_identity: string(current_value, "root_identity")?,
+        current_relative_path: string(current_value, "relative_path")?,
+        current_file_device: decimal(current_value, "file_device")?,
+        current_file_inode: decimal(current_value, "file_inode")?,
+        cursor_offset: decimal(current_value, "cursor_offset")?,
+        cursor_prefix_generation: hexadecimal(current_value, "cursor_prefix_generation")?,
+        cursor_collector_epoch: hexadecimal(current_value, "cursor_collector_epoch")?,
+        cursor_cycle_seq: decimal(current_value, "cursor_cycle_seq")?,
+    };
+    validate_session_token_anchor_recovery(&recovery)?;
+    Ok(recovery)
 }
 
 fn validate_session_event(event: &SessionEvent) -> Result<()> {
@@ -5042,6 +5452,282 @@ fn replace_session_pending_ranges(
     Ok(())
 }
 
+fn session_pending_range_exists(
+    connection: &Connection,
+    pending: &SessionPendingRange,
+) -> Result<bool> {
+    let exists: i64 = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM session_pending_ranges
+            WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+              AND file_inode=?4 AND start_offset=?5 AND end_offset=?6
+              AND collector_epoch=?7 AND cycle_seq=?8 AND prefix_generation=?9
+              AND record_sha256=?10 AND parser_version=?11 AND reason=?12
+              AND complete=?13
+        )",
+        params![
+            &pending.root_identity,
+            &pending.relative_path,
+            pending.file_device.to_string(),
+            pending.file_inode.to_string(),
+            pending.start_offset as i64,
+            pending.end_offset as i64,
+            format!("{:032x}", pending.collector_epoch),
+            pending.cycle_seq.to_string(),
+            format!("{:032x}", pending.prefix_generation),
+            &pending.record_sha256,
+            &pending.parser_version,
+            &pending.reason,
+            i64::from(pending.complete),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+fn session_anchor_source_range_exists(
+    connection: &Connection,
+    range: &SessionRange,
+) -> Result<bool> {
+    let exists: i64 = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM session_ranges
+            WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+              AND file_inode=?4 AND prefix_generation=?5 AND start_offset=?6
+              AND end_offset=?7 AND record_sha256=?8
+        )",
+        params![
+            &range.root_identity,
+            &range.relative_path,
+            range.file_device.to_string(),
+            range.file_inode.to_string(),
+            format!("{:032x}", range.prefix_generation),
+            range.start_offset as i64,
+            range.end_offset as i64,
+            &range.record_sha256,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+fn session_token_anchor_checkpoint_matches(
+    connection: &Connection,
+    checkpoint: Option<&SessionCheckpoint>,
+    recovery: &SessionTokenAnchorRecovery,
+    matched_end_offset: u64,
+) -> Result<bool> {
+    if let Some(checkpoint) = checkpoint {
+        return Ok(checkpoint.root_identity == recovery.current_root_identity
+            && checkpoint.relative_path == recovery.current_relative_path
+            && checkpoint.file_device == recovery.current_file_device
+            && checkpoint.file_inode == recovery.current_file_inode
+            && checkpoint.committed_offset >= matched_end_offset
+            && checkpoint.prefix_generation == recovery.cursor_prefix_generation
+            && checkpoint.collector_epoch == recovery.cursor_collector_epoch);
+    }
+    let exists: i64 = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM session_checkpoints
+            WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+              AND file_inode=?4 AND prefix_generation=?5 AND committed_offset>=?6
+              AND collector_epoch=?7
+        )",
+        params![
+            &recovery.current_root_identity,
+            &recovery.current_relative_path,
+            recovery.current_file_device.to_string(),
+            recovery.current_file_inode.to_string(),
+            format!("{:032x}", recovery.cursor_prefix_generation),
+            matched_end_offset as i64,
+            format!("{:032x}", recovery.cursor_collector_epoch),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists == 1)
+}
+
+type SessionCheckpointLookup = BTreeMap<(String, String, u64, u64, u128), SessionCheckpoint>;
+
+fn resolve_session_token_anchor_recoveries(
+    transaction: &rusqlite::Transaction<'_>,
+    resolutions: &BTreeMap<String, SessionTokenAnchorResolution>,
+    checkpoints: Option<&SessionCheckpointLookup>,
+) -> Result<()> {
+    for resolution in resolutions.values() {
+        let payload: Option<String> = transaction
+            .query_row(
+                "SELECT payload_json FROM session_token_anchor_recoveries WHERE recovery_id=?1",
+                [&resolution.recovery_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !session_anchor_source_range_exists(transaction, &resolution.accepted_range)? {
+            return Err(UsageStoreError::InvalidImport(
+                "session token anchor match has no committed source range".into(),
+            ));
+        }
+        let Some(payload) = payload else {
+            let stale_anchor_pending: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM session_pending_ranges
+                 WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+                   AND file_inode=?4 AND reason='checkpoint-token-anchor-missing'",
+                params![
+                    &resolution.accepted_range.root_identity,
+                    &resolution.accepted_range.relative_path,
+                    resolution.accepted_range.file_device.to_string(),
+                    resolution.accepted_range.file_inode.to_string(),
+                ],
+                |row| row.get(0),
+            )?;
+            if stale_anchor_pending != 0 {
+                return Err(UsageStoreError::InvalidImport(
+                    "resolved session token anchor still has pending evidence".into(),
+                ));
+            }
+            // A retry after a successful commit is idempotent only after both
+            // durable marker rows are absent and the exact accepted range is
+            // still present.
+            continue;
+        };
+        let recovery = decode_session_token_anchor_recovery(&resolution.recovery_id, &payload)?;
+        if resolution.accepted_range.root_identity != recovery.current_root_identity
+            || resolution.accepted_range.relative_path != recovery.current_relative_path
+            || resolution.accepted_range.file_device != recovery.current_file_device
+            || resolution.accepted_range.file_inode != recovery.current_file_inode
+            || resolution.accepted_range.prefix_generation != recovery.cursor_prefix_generation
+            || resolution.accepted_range.start_offset > resolution.matched_start_offset
+            || resolution.accepted_range.end_offset < resolution.matched_end_offset
+            || resolution.matched_start_offset >= resolution.matched_end_offset
+            || resolution.total_tokens != recovery.anchor.total_tokens
+            || resolution.input_tokens != recovery.anchor.input_tokens
+            || resolution.cached_input_tokens != recovery.anchor.cached_input_tokens
+            || resolution.output_tokens != recovery.anchor.output_tokens
+            || resolution.cache_write_input_tokens != recovery.anchor.cache_write_input_tokens
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "session token anchor did not match its saved counter".into(),
+            ));
+        }
+        let candidate_checkpoint = checkpoints.and_then(|items| {
+            items.values().find(|checkpoint| {
+                checkpoint.root_identity == recovery.current_root_identity
+                    && checkpoint.relative_path == recovery.current_relative_path
+                    && checkpoint.file_device == recovery.current_file_device
+                    && checkpoint.file_inode == recovery.current_file_inode
+                    && checkpoint.prefix_generation == recovery.cursor_prefix_generation
+            })
+        });
+        if !session_token_anchor_checkpoint_matches(
+            transaction,
+            candidate_checkpoint,
+            &recovery,
+            resolution.matched_end_offset,
+        )? {
+            return Err(UsageStoreError::InvalidImport(
+                "session token anchor match is beyond the committed cursor".into(),
+            ));
+        }
+        if !session_pending_range_exists(transaction, &recovery.pending)? {
+            return Err(UsageStoreError::InvalidImport(
+                "session token anchor pending evidence changed before resolution".into(),
+            ));
+        }
+        let pending = &recovery.pending;
+        let removed_pending = transaction.execute(
+            "DELETE FROM session_pending_ranges
+             WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+               AND file_inode=?4 AND start_offset=?5 AND end_offset=?6
+               AND collector_epoch=?7 AND cycle_seq=?8 AND prefix_generation=?9
+               AND record_sha256=?10 AND parser_version=?11 AND reason=?12
+               AND complete=?13",
+            params![
+                &pending.root_identity,
+                &pending.relative_path,
+                pending.file_device.to_string(),
+                pending.file_inode.to_string(),
+                pending.start_offset as i64,
+                pending.end_offset as i64,
+                format!("{:032x}", pending.collector_epoch),
+                pending.cycle_seq.to_string(),
+                format!("{:032x}", pending.prefix_generation),
+                &pending.record_sha256,
+                &pending.parser_version,
+                &pending.reason,
+                i64::from(pending.complete),
+            ],
+        )?;
+        if removed_pending != 1 {
+            return Err(UsageStoreError::InvalidImport(
+                "session token anchor pending evidence changed during resolution".into(),
+            ));
+        }
+        let removed_recovery = transaction.execute(
+            "DELETE FROM session_token_anchor_recoveries WHERE recovery_id=?1",
+            [&resolution.recovery_id],
+        )?;
+        if removed_recovery != 1 {
+            return Err(UsageStoreError::InvalidImport(
+                "session token anchor recovery changed during resolution".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn upsert_session_token_anchor_recoveries(
+    transaction: &rusqlite::Transaction<'_>,
+    recoveries: &BTreeMap<String, SessionTokenAnchorRecovery>,
+) -> Result<()> {
+    for recovery in recoveries.values() {
+        let encoded = encode_session_token_anchor_recovery(recovery)?;
+        let existing_payload: Option<String> = transaction
+            .query_row(
+                "SELECT payload_json FROM session_token_anchor_recoveries WHERE recovery_id=?1",
+                [&recovery.recovery_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_payload) = existing_payload {
+            let existing =
+                decode_session_token_anchor_recovery(&recovery.recovery_id, &existing_payload)?;
+            if existing.pending != recovery.pending
+                || existing.anchor != recovery.anchor
+                || existing.current_root_identity != recovery.current_root_identity
+                || existing.current_relative_path != recovery.current_relative_path
+                || existing.current_file_device != recovery.current_file_device
+                || existing.current_file_inode != recovery.current_file_inode
+                || existing.cursor_prefix_generation != recovery.cursor_prefix_generation
+                || existing.cursor_collector_epoch != recovery.cursor_collector_epoch
+                || recovery.cursor_offset < existing.cursor_offset
+                || recovery.cursor_cycle_seq < existing.cursor_cycle_seq
+                || !session_pending_range_exists(transaction, &recovery.pending)?
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "session token anchor cursor regressed or changed identity".into(),
+                ));
+            }
+            transaction.execute(
+                "UPDATE session_token_anchor_recoveries
+                 SET payload_json=?2 WHERE recovery_id=?1",
+                params![&recovery.recovery_id, encoded],
+            )?;
+        } else {
+            if !session_pending_range_exists(transaction, &recovery.pending)? {
+                return Err(UsageStoreError::InvalidImport(
+                    "session token anchor has no durable pending evidence".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO session_token_anchor_recoveries (recovery_id, payload_json)
+                 VALUES (?1, ?2)",
+                params![&recovery.recovery_id, encoded],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::type_complexity)]
 fn upsert_session_events(
     transaction: &rusqlite::Transaction<'_>,
@@ -7395,6 +8081,10 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             ],
         ),
         (
+            "session_token_anchor_recoveries",
+            &[("recovery_id", "TEXT", 1), ("payload_json", "TEXT", 0)],
+        ),
+        (
             "session_events",
             &[
                 ("root_identity", "TEXT", 1),
@@ -7550,7 +8240,10 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         .map(|(table, _)| (*table).to_owned())
         .collect::<BTreeSet<_>>();
     let expected_for_version = expected_tables.clone();
+    let mut pre_session_token_anchor_tables = expected_for_version.clone();
+    pre_session_token_anchor_tables.remove("session_token_anchor_recoveries");
     let mut pre_continuity_tables = expected_for_version.clone();
+    pre_continuity_tables.remove("session_token_anchor_recoveries");
     pre_continuity_tables.remove("history_continuity");
     pre_continuity_tables.remove("usage_model_history");
     pre_continuity_tables.remove("session_cumulative_recoveries");
@@ -7559,6 +8252,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     pre_continuity_tables.remove("session_events");
     pre_continuity_tables.remove("active_thread_snapshot");
     let mut pre_model_history_tables = expected_for_version.clone();
+    pre_model_history_tables.remove("session_token_anchor_recoveries");
     pre_model_history_tables.remove("usage_model_history");
     pre_model_history_tables.remove("session_cumulative_recoveries");
     pre_model_history_tables.remove("session_timeline_recoveries");
@@ -7566,24 +8260,29 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     pre_model_history_tables.remove("session_events");
     pre_model_history_tables.remove("active_thread_snapshot");
     let mut pre_cumulative_recovery_tables = expected_for_version.clone();
+    pre_cumulative_recovery_tables.remove("session_token_anchor_recoveries");
     pre_cumulative_recovery_tables.remove("session_cumulative_recoveries");
     pre_cumulative_recovery_tables.remove("session_timeline_recoveries");
     pre_cumulative_recovery_tables.remove("session_pending_ranges");
     pre_cumulative_recovery_tables.remove("session_events");
     pre_cumulative_recovery_tables.remove("active_thread_snapshot");
     let mut pre_timeline_recovery_tables = expected_for_version.clone();
+    pre_timeline_recovery_tables.remove("session_token_anchor_recoveries");
     pre_timeline_recovery_tables.remove("session_timeline_recoveries");
     pre_timeline_recovery_tables.remove("session_pending_ranges");
     pre_timeline_recovery_tables.remove("session_events");
     pre_timeline_recovery_tables.remove("active_thread_snapshot");
     let mut pre_pending_range_tables = expected_for_version.clone();
+    pre_pending_range_tables.remove("session_token_anchor_recoveries");
     pre_pending_range_tables.remove("session_pending_ranges");
     pre_pending_range_tables.remove("session_events");
     pre_pending_range_tables.remove("active_thread_snapshot");
     let mut pre_session_event_tables = expected_for_version.clone();
+    pre_session_event_tables.remove("session_token_anchor_recoveries");
     pre_session_event_tables.remove("session_events");
     pre_session_event_tables.remove("active_thread_snapshot");
     let mut pre_session_task_evidence_tables = expected_for_version.clone();
+    pre_session_task_evidence_tables.remove("session_token_anchor_recoveries");
     pre_session_task_evidence_tables.remove("session_task_events");
     pre_session_task_evidence_tables.remove("session_task_indexed_ranges");
     pre_session_task_evidence_tables.remove("active_thread_snapshot");
@@ -7611,6 +8310,9 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         && !(schema_version < 8
             && (actual_tables == pre_session_task_evidence_tables
                 || actual_tables_without_active == pre_session_task_evidence_tables))
+        && !(schema_version < HISTORY_CANONICAL_SCHEMA_VERSION
+            && (actual_tables == pre_session_token_anchor_tables
+                || actual_tables_without_active == pre_session_token_anchor_tables))
     {
         return Err(UsageStoreError::InvalidImport(
             "account partition table set mismatch".into(),
@@ -7623,6 +8325,8 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             || *table == "session_cumulative_recoveries"
             || *table == "session_timeline_recoveries"
             || *table == "session_pending_ranges"
+            || (*table == "session_token_anchor_recoveries"
+                && schema_version < HISTORY_CANONICAL_SCHEMA_VERSION)
             || *table == "session_events"
             || *table == "session_task_events"
             || *table == "session_task_indexed_ranges"
@@ -7902,6 +8606,23 @@ fn ensure_session_pending_range_schema(transaction: &rusqlite::Transaction<'_>) 
                 prefix_generation,
                 start_offset
             )
+        ) WITHOUT ROWID;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn ensure_session_token_anchor_recovery_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_token_anchor_recoveries (
+            recovery_id TEXT PRIMARY KEY CHECK (
+                length(recovery_id) = 64
+                AND recovery_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            payload_json TEXT NOT NULL CHECK (length(payload_json) BETWEEN 2 AND 1048576)
         ) WITHOUT ROWID;
         "#,
     )?;
@@ -8630,6 +9351,7 @@ impl UsageStore {
         ensure_session_cumulative_recovery_schema(&transaction)?;
         ensure_session_timeline_recovery_schema(&transaction)?;
         ensure_session_pending_range_schema(&transaction)?;
+        ensure_session_token_anchor_recovery_schema(&transaction)?;
         ensure_session_event_schema(&transaction)?;
         ensure_session_task_event_schema(&transaction)?;
         ensure_active_thread_snapshot_schema(&transaction)?;
@@ -8698,6 +9420,7 @@ impl UsageStore {
         ensure_session_cumulative_recovery_schema(&transaction)?;
         ensure_session_timeline_recovery_schema(&transaction)?;
         ensure_session_pending_range_schema(&transaction)?;
+        ensure_session_token_anchor_recovery_schema(&transaction)?;
         ensure_session_event_schema(&transaction)?;
         ensure_session_task_event_schema(&transaction)?;
         ensure_active_thread_snapshot_schema(&transaction)?;
@@ -9086,13 +9809,13 @@ impl UsageStore {
         ensure_collection_generation_live_quota_schema(&transaction, true)?;
         if version == LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION
             || version == MODEL_PRICING_PREVIOUS_SCHEMA_VERSION
+            || version == SESSION_TOKEN_ANCHOR_PREVIOUS_SCHEMA_VERSION
         {
-            // Version 10 and the immediately preceding canonical schema
-            // already have single-table history and sidecar constraints. This
-            // adds the independent live quota deadline when needed and the
-            // nullable pricing columns; rewriting history would add cost
-            // without changing any accepted row.
+            // Versions 10 through 12 already have canonical single-table
+            // history. Add only the columns/tables introduced by the selected
+            // versions; rewriting accepted history would change no authority.
             ensure_usage_model_history_schema(&transaction)?;
+            ensure_session_token_anchor_recovery_schema(&transaction)?;
             stamp_current_account_db_schema(&transaction)?;
             validate_canonical_history_storage(&transaction)?;
             validate_storage_partition(&transaction, identity)?;
@@ -9110,6 +9833,7 @@ impl UsageStore {
         ensure_session_cumulative_recovery_schema(&transaction)?;
         ensure_session_timeline_recovery_schema(&transaction)?;
         ensure_session_pending_range_schema(&transaction)?;
+        ensure_session_token_anchor_recovery_schema(&transaction)?;
         ensure_session_event_schema(&transaction)?;
         ensure_session_task_event_schema(&transaction)?;
         ensure_active_thread_snapshot_schema(&transaction)?;
@@ -10671,6 +11395,74 @@ impl UsageStore {
         Ok(rows)
     }
 
+    /// Loads the immutable source anchors whose replacement prefixes remain
+    /// unresolved. A row is accepted only when its payload and stable ID
+    /// validate as the same pending evidence and cursor persisted by writer.
+    pub fn load_session_token_anchor_recoveries(&self) -> Result<Vec<SessionTokenAnchorRecovery>> {
+        let mut statement = self.connection.prepare(
+            "SELECT recovery_id, payload_json FROM session_token_anchor_recoveries
+             ORDER BY recovery_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let recovery_id = row.get::<_, String>(0)?;
+                let payload = row.get::<_, String>(1)?;
+                decode_session_token_anchor_recovery(&recovery_id, &payload)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for recovery in &rows {
+            validate_session_token_anchor_recovery(recovery)?;
+            if !session_pending_range_exists(&self.connection, &recovery.pending)? {
+                return Err(UsageStoreError::InvalidImport(
+                    "session token anchor has no matching pending evidence".into(),
+                ));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Verifies that the collection transaction either retained every
+    /// unresolved cursor or atomically removed both marker rows for each
+    /// exact anchor match.
+    pub fn verify_session_token_anchor_batch(
+        &self,
+        recoveries: &[SessionTokenAnchorRecovery],
+        resolutions: &[SessionTokenAnchorResolution],
+    ) -> Result<bool> {
+        let durable = self.load_session_token_anchor_recoveries()?;
+        if recoveries
+            .iter()
+            .any(|expected| !durable.iter().any(|actual| actual == expected))
+        {
+            return Ok(false);
+        }
+        for resolution in resolutions {
+            if durable
+                .iter()
+                .any(|recovery| recovery.recovery_id == resolution.recovery_id)
+            {
+                return Ok(false);
+            }
+            let pending_count: i64 = self.connection.query_row(
+                "SELECT COUNT(*) FROM session_pending_ranges
+                 WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+                   AND file_inode=?4 AND reason='checkpoint-token-anchor-missing'",
+                params![
+                    &resolution.accepted_range.root_identity,
+                    &resolution.accepted_range.relative_path,
+                    resolution.accepted_range.file_device.to_string(),
+                    resolution.accepted_range.file_inode.to_string(),
+                ],
+                |row| row.get(0),
+            )?;
+            if pending_count != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Read the accepted source ranges for commit acknowledgement.  A
     /// recorder must verify that every range it submitted is durable before
     /// acknowledging the corresponding source checkpoint.
@@ -12035,6 +12827,8 @@ impl UsageStore {
                 cumulative_recovery: None,
                 timeline_recovery: None,
                 pending_ranges: None,
+                token_anchor_recoveries: None,
+                token_anchor_resolutions: None,
                 events: None,
                 task_events: None,
                 task_indexed_ranges: None,
@@ -12059,6 +12853,8 @@ impl UsageStore {
                 cumulative_recovery: None,
                 timeline_recovery: None,
                 pending_ranges: None,
+                token_anchor_recoveries: None,
+                token_anchor_resolutions: None,
                 events: None,
                 task_events: None,
                 task_indexed_ranges: None,
@@ -12084,6 +12880,8 @@ impl UsageStore {
                 cumulative_recovery: Some(recovery),
                 timeline_recovery: None,
                 pending_ranges: None,
+                token_anchor_recoveries: None,
+                token_anchor_resolutions: None,
                 events: None,
                 task_events: None,
                 task_indexed_ranges: None,
@@ -12108,6 +12906,8 @@ impl UsageStore {
                 cumulative_recovery: None,
                 timeline_recovery: Some(recovery),
                 pending_ranges: None,
+                token_anchor_recoveries: None,
+                token_anchor_resolutions: None,
                 events: None,
                 task_events: None,
                 task_indexed_ranges: None,
@@ -12133,6 +12933,8 @@ impl UsageStore {
                 cumulative_recovery: None,
                 timeline_recovery: None,
                 pending_ranges: Some(pending_ranges),
+                token_anchor_recoveries: None,
+                token_anchor_resolutions: None,
                 events: None,
                 task_events: None,
                 task_indexed_ranges: None,
@@ -12157,6 +12959,8 @@ impl UsageStore {
                 cumulative_recovery: None,
                 timeline_recovery: Some(recovery),
                 pending_ranges: Some(pending_ranges),
+                token_anchor_recoveries: None,
+                token_anchor_resolutions: None,
                 events: None,
                 task_events: None,
                 task_indexed_ranges: None,
@@ -12183,6 +12987,8 @@ impl UsageStore {
                 cumulative_recovery: None,
                 timeline_recovery: None,
                 pending_ranges: Some(pending_ranges),
+                token_anchor_recoveries: None,
+                token_anchor_resolutions: None,
                 events: Some(events),
                 task_events: None,
                 task_indexed_ranges: None,
@@ -12207,6 +13013,8 @@ impl UsageStore {
                 cumulative_recovery: None,
                 timeline_recovery: Some(recovery),
                 pending_ranges: Some(pending_ranges),
+                token_anchor_recoveries: None,
+                token_anchor_resolutions: None,
                 events: Some(events),
                 task_events: None,
                 task_indexed_ranges: None,
@@ -12233,6 +13041,8 @@ impl UsageStore {
                 cumulative_recovery: None,
                 timeline_recovery: None,
                 pending_ranges: Some(evidence.pending_ranges),
+                token_anchor_recoveries: Some(evidence.token_anchor_recoveries),
+                token_anchor_resolutions: Some(evidence.token_anchor_resolutions),
                 events: Some(evidence.events),
                 task_events: Some(evidence.task_events),
                 task_indexed_ranges: Some(evidence.task_indexed_ranges),
@@ -12256,6 +13066,8 @@ impl UsageStore {
                 cumulative_recovery: None,
                 timeline_recovery: Some(recovery),
                 pending_ranges: Some(evidence.pending_ranges),
+                token_anchor_recoveries: Some(evidence.token_anchor_recoveries),
+                token_anchor_resolutions: Some(evidence.token_anchor_resolutions),
                 events: Some(evidence.events),
                 task_events: Some(evidence.task_events),
                 task_indexed_ranges: Some(evidence.task_indexed_ranges),
@@ -12274,6 +13086,8 @@ impl UsageStore {
             cumulative_recovery,
             timeline_recovery,
             pending_ranges,
+            token_anchor_recoveries,
+            token_anchor_resolutions,
             events,
             task_events,
             task_indexed_ranges,
@@ -12379,6 +13193,94 @@ impl UsageStore {
             {
                 return Err(UsageStoreError::InvalidImport(
                     "duplicate session pending range".into(),
+                ));
+            }
+        }
+        let mut canonical_token_anchor_recoveries = BTreeMap::new();
+        for recovery in token_anchor_recoveries.unwrap_or(&[]) {
+            validate_session_token_anchor_recovery(recovery)?;
+            if recovery.cursor_collector_epoch != collector_epoch
+                || recovery.cursor_cycle_seq != cycle_seq
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "session token anchor cursor generation mismatch".into(),
+                ));
+            }
+            let checkpoint_matches = canonical_checkpoints.values().any(|checkpoint| {
+                checkpoint.root_identity == recovery.current_root_identity
+                    && checkpoint.relative_path == recovery.current_relative_path
+                    && checkpoint.file_device == recovery.current_file_device
+                    && checkpoint.file_inode == recovery.current_file_inode
+                    && checkpoint.committed_offset == recovery.cursor_offset
+                    && checkpoint.prefix_generation == recovery.cursor_prefix_generation
+                    && checkpoint.collector_epoch == recovery.cursor_collector_epoch
+                    && checkpoint.cycle_seq == recovery.cursor_cycle_seq
+            });
+            if !checkpoint_matches {
+                return Err(UsageStoreError::InvalidImport(
+                    "session token anchor has no matching source cursor".into(),
+                ));
+            }
+            if let Some(current_pending) = canonical_pending_ranges.values().find(|pending| {
+                pending.root_identity == recovery.pending.root_identity
+                    && pending.relative_path == recovery.pending.relative_path
+                    && pending.file_device == recovery.pending.file_device
+                    && pending.file_inode == recovery.pending.file_inode
+                    && pending.prefix_generation == recovery.pending.prefix_generation
+                    && pending.start_offset == recovery.pending.start_offset
+            }) {
+                if current_pending != &recovery.pending {
+                    return Err(UsageStoreError::InvalidImport(
+                        "session token anchor pending evidence changed".into(),
+                    ));
+                }
+            }
+            if canonical_token_anchor_recoveries
+                .insert(recovery.recovery_id.clone(), recovery.clone())
+                .is_some()
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "duplicate session token anchor recovery".into(),
+                ));
+            }
+        }
+        let mut canonical_token_anchor_resolutions = BTreeMap::new();
+        for resolution in token_anchor_resolutions.unwrap_or(&[]) {
+            validate_sha256(&resolution.recovery_id, "session token anchor recovery")?;
+            validate_session_range(&resolution.accepted_range)?;
+            if resolution.matched_start_offset >= resolution.matched_end_offset
+                || resolution.matched_end_offset > i64::MAX as u64
+                || resolution.accepted_range.start_offset > resolution.matched_start_offset
+                || resolution.accepted_range.end_offset < resolution.matched_end_offset
+                || !canonical_ranges
+                    .values()
+                    .any(|range| range == &resolution.accepted_range)
+                || canonical_token_anchor_recoveries.contains_key(&resolution.recovery_id)
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "session token anchor resolution is invalid".into(),
+                ));
+            }
+            if canonical_token_anchor_resolutions
+                .insert(resolution.recovery_id.clone(), resolution.clone())
+                .is_some()
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "duplicate session token anchor resolution".into(),
+                ));
+            }
+        }
+        for resolution in canonical_token_anchor_resolutions.values() {
+            if canonical_pending_ranges.values().any(|pending| {
+                pending.root_identity == resolution.accepted_range.root_identity
+                    && pending.relative_path == resolution.accepted_range.relative_path
+                    && pending.file_device == resolution.accepted_range.file_device
+                    && pending.file_inode == resolution.accepted_range.file_inode
+                    && pending.prefix_generation == resolution.accepted_range.prefix_generation
+                    && pending.start_offset == resolution.accepted_range.start_offset
+            }) {
+                return Err(UsageStoreError::InvalidImport(
+                    "resolved token anchor range remains pending".into(),
                 ));
             }
         }
@@ -12748,11 +13650,20 @@ impl UsageStore {
                     &observation_source_timestamps,
                 )?;
                 upsert_observation_model_totals(&transaction, &replay_observations, true, None)?;
+                resolve_session_token_anchor_recoveries(
+                    &transaction,
+                    &canonical_token_anchor_resolutions,
+                    None,
+                )?;
                 replace_session_pending_ranges(
                     &transaction,
                     &canonical_pending_ranges,
                     &canonical_ranges,
                     replace_incomplete_pending_ranges,
+                )?;
+                upsert_session_token_anchor_recoveries(
+                    &transaction,
+                    &canonical_token_anchor_recoveries,
                 )?;
                 upsert_session_events(&transaction, &canonical_events)?;
                 upsert_session_task_indexed_ranges(&transaction, &canonical_task_indexed_ranges)?;
@@ -12893,12 +13804,18 @@ impl UsageStore {
                 ])?;
             }
         }
+        resolve_session_token_anchor_recoveries(
+            &transaction,
+            &canonical_token_anchor_resolutions,
+            Some(&canonical_checkpoints),
+        )?;
         replace_session_pending_ranges(
             &transaction,
             &canonical_pending_ranges,
             &canonical_ranges,
             replace_incomplete_pending_ranges,
         )?;
+        upsert_session_token_anchor_recoveries(&transaction, &canonical_token_anchor_recoveries)?;
         upsert_session_events(&transaction, &canonical_events)?;
         upsert_session_task_indexed_ranges(&transaction, &canonical_task_indexed_ranges)?;
         upsert_session_task_events(&transaction, &canonical_task_events)?;
@@ -14600,11 +15517,7 @@ mod tests {
         }
         drop(store);
 
-        let legacy_version = if HISTORY_CANONICAL_SCHEMA_VERSION > 11 {
-            HISTORY_CANONICAL_SCHEMA_VERSION - 1
-        } else {
-            HISTORY_CANONICAL_SCHEMA_VERSION
-        };
+        let legacy_version = MODEL_PRICING_PREVIOUS_SCHEMA_VERSION;
         let connection = Connection::open(&path).unwrap();
         let pricing_columns_present: bool = connection
             .query_row(
@@ -14651,6 +15564,411 @@ mod tests {
         assert_eq!(saved_sol_usd, 0.0005);
         assert_eq!(saved_model_usd, None);
         assert_eq!(saved_revision, None);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn session_token_anchor_v12_migration_adds_table_without_rewriting_saved_rows() {
+        let path = database_path("session-token-anchor-v12-migration");
+        let identity = partition_identity('d', 575);
+        let reset_at = 1_800_604_800_i64;
+        let timestamp = 1_800_000_000_i64;
+        let history = sample(timestamp, reset_at, Some(72.0), 3.25);
+        let source = recorded_source("2026/09/anchor-migration.jsonl", 575);
+        let mut source_checkpoint = checkpoint(&source, 12);
+        source_checkpoint.cycle_seq = 7;
+        let pending = SessionPendingRange {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            start_offset: 0,
+            end_offset: 12,
+            collector_epoch: source_checkpoint.collector_epoch,
+            cycle_seq: source_checkpoint.cycle_seq,
+            prefix_generation: source_checkpoint.prefix_generation,
+            record_sha256: "ab".repeat(32),
+            parser_version: "codex-info-session-recorder-v3".to_owned(),
+            reason: "checkpoint-token-anchor-missing".to_owned(),
+            complete: true,
+        };
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let model = SessionModelTotal {
+            model: "SOL".to_owned(),
+            total_tokens: 100,
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        };
+        let mut observation =
+            UsageHistoryObservation::confirmed_with_models(&history, vec![model.clone()]);
+        observation.sol_dollars = Some(history.sol_dollars);
+        store
+            .commit_session_collection_with_task_evidence(
+                SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: source_checkpoint.collector_epoch,
+                    cycle_seq: source_checkpoint.cycle_seq,
+                    samples: std::slice::from_ref(&history),
+                    checkpoints: std::slice::from_ref(&source_checkpoint),
+                    ranges: &[],
+                    model_totals: std::slice::from_ref(&model),
+                    recorded_sessions: &[],
+                },
+                &[observation],
+                reset_at,
+                SessionTaskEvidenceInput {
+                    events: &[],
+                    pending_ranges: std::slice::from_ref(&pending),
+                    token_anchor_recoveries: &[],
+                    token_anchor_resolutions: &[],
+                    task_events: &[],
+                    task_indexed_ranges: &[],
+                },
+            )
+            .unwrap();
+        let before_history = store.load_all_raw().unwrap();
+        let before_state = store.load_session_collection_state().unwrap();
+        let before_pending = store.load_session_pending_ranges().unwrap();
+        let before_model_groups = load_history_model_groups(&store.connection)
+            .unwrap()
+            .into_iter()
+            .map(|group| {
+                (
+                    group.timestamp,
+                    group.reset_at,
+                    group.source_timestamp,
+                    group.source_reset_at,
+                    group.totals,
+                    group.complete,
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE IF EXISTS session_token_anchor_recoveries;
+                 PRAGMA user_version=12;",
+            )
+            .unwrap();
+        drop(connection);
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+
+        assert!(
+            UsageStore::migrate_partition_history_after_verified_backup(&path, &identity, &backup)
+                .unwrap(),
+            "schema 12 must migrate to the additive source-anchor schema"
+        );
+        let migrated = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(migrated.load_all_raw().unwrap(), before_history);
+        assert_eq!(
+            migrated.load_session_collection_state().unwrap(),
+            before_state
+        );
+        assert_eq!(
+            migrated.load_session_pending_ranges().unwrap(),
+            before_pending
+        );
+        let migrated_model_groups = load_history_model_groups(&migrated.connection)
+            .unwrap()
+            .into_iter()
+            .map(|group| {
+                (
+                    group.timestamp,
+                    group.reset_at,
+                    group.source_timestamp,
+                    group.source_reset_at,
+                    group.totals,
+                    group.complete,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(migrated_model_groups, before_model_groups);
+        let table_exists: i64 = migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='table' AND name='session_token_anchor_recoveries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1);
+        let recovery_rows: i64 = migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_token_anchor_recoveries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovery_rows, 0);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn session_token_anchor_resolution_rolls_back_and_commits_exactly_once() {
+        let path = database_path("session-token-anchor-atomic-resolution");
+        let identity = partition_identity('f', 576);
+        let reset_at = 1_800_604_800_i64;
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let mut source = recorded_source("2026/09/anchor-atomic.jsonl", 31);
+        source.file_bytes = 20;
+        let mut unresolved_checkpoint = checkpoint(&source, 20);
+        unresolved_checkpoint.prefix_sha256 = "22".repeat(32);
+        let initial_range = SessionRange {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            start_offset: 0,
+            end_offset: 20,
+            collector_epoch: unresolved_checkpoint.collector_epoch,
+            cycle_seq: unresolved_checkpoint.cycle_seq,
+            prefix_generation: unresolved_checkpoint.prefix_generation,
+            record_sha256: unresolved_checkpoint.prefix_sha256.clone(),
+        };
+        let pending = SessionPendingRange {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            start_offset: 0,
+            end_offset: 20,
+            collector_epoch: unresolved_checkpoint.collector_epoch,
+            cycle_seq: unresolved_checkpoint.cycle_seq,
+            prefix_generation: unresolved_checkpoint.prefix_generation,
+            record_sha256: "33".repeat(32),
+            parser_version: "codex-info-session-recorder-v3".to_owned(),
+            reason: "checkpoint-token-anchor-missing".to_owned(),
+            complete: true,
+        };
+        let anchor = SessionTokenAnchor {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: 30,
+            prefix_generation: 0x1111,
+            committed_offset: 12,
+            prefix_sha256: "44".repeat(32),
+            collector_epoch: unresolved_checkpoint.collector_epoch,
+            cycle_seq: 9,
+            fully_attributed_from_zero: true,
+            total_tokens: 20,
+            input_tokens: 12,
+            cached_input_tokens: 2,
+            output_tokens: 8,
+            cache_write_input_tokens: Some(0),
+        };
+        let recovery = SessionTokenAnchorRecovery {
+            recovery_id: session_token_anchor_recovery_id(&pending, &anchor),
+            pending: pending.clone(),
+            anchor: anchor.clone(),
+            current_root_identity: source.root_identity.clone(),
+            current_relative_path: source.relative_path.clone(),
+            current_file_device: source.file_device,
+            current_file_inode: source.file_inode,
+            cursor_offset: unresolved_checkpoint.committed_offset,
+            cursor_prefix_generation: unresolved_checkpoint.prefix_generation,
+            cursor_collector_epoch: unresolved_checkpoint.collector_epoch,
+            cursor_cycle_seq: unresolved_checkpoint.cycle_seq,
+        };
+        store
+            .commit_session_collection_with_task_evidence(
+                SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: unresolved_checkpoint.collector_epoch,
+                    cycle_seq: unresolved_checkpoint.cycle_seq,
+                    samples: &[],
+                    checkpoints: std::slice::from_ref(&unresolved_checkpoint),
+                    ranges: std::slice::from_ref(&initial_range),
+                    model_totals: &[],
+                    recorded_sessions: &[],
+                },
+                &[],
+                reset_at,
+                SessionTaskEvidenceInput {
+                    events: &[],
+                    pending_ranges: std::slice::from_ref(&pending),
+                    token_anchor_recoveries: std::slice::from_ref(&recovery),
+                    token_anchor_resolutions: &[],
+                    task_events: &[],
+                    task_indexed_ranges: &[],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session_token_anchor_recoveries()
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&recovery)
+        );
+        assert_eq!(
+            store.load_session_pending_ranges().unwrap().as_slice(),
+            std::slice::from_ref(&pending)
+        );
+
+        let mut resolved_checkpoint = unresolved_checkpoint.clone();
+        resolved_checkpoint.cycle_seq = 2;
+        resolved_checkpoint.committed_offset = 40;
+        let accepted_range = SessionRange {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            start_offset: 20,
+            end_offset: 40,
+            collector_epoch: resolved_checkpoint.collector_epoch,
+            cycle_seq: resolved_checkpoint.cycle_seq,
+            prefix_generation: resolved_checkpoint.prefix_generation,
+            record_sha256: "55".repeat(32),
+        };
+        let event = SessionEvent {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            prefix_generation: accepted_range.prefix_generation,
+            range_start: accepted_range.start_offset,
+            range_end: accepted_range.end_offset,
+            record_sha256: accepted_range.record_sha256.clone(),
+            event_index: 1,
+            timestamp: 1_800_000_010,
+            model: "SOL".to_owned(),
+            total_tokens: 5,
+            input_tokens: 5,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        };
+        let resolution = SessionTokenAnchorResolution {
+            recovery_id: recovery.recovery_id.clone(),
+            matched_start_offset: 22,
+            matched_end_offset: 30,
+            total_tokens: anchor.total_tokens,
+            input_tokens: anchor.input_tokens,
+            cached_input_tokens: anchor.cached_input_tokens,
+            output_tokens: anchor.output_tokens,
+            cache_write_input_tokens: anchor.cache_write_input_tokens,
+            accepted_range: accepted_range.clone(),
+        };
+        let resolved_model_total = SessionModelTotal {
+            model: "SOL".to_owned(),
+            total_tokens: 5,
+            input_tokens: 5,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        };
+        let trigger = "CREATE TRIGGER reject_token_anchor_resolution
+                       BEFORE DELETE ON session_token_anchor_recoveries
+                       BEGIN SELECT RAISE(ABORT, 'injected anchor resolution failure'); END;";
+        store.connection.execute_batch(trigger).unwrap();
+        let failed = store.commit_session_collection_with_task_evidence(
+            SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: resolved_checkpoint.collector_epoch,
+                cycle_seq: resolved_checkpoint.cycle_seq,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&resolved_checkpoint),
+                ranges: std::slice::from_ref(&accepted_range),
+                model_totals: std::slice::from_ref(&resolved_model_total),
+                recorded_sessions: &[],
+            },
+            &[],
+            reset_at,
+            SessionTaskEvidenceInput {
+                events: std::slice::from_ref(&event),
+                pending_ranges: &[],
+                token_anchor_recoveries: &[],
+                token_anchor_resolutions: std::slice::from_ref(&resolution),
+                task_events: &[],
+                task_indexed_ranges: &[],
+            },
+        );
+        assert!(
+            failed.is_err(),
+            "injected resolution failure must abort the collection"
+        );
+        assert_eq!(store.load_session_collection_state().unwrap().cycle_seq, 1);
+        assert_eq!(
+            store.load_session_pending_ranges().unwrap().as_slice(),
+            std::slice::from_ref(&pending)
+        );
+        assert_eq!(
+            store
+                .load_session_token_anchor_recoveries()
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&recovery)
+        );
+        assert_eq!(store.load_session_events().unwrap(), []);
+        assert_eq!(
+            store.load_session_ranges().unwrap().as_slice(),
+            std::slice::from_ref(&initial_range)
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_token_anchor_resolution")
+            .unwrap();
+
+        let commit = || SessionCollectionCommit {
+            reset_at,
+            window_seconds: 604_800,
+            collector_epoch: resolved_checkpoint.collector_epoch,
+            cycle_seq: resolved_checkpoint.cycle_seq,
+            samples: &[],
+            checkpoints: std::slice::from_ref(&resolved_checkpoint),
+            ranges: std::slice::from_ref(&accepted_range),
+            model_totals: std::slice::from_ref(&resolved_model_total),
+            recorded_sessions: &[],
+        };
+        let evidence = || SessionTaskEvidenceInput {
+            events: std::slice::from_ref(&event),
+            pending_ranges: &[],
+            token_anchor_recoveries: &[],
+            token_anchor_resolutions: std::slice::from_ref(&resolution),
+            task_events: &[],
+            task_indexed_ranges: &[],
+        };
+        let success = store
+            .commit_session_collection_with_task_evidence(commit(), &[], reset_at, evidence())
+            .unwrap();
+        assert_eq!(success.data_generation, 2);
+        assert!(store.load_session_pending_ranges().unwrap().is_empty());
+        assert!(store
+            .load_session_token_anchor_recoveries()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.load_session_events().unwrap().as_slice(),
+            std::slice::from_ref(&event)
+        );
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .model_totals
+                .as_slice(),
+            std::slice::from_ref(&resolved_model_total)
+        );
+
+        let replay = store
+            .commit_session_collection_with_task_evidence(commit(), &[], reset_at, evidence())
+            .unwrap();
+        assert_eq!(replay.data_generation, success.data_generation);
+        assert_eq!(store.load_session_events().unwrap(), [event]);
+        assert!(store
+            .verify_session_token_anchor_batch(&[], &[resolution])
+            .unwrap());
         remove_database(&path);
     }
 
@@ -15354,6 +16672,10 @@ mod tests {
         store
             .connection
             .execute("DROP TABLE session_events", [])
+            .unwrap();
+        store
+            .connection
+            .execute("DROP TABLE session_token_anchor_recoveries", [])
             .unwrap();
         store
             .connection
@@ -16460,6 +17782,7 @@ mod tests {
             .execute_batch(
                 "DROP TABLE session_task_events;
                  DROP TABLE session_task_indexed_ranges;
+                 DROP TABLE session_token_anchor_recoveries;
                  PRAGMA user_version = 7;",
             )
             .unwrap();
@@ -16540,6 +17863,8 @@ mod tests {
                 SessionTaskEvidenceInput {
                     events: &[],
                     pending_ranges: &[],
+                    token_anchor_recoveries: &[],
+                    token_anchor_resolutions: &[],
                     task_events: &[],
                     task_indexed_ranges: std::slice::from_ref(&indexed),
                 },
@@ -16571,6 +17896,8 @@ mod tests {
                 SessionTaskEvidenceInput {
                     events: &[],
                     pending_ranges: &[],
+                    token_anchor_recoveries: &[],
+                    token_anchor_resolutions: &[],
                     task_events: &[],
                     task_indexed_ranges: std::slice::from_ref(&indexed),
                 },
@@ -16641,6 +17968,8 @@ mod tests {
                 SessionTaskEvidenceInput {
                     events: &[],
                     pending_ranges: &[],
+                    token_anchor_recoveries: &[],
+                    token_anchor_resolutions: &[],
                     task_events: &[],
                     task_indexed_ranges: std::slice::from_ref(&indexed),
                 },
@@ -21994,7 +23323,7 @@ mod wave_b_correction_tests {
 
     #[test]
     fn issue_362_checkpoint_schema_accepts_only_supported_legacy_shapes() {
-        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
         const SHAPE_MATRIX: &[(usize, &[i64])] = &[
             (22, SUPPORTED_VERSIONS),
             (21, &[]),

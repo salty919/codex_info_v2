@@ -3,6 +3,7 @@
 
 using System.Diagnostics;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Updates;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
@@ -64,6 +65,49 @@ public sealed class PreviewEnvironmentTests
         Assert.Contains(details.Snapshot.Threads, thread => thread.IsOrphan);
         Assert.Contains(details.Snapshot.Threads, thread => thread.ParentId == "preview-root");
         Assert.True(details.Snapshot.EstimatedCostLabel.Length > 0);
+    }
+
+    [Fact]
+    public async Task PreviewMainModelBreakdownContainsSevenExactModelsAndOtherBucket()
+    {
+        await WithPreviewScenarioAsync("model-breakdown", async () =>
+        {
+            using var client = new PreviewLoopbackClient();
+            var detailsResult = await client.FetchDetailsAsync(CancellationToken.None);
+            var details = Assert.IsType<ApiDetailsSnapshot>(detailsResult.Snapshot);
+            Assert.Equal("v3", details.ApiVersion);
+            Assert.Equal("概算 —", details.EstimatedCostLabel);
+            Assert.Equal(
+                [
+                    "gpt-5.6-terra",
+                    "gpt-6-astra",
+                    "gpt-6.1-sol",
+                    "gpt-6-sol",
+                    "gpt-5.6-sol",
+                    "gpt-6-luna",
+                    "gpt-5.6-luna",
+                    "gpt-6-terra",
+                    "future-preview-model",
+                ],
+                details.Models.Select(model => model.Name));
+
+            using var viewModel = new MainWindowViewModel(client);
+            viewModel.Start();
+            await EventuallyAsync(() => viewModel.IsAuthenticated &&
+                !viewModel.IsStartupLoading && viewModel.Models.Count == 8);
+
+            Assert.Equal(
+                ["gpt-5.6-terra", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-6-luna", "gpt-5.6-luna", "Other"],
+                viewModel.Models.Select(model => model.Name));
+            Assert.Equal(
+                ["5.6 Tera", "6 Astra", "6.1 Sol", "6 Sol", "5.6 Sol", "6 Luna", "5.6 Luna", LocalizationService.Current.Other],
+                viewModel.Models.Select(model =>
+                    model.GetType().GetProperty("DisplayName")?.GetValue(model) as string ?? "<missing-label>"));
+            Assert.Equal(
+                ["$0.70", "$0.60", "$0.50", "$0.40", "$0.30", "$0.20", "$0.10"],
+                viewModel.Models.Take(7).Select(model => model.TotalDollarsText));
+            Assert.Equal(LocalizationService.Current.UnavailableValue, viewModel.Models[^1].TotalDollarsText);
+        });
     }
 
     [Fact]
