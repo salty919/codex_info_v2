@@ -3316,6 +3316,218 @@ mod tests {
     }
 
     #[test]
+    fn issue_575_completed_inventory_publishes_ready_in_same_cycle() {
+        use codex_info_db_writer::{StoragePartitionIdentity, UsageStore};
+        use codex_info_recorder::{QuotaSnapshot, Recorder, RecorderConfig};
+        use std::io::Write;
+
+        const NOW: i64 = 2_000_000_040;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let source = sessions.join("one.jsonl");
+        let database = root.path().join("history.sqlite3");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 1,
+            partition_id: "33".repeat(32),
+        };
+        drop(UsageStore::create_partitioned(&database, &identity).unwrap());
+        let token = |value: u64, time: i64| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "event_msg",
+                    "timestamp": chrono::DateTime::<chrono::Utc>::from_timestamp(time, 0).unwrap().to_rfc3339(),
+                    "payload": {"type": "token_count", "info": {"total_token_usage": {
+                        "total_tokens": value, "input_tokens": value,
+                        "cached_input_tokens": 0, "output_tokens": 0
+                    }}}
+                })
+            )
+        };
+        let model = "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6-astra\"}}\n";
+        fs::write(
+            &source,
+            format!("{model}{}{}", token(10, NOW - 120), token(20, NOW - 60)),
+        )
+        .unwrap();
+        let initial_source_len = fs::metadata(&source).unwrap().len();
+        let open = |chunk_bytes| {
+            Recorder::open_partitioned(
+                RecorderConfig {
+                    sessions_root: sessions.clone(),
+                    chunk_bytes,
+                },
+                &database,
+                &identity,
+            )
+            .unwrap()
+        };
+        let quota = |observed_at| {
+            Some(QuotaSnapshot {
+                observed_at,
+                reset_at: NOW + 3600,
+                window_seconds: 7200,
+                remaining_percent: Some(72.0),
+            })
+        };
+
+        let mut initial = open(4096);
+        initial.run_cycle_with_quota(quota(NOW)).unwrap().unwrap();
+        drop(initial);
+
+        let first_append = token(30, NOW + 60);
+        let second_append = token(40, NOW + 120);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{first_append}{second_append}").as_bytes())
+            .unwrap();
+        let mut bounded = open(first_append.len() as u64);
+        let backlog = bounded
+            .run_cycle_with_quota(quota(NOW + 180))
+            .unwrap()
+            .unwrap();
+        assert!(
+            backlog.pending_ranges > 0,
+            "the small chunk must leave unread source bytes"
+        );
+        let bounded_checkpoint_offset: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT MAX(committed_offset) FROM session_checkpoints WHERE relative_path='one.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bounded_checkpoint_offset as u64,
+            initial_source_len + first_append.len() as u64
+        );
+        drop(bounded);
+
+        let reader_identity = codex_info_db_reader::StoragePartitionIdentity {
+            schema_version: identity.schema_version.clone(),
+            profile_scope_id: identity.profile_scope_id.clone(),
+            account_scope_id: identity.account_scope_id.clone(),
+            storage_epoch: identity.storage_epoch,
+            partition_id: identity.partition_id.clone(),
+        };
+        let reader = DbReader::open_partitioned(&database, &reader_identity).unwrap();
+        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let get = |route: &str| {
+            request(
+                server.local_addr(),
+                &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            )
+        };
+        let incomplete_response = get("/v3/current");
+        let incomplete: Value = serde_json::from_str(body(&incomplete_response)).unwrap();
+        assert_eq!(incomplete["state"], "error");
+        assert_eq!(incomplete["models"][0]["total_tokens"], 20);
+        assert_eq!(incomplete["models"][0]["model"], "gpt-6-astra");
+
+        let generation_before: u64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT CAST(data_generation AS INTEGER) FROM collection_generation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut recovered = open(4096);
+        let caught_up = recovered
+            .run_cycle_with_quota(quota(NOW + 240))
+            .unwrap()
+            .unwrap();
+        assert_eq!(caught_up.pending_ranges, 0);
+        assert_eq!(caught_up.generation, generation_before + 1);
+
+        let connection = Connection::open(&database).unwrap();
+        let published_generation: String = connection
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(published_generation, caught_up.generation.to_string());
+        let checkpoint_offset: i64 = connection
+            .query_row(
+                "SELECT MAX(committed_offset) FROM session_checkpoints WHERE relative_path='one.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            checkpoint_offset as u64,
+            fs::metadata(&source).unwrap().len()
+        );
+        let pending_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM session_pending_ranges", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending_count, 0);
+        let (astra_total, models_complete): (String, i64) = connection
+            .query_row(
+                "SELECT total_tokens, model_set_complete FROM usage_model_history
+                 WHERE timestamp=(SELECT MAX(timestamp) FROM usage_model_history)
+                   AND model='gpt-6-astra'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(astra_total, "30");
+        assert_eq!(models_complete, 1);
+        drop(connection);
+
+        server.store().refresh();
+        let mut ready_pair = None;
+        for route in ["/v1/details", "/v2/details", "/v3/details", "/v3/current"] {
+            let response = get(route);
+            assert!(response.starts_with("HTTP/1.1 200"), "{route}: {response}");
+            let value: Value = serde_json::from_str(body(&response)).unwrap();
+            assert_eq!(value["state"], "ready", "{route}");
+            let pair = published_pair(&response);
+            if let Some(expected) = &ready_pair {
+                assert_eq!(
+                    pair, expected,
+                    "{route} must publish the recovered generation"
+                );
+            } else {
+                ready_pair = Some(pair.to_owned());
+            }
+            if route == "/v3/current" || route == "/v3/details" {
+                assert_eq!(value["models"][0]["model"], "gpt-6-astra");
+                assert_eq!(value["models"][0]["total_tokens"], 30);
+            }
+        }
+        let history_response = get(&format!("/v3/history?period={}", NOW + 3600));
+        assert_eq!(
+            published_pair(&history_response),
+            ready_pair.as_deref().unwrap()
+        );
+        let history: Value = serde_json::from_str(body(&history_response)).unwrap();
+        let tail = history["history_samples"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(tail["models_complete"], true);
+        assert_eq!(tail["models"][0]["model"], "gpt-6-astra");
+        assert_eq!(tail["models"][0]["total_tokens"], 30);
+        assert_eq!(caught_up.generation, backlog.generation + 1);
+
+        drop(recovered);
+        server.shutdown();
+    }
+
+    #[test]
     fn issue_575_latest_partial_models_and_recovery_share_one_publication() {
         let log_root = tempfile::tempdir().unwrap();
         let path = temp_db("current-model-integrity");

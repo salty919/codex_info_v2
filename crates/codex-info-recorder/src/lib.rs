@@ -3842,21 +3842,25 @@ impl Recorder {
         }
 
         // A currently committed exact anchor resolution can clear its own
-        // durable pending row in the same writer transaction. Keep every
-        // other durable or current-cycle issue incomplete; in particular,
-        // ordinary accepted-range replacement retains its conservative
-        // existing one-cycle behavior.
+        // durable pending row in the same writer transaction. Complete
+        // durable markers still require their existing proof or resolution;
+        // transient incomplete rows are superseded by this full inventory,
+        // with any unresolved current work represented by
+        // `current_cycle_unresolved`.
         let mut candidate_token_anchor_recoveries = durable_token_anchor_recoveries.clone();
         candidate_token_anchor_recoveries.extend(token_anchor_recoveries.iter().cloned());
         let candidate_model_totals_complete = !current_cycle_unresolved
-            && durable_pending.iter().all(|pending| {
-                old_epoch_no_delta_proofs.contains(pending)
-                    || pending_range_resolved_by_anchor(
-                        pending,
-                        &candidate_token_anchor_recoveries,
-                        &token_anchor_resolutions,
-                    )
-            });
+            && durable_pending
+                .iter()
+                .filter(|pending| pending.complete)
+                .all(|pending| {
+                    old_epoch_no_delta_proofs.contains(pending)
+                        || pending_range_resolved_by_anchor(
+                            pending,
+                            &candidate_token_anchor_recoveries,
+                            &token_anchor_resolutions,
+                        )
+                });
 
         let timeline_recovery = if !period_restarted && period_available {
             if let Some(identity) = self.identity.as_ref() {
