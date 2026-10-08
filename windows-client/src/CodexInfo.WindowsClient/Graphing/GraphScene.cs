@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.ViewModels;
 using System.Text;
 
 namespace CodexInfo.WindowsClient.Graphing;
@@ -451,10 +452,15 @@ public sealed class GraphScene
             .Distinct(StringComparer.Ordinal)
             .OrderBy(name => name, Utf8ModelNameComparer.Instance)
             .ToArray();
-        var displayModelNames = hiddenModelNames is null
+        var visibleModelNames = hiddenModelNames is null
             ? allModelNames
             : allModelNames
-                .Where(name => !hiddenModelNames.Contains(name))
+                .Where(name =>
+                {
+                    var family = ModelUsageViewModel.DisplayFamilyName(name);
+                    return !hiddenModelNames.Contains(name) &&
+                        (family is null || !hiddenModelNames.Contains(family));
+                })
                 .ToArray();
         // Semantic evidence is derived from the complete published model
         // universe. A visibility toggle is a rendering concern only: hidden
@@ -485,7 +491,12 @@ public sealed class GraphScene
         var semanticProjection = metric == GraphMetric.Dollars
             ? dollarProjection
             : tokenProjection;
-        var displayProjection = semanticProjection.Filter(displayModelNames);
+        var rawDisplayProjection = semanticProjection.Filter(visibleModelNames);
+        var displayProjection = GroupDisplayProjection(
+            rawDisplayProjection,
+            visibleModelNames,
+            samples.Count,
+            out var displayModelNames);
         var publishedModelNames = samples
             .Select(sample => (IReadOnlySet<string>)(sample.IsSyntheticTail ||
                 sample.ModelSource is ApiHistorySample.UnavailableModelSource or
@@ -601,12 +612,86 @@ public sealed class GraphScene
             idleIntervals,
             maximum,
             resetAt: resetAt,
-            hoverObservations: BuildHoverObservations(samples, points));
+            hoverObservations: BuildHoverObservations(samples, points, allModelNames));
+    }
+
+    private static ModelProjection GroupDisplayProjection(
+        ModelProjection source,
+        IReadOnlyList<string> rawModelNames,
+        int sampleCount,
+        out string[] displayModelNames)
+    {
+        var groups = rawModelNames
+            .GroupBy(
+                name => ModelUsageViewModel.DisplayFamilyName(name) ?? name,
+                StringComparer.Ordinal)
+            .ToArray();
+        displayModelNames = groups.Select(group => group.Key).ToArray();
+        var values = new Dictionary<string, IReadOnlyList<double>>(StringComparer.Ordinal);
+        var reliability = new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal);
+        var lineReliability = new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal);
+        var origins = new Dictionary<string, IReadOnlyList<GraphModelOrigin>>(StringComparer.Ordinal);
+        var correctionStartsByModel = new Dictionary<string, IReadOnlySet<long>>(StringComparer.Ordinal);
+
+        foreach (var group in groups)
+        {
+            var members = group.ToArray();
+            var groupValues = new double[sampleCount];
+            var groupReliability = new bool[sampleCount];
+            var groupLineReliability = new bool[sampleCount];
+            var groupOrigins = new GraphModelOrigin[sampleCount];
+            for (var index = 0; index < sampleCount; index++)
+            {
+                var total = 0d;
+                var complete = true;
+                foreach (var name in members)
+                {
+                    var value = source.Values[name][index];
+                    if (!double.IsFinite(value) || value < 0)
+                    {
+                        complete = false;
+                        break;
+                    }
+                    total += value;
+                    if (!double.IsFinite(total))
+                    {
+                        complete = false;
+                        break;
+                    }
+                }
+
+                groupValues[index] = complete ? total : double.NaN;
+                groupReliability[index] = complete && members.All(name => source.Reliability[name][index]);
+                groupLineReliability[index] = complete && members.All(name => source.LineReliability[name][index]);
+                var memberOrigins = members.Select(name => source.Origins[name][index]).Distinct().ToArray();
+                groupOrigins[index] = memberOrigins.Length == 1 ? memberOrigins[0] : GraphModelOrigin.Unknown;
+            }
+
+            values.Add(group.Key, groupValues);
+            reliability.Add(group.Key, groupReliability);
+            lineReliability.Add(group.Key, groupLineReliability);
+            origins.Add(group.Key, groupOrigins);
+            correctionStartsByModel.Add(
+                group.Key,
+                members.SelectMany(name => source.CorrectionStartsByModel[name]).ToHashSet());
+        }
+
+        var correctionStarts = correctionStartsByModel.Values
+            .SelectMany(starts => starts)
+            .ToHashSet();
+        return new ModelProjection(
+            values,
+            reliability,
+            lineReliability,
+            origins,
+            correctionStartsByModel,
+            correctionStarts);
     }
 
     private static IReadOnlyList<GraphObservedSample> BuildHoverObservations(
         IReadOnlyList<ApiHistorySample> samples,
-        IReadOnlyList<ScenePoint> points)
+        IReadOnlyList<ScenePoint> points,
+        IReadOnlyList<string> allModelNames)
     {
         var observations = new List<GraphObservedSample>(samples.Count);
         for (var index = 0; index < samples.Count; index++)
@@ -621,30 +706,40 @@ public sealed class GraphScene
                 sample.Timestamp,
                 sample.ResetAt,
                 index,
-                ObservedModelTokens(sample, "SOL"),
-                ObservedModelTokens(sample, "TERRA"),
-                ObservedModelTokens(sample, "LUNA"),
-                ObservedModelTokens(sample, "ASTRA")));
+                ObservedModelTokens(sample, allModelNames, "SOL"),
+                ObservedModelTokens(sample, allModelNames, "TERRA"),
+                ObservedModelTokens(sample, allModelNames, "LUNA"),
+                ObservedModelTokens(sample, allModelNames, "ASTRA")));
         }
         return observations;
     }
 
-    private static ulong? ObservedModelTokens(ApiHistorySample sample, string modelName)
+    private static ulong? ObservedModelTokens(
+        ApiHistorySample sample,
+        IReadOnlyList<string> allModelNames,
+        string modelName)
     {
-        ApiHistoryModelSample? match = null;
-        foreach (var model in PublishedModels(sample))
+        var familyMembers = allModelNames
+            .Where(name => ModelUsageViewModel.DisplayFamilyName(name) == modelName)
+            .ToArray();
+        if (familyMembers.Length == 0)
         {
-            if (!string.Equals(model.Name, modelName, StringComparison.Ordinal))
-            {
-                continue;
-            }
-            if (match is not null)
+            return null;
+        }
+
+        var models = PublishedModels(sample).ToArray();
+        var total = 0UL;
+        foreach (var member in familyMembers)
+        {
+            var matching = models.Where(model => string.Equals(model.Name, member, StringComparison.Ordinal)).ToArray();
+            if (matching.Length != 1 || matching[0].TotalTokens is not { } tokens ||
+                ulong.MaxValue - total < tokens)
             {
                 return null;
             }
-            match = model;
+            total += tokens;
         }
-        return match?.TotalTokens;
+        return total;
     }
 
     private static IReadOnlyList<GraphUnusedInterval> BuildNonOwnedIntervals(
@@ -792,10 +887,46 @@ public sealed class GraphScene
         var name = ModelSeries
             .FirstOrDefault(pair => ReferenceEquals(pair.Value, values))
             .Key;
-        return name is not null && TokenModelSeries.TryGetValue(name, out var tokens) &&
-            before >= 0 && after >= 0 && before < tokens.Count && after < tokens.Count &&
-            double.IsFinite(tokens[before]) && double.IsFinite(tokens[after]) &&
-            tokens[before] != tokens[after];
+        if (name is null || before < 0 || after < 0)
+        {
+            return false;
+        }
+
+        var familyMembers = TokenModelSeries.Keys
+            .Where(modelName => ModelUsageViewModel.DisplayFamilyName(modelName) == name)
+            .ToArray();
+        if (familyMembers.Length == 0)
+        {
+            return TokenModelSeries.TryGetValue(name, out var tokens) &&
+                before < tokens.Count && after < tokens.Count &&
+                double.IsFinite(tokens[before]) && double.IsFinite(tokens[after]) &&
+                tokens[before] != tokens[after];
+        }
+
+        var beforeTotal = 0d;
+        var afterTotal = 0d;
+        foreach (var member in familyMembers)
+        {
+            if (!TokenModelSeries.TryGetValue(member, out var tokens) ||
+                !TokenReliability.TryGetValue(member, out var reliable) ||
+                before >= tokens.Count || after >= tokens.Count ||
+                before >= reliable.Count || after >= reliable.Count ||
+                !reliable[before] || !reliable[after] ||
+                !double.IsFinite(tokens[before]) || !double.IsFinite(tokens[after]))
+            {
+                return false;
+            }
+
+            beforeTotal += tokens[before];
+            afterTotal += tokens[after];
+            if (!double.IsFinite(beforeTotal) || !double.IsFinite(afterTotal))
+            {
+                return false;
+            }
+        }
+
+        // Cumulative token counts are integral; a real change is at least one token.
+        return Math.Abs(afterTotal - beforeTotal) >= 1d;
     }
 
     private static bool IsLowRateLongModelChange(

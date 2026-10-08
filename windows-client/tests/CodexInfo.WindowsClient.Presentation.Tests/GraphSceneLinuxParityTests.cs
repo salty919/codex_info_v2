@@ -122,6 +122,24 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
+    public void ExactModelHistoryUsesPersistedDollarsThenGroupsToFamily()
+    {
+        var sample = V3Sample(
+            1_000,
+            100,
+            DollarModel("gpt-6-sol", 10, 0.2),
+            DollarModel("gpt-5.6-sol", 20, 0.4));
+
+        var scene = GraphScene.Create([sample], GraphMetric.Dollars, 1_000, 1_000);
+
+        Assert.Equal(0.6, scene.Sol[0], 12);
+        Assert.Equal(0.6, scene.ModelSeries["SOL"][0], 12);
+        Assert.DoesNotContain("gpt-6-sol", scene.ModelSeries.Keys);
+        Assert.DoesNotContain("gpt-5.6-sol", scene.ModelSeries.Keys);
+        Assert.Equal(30UL, Assert.Single(scene.HoverObservations).TokensFor(GraphSeries.Sol));
+    }
+
+    [Fact]
     public void LegacyUnknownRowsRenderMeasuredLinesWithoutBecomingQuotaAuthorities()
     {
         var samples = new[]
@@ -440,6 +458,15 @@ public sealed class GraphSceneLinuxParityTests
         ulong tokens,
         ulong dollars) =>
         new(name, null, null, null, (double)dollars)
+        {
+            TotalTokens = tokens,
+        };
+
+    private static ApiHistoryModelSample DollarModel(
+        string name,
+        ulong tokens,
+        double dollars) =>
+        new(name, null, null, null, dollars)
         {
             TotalTokens = tokens,
         };

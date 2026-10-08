@@ -11,6 +11,16 @@ namespace CodexInfo.WindowsClient.ViewModels;
 
 public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
 {
+    internal static string? DisplayFamilyName(string modelName) =>
+        modelName.Trim().ToLowerInvariant() switch
+        {
+            "sol" or "gpt-6.1-sol" or "gpt-6-sol" or "gpt-5.6-sol" => "SOL",
+            "terra" or "gpt-5.6-terra" => "TERRA",
+            "luna" or "gpt-6-luna" or "gpt-5.6-luna" => "LUNA",
+            "astra" or "gpt-6-astra" => "ASTRA",
+            _ => null,
+        };
+
     public ModelUsageViewModel(ApiDetailsModelUsage usage)
         : this(
             usage.Name,

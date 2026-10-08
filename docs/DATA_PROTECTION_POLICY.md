@@ -29,6 +29,8 @@ Windows clientの設定JSONは従来のexact 6 keyを有効な旧形式として
 
 ## RECORDER-MODEL-01 — モデル追加・source障害時の記録継続
 
+- `MODEL-PRICING-463`の新規記録は正確なmodel IDを保存し、既存family keyをモデル版へ推測変換しない。canonical schema v12は`usage_model_history`へNULL許容の`total_dollars`/`price_version`を追加し、旧行はNULLのまま維持する。既にcanonicalなv11からは検証済みbackup後の列追加・version更新だけを行い、期間再分類や履歴再集計をしない。新規履歴の金額は観測時に検証済みcatalog revisionで確定し、同じ観測の再読込み・修復では保存済みrevisionまたは観測時に固定されたrevisionを使う。価格表更新で旧履歴の保存額を上書きしない。互換用の固定family金額列は既知の正確なmodel IDも従来のfamily単価で集約し、新規sidecarの旧family行には当該行だけの固定参考額を保存する。v3で固定列の全family合計と正確なIDの保存額を二重加算しない。既存物理sourceの同一byte範囲と同一token payloadが証明するreplayでは旧familyイベントを保持し、新しいmodel IDへ置換・二重計上しない。
+
 - Sessionが返す有効なmodel IDは固定allowlistで捨てず、正規化したIDごとに既存account DBへ記録する。既知の`gpt-6-astra` / `ASTRA`を含め、入力、cached入力、cache write入力、出力の各tokenを保持する。価格未登録モデルもtoken事実は保存し、価格だけを未確定とする。
 - account lifecycleの異なるSession eventを同じ累積値へ混在させない。writerはregistryの全half-open interval、保存済みevent、保存値の三者を照合し、verified backupを取得できた完全一致ケースだけで現行periodのmodel totals/historyを補正する。raw event/range/checkpointは削除せず、所属を証明できない履歴はUnavailableとして公開し、reader/UIの後付け補償を行わない。
 - `cache_write_input_tokens` の未提供と明示的な0を区別する。提供されない内訳を推測して確定値にしない。

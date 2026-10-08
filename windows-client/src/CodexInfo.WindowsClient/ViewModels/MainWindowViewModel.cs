@@ -1736,16 +1736,28 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private string FormatV3EstimatedCost(IReadOnlyList<ApiDetailsModelUsage> currentModels)
     {
-        var known = currentModels
-            .Where(model => model.HasEstimatedCost)
-            .Select(model => model.EstimatedTotalDollars!.Value)
-            .ToArray();
-        if (known.Length == 0 || known.Any(value => !double.IsFinite(value) || value < 0))
+        if (currentModels.Count == 0)
         {
             return Texts.EstimatedUnavailable;
         }
 
-        var total = known.Sum();
+        var total = 0d;
+        foreach (var model in currentModels)
+        {
+            if (!model.HasEstimatedCost ||
+                model.EstimatedTotalDollars is not { } value ||
+                !double.IsFinite(value) || value < 0)
+            {
+                return Texts.EstimatedUnavailable;
+            }
+
+            total += value;
+            if (!double.IsFinite(total))
+            {
+                return Texts.EstimatedUnavailable;
+            }
+        }
+
         var prefix = Texts.LanguageCode == "ja" ? "概算" : Texts.Dollars;
         return double.IsFinite(total)
             ? string.Create(CultureInfo.CurrentCulture, $"{prefix} ${total:N2}")
@@ -1885,7 +1897,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void ReplaceModels(IEnumerable<ApiDetailsModelUsage> source)
     {
-        var usages = source.ToArray();
+        var usages = GroupModelsForDisplay(source);
         if (usages.Length == models.Count &&
             usages.Select(usage => usage.Name).SequenceEqual(models.Select(model => model.Name), StringComparer.Ordinal))
         {
@@ -1903,6 +1915,117 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             model.Dispose();
         }
+    }
+
+    private static ApiDetailsModelUsage[] GroupModelsForDisplay(
+        IEnumerable<ApiDetailsModelUsage> source)
+    {
+        var groups = source.GroupBy(
+            model => ModelUsageViewModel.DisplayFamilyName(model.Name) ?? model.Name,
+            StringComparer.Ordinal);
+        var result = new List<ApiDetailsModelUsage>();
+        foreach (var group in groups)
+        {
+            var rows = group.ToArray();
+            if (rows.Length == 1)
+            {
+                result.Add(string.Equals(rows[0].Name, group.Key, StringComparison.Ordinal)
+                    ? rows[0]
+                    : rows[0] with { Name = group.Key });
+                continue;
+            }
+
+            if (!TrySumTokens(rows.Select(row => row.InputTokens), out var inputTokens) ||
+                !TrySumTokens(rows.Select(row => row.CachedInputTokens), out var cachedInputTokens) ||
+                !TrySumTokens(rows.Select(row => row.OutputTokens), out var outputTokens) ||
+                !TrySumTokens(rows.Select(row => row.TotalTokens), out var totalTokens))
+            {
+                // Keep exact raw rows if the family bucket cannot represent
+                // every token fact without overflow.
+                result.AddRange(rows);
+                continue;
+            }
+
+            var allPricesKnown = rows.All(row =>
+                row.HasEstimatedCost &&
+                row.EstimatedTotalDollars is { } amount &&
+                double.IsFinite(amount) && amount >= 0);
+            var cacheWriteValues = rows.Select(row => row.CacheWriteInputTokens).ToArray();
+            ulong? cacheWriteTokens = null;
+            if (cacheWriteValues.All(value => value is not null) &&
+                TrySumTokens(cacheWriteValues.Select(value => value!.Value), out var writes))
+            {
+                cacheWriteTokens = writes;
+            }
+
+            var inputDollars = allPricesKnown
+                ? SumDollars(rows.Select(row => row.InputDollars))
+                : double.NaN;
+            var cachedInputDollars = allPricesKnown
+                ? SumDollars(rows.Select(row => row.CachedInputDollars))
+                : double.NaN;
+            var outputDollars = allPricesKnown
+                ? SumDollars(rows.Select(row => row.OutputDollars))
+                : double.NaN;
+            var cacheWriteInputDollars = allPricesKnown
+                ? SumDollars(rows.Select(row => row.CacheWriteInputDollars))
+                : double.NaN;
+            var estimatedTotalDollars = allPricesKnown
+                ? SumDollars(rows.Select(row => row.EstimatedTotalDollars!.Value))
+                : double.NaN;
+
+            result.Add(new ApiDetailsModelUsage(
+                group.Key,
+                inputTokens,
+                cachedInputTokens,
+                outputTokens,
+                inputDollars,
+                cachedInputDollars,
+                outputDollars)
+            {
+                TotalTokens = totalTokens,
+                CacheWriteInputTokens = cacheWriteTokens,
+                CacheWriteInputDollars = cacheWriteInputDollars,
+                EstimatedTotalDollars = double.IsFinite(estimatedTotalDollars)
+                    ? estimatedTotalDollars
+                    : null,
+            });
+        }
+
+        return result.OrderBy(ModelOrder).ToArray();
+    }
+
+    private static bool TrySumTokens(IEnumerable<ulong> values, out ulong total)
+    {
+        total = 0;
+        foreach (var value in values)
+        {
+            if (ulong.MaxValue - total < value)
+            {
+                return false;
+            }
+
+            total += value;
+        }
+        return true;
+    }
+
+    private static double SumDollars(IEnumerable<double> values)
+    {
+        var total = 0d;
+        foreach (var value in values)
+        {
+            if (!double.IsFinite(value) || value < 0)
+            {
+                return double.NaN;
+            }
+            total += value;
+            if (!double.IsFinite(total))
+            {
+                return double.NaN;
+            }
+        }
+        return total;
     }
 
     /// <summary>
