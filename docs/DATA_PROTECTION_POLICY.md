@@ -435,8 +435,21 @@ appendやrestartで新しいpairが欠けても、既存の観測値をNULLへ�
 週切替では同じaccount/sourceの照合証拠を維持し、eventの既存period所属規則を守る。account identity境界は越えない。
 
 canonical schema v13は検証済みbackup後にこの照合sidecarを追加し、既存の履歴・金額・event・checkpoint・pendingを
-書き換えない。元anchorを保存していない旧pendingは、重複計上しないことを証明できない限り再解釈や削除をしない。
-照合失敗・transaction失敗では旧状態を保持し、照合できていない状態を完全収集として公開しない。
+書き換えない。旧pendingでも、同じaccount/collector epochに属するpending発生前の保存checkpointと、
+現在source上でhashが一致するpending原byte範囲が残っていれば、その元基準から通常のbounded収集へ復帰する。
+pending発生後のcheckpointを元anchorとして採用しない。既知の非zero基準は全token成分の一致まで加算を保留する。
+既知のzero基準では先頭から差分を収集し、存在しないzero token行を待たない。基準未取得の初期値0は既知zeroに昇格せず、
+最初の累積counterを基準としてのみ採用する。再読込みで保存済みeventを二重加算せず、他sourceの継続収集と週切替を妨げない。
+再走査cursorは旧pending範囲の終端とは独立して保持し、複数cycle・再起動でも元基準とpendingの識別を維持する。
+anchorが一致しても観測済みsource末尾まで未読部分があれば集計完了にせず、次cycleで残りを収集する。
+証拠が不足する旧pendingは削除しない。照合失敗・transaction失敗では旧状態を保持し、照合できていない状態を完全収集として公開しない。
+同じpartitionに残る別collector epochの旧pendingは、世代が違うだけでは現在集計から除外しない。
+現epochのcheckpointが元範囲を覆い、元範囲の終端から現checkpointまでに進んだ部分も、同じ物理source・現epoch・
+現prefixの保存済みaccepted rangeで隙間なく覆われていることを要する。発生前checkpoint・物理identity・原byte hash・
+完全な行境界を再検証して未計上deltaがないと証明できる場合だけ、そのcycleの現在model集合の完全性を妨げないものとする。
+既知zeroでは全counterがzero、基準未取得では最初のcounterを基準とし以後全成分同値であることを要する。
+history-base継続、未解析・不正record、counter増減、証拠不一致は証明不成立とする。旧pendingと旧履歴の不完全状態は保存し、
+旧range/event/taskを新epochとして登録せず、現checkpointから後続appendを通常収集する。
 
 ### 8.8 DP-REST-007 / RC-145 — typed generation namespace
 

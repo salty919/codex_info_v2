@@ -2397,14 +2397,12 @@ fn validate_session_token_anchor_recovery(recovery: &SessionTokenAnchorRecovery)
         || recovery.current_relative_path != recovery.pending.relative_path
         || recovery.current_file_device != recovery.pending.file_device
         || recovery.current_file_inode != recovery.pending.file_inode
-        || recovery.cursor_offset < recovery.pending.end_offset
         || recovery.cursor_offset > i64::MAX as u64
         || recovery.cursor_prefix_generation == 0
         || recovery.cursor_collector_epoch == 0
         || recovery.cursor_cycle_seq == 0
         || recovery.cursor_collector_epoch != recovery.anchor.collector_epoch
         || recovery.pending.collector_epoch != recovery.anchor.collector_epoch
-        || recovery.pending.prefix_generation != recovery.cursor_prefix_generation
         || recovery.anchor.root_identity != recovery.current_root_identity
         || recovery.anchor.relative_path != recovery.current_relative_path
         || recovery.recovery_id
@@ -5591,6 +5589,21 @@ fn resolve_session_token_anchor_recoveries(
             continue;
         };
         let recovery = decode_session_token_anchor_recovery(&resolution.recovery_id, &payload)?;
+        // A fully observed zero baseline exists at the source origin even
+        // when the log has never emitted a literal zero-token record.
+        let origin_match = resolution.matched_start_offset == 0
+            && resolution.matched_end_offset == 0
+            && resolution.accepted_range.start_offset == 0
+            && resolution.accepted_range.end_offset > 0
+            && recovery.anchor.fully_attributed_from_zero
+            && recovery.anchor.total_tokens == 0
+            && recovery.anchor.input_tokens == 0
+            && recovery.anchor.cached_input_tokens == 0
+            && recovery.anchor.output_tokens == 0
+            && recovery
+                .anchor
+                .cache_write_input_tokens
+                .is_none_or(|value| value == 0);
         if resolution.accepted_range.root_identity != recovery.current_root_identity
             || resolution.accepted_range.relative_path != recovery.current_relative_path
             || resolution.accepted_range.file_device != recovery.current_file_device
@@ -5598,7 +5611,7 @@ fn resolve_session_token_anchor_recoveries(
             || resolution.accepted_range.prefix_generation != recovery.cursor_prefix_generation
             || resolution.accepted_range.start_offset > resolution.matched_start_offset
             || resolution.accepted_range.end_offset < resolution.matched_end_offset
-            || resolution.matched_start_offset >= resolution.matched_end_offset
+            || (!origin_match && resolution.matched_start_offset >= resolution.matched_end_offset)
             || resolution.total_tokens != recovery.anchor.total_tokens
             || resolution.input_tokens != recovery.anchor.input_tokens
             || resolution.cached_input_tokens != recovery.anchor.cached_input_tokens
@@ -5622,7 +5635,11 @@ fn resolve_session_token_anchor_recoveries(
             transaction,
             candidate_checkpoint,
             &recovery,
-            resolution.matched_end_offset,
+            if origin_match {
+                resolution.accepted_range.end_offset
+            } else {
+                resolution.matched_end_offset
+            },
         )? {
             return Err(UsageStoreError::InvalidImport(
                 "session token anchor match is beyond the committed cursor".into(),
@@ -11433,6 +11450,11 @@ impl UsageStore {
         let durable = self.load_session_token_anchor_recoveries()?;
         if recoveries
             .iter()
+            .filter(|expected| {
+                !resolutions
+                    .iter()
+                    .any(|resolved| resolved.recovery_id == expected.recovery_id)
+            })
             .any(|expected| !durable.iter().any(|actual| actual == expected))
         {
             return Ok(false);
@@ -13174,7 +13196,21 @@ impl UsageStore {
         let mut canonical_pending_ranges = BTreeMap::new();
         for pending in pending_ranges.unwrap_or(&[]) {
             validate_session_pending_range(pending)?;
-            if pending.collector_epoch != collector_epoch || pending.cycle_seq != cycle_seq {
+            // An unresolved anchor retains the exact original failure marker;
+            // only its replay cursor belongs to the new collection cycle.
+            let retained_anchor_pending = pending.cycle_seq < cycle_seq
+                && session_pending_range_exists(&self.connection, pending)?
+                && (token_anchor_recoveries
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|recovery| recovery.pending == *pending)
+                    || self
+                        .load_session_token_anchor_recoveries()?
+                        .iter()
+                        .any(|recovery| recovery.pending == *pending));
+            if pending.collector_epoch != collector_epoch
+                || (pending.cycle_seq != cycle_seq && !retained_anchor_pending)
+            {
                 return Err(UsageStoreError::InvalidImport(
                     "pending range admission generation mismatch".into(),
                 ));
@@ -13248,14 +13284,17 @@ impl UsageStore {
         for resolution in token_anchor_resolutions.unwrap_or(&[]) {
             validate_sha256(&resolution.recovery_id, "session token anchor recovery")?;
             validate_session_range(&resolution.accepted_range)?;
-            if resolution.matched_start_offset >= resolution.matched_end_offset
+            let origin_shape = resolution.matched_start_offset == 0
+                && resolution.matched_end_offset == 0
+                && resolution.accepted_range.start_offset == 0
+                && resolution.accepted_range.end_offset > 0;
+            if (!origin_shape && resolution.matched_start_offset >= resolution.matched_end_offset)
                 || resolution.matched_end_offset > i64::MAX as u64
                 || resolution.accepted_range.start_offset > resolution.matched_start_offset
                 || resolution.accepted_range.end_offset < resolution.matched_end_offset
                 || !canonical_ranges
                     .values()
                     .any(|range| range == &resolution.accepted_range)
-                || canonical_token_anchor_recoveries.contains_key(&resolution.recovery_id)
             {
                 return Err(UsageStoreError::InvalidImport(
                     "session token anchor resolution is invalid".into(),
@@ -13270,6 +13309,13 @@ impl UsageStore {
                 ));
             }
         }
+        let (matched_token_anchor_recoveries, pending_token_anchor_recoveries): (
+            BTreeMap<_, _>,
+            BTreeMap<_, _>,
+        ) = canonical_token_anchor_recoveries
+            .iter()
+            .map(|(id, recovery)| (id.clone(), recovery.clone()))
+            .partition(|(id, _)| canonical_token_anchor_resolutions.contains_key(id));
         for resolution in canonical_token_anchor_resolutions.values() {
             if canonical_pending_ranges.values().any(|pending| {
                 pending.root_identity == resolution.accepted_range.root_identity
@@ -13663,7 +13709,7 @@ impl UsageStore {
                 )?;
                 upsert_session_token_anchor_recoveries(
                     &transaction,
-                    &canonical_token_anchor_recoveries,
+                    &pending_token_anchor_recoveries,
                 )?;
                 upsert_session_events(&transaction, &canonical_events)?;
                 upsert_session_task_indexed_ranges(&transaction, &canonical_task_indexed_ranges)?;
@@ -13804,6 +13850,10 @@ impl UsageStore {
                 ])?;
             }
         }
+        // Legacy replay can discover its saved anchor on its first chunk.
+        // Install its original pending ownership before resolving it, within
+        // the same transaction; acknowledgement retries skip this insertion.
+        upsert_session_token_anchor_recoveries(&transaction, &matched_token_anchor_recoveries)?;
         resolve_session_token_anchor_recoveries(
             &transaction,
             &canonical_token_anchor_resolutions,
@@ -13815,7 +13865,7 @@ impl UsageStore {
             &canonical_ranges,
             replace_incomplete_pending_ranges,
         )?;
-        upsert_session_token_anchor_recoveries(&transaction, &canonical_token_anchor_recoveries)?;
+        upsert_session_token_anchor_recoveries(&transaction, &pending_token_anchor_recoveries)?;
         upsert_session_events(&transaction, &canonical_events)?;
         upsert_session_task_indexed_ranges(&transaction, &canonical_task_indexed_ranges)?;
         upsert_session_task_events(&transaction, &canonical_task_events)?;
@@ -15713,7 +15763,21 @@ mod tests {
 
     #[test]
     fn session_token_anchor_resolution_rolls_back_and_commits_exactly_once() {
-        let path = database_path("session-token-anchor-atomic-resolution");
+        check_token_anchor_atomic_resolution(false, false);
+    }
+
+    #[test]
+    fn session_token_anchor_legacy_replay_resolves_in_one_atomic_batch() {
+        check_token_anchor_atomic_resolution(true, false);
+    }
+
+    #[test]
+    fn session_token_anchor_zero_origin_resolves_in_one_atomic_batch() {
+        check_token_anchor_atomic_resolution(true, true);
+    }
+
+    fn check_token_anchor_atomic_resolution(legacy: bool, zero: bool) {
+        let path = database_path(&format!("session-token-anchor-atomic-{legacy}-{zero}"));
         let identity = partition_identity('f', 576);
         let reset_at = 1_800_604_800_i64;
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
@@ -15748,7 +15812,7 @@ mod tests {
             reason: "checkpoint-token-anchor-missing".to_owned(),
             complete: true,
         };
-        let anchor = SessionTokenAnchor {
+        let mut anchor = SessionTokenAnchor {
             root_identity: source.root_identity.clone(),
             relative_path: source.relative_path.clone(),
             file_device: source.file_device,
@@ -15765,6 +15829,12 @@ mod tests {
             output_tokens: 8,
             cache_write_input_tokens: Some(0),
         };
+        if zero {
+            anchor.total_tokens = 0;
+            anchor.input_tokens = 0;
+            anchor.cached_input_tokens = 0;
+            anchor.output_tokens = 0;
+        }
         let recovery = SessionTokenAnchorRecovery {
             recovery_id: session_token_anchor_recovery_id(&pending, &anchor),
             pending: pending.clone(),
@@ -15777,6 +15847,11 @@ mod tests {
             cursor_prefix_generation: unresolved_checkpoint.prefix_generation,
             cursor_collector_epoch: unresolved_checkpoint.collector_epoch,
             cursor_cycle_seq: unresolved_checkpoint.cycle_seq,
+        };
+        let mut initial_recoveries = if legacy {
+            vec![]
+        } else {
+            vec![recovery.clone()]
         };
         store
             .commit_session_collection_with_task_evidence(
@@ -15796,7 +15871,7 @@ mod tests {
                 SessionTaskEvidenceInput {
                     events: &[],
                     pending_ranges: std::slice::from_ref(&pending),
-                    token_anchor_recoveries: std::slice::from_ref(&recovery),
+                    token_anchor_recoveries: &initial_recoveries,
                     token_anchor_resolutions: &[],
                     task_events: &[],
                     task_indexed_ranges: &[],
@@ -15808,22 +15883,94 @@ mod tests {
                 .load_session_token_anchor_recoveries()
                 .unwrap()
                 .as_slice(),
-            std::slice::from_ref(&recovery)
+            initial_recoveries.as_slice()
         );
         assert_eq!(
             store.load_session_pending_ranges().unwrap().as_slice(),
             std::slice::from_ref(&pending)
         );
 
+        let mut expected_ranges = vec![initial_range.clone()];
+        let chunked = legacy && !zero;
+        if chunked {
+            let mut first_checkpoint = unresolved_checkpoint.clone();
+            first_checkpoint.prefix_generation = 0x5151;
+            first_checkpoint.committed_offset = 10;
+            first_checkpoint.cycle_seq = 2;
+            let mut first_range = initial_range.clone();
+            first_range.prefix_generation = first_checkpoint.prefix_generation;
+            first_range.end_offset = 10;
+            first_range.cycle_seq = 2;
+            first_range.record_sha256 = "77".repeat(32);
+            let mut first_recovery = recovery.clone();
+            first_recovery.cursor_prefix_generation = first_checkpoint.prefix_generation;
+            first_recovery.cursor_offset = 10;
+            first_recovery.cursor_cycle_seq = 2;
+            store
+                .commit_session_collection_with_task_evidence(
+                    SessionCollectionCommit {
+                        reset_at,
+                        window_seconds: 604_800,
+                        collector_epoch: first_checkpoint.collector_epoch,
+                        cycle_seq: 2,
+                        samples: &[],
+                        checkpoints: std::slice::from_ref(&first_checkpoint),
+                        ranges: std::slice::from_ref(&first_range),
+                        model_totals: &[],
+                        recorded_sessions: &[],
+                    },
+                    &[],
+                    reset_at,
+                    SessionTaskEvidenceInput {
+                        events: &[],
+                        pending_ranges: std::slice::from_ref(&pending),
+                        token_anchor_recoveries: std::slice::from_ref(&first_recovery),
+                        token_anchor_resolutions: &[],
+                        task_events: &[],
+                        task_indexed_ranges: &[],
+                    },
+                )
+                .expect("legacy replay cursor before original pending end must commit");
+            expected_ranges.push(first_range);
+            initial_recoveries = vec![first_recovery];
+            drop(store);
+            store = UsageStore::open_partitioned(&path, &identity).unwrap();
+            assert_eq!(
+                store.load_session_pending_ranges().unwrap().as_slice(),
+                std::slice::from_ref(&pending)
+            );
+            assert_eq!(
+                store.load_session_token_anchor_recoveries().unwrap(),
+                initial_recoveries
+            );
+        }
         let mut resolved_checkpoint = unresolved_checkpoint.clone();
-        resolved_checkpoint.cycle_seq = 2;
+        resolved_checkpoint.cycle_seq = if chunked { 3 } else { 2 };
         resolved_checkpoint.committed_offset = 40;
+        if legacy {
+            resolved_checkpoint.prefix_generation = 0x5151;
+        }
+        let replay_recoveries = if legacy {
+            let mut replay = recovery.clone();
+            replay.cursor_offset = 40;
+            replay.cursor_prefix_generation = resolved_checkpoint.prefix_generation;
+            replay.cursor_cycle_seq = resolved_checkpoint.cycle_seq;
+            vec![replay]
+        } else {
+            vec![]
+        };
         let accepted_range = SessionRange {
             root_identity: source.root_identity.clone(),
             relative_path: source.relative_path.clone(),
             file_device: source.file_device,
             file_inode: source.file_inode,
-            start_offset: 20,
+            start_offset: if chunked {
+                10
+            } else if legacy {
+                0
+            } else {
+                20
+            },
             end_offset: 40,
             collector_epoch: resolved_checkpoint.collector_epoch,
             cycle_seq: resolved_checkpoint.cycle_seq,
@@ -15850,8 +15997,8 @@ mod tests {
         };
         let resolution = SessionTokenAnchorResolution {
             recovery_id: recovery.recovery_id.clone(),
-            matched_start_offset: 22,
-            matched_end_offset: 30,
+            matched_start_offset: if zero { 0 } else { 22 },
+            matched_end_offset: if zero { 0 } else { 30 },
             total_tokens: anchor.total_tokens,
             input_tokens: anchor.input_tokens,
             cached_input_tokens: anchor.cached_input_tokens,
@@ -15867,6 +16014,63 @@ mod tests {
             output_tokens: 0,
             cache_write_input_tokens: Some(0),
         };
+        if zero {
+            for incomplete_origin in [true, false] {
+                let mut invalid_recovery = replay_recoveries[0].clone();
+                let mut invalid_resolution = resolution.clone();
+                let mut invalid_checkpoint = resolved_checkpoint.clone();
+                if incomplete_origin {
+                    invalid_recovery.anchor.fully_attributed_from_zero = false;
+                    invalid_recovery.recovery_id = session_token_anchor_recovery_id(
+                        &invalid_recovery.pending,
+                        &invalid_recovery.anchor,
+                    );
+                    invalid_resolution.recovery_id = invalid_recovery.recovery_id.clone();
+                } else {
+                    invalid_checkpoint.committed_offset = 10;
+                    invalid_recovery.cursor_offset = 10;
+                }
+                let invalid = store.commit_session_collection_with_task_evidence(
+                    SessionCollectionCommit {
+                        reset_at,
+                        window_seconds: 604_800,
+                        collector_epoch: resolved_checkpoint.collector_epoch,
+                        cycle_seq: resolved_checkpoint.cycle_seq,
+                        samples: &[],
+                        checkpoints: std::slice::from_ref(&invalid_checkpoint),
+                        ranges: std::slice::from_ref(&accepted_range),
+                        model_totals: &[],
+                        recorded_sessions: &[],
+                    },
+                    &[],
+                    reset_at,
+                    SessionTaskEvidenceInput {
+                        events: &[],
+                        pending_ranges: &[],
+                        token_anchor_recoveries: std::slice::from_ref(&invalid_recovery),
+                        token_anchor_resolutions: std::slice::from_ref(&invalid_resolution),
+                        task_events: &[],
+                        task_indexed_ranges: &[],
+                    },
+                );
+                assert!(
+                    invalid.is_err(),
+                    "zero origin requires a proven baseline and complete accepted prefix"
+                );
+                assert_eq!(
+                    store.load_session_pending_ranges().unwrap().as_slice(),
+                    std::slice::from_ref(&pending)
+                );
+                assert!(store
+                    .load_session_token_anchor_recoveries()
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    store.load_session_collection_state().unwrap().cycle_seq,
+                    resolved_checkpoint.cycle_seq - 1
+                );
+            }
+        }
         let trigger = "CREATE TRIGGER reject_token_anchor_resolution
                        BEFORE DELETE ON session_token_anchor_recoveries
                        BEGIN SELECT RAISE(ABORT, 'injected anchor resolution failure'); END;";
@@ -15888,7 +16092,7 @@ mod tests {
             SessionTaskEvidenceInput {
                 events: std::slice::from_ref(&event),
                 pending_ranges: &[],
-                token_anchor_recoveries: &[],
+                token_anchor_recoveries: &replay_recoveries,
                 token_anchor_resolutions: std::slice::from_ref(&resolution),
                 task_events: &[],
                 task_indexed_ranges: &[],
@@ -15898,7 +16102,10 @@ mod tests {
             failed.is_err(),
             "injected resolution failure must abort the collection"
         );
-        assert_eq!(store.load_session_collection_state().unwrap().cycle_seq, 1);
+        assert_eq!(
+            store.load_session_collection_state().unwrap().cycle_seq,
+            resolved_checkpoint.cycle_seq - 1
+        );
         assert_eq!(
             store.load_session_pending_ranges().unwrap().as_slice(),
             std::slice::from_ref(&pending)
@@ -15908,13 +16115,14 @@ mod tests {
                 .load_session_token_anchor_recoveries()
                 .unwrap()
                 .as_slice(),
-            std::slice::from_ref(&recovery)
+            initial_recoveries.as_slice()
         );
         assert_eq!(store.load_session_events().unwrap(), []);
-        assert_eq!(
-            store.load_session_ranges().unwrap().as_slice(),
-            std::slice::from_ref(&initial_range)
-        );
+        let retained_ranges = store.load_session_ranges().unwrap();
+        assert_eq!(retained_ranges.len(), expected_ranges.len());
+        assert!(expected_ranges
+            .iter()
+            .all(|range| retained_ranges.contains(range)));
         store
             .connection
             .execute_batch("DROP TRIGGER reject_token_anchor_resolution")
@@ -15934,7 +16142,7 @@ mod tests {
         let evidence = || SessionTaskEvidenceInput {
             events: std::slice::from_ref(&event),
             pending_ranges: &[],
-            token_anchor_recoveries: &[],
+            token_anchor_recoveries: &replay_recoveries,
             token_anchor_resolutions: std::slice::from_ref(&resolution),
             task_events: &[],
             task_indexed_ranges: &[],
@@ -15942,7 +16150,7 @@ mod tests {
         let success = store
             .commit_session_collection_with_task_evidence(commit(), &[], reset_at, evidence())
             .unwrap();
-        assert_eq!(success.data_generation, 2);
+        assert_eq!(success.data_generation, resolved_checkpoint.cycle_seq);
         assert!(store.load_session_pending_ranges().unwrap().is_empty());
         assert!(store
             .load_session_token_anchor_recoveries()
@@ -15967,7 +16175,7 @@ mod tests {
         assert_eq!(replay.data_generation, success.data_generation);
         assert_eq!(store.load_session_events().unwrap(), [event]);
         assert!(store
-            .verify_session_token_anchor_batch(&[], &[resolution])
+            .verify_session_token_anchor_batch(&replay_recoveries, &[resolution])
             .unwrap());
         remove_database(&path);
     }

@@ -712,7 +712,7 @@ public sealed class GraphViewportRenderingTests
             var lines = control.Plot.GetPlottables()
                 .OfType<ScottPlot.Plottables.Scatter>()
                 .ToArray();
-            var resetGuides = lines.Where(line => line.LineColor.ToStringRGB() == "#D6A45C").ToArray();
+            var resetGuides = lines.Where(line => line.LineColor.ToStringRGB() == "#E6B85C").ToArray();
             Assert.Equal(new double[] { midnight, midnight + 600 },
                 resetGuides.Select(line => line.Data.GetScatterPoints().First().X).Order());
             Assert.All(resetGuides, line =>

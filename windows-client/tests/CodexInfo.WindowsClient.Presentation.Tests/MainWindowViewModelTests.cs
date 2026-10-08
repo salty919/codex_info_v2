@@ -512,6 +512,38 @@ public sealed class MainWindowViewModelTests
         Assert.StartsWith("0", viewModel.ActiveThreadCountLabel, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(0UL)]
+    [InlineData(1UL)]
+    public async Task ApiErrorAcceptedThreadSummaryRemainsVisible(ulong activeThreadCount)
+    {
+        var current = new ApiCurrentSnapshot(
+            ApiState.Error,
+            1,
+            true,
+            "Pro",
+            new ApiQuota(45, 2, 604800, false),
+            [new ApiDetailsModelUsage("gpt-6-astra", 10, 0, 0, 0, 0, 0) { TotalTokens = 10 }],
+            activeThreadCount,
+            PublishedPair(CanonicalPublishedPair));
+        ThreadsFetchResult[] threadResults = activeThreadCount == 0
+            ? []
+            : [ThreadsFetchResult.Success(new ApiThreadsSnapshot(
+                [ThreadDetails("gpt-6-astra")],
+                current.PublishedPair))];
+        var client = new SequencedSplitClient([current], threadResults);
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.DetailsSnapshot?.ObservedAt == 1);
+
+        Assert.True(viewModel.HasLiveThreadSummary);
+        Assert.Equal(activeThreadCount, viewModel.ActiveThreadCount);
+        Assert.Equal(activeThreadCount == 0 ? 0 : 1, client.ThreadsCallCount);
+        Assert.Equal(viewModel.Texts.ApiError, viewModel.StatusTitle);
+        Assert.Equal("error", viewModel.DetailsStatusAutomationText);
+    }
+
     [Fact]
     public async Task Issue419StoppedOpenRootIsHiddenInSameMainCycle()
     {
@@ -986,6 +1018,7 @@ public sealed class MainWindowViewModelTests
         Assert.Equal(resetLocal, viewModel.ResetAtText);
         Assert.Equal(viewModel.ResetAtText, viewModel.QuotaRemainingText);
         Assert.Equal(0, viewModel.QuotaRemainingPeriodValue);
+        Assert.False(viewModel.HasLiveThreadSummary);
         Assert.False(viewModel.HasActiveThreads);
         Assert.False(viewModel.HasNoActiveThreads);
         Assert.True(viewModel.HasHistoricalThreadNotice);

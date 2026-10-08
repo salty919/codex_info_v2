@@ -385,8 +385,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool HasActiveThreads => !historicalActivitySuppressed && ActiveThreadCount > 0;
 
-    public bool HasLiveThreadSummary => !historicalActivitySuppressed &&
-        detailsSnapshot is { State: ApiState.Ready, Authenticated: true };
+    public bool HasLiveThreadSummary => !historicalActivitySuppressed && !IsSelectedAccountHistorical &&
+        detailsSnapshot is { State: ApiState.Ready or ApiState.Error, Authenticated: true };
 
     public bool HasNoActiveThreads => !historicalActivitySuppressed && !HasActiveThreads;
 
