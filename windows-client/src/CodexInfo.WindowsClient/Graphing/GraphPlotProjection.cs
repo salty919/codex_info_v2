@@ -400,10 +400,9 @@ internal static class GraphPlotProjection
 
     internal static IReadOnlyList<long> BuildResetGuides(GraphScene scene)
     {
-        IReadOnlyList<GraphScene> periods = scene.IsViewport ? scene.PeriodScenes : [scene];
-        return periods.Select(period => period.ResetAt)
-            .Where(reset => reset.HasValue && reset.Value >= scene.PeriodStartAt && reset.Value <= scene.PeriodEndAt)
-            .Select(reset => reset!.Value)
+        ArgumentNullException.ThrowIfNull(scene);
+        return scene.PublishedPeriodStarts
+            .Where(startAt => startAt >= scene.PeriodStartAt && startAt <= scene.PeriodEndAt)
             .Distinct()
             .Order()
             .ToArray();

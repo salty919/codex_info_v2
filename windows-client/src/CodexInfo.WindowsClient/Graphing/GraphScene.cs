@@ -120,6 +120,7 @@ public sealed class GraphScene
         bool isViewport = false,
         IReadOnlyList<GraphScene>? periodScenes = null,
         bool hasViewportPoints = false,
+        IReadOnlyList<long>? publishedPeriodStarts = null,
         long? resetAt = null,
         IReadOnlyList<GraphObservedSample>? hoverObservations = null,
         bool isVerifiedCurrentResetStart = false,
@@ -159,6 +160,7 @@ public sealed class GraphScene
         ModelMaximum = modelMaximum;
         IsViewport = isViewport;
         PeriodScenes = Array.AsReadOnly((periodScenes ?? Array.Empty<GraphScene>()).ToArray());
+        PublishedPeriodStarts = Array.AsReadOnly((publishedPeriodStarts ?? Array.Empty<long>()).ToArray());
         HasViewportPoints = isViewport && hasViewportPoints;
         HoverObservations = Array.AsReadOnly((hoverObservations ?? Array.Empty<GraphObservedSample>()).ToArray());
         HoverResetAt = resetAt ?? (HoverObservations.Count > 0 ? HoverObservations[0].ResetAt : null);
@@ -254,6 +256,9 @@ public sealed class GraphScene
     /// <summary>The original reset-period scenes displayed inside this viewport.</summary>
     public IReadOnlyList<GraphScene> PeriodScenes { get; }
 
+    /// <summary>Explicit period starts published by the accepted history response.</summary>
+    internal IReadOnlyList<long> PublishedPeriodStarts { get; }
+
     /// <summary>Sorted nonsynthetic raw observations retained for nearest-point hover lookup.</summary>
     internal IReadOnlyList<GraphObservedSample> HoverObservations { get; }
 
@@ -267,7 +272,7 @@ public sealed class GraphScene
 
     public static GraphScene Empty(GraphMetric metric = GraphMetric.Dollars) => Empty(metric, null);
 
-    private static GraphScene Empty(GraphMetric metric, long? resetAt) =>
+    private static GraphScene Empty(GraphMetric metric, long? resetAt, long? publishedPeriodStartAt = null) =>
         new(
             0,
             1,
@@ -298,6 +303,7 @@ public sealed class GraphScene
             new Dictionary<string, IReadOnlyList<GraphIdleInterval>>(StringComparer.Ordinal),
             [],
             1,
+            publishedPeriodStarts: publishedPeriodStartAt is { } startAt ? [startAt] : [],
             resetAt: resetAt);
 
     /// <summary>
@@ -309,7 +315,15 @@ public sealed class GraphScene
         long startAt,
         long endAt,
         GraphMetric metric,
-        IReadOnlyList<GraphScene> periodScenes)
+        IReadOnlyList<GraphScene> periodScenes) =>
+        CreateViewport(startAt, endAt, metric, periodScenes, publishedPeriodStarts: null);
+
+    internal static GraphScene CreateViewport(
+        long startAt,
+        long endAt,
+        GraphMetric metric,
+        IReadOnlyList<GraphScene> periodScenes,
+        IReadOnlyList<long>? publishedPeriodStarts)
     {
         ArgumentNullException.ThrowIfNull(periodScenes);
         if (endAt <= startAt)
@@ -362,6 +376,8 @@ public sealed class GraphScene
 
         var hasVisiblePoints = GraphPlotProjection.HasVisibleViewportPoints(children, startAt, endAt);
         var visibleModelMaximum = GraphPlotProjection.CalculateViewportModelMaximum(children, startAt, endAt);
+        var acceptedPeriodStarts = publishedPeriodStarts ??
+            children.SelectMany(scene => scene.PublishedPeriodStarts).ToArray();
         return new GraphScene(
             startAt,
             endAt,
@@ -394,7 +410,8 @@ public sealed class GraphScene
             visibleModelMaximum,
             isViewport: true,
             periodScenes: children,
-            hasViewportPoints: hasVisiblePoints);
+            hasViewportPoints: hasVisiblePoints,
+            publishedPeriodStarts: acceptedPeriodStarts);
     }
 
     public static GraphScene Create(
@@ -440,12 +457,13 @@ public sealed class GraphScene
         IReadOnlySet<string>? hiddenModelNames,
         IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals,
         long? resetAt,
-        bool isVerifiedCurrentResetStart = false)
+        bool isVerifiedCurrentResetStart = false,
+        long? publishedPeriodStartAt = null)
     {
         ArgumentNullException.ThrowIfNull(samples);
         if (samples.Count == 0)
         {
-            return Empty(metric, resetAt);
+            return Empty(metric, resetAt, publishedPeriodStartAt);
         }
 
         var start = periodStartAt >= 0 ? periodStartAt : samples[0].Timestamp;
@@ -631,6 +649,7 @@ public sealed class GraphScene
             modelIdleIntervals,
             idleIntervals,
             maximum,
+            publishedPeriodStarts: publishedPeriodStartAt is { } publishedStartAt ? [publishedStartAt] : [],
             resetAt: resetAt,
             hoverObservations: BuildHoverObservations(samples, points, firstModelPublications),
             isVerifiedCurrentResetStart: isVerifiedCurrentResetStart,
