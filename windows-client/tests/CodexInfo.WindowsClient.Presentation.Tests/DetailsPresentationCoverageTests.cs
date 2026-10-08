@@ -904,7 +904,7 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
-    public async Task GraphWindow_HistoricalAndUnknownPeriodsHaveNoResetStartBaseline()
+    public async Task GraphWindow_PublishedHistoricalPeriodHasQuotaBaselineWithoutModelBackfill()
     {
         const long start = 1_820_000_000;
         const long firstObservation = start + 300;
@@ -920,11 +920,20 @@ public sealed class DetailsPresentationCoverageTests
         await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
 
         var geometry = GraphPlotProjection.PrepareGeometry(graph.Scene);
+        var quota = geometry.RemainingLines.Solid.Line;
+        Assert.Contains(start, graph.Scene.PublishedPeriodStarts);
+        Assert.False(graph.Scene.IsVerifiedCurrentResetStart);
+        Assert.Equal((double)start, quota.X[0]);
+        Assert.Equal(100d, quota.Y[0]);
+        Assert.InRange(quota.X[^1], firstObservation - 4d, firstObservation + 4d);
+        Assert.Equal(95d, quota.Y[^1], precision: 8);
         Assert.DoesNotContain((double)start, geometry.ModelLines[GraphSeries.Astra].Rising.Line.X);
-        Assert.DoesNotContain((double)start, geometry.RemainingLines.Solid.Line.X);
         Assert.DoesNotContain((double)start, geometry.RemainingLines.Dashed.Line.X);
         Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
+        Assert.Equal(95d, graph.Scene.ObservedRemainingValues[0]);
+        Assert.DoesNotContain(100d, graph.Scene.ObservedRemainingValues);
         Assert.Single(graph.Scene.HoverObservations);
+        Assert.Equal(firstObservation, graph.Scene.HoverObservations[0].Timestamp);
     }
 
     [Fact]
