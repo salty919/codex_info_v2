@@ -3165,6 +3165,157 @@ mod tests {
     }
 
     #[test]
+    fn issue_575_legacy_collector_recovery_republishes_ready_without_double_credit() {
+        use codex_info_db_writer::{StoragePartitionIdentity, UsageStore};
+        use codex_info_recorder::{QuotaSnapshot, Recorder, RecorderConfig};
+        use std::io::Write;
+
+        const NOW: i64 = 2_000_000_040;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let source = sessions.join("one.jsonl");
+        let database = root.path().join("history.sqlite3");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 1,
+            partition_id: "33".repeat(32),
+        };
+        drop(UsageStore::create_partitioned(&database, &identity).unwrap());
+        let token = |value: u64, time: i64| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "event_msg",
+                    "timestamp": chrono::DateTime::<chrono::Utc>::from_timestamp(time, 0).unwrap().to_rfc3339(),
+                    "payload": {"type": "token_count", "info": {"total_token_usage": {
+                        "total_tokens": value, "input_tokens": value,
+                        "cached_input_tokens": 0, "output_tokens": 0
+                    }}}
+                })
+            )
+        };
+        let model = "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6-astra\"}}\n";
+        fs::write(
+            &source,
+            format!("{model}{}{}", token(10, NOW - 20), token(20, NOW - 10)),
+        )
+        .unwrap();
+        let open = || {
+            Recorder::open_partitioned(
+                RecorderConfig {
+                    sessions_root: sessions.clone(),
+                    chunk_bytes: 4096,
+                },
+                &database,
+                &identity,
+            )
+            .unwrap()
+        };
+        let quota = |observed_at| {
+            Some(QuotaSnapshot {
+                observed_at,
+                reset_at: NOW + 3600,
+                window_seconds: 7200,
+                remaining_percent: Some(72.0),
+            })
+        };
+        let mut recorder = open();
+        recorder.run_cycle_with_quota(quota(NOW)).unwrap().unwrap();
+        // A physical replacement lacks the old 20-token anchor. Preserve the
+        // old inode checkpoint, just as the affected saved profiles do.
+        fs::rename(&source, root.path().join("original.jsonl")).unwrap();
+        fs::write(&source, format!("{model}{}", token(30, NOW + 30))).unwrap();
+        assert_eq!(
+            recorder
+                .run_cycle_with_quota(quota(NOW + 60))
+                .unwrap()
+                .unwrap()
+                .pending_ranges,
+            1
+        );
+        drop(recorder);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("DELETE FROM session_token_anchor_recoveries", [])
+            .unwrap();
+        drop(connection);
+        let reader_identity = codex_info_db_reader::StoragePartitionIdentity {
+            schema_version: identity.schema_version.clone(),
+            profile_scope_id: identity.profile_scope_id.clone(),
+            account_scope_id: identity.account_scope_id.clone(),
+            storage_epoch: identity.storage_epoch,
+            partition_id: identity.partition_id.clone(),
+        };
+        let reader = DbReader::open_partitioned(&database, &reader_identity).unwrap();
+        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let get = |route: &str| {
+            request(
+                server.local_addr(),
+                &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            )
+        };
+        let before = get("/v3/current");
+        let initial: Value = serde_json::from_str(body(&before)).unwrap();
+        assert_eq!(initial["state"], "error");
+        assert_eq!(initial["models"][0]["total_tokens"], 10);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(20, NOW + 80), token(25, NOW + 90)).as_bytes())
+            .unwrap();
+        let mut recorder = open();
+        recorder
+            .run_cycle_with_quota(quota(NOW + 120))
+            .unwrap()
+            .unwrap();
+        recorder
+            .run_cycle_with_quota(quota(NOW + 180))
+            .unwrap()
+            .unwrap();
+        server.store().refresh();
+        let after = get("/v3/current");
+        let value: Value = serde_json::from_str(body(&after)).unwrap();
+        // Independent arithmetic: initial 20-10 plus restored 25-20 = 15.
+        assert_eq!(value["state"], "ready");
+        assert_eq!(value["models"][0]["total_tokens"], 15);
+        assert_eq!(value["quota"]["remaining_percent"], 72.0);
+        assert_ne!(published_pair(&before), published_pair(&after));
+        let history = get(&format!("/v3/history?period={}", NOW + 3600));
+        assert_eq!(published_pair(&history), published_pair(&after));
+        let history_value: Value = serde_json::from_str(body(&history)).unwrap();
+        let tail = history_value["history_samples"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(tail["models_complete"], true);
+        assert_eq!(tail["models"][0]["total_tokens"], 15);
+        drop(recorder);
+        let mut restarted = open();
+        restarted
+            .run_cycle_with_quota(quota(NOW + 240))
+            .unwrap()
+            .unwrap();
+        server.store().refresh();
+        let final_value: Value = serde_json::from_str(body(&get("/v3/current"))).unwrap();
+        assert_eq!(final_value["state"], "ready");
+        assert_eq!(final_value["models"][0]["total_tokens"], 15);
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM session_pending_ranges", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        server.shutdown();
+    }
+
+    #[test]
     fn issue_575_latest_partial_models_and_recovery_share_one_publication() {
         let log_root = tempfile::tempdir().unwrap();
         let path = temp_db("current-model-integrity");

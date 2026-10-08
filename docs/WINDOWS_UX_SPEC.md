@@ -402,7 +402,7 @@ component順や表示所有者を変更しない。
 - AccountActivityはWindowsのtotal＋model別件数構成を使い、件数は`THREAD-OPEN-362`の公開対象となった現在openのSession thread集合とする。受理済みの現在accountの
   `open_session_thread_count=0`でも同じ`56px` cardに`0件`、5 modelの`0`、`68×30px`の
   `Details`を表示し、Detailsから空のThreads画面へ進める。未受理のcurrentやhistorical
-  accountを0件とみなさず、historical accountではlive件数を表示しないが固定cardは保持する。
+  accountを0件とみなさず、historical accountではlive件数を表示しないが固定cardは保持する。受理済みのthread行はmodel集計の不完全状態だけを理由に隠さない。
   v3のmodel別表示は`動作中（生成済み）`の順とし、SOL 0件動作中/1件openなら`0（1）`、LUNA 1件動作中/2件openなら`1（2）`と表示する。openが0件なら`0`と表示する。総数は公開対象となったopen行の全件数とする。
   同一pairの元行数・動作中行数を検証した後、停止中の親なし行と、停止中の親を持つ子とその子孫を画面から除外した行集合だけでMainの合計とmodel別件数を算出する。動作中の親の子は、動作中も停止中も表示する。wireの元件数を表示件数へ流用しない。
 - ModelUsageはLinuxの単一table構成を使い、各modelのInput/Cached input/Outputについてtokenと
@@ -519,9 +519,9 @@ component順や表示所有者を変更しない。
   familyの表示・hoverは`G137-7`の時点別membershipを使い、後から追加された版名によってそれ以前の保存値を
   消さない。一度掲載されたmemberの欠測・価格不明は0へ補完せず、rawの完全性やidle authorityも昇格させない。
   全表示mode・両metricの実reset期間のドル利用相当量は`G137-7`に従う。グラフ/x軸の下の細い金額欄へ、
-  各periodの可視区間中央に、大きくテーマに沿った高コントラストの整数額だけを表示する（例: `$75`）。
+  各periodの可視区間中央に、控えめで読みやすいテーマ色の整数額だけを表示する（例: `$75`）。
   小数は表示時だけ四捨五入し、説明文・開始日時・小数点は付けない。額がなければ「—」とし、確定0と区別する。
-  左端で途中から始まる前periodは金額だけを省略し、線は残す。短い期間では金額が重ならないよう欄内で調整する。
+  左端で途中から始まる前periodは金額だけを省略し、線は残す。短い期間では中央を維持し、その区間の幅と左右余白に合わせて文字を縮小する。reset区切りは金額と同じ黄色系のテーマ色でplotと金額欄に描き、日区切りの細い白系線は維持する。
   通常の系列hoverは維持し、金額専用tooltip、説明、警告を追加しない。個別modelの右端値やleaderは再導入しない。
 - X版とWindows版は`G137-1`..`G137-10`を参照する同一の履歴fixtureと固定期待値（period/pair、
   累積model、raw/effective Remaining、gap、metric別anomaly、partial/unavailable、未使用区間、期間末）を通過しなければならない。

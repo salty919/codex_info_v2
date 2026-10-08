@@ -33,7 +33,8 @@ public sealed class GraphPlotControl : Control
     internal const string AxisTextColorHex = "#78879c";
     internal const string GridColorHex = "#263850";
     internal const string MidnightGuideColorHex = "#FFFFFF";
-    internal const string ResetGuideColorHex = "#D6A45C";
+    internal const string PeriodAmountColorHex = "#E6B85C";
+    internal const string ResetGuideColorHex = PeriodAmountColorHex;
     internal const string PlotColorHex = "#121c2c";
     private const string PlotFontFamily = "Noto Sans JP Medium";
     internal const string RemainingColorRole = ThemePalette.GraphRemaining;
@@ -64,7 +65,8 @@ public sealed class GraphPlotControl : Control
     private ScottPlot.Color MutedColor => new(ThemePalette.Resolve(AxisTextColorHex));
     private ScottPlot.Color GridColor => new(ThemePalette.Resolve(GridColorHex));
     private ScottPlot.Color MidnightGuideColor => new ScottPlot.Color(MidnightGuideColorHex).WithOpacity(0.30);
-    private ScottPlot.Color ResetGuideColor => new ScottPlot.Color(ResetGuideColorHex).WithOpacity(0.70);
+    private ScottPlot.Color ResetGuideColor =>
+        new ScottPlot.Color(ThemePalette.Resolve(ResetGuideColorHex)).WithOpacity(0.70);
     private ScottPlot.Color PlotColor => new(ThemePalette.Resolve(PlotColorHex));
 
     private PlotPresentation presentation = new(GraphScene.Empty());
@@ -343,15 +345,17 @@ public sealed class GraphPlotControl : Control
                 // default. Clear it so the per-label embedded-font alias is resolved.
                 Font = null,
                 FontSize = GraphPeriodCostPanel.BaseFontSize,
-                ForeColor = new ScottPlot.Color(ThemePalette.Resolve("#E6B85C")),
+                ForeColor = new ScottPlot.Color(ThemePalette.Resolve(PeriodAmountColorHex)),
                 Alignment = ScottPlot.Alignment.MiddleCenter,
                 BorderWidth = 0,
                 ShadowOffset = new ScottPlot.PixelOffset(0, 0),
             };
-            amounts.Add(new GraphPeriodCostAmount(centerAt, labelStyle));
+            amounts.Add(new GraphPeriodCostAmount(visibleStart, visibleEnd, centerAt, labelStyle));
         }
 
-        presentation.Plot.Axes.AddPanel(new GraphPeriodCostPanel(amounts));
+        presentation.Plot.Axes.AddPanel(new GraphPeriodCostPanel(
+            amounts,
+            GraphPlotProjection.BuildResetGuides(scene)));
     }
 
     private static GraphCanonicalModelLineProjection BuildModelLines(GraphScene scene, GraphSeries series) =>
