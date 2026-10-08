@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess  # noqa: B404,S404  # nosec B404 # Offline fixture process API only.
+import subprocess  # noqa: B404  # nosec B404 # Offline fixture process API only.
 import sys
 import tempfile
 import textwrap
@@ -213,7 +213,7 @@ class SnapshotTests(unittest.TestCase):
             snapshot = root / "standard-short.json"
             source.write_text(STANDARD_TABLE, encoding="utf-8")
             # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
-            completed = subprocess.run(  # noqa: B603,S603  # nosec B603 # Fixed interpreter and private fixture argv.
+            completed = subprocess.run(  # noqa: B603  # nosec B603 # Fixed interpreter and private fixture argv.
                 [
                     sys.executable,
                     str(Path(pricing.__file__).resolve()),
@@ -395,11 +395,11 @@ class PriceWorkflowCausalTests(unittest.TestCase):
         if real_git is None or not Path(real_git).is_absolute():
             raise RuntimeError("workflow fixture requires an absolute Git executable")
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
-        subprocess.run(  # noqa: B603,S603  # nosec B603 # Fixed Git argv against a private fixture repo.
+        subprocess.run(  # noqa: B603  # nosec B603 # Fixed Git argv against a private fixture repo.
             [real_git, "init", "-q", str(repository)], check=True, shell=False
         )
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
-        subprocess.run(  # noqa: B603,S603  # nosec B603 # Fixed Git argv against a private fixture repo.
+        subprocess.run(  # noqa: B603  # nosec B603 # Fixed Git argv against a private fixture repo.
             [real_git, "-C", str(repository), "add", "--all"], check=True, shell=False
         )
         initial_commit_env = os.environ.copy()
@@ -414,14 +414,14 @@ class PriceWorkflowCausalTests(unittest.TestCase):
             }
         )
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
-        subprocess.run(  # noqa: B603,S603  # nosec B603 # Fixed Git commit in a private fixture repo.
+        subprocess.run(  # noqa: B603  # nosec B603 # Fixed Git commit in a private fixture repo.
             [real_git, "-C", str(repository), "commit", "-qm", "fixture base"],
             check=True,
             env=initial_commit_env,
             shell=False,
         )
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
-        base_sha = subprocess.check_output(  # noqa: B603,S603  # nosec B603 # Fixed read-only Git argv.
+        base_sha = subprocess.check_output(  # noqa: B603  # nosec B603 # Fixed read-only Git argv.
             [real_git, "-C", str(repository), "rev-parse", "HEAD"],
             text=True,
             shell=False,
@@ -537,13 +537,13 @@ class PriceWorkflowCausalTests(unittest.TestCase):
                 "GH_CREATED_PR": str(root / "created-pr.json"),
                 "GITHUB_REPOSITORY": "salty919/codex_info_v2",
                 "GITHUB_EVENT_NAME": "workflow_dispatch",
-                "GH_TOKEN": "test-token-must-not-be-printed",  # noqa: B105,S105  # nosec B105 # Non-secret sentinel verifies output redaction.
+                "GH_TOKEN": "test-token-must-not-be-printed",  # noqa: B105  # nosec B105 # Non-secret sentinel verifies output redaction.
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": "/dev/null",
             }
         )
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
-        completed = subprocess.run(  # noqa: B603,S603  # nosec B603 # Workflow script, stubbed commands, private repo.
+        completed = subprocess.run(  # noqa: B603  # nosec B603 # Workflow script, stubbed commands, private repo.
             [BASH, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
             cwd=repository,
             env=env,
