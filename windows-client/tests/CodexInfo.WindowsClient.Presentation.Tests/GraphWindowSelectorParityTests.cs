@@ -36,6 +36,7 @@ public sealed class GraphWindowSelectorParityTests
             element.Attribute(XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml"))?.Value == "GraphContent");
         var rows = content.Attribute("RowDefinitions")!.Value.Split(',');
         Assert.Equal(4, rows.Length);
+        Assert.Equal("8", content.Attribute("RowSpacing")?.Value);
         for (var row = 0; row < rows.Length - 1; row++)
         {
             Assert.Contains(content.Elements(), element =>
