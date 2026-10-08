@@ -7,11 +7,11 @@
         x:Class="CodexInfo.WindowsClient.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Width="900"
-        Height="498"
+        Height="542"
         MinWidth="900"
-        MinHeight="498"
+        MinHeight="542"
         MaxWidth="900"
-        MaxHeight="498"
+        MaxHeight="542"
         WindowStartupLocation="CenterScreen"
         CanResize="False"
         WindowDecorations="None"
@@ -121,10 +121,10 @@
     </Style>
   </Window.Styles>
 
-  <!-- The six rows keep the complete overview on one surface without
-       compressing labels or table rows below the product typography scale. -->
-  <Grid Margin="22,14"
-        RowDefinitions="52,82,78,56,120,42"
+    <!-- The six rows keep the overview on one surface while the model table
+         scrolls after its six-row viewport. -->
+    <Grid Margin="22,14"
+        RowDefinitions="52,82,78,56,164,42"
         RowSpacing="8">
     <!-- Header owns the application heading, endpoint, and navigation. -->
     <Grid Grid.Row="0"
@@ -355,12 +355,11 @@
       </Grid>
     </Border>
 
-    <!-- ModelUsage is a compact table rather than one card per model.  The
-         fixed row budget displays the expected four model rows without a
-         nested scroll surface. -->
+    <!-- ModelUsage keeps exact model identity in Main and scrolls beyond the
+         six visible rows without changing the compact table columns. -->
     <Border Grid.Row="4" Classes="section" Padding="12,5" IsVisible="{Binding ShowAuthenticatedContent}" AutomationProperties.AutomationId="Main.ModelUsageTable">
       <Grid RowDefinitions="20,*">
-        <Grid
+        <Grid Margin="0,0,16,0"
               ColumnDefinitions="2.4*,*,*,*,*,*,*"
               ColumnSpacing="6">
           <TextBlock Classes="metric-label" VerticalAlignment="Center" Text="{Binding Texts.ModelLabel}" />
@@ -373,30 +372,34 @@
                    VerticalAlignment="Center"
                    IsVisible="{Binding HasNoModels}"
                    Text="{Binding ModelUsageUnavailableText}" />
-        <ItemsControl Grid.Row="1"
+        <ScrollViewer Grid.Row="1"
+                      MaxHeight="132"
+                      VerticalScrollBarVisibility="Auto"
                       IsVisible="{Binding HasModels}"
-                      ItemsSource="{Binding Models}">
-          <ItemsControl.ItemsPanel>
-            <ItemsPanelTemplate>
-              <StackPanel Orientation="Vertical" />
-            </ItemsPanelTemplate>
-          </ItemsControl.ItemsPanel>
-          <ItemsControl.ItemTemplate>
-            <DataTemplate x:DataType="vm:ModelUsageViewModel">
-              <Grid Height="22"
-                    ColumnDefinitions="2.4*,*,*,*,*,*,*"
-                    ColumnSpacing="6">
-                <TextBlock FontSize="13" VerticalAlignment="Center" Text="{Binding Name}" TextWrapping="NoWrap" />
-                <TextBlock Grid.Column="1" Classes="metric-value" VerticalAlignment="Center" Text="{Binding InputTokensText}" />
-                <TextBlock Grid.Column="2" Classes="metric-value" Foreground="{DynamicResource ThemeB8C6D7}" VerticalAlignment="Center" Text="{Binding InputDollarsText}" />
-                <TextBlock Grid.Column="3" Classes="metric-value" VerticalAlignment="Center" Text="{Binding CachedInputTokensText}" />
-                <TextBlock Grid.Column="4" Classes="metric-value" Foreground="{DynamicResource ThemeB8C6D7}" VerticalAlignment="Center" Text="{Binding CachedInputDollarsText}" />
-                <TextBlock Grid.Column="5" Classes="metric-value" VerticalAlignment="Center" Text="{Binding OutputTokensText}" />
-                <TextBlock Grid.Column="6" Classes="metric-value" Foreground="{DynamicResource ThemeB8C6D7}" VerticalAlignment="Center" Text="{Binding OutputDollarsText}" />
-              </Grid>
-            </DataTemplate>
-          </ItemsControl.ItemTemplate>
-        </ItemsControl>
+                      AutomationProperties.AutomationId="Main.ModelUsageScroll">
+          <ItemsControl Margin="0,0,16,0" ItemsSource="{Binding Models}">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate>
+                <StackPanel Orientation="Vertical" />
+              </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="vm:ModelUsageViewModel">
+                <Grid Height="22"
+                      ColumnDefinitions="2.4*,*,*,*,*,*,*"
+                      ColumnSpacing="6">
+                  <TextBlock FontSize="13" VerticalAlignment="Center" Text="{Binding DisplayName}" TextWrapping="NoWrap" />
+                  <TextBlock Grid.Column="1" Classes="metric-value" VerticalAlignment="Center" Text="{Binding InputTokensText}" />
+                  <TextBlock Grid.Column="2" Classes="metric-value" Foreground="{DynamicResource ThemeB8C6D7}" VerticalAlignment="Center" Text="{Binding InputDollarsText}" />
+                  <TextBlock Grid.Column="3" Classes="metric-value" VerticalAlignment="Center" Text="{Binding CachedInputTokensText}" />
+                  <TextBlock Grid.Column="4" Classes="metric-value" Foreground="{DynamicResource ThemeB8C6D7}" VerticalAlignment="Center" Text="{Binding CachedInputDollarsText}" />
+                  <TextBlock Grid.Column="5" Classes="metric-value" VerticalAlignment="Center" Text="{Binding OutputTokensText}" />
+                  <TextBlock Grid.Column="6" Classes="metric-value" Foreground="{DynamicResource ThemeB8C6D7}" VerticalAlignment="Center" Text="{Binding OutputDollarsText}" />
+                </Grid>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </ScrollViewer>
       </Grid>
     </Border>
 

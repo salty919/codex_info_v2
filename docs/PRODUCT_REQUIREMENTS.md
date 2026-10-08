@@ -74,9 +74,10 @@ U128-36
 `MODEL-PRICING-463`: API相当USD参考額は公式 `https://developers.openai.com/api/docs/pricing` のStandard・短文脈（100万token単位）を基準とし、通常入力・cached入力・cache write入力・出力の4単価を正確なmodel IDごとに保持する。対象はgpt-5.6-sol/terra/luna、gpt-6-astra/sol/luna、gpt-6.1-sol。単価catalogは出典、観測時点、内容revisionを持ち、更新時は旧revisionを保持する。未観測のcache writeや矛盾したtoken内訳、未知modelの料金を0や別モデル価格へ置換しない。世代が失われた旧family履歴のtoken・保存済み金額は維持し、最新modelへ再割当しない。価格lookupと表示familyの集約は分離する。これはStandard・短文脈を基準にした参考額であり、実際のspeed/context料金、ChatGPT請求額、quota、creditsを表さない。既存記録済み履歴金額を最新料金で上書きしない。旧APIの固定family金額欄は従来の単価・family集約を維持し、v3はモデルごとの保存額を優先して旧familyと正確なIDが混在しても二重加算しない。
 `MODEL-PRICE-UPDATE-463`: 公式料金MarkdownのStandard表を日次および手動で取得・検証し、対象モデルの4単価に変更があればcatalogの新revisionだけを追加した`codex/issue-463-* -> feat/next`のPRを作る。取得失敗、表の列変更、重複、対象model欠落、不正な値ではcatalog/refを更新せず失敗する。価格不変なら更新commit/PRを作らない。検証済み旧revisionを削除・書換えず、未処理の自動更新PRがあれば重複作成しない。mainへの直接反映、auto-merge、稼働アプリのnetwork取得は行わない。定期起動にはユーザーによるdefault branchへのworkflow統合とrepositoryのPR作成権限が必要で、その外部有効化をlocal検証済みと混同しない。
 
-`MODEL-USAGE-DISPLAY-01`: 価格は正確なmodel IDごとに算出し、その後に既知のIDを表示familyへ集約する。DB/RESTの元model keyとtoken事実は保持し、表示層のfamily対応を価格lookupに使わない。表示familyに価格未確定のmodelが含まれる場合、そのfamilyの合計金額を既知部分だけの値や0として表示しない。現在期間のモデル別利用量は、LinuxとWindowsで同じ3組の表示bucketを使う。v3 wireの入力総数をI、cached入力をC、cache write入力をW、出力をOとすると、表示Inputはtoken `I-C`と概算ドル「通常入力＋cache write」、表示Cached inputはtoken Cとcached入力ドル、表示Outputはtoken Oと出力ドルを必ず隣接させる。したがって独立列を持たないcache writeはInputのtokenとドルの双方に含め、片方だけへ含めない。v3 adapterだけがraw値をこの表示契約へ正規化し、既に表示bucketを返すv1/v2を再減算しない。有限の概算ドルは小数2桁、価格未定または非有限値は0へ推測せず利用不可として表示する。
+`MODEL-USAGE-DISPLAY-01`: 価格は正確なmodel IDごとに算出する。Windows Mainの内訳は価格catalogで採用済みの正確なIDごとに版名（例: 6 Astra、6.1 Sol、6 Sol、5.6 Tera、6 Luna）を表示し、今回期間の公開済み合計利用額の降順、同額はmodel keyの安定順、金額不明は末尾とする。既知IDの価格が未定でも版名を保持する。未対応の新modelはその他へ集約し、版が失われた旧familyは従来名のまま維持して最新の版へ推定変換しない。最大6行を同時表示し、超過行は表内の縦scrollで全件確認可能にする。GraphとLinux Mainは既知IDの表示family集約を維持する。DB/RESTの元model keyとtoken事実は保持し、表示対応を価格lookupに使わない。表示groupに価格未確定のmodelが含まれる場合、そのgroupの合計金額を既知部分だけの値や0として表示しない。現在期間のモデル別利用量は、LinuxとWindowsで同じ3組の表示bucketを使う。v3 wireの入力総数をI、cached入力をC、cache write入力をW、出力をOとすると、表示Inputはtoken `I-C`と概算ドル「通常入力＋cache write」、表示Cached inputはtoken Cとcached入力ドル、表示Outputはtoken Oと出力ドルを必ず隣接させる。したがって独立列を持たないcache writeはInputのtokenとドルの双方に含め、片方だけへ含めない。v3 adapterだけがraw値をこの表示契約へ正規化し、既に表示bucketを返すv1/v2を再減算しない。有限の概算ドルは小数2桁、価格未定または非有限値は0へ推測せず利用不可として表示する。
 `API-LIFECYCLE-01`: canonicalな収集・DB domainはUIの固定field、表示文言、画面構成および特定client versionへ依存させない。public APIは同じcommit済みdomain snapshotから作るversion別read-only adapterとし、client変更でcollectorまたはDB writerを変更しない。現行v3は現在値、履歴期間、選択期間の有限履歴page、Threadsを独立resourceとして公開し、各UIは可視surfaceに必要なresourceだけを取得する。全resourceは同じopaqueなpublished pairへ結合し、一つの取得cycleで一つのsurfaceが必要とする全pageを同一pairで受理した場合だけatomic表示する。履歴差分だけは、直前rootのcursorが同じperiodの既取得prefix不変を証明した場合に限り、新pairの全pageを揃えて旧prefixへatomic appendできる。prefixのsampleまたはgapが補正された場合はcursorを拒否し、先頭から再取得する。modelは固定3列でなく有界な配列として公開し、未知モデルのtoken事実と価格未確定を区別する。旧v1/v2と`/v3/details`は互換期間中だけ同一snapshotのdeprecated projectionとして保持し、旧API削除はadapter・route・client fallbackだけで完結させ、記録、DB schema、常駐監視、安定health endpointを変更しない。Sunset日時は別途明示決定されるまで推測しない。
 REST/DBの公開応答に含めるモデル数値は、同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値、または保存済みの同じmodel keyをlosslessに保持する`legacy-unknown`値だけとする。`reconstructed-from-session`、`unknown`、`unavailable`はモデル数値を公開せず、model key/sourceと欠損metadataだけを公開する。`legacy-unknown`は集計・予測のauthorityにはせず、`G137-5`の同一非空model集合・全lossless raw tokenとraw Remainingのexact不変・欠測／異常／confirmed gapなしをrun全体で満たす場合だけidle判定に利用できる。補間、hold、smoothing、予測およびそれらの派生値はUI presentation-onlyであり、API/DBへ書き戻さない。
+`MODEL-USAGE-DISPLAY-01`の部分額非表示、およびDirect以外を集計authorityにしない規則に対し、Windows Graphの`G137-7`期間注記だけは、保存済みの有効な部分額を「記録分（未確定）」として表示上合算できる。確定した期間合計やmodel groupの確定額とはせず、DB/API・モデル線・idle・予測のauthorityへ反映しない。
 `ACCOUNT-LIFECYCLE-134`: 一つのCodex profileは同時に一つの`auth.json` authorityだけを持つため、resident recorderが同時に書き込むのは現在認証を再確認できた一つのaccount partitionだけとする。認証されていないaccountを並行取得・推測更新しない。認証済みになった全accountのpartitionは削除せず、切替後も保持し、同一accountへ戻った場合は同じpartitionを境界後から再開する。REST/UIは初期化済みpartitionを列挙し、起動ごとに検証済み`/v3/accounts`の現accountを表示対象にする。現accountを確認できない新規起動では履歴accountを推測選択しない。起動後は利用者が設定画面で一つだけ選択して読み出せる。一覧に残る明示選択は同一processの一覧更新で保持し、次回起動の既定には保存しない。選択変更はcurrent、history、threads、pair、cursor、last-goodを同じaccount境界で一括破棄・再取得し、複数partitionの値を一画面へ混合しない。
 一つの外部観測可能な契約IDを複数ownerへ置かず、下流文書、要求台帳、実装、testは登録済みownerの
 契約IDを参照する。監査履歴、作業経過、文書SHA一覧、test名やagent運用は製品要件ではない。
@@ -147,6 +148,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - 同じ物理Session JSONLの重複`prefix_generation`がaccount切替・再起動で検出された場合、重複するsource identity、byte range、token recordは一つの物理証拠へcanonicalizeし、重複event rowを保存しない。既存の重複rowはverified backup後のwriter repairで削除し、累積model totals、history、graphへ二重加算しない。source identity・payload・byte rangeが一致せず一意に重複と確定できない場合は正常データを削除せず`unattributed`として保持する。
 - logout、account切替、identity/metadata/DB検証失敗では旧accountのdurable dataとSession sourceを保持し、current公開rootだけをstrict emptyの`auth_required`、`initializing`、または`error`へ切り替える。logoutは`auth.json`不在だけで確定せず、同一app-server processの2回の`account/read`がともに`account=null`かつ`requiresOpenaiAuth=true`で、両応答が一致する場合だけ確定する。不正応答、矛盾、transport失敗はlogoutへ変換せず`error`とする。account切替後は新account自身のquotaをcommitするまでcurrent公開を`initializing`に保ち、旧accountのquotaや`reset_at`を表示しない。旧account DBへのfallbackと自動migrationを行わない。
 - current quotaの`reset_at`は、現在のaccount partition・AuthEpochで受理した最新quota観測のprovider `resetsAt`をUnix秒のまま保持する。最新性はdeadlineの大小ではなく受理済み`observed_at`とcollector generationで決め、遅着した古い観測や同時刻の矛盾candidateで上書きしない。対応する`window_seconds`と同じtransactionで保存し、同一period内のrolling driftでもREST `quota.reset_at`とLinux/Windowsのリセット時刻を更新する。公開するcurrent periodは同じquota観測から`start_at = reset_at - window_seconds`、`end_at = min(reset_at, observed_at)`を一度だけ投影し、両platformの期間欄、メイン利用期間、selected start、横軸左端・右端へそのpairを使う。history periodのstable `id`、canonical `reset_at`、durable sample、model totalsはrolling driftだけでは書き換えず、公開windowより前のsampleは保存したままcurrent公開から除外する。completed/historical periodは保存済み`start_at/end_at`を使う。同一accountの一時的なquota/transport失敗は最後の完全な同account値を保持する。A→BではBのidentityとfresh quotaを一組でcommitするまでstrict emptyの`initializing`、confirmed logoutでは旧quotaを含まないstrict emptyの`auth_required`、identity/metadata/partition検証失敗ではstrict emptyの`error`とする。
+- `LIVE-RESET-129`の期間切替はSession利用・開始・終了と非同期である。予定週切替、OpenAI側の随時リセット、利用者のリセット券使用を考慮し、予定時刻到達やSession再開を新期間の必要条件にしない。外部quota応答に契機の識別情報がなければ原因名を推測せず、受理済みquota/windowの切替証拠を同じ規則で判定する。初回の新期間観測が既に使用済みでもよく、0 token/100%の実測を必須にしない。Sessionの累計counterや物理checkpointをquotaリセットでゼロ化せず、遅れて届いたeventを観測された期間境界とevent時刻で所属させ、新旧期間の混合・二重計上を防ぐ。rolling deadline補正と真のresetを区別する根拠が不足する場合は、時計や利用量からリセットを捏造しない。
 - account partitionの旧`reset_at` aliasと既知の`-1` quota sentinelは、DATA owner `HISTORY-CANONICAL-134`の検証済みbackup後migrationで`usage_history`単一正本へ置換する。既存model/provenance sidecarは`HistoryCanonicalizer`が実際に採用したraw usage rowのexact旧キーに結び付くものだけを同じcanonical keyへ再所属し、捨てたaliasのsidecarを比較選択・混合・補間しない。現在・過去accountへ同じmigration/write契約を適用し、稼働DBにraw/canonical並列表、revision同期、reader/UI補償を残さない。同一period内でquotaまたはvectorを一意化できない局所minuteは値を作らずlive集合から除外し、period ownerまたはcycle境界不明時だけpartition全体を無変更としてverified backupとlast-good publicationを保持する。
 - migration、restore、updateはcandidateを完全検証してからatomic switchする。検証またはswitch失敗時は旧世代だけをcurrentとして保持する。
 - cursorはsource identityと結合し、rotate、truncate、replaceを区別する。古いoffsetによるskipと二重登録を防ぐ。
@@ -493,10 +495,15 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    これはread-timeのgeometry生成だけであり、DB、history row、gap ledger、raw値を書き換えない。timestampの疎または
    sampling jitterだけでは欠損・予測へ降格しない。
 
-   accepted raw Remainingが1点以上あり、その最初のtimestampが`period_start`より後なら、Linux / Windowsの両rendererは
-   表示専用の`(period_start,100%)`から最初のaccepted raw Remainingまでを1px破線で結ぶ。この100%はquota reset境界の
-   表示規約であり、history row、raw/effective anchor、変化時刻、model利用または原因帰属ではない。DB/APIへ追加せず、
-   model系列を`period_start`へbackfillせず、最初のraw以降のRemaining geometryにも混入させない。
+   accepted raw Remainingが1点以上あり、その最初のtimestampが`period_start`より後なら、Linux rendererは
+   表示専用の`(period_start,100%)`から最初のaccepted raw Remainingまでを1px破線で結ぶ。
+   Windowsでは、同一published pairとして検証済みのperiods/historyの`Current=true`とcanonical `start_at`を
+   明示的にgeometryへ渡し、確認済みの現期間開始から最初のaccepted raw Remainingまで100%起点の実線で結ぶ。
+   同じ条件で、値が確認できたmodel系列は0起点から最初の実測値へ実線で結ぶ。最初の実測が95%や正のtoken値でもよく、
+   0または100%の実測検出を開始条件にしない。これらはリセット時の表示専用起点であり、観測値ではない。
+   DB/API、raw/effective anchor、hoverの実観測列に追加せず、最初のraw以降のgeometryにも混入させない。
+   Windowsの過去期間・開始authority不明の期間には開始補助線を作らず、24時間/7日間viewportの左端をreset開始と解釈しない。
+   明示欠損・model unknown・別resetを跨いで接続しない。このWindows変更はLinuxのmodel系列をbackfillしない。
 
    raw-null、`Held`、`Rejected`、上記の限定補完条件を満たさない明示的unavailableまたはconfirmed gapを含む区間だけを予測とし、両側のaccepted raw
    anchor間は同じ単調補間geometryを1px破線で描く。予測した中間値を新しいanchorへ昇格しない。token anomalyや
@@ -507,7 +514,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    carryする。accepted raw Remainingが1点以上あれば、最後のeffective pointからexact period endまでを長さに
    関係なく時間幅のある破線holdとし、空白や同一X座標の垂直落下を作らない。`Remaining`のeffective値から
    model系列の値またはそのperiod tailを外挿しない。
-7. `G137-7`: model線はaccepted raw同士のexact値の増加と、10分未満またはsession-level idleではない不変区間を同じ3px実線とし、
+7. `G137-7`: G137-6で定めるWindows現期間の表示専用起点を除き、model線はaccepted raw同士のexact値の増加と、10分未満またはsession-level idleではない不変区間を同じ3px実線とし、
    確定idleに含まれる不変区間だけをbandと同じX範囲の1px水平実線へ分離する。timestamp差だけでは破線化しない。raw列を
    変更せず、ドル表示では同じmodelのraw tokenが不変なrunを左端ドル値へ水平補正してから同じ線種規則を適用する。
    未使用と確定できないsampling同値反復は折れ点から外して有効変化点間を単調PCHIPで滑らかにつなぐ。途中に
@@ -519,6 +526,27 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    raw観測時刻におけるeffective値を表示する。Windowsは右端ラベルを廃止し、選択した近傍実観測時刻の
    全表示系列をホバーで確認する。整数Tokens・accepted/read-time補正Dollars・raw Remainingの表示条件は
    UX ownerの§4.2に従い、欠測を補間や0として表示しない。
+
+   Windowsのfamily表示・hoverは、同一reset period内でその時点までに掲載されたmodel keyを対象にする。
+   後から初掲載された正確なmodel IDを過去のfamily集合へ遡及追加して、保存済みの旧familyや旧版の値を消さない。
+   一度掲載されたmemberの後続欠測・価格不明はunknownのままとし、未掲載をrawの0へ変換しない。
+   旧familyと正確なIDの独立した保存値は既存の価格契約に従って表示上だけ合算する。
+   tokens/dollars、週期間/24h/7d、hoverへ同じ表示membershipを適用し、raw token、idle・予測authority、DB/APIは変更しない。
+
+   Windowsの全表示mode・両metricでは、各実reset期間の保存済みドル利用相当量を区間右上に注記する。
+   固定7日や表示窓の幅から期間を推定せず、canonicalなperiod start/endを使う。モデルの表示ON/OFFによって額を変えない。
+   最新の非synthetic raw観測だけから全raw model keyの保存USD（旧ASTRAは既定式）を一度ずつ合算し、
+   補間・hold・smoothing・予測値や過去の完全集合へfallbackしない。右端が窓内で途中まででも保存済み期間全体の累計を表す。
+   全掲載keyが最新のconfirmed完全集合に存在し、全額が有効な場合だけ「期間合計」とする。
+   不完全な集合、価格不明、無効・減少により採用できないmodel値がある場合は、そのmodelを額から除き、
+   同額の計算式と保存値の二進丸め差は減少扱いせず、最新保存額を注記だけに用いる。
+   他の有効な額だけを「記録分（未確定）」として表示する。有効な額が一つもなければ「期間合計 未取得」とし、0へ置換しない。
+   ただし過去の掲載keyもない明示的なconfirmed空集合は確定$0とする。legacy-unknownの保存値の合算はこの未確定注記だけの表示専用例外である。
+   24h/7d窓の左端が前periodの途中なら、そのperiodの注記だけを省略してグラフ線を保持する。
+   右側が部分表示のperiodは可視区間の右端を注記のanchorとし、plot内で全文を読める位置へ配置する。
+   短期間に複数resetが続いて注記が重なる場合は位置をずらし、数字を重ねたり軸・plot外で切ったりしない。
+   狭さだけを理由に注記を省略せず、複数の短い実期間と右端部分表示を含むrenderで検証する。
+   履歴0点の場合は既存の未取得・履歴なし表示を維持する。注記はテーマと言語の変更に追従し、旧model別右端ラベルやleaderを復活させない。
 8. `G137-8`: Graph candidateのpairはperiods応答のexact
    `Codex-Info-Published-Pair`を`P`とし、全history success pageの同headerがASCII
    case-sensitiveで`P`と一致した場合だけ全pageをatomic publishする。欠落、malformed、別値`Q`、
@@ -618,11 +646,11 @@ component別max、last-row、null化、任意mergeを行わない。
 
 次の条件をすべて満たした状態だけを正しい表示と定義する。
 
-1. 同一の認証主体でquotaを定期更新している間は、前回の完全なモデル使用量・履歴・threadを保持する。更新途中の欠測を空、0、未取得へ置き換えない。
+1. 同一の認証主体でquotaを定期更新している間は、受理済みモデル使用量・履歴・threadを保持する。更新途中の欠測を空、0、未取得へ置き換えない。収集済みの新しい部分観測を受理した場合は、`API-V3-MODELS-01`に従い確認できた最新model値と不完全状態を一組で表示し、古い完全集合へ戻さない。
 2. `reset_at`がサービスのrolling値として移動しても同一期間を維持する。実際の期間切替は、quotaの回復または期間境界を示す観測がある場合だけ新期間へ移す。
 3. モデル使用量（ドル・token）と残量（%）は別観測として扱う。残量観測がない時間帯をモデル使用量から逆算せず、遅れて届いた残量観測はその時刻へ反映する。
 4. DATA owner `HISTORY-CANONICAL-134`に従い、同じprofile-owned transaction snapshot内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化し、`usage_history`単一表へ一括commitする。account readerはこの表のcanonical `reset_at`をperiod authorityとして読み、model・provenanceを同じexact keyで結合する。現行periodは最新quotaの公開windowでclippingするだけとし、window内の別periodのrowをcurrentへ再所属させず、読出し時に異なるsourceを再mergeしない。quota観測を持たずquota確認済みcycleと重なるbackfill reset群と、継続cycleの内部だけにあるreset断片はperiod authorityにしない。実resetの秒をminute-startへ丸めて旧cycle末尾と新cycle先頭が同じ分になり、旧cycleがそこで終了して新cycleだけが後続分へ継続すると確認できる場合は、その境界分を新cycleへ一意に所属させる。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。同一period内のquota競合・非比較・dominant不存在は値を推測せずそのminuteと対応sidecarだけをlive canonical集合から除外する。別cycle間のownerまたは境界不明はmigration transaction全体をrejectする。既知の旧`-1`だけをmigration時に`NULL`へ置換し、通常reader/writerでは範囲外値を拒否する。100%・7日窓など数値の形で除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
-5. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の完全表示を保持し、失敗状態は別途表示する。
+5. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の受理済み表示を保持し、失敗状態は別途表示する。取得できた部分観測のmodel値は集合全体の不完全性だけで消去せず、MainとGraphで不完全状態を可視化し、正常・最新と誤称しない。
 6. 製品バージョンはメイン画面に一度だけ表示し、子ウインドウのタイトルやボタンへ重複表示しない。値はX版・Windows版とも同じリリースversion authorityから導出する。
 7. Windows版の初回起動では、health readiness後に最初のstrict validation済み`/v3/current` generation（新resourceがexact 404の旧serviceだけ上記legacy chain）が揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。control応答とのmerge、途中fieldの順番描画をせず、初回取得失敗時はスピナーを解除して失敗状態と再試行手段を表示する。Linux / WindowsのMainに公開対象となった現在openのSession thread件数を表示するため、`open_session_thread_count>0`のcurrentに限り同じMain cycleでthreadsを1回取得し、同一published pair、open件数と行数、active件数と動作中行数が一致する組だけを一括表示する。`open_session_thread_count=0`はthreadsを要求せず同じcurrent pairのthread行を空として一括表示する。Mainの合計と`SOL/TERRA/LUNA/ASTRA/その他`はこの一つの受理済み行集合だけから導出し、常に合計＝各bucketの和とする。開いたThreads詳細はMainが新しいbundleを受理した同じUI更新でそのthread行（0件を含む）へ追従し、別のthreads requestを追加しない。Main更新前に始めた独立Threads取得の古い応答で、その更新を上書きしない。threads失敗・世代不一致・件数不一致ではcurrentだけを反映せず直前の完全表示を保持する。positive bundle失敗後は10秒後にcurrentを条件headerなしで1回だけ再取得し、そのbundleが成功するまでforce、Graph、独立Threads取得で待機を迂回せず、保持中のerrorを解除しない。Graphを開いていない間はGraph resourceを取得せず、Threads詳細windowを閉じている間はこのMain bundle以外の5秒周期threads取得を行わない。
 8. X版の初回起動でも、health readiness後に最初のstrict validation済み`/v3/current` generation（新resourceがexact 404の旧serviceだけ上記legacy chain）が揃うまで主画面の内容領域を公開せず、ヘッダー（製品バージョンを含む）を固定したままスピナーを表示する。current取得が失敗した場合はスピナーを解除し、最後の完全表示または失敗状態を表示する。GraphまたはThreadsを開いていない間は、前項のMain bundle例外を除きそのresourceを取得しない。Threads詳細windowの独立5秒pollが失敗しても、その失敗を詳細側に隔離し、受理済みMainのpair、quota、model、thread合計、状態表示を変更しない。Main自身のbundle失敗では前項どおり最後の完全表示とerror表示を保持する。X11の実service gateは、同じ候補binary・display・900x498・fontで作ったpreview部品templateと、同一pairのcurrent count 1＋threads 1件（SOL）を受理した非preview Mainの合計と5 model部品を個別比較し、`[1,1,0,0,0,0]`かつ合計＝bucket和でなければFAIL/HOLDとする。

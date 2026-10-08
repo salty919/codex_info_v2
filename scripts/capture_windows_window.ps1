@@ -3,6 +3,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [string]$ThreadsOutputPath = '',
+    [string]$MainScrolledOutputPath = '',
     [string]$Preview = 'setup',
     [string]$PreviewSize = '760x680',
     [string]$ClientPath = '',
@@ -42,7 +43,8 @@ public static class CodexInfoCaptureWin32 {
 
 if ($ConfiguredService) {
     if ($PSBoundParameters.ContainsKey('Preview') -or $OpenGraphPeriodMenu -or
-        $PSBoundParameters.ContainsKey('GraphMetric')) {
+        $PSBoundParameters.ContainsKey('GraphMetric') -or
+        -not [string]::IsNullOrWhiteSpace($MainScrolledOutputPath)) {
         throw 'ConfiguredService captures only the live Main window without preview or Graph selector options'
     }
     # The launched client must use its persisted service settings and real
@@ -60,13 +62,24 @@ if ($ConfiguredService) {
     if (-not [string]::IsNullOrWhiteSpace($ThreadsOutputPath)) {
         throw 'ThreadsOutputPath requires ConfiguredService'
     }
+    if (-not [string]::IsNullOrWhiteSpace($MainScrolledOutputPath)) {
+        if ($Preview -ne 'model-breakdown') {
+            throw 'MainScrolledOutputPath requires the model-breakdown preview'
+        }
+        if ([string]::Equals(
+                [System.IO.Path]::GetFullPath($OutputPath),
+                [System.IO.Path]::GetFullPath($MainScrolledOutputPath),
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'MainScrolledOutputPath must differ from OutputPath'
+        }
+    }
     $env:CODEX_INFO_WINDOWS_PREVIEW = $Preview
     $env:CODEX_INFO_WINDOWS_PREVIEW_SIZE = $PreviewSize
     $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS = $GraphPoints
     $env:CODEX_INFO_WINDOWS_PREVIEW_GRAPH_BUILD_DELAY_MS = $GraphBuildDelayMilliseconds
     $env:CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT = $ThreadCount
     $expectedTitle = switch ($Preview) {
-        { $_ -in @('normal', 'auth', 'error', 'warning', 'danger', 'zero', 'full', 'update') } { 'Codex Info Monitor' }
+        { $_ -in @('normal', 'auth', 'error', 'warning', 'danger', 'zero', 'full', 'update', 'model-breakdown') } { 'Codex Info Monitor' }
         'graph' { 'Codex Info Graph' }
         { $_ -in @('threads', 'threads-tree', 'threads-branches') } { 'Codex Info Threads' }
         'legal' { 'Codex Info Legal' }
@@ -284,6 +297,60 @@ try {
     $bitmap.Dispose()
     $captureMode = if ($ConfiguredService) { 'configured-service' } else { "preview:$Preview" }
     Write-Output "capture: PASS mode=$captureMode pid=$($process.Id) hwnd=$window size=${width}x${height} path=$OutputPath"
+    if (-not [string]::IsNullOrWhiteSpace($MainScrolledOutputPath)) {
+        $automationRoot = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $scrollCondition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+            'Main.ModelUsageScroll')
+        $modelScrollViewer = $automationRoot.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $scrollCondition)
+        if ($null -eq $modelScrollViewer) { throw 'Main model usage scroll viewer is missing' }
+        $scrollPattern = $null
+        if (-not $modelScrollViewer.TryGetCurrentPattern(
+                [System.Windows.Automation.ScrollPattern]::Pattern,
+                [ref]$scrollPattern)) {
+            throw 'Main model usage scroll viewer has no ScrollPattern'
+        }
+        if (-not $scrollPattern.Current.VerticallyScrollable) {
+            throw 'Model breakdown preview did not overflow the six-row viewport'
+        }
+        $logicalScale = $height / 542.0
+        $viewportHeight = $modelScrollViewer.Current.BoundingRectangle.Height / $logicalScale
+        if ([Math]::Abs($viewportHeight - 132) -gt 1) {
+            throw "Main model viewport is not six 22px rows: height=$viewportHeight"
+        }
+        if ([Math]::Abs($scrollPattern.Current.VerticalViewSize - 75) -gt 0.5) {
+            throw 'Main model viewport does not expose six of eight rows'
+        }
+        if ($scrollPattern.Current.VerticalScrollPercent -gt 0.1) {
+            throw 'Main model viewport did not start at the first row'
+        }
+        $scrollPattern.SetScrollPercent(
+            [System.Windows.Automation.ScrollPattern]::NoScroll, 100)
+        $atBottom = $false
+        for ($scrollAttempt = 0; $scrollAttempt -lt 20; $scrollAttempt++) {
+            Start-Sleep -Milliseconds 100
+            if ($scrollPattern.Current.VerticalScrollPercent -ge 99.9) {
+                $atBottom = $true
+                break
+            }
+        }
+        if (-not $atBottom) { throw 'Main model rows did not reach the end of the scroll viewport' }
+        [CodexInfoCaptureWin32]::SetForegroundWindow($window) | Out-Null
+        Start-Sleep -Milliseconds 250
+        $scrolledBitmap = New-Object System.Drawing.Bitmap($width, $height)
+        $scrolledGraphics = [System.Drawing.Graphics]::FromImage($scrolledBitmap)
+        try {
+            $scrolledGraphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $scrolledBitmap.Size)
+            $scrolledBitmap.Save($MainScrolledOutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        }
+        finally {
+            $scrolledGraphics.Dispose()
+            $scrolledBitmap.Dispose()
+        }
+        Write-Output "capture: PASS mode=preview:$($Preview):scrolled pid=$($process.Id) hwnd=$window size=${width}x${height} path=$MainScrolledOutputPath"
+    }
     if (-not [string]::IsNullOrWhiteSpace($ThreadsOutputPath)) {
         $automationRoot = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $openCondition = New-Object System.Windows.Automation.PropertyCondition(

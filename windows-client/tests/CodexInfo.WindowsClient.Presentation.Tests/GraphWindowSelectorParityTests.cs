@@ -74,6 +74,36 @@ public sealed class GraphWindowSelectorParityTests
     }
 
     [Fact]
+    public void GraphCurrentDataWarningHasDedicatedNonBlockingRowAbovePlot()
+    {
+        var graph = XDocument.Parse(Load("GraphWindow.axaml"));
+        var warning = Assert.Single(graph.Descendants(), element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.CurrentDataWarning");
+
+        Assert.Equal("TextBlock", warning.Name.LocalName);
+        Assert.Equal("{Binding DetailsStatusText}", warning.Attribute("Text")?.Value);
+        Assert.Equal("{Binding HasCurrentDataWarning}", warning.Attribute("IsVisible")?.Value);
+        Assert.Equal("{Binding DetailsStatusText}", warning.Attribute("AutomationProperties.Name")?.Value);
+        Assert.Equal("False", warning.Attribute("IsHitTestVisible")?.Value);
+        Assert.Equal("Left", warning.Attribute("HorizontalAlignment")?.Value);
+        Assert.Equal("0", warning.Attribute("Grid.Row")?.Value);
+
+        var frame = graph.Descendants().Single(element =>
+            element.Attribute(XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml"))?.Value == "GraphFrame");
+        var clippedContent = frame.Elements().First();
+        Assert.Contains(clippedContent.Descendants(), element => ReferenceEquals(element, warning));
+
+        var plot = graph.Descendants().Single(element => element.Name.LocalName == "GraphPlotControl");
+        Assert.Equal("{Binding HasPlot}", plot.Attribute("IsVisible")?.Value);
+        Assert.Equal("1", plot.Attribute("Grid.Row")?.Value);
+        Assert.Same(warning.Parent, plot.Parent);
+        Assert.Equal("Auto,*", warning.Parent?.Attribute("RowDefinitions")?.Value);
+        Assert.Contains(graph.Descendants(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            element.Attribute("IsVisible")?.Value == "{Binding HasBlockingLoadError}");
+    }
+
+    [Fact]
     public void GraphPeriodSelectorUsesOneAnchoredPopupComponent()
     {
         var graph = XDocument.Parse(Load("GraphWindow.axaml"));

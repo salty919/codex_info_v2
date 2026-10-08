@@ -97,6 +97,24 @@ public sealed class GraphPointViewModel
 
 public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 {
+    private readonly record struct MainQuotaBoundary(long ResetAt, long WindowSeconds);
+    private sealed record PendingGraphRequest(
+        long RequestId,
+        GraphTimeRange Range,
+        string? RequestedPeriodId,
+        long? PinnedEndAt,
+        long? NavigationOriginAt,
+        string? AccountId,
+        long AccountGeneration,
+        long TimeWindowRevision,
+        long PeriodSelectionRevision);
+    private sealed record QuotaBoundaryRefreshRequest(
+        long SignalRevision,
+        long UserRequestRevisionAtSignal,
+        long PendingGraphRequestId,
+        string? AccountId,
+        long AccountGeneration);
+
     // Bound the legacy diagnostic point view-model collection. GraphScene and
     // the rendered evidence retain every admitted minute: reducing before
     // semantic projection would turn ordinary 60-second idle observations
@@ -149,6 +167,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private bool timeWindowRequestPending;
     private bool staticDetailsRebuildDeferred;
     private bool rebuildingPeriodDirectory;
+    private MainQuotaBoundary? observedMainQuotaBoundary;
+    private long quotaBoundaryRefreshSignalRevision;
+    private int quotaBoundaryRefreshScheduled;
+    private long graphRequestRevision;
+    private PendingGraphRequest? pendingGraphRequest;
+    private QuotaBoundaryRefreshRequest? pendingQuotaBoundaryRefresh;
+    private int windowPairRequiresFreshRefresh;
     private IReadOnlyList<GraphWindowPeriodData> staticWindowPeriodData = Array.Empty<GraphWindowPeriodData>();
     private IReadOnlyList<ApiHistoryPeriod> windowPeriodDirectory = Array.Empty<ApiHistoryPeriod>();
     private IReadOnlyDictionary<string, GraphWindowPeriodData> windowPeriodData =
@@ -171,6 +196,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         this.main = main;
         this.postToUi = postToUi;
         this.getUnixTimeSeconds = getUnixTimeSeconds;
+        observedMainQuotaBoundary = ReadMainQuotaBoundary(main.DetailsSnapshot);
         Periods = new ReadOnlyObservableCollection<ApiHistoryPeriod>(periods);
         main.PropertyChanged += OnMainPropertyChanged;
         resourceClient = main.SplitResourceClient;
@@ -347,6 +373,17 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             if (requiresResourceFetch)
             {
                 var selectionRevision = Interlocked.Increment(ref periodSelectionRevision);
+                var requestId = Interlocked.Increment(ref graphRequestRevision);
+                Volatile.Write(ref pendingGraphRequest, new PendingGraphRequest(
+                    requestId,
+                    GraphTimeRange.ResetPeriod,
+                    value!.Id,
+                    PinnedEndAt: null,
+                    NavigationOriginAt: null,
+                    main.SelectedAccountId,
+                    main.AccountSelectionGeneration,
+                    Interlocked.Read(ref timeWindowRevision),
+                    selectionRevision));
                 SetLoadError(false);
                 SetLoading(true);
                 // Keep the accepted selector, scene, and axis as one visible
@@ -713,6 +750,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string DetailsStatusText => main.DetailsStatusText;
 
+    public bool HasCurrentDataWarning =>
+        main.HasDetails && main.DetailsStatusAutomationText == "error";
+
     public bool IsLoading => isLoading;
 
     public bool HasLoadError => hasLoadError;
@@ -895,6 +935,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         disposed = true;
+        Volatile.Write(ref pendingGraphRequest, null);
+        Volatile.Write(ref pendingQuotaBoundaryRefresh, null);
         timeWindowRequestCancellation?.Cancel();
         timeWindowRequestCancellation?.Dispose();
         timeWindowRequestCancellation = null;
@@ -940,16 +982,32 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         if (eventArgs.PropertyName == nameof(MainWindowViewModel.DetailsSnapshot))
         {
+            var nextQuotaBoundary = ReadMainQuotaBoundary(main.DetailsSnapshot);
+            var quotaBoundaryChanged = observedMainQuotaBoundary is { } previousBoundary &&
+                nextQuotaBoundary is { } nextBoundary &&
+                previousBoundary != nextBoundary;
+            if (nextQuotaBoundary is { } acceptedBoundary)
+            {
+                observedMainQuotaBoundary = acceptedBoundary;
+            }
             if (resourceClient is null)
             {
                 Rebuild();
             }
+            else if (quotaBoundaryChanged && !disposed)
+            {
+                QueueQuotaBoundaryRefresh();
+            }
+            Notify(nameof(HasCurrentDataWarning));
             return;
         }
 
-        if (eventArgs.PropertyName == nameof(MainWindowViewModel.DetailsStatusText))
+        if (eventArgs.PropertyName is nameof(MainWindowViewModel.DetailsStatusText) or
+            nameof(MainWindowViewModel.DetailsStatusAutomationText) or
+            nameof(MainWindowViewModel.HasDetails))
         {
             Notify(nameof(DetailsStatusText));
+            Notify(nameof(HasCurrentDataWarning));
             return;
         }
 
@@ -978,6 +1036,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         Interlocked.Increment(ref periodSelectionRevision);
         Interlocked.Increment(ref timeWindowRevision);
+        Volatile.Write(ref pendingGraphRequest, null);
+        Volatile.Write(ref pendingQuotaBoundaryRefresh, null);
+        Volatile.Write(ref windowPairRequiresFreshRefresh, 0);
         resetRangeCommitRevision = -1;
         timeWindowRequestPending = false;
         staticDetailsRebuildDeferred = false;
@@ -1027,6 +1088,235 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         NotifyTimeRangeProperties();
     }
 
+    private static MainQuotaBoundary? ReadMainQuotaBoundary(ApiDetailsSnapshot? details) =>
+        details?.Quota is { } quota
+            ? new MainQuotaBoundary(quota.ResetAt, quota.WindowSeconds)
+            : null;
+
+    private void QueueQuotaBoundaryRefresh()
+    {
+        Volatile.Write(ref windowPairRequiresFreshRefresh, 1);
+        var signalRevision = Interlocked.Increment(ref quotaBoundaryRefreshSignalRevision);
+        var currentRequest = Volatile.Read(ref pendingGraphRequest);
+        var requestAccountIsCurrent = currentRequest is not null &&
+            IsAccountIdentityCurrent(currentRequest.AccountId, currentRequest.AccountGeneration);
+        string? accountId;
+        long accountGeneration;
+        long pendingRequestId;
+        if (requestAccountIsCurrent)
+        {
+            accountId = currentRequest!.AccountId;
+            accountGeneration = currentRequest.AccountGeneration;
+            pendingRequestId = currentRequest.RequestId;
+            if (currentRequest.Range == GraphTimeRange.ResetPeriod)
+            {
+                // Invalidate any in-flight period response before it can
+                // publish a scene from the previous current-period directory.
+                var selectionRevision = Interlocked.Increment(ref periodSelectionRevision);
+                Volatile.Write(ref pendingGraphRequest, currentRequest with
+                {
+                    PeriodSelectionRevision = selectionRevision,
+                });
+            }
+            else
+            {
+                // Fence the old window candidate, but retain the user's exact
+                // range and navigation intent for the coalesced re-fetch.
+                var timeRevision = Interlocked.Increment(ref timeWindowRevision);
+                timeWindowRequestCancellation?.Cancel();
+                timeWindowRequestCancellation?.Dispose();
+                timeWindowRequestCancellation = null;
+                Volatile.Write(ref pendingGraphRequest, currentRequest with
+                {
+                    TimeWindowRevision = timeRevision,
+                });
+            }
+        }
+        else
+        {
+            if (currentRequest is not null)
+            {
+                Volatile.Write(ref pendingGraphRequest, null);
+            }
+
+            accountId = main.SelectedAccountId;
+            accountGeneration = main.AccountSelectionGeneration;
+            pendingRequestId = 0;
+            if (SelectedTimeRange == GraphTimeRange.ResetPeriod)
+            {
+                // Boundary refresh is an authority refresh. The published
+                // period/page pair, not Main's quota event, chooses the data.
+                Interlocked.Increment(ref periodSelectionRevision);
+            }
+            else
+            {
+                Interlocked.Increment(ref timeWindowRevision);
+            }
+        }
+
+        Volatile.Write(ref pendingQuotaBoundaryRefresh, new QuotaBoundaryRefreshRequest(
+            signalRevision,
+            Interlocked.Read(ref graphRequestRevision),
+            pendingRequestId,
+            accountId,
+            accountGeneration));
+
+        if (Interlocked.CompareExchange(ref quotaBoundaryRefreshScheduled, 1, 0) == 0)
+        {
+            _ = RunQuotaBoundaryRefreshAsync(
+                resourcePollingCancellation?.Token ?? main.LifetimeToken);
+        }
+    }
+
+    private async Task RunQuotaBoundaryRefreshAsync(CancellationToken cancellationToken)
+    {
+        long processedSignalRevision = 0;
+        try
+        {
+            do
+            {
+                var request = Volatile.Read(ref pendingQuotaBoundaryRefresh);
+                processedSignalRevision = request?.SignalRevision ??
+                    Interlocked.Read(ref quotaBoundaryRefreshSignalRevision);
+                if (request is not null)
+                {
+                    await RefreshForQuotaBoundaryAsync(request, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            while (!disposed &&
+                processedSignalRevision != Interlocked.Read(ref quotaBoundaryRefreshSignalRevision));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Closing the graph owns cancellation.
+        }
+        finally
+        {
+            var completedRequest = Volatile.Read(ref pendingQuotaBoundaryRefresh);
+            if (completedRequest?.SignalRevision == processedSignalRevision)
+            {
+                Interlocked.CompareExchange(ref pendingQuotaBoundaryRefresh, null, completedRequest);
+            }
+            Interlocked.Exchange(ref quotaBoundaryRefreshScheduled, 0);
+            if (!disposed &&
+                processedSignalRevision != Interlocked.Read(ref quotaBoundaryRefreshSignalRevision) &&
+                Interlocked.CompareExchange(ref quotaBoundaryRefreshScheduled, 1, 0) == 0)
+            {
+                _ = RunQuotaBoundaryRefreshAsync(
+                    resourcePollingCancellation?.Token ?? main.LifetimeToken);
+            }
+        }
+    }
+
+    private async Task RefreshForQuotaBoundaryAsync(
+        QuotaBoundaryRefreshRequest boundaryRequest,
+        CancellationToken cancellationToken)
+    {
+        if (disposed ||
+            !IsAccountIdentityCurrent(boundaryRequest.AccountId, boundaryRequest.AccountGeneration))
+        {
+            return;
+        }
+
+        var currentRequest = Volatile.Read(ref pendingGraphRequest);
+        if (Interlocked.Read(ref graphRequestRevision) > boundaryRequest.UserRequestRevisionAtSignal ||
+            currentRequest is not null && currentRequest.RequestId != boundaryRequest.PendingGraphRequestId)
+        {
+            // A newer user request owns the graph now. It carries the latest
+            // selector/range and runs its own resource fetch.
+            return;
+        }
+
+        if (boundaryRequest.PendingGraphRequestId != 0)
+        {
+            if (currentRequest is null || currentRequest.RequestId != boundaryRequest.PendingGraphRequestId ||
+                !IsAccountIdentityCurrent(currentRequest.AccountId, currentRequest.AccountGeneration))
+            {
+                return;
+            }
+
+            await RestartPendingGraphRequestAsync(currentRequest, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (currentRequest is not null)
+        {
+            return;
+        }
+
+        if (SelectedTimeRange == GraphTimeRange.ResetPeriod)
+        {
+            var requestedPeriodId = selectedPeriod is { Current: false } ? selectedPeriod.Id : null;
+            await RefreshSplitResourceCoreAsync(
+                    initial: false,
+                    requestedPeriodId,
+                    Interlocked.Read(ref periodSelectionRevision),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var range = SelectedTimeRange;
+        var now = getUnixTimeSeconds();
+        var pinnedEndAt = pinnedWindowEndAt == long.MinValue ? (long?)null : pinnedWindowEndAt;
+        await RefreshTimeWindowCoreAsync(
+                range,
+                GraphTimeWindow.GetBounds(range, now, pinnedEndAt),
+                pinnedEndAt,
+                windowNavigationOriginAt,
+                Interlocked.Read(ref timeWindowRevision),
+                forceRefresh: true,
+                explicitRequest: false,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async Task RestartPendingGraphRequestAsync(
+        PendingGraphRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (disposed ||
+            !IsAccountIdentityCurrent(request.AccountId, request.AccountGeneration) ||
+            !ReferenceEquals(Volatile.Read(ref pendingGraphRequest), request))
+        {
+            return;
+        }
+
+        if (request.Range == GraphTimeRange.ResetPeriod)
+        {
+            await RefreshSplitResourceCoreAsync(
+                    initial: true,
+                    request.RequestedPeriodId,
+                    request.PeriodSelectionRevision,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var now = getUnixTimeSeconds();
+        var pinnedEndAt = request.PinnedEndAt is { } requestedEnd && requestedEnd < now
+            ? requestedEnd
+            : (long?)null;
+        var navigationOriginAt = pinnedEndAt is null ? null : request.NavigationOriginAt;
+        var bounds = GraphTimeWindow.GetBounds(request.Range, now, pinnedEndAt);
+        var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeWindowRequestCancellation = linkedCancellation;
+        await RefreshTimeWindowCoreAsync(
+                request.Range,
+                bounds,
+                pinnedEndAt,
+                navigationOriginAt,
+                request.TimeWindowRevision,
+                forceRefresh: true,
+                explicitRequest: true,
+                linkedCancellation.Token)
+            .ConfigureAwait(false);
+    }
+
+    private bool IsAccountIdentityCurrent(string? accountId, long generation) => accountId is null
+        ? main.SelectedAccountId is null && main.AccountSelectionGeneration == generation
+        : main.IsAccountSelectionCurrent(accountId, generation);
+
     private void RequestTimeRange(
         GraphTimeRange range,
         long? requestedPinnedEndAt,
@@ -1039,7 +1329,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         var revision = Interlocked.Increment(ref timeWindowRevision);
-        Interlocked.Increment(ref periodSelectionRevision);
+        var selectionRevision = Interlocked.Increment(ref periodSelectionRevision);
         pointBuildCancellation.Cancel();
         pointBuildCancellation.Dispose();
         pointBuildCancellation = new CancellationTokenSource();
@@ -1051,6 +1341,17 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         if (range == GraphTimeRange.ResetPeriod)
         {
+            var requestId = Interlocked.Increment(ref graphRequestRevision);
+            Volatile.Write(ref pendingGraphRequest, new PendingGraphRequest(
+                requestId,
+                range,
+                RequestedPeriodId: null,
+                PinnedEndAt: null,
+                NavigationOriginAt: null,
+                main.SelectedAccountId,
+                main.AccountSelectionGeneration,
+                revision,
+                selectionRevision));
             timeWindowRequestPending = true;
             resetRangeCommitRevision = revision;
             SetLoadError(false);
@@ -1080,6 +1381,17 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             : requestedNavigationOriginAt ?? windowNavigationOriginAt ??
                 pinnedEndAt + GraphTimeWindow.GetDurationSeconds(range);
         var bounds = GraphTimeWindow.GetBounds(range, now, pinnedEndAt);
+        var rangeRequestId = Interlocked.Increment(ref graphRequestRevision);
+        Volatile.Write(ref pendingGraphRequest, new PendingGraphRequest(
+            rangeRequestId,
+            range,
+            RequestedPeriodId: null,
+            pinnedEndAt,
+            navigationOriginAt,
+            main.SelectedAccountId,
+            main.AccountSelectionGeneration,
+            revision,
+            selectionRevision));
         timeWindowRequestPending = true;
         SetLoadError(false);
         SetLoading(true);
@@ -1127,7 +1439,10 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             return;
         }
 
-        if (TryPublishCachedWindow(range, bounds, pinnedEndAt, navigationOriginAt, revision))
+        var forceRefreshAfterBoundary = Volatile.Read(ref windowPairRequiresFreshRefresh) != 0 ||
+            Volatile.Read(ref quotaBoundaryRefreshScheduled) != 0;
+        if (!forceRefreshAfterBoundary &&
+            TryPublishCachedWindow(range, bounds, pinnedEndAt, navigationOriginAt, revision))
         {
             return;
         }
@@ -1140,7 +1455,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             pinnedEndAt,
             navigationOriginAt,
             revision,
-            forceRefresh: false,
+            forceRefresh: forceRefreshAfterBoundary,
             explicitRequest: true,
             timeWindowRequestCancellation.Token);
     }
@@ -1599,6 +1914,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             return;
         }
 
+        ClearPendingGraphRequestForWindow(revision);
+        Volatile.Write(ref windowPairRequiresFreshRefresh, 0);
         if (resourceClient is not null)
         {
             var nextData = pair == windowPublishedPair
@@ -1691,6 +2008,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
+            ClearPendingGraphRequestForWindow(revision);
             timeWindowRequestPending = false;
             if (timeWindowRequestCancellation is not null)
             {
@@ -1716,6 +2034,26 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(RangeLabel));
     }
 
+    private void ClearPendingGraphRequestForWindow(long revision)
+    {
+        var request = Volatile.Read(ref pendingGraphRequest);
+        if (request is not null && request.Range != GraphTimeRange.ResetPeriod &&
+            request.TimeWindowRevision == revision)
+        {
+            Interlocked.CompareExchange(ref pendingGraphRequest, null, request);
+        }
+    }
+
+    private void ClearPendingGraphRequestForPeriod(long selectionRevision)
+    {
+        var request = Volatile.Read(ref pendingGraphRequest);
+        if (request is not null && request.Range == GraphTimeRange.ResetPeriod &&
+            request.PeriodSelectionRevision == selectionRevision)
+        {
+            Interlocked.CompareExchange(ref pendingGraphRequest, null, request);
+        }
+    }
+
     private async Task RunSplitResourcePollingAsync(CancellationToken cancellationToken)
     {
         try
@@ -1731,7 +2069,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 await RefreshSplitResourceAsync(
                         initial: false,
-                        requestedPeriodId: selectedPeriod?.Id,
+                        requestedPeriodId: selectedPeriod is { Current: false } ? selectedPeriod.Id : null,
                         cancellationToken)
                     .ConfigureAwait(false);
             }
@@ -1747,7 +2085,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         string? requestedPeriodId,
         CancellationToken cancellationToken)
     {
-        if (timeWindowRequestPending)
+        if (timeWindowRequestPending || Volatile.Read(ref pendingGraphRequest) is not null)
         {
             return;
         }
@@ -2422,6 +2760,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
+            ClearPendingGraphRequestForPeriod(selectionRevision);
             applyingSplitResourceState = true;
             try
             {
@@ -2483,6 +2822,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
+            ClearPendingGraphRequestForPeriod(selectionRevision);
             resourceCursorResetRequired = nextCursorResetRequired;
             if (resetRangeCommitRevision == Interlocked.Read(ref timeWindowRevision))
             {
@@ -2860,7 +3200,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             confirmedGaps,
             hiddenModelNames,
             accountOwnershipIntervals,
-            period.ResetAt);
+            period.ResetAt,
+            isVerifiedCurrentResetStart: period.Current);
         GraphPlotProjection.PrepareGeometry(graphScene);
         return new GraphProjection(
             diagnosticSamples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
@@ -2888,6 +3229,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             resetRangeCommitRevision = -1;
             timeWindowRequestPending = false;
+            ClearPendingGraphRequestForPeriod(Interlocked.Read(ref periodSelectionRevision));
             Volatile.Write(ref selectedTimeRangeValue, (int)GraphTimeRange.ResetPeriod);
             pinnedWindowEndAt = long.MinValue;
             windowNavigationOriginAt = null;
@@ -2991,6 +3333,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             resetRangeCommitRevision = -1;
             timeWindowRequestPending = false;
+            ClearPendingGraphRequestForPeriod(Interlocked.Read(ref periodSelectionRevision));
         }
         SetLoadError(true);
         SetLoading(false);

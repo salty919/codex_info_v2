@@ -244,8 +244,17 @@
 
       <Grid Grid.Row="3" x:Name="GraphFrame">
         <Border Background="{DynamicResource Theme121C2C}" BorderBrush="Transparent" BorderThickness="1" CornerRadius="10" ClipToBounds="True">
-          <Grid>
-            <plot:GraphPlotControl Scene="{Binding Scene}"
+          <Grid RowDefinitions="Auto,*">
+            <TextBlock Grid.Row="0" Classes="label" Margin="12,8,12,6" MaxWidth="560"
+                       HorizontalAlignment="Left" VerticalAlignment="Center"
+                       TextWrapping="Wrap" FontWeight="SemiBold"
+                       Foreground="{DynamicResource ThemeF0A35B}"
+                       Text="{Binding DetailsStatusText}"
+                       IsVisible="{Binding HasCurrentDataWarning}"
+                       IsHitTestVisible="False"
+                       AutomationProperties.Name="{Binding DetailsStatusText}"
+                       AutomationProperties.AutomationId="Graph.CurrentDataWarning" />
+            <plot:GraphPlotControl Grid.Row="1" Scene="{Binding Scene}"
                                    ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}"
                                    ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}"
                                    ShowAstra="{Binding ShowAstra}"
@@ -253,15 +262,15 @@
                                    AutomationProperties.HelpText="{Binding MetricAxisText}"
                                    AutomationProperties.AutomationId="Graph.Plot"
                                    IsVisible="{Binding HasPlot}" />
-            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8"
+            <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8"
                         IsVisible="{Binding IsLoading}" IsHitTestVisible="False">
               <ProgressBar Width="72" Height="4" IsIndeterminate="True" />
               <TextBlock Classes="label" Text="{Binding LoadingText}" />
             </StackPanel>
-            <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
+            <TextBlock Grid.Row="1" Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
                        IsVisible="{Binding HasBlockingLoadError}" IsHitTestVisible="False"
                        Foreground="{DynamicResource ThemeF0A35B}" Text="{Binding LoadErrorText}" />
-            <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
+            <TextBlock Grid.Row="1" Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
                        IsVisible="{Binding HasNoPoints}" IsHitTestVisible="False"
                        Text="{Binding Texts.UnavailableDetails}" />
           </Grid>

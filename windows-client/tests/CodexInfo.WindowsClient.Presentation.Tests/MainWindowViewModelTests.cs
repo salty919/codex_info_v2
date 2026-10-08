@@ -168,7 +168,7 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task V3ExactModelsArePricedIndividuallyThenGroupedForDisplay()
+    public async Task V3MainModelProjectionKeepsExactCatalogLabelsAndSortsByWireTotal()
     {
         var current = new ApiCurrentSnapshot(
             ApiState.Ready,
@@ -177,22 +177,58 @@ public sealed class MainWindowViewModelTests
             "Pro",
             new ApiQuota(45, 2, 604800, false),
             [
-                new ApiDetailsModelUsage("gpt-6-sol", 10, 2, 3, 0.12, 0.02, 0.03)
+                new ApiDetailsModelUsage("gpt-6-sol", 10, 2, 3, 0.15, 0, 0)
                 {
                     TotalTokens = 15,
-                    CacheWriteInputTokens = 2,
-                    CacheWriteInputDollars = 0.04,
+                    CacheWriteInputTokens = 0,
+                    CacheWriteInputDollars = 0,
                     PriceVersion = "revision-current",
-                    EstimatedTotalDollars = 0.17,
+                    EstimatedTotalDollars = 0.15,
                 },
-                new ApiDetailsModelUsage("gpt-5.6-sol", 20, 5, 6, 0.30, 0.05, 0.06)
+                new ApiDetailsModelUsage("gpt-5.6-sol", 20, 5, 6, 0.10, 0, 0)
                 {
                     TotalTokens = 31,
-                    CacheWriteInputTokens = 1,
-                    CacheWriteInputDollars = 0.10,
+                    CacheWriteInputTokens = 0,
+                    CacheWriteInputDollars = 0,
                     PriceVersion = "revision-older",
-                    EstimatedTotalDollars = 0.41,
+                    EstimatedTotalDollars = 0.10,
                 },
+                new ApiDetailsModelUsage("gpt-6-astra", 30, 0, 0, 0.30, 0, 0)
+                {
+                    TotalTokens = 30,
+                    EstimatedTotalDollars = 0.30,
+                },
+                new ApiDetailsModelUsage("gpt-6.1-sol", 15, 0, 0, 0.15, 0, 0)
+                {
+                    TotalTokens = 15,
+                    EstimatedTotalDollars = 0.15,
+                },
+                new ApiDetailsModelUsage("gpt-5.6-terra", 40, 0, 0, 0.40, 0, 0)
+                {
+                    TotalTokens = 40,
+                    EstimatedTotalDollars = 0.40,
+                },
+                new ApiDetailsModelUsage("gpt-6-luna", 5, 0, 0, 0.05, 0, 0)
+                {
+                    TotalTokens = 5,
+                    EstimatedTotalDollars = 0.05,
+                },
+                new ApiDetailsModelUsage("gpt-5.6-luna", 6, 0, 0, double.NaN, double.NaN, double.NaN)
+                {
+                    TotalTokens = 6,
+                },
+                new ApiDetailsModelUsage("gpt-6-terra", 7, 0, 0, double.NaN, double.NaN, double.NaN)
+                {
+                    TotalTokens = 7,
+                },
+                new ApiDetailsModelUsage("future-model", 8, 0, 0, double.NaN, double.NaN, double.NaN)
+                {
+                    TotalTokens = 8,
+                },
+                new ApiDetailsModelUsage("SOL", 9, 0, 0, 0.07, 0, 0) { TotalTokens = 9 },
+                new ApiDetailsModelUsage("TERRA", 8, 0, 0, 0.06, 0, 0) { TotalTokens = 8 },
+                new ApiDetailsModelUsage("LUNA", 6, 0, 0, 0.04, 0, 0) { TotalTokens = 6 },
+                new ApiDetailsModelUsage("ASTRA", 2, 0, 0, 0.02, 0, 0) { TotalTokens = 2 },
             ],
             0,
             PublishedPair(CanonicalPublishedPair));
@@ -201,18 +237,100 @@ public sealed class MainWindowViewModelTests
         viewModel.Start();
         await EventuallyAsync(() => viewModel.IsAuthenticated);
 
-        var row = Assert.Single(viewModel.Models);
-        Assert.Equal("SOL", row.Name);
-        Assert.Equal("30", row.InputTokensText);
-        Assert.Equal("7", row.CachedInputTokensText);
-        Assert.Equal("9", row.OutputTokensText);
-        Assert.Equal("$0.42", row.InputDollarsText);
-        Assert.Equal("$0.07", row.CachedInputDollarsText);
-        Assert.Equal("$0.09", row.OutputDollarsText);
-        Assert.Equal("$0.58", row.TotalDollarsText);
-        Assert.Equal("概算 $0.58", viewModel.EstimatedCostText);
-        Assert.Equal(["gpt-6-sol", "gpt-5.6-sol"],
+        var expectedLabels = new[]
+        {
+            "5.6 Tera",
+            "6 Astra",
+            "6 Sol",
+            "6.1 Sol",
+            "5.6 Sol",
+            "SOL",
+            "TERRA",
+            "6 Luna",
+            "LUNA",
+            "ASTRA",
+            LocalizationService.Current.Other,
+            "5.6 Luna",
+        };
+        Assert.Equal(
+            ["gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-5.6-sol", "SOL", "TERRA", "gpt-6-luna", "LUNA", "ASTRA"],
+            viewModel.Models.Take(10).Select(row => row.Name));
+        Assert.Equal(expectedLabels, viewModel.Models.Select(row =>
+            row.GetType().GetProperty("DisplayName")?.GetValue(row) as string ?? "<missing-label>"));
+
+        var tieRows = viewModel.Models.Where(row => row.TotalDollarsText == "$0.15").ToArray();
+        Assert.Equal(["gpt-6-sol", "gpt-6.1-sol"], tieRows.Select(row => row.Name));
+        Assert.Equal("$0.40", viewModel.Models[0].TotalDollarsText);
+        Assert.Equal("$0.30", viewModel.Models[1].TotalDollarsText);
+        Assert.Equal("15", viewModel.Models[10].TotalTokensText);
+        Assert.Equal(LocalizationService.Current.UnavailableValue, viewModel.Models[10].TotalDollarsText);
+        Assert.Equal(LocalizationService.Current.UnavailableValue, viewModel.Models[11].TotalDollarsText);
+        Assert.Equal("概算 —", viewModel.EstimatedCostText);
+        Assert.Equal(
+            ["gpt-6-sol", "gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.6-luna", "gpt-6-terra", "future-model", "SOL", "TERRA", "LUNA", "ASTRA"],
             viewModel.DetailsSnapshot!.Models.Select(model => model.Name));
+    }
+
+    [Fact]
+    public async Task MainModelGroupingPreservesRawValuesWhenOtherTotalsOverflow()
+    {
+        var rawModels = new[]
+        {
+            new ApiDetailsModelUsage(
+                "future-overflow-a",
+                ulong.MaxValue,
+                0,
+                0,
+                0.30,
+                0,
+                0)
+            {
+                TotalTokens = ulong.MaxValue,
+                CacheWriteInputTokens = ulong.MaxValue,
+                EstimatedTotalDollars = 0.30,
+            },
+            new ApiDetailsModelUsage(
+                "future-overflow-b",
+                1,
+                0,
+                0,
+                0.20,
+                0,
+                0)
+            {
+                TotalTokens = 1,
+                CacheWriteInputTokens = 1,
+                EstimatedTotalDollars = 0.20,
+            },
+        };
+        var current = new ApiCurrentSnapshot(
+            ApiState.Ready,
+            1,
+            true,
+            "Pro",
+            new ApiQuota(45, 2, 604800, false),
+            rawModels,
+            0,
+            PublishedPair(CanonicalPublishedPair));
+        using var viewModel = new MainWindowViewModel(new SingleCurrentClient(current));
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated);
+
+        Assert.Equal(["future-overflow-a", "future-overflow-b"],
+            viewModel.Models.Select(model => model.Name));
+        Assert.Equal([LocalizationService.Current.Other, LocalizationService.Current.Other],
+            viewModel.Models.Select(model => model.DisplayName));
+        var maxTokenText = ulong.MaxValue.ToString("N0", CultureInfo.CurrentCulture);
+        Assert.Equal([maxTokenText, "1"], viewModel.Models.Select(model => model.InputTokensText));
+        Assert.Equal([maxTokenText, "1"], viewModel.Models.Select(model => model.TotalTokensText));
+        Assert.Equal([maxTokenText, "1"], viewModel.Models.Select(model => model.CacheWriteInputTokensText));
+        Assert.Equal(["$0.30", "$0.20"], viewModel.Models.Select(model => model.TotalDollarsText));
+        Assert.Equal(rawModels.Select(model => model.Name),
+            viewModel.DetailsSnapshot!.Models.Select(model => model.Name));
+        Assert.Equal(ulong.MaxValue, viewModel.DetailsSnapshot.Models[0].TotalTokens);
+        Assert.Equal(ulong.MaxValue, viewModel.DetailsSnapshot.Models[0].CacheWriteInputTokens);
+        Assert.Equal(ulong.MaxValue, viewModel.DetailsSnapshot.Models[0].InputTokens);
     }
 
     [Fact]
@@ -1606,17 +1724,68 @@ public sealed class MainWindowViewModelTests
     [Fact]
     public async Task ApiErrorIsNotPresentedAsTransportFailure()
     {
-        using var viewModel = new MainWindowViewModel(new SequenceClient(
-            DetailsFetchResult.Success(ValidSnapshot(state: ApiState.Error))));
+        static ApiCurrentSnapshot Current(
+            ApiState state,
+            long observedAt,
+            ulong totalTokens,
+            double estimatedTotalDollars) => new(
+                state,
+                observedAt,
+                true,
+                "Pro",
+                new ApiQuota(98.5, 2, 604800, false),
+                [new ApiDetailsModelUsage("gpt-6-astra", totalTokens, 0, 0, 0, 0, 0)
+                {
+                    TotalTokens = totalTokens,
+                    EstimatedTotalDollars = estimatedTotalDollars,
+                }],
+                0,
+                PublishedPair(CanonicalPublishedPair));
+
+        var client = new SequencedSplitClient(
+            [
+                Current(ApiState.Ready, 1, 19_194_384, 19.194384),
+                Current(ApiState.Error, 2, 201_416_126, 258.04086),
+                Current(ApiState.Ready, 3, 201_416_126, 258.04086),
+            ],
+            []);
+        using var viewModel = new MainWindowViewModel(client);
 
         viewModel.Start();
-        await EventuallyAsync(() => viewModel.StatusTitle == "Linux 側の取得エラー");
+        await EventuallyAsync(() => viewModel.DetailsSnapshot?.ObservedAt == 1);
+
+        Assert.Equal("概算 $19.19", viewModel.EstimatedCostText);
+        Assert.Equal("$19.19", Assert.Single(viewModel.Models).TotalDollarsText);
+
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => viewModel.DetailsSnapshot?.ObservedAt == 2);
+
+        var latestAstra = Assert.Single(viewModel.Models);
+        Assert.Equal("gpt-6-astra", latestAstra.Name);
+        Assert.Equal("6 Astra", latestAstra.GetType().GetProperty("DisplayName")?.GetValue(latestAstra));
+        Assert.Equal("201,416,126", latestAstra.TotalTokensText);
+        Assert.Equal("$258.04", latestAstra.TotalDollarsText);
+        Assert.Equal("概算 $258.04", viewModel.EstimatedCostText);
+        Assert.Equal(ApiState.Error, viewModel.DetailsSnapshot!.State);
+        Assert.Equal(viewModel.Texts.ApiError, viewModel.StatusTitle);
+        Assert.Equal("error", viewModel.DetailsStatusAutomationText);
+        Assert.Contains(viewModel.Texts.ApiErrorSnapshotNotice, viewModel.DetailsStatusText, StringComparison.Ordinal);
+        Assert.DoesNotContain(viewModel.Texts.Unavailable, viewModel.DetailsStatusText, StringComparison.Ordinal);
 
         Assert.DoesNotContain("更新できていません", viewModel.StatusDetail, StringComparison.Ordinal);
         Assert.Contains("接続経路", viewModel.StatusDetail, StringComparison.Ordinal);
         Assert.Contains("前回受信:", viewModel.StatusDetail, StringComparison.Ordinal);
         Assert.False(viewModel.ShowLastReceived);
-        Assert.Equal("98.5%", viewModel.RemainingPercentText);
+
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => viewModel.DetailsSnapshot?.ObservedAt == 3);
+
+        var recoveredAstra = Assert.Single(viewModel.Models);
+        Assert.Equal("201,416,126", recoveredAstra.TotalTokensText);
+        Assert.Equal("$258.04", recoveredAstra.TotalDollarsText);
+        Assert.Equal("概算 $258.04", viewModel.EstimatedCostText);
+        Assert.Equal("ready", viewModel.DetailsStatusAutomationText);
+        Assert.Contains(viewModel.Texts.Latest, viewModel.DetailsStatusText, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -1758,8 +1927,34 @@ public sealed class MainWindowViewModelTests
     [Fact]
     public async Task RefreshUpdatesStableModelAndQuotaRowsWithoutCollectionReset()
     {
-        var firstDetails = DetailsSnapshot(1.25);
-        var secondDetails = DetailsSnapshot(2.5);
+        var firstDetails = DetailsSnapshot(1.25) with
+        {
+            Models =
+            [
+                new ApiDetailsModelUsage("gpt-6-astra", 1, 0, 0, 1.25, 0, 0)
+                {
+                    EstimatedTotalDollars = 1.25,
+                },
+                new ApiDetailsModelUsage("gpt-6-sol", 1, 0, 0, 0.50, 0, 0)
+                {
+                    EstimatedTotalDollars = 0.50,
+                },
+            ],
+        };
+        var secondDetails = DetailsSnapshot(2.5) with
+        {
+            Models =
+            [
+                new ApiDetailsModelUsage("gpt-6-astra", 2, 0, 0, 2.50, 0, 0)
+                {
+                    EstimatedTotalDollars = 2.50,
+                },
+                new ApiDetailsModelUsage("gpt-6-sol", 2, 0, 0, 0.75, 0, 0)
+                {
+                    EstimatedTotalDollars = 0.75,
+                },
+            ],
+        };
         using var viewModel = new MainWindowViewModel(
             new SequenceClient(
                 DetailsFetchResult.Success(ValidSnapshot()),
@@ -1771,6 +1966,8 @@ public sealed class MainWindowViewModelTests
         viewModel.Start();
         await EventuallyAsync(() => viewModel.HasDetails && !viewModel.IsStartupLoading);
         var modelRow = viewModel.Models[0];
+        var secondModelRow = viewModel.Models[1];
+        Assert.Equal(["gpt-6-astra", "gpt-6-sol"], viewModel.Models.Select(row => row.Name));
         var quotaRows = viewModel.QuotaSegments.ToArray();
 
         var modelChanges = 0;
@@ -1788,6 +1985,7 @@ public sealed class MainWindowViewModelTests
         Assert.Equal(0, modelChanges);
         Assert.Equal(0, quotaChanges);
         Assert.Same(modelRow, viewModel.Models[0]);
+        Assert.Same(secondModelRow, viewModel.Models[1]);
         Assert.Equal(quotaRows.Length, viewModel.QuotaSegments.Count);
         Assert.All(quotaRows.Select((row, index) => (row, index)), item =>
             Assert.Same(item.row, viewModel.QuotaSegments[item.index]));
