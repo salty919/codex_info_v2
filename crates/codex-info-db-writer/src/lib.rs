@@ -6,6 +6,7 @@ use codex_info_db_reader::{
     canonicalize_history_for_storage_with_sources, RawSample as CanonicalRawSample,
     HISTORY_CANONICAL_SCHEMA_VERSION,
 };
+use codex_info_pricing::{estimate_at, estimate_legacy, estimate_with_revision, family, Usage};
 use rusqlite::types::Value;
 use rusqlite::{
     params, Connection, DatabaseName, OpenFlags, OptionalExtension, TransactionBehavior,
@@ -349,6 +350,8 @@ CREATE TABLE usage_model_history (
     output_tokens TEXT NOT NULL,
     cache_write_input_tokens TEXT,
     model_set_complete INTEGER NOT NULL CHECK (model_set_complete IN (0, 1)),
+    total_dollars REAL,
+    price_version TEXT,
     PRIMARY KEY (reset_at, timestamp, model)
 ) WITHOUT ROWID;
 
@@ -650,6 +653,7 @@ const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
 pub const MAX_SESSION_MODEL_BYTES: usize = 512;
 const ACCOUNT_DB_SCHEMA_VERSION: i64 = HISTORY_CANONICAL_SCHEMA_VERSION;
 const LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION: i64 = 10;
+const MODEL_PRICING_PREVIOUS_SCHEMA_VERSION: i64 = 11;
 const MAX_LOGIN_ID_SCALARS: usize = 254;
 const MAX_ACTIVE_THREADS: usize = 256;
 const MAX_ACTIVE_THREAD_ID_SCALARS: usize = 512;
@@ -2779,53 +2783,17 @@ fn event_has_usage(event: &SessionEvent) -> bool {
             .is_some_and(|value| value > 0)
 }
 
-fn session_total_dollars(total: &SessionModelTotal) -> f64 {
-    let input = total.input_tokens.saturating_sub(total.cached_input_tokens) as f64;
-    let cached = total.cached_input_tokens as f64;
-    let output = total.output_tokens as f64;
-    match total.model.as_str() {
-        "SOL" => (input * 5.0 + cached * 0.5 + output * 30.0) / 1_000_000.0,
-        "TERRA" => (input * 2.0 + cached * 0.2 + output * 12.0) / 1_000_000.0,
-        "LUNA" => (input * 0.2 + cached * 0.02 + output * 1.2) / 1_000_000.0,
-        "ASTRA" => {
-            let Some(writes) = total.cache_write_input_tokens else {
-                return 0.0;
-            };
-            let ordinary = total
-                .input_tokens
-                .saturating_sub(total.cached_input_tokens)
-                .saturating_sub(writes);
-            (ordinary as f64 * 10.0 + cached * 1.0 + writes as f64 * 12.5 + output * 50.0)
-                / 1_000_000.0
-        }
-        _ => 0.0,
-    }
-}
-
-fn session_totals_history_values(totals: &[SessionModelTotal]) -> (f64, f64, f64, u64, u64, u64) {
-    let mut dollars = (0.0, 0.0, 0.0);
+fn session_totals_history_tokens(totals: &[SessionModelTotal]) -> (u64, u64, u64) {
     let mut tokens: (u64, u64, u64) = (0, 0, 0);
     for total in totals {
-        let value = session_total_dollars(total);
-        match total.model.as_str() {
-            "SOL" => {
-                dollars.0 += value;
-                tokens.0 = tokens.0.saturating_add(total.total_tokens);
-            }
-            "TERRA" => {
-                dollars.1 += value;
-                tokens.1 = tokens.1.saturating_add(total.total_tokens);
-            }
-            "LUNA" => {
-                dollars.2 += value;
-                tokens.2 = tokens.2.saturating_add(total.total_tokens);
-            }
+        match family(&total.model) {
+            Some("SOL") => tokens.0 = tokens.0.saturating_add(total.total_tokens),
+            Some("TERRA") => tokens.1 = tokens.1.saturating_add(total.total_tokens),
+            Some("LUNA") => tokens.2 = tokens.2.saturating_add(total.total_tokens),
             _ => {}
         }
     }
-    (
-        dollars.0, dollars.1, dollars.2, tokens.0, tokens.1, tokens.2,
-    )
+    tokens
 }
 
 fn load_raw_session_events_from_connection(connection: &Connection) -> Result<Vec<SessionEvent>> {
@@ -2896,9 +2864,23 @@ fn load_raw_session_events_from_connection(connection: &Connection) -> Result<Ve
 /// also a replay only when the immutable source identity, token payload, and
 /// overlapping byte ranges all agree.  Equal timestamps alone are not enough:
 /// two independent source records may legitimately have the same timestamp.
+fn session_event_models_replay_compatible(existing: &str, candidate: &str) -> bool {
+    if existing == candidate {
+        return true;
+    }
+    let is_legacy_family_key = |model: &str| matches!(model, "SOL" | "TERRA" | "LUNA" | "ASTRA");
+    if is_legacy_family_key(existing) {
+        return family(candidate).is_some_and(|candidate_family| candidate_family == existing);
+    }
+    if is_legacy_family_key(candidate) {
+        return family(existing).is_some_and(|existing_family| existing_family == candidate);
+    }
+    false
+}
+
 pub fn session_event_is_replay(existing: &SessionEvent, candidate: &SessionEvent) -> bool {
     let same_payload = existing.timestamp == candidate.timestamp
-        && existing.model == candidate.model
+        && session_event_models_replay_compatible(&existing.model, &candidate.model)
         && existing.total_tokens == candidate.total_tokens
         && existing.input_tokens == candidate.input_tokens
         && existing.cached_input_tokens == candidate.cached_input_tokens
@@ -5668,13 +5650,29 @@ fn upsert_observation_model_totals(
     preserve_existing: bool,
     preserve_existing_before: Option<i64>,
 ) -> Result<()> {
+    upsert_observation_model_totals_with_saved_legacy_dollars(
+        transaction,
+        observations,
+        preserve_existing,
+        preserve_existing_before,
+        None,
+    )
+}
+
+fn upsert_observation_model_totals_with_saved_legacy_dollars(
+    transaction: &rusqlite::Transaction<'_>,
+    observations: &[UsageHistoryObservation],
+    preserve_existing: bool,
+    preserve_existing_before: Option<i64>,
+    saved_legacy_dollars: Option<&BTreeMap<i64, SavedLegacyFamilyDollars>>,
+) -> Result<()> {
     let mut delete = transaction.prepare("DELETE FROM usage_model_history WHERE timestamp = ?1")?;
     let mut insert = transaction.prepare(
         "INSERT INTO usage_model_history (
             reset_at, timestamp, model, total_tokens, input_tokens,
             cached_input_tokens, output_tokens, cache_write_input_tokens,
-            model_set_complete
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            model_set_complete, total_dollars, price_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     for observation in observations {
         let Some(model_totals) = observation.model_totals.as_ref() else {
@@ -5701,8 +5699,22 @@ fn upsert_observation_model_totals(
                 continue;
             }
         }
+        let saved_prices = load_saved_model_prices(transaction, observation.timestamp)?;
         delete.execute([observation.timestamp])?;
         for total in model_totals {
+            let saved_fixed_dollars = family(&total.model)
+                .filter(|model_family| *model_family == total.model)
+                .and_then(|model_family| {
+                    saved_legacy_dollars
+                        .and_then(|saved| saved.get(&observation.timestamp))
+                        .and_then(|saved| saved.amount_for(model_family))
+                });
+            let (total_dollars, price_version) = model_history_price_with_legacy_fallback(
+                &total,
+                observation.timestamp,
+                saved_prices.get(&total.model),
+                saved_fixed_dollars,
+            );
             insert.execute(params![
                 observation.reset_at,
                 observation.timestamp,
@@ -5715,10 +5727,195 @@ fn upsert_observation_model_totals(
                     .cache_write_input_tokens
                     .map(|value| value.to_string()),
                 i64::from(observation.model_totals_complete),
+                total_dollars,
+                price_version,
             ])?;
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct SavedModelPrice {
+    total_tokens: String,
+    input_tokens: String,
+    cached_input_tokens: String,
+    output_tokens: String,
+    cache_write_input_tokens: Option<String>,
+    total_dollars: Option<f64>,
+    price_version: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SavedLegacyFamilyDollars {
+    sol: f64,
+    terra: f64,
+    luna: f64,
+    families_with_exact_models: BTreeSet<&'static str>,
+}
+
+impl SavedLegacyFamilyDollars {
+    fn amount_for(&self, model_family: &str) -> Option<f64> {
+        if self.families_with_exact_models.contains(model_family) {
+            return None;
+        }
+        match model_family {
+            "SOL" => Some(self.sol),
+            "TERRA" => Some(self.terra),
+            "LUNA" => Some(self.luna),
+            _ => None,
+        }
+    }
+}
+
+/// Captures the fixed family-dollar aggregate before its same-minute sample
+/// is replaced. A v11 family sidecar was the whole family total; once the
+/// first exact-ID row is added, the updated compatibility aggregate also
+/// includes that exact model and must not be copied back onto the family row.
+fn load_saved_legacy_family_dollars(
+    connection: &Connection,
+    samples: &[UsageHistorySample],
+) -> Result<BTreeMap<i64, SavedLegacyFamilyDollars>> {
+    let mut saved = BTreeMap::new();
+    for sample in samples {
+        let values: Option<(f64, f64, f64)> = connection
+            .query_row(
+                "SELECT sol_dollars, terra_dollars, luna_dollars
+                 FROM usage_history WHERE timestamp=?1 AND reset_at=?2",
+                params![sample.timestamp, sample.reset_at],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((sol, terra, luna)) = values else {
+            continue;
+        };
+        let mut families_with_exact_models = BTreeSet::new();
+        let mut statement = connection
+            .prepare("SELECT model FROM usage_model_history WHERE timestamp=?1 AND reset_at=?2")?;
+        let models = statement
+            .query_map(params![sample.timestamp, sample.reset_at], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for model in models {
+            if let Some(model_family) = family(&model) {
+                if model != model_family {
+                    families_with_exact_models.insert(model_family);
+                }
+            }
+        }
+        saved.insert(
+            sample.timestamp,
+            SavedLegacyFamilyDollars {
+                sol,
+                terra,
+                luna,
+                families_with_exact_models,
+            },
+        );
+    }
+    Ok(saved)
+}
+
+fn load_saved_model_prices(
+    connection: &Connection,
+    timestamp: i64,
+) -> Result<BTreeMap<String, SavedModelPrice>> {
+    let mut statement = connection.prepare(
+        "SELECT model, total_tokens, input_tokens, cached_input_tokens,
+                output_tokens, cache_write_input_tokens, total_dollars, price_version
+         FROM usage_model_history WHERE timestamp=?1",
+    )?;
+    let rows = statement.query_map([timestamp], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            SavedModelPrice {
+                total_tokens: row.get(1)?,
+                input_tokens: row.get(2)?,
+                cached_input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cache_write_input_tokens: row.get(5)?,
+                total_dollars: row.get(6)?,
+                price_version: row.get(7)?,
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()
+        .map_err(Into::into)
+}
+
+fn model_history_price(
+    total: &SessionModelTotal,
+    observed_at: i64,
+    saved: Option<&SavedModelPrice>,
+) -> (Option<f64>, Option<String>) {
+    model_history_price_with_legacy_fallback(total, observed_at, saved, None)
+}
+
+fn model_history_price_with_legacy_fallback(
+    total: &SessionModelTotal,
+    observed_at: i64,
+    saved: Option<&SavedModelPrice>,
+    saved_legacy_dollars: Option<f64>,
+) -> (Option<f64>, Option<String>) {
+    let legacy_family = family(&total.model).filter(|model_family| *model_family == total.model);
+    if let Some(saved) = saved {
+        let same_usage = saved.total_tokens == total.total_tokens.to_string()
+            && saved.input_tokens == total.input_tokens.to_string()
+            && saved.cached_input_tokens == total.cached_input_tokens.to_string()
+            && saved.output_tokens == total.output_tokens.to_string()
+            && saved.cache_write_input_tokens
+                == total
+                    .cache_write_input_tokens
+                    .map(|value| value.to_string());
+        if same_usage {
+            if saved.total_dollars.is_some() || saved.price_version.is_some() {
+                return (saved.total_dollars, saved.price_version.clone());
+            }
+            if legacy_family.is_none() {
+                // Missing exact-ID prices are a historical fact too. Keep
+                // them unavailable when a later catalog gains coverage.
+                return (None, None);
+            }
+            if let Some(dollars) = saved_legacy_dollars {
+                // The legacy aggregate was captured before the same-minute
+                // usage_history row was replaced. It is the saved v11 family
+                // value, so retain it verbatim and do not invent a revision.
+                return (Some(dollars), None);
+            }
+            // A saved NULL stays NULL when there is no trustworthy pre-upsert
+            // family aggregate. That keeps historical absence intact during
+            // rewrites; new family rows below are estimated from frozen rates.
+            return (None, None);
+        }
+    }
+    let usage = Usage {
+        input_tokens: total.input_tokens,
+        cached_input_tokens: total.cached_input_tokens,
+        cache_write_input_tokens: total.cache_write_input_tokens,
+        output_tokens: total.output_tokens,
+    };
+    let cost = if let Some(model_family) = legacy_family {
+        // The frozen SOL/TERRA/LUNA family projections historically priced
+        // I-C without a cache-write field. ASTRA retains its strict W input.
+        let legacy_usage = Usage {
+            cache_write_input_tokens: if matches!(model_family, "SOL" | "TERRA" | "LUNA") {
+                Some(0)
+            } else {
+                usage.cache_write_input_tokens
+            },
+            ..usage
+        };
+        estimate_legacy(model_family, legacy_usage)
+    } else {
+        match saved.and_then(|saved| saved.price_version.as_deref()) {
+            Some(revision) => estimate_with_revision(&total.model, usage, revision),
+            None => estimate_at(&total.model, usage, observed_at),
+        }
+    };
+    cost.filter(|cost| cost.total_dollars.is_finite() && cost.total_dollars >= 0.0)
+        .map(|cost| (Some(cost.total_dollars), Some(cost.price_version)))
+        .unwrap_or((None, None))
 }
 
 fn numeric_sqlite_value(value: Value) -> Option<f64> {
@@ -5958,6 +6155,8 @@ const HISTORY_CANONICAL_TRIGGER_NAMES: [&str; 8] = [
 struct HistoryModelGroup {
     timestamp: i64,
     reset_at: i64,
+    source_timestamp: i64,
+    source_reset_at: i64,
     totals: Vec<SessionModelTotal>,
     complete: bool,
 }
@@ -6051,6 +6250,8 @@ fn load_history_model_groups(connection: &Connection) -> Result<Vec<HistoryModel
             Ok(HistoryModelGroup {
                 timestamp,
                 reset_at,
+                source_timestamp: timestamp,
+                source_reset_at: reset_at,
                 totals: canonicalize_model_totals(&totals)?,
                 complete,
             })
@@ -6298,6 +6499,8 @@ fn canonicalize_history_model_groups(
         canonical.push(HistoryModelGroup {
             timestamp: sample.timestamp,
             reset_at: sample.reset_at,
+            source_timestamp: group.timestamp,
+            source_reset_at: group.reset_at,
             totals: group.totals,
             complete: group.complete,
         });
@@ -6368,6 +6571,13 @@ fn rewrite_canonical_history(
     canonical_models: &[HistoryModelGroup],
     canonical_observations: &[(i64, UsageHistoryObservation, i64)],
 ) -> Result<()> {
+    let mut saved_prices_by_source = BTreeMap::new();
+    for group in canonical_models {
+        saved_prices_by_source.insert(
+            (group.source_timestamp, group.source_reset_at),
+            load_saved_model_prices(transaction, group.source_timestamp)?,
+        );
+    }
     transaction.execute("DELETE FROM usage_model_history", [])?;
     transaction.execute(
         "DELETE FROM durable_state WHERE singleton >= ?1",
@@ -6403,11 +6613,18 @@ fn rewrite_canonical_history(
             "INSERT INTO usage_model_history (
                  reset_at, timestamp, model, total_tokens, input_tokens,
                  cached_input_tokens, output_tokens, cache_write_input_tokens,
-                 model_set_complete
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 model_set_complete, total_dollars, price_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         for group in canonical_models {
             for total in &group.totals {
+                let saved_prices =
+                    saved_prices_by_source.get(&(group.source_timestamp, group.source_reset_at));
+                let (total_dollars, price_version) = model_history_price(
+                    total,
+                    group.source_timestamp,
+                    saved_prices.and_then(|prices| prices.get(&total.model)),
+                );
                 insert.execute(params![
                     group.reset_at,
                     group.timestamp,
@@ -6420,6 +6637,8 @@ fn rewrite_canonical_history(
                         .cache_write_input_tokens
                         .map(|value| value.to_string()),
                     i64::from(group.complete),
+                    total_dollars,
+                    price_version,
                 ])?;
             }
         }
@@ -7251,6 +7470,8 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                 ("output_tokens", "TEXT", 0),
                 ("cache_write_input_tokens", "TEXT", 0),
                 ("model_set_complete", "INTEGER", 0),
+                ("total_dollars", "REAL", 0),
+                ("price_version", "TEXT", 0),
             ],
         ),
         (
@@ -7434,6 +7655,10 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             && schema_version < 9
             && actual.len() + 1 == expected.len()
             && actual == expected[..actual.len()];
+        let legacy_usage_model_pricing_columns = *table == "usage_model_history"
+            && schema_version < HISTORY_CANONICAL_SCHEMA_VERSION
+            && actual.len() + 2 == expected.len()
+            && actual == expected[..actual.len()];
         let legacy_collection_generation_quota_reset = *table == "collection_generation"
             && schema_version <= LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION
             && actual.len() + 1 == expected.len()
@@ -7451,6 +7676,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             && !legacy_session_checkpoint_shape
             && !legacy_active_thread_snapshot_columns
             && !legacy_storage_partition_login_id
+            && !legacy_usage_model_pricing_columns
             && !legacy_collection_generation_quota_reset
         {
             return Err(UsageStoreError::InvalidImport(format!(
@@ -7565,10 +7791,27 @@ fn ensure_usage_model_history_schema(transaction: &rusqlite::Transaction<'_>) ->
             output_tokens TEXT NOT NULL,
             cache_write_input_tokens TEXT,
             model_set_complete INTEGER NOT NULL CHECK (model_set_complete IN (0, 1)),
+            total_dollars REAL,
+            price_version TEXT,
             PRIMARY KEY (reset_at, timestamp, model)
         ) WITHOUT ROWID;
         "#,
     )?;
+    for (column, sql_type) in [("total_dollars", "REAL"), ("price_version", "TEXT")] {
+        let present: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('usage_model_history') WHERE name=?1
+            )",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !present {
+            transaction.execute(
+                &format!("ALTER TABLE usage_model_history ADD COLUMN {column} {sql_type}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -8826,11 +9069,15 @@ impl UsageStore {
             ));
         }
         ensure_collection_generation_live_quota_schema(&transaction, true)?;
-        if version == LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION {
-            // Version 10 already has the canonical single-table history and
-            // all sidecar constraints. This upgrade only adds the independent
-            // live quota deadline; rewriting history would add cost without
-            // changing any accepted row.
+        if version == LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION
+            || version == MODEL_PRICING_PREVIOUS_SCHEMA_VERSION
+        {
+            // Version 10 and the immediately preceding canonical schema
+            // already have single-table history and sidecar constraints. This
+            // adds the independent live quota deadline when needed and the
+            // nullable pricing columns; rewriting history would add cost
+            // without changing any accepted row.
+            ensure_usage_model_history_schema(&transaction)?;
             stamp_current_account_db_schema(&transaction)?;
             validate_canonical_history_storage(&transaction)?;
             validate_storage_partition(&transaction, identity)?;
@@ -10826,6 +11073,13 @@ impl UsageStore {
                 .transpose()?;
             history.push((sample, sidecar));
         }
+        let mut saved_prices_by_timestamp = BTreeMap::new();
+        for (sample, _) in &history {
+            saved_prices_by_timestamp.insert(
+                sample.timestamp,
+                load_saved_model_prices(&transaction, sample.timestamp)?,
+            );
+        }
 
         transaction.execute(
             "DELETE FROM usage_model_history WHERE reset_at=?1",
@@ -10847,23 +11101,15 @@ impl UsageStore {
                     .copied()
                     .filter(|event| event.timestamp <= minute_end),
             )?;
-            let (sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens) =
-                session_totals_history_values(&prefix);
-            sample.sol_dollars = sol_dollars;
-            sample.terra_dollars = terra_dollars;
-            sample.luna_dollars = luna_dollars;
+            let (sol_tokens, terra_tokens, luna_tokens) = session_totals_history_tokens(&prefix);
             sample.sol_tokens = sol_tokens;
             sample.terra_tokens = terra_tokens;
             sample.luna_tokens = luna_tokens;
             sample.validate()?;
             transaction.execute(
-                "UPDATE usage_history SET sol_dollars=?1, terra_dollars=?2,
-                    luna_dollars=?3, sol_tokens=?4, terra_tokens=?5, luna_tokens=?6
-                 WHERE reset_at=?7 AND timestamp=?8",
+                "UPDATE usage_history SET sol_tokens=?1, terra_tokens=?2, luna_tokens=?3
+                 WHERE reset_at=?4 AND timestamp=?5",
                 params![
-                    sample.sol_dollars,
-                    sample.terra_dollars,
-                    sample.luna_dollars,
                     i64::try_from(sample.sol_tokens)
                         .map_err(|_| UsageStoreError::GenerationOverflow)?,
                     i64::try_from(sample.terra_tokens)
@@ -10874,13 +11120,19 @@ impl UsageStore {
                     sample.timestamp,
                 ],
             )?;
+            let saved_prices = saved_prices_by_timestamp
+                .get(&sample.timestamp)
+                .cloned()
+                .unwrap_or_default();
             for total in &prefix {
+                let (total_dollars, price_version) =
+                    model_history_price(total, sample.timestamp, saved_prices.get(&total.model));
                 transaction.execute(
                     "INSERT INTO usage_model_history (
                         reset_at, timestamp, model, total_tokens, input_tokens,
                         cached_input_tokens, output_tokens, cache_write_input_tokens,
-                        model_set_complete
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                        model_set_complete, total_dollars, price_version
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10)",
                     params![
                         sample.reset_at,
                         sample.timestamp,
@@ -10892,6 +11144,8 @@ impl UsageStore {
                         total
                             .cache_write_input_tokens
                             .map(|value| value.to_string()),
+                        total_dollars,
+                        price_version,
                     ],
                 )?;
             }
@@ -12577,6 +12831,8 @@ impl UsageStore {
             }
         }
 
+        let saved_legacy_dollars =
+            load_saved_legacy_family_dollars(&transaction, &canonical_samples)?;
         upsert_canonical_samples(
             &transaction,
             &canonical_samples,
@@ -12588,11 +12844,12 @@ impl UsageStore {
             &canonical_observations,
             &observation_source_timestamps,
         )?;
-        upsert_observation_model_totals(
+        upsert_observation_model_totals_with_saved_legacy_dollars(
             &transaction,
             &persisted_observations,
             preserve_all_existing_history,
             preserve_existing_before,
+            Some(&saved_legacy_dollars),
         )?;
         {
             let mut statement = transaction.prepare(
@@ -13701,7 +13958,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row.1, 100);
-        assert!((row.0 - 0.0005).abs() < f64::EPSILON);
+        assert_eq!(
+            row.0, 0.0015,
+            "lifecycle repair keeps the already-saved legacy family USD"
+        );
         remove_database(&path);
     }
 
@@ -13736,6 +13996,26 @@ mod tests {
         };
         assert!(session_event_is_replay(&existing, &overlapping_prefix));
 
+        // Older recorder builds persisted a family key. Re-reading the same
+        // physical record after exact model IDs are preserved must retain
+        // that legacy row as replay evidence instead of inserting a duplicate.
+        let exact_id_replay = SessionEvent {
+            model: "gpt-6-sol".to_owned(),
+            ..overlapping_prefix.clone()
+        };
+        assert!(session_event_is_replay(&existing, &exact_id_replay));
+
+        // Two different exact IDs in one family are distinct observations;
+        // family projection must not make them replay-equivalent.
+        let different_exact_id = SessionEvent {
+            model: "gpt-6.1-sol".to_owned(),
+            ..exact_id_replay.clone()
+        };
+        assert!(!session_event_is_replay(
+            &exact_id_replay,
+            &different_exact_id
+        ));
+
         let different_source = SessionEvent {
             file_inode: 3,
             ..overlapping_prefix.clone()
@@ -13752,9 +14032,572 @@ mod tests {
         let disjoint_range = SessionEvent {
             range_start: 100,
             range_end: 200,
-            ..overlapping_prefix
+            ..overlapping_prefix.clone()
         };
         assert!(!session_event_is_replay(&existing, &disjoint_range));
+        let exact_id_disjoint_range = SessionEvent {
+            model: "gpt-6-sol".to_owned(),
+            range_start: 100,
+            range_end: 200,
+            ..overlapping_prefix
+        };
+        assert!(!session_event_is_replay(
+            &existing,
+            &exact_id_disjoint_range
+        ));
+    }
+
+    #[test]
+    fn exact_model_history_stores_distinct_cached_rates_and_reuses_its_revision() {
+        const TIMESTAMP: i64 = 1_791_430_620;
+        const RESET_AT: i64 = TIMESTAMP + 60;
+        let legacy_total = SessionModelTotal {
+            model: "SOL".to_owned(),
+            total_tokens: 10,
+            input_tokens: 10,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cache_write_input_tokens: None,
+        };
+        let expected_legacy = estimate_legacy(
+            "SOL",
+            Usage {
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                output_tokens: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            model_history_price(&legacy_total, TIMESTAMP, None),
+            (
+                Some(expected_legacy.total_dollars),
+                Some(expected_legacy.price_version)
+            )
+        );
+        for total in [
+            SessionModelTotal {
+                model: "gpt-7-sol".to_owned(),
+                total_tokens: 10,
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+            },
+            SessionModelTotal {
+                model: "gpt-6-sol".to_owned(),
+                total_tokens: 10,
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: None,
+            },
+        ] {
+            assert_eq!(model_history_price(&total, TIMESTAMP, None), (None, None));
+        }
+        let path = database_path("exact-model-history-pricing");
+        let identity = partition_identity('b', 463);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1,
+                    latest_quota_reset_at=?1, window_seconds=?2 WHERE singleton=1",
+                params![RESET_AT, 604_800_i64],
+            )
+            .unwrap();
+
+        let sample = sample(TIMESTAMP, RESET_AT, Some(85.0), 0.0005);
+        let exact_totals = vec![
+            SessionModelTotal {
+                model: "gpt-6-sol".to_owned(),
+                total_tokens: 1_000_000,
+                input_tokens: 1_000_000,
+                cached_input_tokens: 1_000_000,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+            },
+            SessionModelTotal {
+                model: "gpt-6.1-sol".to_owned(),
+                ..SessionModelTotal {
+                    model: "gpt-6-sol".to_owned(),
+                    total_tokens: 1_000_000,
+                    input_tokens: 1_000_000,
+                    cached_input_tokens: 1_000_000,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
+                }
+            },
+        ];
+        let initial_observation =
+            UsageHistoryObservation::confirmed_with_models(&sample, exact_totals.clone());
+        {
+            let transaction = store.connection.transaction().unwrap();
+            upsert_canonical_samples(&transaction, std::slice::from_ref(&sample), false, None)
+                .unwrap();
+            upsert_observation_model_totals(
+                &transaction,
+                std::slice::from_ref(&initial_observation),
+                false,
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let read_priced_rows = |connection: &Connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT model, total_dollars, price_version FROM usage_model_history
+                     WHERE timestamp=?1 ORDER BY model",
+                )
+                .unwrap();
+            statement
+                .query_map([TIMESTAMP], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let first_rows = read_priced_rows(&store.connection);
+        assert_eq!(first_rows.len(), 2);
+        assert_eq!(first_rows[0].0, "gpt-6-sol");
+        assert_eq!(first_rows[0].1, Some(0.2));
+        assert_eq!(first_rows[1].0, "gpt-6.1-sol");
+        assert_eq!(first_rows[1].1, Some(0.1));
+        let gpt_6_revision = first_rows[0].2.clone().expect("priced row has a revision");
+        let gpt_6_1_revision = first_rows[1].2.clone().expect("priced row has a revision");
+        assert_eq!(gpt_6_revision, gpt_6_1_revision);
+
+        // A previously stored row is immutable history even if its revision
+        // is no longer resolvable by the current catalog implementation.
+        // Rewriting the same token fact must retain its saved dollars/revision.
+        store
+            .connection
+            .execute(
+                "UPDATE usage_model_history
+                 SET total_dollars=?1, price_version=?2
+                 WHERE timestamp=?3 AND model='gpt-6-sol'",
+                params![123.456789_f64, "SAVED_HISTORIC_REVISION", TIMESTAMP],
+            )
+            .unwrap();
+
+        let revised_totals = exact_totals
+            .iter()
+            .cloned()
+            .map(|mut total| {
+                if total.model == "gpt-6.1-sol" {
+                    total.total_tokens *= 2;
+                    total.input_tokens *= 2;
+                    total.cached_input_tokens *= 2;
+                }
+                total
+            })
+            .collect::<Vec<_>>();
+        let revised_observation =
+            UsageHistoryObservation::confirmed_with_models(&sample, revised_totals);
+        {
+            let transaction = store.connection.transaction().unwrap();
+            upsert_observation_model_totals(
+                &transaction,
+                std::slice::from_ref(&revised_observation),
+                false,
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        let rewritten_rows = read_priced_rows(&store.connection);
+        assert_eq!(rewritten_rows[0].1, Some(123.456789));
+        assert_eq!(
+            rewritten_rows[0].2.as_deref(),
+            Some("SAVED_HISTORIC_REVISION")
+        );
+        assert_eq!(
+            rewritten_rows[1].2.as_deref(),
+            Some(gpt_6_1_revision.as_str())
+        );
+        let expected_gpt_6_1 = codex_info_pricing::estimate_with_revision(
+            "gpt-6.1-sol",
+            codex_info_pricing::Usage {
+                input_tokens: 2_000_000,
+                cached_input_tokens: 2_000_000,
+                cache_write_input_tokens: Some(0),
+                output_tokens: 0,
+            },
+            &gpt_6_1_revision,
+        )
+        .expect("the stored catalog revision remains resolvable");
+        assert_eq!(rewritten_rows[1].1, Some(expected_gpt_6_1.total_dollars));
+        remove_database(&path);
+    }
+
+    #[test]
+    fn same_timestamp_mixed_family_and_exact_models_keep_independent_history_costs() {
+        const TIMESTAMP: i64 = 1_791_430_620;
+        const RESET_AT: i64 = TIMESTAMP + 60;
+        const OLD_FAMILY_DOLLARS: f64 = 0.00005;
+        const FIRST_PRICE_VERSION: &str = "1791430564-183968cc652f6276";
+        let path = database_path("mixed-family-exact-history-pricing");
+        let identity = partition_identity('b', 465);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1,
+                    latest_quota_reset_at=?1, window_seconds=?2 WHERE singleton=1",
+                params![RESET_AT, 604_800_i64],
+            )
+            .unwrap();
+
+        let mut old_sample = sample(TIMESTAMP, RESET_AT, Some(85.0), OLD_FAMILY_DOLLARS);
+        old_sample.sol_tokens = 100;
+        let old_family = SessionModelTotal {
+            model: "SOL".to_owned(),
+            total_tokens: 100,
+            input_tokens: 100,
+            cached_input_tokens: 100,
+            output_tokens: 0,
+            cache_write_input_tokens: None,
+        };
+        let old_observation =
+            UsageHistoryObservation::confirmed_with_models(&old_sample, vec![old_family.clone()]);
+        {
+            let transaction = store.connection.transaction().unwrap();
+            upsert_canonical_samples(&transaction, std::slice::from_ref(&old_sample), false, None)
+                .unwrap();
+            upsert_observation_model_totals(
+                &transaction,
+                std::slice::from_ref(&old_observation),
+                false,
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        // This is the v11 shape: the saved family aggregate exists, while
+        // model-sidecar prices did not yet exist.
+        store
+            .connection
+            .execute(
+                "UPDATE usage_model_history SET total_dollars=NULL, price_version=NULL
+                 WHERE timestamp=?1 AND model='SOL'",
+                [TIMESTAMP],
+            )
+            .unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE usage_model_history DROP COLUMN price_version;
+                 ALTER TABLE usage_model_history DROP COLUMN total_dollars;",
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", MODEL_PRICING_PREVIOUS_SCHEMA_VERSION)
+            .unwrap();
+        drop(connection);
+
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        assert!(UsageStore::migrate_partition_history_after_verified_backup(
+            &path, &identity, &backup
+        )
+        .unwrap());
+        let mut store = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let migrated_price: (f64, Option<f64>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT history.sol_dollars, models.total_dollars, models.price_version
+                 FROM usage_history AS history
+                 JOIN usage_model_history AS models USING (timestamp, reset_at)
+                 WHERE history.timestamp=?1 AND models.model='SOL'",
+                [TIMESTAMP],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated_price, (OLD_FAMILY_DOLLARS, None, None));
+        let family_tokens = |connection: &Connection| {
+            connection
+                .query_row(
+                    "SELECT total_tokens, input_tokens, cached_input_tokens,
+                            output_tokens, cache_write_input_tokens
+                     FROM usage_model_history WHERE timestamp=?1 AND model='SOL'",
+                    [TIMESTAMP],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let migrated_tokens = family_tokens(&store.connection);
+        assert_eq!(
+            migrated_tokens,
+            (
+                "100".to_owned(),
+                "100".to_owned(),
+                "100".to_owned(),
+                "0".to_owned(),
+                None,
+            )
+        );
+
+        let exact = SessionModelTotal {
+            model: "gpt-6.1-sol".to_owned(),
+            total_tokens: 1_000_000,
+            input_tokens: 1_000_000,
+            cached_input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        };
+        let rows = |connection: &Connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT model, total_dollars, price_version FROM usage_model_history
+                     WHERE timestamp=?1 ORDER BY model",
+                )
+                .unwrap();
+            statement
+                .query_map([TIMESTAMP], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let mut first_sample = old_sample.clone();
+        first_sample.sol_tokens += exact.total_tokens;
+        first_sample.sol_dollars = OLD_FAMILY_DOLLARS + 0.5;
+        let first_observation = UsageHistoryObservation::confirmed_with_models(
+            &first_sample,
+            vec![old_family.clone(), exact.clone()],
+        );
+        {
+            let transaction = store.connection.transaction().unwrap();
+            let saved_legacy_dollars =
+                load_saved_legacy_family_dollars(&transaction, std::slice::from_ref(&first_sample))
+                    .unwrap();
+            upsert_canonical_samples(
+                &transaction,
+                std::slice::from_ref(&first_sample),
+                false,
+                None,
+            )
+            .unwrap();
+            upsert_observation_model_totals_with_saved_legacy_dollars(
+                &transaction,
+                std::slice::from_ref(&first_observation),
+                false,
+                None,
+                Some(&saved_legacy_dollars),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        let first_rows = rows(&store.connection);
+        let family_cost = first_rows.iter().find(|row| row.0 == "SOL").unwrap().1;
+        let family_price_version = first_rows
+            .iter()
+            .find(|row| row.0 == "SOL")
+            .unwrap()
+            .2
+            .clone();
+        let exact_row = first_rows.iter().find(|row| row.0 == exact.model).unwrap();
+        let exact_cost_saved = exact_row.1;
+        assert_eq!(family_cost, Some(OLD_FAMILY_DOLLARS));
+        assert_eq!(family_price_version, None);
+        assert_eq!(family_tokens(&store.connection), migrated_tokens);
+        assert_eq!(exact_cost_saved, Some(0.1));
+        assert_eq!(exact_row.2.as_deref(), Some(FIRST_PRICE_VERSION));
+        assert_eq!(
+            family_cost.unwrap() + exact_cost_saved.unwrap(),
+            OLD_FAMILY_DOLLARS + 0.1
+        );
+        let first_compatibility_usd: f64 = store
+            .connection
+            .query_row(
+                "SELECT sol_dollars FROM usage_history WHERE timestamp=?1",
+                [TIMESTAMP],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_compatibility_usd, OLD_FAMILY_DOLLARS + 0.5);
+
+        let mut larger_exact = exact.clone();
+        larger_exact.total_tokens *= 2;
+        larger_exact.input_tokens *= 2;
+        larger_exact.cached_input_tokens *= 2;
+        let mut second_sample = first_sample;
+        second_sample.sol_tokens += exact.total_tokens;
+        second_sample.sol_dollars = OLD_FAMILY_DOLLARS + 1.0;
+        let second_observation = UsageHistoryObservation::confirmed_with_models(
+            &second_sample,
+            vec![old_family.clone(), larger_exact.clone()],
+        );
+        {
+            let transaction = store.connection.transaction().unwrap();
+            let saved_legacy_dollars = load_saved_legacy_family_dollars(
+                &transaction,
+                std::slice::from_ref(&second_sample),
+            )
+            .unwrap();
+            upsert_canonical_samples(
+                &transaction,
+                std::slice::from_ref(&second_sample),
+                false,
+                None,
+            )
+            .unwrap();
+            upsert_observation_model_totals_with_saved_legacy_dollars(
+                &transaction,
+                std::slice::from_ref(&second_observation),
+                false,
+                None,
+                Some(&saved_legacy_dollars),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        let second_rows = rows(&store.connection);
+        let second_family_row = second_rows.iter().find(|row| row.0 == "SOL").unwrap();
+        assert_eq!(second_family_row.1, Some(OLD_FAMILY_DOLLARS));
+        assert_eq!(second_family_row.2, None);
+        assert_eq!(family_tokens(&store.connection), migrated_tokens);
+        let second_exact_row = second_rows.iter().find(|row| row.0 == exact.model).unwrap();
+        assert_eq!(second_exact_row.1, Some(0.2));
+        assert_eq!(second_exact_row.2.as_deref(), Some(FIRST_PRICE_VERSION));
+        let second_compatibility_usd: f64 = store
+            .connection
+            .query_row(
+                "SELECT sol_dollars FROM usage_history WHERE timestamp=?1",
+                [TIMESTAMP],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_compatibility_usd, OLD_FAMILY_DOLLARS + 1.0);
+
+        let legacy_usage = Usage {
+            input_tokens: old_family.input_tokens,
+            cached_input_tokens: old_family.cached_input_tokens,
+            cache_write_input_tokens: Some(0),
+            output_tokens: old_family.output_tokens,
+        };
+        let expected_legacy_cost =
+            codex_info_pricing::estimate_legacy("SOL", legacy_usage).unwrap();
+        assert_eq!(
+            model_history_price(&old_family, TIMESTAMP, None),
+            (
+                Some(expected_legacy_cost.total_dollars),
+                Some(expected_legacy_cost.price_version)
+            )
+        );
+        remove_database(&path);
+    }
+
+    #[test]
+    fn history_schema_upgrade_preserves_saved_family_usd_and_leaves_price_columns_null() {
+        const TIMESTAMP: i64 = 2_500_000_020;
+        const RESET_AT: i64 = TIMESTAMP + 60;
+        let path = database_path("history-pricing-schema-upgrade");
+        let identity = partition_identity('b', 464);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1,
+                    latest_quota_reset_at=?1, window_seconds=?2 WHERE singleton=1",
+                params![RESET_AT, 604_800_i64],
+            )
+            .unwrap();
+        let old_sample = sample(TIMESTAMP, RESET_AT, Some(85.0), 0.0005);
+        let old_family = SessionModelTotal {
+            model: "SOL".to_owned(),
+            total_tokens: 100,
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        };
+        {
+            let transaction = store.connection.transaction().unwrap();
+            upsert_canonical_samples(&transaction, std::slice::from_ref(&old_sample), false, None)
+                .unwrap();
+            let mut observation =
+                UsageHistoryObservation::confirmed_with_models(&old_sample, vec![old_family]);
+            observation.sol_dollars = Some(0.0005);
+            upsert_observation_model_totals(&transaction, &[observation], false, None).unwrap();
+            transaction.commit().unwrap();
+        }
+        drop(store);
+
+        let legacy_version = if HISTORY_CANONICAL_SCHEMA_VERSION > 11 {
+            HISTORY_CANONICAL_SCHEMA_VERSION - 1
+        } else {
+            HISTORY_CANONICAL_SCHEMA_VERSION
+        };
+        let connection = Connection::open(&path).unwrap();
+        let pricing_columns_present: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('usage_model_history')
+                    WHERE name='total_dollars'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if pricing_columns_present {
+            connection
+                .execute_batch(
+                    "ALTER TABLE usage_model_history DROP COLUMN price_version;
+                     ALTER TABLE usage_model_history DROP COLUMN total_dollars;",
+                )
+                .unwrap();
+        }
+        connection
+            .pragma_update(None, "user_version", legacy_version)
+            .unwrap();
+        drop(connection);
+
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        assert!(UsageStore::migrate_partition_history_after_verified_backup(
+            &path, &identity, &backup
+        )
+        .unwrap());
+        let reopened = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let (saved_sol_usd, saved_model_usd, saved_revision): (f64, Option<f64>, Option<String>) =
+            reopened
+                .connection
+                .query_row(
+                    "SELECT history.sol_dollars, models.total_dollars, models.price_version
+                     FROM usage_history AS history
+                     JOIN usage_model_history AS models USING (timestamp, reset_at)
+                     WHERE history.timestamp=?1 AND models.model='SOL'",
+                    [TIMESTAMP],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(saved_sol_usd, 0.0005);
+        assert_eq!(saved_model_usd, None);
+        assert_eq!(saved_revision, None);
+        remove_database(&path);
     }
 
     #[test]
@@ -14583,12 +15426,30 @@ mod tests {
                 recorded_sessions: &[],
             })
             .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO usage_model_history (
+                    reset_at, timestamp, model, total_tokens, input_tokens,
+                    cached_input_tokens, output_tokens, cache_write_input_tokens,
+                    model_set_complete
+                 ) VALUES (?1, ?2, 'SOL', '100', '100', '0', '0', '0', 1)",
+                params![reset_at, history.timestamp],
+            )
+            .unwrap();
         let history_before = legacy_raw_evidence(&store.connection).unwrap();
         store
             .connection
             .execute(
                 "ALTER TABLE collection_generation DROP COLUMN latest_quota_reset_at",
                 [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE usage_model_history DROP COLUMN price_version;
+                 ALTER TABLE usage_model_history DROP COLUMN total_dollars;",
             )
             .unwrap();
         store
@@ -14622,6 +15483,22 @@ mod tests {
                 .unwrap(),
             ACCOUNT_DB_SCHEMA_VERSION
         );
+        let (model_tokens, model_dollars, model_price_version): (
+            String,
+            Option<f64>,
+            Option<String>,
+        ) = migrated
+            .connection
+            .query_row(
+                "SELECT total_tokens, total_dollars, price_version
+                 FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model='SOL'",
+                params![reset_at, history.timestamp],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(model_tokens, "100");
+        assert_eq!(model_dollars, None);
+        assert_eq!(model_price_version, None);
         drop(migrated);
         remove_database(&path);
     }

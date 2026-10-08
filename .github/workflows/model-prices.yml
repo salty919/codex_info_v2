@@ -1,0 +1,168 @@
+name: Model price catalog
+
+on:
+  schedule:
+    - cron: "15 0 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: model-prices-feat-next
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'salty919/codex_info_v2'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out feat/next without storing credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: feat/next
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate official prices and open a review PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          readonly CATALOG_PATH="crates/codex-info-pricing/data/standard-short.json"
+          readonly PR_TITLE="[Issue #463] Update official model prices"
+          readonly PR_MARKER="MODEL-PRICE-UPDATE-463"
+
+          if [[ "${GITHUB_REPOSITORY:-}" != "salty919/codex_info_v2" ]]; then
+            echo "pricing updater only runs for salty919/codex_info_v2" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_EVENT_NAME:-}" != "schedule" && "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" ]]; then
+            echo "unsupported workflow event" >&2
+            exit 1
+          fi
+
+          OPEN_PR_JSON="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base feat/next \
+            --state open \
+            --search "$PR_MARKER in:body" \
+            --json number \
+            --limit 100)"
+          if ! OPEN_PR_STATE="$(python3 -c 'import json,sys; value=json.load(sys.stdin); assert isinstance(value,list); print("open" if value else "none")' <<<"$OPEN_PR_JSON")"; then
+            echo "could not classify open Issue #463 pricing PRs" >&2
+            exit 1
+          fi
+          if [[ "$OPEN_PR_STATE" == "open" ]]; then
+            echo "an open automated Issue #463 pricing PR already exists; skipping"
+            exit 0
+          fi
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "checkout is not clean; refusing to update prices" >&2
+            exit 1
+          fi
+
+          ASKPASS_FILE="$(mktemp)"
+          PR_BODY_FILE="$(mktemp)"
+          trap 'rm -f "$ASKPASS_FILE" "$PR_BODY_FILE"' EXIT
+          cat >"$ASKPASS_FILE" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' 'x-access-token' ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+          chmod 700 "$ASKPASS_FILE"
+          export GIT_ASKPASS="$ASKPASS_FILE"
+          export GIT_TERMINAL_PROMPT=0
+
+          remote_feat_sha() {
+            local output
+            output="$(git ls-remote origin refs/heads/feat/next)"
+            python3 -c '
+          import re,sys
+          rows=[line.split() for line in sys.stdin.read().splitlines()]
+          if len(rows)!=1 or len(rows[0])!=2 or rows[0][1]!="refs/heads/feat/next" or re.fullmatch(r"[0-9a-f]{40}",rows[0][0]) is None:
+              raise SystemExit("origin/feat/next did not resolve to exactly one full SHA")
+          print(rows[0][0])
+          ' <<<"$output"
+          }
+
+          BASE_SHA="$(remote_feat_sha)"
+          git fetch --no-tags origin refs/heads/feat/next
+          FETCHED_SHA="$(git rev-parse FETCH_HEAD)"
+          if [[ "$FETCHED_SHA" != "$BASE_SHA" ]]; then
+            echo "origin/feat/next moved between read and fetch; refusing to update" >&2
+            exit 1
+          fi
+          git checkout --detach "$BASE_SHA"
+
+          RESULT_JSON="$(python3 scripts/update_model_prices.py --snapshot "$CATALOG_PATH")"
+          if ! RESULT_FIELDS="$(python3 -c '
+          import json,re,sys
+          value=json.load(sys.stdin)
+          status=value.get("status")
+          price_hash=value.get("price_hash")
+          if status not in ("changed","unchanged") or re.fullmatch(r"[0-9a-f]{64}",str(price_hash)) is None:
+              raise SystemExit("price updater returned an invalid result")
+          print(status + "\t" + price_hash)
+          ' <<<"$RESULT_JSON")"; then
+            echo "price updater result was invalid" >&2
+            exit 1
+          fi
+          IFS=$'\t' read -r PRICE_STATUS PRICE_HASH <<<"$RESULT_FIELDS"
+          if [[ "$PRICE_STATUS" == "unchanged" ]]; then
+            echo "official prices are unchanged; no commit or PR created"
+            exit 0
+          fi
+
+          BRANCH="codex/issue-463-price-update-${BASE_SHA}-${PRICE_HASH}"
+          EXISTING_BRANCH="$(git ls-remote origin "refs/heads/$BRANCH")"
+          if [[ -n "$EXISTING_BRANCH" ]]; then
+            echo "generated branch already exists; refusing to replace it" >&2
+            exit 1
+          fi
+
+          git checkout -b "$BRANCH" "$BASE_SHA"
+          git add -- "$CATALOG_PATH"
+          STAGED_PATHS="$(git diff --cached --name-status --find-renames --find-copies)"
+          EXPECTED_STAGED_PATH="$(printf 'M\t%s' "$CATALOG_PATH")"
+          if [[ "$STAGED_PATHS" != "$EXPECTED_STAGED_PATH" ]]; then
+            echo "staged changes are outside the price catalog" >&2
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "price updater reported a change but the catalog diff is empty" >&2
+            exit 1
+          fi
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "chore(pricing): update official model prices (Refs #463)"
+
+          CURRENT_FEAT_SHA="$(remote_feat_sha)"
+          if [[ "$CURRENT_FEAT_SHA" != "$BASE_SHA" ]]; then
+            echo "origin/feat/next advanced before push; refusing to publish a stale update" >&2
+            exit 1
+          fi
+          git push --set-upstream origin "$BRANCH"
+
+          cat >"$PR_BODY_FILE" <<'BODY'
+          Refs #463
+
+          Automated update from the official Standard short-context pricing table. Values are USD per 1,000,000 tokens.
+
+          This PR was created with `GITHUB_TOKEN`; that event does not start other Actions workflows. Run the full `feat/next` checks in the user stage before integration.
+
+          <!-- MODEL-PRICE-UPDATE-463 -->
+          BODY
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base feat/next \
+            --head "$BRANCH" \
+            --title "$PR_TITLE" \
+            --body-file "$PR_BODY_FILE"

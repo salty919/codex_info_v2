@@ -6,6 +6,7 @@ license = "GPL-3.0-only"
 publish = false
 
 [dependencies]
+codex-info-pricing = { path = "../codex-info-pricing" }
 chrono = { version = "0.4", features = ["serde"] }
 codex-info-db-reader = { path = "../codex-info-db-reader" }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }

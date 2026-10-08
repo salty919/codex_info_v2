@@ -19,6 +19,7 @@ use codex_info_db_writer::{
     StoragePartitionIdentity, UsageHistoryObservation, UsageHistorySample, UsageStore,
     UsageStoreError, VerifiedPartitionBackup,
 };
+use codex_info_pricing::{estimate_legacy, family, Usage as PricingUsage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2185,29 +2186,23 @@ impl ModelCounter {
     }
 
     fn dollars(&self, model: &str) -> f64 {
-        let input = self.input.saturating_sub(self.cached_input) as f64;
-        let cached = self.cached_input as f64;
-        let output = self.output as f64;
-        let (input_rate, cached_rate, output_rate) = match model {
-            "SOL" => (5.0, 0.5, 30.0),
-            "TERRA" => (2.0, 0.2, 12.0),
-            "LUNA" => (0.2, 0.02, 1.2),
-            "ASTRA" => {
-                let Some(writes) = self.cache_write_input else {
-                    return 0.0;
-                };
-                let ordinary = self
-                    .input
-                    .saturating_sub(self.cached_input)
-                    .saturating_sub(writes);
-                return ordinary as f64 * 10.0 / 1_000_000.0
-                    + self.cached_input as f64 * 1.0 / 1_000_000.0
-                    + writes as f64 * 12.5 / 1_000_000.0
-                    + output * 50.0 / 1_000_000.0;
-            }
-            _ => return 0.0,
-        };
-        (input * input_rate + cached * cached_rate + output * output_rate) / 1_000_000.0
+        estimate_legacy(
+            model,
+            PricingUsage {
+                input_tokens: self.input,
+                cached_input_tokens: self.cached_input,
+                // These three frozen family columns historically priced I-C
+                // without a cache-write field. Treat that legacy projection
+                // as W=0; exact-ID prices remain strict in the model sidecar.
+                cache_write_input_tokens: if matches!(model, "SOL" | "TERRA" | "LUNA") {
+                    Some(0)
+                } else {
+                    self.cache_write_input
+                },
+                output_tokens: self.output,
+            },
+        )
+        .map_or(0.0, |cost| cost.total_dollars)
     }
 }
 
@@ -2226,26 +2221,14 @@ impl ModelTotals {
     }
 
     fn canonical_model(model: &str) -> Option<String> {
-        let lowered = model.to_ascii_lowercase();
-        let canonical = if lowered.contains("sol") {
-            "SOL"
-        } else if lowered.contains("terra") {
-            "TERRA"
-        } else if lowered.contains("luna") {
-            "LUNA"
-        } else if lowered.contains("astra") {
-            "ASTRA"
-        } else {
-            let trimmed = model.trim();
-            if trimmed.is_empty()
-                || trimmed.len() > codex_info_db_writer::MAX_SESSION_MODEL_BYTES
-                || trimmed.chars().any(char::is_control)
-            {
-                return None;
-            }
-            return Some(trimmed.to_owned());
-        };
-        Some(canonical.to_owned())
+        let trimmed = model.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > codex_info_db_writer::MAX_SESSION_MODEL_BYTES
+            || trimmed.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(trimmed.to_owned())
     }
 
     fn checkpoint_model(model: &str) -> Option<String> {
@@ -2340,11 +2323,10 @@ impl ModelTotals {
     fn dollar_totals(&self) -> (f64, f64, f64) {
         let mut result = (0.0, 0.0, 0.0);
         for (model, counter) in &self.values {
-            let dollars = counter.dollars(model);
-            match model.as_str() {
-                "SOL" => result.0 += dollars,
-                "TERRA" => result.1 += dollars,
-                "LUNA" => result.2 += dollars,
+            match family(model) {
+                Some("SOL") => result.0 += counter.dollars("SOL"),
+                Some("TERRA") => result.1 += counter.dollars("TERRA"),
+                Some("LUNA") => result.2 += counter.dollars("LUNA"),
                 _ => {}
             }
         }
@@ -2352,11 +2334,16 @@ impl ModelTotals {
     }
 
     fn token_totals(&self) -> (u64, u64, u64) {
-        (
-            self.values.get("SOL").map_or(0, |row| row.total),
-            self.values.get("TERRA").map_or(0, |row| row.total),
-            self.values.get("LUNA").map_or(0, |row| row.total),
-        )
+        let mut result = (0_u64, 0_u64, 0_u64);
+        for (model, counter) in &self.values {
+            match family(model) {
+                Some("SOL") => result.0 = result.0.saturating_add(counter.total),
+                Some("TERRA") => result.1 = result.1.saturating_add(counter.total),
+                Some("LUNA") => result.2 = result.2.saturating_add(counter.total),
+                _ => {}
+            }
+        }
+        result
     }
 
     fn history_sample(
@@ -8943,7 +8930,7 @@ mod tests {
             .write_all(format!("{}{}", token(20, now + 1), token(25, now + 2)).as_bytes())
             .unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(recorder.model_totals().unwrap()["SOL"].total, 5);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-5.6-sol"].total, 5);
         assert!(!recorder
             .model_totals()
             .unwrap()
@@ -8964,8 +8951,8 @@ mod tests {
             )
             .unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(recorder.model_totals().unwrap()["SOL"].total, 5);
-        assert_eq!(recorder.model_totals().unwrap()["LUNA"].total, 10);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-5.6-sol"].total, 5);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-5.6-luna"].total, 10);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9019,20 +9006,20 @@ mod tests {
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         let repaired_generation = repaired.generation().unwrap();
         let totals = repaired.model_totals().unwrap();
-        assert_eq!(totals["SOL"].total, 5);
+        assert_eq!(totals["gpt-5.6-sol"].total, 5);
         assert!(!totals.contains_key(UNATTRIBUTED_MODEL));
         assert!(repaired
             .writer
             .load_session_events()
             .unwrap()
             .iter()
-            .all(|event| event.model == "SOL"));
+            .all(|event| event.model == "gpt-5.6-sol"));
         drop(repaired);
 
         let reopened =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         assert_eq!(reopened.generation().unwrap(), repaired_generation);
-        assert_eq!(reopened.model_totals().unwrap()["SOL"].total, 5);
+        assert_eq!(reopened.model_totals().unwrap()["gpt-5.6-sol"].total, 5);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9116,7 +9103,7 @@ mod tests {
         let connection = Connection::open(&database).unwrap();
         connection
             .execute(
-                "UPDATE session_model_totals SET model='SOL' WHERE model='UNATTRIBUTED'",
+                "UPDATE session_model_totals SET model='gpt-5.6-sol' WHERE model='UNATTRIBUTED'",
                 [],
             )
             .unwrap();
@@ -9126,19 +9113,19 @@ mod tests {
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         let repaired_generation = repaired.generation().unwrap();
         assert!(repaired_generation > unchanged_generation);
-        assert_eq!(repaired.model_totals().unwrap()["SOL"].total, 6);
+        assert_eq!(repaired.model_totals().unwrap()["gpt-5.6-sol"].total, 6);
         assert!(repaired
             .writer
             .load_session_events()
             .unwrap()
             .iter()
-            .all(|event| event.model == "SOL"));
+            .all(|event| event.model == "gpt-5.6-sol"));
         drop(repaired);
 
         let reopened =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         assert_eq!(reopened.generation().unwrap(), repaired_generation);
-        assert_eq!(reopened.model_totals().unwrap()["SOL"].total, 6);
+        assert_eq!(reopened.model_totals().unwrap()["gpt-5.6-sol"].total, 6);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9283,6 +9270,85 @@ mod tests {
             5
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forward_model_versions_keep_exact_keys_and_project_into_family_tokens() {
+        let legacy = SessionModelTotal {
+            model: "SOL".to_owned(),
+            total_tokens: 100,
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        };
+        let exact_model = ModelTotals::usage_model(Some("gpt-6.1-sol"));
+        assert_eq!(exact_model, "gpt-6.1-sol");
+
+        let mut totals = ModelTotals::from_state(&[legacy]);
+        totals
+            .add(
+                &exact_model,
+                TokenSnapshot {
+                    total: 10,
+                    input: 10,
+                    cached_input: 0,
+                    output: 0,
+                    cache_write_input: Some(0),
+                },
+            )
+            .unwrap();
+
+        let stored = totals.to_totals();
+        assert_eq!(
+            stored.len(),
+            2,
+            "legacy family totals stay distinct from raw IDs"
+        );
+        assert!(stored.iter().any(|row| row.model == "SOL"));
+        assert!(stored.iter().any(|row| row.model == "gpt-6.1-sol"));
+        assert_eq!(totals.token_totals().0, 110);
+
+        let restarted = ModelTotals::from_state(&stored);
+        assert_eq!(restarted.values["gpt-6.1-sol"].total, 10);
+        assert_eq!(restarted.token_totals().0, 110);
+    }
+
+    #[test]
+    fn exact_model_counters_keep_legacy_family_dollar_projection() {
+        let mut totals = ModelTotals::default();
+        totals
+            .add(
+                "gpt-6.1-sol",
+                TokenSnapshot {
+                    total: 1_000_000,
+                    input: 1_000_000,
+                    cached_input: 1_000_000,
+                    output: 0,
+                    cache_write_input: Some(0),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(totals.dollar_totals().0, 0.5);
+        assert_eq!(
+            totals
+                .history_sample(1_800_000_000, 1_800_604_800, 90.0)
+                .sol_dollars,
+            0.5
+        );
+    }
+
+    #[test]
+    fn legacy_family_dollars_keep_fixed_rates_when_cache_write_is_unknown() {
+        let counter = ModelCounter {
+            total: 110,
+            input: 100,
+            cached_input: 20,
+            output: 10,
+            cache_write_input: None,
+        };
+        assert!((counter.dollars("SOL") - 0.00071).abs() < f64::EPSILON);
     }
 
     #[test]

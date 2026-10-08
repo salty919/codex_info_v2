@@ -17,11 +17,13 @@ members = [
     "crates/codex-info-db-reader",
     "crates/codex-info-db-writer",
     "crates/codex-info-recorder",
+    "crates/codex-info-pricing",
     "crates/codex-info-rest",
     "crates/codex-info-rest-contract",
 ]
 
 [dependencies]
+codex-info-pricing = { path = "crates/codex-info-pricing" }
 codex-info-db-writer = { path = "crates/codex-info-db-writer" }
 codex-info-rest-contract = { path = "crates/codex-info-rest-contract" }
 chrono = { version = "0.4", features = ["serde"] }

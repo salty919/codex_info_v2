@@ -16,13 +16,12 @@ use codex_info::security;
 #[cfg(test)]
 use codex_info::server::{
     legacy_history_models_v3, ApiServer, PublicDetailedModelUsage, PublicHistorySample,
-    PublicModelCostV3,
 };
 use codex_info::server::{
     validate_public_threads, ApiServerConfig, PublicDetails, PublicDetailsV2, PublicDetailsV3,
     PublicHistoryGap, PublicHistoryModelUsageV3, PublicHistoryObservation,
-    PublicHistoryObservationV3, PublicHistoryPeriod, PublicModelUsageV3, PublicQuota, PublicState,
-    PublicThread, PublicThreadActivityStatus,
+    PublicHistoryObservationV3, PublicHistoryPeriod, PublicModelCostV3, PublicModelUsageV3,
+    PublicQuota, PublicState, PublicThread, PublicThreadActivityStatus,
 };
 use codex_info::thread_contract::{self, ThreadTopologyNode};
 #[cfg(test)]
@@ -33,6 +32,7 @@ use codex_info::usage_store::{
     classify_quota_transition, select_predeadline_quota_authority, PreviousQuotaState,
     QuotaCandidate, QuotaTransition, StoragePartitionIdentity, UsageStore,
 };
+use codex_info_pricing::{estimate_legacy, Usage as PriceUsage};
 use codex_info_rest_contract::{current_period_bounds, current_period_start_at};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -330,16 +330,13 @@ impl TokenSnapshot {
 
 const LOCAL_ESTIMATE_PRICE_VERSION: &str = "LOCAL_ESTIMATE_V1_2026-08-14";
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SOL_PRICE_PER_MILLION: (f64, f64, f64) = (5.0, 0.5, 30.0);
-const TERRA_PRICE_PER_MILLION: (f64, f64, f64) = (2.0, 0.2, 12.0);
-const LUNA_PRICE_PER_MILLION: (f64, f64, f64) = (0.2, 0.02, 1.2);
 const ASTRA_PRICE_PER_MILLION: (f64, f64, f64, f64) = (10.0, 1.0, 12.5, 50.0);
 #[cfg(test)]
 const ASTRA_PRICE_VERSION: &str = "ASTRA_USER_2026-09-05";
 #[cfg(test)]
 const UNATTRIBUTED_SESSION_MODEL: &str = "UNATTRIBUTED";
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct ModelUsageRow {
     name: String,
     tokens: u64,
@@ -347,6 +344,8 @@ struct ModelUsageRow {
     cached_input_tokens: u64,
     output_tokens: u64,
     cache_write_input_tokens: Option<u64>,
+    server_estimated_cost: Option<PublicModelCostV3>,
+    server_pricing_authoritative: bool,
 }
 
 impl ModelUsageRow {
@@ -372,6 +371,8 @@ impl ModelUsageRow {
         Self {
             name: name.into(),
             cache_write_input_tokens: Some(0),
+            server_estimated_cost: None,
+            server_pricing_authoritative: false,
             ..Self::default()
         }
     }
@@ -392,27 +393,51 @@ impl ModelUsageRow {
     }
 
     fn dollar_costs(&self) -> (f64, f64, f64) {
-        // The version is intentionally fixed with the rates; changing either
-        // requires updating the contract fixture rather than silent drift.
-        let _ = LOCAL_ESTIMATE_PRICE_VERSION;
+        if self.server_pricing_authoritative {
+            return self
+                .server_estimated_cost
+                .as_ref()
+                .and_then(model_cost_display_components)
+                .unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+        }
         if self.name == "ASTRA" {
             return self
                 .astra_dollar_costs()
                 .map(|(ordinary, cached, writes, output)| (ordinary + writes, cached, output))
                 .unwrap_or((f64::NAN, f64::NAN, f64::NAN));
         }
-        let (input_rate, cached_rate, output_rate) = match self.name.as_str() {
-            "SOL" => SOL_PRICE_PER_MILLION,
-            "TERRA" => TERRA_PRICE_PER_MILLION,
-            "LUNA" => LUNA_PRICE_PER_MILLION,
-            _ => (f64::NAN, f64::NAN, f64::NAN),
+        let usage = PriceUsage {
+            input_tokens: self.input_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_write_input_tokens: self.cache_write_input_tokens,
+            output_tokens: self.output_tokens,
         };
-        let input = self.input_tokens.saturating_sub(self.cached_input_tokens) as f64;
-        (
-            input * input_rate / 1_000_000.0,
-            self.cached_input_tokens as f64 * cached_rate / 1_000_000.0,
-            self.output_tokens as f64 * output_rate / 1_000_000.0,
-        )
+        let cost = if matches!(self.name.as_str(), "SOL" | "TERRA" | "LUNA") {
+            // Legacy compatibility displays historically folded cache-write
+            // tokens into ordinary input and exposed no separate write count.
+            estimate_legacy(
+                &self.name,
+                PriceUsage {
+                    cache_write_input_tokens: Some(0),
+                    ..usage
+                },
+            )
+        } else {
+            // Exact-ID current prices arrive with the V3 service row above.
+            // A raw local row without that server cost remains unpriced.
+            None
+        };
+        cost.and_then(|cost| {
+            model_cost_display_components(&PublicModelCostV3 {
+                price_version: cost.price_version,
+                ordinary_input_dollars: cost.ordinary_input_dollars,
+                cached_input_dollars: cost.cached_input_dollars,
+                cache_write_input_dollars: cost.cache_write_input_dollars,
+                output_dollars: cost.output_dollars,
+                total_dollars: cost.total_dollars,
+            })
+        })
+        .unwrap_or((f64::NAN, f64::NAN, f64::NAN))
     }
 
     #[cfg(test)]
@@ -514,7 +539,7 @@ fn history_models_v3(
     (!models.is_empty()).then_some(models)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[cfg(test)]
 struct ModelUsageTotals {
     sol: ModelUsageRow,
@@ -726,6 +751,8 @@ impl ModelUsageTotals {
                     (Some(current), Some(before)) => Some(current.checked_sub(before)?),
                     _ => None,
                 },
+                server_estimated_cost: None,
+                server_pricing_authoritative: false,
                 tokens: current.tokens.checked_sub(baseline.tokens)?,
                 input_tokens: current.input_tokens.checked_sub(baseline.input_tokens)?,
                 cached_input_tokens: current
@@ -3961,6 +3988,24 @@ fn history_model_dollars(model: &PublicHistoryModelUsageV3) -> Option<f64> {
             + output as f64 * output_rate)
             / 1_000_000.0,
     )
+}
+
+fn graph_model_name_matches_selection(model_name: &str, selection: &str) -> bool {
+    match codex_info_pricing::family(selection) {
+        Some(family) => codex_info_pricing::family(model_name) == Some(family),
+        None => model_name == selection,
+    }
+}
+
+fn graph_history_model_matches_selection(
+    model: &PublicHistoryModelUsageV3,
+    selection: &str,
+) -> bool {
+    graph_model_name_matches_selection(&model.model, selection)
+}
+
+fn graph_stored_model_matches_selection(model_name: &str, selection: &str) -> bool {
+    graph_model_name_matches_selection(model_name, selection)
 }
 
 fn main_sample_from_public_observation_v3(
@@ -15387,6 +15432,17 @@ impl CodexInfoState {
                     input_tokens,
                     cached_input_tokens: model.cached_input_tokens,
                     output_tokens: model.output_tokens,
+                    server_estimated_cost: Some(PublicModelCostV3 {
+                        price_version: LOCAL_ESTIMATE_PRICE_VERSION.to_owned(),
+                        ordinary_input_dollars: model.input_dollars,
+                        cached_input_dollars: model.cached_input_dollars,
+                        cache_write_input_dollars: 0.0,
+                        output_dollars: model.output_dollars,
+                        total_dollars: model.input_dollars
+                            + model.cached_input_dollars
+                            + model.output_dollars,
+                    }),
+                    server_pricing_authoritative: true,
                 }
             })
             .collect::<Vec<_>>();
@@ -15547,6 +15603,8 @@ impl CodexInfoState {
                 cached_input_tokens: model.cached_input_tokens,
                 output_tokens: model.output_tokens,
                 cache_write_input_tokens: model.cache_write_input_tokens,
+                server_estimated_cost: model.estimated_cost.clone(),
+                server_pricing_authoritative: true,
             })
             .collect::<Vec<_>>();
         let next_history = UsageHistory {
@@ -15796,6 +15854,8 @@ impl CodexInfoState {
                 cached_input_tokens: model.cached_input_tokens,
                 output_tokens: model.output_tokens,
                 cache_write_input_tokens: model.cache_write_input_tokens,
+                server_estimated_cost: model.estimated_cost.clone(),
+                server_pricing_authoritative: true,
             })
             .collect();
         self.estimated_cost_label = estimated_cost_label_from_v3(&current.models);
@@ -18155,16 +18215,29 @@ impl CodexInfoState {
                 // model vector while allowing other rows to render.
                 _ => continue,
             };
-            let model = observation
-                .models
-                .as_deref()
-                .and_then(|models| models.iter().find(|model| model.model == model_name));
-            let Some(model) = model else {
+            let selected_models = observation.models.as_deref().map(|models| {
+                models
+                    .iter()
+                    .filter(|model| graph_history_model_matches_selection(model, model_name))
+                    .collect::<Vec<_>>()
+            });
+            let Some(models) = selected_models.filter(|models| !models.is_empty()) else {
                 // An omitted model is unknown, even in a complete row. A
                 // zero carrier here would become false cumulative evidence
                 // for both the graph and the idle oracle.
                 continue;
             };
+            let Some(tokens) = models
+                .iter()
+                .try_fold(0_u64, |sum, model| sum.checked_add(model.total_tokens))
+            else {
+                continue;
+            };
+            let dollars = models.iter().try_fold(0.0, |sum, model| {
+                let value = history_model_dollars(model)?;
+                let next = sum + value;
+                next.is_finite().then_some(next)
+            });
             let minute = observation.timestamp.div_euclid(60) * 60;
             points.insert(
                 minute,
@@ -18173,9 +18246,9 @@ impl CodexInfoState {
                     // is the sole exception defined by ASTRA-COST-01: the UI
                     // may derive its display value from a complete, internally
                     // consistent historical token vector.
-                    dollar: history_model_dollars(model).unwrap_or(-1.0),
-                    tokens: model.total_tokens as f64,
-                    raw_tokens: Some(model.total_tokens),
+                    dollar: dollars.unwrap_or(-1.0),
+                    tokens: tokens as f64,
+                    raw_tokens: Some(tokens),
                     origin,
                 },
             );
@@ -18204,12 +18277,14 @@ impl CodexInfoState {
                 usage_store::ModelSource::ReconstructedFromSession
                 | usage_store::ModelSource::Unavailable => continue,
             };
-            let model = observation
-                .model_totals
-                .as_deref()
-                .and_then(|models| models.iter().find(|model| model.model == model_name));
             let minute = observation.timestamp.div_euclid(60) * 60;
-            let Some(model) = model else {
+            let models = observation.model_totals.as_deref().map(|models| {
+                models
+                    .iter()
+                    .filter(|model| graph_stored_model_matches_selection(&model.model, model_name))
+                    .collect::<Vec<_>>()
+            });
+            let Some(models) = models.filter(|models| !models.is_empty()) else {
                 // If a model vector exists but omits this model, its legacy
                 // fixed columns are not a valid substitute. Only rows with
                 // no model vector at all may use the compatibility columns.
@@ -18239,22 +18314,30 @@ impl CodexInfoState {
                 // is a zero-valued observation.
                 continue;
             };
-            // The compatibility store retains exact legacy dollars only for
-            // these fixed models. Generic token totals without a persisted
-            // dollar remain unknown; current prices are not historical data.
-            let dollar = match model_name {
-                "SOL" => observation.sol_dollars,
-                "TERRA" => observation.terra_dollars,
-                "LUNA" => observation.luna_dollars,
-                _ => None,
-            }
-            .unwrap_or(-1.0);
+            let Some(tokens) = models
+                .iter()
+                .try_fold(0_u64, |sum, model| sum.checked_add(model.total_tokens))
+            else {
+                continue;
+            };
+            // The compatibility store has only frozen family-dollar columns.
+            // They remain usable for a grouped family display, while a raw
+            // exact ID without a stored amount remains unknown here.
+            let dollar = codex_info_pricing::family(model_name)
+                .and_then(|family| match family {
+                    "SOL" => observation.sol_dollars,
+                    "TERRA" => observation.terra_dollars,
+                    "LUNA" => observation.luna_dollars,
+                    "ASTRA" => None,
+                    _ => None,
+                })
+                .unwrap_or(-1.0);
             points.insert(
                 minute,
                 GraphModelPoint {
                     dollar,
-                    tokens: model.total_tokens as f64,
-                    raw_tokens: Some(model.total_tokens),
+                    tokens: tokens as f64,
+                    raw_tokens: Some(tokens),
                     origin,
                 },
             );
@@ -18328,7 +18411,11 @@ impl CodexInfoState {
                 })
                 .filter_map(|observation| observation.models.as_deref())
                 .flatten()
-                .map(|model| model.model.clone())
+                .map(|model| {
+                    codex_info_pricing::family(&model.model)
+                        .unwrap_or(&model.model)
+                        .to_owned()
+                })
                 .collect();
         }
         let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
@@ -18351,7 +18438,11 @@ impl CodexInfoState {
                 continue;
             }
             if let Some(models) = observation.model_totals.as_ref() {
-                model_names.extend(models.iter().map(|model| model.model.clone()));
+                model_names.extend(models.iter().map(|model| {
+                    codex_info_pricing::family(&model.model)
+                        .unwrap_or(&model.model)
+                        .to_owned()
+                }));
                 continue;
             }
             if observation.model_source == usage_store::ModelSource::Unavailable {
@@ -19966,17 +20057,25 @@ impl CodexInfoState {
         ui.set_model_usage_output_costs(output_costs.into());
         ui.set_model_usage_period(self.model_usage_period().into());
         let estimate = if self.model_usage.is_empty() {
-            format!("{} —", self.i18n.text(TextKey::EstimatePrefix))
+            None
         } else {
-            let total = self
-                .model_usage
-                .iter()
-                .map(ModelUsageRow::dollar_costs)
-                .map(|(input, cached, output)| input + cached + output)
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .sum::<f64>();
-            self.i18n.format_estimate(total)
+            self.model_usage.iter().try_fold(0.0, |total, row| {
+                let (input, cached, output) = row.dollar_costs();
+                if [input, cached, output]
+                    .iter()
+                    .any(|value| !value.is_finite() || *value < 0.0)
+                {
+                    return None;
+                }
+                let row_total = input + cached + output;
+                let next = total + row_total;
+                (row_total.is_finite() && next.is_finite()).then_some(next)
+            })
         };
+        let estimate = estimate.map_or_else(
+            || format!("{} —", self.i18n.text(TextKey::EstimatePrefix)),
+            |total| self.i18n.format_estimate(total),
+        );
         ui.set_estimated_cost_label(estimate.into());
         ui.set_status(self.display_status_detail().into());
         let status_level = self.status_level();
@@ -20167,46 +20266,155 @@ fn preview_model_row(
         input_tokens,
         cached_input_tokens,
         output_tokens,
+        server_estimated_cost: None,
+        server_pricing_authoritative: false,
     }
+}
+
+#[derive(Default)]
+struct ModelUsageDisplayRow {
+    name: String,
+    input_tokens: u128,
+    cached_tokens: u128,
+    output_tokens: u128,
+    input_dollars: f64,
+    cached_dollars: f64,
+    output_dollars: f64,
+    costs_known: bool,
 }
 
 fn format_model_usage_columns(
     rows: &[ModelUsageRow],
 ) -> (String, String, String, String, String, String, String) {
-    let names = rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
-    let input_tokens = rows
+    let mut display_rows = Vec::<ModelUsageDisplayRow>::new();
+    let mut indexes = BTreeMap::<String, usize>::new();
+    for row in rows {
+        let display_name = codex_info_pricing::family(&row.name).unwrap_or(&row.name);
+        let index = *indexes.entry(display_name.to_owned()).or_insert_with(|| {
+            let index = display_rows.len();
+            display_rows.push(ModelUsageDisplayRow {
+                name: display_name.to_owned(),
+                costs_known: true,
+                ..ModelUsageDisplayRow::default()
+            });
+            index
+        });
+        let display = &mut display_rows[index];
+        display.input_tokens = display.input_tokens.saturating_add(u128::from(
+            row.input_tokens.saturating_sub(row.cached_input_tokens),
+        ));
+        display.cached_tokens = display
+            .cached_tokens
+            .saturating_add(u128::from(row.cached_input_tokens));
+        display.output_tokens = display
+            .output_tokens
+            .saturating_add(u128::from(row.output_tokens));
+
+        let (input, cached, output) = row.dollar_costs();
+        if [input, cached, output]
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            display.costs_known = false;
+            continue;
+        }
+        let next_input = display.input_dollars + input;
+        let next_cached = display.cached_dollars + cached;
+        let next_output = display.output_dollars + output;
+        if [next_input, next_cached, next_output]
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            display.costs_known = false;
+            continue;
+        }
+        display.input_dollars = next_input;
+        display.cached_dollars = next_cached;
+        display.output_dollars = next_output;
+    }
+
+    let names = display_rows
         .iter()
-        .map(|row| format_token_count(row.input_tokens.saturating_sub(row.cached_input_tokens)))
-        .collect::<Vec<_>>();
-    let input_costs = rows
+        .map(|row| row.name.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input_tokens = display_rows
         .iter()
-        .map(|row| format_dollar_cost(row.dollar_costs().0))
-        .collect::<Vec<_>>();
-    let cached_tokens = rows
+        .map(|row| format_unsigned_count(row.input_tokens))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input_costs = display_rows
         .iter()
-        .map(|row| format_token_count(row.cached_input_tokens))
-        .collect::<Vec<_>>();
-    let cached_costs = rows
+        .map(|row| {
+            format_dollar_cost(if row.costs_known {
+                row.input_dollars
+            } else {
+                f64::NAN
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cached_tokens = display_rows
         .iter()
-        .map(|row| format_dollar_cost(row.dollar_costs().1))
-        .collect::<Vec<_>>();
-    let output_tokens = rows
+        .map(|row| format_unsigned_count(row.cached_tokens))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cached_costs = display_rows
         .iter()
-        .map(|row| format_token_count(row.output_tokens))
-        .collect::<Vec<_>>();
-    let output_costs = rows
+        .map(|row| {
+            format_dollar_cost(if row.costs_known {
+                row.cached_dollars
+            } else {
+                f64::NAN
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output_tokens = display_rows
         .iter()
-        .map(|row| format_dollar_cost(row.dollar_costs().2))
-        .collect::<Vec<_>>();
+        .map(|row| format_unsigned_count(row.output_tokens))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output_costs = display_rows
+        .iter()
+        .map(|row| {
+            format_dollar_cost(if row.costs_known {
+                row.output_dollars
+            } else {
+                f64::NAN
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     (
-        names.join("\n"),
-        input_tokens.join("\n"),
-        input_costs.join("\n"),
-        cached_tokens.join("\n"),
-        cached_costs.join("\n"),
-        output_tokens.join("\n"),
-        output_costs.join("\n"),
+        names,
+        input_tokens,
+        input_costs,
+        cached_tokens,
+        cached_costs,
+        output_tokens,
+        output_costs,
     )
+}
+
+fn model_cost_display_components(cost: &PublicModelCostV3) -> Option<(f64, f64, f64)> {
+    let values = [
+        cost.ordinary_input_dollars,
+        cost.cached_input_dollars,
+        cost.cache_write_input_dollars,
+        cost.output_dollars,
+        cost.total_dollars,
+    ];
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return None;
+    }
+    let input = cost.ordinary_input_dollars + cost.cache_write_input_dollars;
+    input
+        .is_finite()
+        .then_some((input, cost.cached_input_dollars, cost.output_dollars))
 }
 
 fn format_dollar_cost(value: f64) -> String {
@@ -20217,19 +20425,21 @@ fn format_dollar_cost(value: f64) -> String {
 }
 
 fn estimated_cost_label_from_v3(models: &[PublicModelUsageV3]) -> String {
-    let mut total = 0.0;
-    let mut known = false;
-    for model in models {
-        if let Some(cost) = model.estimated_cost.as_ref() {
-            if cost.total_dollars.is_finite() && cost.total_dollars >= 0.0 {
-                total += cost.total_dollars;
-                known = true;
-            }
-        }
-    }
-    if !known || !total.is_finite() || total < 0.0 {
+    if models.is_empty() {
         return "概算 —".into();
     }
+    let Some(total) = models.iter().try_fold(0.0, |total, model| {
+        let cost = model.estimated_cost.as_ref()?;
+        model_cost_display_components(cost)?;
+        let value = cost.total_dollars;
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        let sum = total + value;
+        sum.is_finite().then_some(sum)
+    }) else {
+        return "概算 —".into();
+    };
     format_estimated_total(total)
 }
 
@@ -24088,13 +24298,13 @@ mod tests {
         LocalUsageCache, LocalUsageCandidate, LocalUsageResult, ManualX11Geometry,
         ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
         ModelUsageTotals, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
-        PublicHistoryPeriod, PublicThreadActivityStatus, RpcReadEvent, ServiceEndpointState,
-        ServiceHealthVersion, SessionFileCandidate, SessionTraversalBudget, ThreadRolloutCache,
-        TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
-        UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
-        FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
-        LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
-        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        PublicHistoryPeriod, PublicModelCostV3, PublicModelUsageV3, PublicThreadActivityStatus,
+        RpcReadEvent, ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate,
+        SessionTraversalBudget, ThreadRolloutCache, TimedModelUsage, TokenSnapshot,
+        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
+        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
+        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
+        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use codex_info::usage_store;
     use serde::Deserialize;
@@ -24568,6 +24778,7 @@ mod tests {
         cached_input_tokens: u64,
         cache_write_input_tokens: Option<u64>,
         output_tokens: u64,
+        estimated_cost: Option<PublicModelCostV3>,
     }
 
     #[derive(Deserialize)]
@@ -30639,6 +30850,8 @@ mod tests {
                 input_tokens: 2_000_000,
                 cached_input_tokens: 1_000_000,
                 output_tokens: 1_000_000,
+                server_estimated_cost: None,
+                server_pricing_authoritative: false,
             },
             ModelUsageRow {
                 cache_write_input_tokens: None,
@@ -30647,6 +30860,8 @@ mod tests {
                 input_tokens: 2_000_000,
                 cached_input_tokens: 1_000_000,
                 output_tokens: 1_000_000,
+                server_estimated_cost: None,
+                server_pricing_authoritative: false,
             },
             ModelUsageRow {
                 cache_write_input_tokens: None,
@@ -30655,6 +30870,8 @@ mod tests {
                 input_tokens: 2_000_000,
                 cached_input_tokens: 1_000_000,
                 output_tokens: 1_000_000,
+                server_estimated_cost: None,
+                server_pricing_authoritative: false,
             },
         ];
         let totals = ModelDollarTotals::from_rows(&rows);
@@ -30689,6 +30906,8 @@ mod tests {
             input_tokens: u64::MAX,
             cached_input_tokens: 0,
             output_tokens: u64::MAX,
+            server_estimated_cost: None,
+            server_pricing_authoritative: false,
         };
         let costs = maximum.dollar_costs();
         assert!(costs.0.is_finite() && costs.2.is_finite());
@@ -37494,6 +37713,8 @@ mod tests {
                     cached_input_tokens: wire.cached_input_tokens,
                     output_tokens: wire.output_tokens,
                     cache_write_input_tokens: wire.cache_write_input_tokens,
+                    server_estimated_cost: wire.estimated_cost.clone(),
+                    server_pricing_authoritative: true,
                 }
             })
             .collect::<Vec<_>>();
@@ -37530,6 +37751,81 @@ mod tests {
                 expected_dollar_column(|row| row.output_dollars.as_ref()),
             )
         );
+    }
+
+    #[test]
+    fn linux_v3_groups_exact_models_after_using_server_costs() {
+        let (mut current, threads) = split_current_fixture();
+        let cost = |price_version: &str,
+                    ordinary_input_dollars: f64,
+                    cached_input_dollars: f64,
+                    cache_write_input_dollars: f64,
+                    output_dollars: f64| PublicModelCostV3 {
+            price_version: price_version.to_owned(),
+            ordinary_input_dollars,
+            cached_input_dollars,
+            cache_write_input_dollars,
+            output_dollars,
+            total_dollars: ordinary_input_dollars
+                + cached_input_dollars
+                + cache_write_input_dollars
+                + output_dollars,
+        };
+        current.models = vec![
+            PublicModelUsageV3 {
+                model: "gpt-6-sol".into(),
+                total_tokens: 230,
+                input_tokens: 200,
+                cached_input_tokens: 50,
+                cache_write_input_tokens: Some(20),
+                output_tokens: 30,
+                estimated_cost: Some(cost("server-raw-b", 2.222, 0.555, 0.666, 0.777)),
+            },
+            PublicModelUsageV3 {
+                model: "gpt-6.1-sol".into(),
+                total_tokens: 140,
+                input_tokens: 100,
+                cached_input_tokens: 20,
+                cache_write_input_tokens: Some(10),
+                output_tokens: 40,
+                estimated_cost: Some(cost("server-raw-a", 1.111, 0.022, 0.333, 0.444)),
+            },
+            PublicModelUsageV3 {
+                model: "gpt-8-sol".into(),
+                total_tokens: 10,
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                output_tokens: 0,
+                estimated_cost: None,
+            },
+        ];
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_current_bundle(published_pair(463, 1), current, None, threads)
+            .expect("valid exact-ID current snapshot");
+
+        assert_eq!(
+            state
+                .model_usage
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-6-sol", "gpt-6.1-sol", "gpt-8-sol"]
+        );
+        assert_eq!(
+            format_model_usage_columns(&state.model_usage),
+            (
+                "SOL\ngpt-8-sol".into(),
+                "230\n10".into(),
+                "$4.33\n—".into(),
+                "70\n0".into(),
+                "$0.58\n—".into(),
+                "70\n0".into(),
+                "$1.22\n—".into(),
+            )
+        );
+        assert_eq!(state.estimated_cost_label, "概算 —");
     }
 
     #[test]
@@ -48670,6 +48966,58 @@ mod tests {
     }
 
     #[test]
+    fn linux_graph_groups_exact_history_by_family_after_stored_dollars() {
+        let reset_at = 20_000;
+        let model = |name: &str, tokens, dollars| super::PublicHistoryModelUsageV3 {
+            model: name.into(),
+            total_tokens: tokens,
+            input_tokens: Some(tokens),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            output_tokens: Some(0),
+            total_dollars: dollars,
+        };
+        let observation = |timestamp, models| super::PublicHistoryObservationV3 {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(90.0),
+            task_active_since_previous: None,
+            models: Some(models),
+            models_complete: true,
+            model_source: "confirmed".into(),
+        };
+        let mut client = CodexInfoState::service_client();
+        client.service_history_samples = vec![
+            observation(
+                60,
+                vec![
+                    model("gpt-6-sol", 20, Some(0.125)),
+                    model("gpt-6.1-sol", 10, Some(0.375)),
+                    // Unknown family-like names remain separate raw models.
+                    model("gpt-8-sol", 7, Some(9.0)),
+                ],
+            ),
+            observation(
+                120,
+                vec![
+                    model("gpt-6-sol", 25, Some(0.5)),
+                    // A missing exact model amount makes the family total
+                    // unknown instead of publishing the priced partial sum.
+                    model("gpt-5.6-sol", 5, None),
+                ],
+            ),
+        ];
+
+        let points = client.graph_model_points_for_selection(reset_at, 0, 120, "SOL");
+        assert_eq!(points[&60].dollar, 0.5);
+        assert_eq!(points[&60].tokens, 30.0);
+        assert_eq!(points[&60].raw_tokens, Some(30));
+        assert_eq!(points[&120].dollar, -1.0);
+        assert_eq!(points[&120].tokens, 30.0);
+        assert_eq!(points[&120].raw_tokens, Some(30));
+    }
+
+    #[test]
     fn reconstructed_session_values_never_enter_the_graph_or_price_projection() {
         let reset_at = 20_000;
         let mut client = CodexInfoState::service_client();
@@ -51203,6 +51551,8 @@ mod tests {
             input_tokens: 1_500,
             cached_input_tokens: 500,
             output_tokens: 250,
+            server_estimated_cost: None,
+            server_pricing_authoritative: false,
         }];
         publisher.publish_details(state.public_details()).unwrap();
         let cycle_details = raw_loopback_get(server.local_addr(), "/v1/details");

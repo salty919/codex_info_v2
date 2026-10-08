@@ -168,6 +168,88 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task V3ExactModelsArePricedIndividuallyThenGroupedForDisplay()
+    {
+        var current = new ApiCurrentSnapshot(
+            ApiState.Ready,
+            1,
+            true,
+            "Pro",
+            new ApiQuota(45, 2, 604800, false),
+            [
+                new ApiDetailsModelUsage("gpt-6-sol", 10, 2, 3, 0.12, 0.02, 0.03)
+                {
+                    TotalTokens = 15,
+                    CacheWriteInputTokens = 2,
+                    CacheWriteInputDollars = 0.04,
+                    PriceVersion = "revision-current",
+                    EstimatedTotalDollars = 0.17,
+                },
+                new ApiDetailsModelUsage("gpt-5.6-sol", 20, 5, 6, 0.30, 0.05, 0.06)
+                {
+                    TotalTokens = 31,
+                    CacheWriteInputTokens = 1,
+                    CacheWriteInputDollars = 0.10,
+                    PriceVersion = "revision-older",
+                    EstimatedTotalDollars = 0.41,
+                },
+            ],
+            0,
+            PublishedPair(CanonicalPublishedPair));
+        using var viewModel = new MainWindowViewModel(new SingleCurrentClient(current));
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated);
+
+        var row = Assert.Single(viewModel.Models);
+        Assert.Equal("SOL", row.Name);
+        Assert.Equal("30", row.InputTokensText);
+        Assert.Equal("7", row.CachedInputTokensText);
+        Assert.Equal("9", row.OutputTokensText);
+        Assert.Equal("$0.42", row.InputDollarsText);
+        Assert.Equal("$0.07", row.CachedInputDollarsText);
+        Assert.Equal("$0.09", row.OutputDollarsText);
+        Assert.Equal("$0.58", row.TotalDollarsText);
+        Assert.Equal("概算 $0.58", viewModel.EstimatedCostText);
+        Assert.Equal(["gpt-6-sol", "gpt-5.6-sol"],
+            viewModel.DetailsSnapshot!.Models.Select(model => model.Name));
+    }
+
+    [Fact]
+    public async Task V3EstimatedCostIsUnavailableWhenAnyModelPriceIsUnknown()
+    {
+        var current = new ApiCurrentSnapshot(
+            ApiState.Ready,
+            1,
+            true,
+            "Pro",
+            new ApiQuota(45, 2, 604800, false),
+            [
+                new ApiDetailsModelUsage("gpt-6-sol", 10, 2, 3, 0.12, 0.02, 0.03)
+                {
+                    TotalTokens = 15,
+                    CacheWriteInputTokens = 2,
+                    CacheWriteInputDollars = 0.04,
+                    PriceVersion = "revision-current",
+                    EstimatedTotalDollars = 0.17,
+                },
+                new ApiDetailsModelUsage("unknown-model", 4, 0, 1, double.NaN, double.NaN, double.NaN)
+                {
+                    TotalTokens = 5,
+                    CacheWriteInputTokens = 0,
+                },
+            ],
+            0,
+            PublishedPair(CanonicalPublishedPair));
+        using var viewModel = new MainWindowViewModel(new SingleCurrentClient(current));
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated);
+
+        Assert.Equal("概算 —", viewModel.EstimatedCostText);
+    }
+
+    [Fact]
     public async Task V3CurrentAndThreadsPublishOneSolThreadAtomically()
     {
         var current = CurrentSnapshot(activeThreadCount: 1);

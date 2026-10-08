@@ -5,6 +5,7 @@
 //! Every connection is opened with `SQLITE_OPEN_READ_ONLY`, then `query_only`
 //! is enabled and read back before any product query is issued.
 
+use codex_info_pricing::{estimate as estimate_model_price, estimate_legacy, Usage as PriceUsage};
 use codex_info_rest_contract::{
     current_period_bounds, current_period_start_at, is_valid_public_model_name, ContractError,
     PublicDetailedModelUsage, PublicDetails, PublicHistoryGap, PublicHistoryModelUsageV3,
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 const MAX_HISTORY_ROWS: usize = 31 * 24 * 60;
 const HISTORY_WINDOW_SECONDS: i64 = 31 * 24 * 60 * 60;
-pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 11;
+pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 12;
 const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
 const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
@@ -33,16 +34,6 @@ const MAX_ACTIVE_THREADS: usize = 256;
 const MAX_ACTIVE_THREAD_JSON_BYTES: usize = 1024 * 1024;
 const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799;
 const MAX_LOGIN_ID_SCALARS: usize = 254;
-// These are the distribution's established local estimate rates.  Keep the
-// REST projection numerically identical to the root UI: durable history
-// dollars are cumulative totals, while the public model fields are split into
-// ordinary input, cached input, and output components from token totals.
-const SOL_PRICE_PER_MILLION: (f64, f64, f64) = (5.0, 0.5, 30.0);
-const TERRA_PRICE_PER_MILLION: (f64, f64, f64) = (2.0, 0.2, 12.0);
-const LUNA_PRICE_PER_MILLION: (f64, f64, f64) = (0.2, 0.02, 1.2);
-const ASTRA_PRICE_PER_MILLION: (f64, f64, f64, f64) = (10.0, 1.0, 12.5, 50.0);
-const LOCAL_ESTIMATE_PRICE_VERSION: &str = "LOCAL_ESTIMATE_V1_2026-08-14";
-const ASTRA_PRICE_VERSION: &str = "ASTRA_USER_2026-09-05";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DbSnapshot {
@@ -1338,7 +1329,7 @@ fn build_details_for_intervals(
     assign_history_period_labels(&mut periods, current_window_reset_at);
     let history_samples_v2 = history_observations_v2(&samples, &history_samples_v3);
     let history_samples_v1 = history_samples_v1(&history_samples_v2);
-    let estimated_cost_label = format_estimated_cost(&models);
+    let estimated_cost_label = format_estimated_cost_v3(&model_projection.v3);
     let mut gaps = read_confirmed_gaps_for_intervals(connection, intervals)?
         .into_iter()
         .filter_map(|gap| {
@@ -2686,21 +2677,30 @@ fn read_history_model_groups_for_intervals(
         "usage_model_history",
         "cache_write_input_tokens",
     )?;
-    let query = if has_cache_write {
-        "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
-                cached_input_tokens, output_tokens, cache_write_input_tokens,
-                model_set_complete
-         FROM usage_model_history
+    let has_total_dollars = table_has_column(connection, "usage_model_history", "total_dollars")?;
+    let mut columns = vec![
+        "reset_at",
+        "timestamp",
+        "model",
+        "total_tokens",
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+    ];
+    if has_cache_write {
+        columns.push("cache_write_input_tokens");
+    }
+    if has_total_dollars {
+        columns.push("total_dollars");
+    }
+    columns.push("model_set_complete");
+    let query = format!(
+        "SELECT {} FROM usage_model_history
          WHERE timestamp > ?1 AND timestamp <= ?2
-         ORDER BY reset_at, timestamp, model"
-    } else {
-        "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
-                cached_input_tokens, output_tokens, model_set_complete
-         FROM usage_model_history
-         WHERE timestamp > ?1 AND timestamp <= ?2
-         ORDER BY reset_at, timestamp, model"
-    };
-    let mut statement = connection.prepare(query)?;
+         ORDER BY reset_at, timestamp, model",
+        columns.join(", ")
+    );
+    let mut statement = connection.prepare(&query)?;
     let mut rows = statement.query(params![cutoff, observed_at])?;
     let mut groups = BTreeMap::<(i64, i64), HistoryModelGroup>::new();
     while let Some(row) = rows.next()? {
@@ -2713,7 +2713,7 @@ fn read_history_model_groups_for_intervals(
         if !intervals.intersects_canonical_minute(timestamp) {
             continue;
         }
-        let complete_index = if has_cache_write { 8 } else { 7 };
+        let complete_index = 7 + usize::from(has_cache_write) + usize::from(has_total_dollars);
         let canonical_reset =
             canonical_period_reset_at(reset_at, timestamp, current_reset_at, window_seconds);
         let group = groups.entry((canonical_reset, timestamp)).or_default();
@@ -2772,6 +2772,9 @@ fn read_history_model_groups_for_intervals(
         } else {
             None
         };
+        let total_dollars = has_total_dollars
+            .then(|| sql_nonnegative_f64(row, 7 + usize::from(has_cache_write)))
+            .flatten();
         let row = RawModelTotal {
             model,
             total_tokens,
@@ -2779,6 +2782,7 @@ fn read_history_model_groups_for_intervals(
             cached_input_tokens,
             output_tokens,
             cache_write_input_tokens,
+            total_dollars,
         };
         if !valid_public_timestamp(reset_at)
             || !valid_public_timestamp(timestamp)
@@ -2851,6 +2855,16 @@ fn sql_text_option(row: &Row<'_>, index: usize) -> Option<Option<String>> {
     }
 }
 
+fn sql_nonnegative_f64(row: &Row<'_>, index: usize) -> Option<f64> {
+    let value = match row.get_ref(index).ok()? {
+        ValueRef::Integer(value) => value as f64,
+        ValueRef::Real(value) => value,
+        ValueRef::Text(value) => std::str::from_utf8(value).ok()?.parse().ok()?,
+        ValueRef::Null | ValueRef::Blob(_) => return None,
+    };
+    (value.is_finite() && value >= 0.0).then_some(value)
+}
+
 fn sql_i64(row: &Row<'_>, index: usize) -> Option<i64> {
     match row.get_ref(index).ok()? {
         ValueRef::Integer(value) => Some(value),
@@ -2875,7 +2889,11 @@ fn history_models_v3(
         .unwrap_or_default();
     if !models_complete {
         for legacy in legacy_history_models_v3(sample) {
-            if !models.iter().any(|model| model.model == legacy.model) {
+            let legacy_family = codex_info_pricing::family(&legacy.model);
+            if !models
+                .iter()
+                .any(|model| codex_info_pricing::family(&model.model) == legacy_family)
+            {
                 models.push(legacy);
             }
         }
@@ -2909,14 +2927,16 @@ fn history_model_usage_v3(
     total: &RawModelTotal,
     sample: &PublicHistorySample,
 ) -> PublicHistoryModelUsageV3 {
-    let total_dollars = match total.model.as_str() {
+    let total_dollars = total.total_dollars.or(match total.model.as_str() {
+        // Old history rows have no sidecar amount. Preserve their family-only
+        // SQL values, but let any newly persisted row amount take precedence.
         "SOL" => Some(sample.sol_dollars),
         "TERRA" => Some(sample.terra_dollars),
         "LUNA" => Some(sample.luna_dollars),
-        // `usage_history` has no dollar column for arbitrary model names.
-        // Do not turn a pricing estimate into a historical direct value.
+        // Exact model IDs (and newer ASTRA rows) have no legacy SQL fallback.
+        // Never reprice a historical row from today's catalog.
         _ => None,
-    };
+    });
     PublicHistoryModelUsageV3 {
         model: total.model.clone(),
         total_tokens: total.total_tokens,
@@ -3996,6 +4016,7 @@ struct RawModelTotal {
     cached_input_tokens: u64,
     output_tokens: u64,
     cache_write_input_tokens: Option<u64>,
+    total_dollars: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4096,6 +4117,7 @@ fn read_model_projection(connection: &Connection) -> Result<ModelProjection, Rea
             cached_input_tokens,
             output_tokens,
             cache_write_input_tokens,
+            total_dollars: None,
         }))
     })?;
 
@@ -4302,6 +4324,7 @@ fn read_model_projection_for_intervals(
                 cached_input_tokens,
                 output_tokens,
                 cache_write_input_tokens,
+                total_dollars: None,
             },
         );
     }
@@ -4318,8 +4341,21 @@ impl ReadIntervals {
 }
 
 fn project_model_totals(rows: impl IntoIterator<Item = RawModelTotal>) -> ModelProjection {
+    #[derive(Default)]
+    struct LegacyFamilyProjection {
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+        input_dollars: f64,
+        cached_input_dollars: f64,
+        output_dollars: f64,
+        seen: bool,
+        unavailable: bool,
+    }
+
     let mut projection = ModelProjection::default();
     let mut names = std::collections::HashSet::new();
+    let mut legacy_families = BTreeMap::<String, LegacyFamilyProjection>::new();
     for row in rows {
         if !is_valid_public_model_name(&row.model)
             || row.total_tokens == 0
@@ -4336,24 +4372,49 @@ fn project_model_totals(rows: impl IntoIterator<Item = RawModelTotal>) -> ModelP
             // complete details 503.
             continue;
         }
-        let (input_dollars, cached_input_dollars, output_dollars) = model_dollar_costs(
-            &row.model,
-            row.input_tokens,
-            row.cached_input_tokens,
-            row.output_tokens,
-        );
-        if matches!(row.model.as_str(), "SOL" | "TERRA" | "LUNA") {
-            projection.v1.push(PublicDetailedModelUsage {
-                name: row.model.clone(),
-                // Cached input is already included in the durable input
-                // total.  v1 exposes its ordinary component separately.
-                input_tokens: row.input_tokens.saturating_sub(row.cached_input_tokens),
-                cached_input_tokens: row.cached_input_tokens,
-                output_tokens: row.output_tokens,
-                input_dollars,
-                cached_input_dollars,
-                output_dollars,
-            });
+        let estimated_cost = model_v3_cost(&row);
+        if let Some(family @ ("SOL" | "TERRA" | "LUNA")) = codex_info_pricing::family(&row.model) {
+            let aggregate = legacy_families.entry(family.to_owned()).or_default();
+            aggregate.seen = true;
+            if let Some(cost) = model_legacy_family_cost(&row, family) {
+                let ordinary_tokens = row.input_tokens.saturating_sub(row.cached_input_tokens);
+                let input_dollars = cost.ordinary_input_dollars + cost.cache_write_input_dollars;
+                let token_sums = aggregate
+                    .input_tokens
+                    .checked_add(ordinary_tokens)
+                    .zip(
+                        aggregate
+                            .cached_input_tokens
+                            .checked_add(row.cached_input_tokens),
+                    )
+                    .zip(aggregate.output_tokens.checked_add(row.output_tokens));
+                let dollar_sums = (
+                    aggregate.input_dollars + input_dollars,
+                    aggregate.cached_input_dollars + cost.cached_input_dollars,
+                    aggregate.output_dollars + cost.output_dollars,
+                );
+                if let Some(((input_tokens, cached_input_tokens), output_tokens)) = token_sums
+                    .filter(|_| {
+                        dollar_sums.0.is_finite()
+                            && dollar_sums.1.is_finite()
+                            && dollar_sums.2.is_finite()
+                    })
+                {
+                    aggregate.input_tokens = input_tokens;
+                    aggregate.cached_input_tokens = cached_input_tokens;
+                    aggregate.output_tokens = output_tokens;
+                    aggregate.input_dollars = dollar_sums.0;
+                    aggregate.cached_input_dollars = dollar_sums.1;
+                    aggregate.output_dollars = dollar_sums.2;
+                } else {
+                    aggregate.unavailable = true;
+                }
+            } else {
+                // The v1 shape has no way to express an unpriced family row.
+                // Suppress the whole family instead of publishing a partial
+                // dollar sum; v3 below still retains the raw token facts.
+                aggregate.unavailable = true;
+            }
         }
         projection.v3.push(PublicModelUsageV3 {
             model: row.model.clone(),
@@ -4364,8 +4425,21 @@ fn project_model_totals(rows: impl IntoIterator<Item = RawModelTotal>) -> ModelP
             cached_input_tokens: row.cached_input_tokens,
             cache_write_input_tokens: row.cache_write_input_tokens,
             output_tokens: row.output_tokens,
-            estimated_cost: model_v3_cost(&row),
+            estimated_cost,
         });
+    }
+    for (family, aggregate) in legacy_families {
+        if aggregate.seen && !aggregate.unavailable {
+            projection.v1.push(PublicDetailedModelUsage {
+                name: family,
+                input_tokens: aggregate.input_tokens,
+                cached_input_tokens: aggregate.cached_input_tokens,
+                output_tokens: aggregate.output_tokens,
+                input_dollars: aggregate.input_dollars,
+                cached_input_dollars: aggregate.cached_input_dollars,
+                output_dollars: aggregate.output_dollars,
+            });
+        }
     }
     projection
         .v1
@@ -4400,73 +4474,67 @@ fn public_model_order(model: &str) -> u8 {
 }
 
 fn model_v3_cost(row: &RawModelTotal) -> Option<PublicModelCostV3> {
-    if row.model == "ASTRA" {
-        let writes = row.cache_write_input_tokens?;
-        let ordinary_input_tokens = row
-            .input_tokens
-            .checked_sub(row.cached_input_tokens)?
-            .checked_sub(writes)?;
-        let (input_rate, cached_rate, write_rate, output_rate) = ASTRA_PRICE_PER_MILLION;
-        let ordinary_input = ordinary_input_tokens as f64 * input_rate / 1_000_000.0;
-        let cached_input = row.cached_input_tokens as f64 * cached_rate / 1_000_000.0;
-        let cache_write_input = writes as f64 * write_rate / 1_000_000.0;
-        let output = row.output_tokens as f64 * output_rate / 1_000_000.0;
-        return Some(PublicModelCostV3 {
-            price_version: ASTRA_PRICE_VERSION.to_owned(),
-            ordinary_input_dollars: ordinary_input,
-            cached_input_dollars: cached_input,
-            cache_write_input_dollars: cache_write_input,
-            output_dollars: output,
-            total_dollars: ordinary_input + cached_input + cache_write_input + output,
-        });
-    }
-    if !matches!(row.model.as_str(), "SOL" | "TERRA" | "LUNA")
-        || row.cache_write_input_tokens != Some(0)
-    {
-        return None;
-    }
-    let (ordinary_input, cached_input, output) = model_dollar_costs(
-        &row.model,
-        row.input_tokens,
-        row.cached_input_tokens,
-        row.output_tokens,
-    );
+    let usage = PriceUsage {
+        input_tokens: row.input_tokens,
+        cached_input_tokens: row.cached_input_tokens,
+        cache_write_input_tokens: row.cache_write_input_tokens,
+        output_tokens: row.output_tokens,
+    };
+    let cost =
+        estimate_model_price(&row.model, usage).or_else(|| estimate_legacy(&row.model, usage))?;
     Some(PublicModelCostV3 {
-        price_version: LOCAL_ESTIMATE_PRICE_VERSION.to_owned(),
-        ordinary_input_dollars: ordinary_input,
-        cached_input_dollars: cached_input,
-        cache_write_input_dollars: 0.0,
-        output_dollars: output,
-        total_dollars: ordinary_input + cached_input + output,
+        price_version: cost.price_version,
+        ordinary_input_dollars: cost.ordinary_input_dollars,
+        cached_input_dollars: cost.cached_input_dollars,
+        cache_write_input_dollars: cost.cache_write_input_dollars,
+        output_dollars: cost.output_dollars,
+        total_dollars: cost.total_dollars,
     })
 }
 
-fn model_dollar_costs(
-    model: &str,
-    input_tokens: u64,
-    cached_input_tokens: u64,
-    output_tokens: u64,
-) -> (f64, f64, f64) {
-    let (input_rate, cached_rate, output_rate) = match model {
-        "SOL" => SOL_PRICE_PER_MILLION,
-        "TERRA" => TERRA_PRICE_PER_MILLION,
-        "LUNA" => LUNA_PRICE_PER_MILLION,
-        _ => return (0.0, 0.0, 0.0),
+fn model_legacy_family_cost(row: &RawModelTotal, family: &str) -> Option<PublicModelCostV3> {
+    // v1 has no cache-write field, so known exact IDs are projected through
+    // the frozen three-component family rates with writes folded into input.
+    // This compatibility estimate is kept separate from the official exact
+    // ID estimate carried by v3.
+    let usage = PriceUsage {
+        input_tokens: row.input_tokens,
+        cached_input_tokens: row.cached_input_tokens,
+        cache_write_input_tokens: Some(0),
+        output_tokens: row.output_tokens,
     };
-    let ordinary_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
-    (
-        ordinary_input_tokens as f64 * input_rate / 1_000_000.0,
-        cached_input_tokens as f64 * cached_rate / 1_000_000.0,
-        output_tokens as f64 * output_rate / 1_000_000.0,
-    )
+    let cost = estimate_legacy(family, usage)?;
+    Some(PublicModelCostV3 {
+        price_version: cost.price_version,
+        ordinary_input_dollars: cost.ordinary_input_dollars,
+        cached_input_dollars: cost.cached_input_dollars,
+        cache_write_input_dollars: cost.cache_write_input_dollars,
+        output_dollars: cost.output_dollars,
+        total_dollars: cost.total_dollars,
+    })
 }
 
-fn format_estimated_cost(models: &[PublicDetailedModelUsage]) -> String {
-    let total = models
-        .iter()
-        .map(|model| model.input_dollars + model.cached_input_dollars + model.output_dollars)
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .sum::<f64>();
+fn format_estimated_cost_v3(models: &[PublicModelUsageV3]) -> String {
+    if models.is_empty() {
+        return "概算 —".to_owned();
+    }
+    let mut total = 0.0;
+    for model in models {
+        let Some(cost) = model.estimated_cost.as_ref() else {
+            return "概算 —".to_owned();
+        };
+        if !cost.total_dollars.is_finite() || cost.total_dollars < 0.0 {
+            return "概算 —".to_owned();
+        }
+        total += cost.total_dollars;
+        if !total.is_finite() {
+            return "概算 —".to_owned();
+        }
+    }
+    format_dollar_total(total)
+}
+
+fn format_dollar_total(total: f64) -> String {
     if !total.is_finite() || total < 0.0 {
         return "概算 —".to_owned();
     }
@@ -6469,10 +6537,10 @@ mod tests {
                 "CREATE TABLE session_model_totals(
                     model TEXT NOT NULL, total_tokens TEXT NOT NULL,
                     input_tokens TEXT NOT NULL, cached_input_tokens TEXT NOT NULL,
-                    output_tokens TEXT NOT NULL
+                    output_tokens TEXT NOT NULL, cache_write_input_tokens TEXT
                 );
-                INSERT INTO session_model_totals VALUES('SOL','110','100','40','10');
-                INSERT INTO session_model_totals VALUES('UNKNOWN','1','1','0','0');",
+                INSERT INTO session_model_totals VALUES('SOL','110','100','40','10','0');
+                INSERT INTO session_model_totals VALUES('UNKNOWN','1','1','0','0','0');",
             )
             .expect("model schema");
         let models = read_models(&connection).expect("models");
@@ -6480,10 +6548,282 @@ mod tests {
         assert_eq!(models[0].input_tokens, 60);
         assert_eq!(models[0].cached_input_tokens, 40);
         assert_eq!(models[0].output_tokens, 10);
-        assert_eq!(models[0].input_dollars, 0.0003);
-        assert_eq!(models[0].cached_input_dollars, 0.00002);
-        assert_eq!(models[0].output_dollars, 0.0003);
+        assert!((models[0].input_dollars - 0.0003).abs() < 1e-12);
+        assert!((models[0].cached_input_dollars - 0.00002).abs() < 1e-12);
+        assert!((models[0].output_dollars - 0.0003).abs() < 1e-12);
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn exact_model_projection_prices_raw_ids_before_legacy_family_aggregation() {
+        let price_catalog: serde_json::Value = serde_json::from_str(include_str!(
+            "../../codex-info-pricing/data/standard-short.json"
+        ))
+        .expect("checked-in standard-short price catalog");
+        let latest_revision = price_catalog["revisions"]
+            .as_array()
+            .and_then(|revisions| revisions.last())
+            .expect("latest checked-in price revision");
+        let latest_price_version = latest_revision["id"].as_str().expect("price revision ID");
+        let unit_tokens = price_catalog["unit_tokens"]
+            .as_u64()
+            .expect("catalog token unit") as f64;
+        let expected_component = |model: &str, component: &str, tokens: u64| {
+            let rate = latest_revision["models"][model][component]
+                .as_f64()
+                .expect("catalog model component rate");
+            tokens as f64 / unit_tokens * rate
+        };
+        let path = temp_db("exact-model-current-pricing");
+        let connection = Connection::open(&path).expect("fixture db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session_model_totals(
+                    model TEXT PRIMARY KEY, total_tokens TEXT NOT NULL,
+                    input_tokens TEXT NOT NULL, cached_input_tokens TEXT NOT NULL,
+                    output_tokens TEXT NOT NULL, cache_write_input_tokens TEXT
+                );
+                INSERT INTO session_model_totals VALUES
+                    ('gpt-6.1-sol','1400000','1000000','200000','100000','100000'),
+                    ('gpt-6-sol','1000000','1000000','0','0','0');",
+            )
+            .expect("model schema");
+
+        let exact_only = read_model_projection(&connection).expect("exact-only projection");
+        assert_eq!(
+            exact_only
+                .v3
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-6-sol", "gpt-6.1-sol"]
+        );
+        let current_sol = exact_only
+            .v3
+            .iter()
+            .find(|model| model.model == "gpt-6.1-sol")
+            .expect("raw model ID retained");
+        let cost = current_sol
+            .estimated_cost
+            .as_ref()
+            .expect("exact model has a reference price");
+        assert_eq!(cost.price_version, latest_price_version);
+        let expected_components = [
+            expected_component("gpt-6.1-sol", "input", 700_000),
+            expected_component("gpt-6.1-sol", "cached_input", 200_000),
+            expected_component("gpt-6.1-sol", "cache_write_input", 100_000),
+            expected_component("gpt-6.1-sol", "output", 100_000),
+        ];
+        for (actual, expected) in [
+            cost.ordinary_input_dollars,
+            cost.cached_input_dollars,
+            cost.cache_write_input_dollars,
+            cost.output_dollars,
+        ]
+        .into_iter()
+        .zip(expected_components)
+        {
+            assert!((actual - expected).abs() < 1e-10);
+        }
+        assert!((cost.total_dollars - expected_components.iter().sum::<f64>()).abs() < 1e-10);
+        let second_exact_cost = exact_only
+            .v3
+            .iter()
+            .find(|model| model.model == "gpt-6-sol")
+            .and_then(|model| model.estimated_cost.as_ref())
+            .expect("second exact model has its own reference price");
+        assert_eq!(second_exact_cost.price_version, latest_price_version);
+        let second_exact_components = [
+            expected_component("gpt-6-sol", "input", 1_000_000),
+            expected_component("gpt-6-sol", "cached_input", 0),
+            expected_component("gpt-6-sol", "cache_write_input", 0),
+            expected_component("gpt-6-sol", "output", 0),
+        ];
+        for (actual, expected) in [
+            second_exact_cost.ordinary_input_dollars,
+            second_exact_cost.cached_input_dollars,
+            second_exact_cost.cache_write_input_dollars,
+            second_exact_cost.output_dollars,
+        ]
+        .into_iter()
+        .zip(second_exact_components)
+        {
+            assert!((actual - expected).abs() < 1e-10);
+        }
+        assert!(
+            (second_exact_cost.total_dollars - second_exact_components.iter().sum::<f64>()).abs()
+                < 1e-10
+        );
+
+        // The compatibility view keeps one SOL row even when only raw exact
+        // IDs exist, and applies its frozen family rates before aggregation.
+        assert_eq!(exact_only.v1.len(), 1);
+        assert_eq!(exact_only.v1[0].name, "SOL");
+        assert_eq!(exact_only.v1[0].input_tokens, 1_800_000);
+        assert_eq!(exact_only.v1[0].cached_input_tokens, 200_000);
+        assert_eq!(exact_only.v1[0].output_tokens, 100_000);
+        assert_eq!(exact_only.v1[0].input_dollars, 9.0);
+        assert_eq!(exact_only.v1[0].cached_input_dollars, 0.1);
+        assert_eq!(exact_only.v1[0].output_dollars, 3.0);
+
+        connection
+            .execute(
+                "INSERT INTO session_model_totals VALUES('SOL','1000000','1000000','0','0','0')",
+                [],
+            )
+            .expect("legacy family row");
+        let mixed = read_model_projection(&connection).expect("mixed projection");
+        assert_eq!(mixed.v1.len(), 1);
+        assert_eq!(mixed.v1[0].name, "SOL");
+        assert_eq!(mixed.v1[0].input_tokens, 2_800_000);
+        assert_eq!(mixed.v1[0].cached_input_tokens, 200_000);
+        assert_eq!(mixed.v1[0].output_tokens, 100_000);
+        assert_eq!(mixed.v1[0].input_dollars, 14.0);
+        assert_eq!(mixed.v1[0].cached_input_dollars, 0.1);
+        assert_eq!(mixed.v1[0].output_dollars, 3.0);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn exact_model_history_uses_persisted_dollars_and_old_family_columns() {
+        let path = temp_db("exact-model-history-dollars");
+        let connection = Connection::open(&path).expect("fixture db");
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_model_history(
+                    reset_at INTEGER NOT NULL, timestamp INTEGER NOT NULL,
+                    model TEXT NOT NULL, total_tokens TEXT NOT NULL,
+                    input_tokens TEXT NOT NULL, cached_input_tokens TEXT NOT NULL,
+                    output_tokens TEXT NOT NULL, cache_write_input_tokens TEXT,
+                    model_set_complete INTEGER NOT NULL
+                );
+                INSERT INTO usage_model_history VALUES
+                    (1800000600,1800000000,'gpt-6-sol','100','100','0','0','0',1),
+                    (1800000600,1800000000,'SOL','100','100','0','0','0',1);",
+            )
+            .expect("v11 history shape");
+
+        let timestamp = 1_800_000_000_i64;
+        let reset_at = 1_800_000_600_i64;
+        let intervals = ReadIntervals::unbounded();
+        let mut groups = read_history_model_groups_for_intervals(
+            &connection,
+            timestamp - 1,
+            timestamp,
+            &intervals,
+            None,
+            0,
+        )
+        .expect("legacy-shaped history groups");
+        let old_group = groups
+            .remove(&(reset_at, timestamp))
+            .expect("v11 history group");
+        let sample = PublicHistorySample {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(80.0),
+            sol_dollars: 0.125,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 100,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let exact_old = history_model_usage_v3(
+            old_group.totals.get("gpt-6-sol").expect("exact old row"),
+            &sample,
+        );
+        assert_eq!(exact_old.total_dollars, None);
+        let legacy_family = history_model_usage_v3(
+            old_group.totals.get("SOL").expect("legacy family row"),
+            &sample,
+        );
+        assert_eq!(legacy_family.total_dollars, Some(0.125));
+
+        connection
+            .execute_batch(
+                "ALTER TABLE usage_model_history ADD COLUMN total_dollars REAL;
+                 ALTER TABLE usage_model_history ADD COLUMN price_version TEXT;
+                 UPDATE usage_model_history
+                 SET total_dollars=CASE model
+                         WHEN 'gpt-6-sol' THEN 0.654321
+                         ELSE 0.000321
+                     END,
+                     price_version=CASE model
+                         WHEN 'gpt-6-sol' THEN '1791430564-183968cc652f6276'
+                         ELSE 'LOCAL_ESTIMATE_V1_2026-08-14'
+                     END
+                 WHERE model IN ('gpt-6-sol','SOL');",
+            )
+            .expect("v12 pricing sidecar columns");
+        let groups = read_history_model_groups_for_intervals(
+            &connection,
+            timestamp - 1,
+            timestamp,
+            &intervals,
+            None,
+            0,
+        )
+        .expect("v12 history groups");
+        let exact = history_model_usage_v3(
+            groups[&(reset_at, timestamp)]
+                .totals
+                .get("gpt-6-sol")
+                .expect("exact persisted row"),
+            &sample,
+        );
+        assert_eq!(exact.total_dollars, Some(0.654321));
+        let old_family = history_model_usage_v3(
+            groups[&(reset_at, timestamp)]
+                .totals
+                .get("SOL")
+                .expect("legacy family retained"),
+            &sample,
+        );
+        assert_eq!(old_family.total_dollars, Some(0.000321));
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn incomplete_exact_history_suppresses_same_family_legacy_fallback() {
+        let sample = PublicHistorySample {
+            timestamp: 1_800_000_000,
+            reset_at: 1_800_604_800,
+            remaining_percent: Some(50.0),
+            sol_dollars: 4.5,
+            terra_dollars: 0.75,
+            luna_dollars: 0.25,
+            sol_tokens: 300,
+            terra_tokens: 50,
+            luna_tokens: 20,
+        };
+        let mut group = HistoryModelGroup::default();
+        group.totals.insert(
+            "gpt-6.1-sol".to_owned(),
+            RawModelTotal {
+                model: "gpt-6.1-sol".to_owned(),
+                total_tokens: 120,
+                input_tokens: 100,
+                cached_input_tokens: 10,
+                output_tokens: 20,
+                cache_write_input_tokens: Some(5),
+                total_dollars: Some(1.25),
+            },
+        );
+        assert!(!group.model_set_complete());
+
+        let models = history_models_v3(Some(&group), &sample, false).expect("incomplete models");
+        let sol = models
+            .iter()
+            .filter(|model| codex_info_pricing::family(&model.model) == Some("SOL"))
+            .collect::<Vec<_>>();
+        assert_eq!(sol.len(), 1, "do not append a duplicate SOL aggregate");
+        assert_eq!(sol[0].model, "gpt-6.1-sol");
+        assert_eq!(sol[0].total_tokens, 120);
+        assert_eq!(sol[0].total_dollars, Some(1.25));
+        assert!(models.iter().any(|model| {
+            model.model == "TERRA" && model.total_tokens == 50 && model.total_dollars == Some(0.75)
+        }));
     }
 
     #[test]

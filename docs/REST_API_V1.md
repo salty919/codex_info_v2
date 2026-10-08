@@ -32,6 +32,8 @@ API-DEPRECATION-01
 
 `API-V3-MODELS-01`: v3の`current`と`history` resourceはcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。top-level current modelの`input_tokens`はcached入力と、存在する場合はcache write入力を含むraw入力総数であり、UI表示へのprojectionはPRODUCTの`MODEL-USAGE-DISPLAY-01`だけを参照する。モデルの数値は同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値、または保存済みの同じmodel keyをlosslessに保持する`legacy-unknown`値だけを公開する。`reconstructed-from-session`、`unknown`、`unavailable`はmodel key/sourceと欠損metadataだけを返し、モデル数値を返さない。`legacy-unknown`は集計・予測のauthorityにはせず、`G137-5`の限定条件をrun全体で満たす場合だけidle判定に利用できる。補間、hold、smoothing、予測および派生値はUI presentation-onlyで、API/DBへ書き戻さない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
 
+`MODEL-PRICING-463`の正確なモデルIDはv3のmodel keyとして保持する。currentの`estimated_cost`は共通料金表で計算できた場合だけ返し、historyの`total_dollars`は保存済みの観測時参考額を返す。保存額がないモデル版へ最新単価を遡及適用しない。旧SOL/TERRA/LUNA固定列は従来のfamily単価で集約した互換値を維持し、新しいexact-ID行の公式料金authorityにはしない。v3はfamily行を含め保存済みsidecar金額を優先し、旧family行に保存額がない場合だけ旧固定列を参照する。不完全な履歴へ旧family行を補完する場合も、同じfamilyの正確なID行が存在するなら重複した固定列合計を追加しない。画面向けfamily集約はwireの後段で行う。
+
 v3の各履歴rowは`models`、`models_complete`、nullable boolean `task_active_since_previous`を持つ。
 `task_active_since_previous`は同じcanonical periodの直前rowより後から当該row時刻までにtaskが実行中だったかを表し、
 graphのinterval判定ではafter rowの値として扱う。
