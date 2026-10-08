@@ -1705,16 +1705,8 @@ internal static class GraphPlotProjection
                 .ToArray();
             var timestamps = indices.Select(index => scene.Timestamps[index]).ToArray();
             var runValues = indices.Select(index => values[index]).ToArray();
-            var preservedIndices = run
-                .SelectMany((interval, index) => interval.Dashed
-                    ? new[] { index, index + 1 }
-                    : Array.Empty<int>())
-                .ToHashSet();
-            runValues = SmoothSamplingPlateaus(
-                scene,
-                timestamps,
-                runValues,
-                preservedIndices);
+            // Retain every accepted quota anchor, including equal-value runs.
+            // Smooth only between observations so a plateau cannot become a decline.
             for (var interval = 0; interval < run.Length; interval++)
             {
                 AppendMonotoneCubicInterval(

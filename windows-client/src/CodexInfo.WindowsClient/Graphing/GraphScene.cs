@@ -529,10 +529,12 @@ public sealed class GraphScene
             ? dollarProjection
             : tokenProjection;
         var rawDisplayProjection = semanticProjection.Filter(visibleModelNames);
+        var eligibleMissingZeroModels = BuildEligibleMissingZeroModels(samples);
         var displayProjection = GroupDisplayProjection(
             rawDisplayProjection,
             visibleModelNames,
             firstModelPublications,
+            eligibleMissingZeroModels,
             samples.Count,
             out var displayModelNames);
         var publishedModelNames = samples
@@ -651,7 +653,11 @@ public sealed class GraphScene
             maximum,
             publishedPeriodStarts: publishedPeriodStartAt is { } publishedStartAt ? [publishedStartAt] : [],
             resetAt: resetAt,
-            hoverObservations: BuildHoverObservations(samples, points, firstModelPublications),
+            hoverObservations: BuildHoverObservations(
+                samples,
+                points,
+                firstModelPublications,
+                eligibleMissingZeroModels),
             isVerifiedCurrentResetStart: isVerifiedCurrentResetStart,
             periodCost: periodCost);
     }
@@ -753,10 +759,87 @@ public sealed class GraphScene
         return firstPublications;
     }
 
+    private static IReadOnlyList<IReadOnlySet<string>> BuildEligibleMissingZeroModels(
+        IReadOnlyList<ApiHistorySample> samples)
+    {
+        // A complete vector can display a prior exact known-zero family member as
+        // zero when it is omitted. This map never changes raw values or authority.
+        var eligibleBySample = new IReadOnlySet<string>[samples.Count];
+        var explicitlyZeroMembers = new HashSet<string>(StringComparer.Ordinal);
+        var previouslyPositiveMembers = new HashSet<string>(StringComparer.Ordinal);
+        long? previousResetAt = null;
+        for (var index = 0; index < samples.Count; index++)
+        {
+            var sample = samples[index];
+            if (previousResetAt is { } priorResetAt && priorResetAt != sample.ResetAt)
+            {
+                explicitlyZeroMembers.Clear();
+                previouslyPositiveMembers.Clear();
+            }
+            previousResetAt = sample.ResetAt;
+
+            var currentModels = PublishedModels(sample).ToArray();
+            var currentNames = currentModels
+                .Select(model => model.Name)
+                .ToHashSet(StringComparer.Ordinal);
+            if (!sample.IsSyntheticTail &&
+                sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
+                sample.ModelsComplete &&
+                sample.ModelSamples is not null)
+            {
+                eligibleBySample[index] = explicitlyZeroMembers
+                    .Where(name => ModelUsageViewModel.DisplayFamilyName(name) is not null &&
+                        !previouslyPositiveMembers.Contains(name) &&
+                        !currentNames.Contains(name))
+                    .ToHashSet(StringComparer.Ordinal);
+            }
+            else
+            {
+                eligibleBySample[index] = new HashSet<string>(StringComparer.Ordinal);
+            }
+
+            if (sample.IsSyntheticTail || sample.ModelSource is not
+                (ApiHistorySample.LegacyUnknownModelSource or ApiHistorySample.ConfirmedModelSource))
+            {
+                continue;
+            }
+
+            foreach (var group in currentModels.GroupBy(model => model.Name, StringComparer.Ordinal))
+            {
+                var models = group.ToArray();
+                if (models.Length != 1)
+                {
+                    continue;
+                }
+
+                var model = models[0];
+                var tokens = model.TotalTokens;
+                var dollars = model.TotalDollars;
+                if (tokens is > 0 || dollars is { } positiveDollars &&
+                    double.IsFinite(positiveDollars) && positiveDollars > 0)
+                {
+                    previouslyPositiveMembers.Add(model.Name);
+                }
+                // Partial positive evidence rules out non-use; partial zero cannot
+                // establish it. Keep this distinction separate from raw authority.
+                if ((sample.ModelSource == ApiHistorySample.LegacyUnknownModelSource ||
+                     sample.ModelsComplete && sample.ModelSamples is not null) &&
+                    tokens == 0 && dollars is { } zeroDollars &&
+                    double.IsFinite(zeroDollars) && zeroDollars == 0)
+                {
+                    explicitlyZeroMembers.Add(model.Name);
+                }
+            }
+        }
+
+        return eligibleBySample;
+    }
+
     private static ModelProjection GroupDisplayProjection(
         ModelProjection source,
         IReadOnlyList<string> rawModelNames,
         IReadOnlyDictionary<string, int> firstModelPublications,
+        IReadOnlyList<IReadOnlySet<string>> eligibleMissingZeroModels,
         int sampleCount,
         out string[] displayModelNames)
     {
@@ -791,7 +874,8 @@ public sealed class GraphScene
                 var complete = publishedMembers.Length > 0;
                 foreach (var name in publishedMembers)
                 {
-                    var value = source.Values[name][index];
+                    var missingZeroIsEligible = eligibleMissingZeroModels[index].Contains(name);
+                    var value = missingZeroIsEligible ? 0 : source.Values[name][index];
                     if (!double.IsFinite(value) || value < 0)
                     {
                         complete = false;
@@ -807,7 +891,8 @@ public sealed class GraphScene
 
                 groupValues[index] = complete ? total : double.NaN;
                 groupReliability[index] = complete && publishedMembers.All(name => source.Reliability[name][index]);
-                groupLineReliability[index] = complete && publishedMembers.All(name => source.LineReliability[name][index]);
+                groupLineReliability[index] = complete && publishedMembers.All(name =>
+                    eligibleMissingZeroModels[index].Contains(name) || source.LineReliability[name][index]);
                 var memberOrigins = publishedMembers.Select(name => source.Origins[name][index]).Distinct().ToArray();
                 groupOrigins[index] = memberOrigins.Length == 1 ? memberOrigins[0] : GraphModelOrigin.Unknown;
             }
@@ -836,7 +921,8 @@ public sealed class GraphScene
     private static IReadOnlyList<GraphObservedSample> BuildHoverObservations(
         IReadOnlyList<ApiHistorySample> samples,
         IReadOnlyList<ScenePoint> points,
-        IReadOnlyDictionary<string, int> firstModelPublications)
+        IReadOnlyDictionary<string, int> firstModelPublications,
+        IReadOnlyList<IReadOnlySet<string>> eligibleMissingZeroModels)
     {
         var observations = new List<GraphObservedSample>(samples.Count);
         for (var index = 0; index < samples.Count; index++)
@@ -851,10 +937,10 @@ public sealed class GraphScene
                 sample.Timestamp,
                 sample.ResetAt,
                 index,
-                ObservedModelTokens(sample, firstModelPublications, index, "SOL"),
-                ObservedModelTokens(sample, firstModelPublications, index, "TERRA"),
-                ObservedModelTokens(sample, firstModelPublications, index, "LUNA"),
-                ObservedModelTokens(sample, firstModelPublications, index, "ASTRA")));
+                ObservedModelTokens(sample, firstModelPublications, eligibleMissingZeroModels[index], index, "SOL"),
+                ObservedModelTokens(sample, firstModelPublications, eligibleMissingZeroModels[index], index, "TERRA"),
+                ObservedModelTokens(sample, firstModelPublications, eligibleMissingZeroModels[index], index, "LUNA"),
+                ObservedModelTokens(sample, firstModelPublications, eligibleMissingZeroModels[index], index, "ASTRA")));
         }
         return observations;
     }
@@ -862,6 +948,7 @@ public sealed class GraphScene
     private static ulong? ObservedModelTokens(
         ApiHistorySample sample,
         IReadOnlyDictionary<string, int> firstModelPublications,
+        IReadOnlySet<string> eligibleMissingZeroModels,
         int sampleIndex,
         string modelName)
     {
@@ -879,6 +966,10 @@ public sealed class GraphScene
         foreach (var member in familyMembers)
         {
             var matching = models.Where(model => string.Equals(model.Name, member, StringComparison.Ordinal)).ToArray();
+            if (matching.Length == 0 && eligibleMissingZeroModels.Contains(member))
+            {
+                continue;
+            }
             if (matching.Length != 1 || matching[0].TotalTokens is not { } tokens ||
                 ulong.MaxValue - total < tokens)
             {

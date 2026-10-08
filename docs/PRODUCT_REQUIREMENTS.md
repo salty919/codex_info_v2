@@ -411,6 +411,12 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    不変で、欠測・異常・confirmed gapがない場合に限り、その保存raw vectorをidle判定に利用できる。
    掲載されないmodelを0へ補完しない。v1/v2のfixed-column rowも、保存されたmodel fieldをstrict parseした
    `legacy-unknown` raw vectorとして上記の限定idle条件だけに利用し、未掲載modelを創作しない。
+   Windowsの既知family表示では、同じreset内で既に掲載された同一model keyのtoken・ドルがともに明示0と観測済みで、
+   そのkeyの以前の正値がなく、非syntheticの`confirmed && models_complete=true`の非null model集合からそのkeyが省略された場合だけ、
+   そのmemberの表示合計への寄与を0として現在掲載されたmemberと集約し、実線と両metricのhoverへ渡す。
+   全memberがこの条件で省略されたfamilyは合計0となり、後から実際のモデル版の利用が始まっても旧0 memberを欠測扱いにしない。
+   raw model行・token authority・集計額・idle証拠へ0を追加せず、`U`を増やさない。初掲載前、未知family、未完全集合、
+   未提供集合、既知0でないmemberの欠落、以前に正値があるmemberの消失は補完しない。明示gapと非所有区間の線種・hover制約を維持する。
 3. `G137-3`: 同一periodの累積model値は減少しない。baselineはmodelごとの直前accepted finite値とし、
    source completenessを問わずbaseline未満のraw値は計測異常として表示値へ採用せずbaselineを更新しない。
    隣接する実測点`left,middle,right`で`left <= right`かつ`middle < left || middle > right`となる
@@ -489,8 +495,9 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    破線holdする。このRemaining anomalyとrecovery bridgeは未使用の証拠にしない。
 
    Remainingのaccepted raw値は全て元時刻・元値の証拠として保持し、token増分、task lifecycle、model availabilityで
-   移動または置換しない。表示geometryでは、sampling由来の同値反復を未使用と確定できない区間の折れ点にせず、前後の
-   有効な変化点を非増加かつovershootしないPCHIP（Fritsch–Carlson）の3px実線で滑らかにつなぐ。確定idleは
+   移動または置換しない。Windowsの表示geometryは同値反復も含む全accepted観測点を通過し、横ばい区間と変化時刻を保つ。
+   隣接観測間だけを非増加かつovershootしないPCHIP（Fritsch–Carlson）の3px実線でつなぎ、横ばいを傾斜へ変えない。
+   Linuxは既存のsampling同値反復を省くgeometryを維持する。確定idleは
    bandと同じX範囲をexactな1px水平実線として分離し、明示欠損・異常・reset/correctionの境界は平滑化で跨がない。変化量による別閾値は設けない。
    これはread-timeのgeometry生成だけであり、DB、history row、gap ledger、raw値を書き換えない。timestampの疎または
    sampling jitterだけでは欠損・予測へ降格しない。
@@ -598,8 +605,8 @@ isolated pulseはtoken不変runを消さない。tokenとRemainingが同値でdo
 dollar線だけを破線hold／recovery、直接観測のtoken線を3px実線、未使用帯を表示する。逆にtokenだけ`100→90→100`ならdollarが
 同値でもtoken線だけを破線にして未使用帯を表示しない。
 valid-anchor smoothing oracleは、時系列tokenが`10,20,20,50`でraw Remainingが`100,100,100,99`なら、
-raw/effective列を`100,100,100,99`のまま保持する一方、未使用と確定できない中間の同値raw点を表示geometryの必須通過点に
-しない。正常区間は前後の有効変化点を滑らかにつなぐ3px単調PCHIPとし、確定idleだけはexactな水平線、明示欠損を
+raw/effective列を`100,100,100,99`のまま保持する。Windowsは表示geometryも最初の3点まで100で水平に保ち、最後の隣接区間だけを99へつなぐ。
+Linuxは既存どおり中間の同値raw点を表示geometryの必須通過点にしない。正常区間は3px単調PCHIPとし、確定idleはexactな1px水平線、明示欠損を
 挟む区間だけは1px破線予測とする。accepted raw tokenのexact-equalは確定idleの二値判定だけに使い、token deltaの量・比率や
 task lifecycleでRemaining低下を配分または成形しない。
 `correction_v2`は直接観測されたraw Remainingを元時刻のanchorとして保持し、terminal holdを含む
