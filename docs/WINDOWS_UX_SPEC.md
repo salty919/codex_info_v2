@@ -42,7 +42,7 @@ Linux timezone設定、Issue #422で利用者が選択したWindows版の`WIN-TH
 
 ## WIN-THEME-422 — Windows版の組込みカラーテーマ
 
-Windows Settingsの外観欄は`classic-dark`（従来配色・既定）、`graphite-dark`、`light`、`paper-light`、`sand-light`、`steel-light`、`ocean-dark`、`teal-dark`、`ember-dark`、`ink-dark`、`neon-dark`、`lavender-light`、`mint-light`、`forest-dark`、`tangerine-dark`、`rose-dark`の順に16種類の組込みpresetを選択できる。新規presetの表示名は順にPaper Light、Sand Light、Steel Light、Ocean Dark、Teal Dark、Ember Dark、Ink Darkとし、日本語では順にペーパー ライト、サンド ライト、スチール ライト、オーシャン ダーク、ティール ダーク、エンバー ダーク、インク ダークとする。これらは独自の配色であり、他製品の同名themeとの色互換を表明しない。VS Codeのように利用者がpresetを切り替える操作を提供し、外部themeの取込みや任意色編集は含めない。選択中は現在表示を変えず、既存の保存操作がDATA ownerの`WIN-THEME-PREF-422`に従って成功した後に、開いているMain、Settings、Setup、Graph、Threads、Legalの全Windowへ反映する。取消または保存失敗時は表示中の色と永続設定を変えない。次回起動時は保存したpresetをMain表示前に適用する。theme変更によってquota、Graph系列データ、Threadsの状態、接続、取得要求を変更しない。
+Windows Settingsの外観欄は`classic-dark`（従来配色・既定）、`graphite-dark`、`light`、`paper-light`、`sand-light`、`steel-light`、`ocean-dark`、`teal-dark`、`ember-dark`、`ink-dark`、`neon-dark`、`lavender-light`、`mint-light`、`forest-dark`、`tangerine-dark`、`rose-dark`の順に16種類の組込みpresetを選択できる。新規presetの表示名は順にPaper Light、Sand Light、Steel Light、Ocean Dark、Teal Dark、Ember Dark、Ink Darkとし、日本語では順にペーパー ライト、サンド ライト、スチール ライト、オーシャン ダーク、ティール ダーク、エンバー ダーク、インク ダークとする。これらは独自の配色であり、他製品の同名themeとの色互換を表明しない。VS Codeのように利用者がpresetを切り替える操作を提供し、外部themeの取込みや任意色編集は含めない。テーマ選択時に、開いているMain、Settings、Setup、Graph、Threads、Legalの全Windowへ即時プレビューする（Issue #571）。選択だけでは永続設定と実行中の保存済み設定generationを変更しない。既存の保存操作がDATA ownerの`WIN-THEME-PREF-422`に従って成功した時だけ選択を確定し、取消・設定画面を閉じる操作または保存失敗時は保存済みの配色へ戻す。保存失敗時はテーマ選択欄も保存済みの値へ戻し、表示名と配色を一致させる。保存成功後に閉じても確定済みの配色を保持する。次回起動時は保存したpresetをMain表示前に適用する。theme変更によってquota、Graph系列データ、Threadsの状態、接続、取得要求を変更しない。
 
 | preset | window背景 | card面 | 主要文字 | 補助文字 | accent | Graph背景 | grid | idle基準色 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -421,7 +421,7 @@ component順や表示所有者を変更しない。
 ### 4.2 Trends / Graph（master: `CUM-138-06`）
 
 - Windowsの単位切替は「ドル・スイッチ・トークン」を余白付きで並べ、両ラベルを常時表示する。Graphを開いたときはトークンを選択し、つまみの位置と選択状態で単位を明示する。二重のボタン枠は置かず、ウィンドウ操作ボタンとの間隔を保つ。pointer、キーボード、UI AutomationのToggle操作で同じ切替を行える。単位変更中はスイッチを先に更新し、完成まで既存の描画を保持する。
-- 上部はタイトル／単位切替、表示タイプ・期間情報・前後移動を一つにまとめた行、凡例の3段とする。週期間のselectorと固定時間の日時情報は同じ中央領域を使い、前後移動には方向と短い文字を表示する。ボタン群の角丸・高さ・余白・選択状態を揃え、通常940×640／最小700×480で情報や操作を重ねない。長い期間名は省略表示と全文tooltipを併用する。グラフに被る「時間ごとの累計…」説明文は表示せず、数値軸・単位スイッチ・凡例を維持する。
+- 上部はタイトル／単位切替、表示タイプ・期間情報・前後移動を一つにまとめた行、凡例の3段とする。タイトル、操作行、凡例、グラフの各行間に8 DIPの縦余白を設け、操作行と凡例は同じ背景帯にまとめる。ヘッダー・中央の帯・グラフ枠を接触させず、最小サイズでもグラフの高さを確保する。週期間のselectorと固定時間の日時情報は同じ中央領域を使い、前後移動には方向と短い文字を表示する。ボタン群の角丸・高さ・余白・選択状態を揃え、通常940×640／最小700×480で情報や操作を重ねない。長い期間名は省略表示と全文tooltipを併用する。グラフに被る「時間ごとの累計…」説明文は表示せず、数値軸・単位スイッチ・凡例を維持する。
 - ローカル日付の境界は、data rectangleの上に確保した日付軸で「月/日」と下向きの目印を表示する。日付文字をデータ線へ重ねず、画面外の境界や重なる日付ラベルを描かない。既存の現地0時の細線・reset線の意味とDST処理は維持する。
 - 滑らかさは既存の単調PCHIPを維持し、描画用の曲線分割を1000px級のplotで1px以下の横刻みへ細分化する。accepted raw、変化点、極値、idle、欠測、補正、reset境界の位置と値は変更しない。欠測を実測線で結ぶ、曲線が観測範囲を越える、別reset間を結ぶことを禁止する。
 - Graph専用の系列色は、暗色presetでRemaining `#56B2F5`、LUNA `#E6A23C`、TERRA `#5DC98A`、SOL `#A88CF5`、ASTRA `#EF6A6A`、明色preset（light/paper-light/sand-light/steel-light/lavender-light/mint-light）で順に `#176AAB`、`#985F08`、`#16794B`、`#6A4BCC`、`#B23553` とする。凡例・線・末尾値に同じ役割色を用い、themeのaccent色を系列の代用にしない。全16 presetのplot面とidle面に対して系列は3:1以上の輝度コントラストを保つ。Main/Threads等の共有色キーは変更しない。

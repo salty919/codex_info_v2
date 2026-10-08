@@ -245,7 +245,7 @@ public sealed class Issue422ThemeTests
     }
 
     [Fact]
-    public void ThemeSelectionPublishesOnlyAfterSuccessfulSave()
+    public void ThemeSelectionPreviewsImmediatelyAndCommitsOnlyAfterSuccessfulSave()
     {
         var originalSettings = App.CurrentSettings;
         var originalLanguage = LocalizationService.Current.LanguageCode;
@@ -271,10 +271,12 @@ public sealed class Issue422ThemeTests
             Assert.Equal("classic-dark", ReadStringProperty(cancelledViewModel, "SelectedThemeId"));
             selectedThemeProperty.SetValue(cancelledViewModel, "graphite-dark");
             Assert.Equal("classic-dark", ReadStringProperty(App.CurrentSettings, "ThemeId"));
-            Assert.Equal("classic-dark", ThemePalette.CurrentId);
+            Assert.Equal("classic-dark", ReadStringProperty(store.Load(), "ThemeId"));
+            Assert.Equal("graphite-dark", ThemePalette.CurrentId);
             selectedThemeProperty.SetValue(cancelledViewModel, "paper-light");
             Assert.Equal("classic-dark", ReadStringProperty(App.CurrentSettings, "ThemeId"));
-            Assert.Equal("classic-dark", ThemePalette.CurrentId);
+            Assert.Equal("classic-dark", ReadStringProperty(store.Load(), "ThemeId"));
+            Assert.Equal("paper-light", ThemePalette.CurrentId);
             cancelledViewModel.Dispose();
             cancelledViewModel = null;
             Assert.Equal("classic-dark", ReadStringProperty(App.CurrentSettings, "ThemeId"));
@@ -288,6 +290,8 @@ public sealed class Issue422ThemeTests
             Assert.NotNull(successfulSelectedThemeProperty);
             successfulSelectedThemeProperty.SetValue(successfulViewModel, "light");
             Assert.Equal("classic-dark", ReadStringProperty(App.CurrentSettings, "ThemeId"));
+            Assert.Equal("classic-dark", ReadStringProperty(store.Load(), "ThemeId"));
+            Assert.Equal("light", ThemePalette.CurrentId);
             Assert.True(successfulViewModel.Save());
             Assert.Equal("light", ReadStringProperty(App.CurrentSettings, "ThemeId"));
             Assert.Equal("light", ReadStringProperty(store.Load(), "ThemeId"));
@@ -299,6 +303,7 @@ public sealed class Issue422ThemeTests
 
             successfulViewModel.Dispose();
             successfulViewModel = null;
+            Assert.Equal("light", ThemePalette.CurrentId);
 
             var blocker = Path.Combine(root.FullName, "not-a-directory");
             File.WriteAllText(blocker, "blocked");
@@ -309,10 +314,14 @@ public sealed class Issue422ThemeTests
                 BindingFlags.Instance | BindingFlags.Public);
             Assert.NotNull(failedSelectedThemeProperty);
             failedSelectedThemeProperty.SetValue(failedViewModel, "ink-dark");
+            Assert.Equal("light", ReadStringProperty(App.CurrentSettings, "ThemeId"));
+            Assert.Equal("light", ReadStringProperty(store.Load(), "ThemeId"));
+            Assert.Equal("ink-dark", ThemePalette.CurrentId);
             var savedBytesBeforeFailure = File.ReadAllBytes(path);
 
             Assert.False(failedViewModel.Save());
             Assert.True(failedViewModel.SaveFailed);
+            Assert.Equal("light", ReadStringProperty(failedViewModel, "SelectedThemeId"));
             Assert.Equal("light", ReadStringProperty(App.CurrentSettings, "ThemeId"));
             Assert.Equal("light", ReadStringProperty(store.Load(), "ThemeId"));
             Assert.Equal("light", ThemePalette.CurrentId);

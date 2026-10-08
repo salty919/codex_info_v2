@@ -16,6 +16,7 @@ import textwrap
 import unittest
 from pathlib import Path
 from typing import Mapping, Sequence
+from urllib.parse import quote
 
 import yaml
 
@@ -971,7 +972,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "--paginate --slurp",
         "a same-final-head attempt is pending or concluded non-success",
         "total_count",
-        "branch=$head_ref_encoded&per_page=100",
+        "branch=$head_ref_encoded&created=$created_at_encoded&per_page=100",
         "union_signal_run",
         "release-candidate-v1-pr-",
         "release-candidate-linux-v1-pr-",
@@ -2080,9 +2081,13 @@ def _quality_run(
     }
 
 
+_PR_CREATED_AT = "2026-08-01T00:00:00Z"
+
+
 def _pull_request(*, merged: bool) -> dict[str, object]:
     return {
         "number": _PR_NUMBER,
+        "created_at": _PR_CREATED_AT,
         "state": "closed" if merged else "open",
         "merged": merged,
         "draft": False,
@@ -2185,7 +2190,15 @@ def _object_pages(
 def _runs_endpoint() -> str:
     return (
         f"repos/{_REPOSITORY}/actions/workflows/version-prepare.yml/"
-        f"runs?event=pull_request_target&branch={_HEAD_REF}&per_page=100"
+        f"runs?event=pull_request_target&branch={quote(_HEAD_REF, safe='')}&"
+        "created=%3E%3D2026-08-01T00%3A00%3A00Z&per_page=100"
+    )
+
+
+def _unscoped_runs_endpoint() -> str:
+    return (
+        f"repos/{_REPOSITORY}/actions/workflows/version-prepare.yml/"
+        f"runs?event=pull_request_target&branch={quote(_HEAD_REF, safe='')}&per_page=100"
     )
 
 
@@ -2550,6 +2563,150 @@ class ReleaseGeneratedCommitTests(unittest.TestCase):
             f"repos/{_REPOSITORY}/actions/runs/301/attempts/7" in call
             for call in calls
         ))
+
+
+class ReleaseRunScopeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        workflow = sources()["release.yml"]
+        self.resolve_script = _step_script(
+            workflow, "Resolve the immutable publication snapshot"
+        )
+        self.revalidate_script = _step_script(
+            workflow, "Revalidate authority after acquiring the tag lock"
+        )
+        spec = [{
+            "id": 901,
+            "number": 90,
+            "attempts": [{
+                "status": "completed",
+                "conclusion": "success",
+                "windows": "success",
+                "candidate": "exact",
+                "linux": "success",
+                "linux_candidate": "exact",
+            }],
+        }]
+        self.responses, self.summaries = _manual_release_responses(spec)
+
+    def _responses_with_scoped_runs(self) -> dict[str, object]:
+        responses = json.loads(json.dumps(self.responses))
+        responses[_unscoped_runs_endpoint()] = [{
+            "workflow_runs": [self.summaries[0]],
+            "total_count": 177,
+        }]
+        responses[_runs_endpoint()] = _object_pages(
+            "workflow_runs", self.summaries
+        )
+        return responses
+
+    def test_resolver_scopes_both_signals_to_the_pr_creation_time(self) -> None:
+        for event_name, event in (
+            ("pull_request_target", _closed_event()),
+            ("workflow_run", _workflow_event(self.summaries[0])),
+        ):
+            with self.subTest(event=event_name):
+                result, values, calls = _execute_release_shell(
+                    self.resolve_script,
+                    self._responses_with_scoped_runs(),
+                    event_name=event_name,
+                    event=event,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(values.get("publish"), "true", result.stdout)
+                self.assertIn(
+                    _runs_endpoint(),
+                    [argument for call in calls for argument in call],
+                )
+
+    def test_missing_or_malformed_pr_creation_time_fails_before_run_lookup(self) -> None:
+        for created_at in (None, "", "2026-02-30T00:00:00Z"):
+            with self.subTest(created_at=created_at):
+                responses = self._responses_with_scoped_runs()
+                responses[f"repos/{_REPOSITORY}/pulls/{_PR_NUMBER}"][
+                    "created_at"
+                ] = created_at
+                result, values, calls = _execute_release_shell(
+                    self.resolve_script,
+                    responses,
+                    event_name="pull_request_target",
+                    event=_closed_event(),
+                )
+                self.assertFalse(
+                    result.returncode == 0 and values.get("publish") == "true",
+                    result.stdout,
+                )
+                self.assertFalse(any(
+                    "actions/workflows/version-prepare.yml/runs?" in argument
+                    for call in calls
+                    for argument in call
+                ))
+
+    def test_incomplete_scoped_resolver_and_lock_results_fail_closed(self) -> None:
+        responses = self._responses_with_scoped_runs()
+        responses[_runs_endpoint()] = [{
+            "workflow_runs": [self.summaries[0]],
+            "total_count": 177,
+        }]
+        responses[_unscoped_runs_endpoint()] = _object_pages(
+            "workflow_runs", self.summaries
+        )
+        resolved, values, calls = _execute_release_shell(
+            self.resolve_script,
+            responses,
+            event_name="pull_request_target",
+            event=_closed_event(),
+        )
+        self.assertFalse(
+            resolved.returncode == 0 and values.get("publish") == "true",
+            resolved.stdout,
+        )
+        self.assertIn(
+            _runs_endpoint(),
+            [argument for call in calls for argument in call],
+        )
+
+        generated = ReleaseGeneratedCommitTests()
+        generated.setUp()
+        generated_responses = json.loads(json.dumps(generated.responses))
+        generated_responses[_runs_endpoint()] = [{
+            "workflow_runs": [generated.generator],
+            "total_count": 177,
+        }]
+        generated_responses[_unscoped_runs_endpoint()] = _object_pages(
+            "workflow_runs", [generated.generator]
+        )
+        result, authority = _execute_revalidation(
+            self.revalidate_script,
+            generated_responses,
+            generated.authority,
+            event_name="pull_request_target",
+            event=_closed_event(),
+        )
+        self.assertFalse(
+            result.returncode == 0 and authority.get("proceed") == "true",
+            result.stdout,
+        )
+
+    def test_lock_revalidation_uses_the_same_pr_creation_time_scope(self) -> None:
+        generated = ReleaseGeneratedCommitTests()
+        generated.setUp()
+        responses = json.loads(json.dumps(generated.responses))
+        responses[_unscoped_runs_endpoint()] = [{
+            "workflow_runs": [generated.generator],
+            "total_count": 177,
+        }]
+        responses[_runs_endpoint()] = _object_pages(
+            "workflow_runs", [generated.generator]
+        )
+        result, authority = _execute_revalidation(
+            self.revalidate_script,
+            responses,
+            generated.authority,
+            event_name="pull_request_target",
+            event=_closed_event(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(authority.get("proceed"), "true", result.stdout)
 
 
 def _release_resolution_tests(release_workflow: str) -> int:
@@ -3769,6 +3926,7 @@ def release_self_test() -> int:
     if errors:
         raise AssertionError("production workflow contract failed: " + "; ".join(errors))
     suite = unittest.TestLoader().loadTestsFromTestCase(ReleaseGeneratedCommitTests)
+    suite.addTests(unittest.TestLoader().loadTestsFromTestCase(ReleaseRunScopeTests))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
         return 1

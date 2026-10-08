@@ -239,6 +239,16 @@ jobs:
           head_ref="$(jq -r '.head.ref' <<<"$pr")"
           head_ref_encoded="$(jq -nr --arg ref "$head_ref" '$ref | @uri')"
           merge_sha="$(jq -r '.merge_commit_sha' <<<"$pr")"
+          if ! created_at="$(jq -er '
+            .created_at | select(type == "string" and
+              test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+          ' <<<"$pr")" ||
+             ! date -u -d "$created_at" +%s >/dev/null 2>&1; then
+            echo "invalid pull request created_at" >&2
+            exit 1
+          fi
+          created_at_encoded="$(jq -nr --arg created "$created_at" \
+            '(">=" + $created) | @uri')"
 
           generated=false
           generated_version=''
@@ -279,7 +289,7 @@ jobs:
 
           runs="$(
             object_pages \
-              "repos/$REPOSITORY/actions/workflows/version-prepare.yml/runs?event=pull_request_target&branch=$head_ref_encoded&per_page=100" \
+              "repos/$REPOSITORY/actions/workflows/version-prepare.yml/runs?event=pull_request_target&branch=$head_ref_encoded&created=$created_at_encoded&per_page=100" \
               workflow_runs
           )"
           if [[ "$EVENT_NAME" == workflow_run ]]; then
@@ -720,6 +730,16 @@ jobs:
             ' <<<"$pr" >/dev/null
           head_ref="$(jq -r '.head.ref' <<<"$pr")"
           head_ref_encoded="$(jq -nr --arg ref "$head_ref" '$ref | @uri')"
+          if ! created_at="$(jq -er '
+            .created_at | select(type == "string" and
+              test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+          ' <<<"$pr")" ||
+             ! date -u -d "$created_at" +%s >/dev/null 2>&1; then
+            echo "invalid pull request created_at" >&2
+            exit 1
+          fi
+          created_at_encoded="$(jq -nr --arg created "$created_at" \
+            '(">=" + $created) | @uri')"
 
           generated=false
           generator_run_id=''
@@ -755,7 +775,7 @@ jobs:
           fi
 
           runs="$(object_pages \
-            "repos/$REPOSITORY/actions/workflows/version-prepare.yml/runs?event=pull_request_target&branch=$head_ref_encoded&per_page=100" \
+            "repos/$REPOSITORY/actions/workflows/version-prepare.yml/runs?event=pull_request_target&branch=$head_ref_encoded&created=$created_at_encoded&per_page=100" \
             workflow_runs)"
           case "$EVENT_NAME" in
             workflow_run)

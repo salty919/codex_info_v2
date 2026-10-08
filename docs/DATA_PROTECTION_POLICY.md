@@ -25,7 +25,7 @@ U128-19
 
 ## WIN-THEME-PREF-422 — Windows theme preference
 
-Windows clientの設定JSONは従来のexact 6 keyを有効な旧形式として読み、theme未指定時は`classic-dark`をメモリ内の既定値にする。読込みだけで既存fileを書き換えない。新しい保存は従来6 keyに`themeId`を加えたexact 7 keyをatomic replaceし、値は`classic-dark`、`graphite-dark`、`light`、`paper-light`、`sand-light`、`steel-light`、`ocean-dark`、`teal-dark`、`ember-dark`、`ink-dark`、`neon-dark`、`lavender-light`、`mint-light`、`forest-dark`、`tangerine-dark`、`rose-dark`だけを許す。既存3 IDの保存値はそのまま有効とし、key数や移行形式を変更しない。重複・未知keyまたは不正theme IDを含む新形式は既存の設定破損経路で拒否し、接続資格情報を推測しない。保存失敗は永続fileと実行中の設定generationを保持し、成功した保存だけをUIへ公開する。旧形式のconnection profile/selectorとsetup状態はtheme移行で失わない。
+Windows clientの設定JSONは従来のexact 6 keyを有効な旧形式として読み、theme未指定時は`classic-dark`をメモリ内の既定値にする。読込みだけで既存fileを書き換えない。新しい保存は従来6 keyに`themeId`を加えたexact 7 keyをatomic replaceし、値は`classic-dark`、`graphite-dark`、`light`、`paper-light`、`sand-light`、`steel-light`、`ocean-dark`、`teal-dark`、`ember-dark`、`ink-dark`、`neon-dark`、`lavender-light`、`mint-light`、`forest-dark`、`tangerine-dark`、`rose-dark`だけを許す。既存3 IDの保存値はそのまま有効とし、key数や移行形式を変更しない。重複・未知keyまたは不正theme IDを含む新形式は既存の設定破損経路で拒否し、接続資格情報を推測しない。保存失敗は永続fileと実行中の設定generationを保持し、成功した保存だけを設定generationへ公開する。`WIN-THEME-422`の選択中プレビューは表示paletteだけを変更し、保存成功まで設定を書き換えない。取消・閉じる・保存失敗では保存済み設定の配色へ復元する。旧形式のconnection profile/selectorとsetup状態はtheme移行で失わない。
 
 ## RECORDER-MODEL-01 — モデル追加・source障害時の記録継続
 

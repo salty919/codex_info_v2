@@ -4012,8 +4012,15 @@ function Invoke-E2EThemePresets {
     Assert-E2EThemeSurfaces $windows 'classic-dark'
     $legacyBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
     Select-E2ETheme $windows.Settings.Root 'Paper Light'
-    $preSave = Capture-E2EWindow $MainHandle 'theme-before-save-main'
-    Assert-E2EThemePixel $preSave $MainHandle $script:e2eThemeColors['classic-dark'].Window 'before-save/Main/window' -MinimumPixels 32
+    # Selection previews all open windows before Save; the durable file is unchanged.
+    Assert-E2EThemeSurfaces $windows 'paper-light'
+    foreach ($role in @('Main', 'Settings', 'Setup', 'Graph', 'Threads', 'Legal')) {
+        Copy-Item -LiteralPath (Join-Path $script:e2eOutput "theme-paper-light-$($role.ToLowerInvariant()).png") `
+            -Destination (Join-Path $script:e2eOutput "theme-before-save-$($role.ToLowerInvariant()).png")
+    }
+    Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $legacyBytes) `
+        'Theme preview changed the persisted settings before Save.'
+    Write-E2E 'theme-preview: PASS selected paper-light before Save, windows=6, settings unchanged'
     $close = Find-E2EElementByAutomationId $windows.Settings.Root 'Settings.Window.Close'
     Assert-E2E ($null -ne $close) 'Settings Cancel/Close control is missing.'
     Invoke-E2EElement $close
@@ -4028,7 +4035,8 @@ function Invoke-E2EThemePresets {
         'Cancelled theme selection remained in Settings.'
     $afterCancel = Capture-E2EWindow $MainHandle 'theme-after-cancel-main'
     Assert-E2EThemePixel $afterCancel $MainHandle $script:e2eThemeColors['classic-dark'].Window 'after-cancel/Main/window' -MinimumPixels 32
-    Write-E2E 'theme-cancel: PASS unchanged settings and display'
+    Assert-E2EThemeSurfaces $windows 'classic-dark'
+    Write-E2E 'theme-cancel: PASS unchanged settings and restored display, windows=6'
 
     $originalHandles = @{}
     foreach ($role in @('Main', 'Graph', 'Threads', 'Legal', 'Setup')) {
