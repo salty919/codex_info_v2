@@ -257,12 +257,42 @@ public sealed class DetailsWindowViewModelTests
         Assert.Equal(360, graph.Points[1].LunaValue);
         Assert.Equal(period.EndAt, graph.Points[^1].Timestamp);
 
-        graph.SelectedMetric = graph.Texts.GraphDollarMetric;
+        var isTokensMetric = typeof(GraphWindowViewModel).GetProperty(nameof(GraphWindowViewModel.IsTokensMetric));
+        Assert.NotNull(isTokensMetric);
+        Assert.True(isTokensMetric.CanWrite);
+        var selectedMetricNotifications = 0;
+        graph.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(GraphWindowViewModel.SelectedMetric))
+            {
+                selectedMetricNotifications++;
+            }
+        };
+
+        isTokensMetric.SetValue(graph, false);
+        Assert.Equal(graph.Texts.GraphDollarMetric, graph.SelectedMetric);
         Assert.Equal(GraphMetric.Dollars, graph.Scene.Metric);
         Assert.True(graph.IsDollarsMetric);
         Assert.False(graph.IsTokensMetric);
         Assert.Equal(3.75, graph.Points[0].LunaValue);
         Assert.Equal(4.5, graph.Points[1].LunaValue);
+
+        var dollarsNotificationCount = selectedMetricNotifications;
+        isTokensMetric.SetValue(graph, false);
+        Assert.Equal(dollarsNotificationCount, selectedMetricNotifications);
+
+        isTokensMetric.SetValue(graph, true);
+        Assert.Equal(graph.Texts.GraphTokenMetric, graph.SelectedMetric);
+        Assert.Equal(GraphMetric.Tokens, graph.Scene.Metric);
+        Assert.True(graph.IsTokensMetric);
+        Assert.False(graph.IsDollarsMetric);
+        Assert.Equal(300, graph.Points[0].LunaValue);
+        Assert.Equal(360, graph.Points[1].LunaValue);
+
+        var tokensNotificationCount = selectedMetricNotifications;
+        isTokensMetric.SetValue(graph, true);
+        Assert.Equal(tokensNotificationCount, selectedMetricNotifications);
+
         graph.ShowLuna = false;
         Assert.False(graph.ShowLuna);
         Assert.DoesNotContain("LUNA", graph.Scene.ModelSeries.Keys);

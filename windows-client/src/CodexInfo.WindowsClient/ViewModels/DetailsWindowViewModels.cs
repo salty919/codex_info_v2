@@ -319,7 +319,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    public bool IsTokensMetric => selectedMetric == GraphMetric.Tokens;
+    public bool IsTokensMetric
+    {
+        get => selectedMetric == GraphMetric.Tokens;
+        set => SelectedMetric = value ? Texts.GraphTokenMetric : Texts.GraphDollarMetric;
+    }
 
     public bool IsDollarsMetric => selectedMetric == GraphMetric.Dollars;
 

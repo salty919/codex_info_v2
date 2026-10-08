@@ -45,6 +45,34 @@ public sealed class GraphWindowSelectorParityTests
     }
 
     [Fact]
+    public void GraphPlotFrameDrawsRoundedOutlineAfterClippedContent()
+    {
+        var graph = XDocument.Parse(Load("GraphWindow.axaml"));
+        var xamlName = XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml");
+        var frame = graph.Descendants().Single(element =>
+            element.Attribute(xamlName)?.Value == "GraphFrame");
+        Assert.Equal("Grid", frame.Name.LocalName);
+        Assert.Equal("3", frame.Attribute("Grid.Row")?.Value);
+
+        var children = frame.Elements().ToArray();
+        Assert.Equal(2, children.Length);
+        var content = children[0];
+        Assert.Equal("Border", content.Name.LocalName);
+        Assert.Equal("1", content.Attribute("BorderThickness")?.Value);
+        Assert.Equal("10", content.Attribute("CornerRadius")?.Value);
+        Assert.Equal("True", content.Attribute("ClipToBounds")?.Value);
+
+        var outline = graph.Descendants().Single(element =>
+            element.Attribute(xamlName)?.Value == "GraphFrameOutline");
+        Assert.Same(children[^1], outline);
+        Assert.Equal("Border", outline.Name.LocalName);
+        Assert.Equal("{DynamicResource Theme3B506F}", outline.Attribute("BorderBrush")?.Value);
+        Assert.Equal("1", outline.Attribute("BorderThickness")?.Value);
+        Assert.Equal("10", outline.Attribute("CornerRadius")?.Value);
+        Assert.Equal("False", outline.Attribute("IsHitTestVisible")?.Value);
+    }
+
+    [Fact]
     public void GraphPeriodSelectorUsesOneAnchoredPopupComponent()
     {
         var graph = XDocument.Parse(Load("GraphWindow.axaml"));
