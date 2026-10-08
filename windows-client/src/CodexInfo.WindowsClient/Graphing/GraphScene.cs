@@ -925,7 +925,8 @@ public sealed class GraphScene
             }
         }
 
-        return beforeTotal != afterTotal;
+        // Cumulative token counts are integral; a real change is at least one token.
+        return Math.Abs(afterTotal - beforeTotal) >= 1d;
     }
 
     private static bool IsLowRateLongModelChange(

@@ -2883,7 +2883,20 @@ fn history_models_v3(
             group
                 .totals
                 .values()
-                .map(|total| history_model_usage_v3(total, sample))
+                .map(|total| {
+                    let family_fallback_allowed =
+                        !matches!(total.model.as_str(), "SOL" | "TERRA" | "LUNA")
+                            || !group.totals.values().any(|peer| {
+                                peer.model != total.model
+                                    && codex_info_pricing::family(&peer.model)
+                                        == Some(total.model.as_str())
+                            });
+                    history_model_usage_v3_with_family_fallback(
+                        total,
+                        sample,
+                        family_fallback_allowed,
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -2923,19 +2936,33 @@ fn legacy_history_models_v3(sample: &PublicHistorySample) -> Vec<PublicHistoryMo
     .collect()
 }
 
+#[cfg(test)]
 fn history_model_usage_v3(
     total: &RawModelTotal,
     sample: &PublicHistorySample,
 ) -> PublicHistoryModelUsageV3 {
-    let total_dollars = total.total_dollars.or(match total.model.as_str() {
-        // Old history rows have no sidecar amount. Preserve their family-only
-        // SQL values, but let any newly persisted row amount take precedence.
-        "SOL" => Some(sample.sol_dollars),
-        "TERRA" => Some(sample.terra_dollars),
-        "LUNA" => Some(sample.luna_dollars),
-        // Exact model IDs (and newer ASTRA rows) have no legacy SQL fallback.
-        // Never reprice a historical row from today's catalog.
-        _ => None,
+    history_model_usage_v3_with_family_fallback(total, sample, true)
+}
+
+fn history_model_usage_v3_with_family_fallback(
+    total: &RawModelTotal,
+    sample: &PublicHistorySample,
+    family_fallback_allowed: bool,
+) -> PublicHistoryModelUsageV3 {
+    let total_dollars = total.total_dollars.or(if family_fallback_allowed {
+        match total.model.as_str() {
+            // Old history rows have no sidecar amount. Preserve their family-only
+            // SQL values if this group has no exact-ID peer in the same family,
+            // but let any newly persisted row amount take precedence.
+            "SOL" => Some(sample.sol_dollars),
+            "TERRA" => Some(sample.terra_dollars),
+            "LUNA" => Some(sample.luna_dollars),
+            // Exact model IDs (and newer ASTRA rows) have no legacy SQL fallback.
+            // Never reprice a historical row from today's catalog.
+            _ => None,
+        }
+    } else {
+        None
     });
     PublicHistoryModelUsageV3 {
         model: total.model.clone(),
@@ -6824,6 +6851,60 @@ mod tests {
         assert!(models.iter().any(|model| {
             model.model == "TERRA" && model.total_tokens == 50 && model.total_dollars == Some(0.75)
         }));
+    }
+
+    #[test]
+    fn mixed_exact_history_does_not_fallback_aggregate_into_null_legacy_family_cost() {
+        let sample = PublicHistorySample {
+            timestamp: 1_800_000_000,
+            reset_at: 1_800_604_800,
+            remaining_percent: Some(50.0),
+            // This compatibility aggregate includes the exact model's v1
+            // amount, so it cannot stand in for a missing family-only cost.
+            sol_dollars: 0.7,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 300,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let mut group = HistoryModelGroup::default();
+        group.totals.insert(
+            "SOL".to_owned(),
+            RawModelTotal {
+                model: "SOL".to_owned(),
+                total_tokens: 100,
+                input_tokens: 100,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: None,
+                total_dollars: None,
+            },
+        );
+        group.totals.insert(
+            "gpt-6-sol".to_owned(),
+            RawModelTotal {
+                model: "gpt-6-sol".to_owned(),
+                total_tokens: 200,
+                input_tokens: 200,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: None,
+                total_dollars: Some(0.654321),
+            },
+        );
+
+        let models = history_models_v3(Some(&group), &sample, true).expect("complete models");
+        let legacy = models
+            .iter()
+            .find(|model| model.model == "SOL")
+            .expect("legacy family row");
+        assert_eq!(legacy.total_dollars, None);
+        let exact = models
+            .iter()
+            .find(|model| model.model == "gpt-6-sol")
+            .expect("exact model row");
+        assert_eq!(exact.total_dollars, Some(0.654321));
     }
 
     #[test]

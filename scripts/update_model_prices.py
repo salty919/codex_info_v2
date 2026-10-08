@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Fetch and append official Standard short-context model prices."""
 
 from __future__ import annotations
@@ -12,13 +11,13 @@ import re
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib import request
 from urllib.error import URLError
 from urllib.parse import urljoin, urlparse
-
 
 SOURCE_PAGE_URL = "https://developers.openai.com/api/docs/pricing"
 MARKDOWN_URL = SOURCE_PAGE_URL + ".md"

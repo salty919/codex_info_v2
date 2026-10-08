@@ -5852,6 +5852,21 @@ fn model_history_price(
     model_history_price_with_legacy_fallback(total, observed_at, saved, None)
 }
 
+fn model_history_price_for_lifecycle_repair(
+    total: &SessionModelTotal,
+    observed_at: i64,
+    saved: Option<&SavedModelPrice>,
+) -> (Option<f64>, Option<String>) {
+    let has_legacy_sql_family_column = matches!(total.model.as_str(), "SOL" | "TERRA" | "LUNA");
+    if has_legacy_sql_family_column && !saved.is_some_and(|price| price.total_dollars.is_some()) {
+        // Lifecycle repair keeps the compatibility family dollars already
+        // stored on usage_history. Do not replace a missing row-owned family
+        // amount with a freshly estimated sidecar value.
+        return (None, saved.and_then(|price| price.price_version.clone()));
+    }
+    model_history_price(total, observed_at, saved)
+}
+
 fn model_history_price_with_legacy_fallback(
     total: &SessionModelTotal,
     observed_at: i64,
@@ -11125,8 +11140,11 @@ impl UsageStore {
                 .cloned()
                 .unwrap_or_default();
             for total in &prefix {
-                let (total_dollars, price_version) =
-                    model_history_price(total, sample.timestamp, saved_prices.get(&total.model));
+                let (total_dollars, price_version) = model_history_price_for_lifecycle_repair(
+                    total,
+                    sample.timestamp,
+                    saved_prices.get(&total.model),
+                );
                 transaction.execute(
                     "INSERT INTO usage_model_history (
                         reset_at, timestamp, model, total_tokens, input_tokens,
@@ -14239,6 +14257,42 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_repair_keeps_astra_pricing_without_sql_family_fallback() {
+        const TIMESTAMP: i64 = 1_791_430_620;
+        let astra = SessionModelTotal {
+            model: "ASTRA".to_owned(),
+            total_tokens: 1_400_000,
+            input_tokens: 1_000_000,
+            cached_input_tokens: 200_000,
+            output_tokens: 100_000,
+            cache_write_input_tokens: Some(100_000),
+        };
+        let (astra_dollars, astra_revision) =
+            model_history_price_for_lifecycle_repair(&astra, TIMESTAMP, None);
+        assert!((astra_dollars.expect("ASTRA fixed-user price") - 13.45).abs() < 1e-10);
+        assert_eq!(astra_revision.as_deref(), Some("ASTRA_USER_2026-09-05"));
+
+        let astra_without_writes = SessionModelTotal {
+            cache_write_input_tokens: None,
+            ..astra.clone()
+        };
+        assert_eq!(
+            model_history_price_for_lifecycle_repair(&astra_without_writes, TIMESTAMP, None),
+            (None, None)
+        );
+
+        let sol = SessionModelTotal {
+            model: "SOL".to_owned(),
+            cache_write_input_tokens: Some(0),
+            ..astra
+        };
+        assert_eq!(
+            model_history_price_for_lifecycle_repair(&sol, TIMESTAMP, None),
+            (None, None)
+        );
+    }
+
+    #[test]
     fn same_timestamp_mixed_family_and_exact_models_keep_independent_history_costs() {
         const TIMESTAMP: i64 = 1_791_430_620;
         const RESET_AT: i64 = TIMESTAMP + 60;
@@ -14695,17 +14749,49 @@ mod tests {
         assert_eq!(raw_event_count, 2, "repair removes only the replay row");
         let state = store.load_session_collection_state().unwrap();
         assert_eq!(state.model_totals[0].total_tokens, 100);
-        let row: (f64, i64) = store
+        let row: (f64, i64, Option<f64>, Option<String>) = store
             .connection
             .query_row(
-                "SELECT sol_dollars, sol_tokens FROM usage_history
-                 WHERE timestamp=1500 AND reset_at=2000",
+                "SELECT history.sol_dollars, history.sol_tokens,
+                        models.total_dollars, models.price_version
+                 FROM usage_history AS history
+                 JOIN usage_model_history AS models USING (timestamp, reset_at)
+                 WHERE history.timestamp=1500 AND history.reset_at=2000
+                   AND models.model='SOL'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
         assert_eq!(row.1, 100);
-        assert!((row.0 - 0.0005).abs() < f64::EPSILON);
+        assert_eq!(row.0, 0.001);
+        assert_eq!(
+            row.2, None,
+            "repair must not invent a row-owned legacy price"
+        );
+        assert_eq!(row.3, None, "repair must not invent a price revision");
+
+        let reader_identity = codex_info_db_reader::StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "b".repeat(64),
+            storage_epoch: 8,
+            partition_id: "b".repeat(64),
+        };
+        let snapshot = codex_info_db_reader::DbReader::open_partitioned(&path, &reader_identity)
+            .expect("open repaired partition read-only")
+            .read_snapshot()
+            .expect("read repaired history");
+        let saved = snapshot
+            .history_samples_v3
+            .iter()
+            .find(|sample| sample.timestamp == 1500 && sample.reset_at == reset_at)
+            .expect("repaired V3 history sample");
+        let sol = saved
+            .models
+            .as_ref()
+            .and_then(|models| models.iter().find(|model| model.model == "SOL"))
+            .expect("repaired V3 family history row");
+        assert_eq!(sol.total_dollars, Some(0.001));
         remove_database(&path);
     }
 
@@ -21908,7 +21994,7 @@ mod wave_b_correction_tests {
 
     #[test]
     fn issue_362_checkpoint_schema_accepts_only_supported_legacy_shapes() {
-        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         const SHAPE_MATRIX: &[(usize, &[i64])] = &[
             (22, SUPPORTED_VERSIONS),
             (21, &[]),

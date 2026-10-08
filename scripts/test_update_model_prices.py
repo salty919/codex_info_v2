@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Fixed-oracle tests for the official model-price snapshot updater."""
 
 from __future__ import annotations
@@ -8,18 +7,23 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # noqa: B404,S404  # nosec B404 # Offline fixture process API only.
 import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from typing import Any, ClassVar
 from unittest import mock
-from urllib.error import URLError
 from urllib import request
+from urllib.error import URLError
 from urllib.request import Request
 
 import update_model_prices as pricing
+
+BASH = shutil.which("bash")
+if BASH is None or not Path(BASH).is_absolute():
+    raise RuntimeError("offline workflow fixture requires an absolute Bash executable")
 
 
 ORACLE_RATES = {
@@ -203,15 +207,13 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), before)
 
     def test_cli_accepts_an_offline_markdown_fixture(self) -> None:
-        import subprocess
-        import sys
-
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "pricing.md"
             snapshot = root / "standard-short.json"
             source.write_text(STANDARD_TABLE, encoding="utf-8")
-            completed = subprocess.run(
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+            completed = subprocess.run(  # noqa: B603,S603  # nosec B603 # Fixed interpreter and private fixture argv.
                 [
                     sys.executable,
                     str(Path(pricing.__file__).resolve()),
@@ -225,6 +227,7 @@ class SnapshotTests(unittest.TestCase):
                 check=False,
                 capture_output=True,
                 text=True,
+                shell=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(json.loads(completed.stdout)["status"], "changed")
@@ -237,7 +240,7 @@ class SnapshotTests(unittest.TestCase):
 class FetchBoundaryTests(unittest.TestCase):
     class Response:
         status = 200
-        headers = {"Content-Type": "text/markdown; charset=utf-8"}
+        headers: ClassVar[dict[str, str]] = {"Content-Type": "text/markdown; charset=utf-8"}
 
         def __init__(self, data: bytes, url: str = pricing.MARKDOWN_URL):
             self.data = data
@@ -275,9 +278,11 @@ class FetchBoundaryTests(unittest.TestCase):
         response = self.Response(b"x" * (pricing.MAX_SOURCE_BYTES + 1))
         opener = mock.Mock()
         opener.open.return_value = response
-        with mock.patch.object(request, "build_opener", return_value=opener):
-            with self.assertRaises(pricing.PricingUpdateError):
-                pricing.fetch_standard_markdown()
+        with (
+            mock.patch.object(request, "build_opener", return_value=opener),
+            self.assertRaises(pricing.PricingUpdateError),
+        ):
+            pricing.fetch_standard_markdown()
 
     def test_fetch_rejects_non_official_final_origin(self) -> None:
         response = self.Response(
@@ -285,9 +290,11 @@ class FetchBoundaryTests(unittest.TestCase):
         )
         opener = mock.Mock()
         opener.open.return_value = response
-        with mock.patch.object(request, "build_opener", return_value=opener):
-            with self.assertRaises(pricing.PricingUpdateError):
-                pricing.fetch_standard_markdown()
+        with (
+            mock.patch.object(request, "build_opener", return_value=opener),
+            self.assertRaises(pricing.PricingUpdateError),
+        ):
+            pricing.fetch_standard_markdown()
 
     def test_redirect_handler_rejects_non_official_and_allows_official_https(self) -> None:
         handler = pricing.OfficialRedirectHandler()
@@ -314,9 +321,11 @@ class FetchBoundaryTests(unittest.TestCase):
     def test_fetch_failure_is_not_retried(self) -> None:
         opener = mock.Mock()
         opener.open.side_effect = URLError("offline")
-        with mock.patch.object(request, "build_opener", return_value=opener):
-            with self.assertRaises(pricing.PricingUpdateError):
-                pricing.fetch_standard_markdown()
+        with (
+            mock.patch.object(request, "build_opener", return_value=opener),
+            self.assertRaises(pricing.PricingUpdateError),
+        ):
+            pricing.fetch_standard_markdown()
         opener.open.assert_called_once()
 
 
@@ -383,9 +392,16 @@ class PriceWorkflowCausalTests(unittest.TestCase):
         source_path.write_text(source, encoding="utf-8")
 
         real_git = shutil.which("git")
-        self.assertIsNotNone(real_git)
-        subprocess.run([real_git, "init", "-q", str(repository)], check=True)
-        subprocess.run([real_git, "-C", str(repository), "add", "--all"], check=True)
+        if real_git is None or not Path(real_git).is_absolute():
+            raise RuntimeError("workflow fixture requires an absolute Git executable")
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        subprocess.run(  # noqa: B603,S603  # nosec B603 # Fixed Git argv against a private fixture repo.
+            [real_git, "init", "-q", str(repository)], check=True, shell=False
+        )
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        subprocess.run(  # noqa: B603,S603  # nosec B603 # Fixed Git argv against a private fixture repo.
+            [real_git, "-C", str(repository), "add", "--all"], check=True, shell=False
+        )
         initial_commit_env = os.environ.copy()
         initial_commit_env.update(
             {
@@ -397,13 +413,18 @@ class PriceWorkflowCausalTests(unittest.TestCase):
                 "GIT_CONFIG_GLOBAL": "/dev/null",
             }
         )
-        subprocess.run(
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        subprocess.run(  # noqa: B603,S603  # nosec B603 # Fixed Git commit in a private fixture repo.
             [real_git, "-C", str(repository), "commit", "-qm", "fixture base"],
             check=True,
             env=initial_commit_env,
+            shell=False,
         )
-        base_sha = subprocess.check_output(
-            [real_git, "-C", str(repository), "rev-parse", "HEAD"], text=True
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        base_sha = subprocess.check_output(  # noqa: B603,S603  # nosec B603 # Fixed read-only Git argv.
+            [real_git, "-C", str(repository), "rev-parse", "HEAD"],
+            text=True,
+            shell=False,
         ).strip()
 
         fake_bin = root / "bin"
@@ -516,18 +537,20 @@ class PriceWorkflowCausalTests(unittest.TestCase):
                 "GH_CREATED_PR": str(root / "created-pr.json"),
                 "GITHUB_REPOSITORY": "salty919/codex_info_v2",
                 "GITHUB_EVENT_NAME": "workflow_dispatch",
-                "GH_TOKEN": "test-token-must-not-be-printed",
+                "GH_TOKEN": "test-token-must-not-be-printed",  # noqa: B105,S105  # nosec B105 # Non-secret sentinel verifies output redaction.
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": "/dev/null",
             }
         )
-        completed = subprocess.run(
-            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+        completed = subprocess.run(  # noqa: B603,S603  # nosec B603 # Workflow script, stubbed commands, private repo.
+            [BASH, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
             cwd=repository,
             env=env,
             check=False,
             capture_output=True,
             text=True,
+            shell=False,
         )
 
         def read_json_lines(path: Path) -> list[list[str]]:
