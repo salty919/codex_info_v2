@@ -207,20 +207,20 @@ public sealed class GraphHoverProjectionTests
     [Fact]
     public void FindReturnsEveryVisibleValueFromTheSameObservedTimestamp()
     {
-        const ulong solTokens = 9_007_199_254_740_993;
-        const ulong terraTokens = 4_000_000_000_000_007;
-        const ulong lunaTokens = 3_000_000_000_000_009;
-        const ulong astraTokens = 2_000_000_000_000_011;
+        const ulong solCount = 9_007_199_254_740_993;
+        const ulong terraCount = 4_000_000_000_000_007;
+        const ulong lunaCount = 3_000_000_000_000_009;
+        const ulong astraCount = 2_000_000_000_000_011;
         var scene = CreateScene(
         [
             Sample(
                 200,
                 1,
                 73,
-                Model("SOL", solTokens, 1),
-                Model("TERRA", terraTokens, 2),
-                Model("LUNA", lunaTokens, 3),
-                Model("ASTRA", astraTokens, 4)),
+                Model("SOL", solCount, 1),
+                Model("TERRA", terraCount, 2),
+                Model("LUNA", lunaCount, 3),
+                Model("ASTRA", astraCount, 4)),
         ],
         GraphMetric.Tokens,
         100,
@@ -233,10 +233,10 @@ public sealed class GraphHoverProjectionTests
 
         Assert.Equal(200, snapshot.Timestamp);
         Assert.Equal(73, Assert.Single(snapshot.Rows, row => row.Series == GraphSeries.Remaining).NumericValue);
-        Assert.Equal(solTokens, Assert.Single(snapshot.Rows, row => row.Series == GraphSeries.Sol).TokenValue);
-        Assert.Equal(terraTokens, Assert.Single(snapshot.Rows, row => row.Series == GraphSeries.Terra).TokenValue);
-        Assert.Equal(lunaTokens, Assert.Single(snapshot.Rows, row => row.Series == GraphSeries.Luna).TokenValue);
-        Assert.Equal(astraTokens, Assert.Single(snapshot.Rows, row => row.Series == GraphSeries.Astra).TokenValue);
+        Assert.Equal(solCount, Assert.Single(snapshot.Rows, row => row.Series == GraphSeries.Sol).TokenValue);
+        Assert.Equal(terraCount, Assert.Single(snapshot.Rows, row => row.Series == GraphSeries.Terra).TokenValue);
+        Assert.Equal(lunaCount, Assert.Single(snapshot.Rows, row => row.Series == GraphSeries.Luna).TokenValue);
+        Assert.Equal(astraCount, Assert.Single(snapshot.Rows, row => row.Series == GraphSeries.Astra).TokenValue);
         Assert.All(snapshot.Rows, row =>
         {
             if (row.Series == GraphSeries.Remaining)
@@ -271,9 +271,9 @@ public sealed class GraphHoverProjectionTests
         Assert.NotEqual(5, dollar.NumericValue);
         Assert.Null(dollar.TokenValue);
 
-        const ulong exactTokens = 9_007_199_254_740_993;
+        const ulong exactCount = 9_007_199_254_740_993;
         var tokenScene = CreateScene(
-            [Sample(100, 1, 90, Model("SOL", exactTokens, 1))],
+            [Sample(100, 1, 90, Model("SOL", exactCount, 1))],
             GraphMetric.Tokens,
             100,
             200);
@@ -282,7 +282,7 @@ public sealed class GraphHoverProjectionTests
             100,
             Visible(GraphSeries.Sol))).Rows);
 
-        Assert.Equal(exactTokens, token.TokenValue);
+        Assert.Equal(exactCount, token.TokenValue);
         Assert.Null(token.NumericValue);
     }
 
