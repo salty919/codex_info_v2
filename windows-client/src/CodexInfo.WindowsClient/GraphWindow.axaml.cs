@@ -75,6 +75,8 @@ public partial class GraphWindow : Window
             case "Dollars":
                 viewModel.SelectedMetric = viewModel.Texts.GraphDollarMetric;
                 break;
+            default:
+                return;
         }
     }
 
