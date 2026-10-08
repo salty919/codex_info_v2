@@ -64,6 +64,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         set
         {
             if (selectedThemeId == value) return;
+            ThemePalette.Apply(value);
             selectedThemeId = value;
             Notify();
         }
@@ -160,6 +161,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         }
         catch (Exception)
         {
+            SelectedThemeId = App.CurrentSettings.ThemeId;
             saveFailed = true;
             Notify(nameof(SaveFailed));
             Notify(nameof(StatusDetail));
@@ -179,6 +181,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public void Dispose()
     {
+        ThemePalette.Apply(App.CurrentSettings.ThemeId);
         LocalizationService.LanguageChanged -= OnLanguageChanged;
         if (main is not null) main.PropertyChanged -= OnMainPropertyChanged;
     }
