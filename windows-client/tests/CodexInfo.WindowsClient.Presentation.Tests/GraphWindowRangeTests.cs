@@ -442,6 +442,32 @@ public sealed class GraphWindowRangeTests
     }
 
     [Fact]
+    public async Task TimeWindowUsesPublishedPeriodStartsIncludingEmptyAndLeftClippedPeriods()
+    {
+        const long now = 1_791_496_260;
+        var periods = new[]
+        {
+            CreatePeriod("left-clipped", 1_790_442_720, 1_790_975_400, 1_791_047_491, current: false, sol: 1),
+            CreatePeriod("empty-visible", 1_790_978_640, 1_791_343_800, 1_791_580_246, current: false, sol: 2)
+                with { Samples = [] },
+            CreatePeriod("prior", 1_791_343_860, 1_791_439_740, 1_791_948_558, current: false, sol: 3),
+            CreatePeriod("current", 1_791_439_732, now, 1_792_044_505, current: true, sol: 4),
+        };
+        var client = new RangeResourceClient(periods, Pair);
+        using var main = CreateResourceMain(client);
+        using var graph = CreateGraph(main, () => now);
+        await EventuallyAsync(() => graph.HasPoints);
+
+        SetRange(graph, "Last7Days");
+        await EventuallyAsync(() => IsViewport(graph.Scene));
+
+        AssertViewport(graph.Scene, 1_790_891_460, now);
+        Assert.Equal(
+            new long[] { 1_790_978_640, 1_791_343_860, 1_791_439_732 },
+            GraphPlotProjection.BuildResetGuides(graph.Scene));
+    }
+
+    [Fact]
     public async Task SplitResourcePeriodReplacementTransientNullDoesNotClearAcceptedScene()
     {
         var periods = CreateTwoResetPeriods(FixedNow, accountOffset: 0);

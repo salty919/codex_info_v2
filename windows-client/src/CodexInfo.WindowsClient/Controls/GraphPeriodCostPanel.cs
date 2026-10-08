@@ -11,8 +11,7 @@ namespace CodexInfo.WindowsClient.Controls;
 /// visible reset-period amount at that period's horizontal midpoint.
 /// </summary>
 internal sealed class GraphPeriodCostPanel(
-    IReadOnlyList<GraphPeriodCostAmount> amounts,
-    IReadOnlyList<long> resetGuideTimestamps) : ScottPlot.IPanel
+    IReadOnlyList<GraphPeriodCostAmount> amounts) : ScottPlot.IPanel
 {
     internal const float FooterHeight = 48;
     internal const float BaseFontSize = 22;
@@ -20,13 +19,10 @@ internal sealed class GraphPeriodCostPanel(
     private const float HorizontalInset = 8;
 
     internal IReadOnlyList<GraphPeriodCostAmount> Amounts { get; } = amounts;
-    internal IReadOnlyList<long> ResetGuideTimestamps { get; } = resetGuideTimestamps;
     internal ScottPlot.PixelRect? LastRenderBounds { get; private set; }
     internal ScottPlot.Color BackgroundColor => new(ThemePalette.Resolve(GraphPlotControl.PlotColorHex));
     internal ScottPlot.Color AmountColor =>
         new ScottPlot.Color(ThemePalette.Resolve(GraphPlotControl.PeriodAmountColorHex));
-    internal ScottPlot.Color ResetSeparatorColor => AmountColor.WithOpacity(0.70);
-
     public bool IsVisible { get; set; } = true;
     public float MinimumSize { get; set; } = FooterHeight;
     public float MaximumSize { get; set; } = FooterHeight;
@@ -74,24 +70,6 @@ internal sealed class GraphPeriodCostPanel(
         if (panelRect.Width <= 0 || panelRect.Height <= 0)
         {
             return;
-        }
-
-        using (var resetGuide = new SKPaint
-        {
-            Color = SKColor.Parse(ThemePalette.Resolve(GraphPlotControl.PeriodAmountColorHex)).WithAlpha(178),
-            Style = SKPaintStyle.Stroke,
-            StrokeWidth = 1,
-            IsAntialias = false,
-        })
-        {
-            foreach (var timestamp in ResetGuideTimestamps)
-            {
-                var x = renderPack.Plot.Axes.Bottom.GetPixel(timestamp, renderPack.DataRect);
-                if (x >= panelRect.Left && x <= panelRect.Right)
-                {
-                    renderPack.Canvas.DrawLine(x, panelRect.Top, x, panelRect.Bottom, resetGuide);
-                }
-            }
         }
 
         foreach (var amount in Amounts)
