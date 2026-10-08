@@ -251,6 +251,51 @@ public sealed record UiText(
         _ => "Dollars"
     };
 
+    public string FormatGraphPeriodCost(double? recordedDollars, bool isComplete)
+    {
+        if (recordedDollars is not { } amount || !double.IsFinite(amount) || amount < 0)
+        {
+            return LanguageCode switch
+            {
+                "ja" => "期間合計 未取得",
+                "zh-Hans" => "期间合计 未获取",
+                "ko" => "기간 합계 가져오지 못함",
+                "es" => "Total del período no disponible",
+                "fr" => "Total de la période indisponible",
+                "de" => "Zeitraumsumme nicht verfügbar",
+                "pt" => "Total do período indisponível",
+                "it" => "Totale del periodo non disponibile",
+                "ru" => "Итого за период недоступно",
+                _ => "Period total unavailable",
+            };
+        }
+
+        var dollars = amount.ToString("F2", CultureInfo.InvariantCulture);
+        return (LanguageCode, isComplete) switch
+        {
+            ("ja", true) => $"期間合計 ${dollars}",
+            ("ja", false) => $"記録分 ${dollars}（未確定）",
+            ("zh-Hans", true) => $"期间合计 ${dollars}",
+            ("zh-Hans", false) => $"已记录 ${dollars}（未确认）",
+            ("ko", true) => $"기간 합계 ${dollars}",
+            ("ko", false) => $"기록됨 ${dollars}（미확정）",
+            ("es", true) => $"Total del período ${dollars}",
+            ("es", false) => $"Registrado ${dollars} (sin confirmar)",
+            ("fr", true) => $"Total de la période ${dollars}",
+            ("fr", false) => $"Enregistré ${dollars} (non confirmé)",
+            ("de", true) => $"Zeitraumsumme ${dollars}",
+            ("de", false) => $"Erfasst ${dollars} (unbestätigt)",
+            ("pt", true) => $"Total do período ${dollars}",
+            ("pt", false) => $"Registrado ${dollars} (não confirmado)",
+            ("it", true) => $"Totale del periodo ${dollars}",
+            ("it", false) => $"Registrato ${dollars} (non confermato)",
+            ("ru", true) => $"Итого за период ${dollars}",
+            ("ru", false) => $"Записано ${dollars} (не подтверждено)",
+            (_, true) => $"Period total ${dollars}",
+            _ => $"Recorded ${dollars} (unconfirmed)",
+        };
+    }
+
     public string GraphTokenMetric => Tokens;
 
     public string GraphDollarDescription => LanguageCode switch

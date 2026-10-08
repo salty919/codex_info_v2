@@ -82,12 +82,26 @@ public sealed class GraphPlotControl : Control
         Focusable = true;
         ClipToBounds = true;
         SizeChanged += OnControlSizeChanged;
-        AttachedToVisualTree += (_, _) => ThemePalette.Changed += OnThemeChanged;
-        DetachedFromVisualTree += (_, _) => ThemePalette.Changed -= OnThemeChanged;
+        AttachedToVisualTree += OnAttachedToVisualTree;
+        DetachedFromVisualTree += OnDetachedFromVisualTree;
         ApplyScene();
     }
 
+    private void OnAttachedToVisualTree(object? sender, VisualTreeAttachmentEventArgs eventArgs)
+    {
+        ThemePalette.Changed += OnThemeChanged;
+        LocalizationService.LanguageChanged += OnLanguageChanged;
+    }
+
+    private void OnDetachedFromVisualTree(object? sender, VisualTreeAttachmentEventArgs eventArgs)
+    {
+        ThemePalette.Changed -= OnThemeChanged;
+        LocalizationService.LanguageChanged -= OnLanguageChanged;
+    }
+
     private void OnThemeChanged(object? sender, EventArgs eventArgs) => ApplyScene();
+
+    private void OnLanguageChanged(object? sender, EventArgs eventArgs) => ApplyScene();
 
     public static readonly StyledProperty<GraphScene> SceneProperty =
         AvaloniaProperty.Register<GraphPlotControl, GraphScene>(nameof(Scene), GraphScene.Empty());
@@ -290,6 +304,81 @@ public sealed class GraphPlotControl : Control
             MeasuredRemainingLineWidth);
         ApplyAxes(presentation, scene, axes);
         ApplyVisibility(presentation);
+        AddPeriodCostLabels(presentation, scene, axes);
+    }
+
+    private void AddPeriodCostLabels(
+        PlotPresentation presentation,
+        GraphScene scene,
+        GraphAxisProjection axes)
+    {
+        if (!scene.HasPoints)
+        {
+            return;
+        }
+
+        var periods = scene.IsViewport
+            ? scene.PeriodScenes
+                .Where(period => period.HasPoints &&
+                    period.PeriodEndAt >= scene.PeriodStartAt &&
+                    period.PeriodStartAt <= scene.PeriodEndAt &&
+                    period.PeriodStartAt >= scene.PeriodStartAt)
+                .OrderBy(period => period.PeriodStartAt)
+                .ToArray()
+            : scene.HasPoints ? [scene] : [];
+        if (periods.Length == 0)
+        {
+            return;
+        }
+
+        var includePeriodStart = periods.Length > 1;
+        GraphPeriodCostFontResolver.EnsureRegistered();
+        var labels = new List<ScottPlot.Plottables.Text>(periods.Length);
+        foreach (var period in periods)
+        {
+            var labelText = LocalizationService.Current.FormatGraphPeriodCost(
+                period.PeriodCost.RecordedDollars,
+                period.PeriodCost.IsComplete);
+            if (includePeriodStart)
+            {
+                var localStart = TimeZoneInfo.ConvertTime(
+                        DateTimeOffset.FromUnixTimeSeconds(period.PeriodStartAt),
+                        LocalizationService.DisplayTimeZone)
+                    .ToString("MM/dd HH:mm", CultureInfo.CurrentCulture);
+                labelText = $"{localStart}～\n{labelText}";
+            }
+
+            var rightEdge = Math.Min(period.PeriodEndAt, scene.PeriodEndAt);
+            var label = presentation.Plot.Add.Text(labelText, rightEdge, axes.ModelDisplayMaximum);
+            label.Alignment = ScottPlot.Alignment.UpperRight;
+            label.LabelFontName = GraphPeriodCostFontResolver.AliasForLanguage(
+                LocalizationService.Current.LanguageCode);
+            // Plot.Font.Set() installs its chosen typeface as ScottPlot's global
+            // default, which new LabelStyle instances inherit. Clear that cached
+            // typeface so rendering resolves this label's embedded-font alias.
+            label.LabelStyle.Font = null;
+            label.LabelFontSize = 11;
+            label.LabelFontColor = MutedColor;
+            label.LabelBackgroundColor = PlotColor;
+            label.LabelBorderColor = GridColor;
+            label.LabelBorderWidth = 0.5f;
+            label.LabelShadowOffset = new ScottPlot.PixelOffset(0, 0);
+            label.LabelPadding = GraphPeriodCostLabelsLayoutAction.LabelPadding;
+            labels.Add(label);
+        }
+
+        // Text is rendered by RenderPlottables. Place layout directly before
+        // that action, after ScottPlot has measured axes and finalized DataRect.
+        var renderPlottablesIndex = presentation.Plot.RenderManager.RenderActions
+            .FindIndex(action => action.GetType().Name == "RenderPlottables");
+        if (renderPlottablesIndex < 0)
+        {
+            throw new InvalidOperationException("ScottPlot's RenderPlottables action was not found.");
+        }
+
+        presentation.Plot.RenderManager.RenderActions.Insert(
+            renderPlottablesIndex,
+            new GraphPeriodCostLabelsLayoutAction(labels));
     }
 
     private static GraphCanonicalModelLineProjection BuildModelLines(GraphScene scene, GraphSeries series) =>

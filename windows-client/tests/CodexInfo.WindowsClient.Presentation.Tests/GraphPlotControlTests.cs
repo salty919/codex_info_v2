@@ -249,7 +249,12 @@ public sealed class GraphPlotControlTests
         ]);
         var control = new GraphPlotControl { Scene = scene };
 
-        Assert.Empty(control.Plot.GetPlottables<ScottPlot.Plottables.Text>());
+        var periodSummary = Assert.Single(control.Plot.GetPlottables<ScottPlot.Plottables.Text>());
+        Assert.Equal(
+            LocalizationService.Current.FormatGraphPeriodCost(
+                scene.PeriodCost.RecordedDollars,
+                scene.PeriodCost.IsComplete),
+            periodSummary.LabelText);
         Assert.DoesNotContain(
             control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>(),
             line =>
@@ -597,7 +602,12 @@ public sealed class GraphPlotControlTests
             control.Plot.Axes.Bottom,
             control.Plot.Axes.Left);
         Assert.InRange(dataRect.Right - endpointPixel.X, 1.5f, 2.5f);
-        Assert.Empty(control.Plot.GetPlottables<ScottPlot.Plottables.Text>());
+        var periodSummary = Assert.Single(control.Plot.GetPlottables<ScottPlot.Plottables.Text>());
+        Assert.Equal(
+            LocalizationService.Current.FormatGraphPeriodCost(
+                scene.PeriodCost.RecordedDollars,
+                scene.PeriodCost.IsComplete),
+            periodSummary.LabelText);
     }
 
     [Fact]

@@ -51,6 +51,9 @@ internal enum GraphModelOrigin
     Rejected,
 }
 
+/// <summary>Recorded USD for one actual reset period, never forecast or held values.</summary>
+internal readonly record struct GraphPeriodCostSummary(double? RecordedDollars, bool IsComplete);
+
 /// <summary>A raw, nonsynthetic observation aligned to its accepted scene row.</summary>
 internal readonly record struct GraphObservedSample(
     long Timestamp,
@@ -119,12 +122,14 @@ public sealed class GraphScene
         bool hasViewportPoints = false,
         long? resetAt = null,
         IReadOnlyList<GraphObservedSample>? hoverObservations = null,
-        bool isVerifiedCurrentResetStart = false)
+        bool isVerifiedCurrentResetStart = false,
+        GraphPeriodCostSummary periodCost = default)
     {
         PeriodStartAt = periodStartAt;
         PeriodEndAt = periodEndAt;
         ResetAt = resetAt;
         IsVerifiedCurrentResetStart = isVerifiedCurrentResetStart;
+        PeriodCost = periodCost;
         Metric = metric;
         Timestamps = timestamps;
         Remaining = remaining;
@@ -175,6 +180,8 @@ public sealed class GraphScene
     internal bool IsVerifiedCurrentResetStart { get; }
 
     public GraphMetric Metric { get; }
+
+    internal GraphPeriodCostSummary PeriodCost { get; }
 
     public IReadOnlyList<double> Timestamps { get; }
 
@@ -454,6 +461,7 @@ public sealed class GraphScene
                 .OrderBy(gap => gap.StartAt)
                 .ToArray();
         var nonOwnedIntervals = BuildNonOwnedIntervals(start, end, accountOwnershipIntervals);
+        var latestCostObservation = samples.LastOrDefault(sample => !sample.IsSyntheticTail);
         samples = WithoutRecoverableSamplingJitter(samples, normalizedGaps);
         var allModelNames = samples
             .SelectMany(PublishedModels)
@@ -476,6 +484,8 @@ public sealed class GraphScene
         // models still participate in exact token and idle evidence.
         var dollarProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Dollars);
         var tokenProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Tokens);
+        var firstModelPublications = FirstModelPublications(samples);
+        var periodCost = BuildPeriodCost(samples, latestCostObservation, firstModelPublications, dollarProjection);
         var idleIntervals = BuildConfirmedIdleIntervals(
             samples,
             start,
@@ -501,7 +511,6 @@ public sealed class GraphScene
             ? dollarProjection
             : tokenProjection;
         var rawDisplayProjection = semanticProjection.Filter(visibleModelNames);
-        var firstModelPublications = FirstModelPublications(samples);
         var displayProjection = GroupDisplayProjection(
             rawDisplayProjection,
             visibleModelNames,
@@ -624,8 +633,87 @@ public sealed class GraphScene
             maximum,
             resetAt: resetAt,
             hoverObservations: BuildHoverObservations(samples, points, firstModelPublications),
-            isVerifiedCurrentResetStart: isVerifiedCurrentResetStart);
+            isVerifiedCurrentResetStart: isVerifiedCurrentResetStart,
+            periodCost: periodCost);
     }
+
+    private static GraphPeriodCostSummary BuildPeriodCost(
+        IReadOnlyList<ApiHistorySample> samples,
+        ApiHistorySample? latest,
+        IReadOnlyDictionary<string, int> firstPublications,
+        ModelProjection dollars)
+    {
+        if (latest is null || latest.ModelSource is not
+            (ApiHistorySample.ConfirmedModelSource or ApiHistorySample.LegacyUnknownModelSource))
+        {
+            return default;
+        }
+        var index = Enumerable.Range(0, samples.Count)
+            .FirstOrDefault(candidate => ReferenceEquals(samples[candidate], latest), -1);
+        if (index < 0)
+        {
+            return default;
+        }
+        var models = PublishedModels(latest).ToArray();
+        var complete = latest.ModelSource == ApiHistorySample.ConfirmedModelSource && latest.ModelsComplete;
+        if (models.Length == 0)
+        {
+            return complete && latest.ModelSamples is { Count: 0 } && firstPublications.Count == 0
+                ? new GraphPeriodCostSummary(0, true)
+                : default;
+        }
+        complete &= firstPublications.Keys.ToHashSet(StringComparer.Ordinal)
+            .SetEquals(models.Select(model => model.Name));
+        var knownCount = 0;
+        var total = 0d;
+        foreach (var group in models.GroupBy(model => model.Name, StringComparer.Ordinal))
+        {
+            var members = group.ToArray();
+            if (members.Length != 1 || !TryGetRecordedPeriodDollars(latest, members[0], index, dollars, out var value))
+            {
+                complete = false;
+                continue;
+            }
+            total += value;
+            if (!double.IsFinite(total))
+            {
+                return default;
+            }
+            knownCount++;
+        }
+        return new GraphPeriodCostSummary(knownCount > 0 ? total : null, complete && knownCount == models.Length);
+    }
+
+    private static bool TryGetRecordedPeriodDollars(
+        ApiHistorySample sample,
+        ApiHistoryModelSample model,
+        int index,
+        ModelProjection dollars,
+        out double value)
+    {
+        value = ModelValue(sample, model, GraphMetric.Dollars);
+        if (!double.IsFinite(value) || value < 0 || model.TotalDollars is < 0 ||
+            !dollars.LineReliability.TryGetValue(model.Name, out var reliable))
+        {
+            return false;
+        }
+        var prior = index > 0 ? dollars.Values[model.Name][index - 1] : double.NaN;
+        if (sample.ModelSource == ApiHistorySample.ConfirmedModelSource && !sample.ModelsComplete)
+        {
+            // An explicitly partial latest row may display its own recorded
+            // values, never a prior complete vector or an inferred amount.
+            return !double.IsFinite(prior) || value >= prior || IsDollarRoundoff(value, prior);
+        }
+        // The legacy component formula and persisted JSON can represent the
+        // same price a few binary units apart. Retain the latest raw amount
+        // in this uncertain note only; do not promote held curve evidence.
+        return reliable[index] ||
+            sample.ModelSource == ApiHistorySample.LegacyUnknownModelSource && IsDollarRoundoff(value, prior);
+    }
+
+    private static bool IsDollarRoundoff(double value, double reference) =>
+        double.IsFinite(reference) && reference >= 0 &&
+        Math.Abs(value - reference) <= 8 * (reference - Math.BitDecrement(reference));
 
     private static IReadOnlyDictionary<string, int> FirstModelPublications(IReadOnlyList<ApiHistorySample> samples)
     {
