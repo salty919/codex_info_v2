@@ -1428,9 +1428,7 @@ public sealed class GraphPlotControlTests
         var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
             scene,
             GraphRemainingBaselineMode.PeriodStartAtFullQuota);
-        Assert.StartsWith("M0.00 1.00", displayLines.Dashed.Path);
-        Assert.Equal((double)period.StartAt, displayLines.Dashed.Line.X[0]);
-        Assert.Equal(100d, displayLines.Dashed.Line.Y[0]);
+        Assert.DoesNotContain((double)period.StartAt, displayLines.Dashed.Line.X);
     }
 
     [Fact]
@@ -3504,7 +3502,16 @@ public sealed class GraphPlotControlTests
             new ApiHistorySample(180, resetAt, 98, 1, 1, 1, 100, 100, 100),
         };
 
-        var scene = GraphScene.Create(samples, GraphMetric.Tokens, periodStart, 180);
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Tokens,
+            periodStart,
+            180,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: null,
+            resetAt: resetAt,
+            isVerifiedCurrentResetStart: true);
 
         // GraphScene retains the raw observation authority. The period-start
         // 100% point is renderer-only and must not be written into raw arrays.
@@ -3532,20 +3539,19 @@ public sealed class GraphPlotControlTests
         Assert.Empty(rawLines.Solid.X);
         Assert.Empty(rawLines.Dashed.X);
 
-        // The user-facing renderer opts into the period-start convention. Its
-        // explicit mode creates only the inferred dashed T0 -> first-raw path.
+        // The authoritative current period enables a renderer-only solid
+        // T0 -> first-raw path; raw history stays untouched.
         var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
             scene,
             GraphRemainingBaselineMode.PeriodStartAtFullQuota);
-        Assert.StartsWith("M0.00 1.00", displayLines.Dashed.Path);
-        Assert.Equal((double)periodStart, displayLines.Dashed.Line.X[0]);
-        Assert.Equal(100d, displayLines.Dashed.Line.Y[0]);
-        Assert.Contains(displayLines.Dashed.Line.X, value => value > 90);
-        Assert.Empty(displayLines.Solid.Line.X);
+        Assert.Contains((double)periodStart, displayLines.Solid.Line.X);
+        Assert.Equal(100d, displayLines.Solid.Line.Y[Array.IndexOf(displayLines.Solid.Line.X.ToArray(), periodStart)]);
+        Assert.Contains(180d, displayLines.Solid.Line.X);
+        Assert.Empty(displayLines.Dashed.Line.X);
     }
 
     [Fact]
-    public void Period_start_display_reaches_first_raw_remaining_across_non_owned_leading_span()
+    public void Verified_current_period_does_not_draw_a_baseline_across_non_owned_leading_span()
     {
         const long periodStart = 1_789_856_676;
         const long firstRaw = 1_789_951_500;
@@ -3561,9 +3567,11 @@ public sealed class GraphPlotControlTests
             GraphMetric.Dollars,
             periodStart,
             secondRaw,
-            null,
-            null,
-            [new GraphAccountOwnershipInterval(firstRaw + 7, null)]);
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(firstRaw + 7, null)],
+            resetAt: resetAt,
+            isVerifiedCurrentResetStart: true);
 
         Assert.Equal([89d, 89d], scene.Remaining);
         Assert.Equal([firstRaw, secondRaw], scene.Timestamps.Select(value => (long)value));
@@ -3575,11 +3583,9 @@ public sealed class GraphPlotControlTests
         var display = GraphPlotProjection.BuildCanonicalRemainingLines(
             scene,
             GraphRemainingBaselineMode.PeriodStartAtFullQuota);
-        Assert.StartsWith("M0.00 1.00", display.Dashed.Path);
-        Assert.Equal((double)periodStart, display.Dashed.Line.X[0]);
-        Assert.Equal(100d, display.Dashed.Line.Y[0]);
-        Assert.Contains(display.Dashed.Line.X, value => value >= firstRaw);
-        Assert.Contains(display.Dashed.Line.Y, value => value == 89d);
+        Assert.DoesNotContain((double)periodStart, display.Idle.Line.X);
+        Assert.DoesNotContain((double)periodStart, display.Solid.Line.X);
+        Assert.DoesNotContain((double)periodStart, display.Dashed.Line.X);
     }
 
     [Fact]
@@ -3598,10 +3604,16 @@ public sealed class GraphPlotControlTests
             samples,
             GraphMetric.Dollars,
             periodStart,
-            secondObservation);
+            secondObservation,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: null,
+            resetAt: 2_000,
+            isVerifiedCurrentResetStart: true);
 
         // GraphScene retains raw timestamps and quota observations. The period
-        // start is a presentation-only 100% baseline in explicit display mode.
+        // start is a presentation-only 100% baseline in explicit display mode
+        // because the caller verified this is the current reset period.
         Assert.Equal([firstObservation, secondObservation],
             scene.Timestamps.Select(timestamp => (long)timestamp));
         Assert.Equal([90d, 80d], scene.Remaining);
@@ -3616,10 +3628,52 @@ public sealed class GraphPlotControlTests
         var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
             scene,
             GraphRemainingBaselineMode.PeriodStartAtFullQuota);
-        Assert.StartsWith("M0.00 1.00", displayLines.Dashed.Path);
-        Assert.NotEmpty(displayLines.Solid.Line.X);
-        Assert.Equal((double)periodStart, displayLines.Dashed.Line.X[0]);
-        Assert.Equal(100d, displayLines.Dashed.Line.Y[0]);
+        Assert.Contains((double)periodStart, displayLines.Solid.Line.X);
+        Assert.Equal(100d, displayLines.Solid.Line.Y[Array.IndexOf(displayLines.Solid.Line.X.ToArray(), periodStart)]);
+        Assert.InRange(displayLines.Solid.Line.X[1], firstObservation - 1d, firstObservation + 1d);
+        Assert.Equal(90d, displayLines.Solid.Line.Y[1]);
+        Assert.Empty(displayLines.Dashed.Line.X);
+    }
+
+    [Fact]
+    public void Verified_current_reset_baselines_do_not_cross_a_confirmed_leading_gap()
+    {
+        const long periodStart = 1_200;
+        const long firstObservation = 1_260;
+        const long secondObservation = 1_320;
+        var samples = new[]
+        {
+            CompleteModelSample(firstObservation, 95, 1, 10),
+            CompleteModelSample(secondObservation, 94, 1, 20),
+        };
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            periodStart,
+            secondObservation,
+            confirmedGaps: [new GraphConfirmedGap(periodStart + 30, firstObservation - 10)],
+            hiddenModelNames: null,
+            accountOwnershipIntervals: null,
+            resetAt: 2_000,
+            isVerifiedCurrentResetStart: true);
+
+        Assert.True(scene.IsVerifiedCurrentResetStart);
+        Assert.DoesNotContain((double)periodStart, scene.Timestamps);
+
+        var model = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
+        Assert.DoesNotContain((double)periodStart, model.Idle.Line.X);
+        Assert.DoesNotContain((double)periodStart, model.Flat.Line.X);
+        Assert.DoesNotContain((double)periodStart, model.Rising.Line.X);
+        Assert.DoesNotContain((double)periodStart, model.Dashed.Line.X);
+
+        var remaining = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.DoesNotContain((double)periodStart, remaining.Idle.Line.X);
+        Assert.DoesNotContain((double)periodStart, remaining.Solid.Line.X);
+        Assert.DoesNotContain((double)periodStart, remaining.Dashed.Line.X);
+        Assert.DoesNotContain(100d, scene.ObservedRemainingValues);
+        Assert.DoesNotContain(0d, scene.Sol);
     }
 
     [Fact]
@@ -3637,7 +3691,12 @@ public sealed class GraphPlotControlTests
             samples,
             GraphMetric.Dollars,
             periodStart,
-            secondObservation);
+            secondObservation,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: null,
+            resetAt: 2_000,
+            isVerifiedCurrentResetStart: true);
 
         // Independent raw-observation oracle: T1 == T0 is already the first
         // accepted point, so no presentation-only 100% point is inserted.
@@ -3680,7 +3739,12 @@ public sealed class GraphPlotControlTests
             samples,
             GraphMetric.Dollars,
             periodStart,
-            secondObservation);
+            secondObservation,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: null,
+            resetAt: 2_000,
+            isVerifiedCurrentResetStart: true);
 
         // Missing observations must remain missing; a display baseline or
         // inferred/raw line would invent quota data without an accepted raw.

@@ -790,6 +790,20 @@ public sealed record UiText(
         _ => " (not updating now)"
     };
 
+    public string ApiErrorSnapshotNotice => LanguageCode switch
+    {
+        "ja" => "Linux 側の取得エラーです。受信済みの値を表示中です。最新の状態は未確認です。",
+        "zh-Hans" => "Linux API 获取出错。正在显示已接收的值，最新数据尚未确认。",
+        "ko" => "Linux API 오류입니다. 받은 값을 표시 중이며 최신 데이터는 확인되지 않았습니다.",
+        "es" => "Error de la API de Linux. Se muestran los valores recibidos; los datos actuales no están confirmados.",
+        "fr" => "Erreur de l’API Linux. Les valeurs reçues sont affichées ; les données actuelles ne sont pas confirmées.",
+        "de" => "Linux-API-Fehler. Empfangene Werte werden angezeigt; aktuelle Daten sind nicht bestätigt.",
+        "pt" => "Erro na API do Linux. Os valores recebidos estão sendo exibidos; os dados atuais não foram confirmados.",
+        "it" => "Errore dell’API Linux. Sono mostrati i valori ricevuti; i dati attuali non sono confermati.",
+        "ru" => "Ошибка API Linux. Показаны полученные значения; текущие данные не подтверждены.",
+        _ => "Linux API error. Showing the received values; current data is unverified."
+    };
+
     public string SshCommandHint => LanguageCode switch
     {
         "ja" => "これは例示コマンドです。user@linux-host を実際のSSHユーザー名とホスト名またはIPアドレスへ置き換えてから実行してください。そのままでは接続できません。",

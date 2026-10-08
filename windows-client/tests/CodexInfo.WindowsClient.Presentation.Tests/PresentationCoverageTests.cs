@@ -236,6 +236,7 @@ public sealed class PresentationCoverageTests
             CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("en-US");
             using var apiModel = new ModelUsageViewModel(new ApiDetailsModelUsage("SOL", 1_234_567, 23_456, 789, 0, 0, 0));
             Assert.Equal("SOL", apiModel.Name);
+            Assert.Equal("SOL", apiModel.GetType().GetProperty("DisplayName")?.GetValue(apiModel));
             Assert.Equal("1,234,567", apiModel.InputTokensText);
             Assert.Equal("23,456", apiModel.CachedInputTokensText);
             Assert.Equal("789", apiModel.OutputTokensText);
@@ -257,6 +258,13 @@ public sealed class PresentationCoverageTests
             Assert.Equal(LocalizationService.Current.CachedInput, detailsModel.CachedInputLabel);
             Assert.Equal(LocalizationService.Current.Output, detailsModel.OutputLabel);
 
+            using var otherModel = new ModelUsageViewModel(
+                new ApiDetailsModelUsage("Other", 1, 0, 0, double.NaN, double.NaN, double.NaN));
+            var otherChanged = new List<string?>();
+            otherModel.PropertyChanged += (_, eventArgs) => otherChanged.Add(eventArgs.PropertyName);
+            Assert.Equal(LocalizationService.Current.Other,
+                otherModel.GetType().GetProperty("DisplayName")?.GetValue(otherModel));
+
             LocalizationService.SetLanguage(originalLanguage == "ja" ? "en" : "ja");
             Assert.Contains(nameof(ModelUsageViewModel.InputTokensText), changed);
             Assert.Contains(nameof(ModelUsageViewModel.CachedInputTokensText), changed);
@@ -267,6 +275,9 @@ public sealed class PresentationCoverageTests
             Assert.Contains(nameof(ModelUsageViewModel.InputLabel), changed);
             Assert.Contains(nameof(ModelUsageViewModel.CachedInputLabel), changed);
             Assert.Contains(nameof(ModelUsageViewModel.OutputLabel), changed);
+            Assert.Contains("DisplayName", otherChanged);
+            Assert.Equal(LocalizationService.Current.Other,
+                otherModel.GetType().GetProperty("DisplayName")?.GetValue(otherModel));
 
             detailsModel.Dispose();
             detailsModel.Dispose();
@@ -481,9 +492,7 @@ public sealed class PresentationCoverageTests
         Assert.Equal("概算 $9", main.EstimatedCostText);
         Assert.Contains("最新", main.DetailsStatusText, StringComparison.Ordinal);
         Assert.Equal(3, main.Models.Count);
-        Assert.Equal("SOL", main.Models[0].Name);
-        Assert.Equal("TERRA", main.Models[1].Name);
-        Assert.Equal("LUNA", main.Models[2].Name);
+        Assert.Equal(["SOL", "TERRA", "LUNA"], main.Models.Select(model => model.Name));
         Assert.NotEmpty(main.ActiveThreadCountLabel);
         Assert.NotEmpty(main.ActiveThreadCountText);
         Assert.NotEmpty(main.ResetAtText);

@@ -118,11 +118,13 @@ public sealed class GraphScene
         IReadOnlyList<GraphScene>? periodScenes = null,
         bool hasViewportPoints = false,
         long? resetAt = null,
-        IReadOnlyList<GraphObservedSample>? hoverObservations = null)
+        IReadOnlyList<GraphObservedSample>? hoverObservations = null,
+        bool isVerifiedCurrentResetStart = false)
     {
         PeriodStartAt = periodStartAt;
         PeriodEndAt = periodEndAt;
         ResetAt = resetAt;
+        IsVerifiedCurrentResetStart = isVerifiedCurrentResetStart;
         Metric = metric;
         Timestamps = timestamps;
         Remaining = remaining;
@@ -165,6 +167,12 @@ public sealed class GraphScene
 
     /// <summary>The API reset boundary, independent of the clipped display end.</summary>
     public long? ResetAt { get; }
+
+    /// <summary>
+    /// True only when the selected directory marks this page-paired period as
+    /// the authoritative current quota window.
+    /// </summary>
+    internal bool IsVerifiedCurrentResetStart { get; }
 
     public GraphMetric Metric { get; }
 
@@ -424,7 +432,8 @@ public sealed class GraphScene
         IReadOnlyList<GraphConfirmedGap>? confirmedGaps,
         IReadOnlySet<string>? hiddenModelNames,
         IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals,
-        long? resetAt)
+        long? resetAt,
+        bool isVerifiedCurrentResetStart = false)
     {
         ArgumentNullException.ThrowIfNull(samples);
         if (samples.Count == 0)
@@ -612,7 +621,8 @@ public sealed class GraphScene
             idleIntervals,
             maximum,
             resetAt: resetAt,
-            hoverObservations: BuildHoverObservations(samples, points, allModelNames));
+            hoverObservations: BuildHoverObservations(samples, points, allModelNames),
+            isVerifiedCurrentResetStart: isVerifiedCurrentResetStart);
     }
 
     private static ModelProjection GroupDisplayProjection(

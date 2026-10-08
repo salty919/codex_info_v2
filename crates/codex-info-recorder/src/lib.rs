@@ -11,13 +11,14 @@ use chrono::{DateTime, Months, Utc};
 use codex_info::{security, thread_contract};
 use codex_info_db_writer::{
     classify_quota_transition, finalize_session_timeline_recovery, session_event_is_replay,
-    ActiveThreadRecord, ActiveThreadSnapshot, PreviousQuotaState, QuotaCandidate, QuotaTransition,
-    RecordedSessionSource, SessionCheckpoint, SessionCollectionCommit, SessionCollectionState,
-    SessionEvent, SessionEventReattribution, SessionLifecycleInterval, SessionModelTotal,
-    SessionPendingRange, SessionRange, SessionTaskEvent, SessionTaskEvidenceInput,
-    SessionTaskIndexedRange, SessionTimelineRecovery, SessionTimelineRecoveryPoint,
-    StoragePartitionIdentity, UsageHistoryObservation, UsageHistorySample, UsageStore,
-    UsageStoreError, VerifiedPartitionBackup,
+    session_token_anchor_recovery_id, ActiveThreadRecord, ActiveThreadSnapshot, PreviousQuotaState,
+    QuotaCandidate, QuotaTransition, RecordedSessionSource, SessionCheckpoint,
+    SessionCollectionCommit, SessionCollectionState, SessionEvent, SessionEventReattribution,
+    SessionLifecycleInterval, SessionModelTotal, SessionPendingRange, SessionRange,
+    SessionTaskEvent, SessionTaskEvidenceInput, SessionTaskIndexedRange, SessionTimelineRecovery,
+    SessionTimelineRecoveryPoint, SessionTokenAnchor, SessionTokenAnchorRecovery,
+    SessionTokenAnchorResolution, StoragePartitionIdentity, UsageHistoryObservation,
+    UsageHistorySample, UsageStore, UsageStoreError, VerifiedPartitionBackup,
 };
 use codex_info_pricing::{estimate_legacy, family, Usage as PricingUsage};
 use serde_json::{json, Value};
@@ -2037,21 +2038,6 @@ pub struct TokenSnapshot {
 }
 
 impl TokenSnapshot {
-    fn checked_delta_from(self, previous: Self) -> Option<Self> {
-        let cache_write_input = match (self.cache_write_input, previous.cache_write_input) {
-            (Some(current), Some(before)) => Some(current.checked_sub(before)?),
-            (None, None) => None,
-            _ => return None,
-        };
-        Some(Self {
-            total: self.total.checked_sub(previous.total)?,
-            input: self.input.checked_sub(previous.input)?,
-            cached_input: self.cached_input.checked_sub(previous.cached_input)?,
-            output: self.output.checked_sub(previous.output)?,
-            cache_write_input,
-        })
-    }
-
     fn cache_write_delta_from(self, previous: Self) -> Option<u64> {
         match (self.cache_write_input, previous.cache_write_input) {
             (Some(current), Some(before)) => current.checked_sub(before),
@@ -2410,6 +2396,8 @@ struct PendingBatch {
     task_events: Vec<SessionTaskEvent>,
     task_indexed_ranges: Vec<SessionTaskIndexedRange>,
     pending_evidence: Vec<SessionPendingRange>,
+    token_anchor_recoveries: Vec<SessionTokenAnchorRecovery>,
+    token_anchor_resolutions: Vec<SessionTokenAnchorResolution>,
     model_totals: Vec<SessionModelTotal>,
     timeline_recovery: Option<SessionTimelineRecovery>,
     accepted_ranges: usize,
@@ -3408,7 +3396,9 @@ impl Recorder {
         // cycle's degraded decision even when the current source scan starts
         // after a completed malformed record; only the writer transaction
         // may remove evidence after an accepted exact range.
-        let durable_pending_count = self.writer.load_session_pending_ranges()?.len();
+        let durable_pending = self.writer.load_session_pending_ranges()?;
+        let durable_pending_count = durable_pending.len();
+        let durable_token_anchor_recoveries = self.writer.load_session_token_anchor_recoveries()?;
         let admitted_quota = quota
             .as_ref()
             .and_then(|candidate| admit_quota_period(&state, candidate));
@@ -3508,6 +3498,8 @@ impl Recorder {
         let mut checkpoints = Vec::new();
         let mut ranges = Vec::new();
         let mut durable_events = Vec::new();
+        let mut token_anchor_recoveries = Vec::new();
+        let mut token_anchor_resolutions = Vec::new();
         let mut pending_evidence = inventory_failures
             .into_iter()
             .map(|failure| {
@@ -3521,6 +3513,7 @@ impl Recorder {
             .collect::<Vec<_>>();
         let mut consumed_budget = 0_u64;
         let mut pending_ranges = pending_evidence.len();
+        let mut current_cycle_unresolved = !pending_evidence.is_empty();
         if durable_pending_count != 0 {
             pending_ranges = pending_ranges.max(1);
         }
@@ -3575,6 +3568,34 @@ impl Recorder {
         };
         for logical_index in 0..source_count {
             let source = &sources[(first_source + logical_index) % source_count];
+            let source_token_anchor_recovery =
+                durable_token_anchor_recoveries.iter().find(|recovery| {
+                    recovery.current_root_identity == source.recorded.root_identity
+                        && recovery.current_relative_path == source.recorded.relative_path
+                        && recovery.current_file_device == source.recorded.file_device
+                        && recovery.current_file_inode == source.recorded.file_inode
+                        && recovery.cursor_collector_epoch == collector_epoch
+                });
+            let path_has_token_anchor_recovery =
+                durable_token_anchor_recoveries.iter().any(|recovery| {
+                    recovery.current_root_identity == source.recorded.root_identity
+                        && recovery.current_relative_path == source.recorded.relative_path
+                });
+            let path_has_legacy_anchor_pending = durable_pending.iter().any(|pending| {
+                pending.root_identity == source.recorded.root_identity
+                    && pending.relative_path == source.recorded.relative_path
+                    && pending.reason == "checkpoint-token-anchor-missing"
+            });
+            if source_token_anchor_recovery.is_none()
+                && (path_has_token_anchor_recovery || path_has_legacy_anchor_pending)
+            {
+                // A pre-sidecar pending row has no durable original anchor.
+                // Keep it unresolved rather than treating the later current
+                // checkpoint as proof; other sources continue normally.
+                pending_ranges = pending_ranges.max(1);
+                current_cycle_unresolved = true;
+                continue;
+            }
             let prior = prior_checkpoint(&state.checkpoints, source);
             let baseline_existing = boundary_not_committed
                 || baseline_new_partition
@@ -3602,6 +3623,7 @@ impl Recorder {
                     ));
                 }
                 pending_ranges = pending_ranges.saturating_add(1);
+                current_cycle_unresolved = true;
                 pending_evidence.push(pending_source_issue(
                     source,
                     prior,
@@ -3621,6 +3643,7 @@ impl Recorder {
                 reset_at,
                 window_start,
                 self.config.chunk_bytes.saturating_sub(consumed_budget),
+                source_token_anchor_recovery,
                 &mut totals,
                 &mut events,
             );
@@ -3642,6 +3665,7 @@ impl Recorder {
                         ));
                     }
                     pending_ranges = pending_ranges.saturating_add(1);
+                    current_cycle_unresolved = true;
                     pending_evidence.push(pending_source_issue(
                         source,
                         prior,
@@ -3660,6 +3684,7 @@ impl Recorder {
                     ));
                 }
                 pending_ranges = pending_ranges.saturating_add(1);
+                current_cycle_unresolved = true;
                 pending_evidence.push(pending_source_issue(
                     source,
                     prior,
@@ -3669,6 +3694,12 @@ impl Recorder {
                 ));
                 continue;
             };
+            if let Some(recovery) = result.token_anchor_recovery.take() {
+                token_anchor_recoveries.push(recovery);
+            }
+            if let Some(resolution) = result.token_anchor_resolution.take() {
+                token_anchor_resolutions.push(resolution);
+            }
             let mut admitted_events = Vec::with_capacity(result.events.len());
             for event in result.events {
                 let replay = admitted_session_events
@@ -3698,6 +3729,10 @@ impl Recorder {
             consumed_budget = consumed_budget.saturating_add(result.consumed_bytes);
             if result.unresolved {
                 pending_ranges = pending_ranges.saturating_add(result.pending.len().max(1));
+                current_cycle_unresolved = true;
+            }
+            if !result.pending.is_empty() {
+                current_cycle_unresolved = true;
             }
             if result.changed {
                 checkpoints.push(result.checkpoint);
@@ -3710,6 +3745,20 @@ impl Recorder {
             durable_events.extend(result.events);
             pending_evidence.extend(result.pending);
         }
+
+        // A currently committed exact anchor resolution can clear its own
+        // durable pending row in the same writer transaction. Keep every
+        // other durable or current-cycle issue incomplete; in particular,
+        // ordinary accepted-range replacement retains its conservative
+        // existing one-cycle behavior.
+        let candidate_model_totals_complete = !current_cycle_unresolved
+            && durable_pending.iter().all(|pending| {
+                pending_range_resolved_by_anchor(
+                    pending,
+                    &durable_token_anchor_recoveries,
+                    &token_anchor_resolutions,
+                )
+            });
 
         let timeline_recovery = if !period_restarted && period_available {
             if let Some(identity) = self.identity.as_ref() {
@@ -3750,7 +3799,7 @@ impl Recorder {
                 &history_events,
                 reset_at,
                 history_initial_totals,
-                pending_ranges == 0,
+                candidate_model_totals_complete,
             )
         };
         let quota_sample = quota.as_ref().and_then(|candidate| {
@@ -3814,7 +3863,7 @@ impl Recorder {
                     UsageHistoryObservation::confirmed_with_models(sample, models);
                 // Known model facts survive a partial scan, but an unresolved
                 // source cannot establish the complete set, including empty.
-                observation.model_totals_complete = pending_ranges == 0;
+                observation.model_totals_complete = candidate_model_totals_complete;
                 observation
             })
             .collect::<Vec<_>>();
@@ -3843,6 +3892,8 @@ impl Recorder {
             task_events,
             task_indexed_ranges,
             pending_evidence,
+            token_anchor_recoveries,
+            token_anchor_resolutions,
             model_totals,
             timeline_recovery,
         });
@@ -3887,6 +3938,8 @@ impl Recorder {
                     SessionTaskEvidenceInput {
                         events: &pending.durable_events,
                         pending_ranges: &pending.pending_evidence,
+                        token_anchor_recoveries: &pending.token_anchor_recoveries,
+                        token_anchor_resolutions: &pending.token_anchor_resolutions,
                         task_events: &pending.task_events,
                         task_indexed_ranges: &pending.task_indexed_ranges,
                     },
@@ -3899,6 +3952,8 @@ impl Recorder {
                 SessionTaskEvidenceInput {
                     events: &pending.durable_events,
                     pending_ranges: &pending.pending_evidence,
+                    token_anchor_recoveries: &pending.token_anchor_recoveries,
+                    token_anchor_resolutions: &pending.token_anchor_resolutions,
                     task_events: &pending.task_events,
                     task_indexed_ranges: &pending.task_indexed_ranges,
                 },
@@ -3924,6 +3979,10 @@ impl Recorder {
             || !self
                 .writer
                 .verify_session_task_batch(&pending.task_indexed_ranges, &pending.task_events)?
+            || !self.writer.verify_session_token_anchor_batch(
+                &pending.token_anchor_recoveries,
+                &pending.token_anchor_resolutions,
+            )?
         {
             return Err(RecorderError::Invalid(
                 "session collection read-back did not match committed batch".to_owned(),
@@ -4020,6 +4079,19 @@ struct SourceInventory {
     root_identity: String,
     sources: Vec<Source>,
     failures: Vec<InventoryFailure>,
+}
+
+fn pending_range_resolved_by_anchor(
+    pending: &SessionPendingRange,
+    durable_recoveries: &[SessionTokenAnchorRecovery],
+    resolutions: &[SessionTokenAnchorResolution],
+) -> bool {
+    durable_recoveries.iter().any(|recovery| {
+        recovery.pending == *pending
+            && resolutions
+                .iter()
+                .any(|resolution| resolution.recovery_id == recovery.recovery_id)
+    })
 }
 
 fn fallback_root_identity(root: &Path) -> String {
@@ -4128,6 +4200,8 @@ struct SourceOutcome {
     task_events: Vec<SessionTaskEvent>,
     task_indexed_ranges: Vec<SessionTaskIndexedRange>,
     pending: Vec<SessionPendingRange>,
+    token_anchor_recovery: Option<SessionTokenAnchorRecovery>,
+    token_anchor_resolution: Option<SessionTokenAnchorResolution>,
     unresolved: bool,
     changed: bool,
     consumed_bytes: u64,
@@ -4359,6 +4433,7 @@ fn scan_source(
     reset_at: i64,
     window_start: i64,
     max_bytes: u64,
+    saved_token_anchor_recovery: Option<&SessionTokenAnchorRecovery>,
     totals: &mut ModelTotals,
     events: &mut Vec<TimedModelUsage>,
 ) -> Result<Option<SourceOutcome>, RecorderError> {
@@ -4390,17 +4465,27 @@ fn scan_source(
             && checkpoint.file_inode == source.recorded.file_inode
             && checkpoint.committed_offset <= snapshot_len
     });
-    let recovery_anchor = (!baseline_existing)
-        .then_some(prior)
-        .flatten()
-        .filter(|checkpoint| checkpoint.token_baseline_known)
-        .filter(|_| continuous.is_none())
-        .map(|checkpoint| TokenSnapshot {
-            total: checkpoint.previous_total,
-            input: checkpoint.previous_input,
-            cached_input: checkpoint.previous_cached_input,
-            output: checkpoint.previous_output,
-            cache_write_input: checkpoint.previous_cache_write_input,
+    let recovery_anchor = saved_token_anchor_recovery
+        .map(|recovery| TokenSnapshot {
+            total: recovery.anchor.total_tokens,
+            input: recovery.anchor.input_tokens,
+            cached_input: recovery.anchor.cached_input_tokens,
+            output: recovery.anchor.output_tokens,
+            cache_write_input: recovery.anchor.cache_write_input_tokens,
+        })
+        .or_else(|| {
+            (!baseline_existing)
+                .then_some(prior)
+                .flatten()
+                .filter(|checkpoint| checkpoint.token_baseline_known)
+                .filter(|_| continuous.is_none())
+                .map(|checkpoint| TokenSnapshot {
+                    total: checkpoint.previous_total,
+                    input: checkpoint.previous_input,
+                    cached_input: checkpoint.previous_cached_input,
+                    output: checkpoint.previous_output,
+                    cache_write_input: checkpoint.previous_cache_write_input,
+                })
         });
     let mut recovery_anchor_found = recovery_anchor.is_none();
     let (
@@ -4508,10 +4593,7 @@ fn scan_source(
     // vector is what lets a later reset boundary reconstruct outage-spanning
     // usage without rereading or double-adding checkpoints.
     let mut all_candidate_events = Vec::new();
-    let mut recovery_stream_previous = None;
-    let mut recovery_stream_events = Vec::new();
-    let mut recovery_stream_proven = true;
-    let mut recovery_last = None;
+    let mut recovery_match = None;
     let mut token_count_seen = false;
     let mut read_any = false;
     let mut record_index = 0_u64;
@@ -4640,35 +4722,15 @@ fn scan_source(
         if let Some(anchor) = recovery_anchor.filter(|_| !recovery_anchor_found) {
             baseline_known = true;
             previous = current;
-            let timestamp = summary.event_timestamp();
-            let model = ModelTotals::usage_model(last_model.as_deref());
-            recovery_last = Some((current, timestamp));
             if current != anchor {
-                if let Some(before) = recovery_stream_previous {
-                    match current.checked_delta_from(before) {
-                        Some(delta) if timestamp > 0 && delta.has_usage() => {
-                            recovery_stream_events.push(TimedModelUsage {
-                                timestamp,
-                                model,
-                                delta,
-                            });
-                        }
-                        Some(_) => {}
-                        None => {
-                            recovery_stream_proven = false;
-                            // Values before a reset or an incomparable token
-                            // shape may overlap the old physical file. Only
-                            // the new, internally monotonic segment after this
-                            // boundary is safe to reconstruct.
-                            recovery_stream_events.clear();
-                        }
-                    }
-                }
-                recovery_stream_previous = Some(current);
                 continue;
             }
             recovery_anchor_found = true;
-            recovery_stream_events.clear();
+            fully_attributed = saved_token_anchor_recovery
+                .map(|recovery| recovery.anchor.fully_attributed_from_zero)
+                .or_else(|| prior.map(|checkpoint| checkpoint.fully_attributed_from_zero))
+                .unwrap_or(false);
+            recovery_match = Some((current, record_start, physical_offset));
             continue;
         }
         let delta = if history_base_pending {
@@ -4757,42 +4819,15 @@ fn scan_source(
     {
         return Ok(None);
     }
-    if let Some(anchor) = recovery_anchor.filter(|_| !recovery_anchor_found) {
+    if recovery_anchor.is_some() && !recovery_anchor_found {
         unresolved = true;
-        pending_evidence.push((
-            admitted_start,
-            end_offset,
-            "checkpoint-token-anchor-missing",
-            true,
-        ));
-        let recovered_events = if recovery_stream_proven {
-            recovery_last
-                .and_then(|(last, timestamp)| {
-                    last.checked_delta_from(anchor).and_then(|delta| {
-                        (timestamp > 0 && delta.has_usage()).then(|| {
-                            vec![TimedModelUsage {
-                                timestamp,
-                                model: UNATTRIBUTED_MODEL.to_owned(),
-                                delta,
-                            }]
-                        })
-                    })
-                })
-                // If the replacement starts after a proven counter reset,
-                // its endpoint cannot be joined to the old anchor. Preserve
-                // only deltas proven inside the new monotonic stream.
-                .unwrap_or(recovery_stream_events)
-        } else {
-            recovery_stream_events
-        };
-        for event in recovered_events {
-            all_candidate_events.push(event.clone());
-            if reset_at == 0 {
-                candidate_events.push(event);
-            } else if event.timestamp >= window_start && event.timestamp <= reset_at {
-                candidate_totals.add(&event.model, event.delta)?;
-                candidate_events.push(event);
-            }
+        if saved_token_anchor_recovery.is_none() {
+            pending_evidence.push((
+                admitted_start,
+                end_offset,
+                "checkpoint-token-anchor-missing",
+                true,
+            ));
         }
     }
     let accepted_digest = (end_offset > admitted_start)
@@ -4951,9 +4986,84 @@ fn scan_source(
             })
         })
         .collect::<Result<Vec<_>, RecorderError>>()?;
+    let changed = prior.is_none_or(|old| !same_checkpoint_content(old, &checkpoint));
+    let token_anchor_recovery = if recovery_anchor.is_some() && !recovery_anchor_found {
+        if let Some(saved) = saved_token_anchor_recovery {
+            if changed {
+                let mut advanced = saved.clone();
+                advanced.cursor_offset = checkpoint.committed_offset;
+                advanced.cursor_prefix_generation = checkpoint.prefix_generation;
+                advanced.cursor_collector_epoch = checkpoint.collector_epoch;
+                advanced.cursor_cycle_seq = checkpoint.cycle_seq;
+                Some(advanced)
+            } else {
+                None
+            }
+        } else {
+            let original = prior.filter(|checkpoint| checkpoint.token_baseline_known);
+            let missing_anchor_pending = pending
+                .iter()
+                .find(|item| item.reason == "checkpoint-token-anchor-missing");
+            original
+                .zip(missing_anchor_pending)
+                .map(|(original, pending)| {
+                    let anchor = SessionTokenAnchor {
+                        root_identity: original.root_identity.clone(),
+                        relative_path: original.relative_path.clone(),
+                        file_device: original.file_device,
+                        file_inode: original.file_inode,
+                        prefix_generation: original.prefix_generation,
+                        committed_offset: original.committed_offset,
+                        prefix_sha256: original.prefix_sha256.clone(),
+                        collector_epoch: original.collector_epoch,
+                        cycle_seq: original.cycle_seq,
+                        fully_attributed_from_zero: original.fully_attributed_from_zero,
+                        total_tokens: original.previous_total,
+                        input_tokens: original.previous_input,
+                        cached_input_tokens: original.previous_cached_input,
+                        output_tokens: original.previous_output,
+                        cache_write_input_tokens: original.previous_cache_write_input,
+                    };
+                    let recovery_id = session_token_anchor_recovery_id(pending, &anchor);
+                    SessionTokenAnchorRecovery {
+                        recovery_id,
+                        pending: pending.clone(),
+                        anchor,
+                        current_root_identity: source.recorded.root_identity.clone(),
+                        current_relative_path: source.recorded.relative_path.clone(),
+                        current_file_device: source.recorded.file_device,
+                        current_file_inode: source.recorded.file_inode,
+                        cursor_offset: checkpoint.committed_offset,
+                        cursor_prefix_generation: checkpoint.prefix_generation,
+                        cursor_collector_epoch: checkpoint.collector_epoch,
+                        cursor_cycle_seq: checkpoint.cycle_seq,
+                    }
+                })
+        }
+    } else {
+        None
+    };
+    let token_anchor_resolution = saved_token_anchor_recovery
+        .and_then(|saved| recovery_match.map(|(matched, start, end)| (saved, matched, start, end)))
+        .and_then(
+            |(saved, matched, matched_start_offset, matched_end_offset)| {
+                range
+                    .as_ref()
+                    .map(|accepted_range| SessionTokenAnchorResolution {
+                        recovery_id: saved.recovery_id.clone(),
+                        matched_start_offset,
+                        matched_end_offset,
+                        total_tokens: matched.total,
+                        input_tokens: matched.input,
+                        cached_input_tokens: matched.cached_input,
+                        output_tokens: matched.output,
+                        cache_write_input_tokens: matched.cache_write_input,
+                        accepted_range: accepted_range.clone(),
+                    })
+            },
+        );
     *totals = candidate_totals;
     events.extend(candidate_events);
-    let changed = prior.is_none_or(|old| !same_checkpoint_content(old, &checkpoint));
     Ok(Some(SourceOutcome {
         checkpoint,
         range,
@@ -4961,6 +5071,8 @@ fn scan_source(
         task_events,
         task_indexed_ranges: task_indexed_range.into_iter().collect(),
         pending,
+        token_anchor_recovery,
+        token_anchor_resolution,
         unresolved,
         changed,
         consumed_bytes,
@@ -7080,6 +7192,34 @@ mod tests {
         )
     }
 
+    fn token_with_cache_write_input(
+        total: u64,
+        cache_write_input_tokens: u64,
+        timestamp: i64,
+    ) -> String {
+        format!(
+            "{}\n",
+            json!({
+                "type": "event_msg",
+                "timestamp": DateTime::<Utc>::from_timestamp(timestamp, 0)
+                    .unwrap()
+                    .to_rfc3339(),
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "total_tokens": total,
+                            "input_tokens": total,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_write_input_tokens": cache_write_input_tokens,
+                        },
+                    },
+                },
+            })
+        )
+    }
+
     fn context_token(total: u64, context: u64, window: u64, timestamp: i64) -> String {
         format!(
             "{}\n",
@@ -7996,43 +8136,6 @@ mod tests {
     }
 
     #[test]
-    fn recovery_delta_requires_matching_cache_write_lineage() {
-        let anchor = TokenSnapshot {
-            total: 10,
-            input: 8,
-            cached_input: 2,
-            output: 2,
-            cache_write_input: Some(3),
-        };
-        let current = TokenSnapshot {
-            total: 15,
-            input: 12,
-            cached_input: 3,
-            output: 3,
-            cache_write_input: Some(5),
-        };
-
-        assert_eq!(
-            current.checked_delta_from(anchor),
-            Some(TokenSnapshot {
-                total: 5,
-                input: 4,
-                cached_input: 1,
-                output: 1,
-                cache_write_input: Some(2),
-            })
-        );
-        assert_eq!(
-            TokenSnapshot {
-                cache_write_input: None,
-                ..current
-            }
-            .checked_delta_from(anchor),
-            None
-        );
-    }
-
-    #[test]
     fn timeline_weighting_preserves_the_exact_final_dollar_endpoint() {
         let dollars = 54.696256_f64;
 
@@ -8316,6 +8419,168 @@ mod tests {
     }
 
     #[test]
+    fn predeadline_quota_rollover_filters_delayed_session_events_by_new_window() {
+        const WINDOW: i64 = 7 * 24 * 60 * 60;
+        const OLD_OBSERVED_AT: i64 = 2_000_000_100;
+        const OLD_RESET_AT: i64 = OLD_OBSERVED_AT + WINDOW;
+        const NEW_WINDOW_START: i64 = 2_000_000_400;
+        const NEW_OBSERVED_AT: i64 = 2_000_000_800;
+        const NEW_RESET_AT: i64 = NEW_WINDOW_START + WINDOW;
+        const PRE_WINDOW_EVENT_AT: i64 = 2_000_000_300;
+        const POST_WINDOW_EVENT_AT: i64 = 2_000_000_650;
+
+        let (root, database) = prepare("predeadline-quota-rollover");
+        let source = root.join("sessions/one.jsonl");
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE collection_generation
+                 SET reset_at=?1, latest_quota_reset_at=?1, window_seconds=?2",
+                (0_i64, 0_i64),
+            )
+            .unwrap();
+        fs::write(&source, token(10, OLD_OBSERVED_AT)).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: OLD_OBSERVED_AT,
+                reset_at: OLD_RESET_AT,
+                window_seconds: WINDOW,
+                remaining_percent: Some(25.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let before_checkpoint = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
+            .unwrap();
+
+        // Session records arrive together after the provider's new window
+        // start. Their timestamps straddle that start, while the old deadline
+        // remains in the future and the quota wire carries no reset reason.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}",
+                    token(15, PRE_WINDOW_EVENT_AT),
+                    token(20, POST_WINDOW_EVENT_AT)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        recorder.run_cycle_with_quota(None).unwrap().unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            10,
+            "both deltas belong to the still-current old window before the new quota arrives"
+        );
+        let collected_checkpoint = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
+            .unwrap();
+        assert_eq!(
+            collected_checkpoint.file_device,
+            before_checkpoint.file_device
+        );
+        assert_eq!(
+            collected_checkpoint.file_inode,
+            before_checkpoint.file_inode
+        );
+        assert!(collected_checkpoint.committed_offset > before_checkpoint.committed_offset);
+
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: NEW_OBSERVED_AT,
+                reset_at: NEW_RESET_AT,
+                window_seconds: WINDOW,
+                remaining_percent: Some(95.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let rolled_state = recorder.state().unwrap();
+        assert_eq!(rolled_state.reset_at, NEW_RESET_AT);
+        assert_eq!(rolled_state.latest_quota_reset_at, NEW_RESET_AT);
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            5,
+            "only the delta timestamped inside the externally defined new window is included"
+        );
+        let rolled_checkpoint = rolled_state
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
+            .unwrap();
+        assert_eq!(
+            rolled_checkpoint.file_device,
+            collected_checkpoint.file_device
+        );
+        assert_eq!(
+            rolled_checkpoint.file_inode,
+            collected_checkpoint.file_inode
+        );
+        assert_eq!(
+            rolled_checkpoint.committed_offset,
+            collected_checkpoint.committed_offset
+        );
+        drop(recorder);
+
+        let mut restarted =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        restarted.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            5,
+            "restarting and replaying the unchanged source must not duplicate its post-window delta"
+        );
+        let restarted_checkpoint = restarted
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
+            .unwrap();
+        assert_eq!(
+            restarted_checkpoint.file_device,
+            rolled_checkpoint.file_device
+        );
+        assert_eq!(
+            restarted_checkpoint.file_inode,
+            rolled_checkpoint.file_inode
+        );
+        assert_eq!(
+            restarted_checkpoint.committed_offset,
+            rolled_checkpoint.committed_offset
+        );
+        let connection = Connection::open(&database).unwrap();
+        for timestamp in [PRE_WINDOW_EVENT_AT, POST_WINDOW_EVENT_AT] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE relative_path='one.jsonl' AND timestamp=?1",
+                    [timestamp],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "source event at {timestamp} must be persisted once"
+            );
+        }
+        drop(restarted);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn live_quota_reset_deadline_correction_keeps_one_recorder_period() {
         let (root, database) = prepare("reset-deadline-correction");
         let source = root.join("sessions/one.jsonl");
@@ -8579,6 +8844,7 @@ mod tests {
             now + 60,
             now - 60,
             4096,
+            None,
             &mut totals,
             &mut events,
         )
@@ -8594,7 +8860,7 @@ mod tests {
     }
 
     #[test]
-    fn replaced_source_without_anchor_is_reconciled_once_and_reported() {
+    fn replaced_source_without_anchor_remains_pending_without_credit() {
         let (root, database) = prepare("source-replacement");
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
@@ -8617,7 +8883,7 @@ mod tests {
         let replacement_report = recorder.run_cycle().unwrap().unwrap();
         assert_eq!(
             recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            95
+            70
         );
         assert_eq!(replacement_report.pending_ranges, 1);
         let diagnostic: (String, i64) = Connection::open(&database)
@@ -8633,20 +8899,29 @@ mod tests {
             ("checkpoint-token-anchor-missing".to_owned(), 1)
         );
 
-        recorder.run_cycle().unwrap().unwrap();
+        let repeated = recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(repeated.pending_ranges, 1);
         assert_eq!(
             recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            95
+            70
+        );
+        assert_eq!(
+            recorder
+                .writer
+                .load_session_token_anchor_recoveries()
+                .unwrap()
+                .len(),
+            1
         );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn replaced_source_recovers_only_the_segment_after_a_counter_reset() {
+    fn replaced_source_without_exact_anchor_does_not_credit_counter_suffix() {
         for (name, replacement_values, recovered_total) in [
-            ("reset-above-anchor", [90, 100, 20, 105], 155),
-            ("reset-below-anchor", [90, 100, 20, 30], 80),
-            ("reset-before-first-record", [20, 20, 20, 30], 80),
+            ("reset-above-anchor", [90, 100, 20, 105], 70),
+            ("reset-below-anchor", [90, 100, 20, 30], 70),
+            ("reset-before-first-record", [20, 20, 20, 30], 70),
         ] {
             let (root, database) = prepare(name);
             let source = root.join("sessions/one.jsonl");
@@ -8679,6 +8954,492 @@ mod tests {
             );
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn checkpoint_token_anchor_recovery_late_match_survives_restart_and_commits_once() {
+        let (root, database) = prepare("checkpoint-anchor-late-match-restart");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE collection_generation
+                 SET reset_at=0, latest_quota_reset_at=0, window_seconds=0",
+                [],
+            )
+            .unwrap();
+        let original = (1..=8)
+            .map(|index| token_with_cache_write_input(index * 10, 0, now + index as i64))
+            .collect::<String>();
+        fs::write(&source, original).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 9,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70
+        );
+
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                token_with_cache_write_input(90, 1, now + 10),
+                token_with_cache_write_input(95, 1, now + 11)
+            ),
+        )
+        .unwrap();
+        let unresolved = recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(unresolved.pending_ranges, 1);
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70,
+            "an unmatched replacement prefix must not be credited"
+        );
+        drop(recorder);
+
+        let mut restarted =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        let still_unresolved = restarted.run_cycle().unwrap().unwrap();
+        assert_eq!(still_unresolved.pending_ranges, 1);
+        assert_eq!(
+            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70,
+            "restart must retain the original unresolved anchor without crediting the prefix"
+        );
+        assert_eq!(
+            restarted
+                .writer
+                .load_session_token_anchor_recoveries()
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token_with_cache_write_input(80, 1, now + 20).as_bytes())
+            .unwrap();
+        let wrong_cache_write = restarted.run_cycle().unwrap().unwrap();
+        assert_eq!(wrong_cache_write.pending_ranges, 1);
+        assert_eq!(
+            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70,
+            "an equal token total with a different cache-write counter is not the saved anchor"
+        );
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}{}",
+                    token_with_cache_write_input(80, 0, now + 20),
+                    token_with_cache_write_input(82, 0, now + 21),
+                    token_with_cache_write_input(84, 0, now + 22)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let current_period = restarted.state().unwrap();
+        let recovered = restarted
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 23,
+                reset_at: current_period.reset_at,
+                window_seconds: current_period.window_seconds,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.pending_ranges, 0);
+        assert_eq!(
+            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            74
+        );
+        let recovered_observation_complete: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT model_set_complete FROM usage_model_history
+                 ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered_observation_complete, 1,
+            "resolving the last pending anchor must publish the new observation as complete"
+        );
+        let recovered_event_count: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp>=?1",
+                [now + 20],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_event_count, 2);
+
+        drop(restarted);
+        let mut replay =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        replay.run_cycle().unwrap().unwrap();
+        assert_eq!(replay.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 74);
+        let replayed_event_count: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp>=?1",
+                [now + 20],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replayed_event_count, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_token_anchor_legacy_pending_without_sidecar_never_uses_current_checkpoint() {
+        let (root, database) = prepare("checkpoint-anchor-legacy-no-sidecar");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE collection_generation
+                 SET reset_at=0, latest_quota_reset_at=0, window_seconds=0",
+                [],
+            )
+            .unwrap();
+        let original = (1..=8)
+            .map(|index| token(index * 10, now + index as i64))
+            .collect::<String>();
+        fs::write(&source, original).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 9,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70
+        );
+
+        fs::write(
+            &source,
+            format!("{}{}", token(90, now + 10), token(95, now + 11)),
+        )
+        .unwrap();
+        assert_eq!(
+            recorder
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at: now + 12,
+                    reset_at: now + 3600,
+                    window_seconds: 3600,
+                    remaining_percent: Some(90.0),
+                }))
+                .unwrap()
+                .unwrap()
+                .pending_ranges,
+            1
+        );
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70
+        );
+        let pending_before = recorder.writer.load_session_pending_ranges().unwrap();
+        let checkpoint_before = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| {
+                checkpoint.file_device == pending_before[0].file_device
+                    && checkpoint.file_inode == pending_before[0].file_inode
+            })
+            .unwrap();
+        drop(recorder);
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("DELETE FROM session_token_anchor_recoveries", [])
+            .unwrap();
+        drop(connection);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(100, now + 20).as_bytes())
+            .unwrap();
+
+        let mut legacy =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        let current_period = legacy.state().unwrap();
+        let retained = legacy
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 21,
+                reset_at: current_period.reset_at,
+                window_seconds: current_period.window_seconds,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.pending_ranges, 1);
+        assert_eq!(legacy.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 70);
+        assert!(legacy
+            .writer
+            .load_session_token_anchor_recoveries()
+            .unwrap()
+            .is_empty());
+        let pending = legacy.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].reason, "checkpoint-token-anchor-missing");
+        let checkpoint_after = legacy
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| {
+                checkpoint.file_device == pending[0].file_device
+                    && checkpoint.file_inode == pending[0].file_inode
+            })
+            .unwrap();
+        assert_eq!(checkpoint_after, checkpoint_before);
+        let credited_late_event: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp=?1",
+                [now + 20],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(credited_late_event, 0);
+        let latest_model_set_complete: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT model_set_complete FROM usage_model_history
+                 ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            latest_model_set_complete, 0,
+            "a legacy pending range without its original anchor remains incomplete"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_token_anchor_recovery_keeps_other_verified_sources_advancing() {
+        let (root, database) = prepare("checkpoint-anchor-other-source");
+        let replaced_source = root.join("sessions/one.jsonl");
+        let verified_source = root.join("sessions/two.jsonl");
+        let now = Utc::now().timestamp();
+        let original = (1..=8)
+            .map(|index| token(index * 10, now + index as i64))
+            .collect::<String>();
+        fs::write(&replaced_source, original).unwrap();
+        fs::write(
+            &verified_source,
+            format!("{}{}", token(10, now), token(15, now + 1)),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            75
+        );
+
+        fs::write(
+            &replaced_source,
+            format!("{}{}", token(90, now + 10), token(95, now + 11)),
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&verified_source)
+            .unwrap()
+            .write_all(token(20, now + 12).as_bytes())
+            .unwrap();
+        let report = recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(report.pending_ranges, 1);
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            80,
+            "only the other source's verified five-token delta may advance"
+        );
+        let connection = Connection::open(&database).unwrap();
+        let verified_delta: i64 = connection
+            .query_row(
+                "SELECT CAST(total_tokens AS INTEGER) FROM session_events
+                 WHERE relative_path='two.jsonl' AND timestamp=?1",
+                [now + 12],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verified_delta, 5);
+        let untrusted_deltas: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp BETWEEN ?1 AND ?2",
+                (now + 10, now + 11),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(untrusted_deltas, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_token_anchor_recovery_preserves_zero_anchor_across_token_free_prefix() {
+        let (root, database) = prepare("checkpoint-anchor-zero-token-free");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&source, token(0, now)).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder
+                .model_totals()
+                .unwrap()
+                .get(UNATTRIBUTED_MODEL)
+                .map_or(0, |counter| counter.total),
+            0
+        );
+
+        fs::write(&source, "{\"type\":\"session_meta\"}\n").unwrap();
+        let unresolved = recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(unresolved.pending_ranges, 1);
+        drop(recorder);
+
+        let mut restarted =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}{}",
+                    token(5, now + 10),
+                    token(0, now + 11),
+                    token(3, now + 12)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let recovered = restarted.run_cycle().unwrap().unwrap();
+        assert_eq!(recovered.pending_ranges, 0);
+        assert_eq!(
+            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            3,
+            "only usage after the exact zero-valued anchor is attributable"
+        );
+        let recovered_delta: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT CAST(total_tokens AS INTEGER) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp=?1",
+                [now + 12],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_delta, 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_token_anchor_recovery_crosses_weekly_boundary_once() {
+        let (root, database) = prepare("checkpoint-anchor-weekly-boundary");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        let previous_reset = now + 20;
+        let window_seconds = 3600;
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE collection_generation
+                 SET reset_at=?1, latest_quota_reset_at=?1, window_seconds=?2",
+                (previous_reset, window_seconds),
+            )
+            .unwrap();
+        let original = (1..=8)
+            .map(|index| token(index * 10, now + index as i64))
+            .collect::<String>();
+        fs::write(&source, original).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 15,
+                reset_at: previous_reset,
+                window_seconds,
+                remaining_percent: Some(80.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70
+        );
+
+        fs::write(
+            &source,
+            format!("{}{}", token(90, now + 16), token(95, now + 17)),
+        )
+        .unwrap();
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 1);
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70
+        );
+
+        let next_reset = previous_reset + window_seconds;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(80, now + 30), token(82, now + 31)).as_bytes())
+            .unwrap();
+        let recovered = recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 32,
+                reset_at: next_reset,
+                window_seconds,
+                remaining_percent: Some(75.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorder.state().unwrap().reset_at, next_reset);
+        assert_eq!(recovered.pending_ranges, 0);
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            2,
+            "the verified post-anchor delta belongs to the new weekly period"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

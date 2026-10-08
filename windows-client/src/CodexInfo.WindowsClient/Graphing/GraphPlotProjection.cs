@@ -864,16 +864,19 @@ internal static class GraphPlotProjection
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
         if (baselineMode is GraphRemainingBaselineMode.PeriodStartAtFullQuota &&
+            scene.IsVerifiedCurrentResetStart &&
             anchors.Length > 0 &&
             scene.RemainingObserved[anchors[0]] &&
-            scene.Timestamps[anchors[0]] > scene.PeriodStartAt)
+            scene.Timestamps[anchors[0]] > scene.PeriodStartAt &&
+            !scene.HasRemainingHardBreakBetween(scene.PeriodStartAt, scene.Timestamps[anchors[0]]) &&
+            !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[anchors[0]]))
         {
-            // Full quota at the period boundary is a renderer-only convention.
-            // Keep it out of GraphScene's raw/history arrays and visibly infer
-            // only the interval leading to the first accepted observation.
+            // Verified current-reset origin is renderer-only. Keep it out of
+            // GraphScene's raw/history arrays and connect only to the first
+            // accepted observation without crossing a confirmed break.
             AppendSegment(
-                dashedX,
-                dashedY,
+                solidX,
+                solidY,
                 scene.PeriodStartAt,
                 100,
                 scene.Timestamps[anchors[0]],
@@ -1155,6 +1158,30 @@ internal static class GraphPlotProjection
                     scene.Timestamps[interval.Right],
                     values[interval.Right]);
             }
+        }
+
+        if (scene.IsVerifiedCurrentResetStart &&
+            anchors.Length > 0 &&
+            scene.Timestamps[anchors[0]] > scene.PeriodStartAt &&
+            !scene.HasModelHardBreakBetween(
+                values,
+                scene.PeriodStartAt,
+                scene.Timestamps[anchors[0]]) &&
+            !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[anchors[0]]))
+        {
+            // The zero origin is a presentation boundary supported by the
+            // authoritative current period. It never becomes a model sample
+            // or a hover observation.
+            var (baselineX, baselineY) = values[anchors[0]] == 0
+                ? (flatX, flatY)
+                : (risingX, risingY);
+            AppendSegment(
+                baselineX,
+                baselineY,
+                scene.PeriodStartAt,
+                0,
+                scene.Timestamps[anchors[0]],
+                values[anchors[0]]);
         }
 
         var previous = anchors.LastOrDefault(-1);

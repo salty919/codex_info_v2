@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 const MAX_HISTORY_ROWS: usize = 31 * 24 * 60;
 const HISTORY_WINDOW_SECONDS: i64 = 31 * 24 * 60 * 60;
-pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 12;
+pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 13;
 const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
 const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
@@ -1299,15 +1299,6 @@ fn build_details_for_intervals(
             })
         })
         .filter(|quota| quota.window_seconds > 0);
-    let model_projection = read_model_projection_for_intervals(
-        connection,
-        intervals,
-        current_reset_at,
-        current_window_reset_at,
-        window_seconds,
-        history_is_canonical,
-    )?;
-    let models = model_projection.v1;
     let history_projection_context = HistoryProjectionContext {
         task_evidence,
         intervals,
@@ -1325,6 +1316,24 @@ fn build_details_for_intervals(
         cutoff,
         history_projection_context,
     )?;
+    let current_model_observation = latest_current_model_observation(
+        &history_samples_v3,
+        intervals,
+        current_reset_at,
+        current_window_reset_at,
+        window_seconds,
+        history_is_canonical,
+    );
+    let model_projection = read_current_model_projection_for_observation(
+        connection,
+        intervals,
+        current_reset_at,
+        current_window_reset_at,
+        window_seconds,
+        history_is_canonical,
+        current_model_observation,
+    )?;
+    let models = model_projection.v1;
     clip_history_periods(&mut periods, intervals);
     assign_history_period_labels(&mut periods, current_window_reset_at);
     let history_samples_v2 = history_observations_v2(&samples, &history_samples_v3);
@@ -1360,6 +1369,8 @@ fn build_details_for_intervals(
     let gaps = non_overlapping_gaps;
     let state = if samples.is_empty() {
         PublicState::Initializing
+    } else if model_projection.incomplete {
+        PublicState::Error
     } else {
         PublicState::Ready
     };
@@ -4050,6 +4061,44 @@ struct RawModelTotal {
 struct ModelProjection {
     v1: Vec<PublicDetailedModelUsage>,
     v3: Vec<PublicModelUsageV3>,
+    incomplete: bool,
+}
+
+fn latest_current_model_observation<'a>(
+    observations: &'a [PublicHistoryObservationV3],
+    intervals: &ReadIntervals,
+    current_reset_at: Option<i64>,
+    current_window_reset_at: Option<i64>,
+    window_seconds: i64,
+    history_is_canonical: bool,
+) -> Option<&'a PublicHistoryObservationV3> {
+    let current_scope = current_reset_at.filter(|reset_at| intervals.contains(*reset_at));
+    if current_scope.is_some_and(|reset_at| quota_period_start(reset_at, window_seconds).is_none())
+    {
+        return None;
+    }
+    let window_reset_at = current_window_reset_at
+        .filter(|_| history_is_canonical)
+        .or(current_scope);
+    let authoritative_start =
+        window_reset_at.and_then(|reset_at| quota_period_start(reset_at, window_seconds));
+    observations
+        .iter()
+        .filter(|observation| intervals.intersects_canonical_minute(observation.timestamp))
+        .filter(|observation| {
+            if let Some(authority) = current_scope {
+                if history_is_canonical && observation.reset_at != authority {
+                    return false;
+                }
+                if authoritative_start.is_some_and(|start| observation.timestamp < start)
+                    || window_reset_at.is_some_and(|end| observation.timestamp > end)
+                {
+                    return false;
+                }
+            }
+            true
+        })
+        .max_by_key(|observation| (observation.timestamp, observation.reset_at))
 }
 
 #[cfg(test)]
@@ -4160,11 +4209,9 @@ fn read_model_projection(connection: &Connection) -> Result<ModelProjection, Rea
 ///
 /// `session_model_totals` is intentionally not used here: it has no timestamp
 /// and therefore cannot prove that its current values belong to the selected
-/// account interval.  The history sidecar is the only source that can bind the
-/// model projection to the same time domain as usage samples. The projection
-/// is one latest complete timestamp group inside the union; combining each
-/// model's independent latest row would retain a stale model after it vanished
-/// from a later complete observation.
+/// account interval. For current display, the history observation is the
+/// authority for the one timestamped model vector; partial rows remain
+/// visible and the observation quality is carried separately as `incomplete`.
 fn read_model_projection_for_intervals(
     connection: &Connection,
     intervals: &ReadIntervals,
@@ -4172,13 +4219,14 @@ fn read_model_projection_for_intervals(
     current_window_reset_at: Option<i64>,
     window_seconds: i64,
     history_is_canonical: bool,
+    anchor: Option<(i64, i64)>,
 ) -> Result<ModelProjection, ReaderError> {
     // An unbounded partition reader still needs the same current quota
     // authority as a lifecycle-bounded reader.  The timestamp-less session
     // totals table cannot prove ownership across an account switch, so it is
     // used only when no current quota authority is available.
     let current_scope = current_reset_at.filter(|reset_at| intervals.contains(*reset_at));
-    if intervals.is_unbounded() && current_scope.is_none() {
+    if anchor.is_none() && intervals.is_unbounded() && current_scope.is_none() {
         return if history_is_canonical {
             // A canonical partition without a validated current quota
             // authority cannot prove ownership of timestamp-less session
@@ -4248,6 +4296,7 @@ fn read_model_projection_for_intervals(
     let mut group_key = None;
     let mut group_complete = true;
     let mut group = BTreeMap::<String, RawModelTotal>::new();
+    let mut ambiguous_models = BTreeSet::new();
     while let Some(row) = rows.next()? {
         let Some(reset_at) = sql_i64(row, 0) else {
             continue;
@@ -4277,19 +4326,26 @@ fn read_model_projection_for_intervals(
         } else {
             canonical_period_reset_at(reset_at, timestamp, current_scope, window_seconds)
         };
+        if anchor.is_some_and(|(anchor_timestamp, anchor_reset)| {
+            timestamp != anchor_timestamp || canonical_reset != anchor_reset
+        }) {
+            continue;
+        }
         let key = (timestamp, canonical_reset);
         if group_key.is_some_and(|current| current != key) {
-            if group_complete && !group.is_empty() {
-                return Ok(project_model_totals(group.into_values()));
+            if anchor.is_some() || (group_complete && !group.is_empty()) {
+                let mut projection = project_model_totals(group.into_values());
+                projection.incomplete |= !group_complete;
+                return Ok(projection);
             }
             group.clear();
+            ambiguous_models.clear();
             group_complete = true;
         }
         group_key = Some(key);
         let complete_index = if has_cache_write { 8 } else { 7 };
         if sql_i64(row, complete_index) != Some(1) {
             group_complete = false;
-            continue;
         }
         let Some(model) = sql_text(row, 2) else {
             group_complete = false;
@@ -4330,7 +4386,7 @@ fn read_model_projection_for_intervals(
         } else {
             None
         };
-        if group.contains_key(&model) {
+        if group.contains_key(&model) || ambiguous_models.contains(&model) {
             // The authoritative reset is ordered before a stale alias at the
             // same timestamp. Keep the canonical row instead of making the
             // current-period group incomplete because of that duplicate.
@@ -4340,6 +4396,8 @@ fn read_model_projection_for_intervals(
                 continue;
             }
             group_complete = false;
+            group.remove(&model);
+            ambiguous_models.insert(model);
             continue;
         }
         group.insert(
@@ -4355,10 +4413,78 @@ fn read_model_projection_for_intervals(
             },
         );
     }
-    if group_complete {
-        return Ok(project_model_totals(group.into_values()));
+    if anchor.is_some() || group_complete {
+        let mut projection = project_model_totals(group.into_values());
+        projection.incomplete |= !group_complete;
+        return Ok(projection);
     }
     Ok(ModelProjection::default())
+}
+
+fn read_current_model_projection_for_observation(
+    connection: &Connection,
+    intervals: &ReadIntervals,
+    current_reset_at: Option<i64>,
+    current_window_reset_at: Option<i64>,
+    window_seconds: i64,
+    history_is_canonical: bool,
+    observation: Option<&PublicHistoryObservationV3>,
+) -> Result<ModelProjection, ReaderError> {
+    let Some(observation) = observation else {
+        // Keep the timestamp-less compatibility source only for an unbounded
+        // legacy database with no current quota authority. Otherwise no
+        // observation means there is no current model vector to publish.
+        if intervals.is_unbounded()
+            && current_reset_at.is_none_or(|reset_at| !intervals.contains(reset_at))
+            && !history_is_canonical
+        {
+            return read_model_projection(connection);
+        }
+        return Ok(ModelProjection::default());
+    };
+    if matches!(
+        observation.model_source.as_str(),
+        "unavailable" | "reconstructed-from-session"
+    ) {
+        // These sources carry provenance only; an exact-key sidecar cannot
+        // turn their model values into directly observed current usage.
+        return Ok(ModelProjection {
+            incomplete: true,
+            ..ModelProjection::default()
+        });
+    }
+    let mut projection = read_model_projection_for_intervals(
+        connection,
+        intervals,
+        current_reset_at,
+        current_window_reset_at,
+        window_seconds,
+        history_is_canonical,
+        Some((observation.timestamp, observation.reset_at)),
+    )?;
+    let (stored_observations, _) = read_stored_history_observations_for_intervals(
+        connection,
+        observation.timestamp.saturating_sub(1),
+        observation.timestamp,
+        intervals,
+        current_reset_at.filter(|_| !history_is_canonical),
+        window_seconds,
+    )?;
+    let stored = stored_observations.into_iter().find(|stored| {
+        stored.timestamp == observation.timestamp && stored.reset_at == observation.reset_at
+    });
+    projection.incomplete |= observation.model_source == "unavailable"
+        || observation.model_source == "reconstructed-from-session"
+        || stored.as_ref().is_some_and(|stored| {
+            matches!(
+                stored.model_source,
+                HistoryModelSource::Unavailable | HistoryModelSource::ReconstructedFromSession
+            ) || stored.empty_model_set_complete == Some(false)
+                || (stored.model_source == HistoryModelSource::Confirmed
+                    && stored.empty_model_set_complete != Some(true)
+                    && projection.v3.is_empty())
+        });
+    Ok(projection)
 }
 
 impl ReadIntervals {
@@ -4383,9 +4509,16 @@ fn project_model_totals(rows: impl IntoIterator<Item = RawModelTotal>) -> ModelP
     let mut projection = ModelProjection::default();
     let mut names = std::collections::HashSet::new();
     let mut legacy_families = BTreeMap::<String, LegacyFamilyProjection>::new();
+    let mut incomplete = false;
     for row in rows {
         if !is_valid_public_model_name(&row.model)
-            || row.total_tokens == 0
+            || (row.total_tokens == 0
+                && (row.input_tokens != 0
+                    || row.cached_input_tokens != 0
+                    || row.output_tokens != 0
+                    || row
+                        .cache_write_input_tokens
+                        .is_some_and(|writes| writes != 0)))
             || row.cached_input_tokens > row.input_tokens
             || row.cache_write_input_tokens.is_some_and(|writes| {
                 row.cached_input_tokens
@@ -4397,6 +4530,7 @@ fn project_model_totals(rows: impl IntoIterator<Item = RawModelTotal>) -> ModelP
             // A malformed model row is local to that model.  Continue with
             // all other durable totals so one bad/unknown row cannot cause a
             // complete details 503.
+            incomplete = true;
             continue;
         }
         let estimated_cost = model_v3_cost(&row);
@@ -4487,6 +4621,7 @@ fn project_model_totals(rows: impl IntoIterator<Item = RawModelTotal>) -> ModelP
             .then_with(|| left.model.cmp(&right.model))
     });
     projection.v3.truncate(MAX_PUBLIC_MODELS_V3);
+    projection.incomplete = incomplete;
     projection
 }
 
@@ -4717,6 +4852,109 @@ mod tests {
                 ],
             )
             .expect("fixture row");
+    }
+
+    #[derive(Clone, Copy)]
+    struct Issue575ModelFact {
+        model: &'static str,
+        total_tokens: u64,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+        cache_write_input_tokens: Option<u64>,
+        complete: bool,
+    }
+
+    const ISSUE_575_RESET_AT: i64 = 1_800_003_600;
+
+    fn issue_575_set_current_reset(connection: &Connection) {
+        connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1, window_seconds=3600
+                 WHERE singleton=1",
+                [ISSUE_575_RESET_AT],
+            )
+            .expect("Issue 575 current reset");
+    }
+
+    fn issue_575_model_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_model_history(
+                    reset_at INTEGER NOT NULL, timestamp INTEGER NOT NULL,
+                    model TEXT NOT NULL, total_tokens TEXT NOT NULL,
+                    input_tokens TEXT NOT NULL, cached_input_tokens TEXT NOT NULL,
+                    output_tokens TEXT NOT NULL, cache_write_input_tokens TEXT,
+                    model_set_complete INTEGER NOT NULL
+                );
+                CREATE TABLE durable_state(
+                    singleton INTEGER PRIMARY KEY, data_generation INTEGER NOT NULL,
+                    snapshot_json TEXT NOT NULL
+                );",
+            )
+            .expect("Issue 575 current model schema");
+    }
+
+    fn issue_575_observation(
+        connection: &Connection,
+        timestamp: i64,
+        reset_at: i64,
+        model_source: &str,
+        empty_model_set_complete: Option<bool>,
+        models: &[Issue575ModelFact],
+    ) {
+        if timestamp != 1_800_000_000 {
+            connection
+                .execute(
+                    "INSERT INTO usage_history VALUES(?1,?2,50.0,0.0,0.0,0.0,0,0,0)",
+                    params![timestamp, reset_at],
+                )
+                .expect("Issue 575 usage observation");
+        }
+        let mut snapshot = serde_json::json!({
+            "kind": "codex-info-usage-observation-v1",
+            "timestamp": timestamp,
+            "reset_at": reset_at,
+            "remaining_percent": 50.0,
+            "model_source": model_source,
+            "sol_dollars": 0.0,
+            "terra_dollars": 0.0,
+            "luna_dollars": 0.0,
+            "sol_tokens": 0,
+            "terra_tokens": 0,
+            "luna_tokens": 0,
+        });
+        if let Some(complete) = empty_model_set_complete {
+            snapshot["empty_model_set_complete"] = serde_json::json!(complete);
+        }
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO durable_state(singleton,data_generation,snapshot_json)
+                 VALUES(?1,?1,?2)",
+                params![timestamp, snapshot.to_string()],
+            )
+            .expect("Issue 575 durable observation");
+        for model in models {
+            connection
+                .execute(
+                    "INSERT INTO usage_model_history
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![
+                        reset_at,
+                        timestamp,
+                        model.model,
+                        model.total_tokens.to_string(),
+                        model.input_tokens.to_string(),
+                        model.cached_input_tokens.to_string(),
+                        model.output_tokens.to_string(),
+                        model
+                            .cache_write_input_tokens
+                            .map(|value| value.to_string()),
+                        if model.complete { 1_i64 } else { 0_i64 },
+                    ],
+                )
+                .expect("Issue 575 model history row");
+        }
     }
 
     fn active_thread_json(id: &str, updated_at: i64) -> String {
@@ -6214,7 +6452,9 @@ mod tests {
             .expect("reader")
             .read_snapshot()
             .expect("one malformed model row must not reject valid history");
-        assert_eq!(snapshot.details.state, PublicState::Ready);
+        // This malformed timestamp group is also the latest current vector;
+        // keep its valid SOL peer while surfacing the bad model row.
+        assert_eq!(snapshot.details.state, PublicState::Error);
         let history = &snapshot.history_samples_v3[0];
         assert_eq!(history.model_source, "legacy-unknown");
         assert!(!history.models_complete);
@@ -6486,6 +6726,7 @@ mod tests {
             Some(reset_at),
             window_seconds,
             false,
+            None,
         )
         .expect("prefix-only projection");
         assert_eq!(prefix_only.v1.len(), 1);
@@ -6500,6 +6741,7 @@ mod tests {
             Some(reset_at),
             window_seconds,
             false,
+            None,
         )
         .expect("current projection");
         assert_eq!(current.v3.len(), 1);
@@ -6512,6 +6754,7 @@ mod tests {
             Some(reset_at),
             0,
             false,
+            None,
         )
         .expect("invalid-window projection");
         assert!(invalid_window.v1.is_empty());
@@ -6537,6 +6780,7 @@ mod tests {
             Some(reset_at),
             window_seconds,
             false,
+            None,
         )
         .expect("unscoped projection");
         assert!(unscoped.v1.is_empty());
@@ -6548,11 +6792,466 @@ mod tests {
             None,
             0,
             true,
+            None,
         )
         .expect("canonical authority fail-closed projection");
         assert!(canonical_without_authority.v1.is_empty());
         assert!(canonical_without_authority.v3.is_empty());
         fs::remove_file(session_path).expect("cleanup timestamp-less fixture");
+    }
+
+    #[test]
+    fn issue_575_current_models_use_latest_partial_vector_and_recover() {
+        let path = temp_db("issue-575-latest-partial");
+        make_db(&path);
+        let connection = Connection::open(&path).expect("Issue 575 fixture db");
+        issue_575_model_schema(&connection);
+        issue_575_set_current_reset(&connection);
+        let reset_at = ISSUE_575_RESET_AT;
+        issue_575_observation(
+            &connection,
+            1_800_000_000,
+            reset_at,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "ASTRA",
+                total_tokens: 1_919_442,
+                input_tokens: 1_919_442,
+                cached_input_tokens: 4,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                complete: true,
+            }],
+        );
+        issue_575_observation(
+            &connection,
+            1_800_000_060,
+            reset_at,
+            "confirmed",
+            None,
+            &[
+                Issue575ModelFact {
+                    model: "ASTRA",
+                    total_tokens: 201_416_126,
+                    input_tokens: 200_878_864,
+                    cached_input_tokens: 197_512_320,
+                    output_tokens: 537_262,
+                    cache_write_input_tokens: Some(0),
+                    complete: false,
+                },
+                Issue575ModelFact {
+                    model: "SOL",
+                    total_tokens: 23_447_491,
+                    input_tokens: 23_447_491,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
+                    complete: false,
+                },
+            ],
+        );
+
+        let partial = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("partial latest vector remains readable");
+        assert_eq!(partial.details.state, PublicState::Error);
+        assert_eq!(
+            partial
+                .models_v3
+                .iter()
+                .map(|model| (model.model.as_str(), model.total_tokens))
+                .collect::<Vec<_>>(),
+            vec![("SOL", 23_447_491), ("ASTRA", 201_416_126)]
+        );
+        let astra = partial
+            .models_v3
+            .iter()
+            .find(|model| model.model == "ASTRA")
+            .expect("latest ASTRA row remains visible");
+        assert!(
+            (astra
+                .estimated_cost
+                .as_ref()
+                .expect("frozen ASTRA reference price")
+                .total_dollars
+                - 258.04086)
+                .abs()
+                < 1e-10
+        );
+
+        issue_575_observation(
+            &connection,
+            1_800_000_120,
+            reset_at,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "ASTRA",
+                total_tokens: 300_000_000,
+                input_tokens: 299_000_000,
+                cached_input_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+                cache_write_input_tokens: Some(0),
+                complete: true,
+            }],
+        );
+        let recovered = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("complete recovery vector remains readable");
+        assert_eq!(recovered.details.state, PublicState::Ready);
+        assert_eq!(
+            recovered
+                .models_v3
+                .iter()
+                .map(|model| (model.model.as_str(), model.total_tokens))
+                .collect::<Vec<_>>(),
+            vec![("ASTRA", 300_000_000)]
+        );
+        drop(connection);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn issue_575_current_empty_or_unavailable_latest_observation_never_falls_back() {
+        let reset_at = ISSUE_575_RESET_AT;
+        for (label, source, empty_marker, expected_state) in [
+            (
+                "confirmed-empty",
+                "confirmed",
+                Some(true),
+                PublicState::Ready,
+            ),
+            (
+                "incomplete-empty",
+                "confirmed",
+                Some(false),
+                PublicState::Error,
+            ),
+            ("unavailable", "unavailable", None, PublicState::Error),
+        ] {
+            let path = temp_db(&format!("issue-575-{label}"));
+            make_db(&path);
+            let connection = Connection::open(&path).expect("Issue 575 fixture db");
+            issue_575_model_schema(&connection);
+            issue_575_set_current_reset(&connection);
+            issue_575_observation(
+                &connection,
+                1_800_000_000,
+                reset_at,
+                "confirmed",
+                None,
+                &[Issue575ModelFact {
+                    model: "ASTRA",
+                    total_tokens: 1_919_442,
+                    input_tokens: 1_919_442,
+                    cached_input_tokens: 4,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
+                    complete: true,
+                }],
+            );
+            issue_575_observation(
+                &connection,
+                1_800_000_060,
+                reset_at,
+                source,
+                empty_marker,
+                &[],
+            );
+
+            let snapshot = DbReader::open(&path)
+                .expect("reader")
+                .read_snapshot()
+                .expect("latest empty or unavailable observation remains readable");
+            assert_eq!(snapshot.details.state, expected_state, "case {label}");
+            assert!(snapshot.details.models.is_empty(), "case {label}");
+            assert!(snapshot.models_v3.is_empty(), "case {label}");
+            drop(connection);
+            fs::remove_file(path).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn issue_575_unconfirmed_source_suppresses_exact_key_sidecar_values() {
+        for source in ["unavailable", "reconstructed-from-session"] {
+            let path = temp_db(&format!("issue-575-{source}-sidecar-values"));
+            make_db(&path);
+            let connection = Connection::open(&path).expect("Issue 575 fixture db");
+            issue_575_model_schema(&connection);
+            issue_575_set_current_reset(&connection);
+            issue_575_observation(
+                &connection,
+                1_800_000_060,
+                ISSUE_575_RESET_AT,
+                source,
+                None,
+                &[Issue575ModelFact {
+                    model: "gpt-6.1-sol",
+                    total_tokens: 10,
+                    input_tokens: 8,
+                    cached_input_tokens: 2,
+                    output_tokens: 2,
+                    cache_write_input_tokens: Some(0),
+                    complete: true,
+                }],
+            );
+
+            let snapshot = DbReader::open(&path)
+                .expect("reader")
+                .read_snapshot()
+                .expect("unconfirmed model source remains readable");
+            assert_eq!(snapshot.details.state, PublicState::Error, "{source}");
+            assert!(snapshot.details.models.is_empty(), "{source}");
+            assert!(snapshot.models_v3.is_empty(), "{source}");
+            let history = snapshot
+                .history_samples_v3
+                .iter()
+                .find(|sample| sample.timestamp == 1_800_000_060)
+                .expect("unconfirmed source observation remains visible");
+            assert_eq!(history.model_source, source);
+            assert!(!history.models_complete);
+            assert!(history.models.is_none());
+
+            drop(connection);
+            fs::remove_file(path).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn issue_575_current_confirmed_zero_token_model_is_valid() {
+        let path = temp_db("issue-575-confirmed-zero-model");
+        make_db(&path);
+        let connection = Connection::open(&path).expect("Issue 575 fixture db");
+        issue_575_model_schema(&connection);
+        issue_575_set_current_reset(&connection);
+        issue_575_observation(
+            &connection,
+            1_800_000_000,
+            ISSUE_575_RESET_AT,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "gpt-6.1-sol",
+                total_tokens: 0,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                complete: true,
+            }],
+        );
+
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("zero-token confirmed model is valid");
+        assert_eq!(snapshot.details.state, PublicState::Ready);
+        assert_eq!(snapshot.models_v3.len(), 1);
+        let model = &snapshot.models_v3[0];
+        assert_eq!(model.model, "gpt-6.1-sol");
+        assert_eq!(model.total_tokens, 0);
+        assert_eq!(model.input_tokens, 0);
+        assert_eq!(model.cached_input_tokens, 0);
+        assert_eq!(model.cache_write_input_tokens, Some(0));
+        assert_eq!(model.output_tokens, 0);
+        let cost = model
+            .estimated_cost
+            .as_ref()
+            .expect("known exact model retains its reference price");
+        assert_eq!(cost.ordinary_input_dollars, 0.0);
+        assert_eq!(cost.cached_input_dollars, 0.0);
+        assert_eq!(cost.cache_write_input_dollars, 0.0);
+        assert_eq!(cost.output_dollars, 0.0);
+        assert_eq!(cost.total_dollars, 0.0);
+        assert_eq!(snapshot.details.models.len(), 1);
+        assert_eq!(snapshot.details.models[0].name, "SOL");
+        assert_eq!(snapshot.details.models[0].input_tokens, 0);
+        assert_eq!(snapshot.details.models[0].cached_input_tokens, 0);
+        assert_eq!(snapshot.details.models[0].output_tokens, 0);
+        assert_eq!(snapshot.history_samples_v3[0].model_source, "confirmed");
+        assert!(snapshot.history_samples_v3[0].models_complete);
+        assert_eq!(
+            snapshot.history_samples_v3[0].models.as_ref().unwrap()[0].model,
+            "gpt-6.1-sol"
+        );
+        drop(connection);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn issue_575_current_zero_total_with_nonzero_components_is_local_error() {
+        let path = temp_db("issue-575-zero-total-nonzero-components");
+        make_db(&path);
+        let connection = Connection::open(&path).expect("Issue 575 fixture db");
+        issue_575_model_schema(&connection);
+        issue_575_set_current_reset(&connection);
+        issue_575_observation(
+            &connection,
+            1_800_000_000,
+            ISSUE_575_RESET_AT,
+            "confirmed",
+            None,
+            &[
+                Issue575ModelFact {
+                    model: "gpt-6.1-sol",
+                    total_tokens: 0,
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
+                    complete: true,
+                },
+                Issue575ModelFact {
+                    model: "gpt-6-astra",
+                    total_tokens: 0,
+                    input_tokens: 1,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
+                    complete: true,
+                },
+            ],
+        );
+
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("inconsistent zero total is isolated to its model");
+        assert_eq!(snapshot.details.state, PublicState::Error);
+        assert_eq!(snapshot.models_v3.len(), 1);
+        assert_eq!(snapshot.models_v3[0].model, "gpt-6.1-sol");
+        assert_eq!(snapshot.models_v3[0].total_tokens, 0);
+        assert_eq!(snapshot.models_v3[0].input_tokens, 0);
+        assert_eq!(snapshot.models_v3[0].output_tokens, 0);
+        drop(connection);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn issue_575_current_malformed_model_is_local_and_marks_error() {
+        let path = temp_db("issue-575-malformed-model");
+        make_db(&path);
+        let connection = Connection::open(&path).expect("Issue 575 fixture db");
+        issue_575_model_schema(&connection);
+        issue_575_set_current_reset(&connection);
+        issue_575_observation(
+            &connection,
+            1_800_000_000,
+            ISSUE_575_RESET_AT,
+            "confirmed",
+            None,
+            &[],
+        );
+        issue_575_observation(
+            &connection,
+            1_800_000_060,
+            ISSUE_575_RESET_AT,
+            "confirmed",
+            None,
+            &[
+                Issue575ModelFact {
+                    model: "ASTRA",
+                    total_tokens: 10,
+                    input_tokens: 10,
+                    cached_input_tokens: 9,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(2),
+                    complete: true,
+                },
+                Issue575ModelFact {
+                    model: "SOL",
+                    total_tokens: 20,
+                    input_tokens: 20,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
+                    complete: true,
+                },
+            ],
+        );
+
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("one invalid model row does not reject valid current rows");
+        assert_eq!(snapshot.details.state, PublicState::Error);
+        assert_eq!(
+            snapshot
+                .models_v3
+                .iter()
+                .map(|model| (model.model.as_str(), model.total_tokens))
+                .collect::<Vec<_>>(),
+            vec![("SOL", 20)]
+        );
+        drop(connection);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn issue_575_current_projection_respects_lifecycle_account_boundary() {
+        let path = temp_db("issue-575-account-boundary");
+        make_db(&path);
+        let connection = Connection::open(&path).expect("Issue 575 fixture db");
+        issue_575_model_schema(&connection);
+        issue_575_set_current_reset(&connection);
+        let reset_at = ISSUE_575_RESET_AT;
+        issue_575_observation(
+            &connection,
+            1_800_000_000,
+            reset_at,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "ASTRA",
+                total_tokens: 10,
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                complete: true,
+            }],
+        );
+        issue_575_observation(
+            &connection,
+            1_800_000_060,
+            reset_at,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "SOL",
+                total_tokens: 20,
+                input_tokens: 20,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                complete: false,
+            }],
+        );
+        drop(connection);
+
+        let owned_interval = ReadIntervals::new(vec![ReadInterval::new(
+            Some(1_800_000_000),
+            Some(1_800_000_060),
+        )
+        .expect("prior account interval")])
+        .expect("one account interval");
+        let snapshot = DbReader::open_with_intervals(&path, owned_interval)
+            .expect("scoped reader")
+            .read_snapshot()
+            .expect("out-of-scope newer observation must not affect this account");
+        assert_eq!(snapshot.details.state, PublicState::Ready);
+        assert_eq!(
+            snapshot
+                .models_v3
+                .iter()
+                .map(|model| (model.model.as_str(), model.total_tokens))
+                .collect::<Vec<_>>(),
+            vec![("ASTRA", 10)]
+        );
+        fs::remove_file(path).expect("cleanup");
     }
 
     #[test]

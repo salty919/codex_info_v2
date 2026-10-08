@@ -174,7 +174,7 @@ Graph selectorの矢印は文字本文ではなく操作アイコンとして3:1
 「画面をスクロールしないと主要操作や主要情報へ到達できない」設計はUX合格としない。
 対象はMain、Setup、Settings、Graph、Threads、Legalの全Windowであり、Main内Helpにも同じviewport条件を適用する。
 
-- Main: 残量、リセット、状態、更新、メニュー、Graph/Threads/Legal入口を同一viewportに置く。
+- Main: 残量、リセット、状態、更新、メニュー、Graph/Threads/Legal入口を同一viewportに置く。Windowsのモデル内訳だけは先頭6行を完全表示し、7行目以降を同じ表内で縦scrollする（`MODEL-USAGE-DISPLAY-01`）。
 - Setup: 現在の手順、入力、検証結果、次へ/戻る/キャンセルを同一viewportに置く。
 - Settings: 編集対象、現在値、保存、取消、復旧、戻るを同一viewportに置く。
 - Graph: 期間、metric、系列操作、plot、現在値を同一viewportに置く。
@@ -185,8 +185,8 @@ Graph selectorの矢印は文字本文ではなく操作アイコンとして3:1
 
 スクロールバー、マウスホイール、トラックパッドによる画面移動を、主要画面の到達手段として
 採用しない。長い一覧・本文はページング、章切替、選択詳細、折りたたみで分割し、現在位置と
-次の操作を固定表示する。例外はThreadsの5件目以降だけであり、先頭4件を完全表示した同じ一覧内
-`ScrollViewer`で追加行へ到達してよい。画面全体のスクロールや4件以下でのscrollbarはFAILとする。
+次の操作を固定表示する。Threadsは先頭4件を完全表示した同じ一覧内
+`ScrollViewer`で5件目以降へ到達してよい。Windows Mainのモデル内訳は先頭6行を完全表示した同じ表内で7行目以降へ到達してよい。画面全体のスクロール、Threadsの4件以下、Windows Mainのモデル6行以下でのscrollbarはFAILとする。
   ページングや折りたたみでも主要情報を同時に比較できない場合は、レイアウトを再設計する。
 
 ### 2.1.1 Window geometry、DPI、topologyの正本
@@ -197,17 +197,17 @@ surfaceとして扱う。
 
 | surface | registered top-level surface | runtime open HWND | logical client initial | logical client min | logical client max | resize | native controls |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Main | yes | 1 | 900×498 | 900×498 | 900×498 | fixed | minimize, close |
+| Main | yes | 1 | 900×542 | 900×542 | 900×542 | fixed | minimize, close |
 | Setup | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | minimize, close |
 | Settings | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | minimize, close |
 | Graph | yes | 0..1 (singleton) | 940×640 | 700×480 | unbounded | resizable | minimize, maximize/restore, close |
 | Threads | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | minimize, close |
 | Legal | yes | 0..1 (singleton) | 900×480 | 900×480 | 900×480 | fixed | minimize, close |
-| Main内 Help | no (owner=Main) | 0 additional | Main client 900×498内 | Main client 900×498内 | Main client 900×498内 | Mainに従う | 独自Window controlsなし |
+| Main内 Help | no (owner=Main) | 0 additional | Main client 900×542内 | Main client 900×542内 | Main client 900×542内 | Mainに従う | 独自Window controlsなし |
 
 registered top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確に6個で
 固定し、Helpを第7 Windowへ分離しない。runtime open HWNDはMain=1＋open child subset=0..5、合計1..6で、
-5 childを全て開いた時だけ6となる。各childはsingletonで、runtime cardinalityを6へ固定しない。`700×480`はGraphのminimumだけに属する。Mainのsupported work areaは少なくとも`900×498 logical`、Setup、Settings、
+5 childを全て開いた時だけ6となる。各childはsingletonで、runtime cardinalityを6へ固定しない。`700×480`はGraphのminimumだけに属する。Mainのsupported work areaは少なくとも`900×542 logical`、Setup、Settings、
 Threads、Legalは少なくとも`900×480 logical`、Graphのsupported
 work-area minimumは少なくとも`700×480 logical`である。各境界未満はsupported matrix外として
 `unsupported_scope` manifestへ記録し、font縮小、clip、scroll、PASS値の捏造で回避しない。
@@ -217,7 +217,7 @@ surface/monitor/DPI/sizeのsupported predicateは次のANDで固定する。
 
 ```text
 supported = client_threshold AND frame_fit
-client_threshold(fixed Main) = logical >= 900×498
+client_threshold(fixed Main) = logical >= 900×542
 client_threshold(fixed Setup/Settings/Threads/Legal) = logical >= 900×480
 client_threshold(Graph) = logical >= 700×480
 frame_fit = DPI変換後のDWM.visible_frame全体が対象MONITORINFO.rcWork内へ完全包含
@@ -266,7 +266,7 @@ residual、HWND count、native move/resize/control-hit、foreground/cursor trace
 rootまたは内部`ScrollViewer`だけを到達手段にする旧要求は、このDecision
 `UX-20260822-UX-002`により明示的にsupersedeする。Main、Setup、Settings、Legalは、
 page/step/detail/chapter/collapseで全主要情報、primary action、Back、Closeを同一viewportへ
-置く。Graphもperiod/metric/series/plot/現在値とBack/Closeを同一viewportへ置く。Threadsは
+置く。ただしWindows Mainのモデル内訳は`MODEL-USAGE-DISPLAY-01`の6行＋表内scrollを適用する。Graphもperiod/metric/series/plot/現在値とBack/Closeを同一viewportへ置く。Threadsは
 先頭4件とWindow操作を同一viewportへ置き、5件目以降に限って一覧内scrollを使う。既存のX版
 データを削除・要約・再順序化しない。
 
@@ -341,6 +341,8 @@ Mainが新しいcurrent/threads bundleを受理した周期には、開いたThr
 
 ### 3.3 詳細・設定・法的情報
 
+`API-V3-MODELS-01`の不完全なcurrentを受理した場合も、確認できた最新modelの内訳・概算額とGraphを表示し続ける。Mainの詳細状態文言とUI Automationを最新/readyにせず、Graphにも同じ取得状態の警告を表示する。警告はplotや履歴読取りエラーのoverlayとは独立し、収集回復時に同じ状態通知で解除する。通信失敗時は既存last-goodを保持して接続エラーを区別する。
+
 子Windowは単一インスタンスとし、既に開いていれば前面化する。子Windowを開いたことでMonitorの
 状態やlast-good値を消さない。戻る/閉じるは常時利用可能で、終了時にタイマー・RPC・購読を解除する。
 
@@ -364,9 +366,9 @@ component順や表示所有者を変更しない。
   `Header→RemainingQuota→WeekGauge→AccountActivity→ModelUsage→StatusBanner`で固定する。
   残量を最初の主値とし、状態は常時viewport内のStatusBannerだけが所有する。状態を上段の
   duplicate cardへ増やさず、StatusBannerが末尾でもBack/Close/復旧CTAを隠さない。
-- 両platformのMain clientは`900×498 logical`、外周は左右`22px`・上下`14px`、内容幅は
-  `856px`とする。6行の`y/height`はclient座標で順に`14/52`、`74/82`、`164/78`、
-  `250/56`、`314/120`、`442/42`とし、行間は全て`8px`、末尾余白は`14px`とする。
+- Windows Main clientは`900×542 logical`、Linux Mainは従来の`900×498 logical`を維持する。外周は左右`22px`・上下`14px`、内容幅は
+  `856px`とする。Windowsの6行の`y/height`はclient座標で順に`14/52`、`74/82`、`164/78`、
+  `250/56`、`314/164`、`486/42`とする。Linuxの末尾2行は従来の`314/120`、`442/42`。行間は全て`8px`、末尾余白は`14px`とする。
   current/historical account、thread/model/quotaの0件・未取得、warning/error、last-good保持で
   行またはcardを脱着・再flowせず、各固定行の内容だけを状態に応じて表示する。startup loadingは
   Headerを同じ位置に保持し、2行目から6行目までを単一surfaceで覆う。
@@ -393,7 +395,7 @@ component順や表示所有者を変更しない。
   上段の残り時間と下段のobserved時刻は右端を揃え、その列は両値の自然幅の大きい方で決める。
   Windowsでは横間隔`8px`の`Auto,*,Auto,Auto,*,Auto`の6列を使い、下段の4項目を
   0・2・3・5列へ置く。上段の期間名は0～4列、残り時間は5列、中央barは全6列を使う。
-  下段はcard内`y=45px`から表示し、日本語・900×498の参照画面ではreset時刻の文字左端が
+  下段はcard内`y=45px`から表示し、日本語・900×542の参照画面ではreset時刻の文字左端が
   約`318px`、observed labelの文字左端が約`445px`、observed時刻の文字右端が約`865px`となる。
   Mainの時刻表記は`PROC-I18N-01`に従い、quota値、期間境界、
   reset/observed epochをUIで再計算しない。
@@ -404,8 +406,8 @@ component順や表示所有者を変更しない。
   v3のmodel別表示は`動作中（生成済み）`の順とし、SOL 0件動作中/1件openなら`0（1）`、LUNA 1件動作中/2件openなら`1（2）`と表示する。openが0件なら`0`と表示する。総数は公開対象となったopen行の全件数とする。
   同一pairの元行数・動作中行数を検証した後、停止中の親なし行と、停止中の親を持つ子とその子孫を画面から除外した行集合だけでMainの合計とmodel別件数を算出する。動作中の親の子は、動作中も停止中も表示する。wireの元件数を表示件数へ流用しない。
 - ModelUsageはLinuxの単一table構成を使い、各modelのInput/Cached input/Outputについてtokenと
-  隣接する概算ドルを同じrowに置く。4 model×22pxをcard内に表示し、0件でも`120px`の固定cardと見出しを保持してemptyを明示する。
-  値の意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
+  隣接する概算ドルを同じrowに置く。Windowsは`MODEL-USAGE-DISPLAY-01`の版別・利用額順の表を6行×22pxのviewportに表示し、7行以上は表内だけ縦scrollする。headerは固定し、headerと行の右側に共通の`16px`を確保してoverlay scrollbarが金額を覆わないようにする。0件でも`164px`のcardと見出しを保持してemptyを明示する。Linuxは従来の4行×22px・`120px` cardを維持する。
+  tokenと金額のbucketの意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
 - StatusBannerはWindowsのstate title、detail、該当する単一CTA、最終受信表示の構成を使う。
   Mainの「前回受信」はLinux/Windows各StatusBannerの高さ方向中央に配置する。platform間で他の座標・寸法を一致させない。
   選択accountのID/labelをtitleまたはdetailへ重複表示しない。
@@ -455,6 +457,13 @@ component順や表示所有者を変更しない。
 - 週期間モードの期間欄、横軸、折れ線、ホバー値は同じselected reset IDだけから一括投影する。poll後の
   bounded reset aliasは60秒以内だけ同一期間として選択を維持し、欄だけ旧期間・plotだけ現在期間の
   混在を禁止する。
+- 既定の現期間を選択している間は、期間ディレクトリ更新後も`Current=true`を追従する。ユーザーが明示的に選んだ
+  過去期間は維持する。Mainが受理したquotaのreset/window変更は期間取得を促す通知として扱い、canonical IDは
+  same-pairの期間ディレクトリから決める。同じquota pairの観測更新だけでは追加取得しない。通知以前の遅延応答は
+  revisionで棄却し、選択やgraphを古い期間へ戻さない。
+- 現期間の確認済み開始時刻から最初の実測へ、モデルは0、Remainingは100%を起点とする表示専用実線を引く。
+  0/100%の実測観測は不要であり、最初の実測が正のtokens/95%でも接続する。開始authorityと欠損を跨がない条件は
+  `G137-6`に従い、補助点をhoverの実測値として表示しない。過去期間や固定時間窓の左端からは値を作らない。
 - Windowsグラフの角丸枠は内容の描画に覆われず全周を連続して表示する。内容のclipと枠線の描画順を分離し、枠線はplotのhoverや入力を妨げない。通常・最小サイズとresize時にも角を保持する。
 - Windowsでは右端の常時数値ラベル・leader・専用gutterを置かず、その横幅をplotへ割り当てる。線端の切れを避ける通常の描画余白と軸ラベルの余白は、数値表示の専用領域とは分離する。横方向のresize差分はplotへ割り当て、縦軸の意味と期間の端点は変えない。Linuxの右端ラベルは従来どおり維持する。
 - Windowsのplot内でマウスを動かすと、近い一つの実観測時刻の日時と表示中の全系列をまとめたツールチップを出す。日時は表示timezone、Tokensは元の整数精度、Dollarsはその観測点のaccepted/read-time補正値、Remainingはraw観測値を用い、単位を明示する。欠けた系列は`—`とし、補間・hold・synthetic tailを実観測値として出さない。viewport内の同じreset期間だけを探索し、confirmed gapや非所有区間を越えて別時刻の値を拾わない。非表示系列は除外し、pointer離脱・scene/metric/表示系列の変更・リサイズ時に旧ツールチップを残さない。観測索引はscene生成時に保持し、pointer移動で全履歴の再投影や全件走査を行わない。
@@ -618,7 +627,7 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
 - UIなしsilent RESTはSlint component/window/event-loop生成0、`DISPLAY`/Wayland/X11依存0、Slint HWND=0
   （visible/hidden HWNDとも0）、headless snapshot builder+read-only publisherだけとする。実装・host・artifact
   証拠未取得のためこのGUI依存ゼロ契約は`PRODUCT_PENDING`である。
-- Help/Connection guideはMain client `900×498 logical`内の情報surfaceであり、独立Window/HWNDを
+- Help/Connection guideはMain client `900×542 logical`内の情報surfaceであり、独立Window/HWNDを
   作らない（additional HWND=0）。registered top-level surface inventoryはMain、Setup、Settings、
   Graph、Threads、Legalの正確な6個で、runtime HWNDはMain=1＋open child subset 0..5（合計1..6）である。
 
@@ -668,7 +677,7 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
   一度だけの`topology_recovery center`だけを例外とする。
 - 最小幅、高DPI、最大化/復元、画面端、same/different-DPI crossing、negative/nonzero origin、
   taskbar-shrunk work areaで、supported boundary以上のmonitorに主要情報を表示する。fixed Window
-  はMainで少なくとも900×498 logical、Setup/Settings/Threads/Legalで少なくとも900×480 logical、Graphで少なくとも700×480 logicalを必要とし、未満は
+  はMainで少なくとも900×542 logical、Setup/Settings/Threads/Legalで少なくとも900×480 logical、Graphで少なくとも700×480 logicalを必要とし、未満は
   `unsupported_scope` manifestに記録する。DPI後DWM visible_frameのrcWork完全包含も必要条件とし、
   client thresholdだけでsupportedにしない。client thresholdとframe-fitのANDがsupportedの十分条件で、
   どのmonitorもpredicate不成立ならunsupported_scopeとする。

@@ -425,6 +425,19 @@ appendやrestartで新しいpairが欠けても、既存の観測値をNULLへ�
 観測が得られるまでNULLのままとし、context補完だけを目的に旧履歴全体を再読込しない。追加pollやbackfillも行わず、
 更新範囲は通常のbounded appendと、そのcommitで得たauthorityへ限定する。
 
+### 8.7.2 SESSION-129 / DB-129 — source置換後のtoken anchor照合
+
+既知のtoken checkpointを持つsourceが置き換わり、その累計anchorが新sourceの固定prefix内にまだ存在しない場合、
+元anchor・source identity・照合cursor・pending keyを`session_token_anchor_recoveries`に保持する。
+未照合prefixの累計を次回の基準へ昇格せず、元anchorの完全一致より前のdeltaをcanonical利用量へ加算しない。
+同一sourceの後続appendと再起動でも元anchorを維持し、他の検証済みsourceの記録は継続する。
+一致後の検証済みdeltaだけを、対応するpending解消・sidecar更新・range/event/checkpoint・generationと同じtransactionで保存する。
+週切替では同じaccount/sourceの照合証拠を維持し、eventの既存period所属規則を守る。account identity境界は越えない。
+
+canonical schema v13は検証済みbackup後にこの照合sidecarを追加し、既存の履歴・金額・event・checkpoint・pendingを
+書き換えない。元anchorを保存していない旧pendingは、重複計上しないことを証明できない限り再解釈や削除をしない。
+照合失敗・transaction失敗では旧状態を保持し、照合できていない状態を完全収集として公開しない。
+
 ### 8.8 DP-REST-007 / RC-145 — typed generation namespace
 
 bare integerを異なるnamespace間で比較しない。採用型は次のとおりである。
