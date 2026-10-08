@@ -750,6 +750,7 @@ dependencies = [
 name = "codex-info-db-reader"
 version = "1.0.48"
 dependencies = [
+ "codex-info-pricing",
  "codex-info-rest-contract",
  "rusqlite",
  "serde",
@@ -763,10 +764,19 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "codex-info-db-reader",
+ "codex-info-pricing",
  "rusqlite",
  "rustix 0.38.44",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "codex-info-pricing"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -776,6 +786,7 @@ dependencies = [
  "chrono",
  "codex-info-account-locator",
  "codex-info-db-writer",
+ "codex-info-pricing",
  "codex_info",
  "getrandom 0.3.4",
  "rusqlite",
@@ -818,6 +829,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "codex-info-db-writer",
+ "codex-info-pricing",
  "codex-info-rest-contract",
  "fontique",
  "getrandom 0.3.4",
