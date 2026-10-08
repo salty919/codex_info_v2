@@ -1836,7 +1836,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             }
         }
 
-        var viewport = GraphScene.CreateViewport(bounds.StartAt, bounds.EndAt, options.Metric, children);
+        var publishedPeriodStarts = data.Select(item => item.Period.StartAt).ToArray();
+        var viewport = GraphScene.CreateViewport(
+            bounds.StartAt,
+            bounds.EndAt,
+            options.Metric,
+            children,
+            publishedPeriodStarts);
         return new WindowGraphProjection(
             points.OrderBy(point => point.Timestamp).ToArray(),
             viewport,
@@ -3201,7 +3207,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             hiddenModelNames,
             accountOwnershipIntervals,
             period.ResetAt,
-            isVerifiedCurrentResetStart: period.Current);
+            isVerifiedCurrentResetStart: period.Current,
+            publishedPeriodStartAt: period.StartAt);
         GraphPlotProjection.PrepareGeometry(graphScene);
         return new GraphProjection(
             diagnosticSamples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),

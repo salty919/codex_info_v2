@@ -682,23 +682,24 @@ public sealed class GraphViewportRenderingTests
     }
 
     [Fact]
-    public void ResetGuideUsesActualBoundaryAndOverridesAnOverlappingMidnight()
+    public void ResetGuidesUsePublishedPeriodStartsAndOverrideAnOverlappingMidnight()
     {
         var midnight = Unix("2026-03-08T00:00:00Z");
         var start = midnight - 1_800;
         var end = midnight + 1_800;
-        var period = CreateResetPeriodScene(start, midnight + 300, midnight);
+        var midnightPeriod = CreateResetPeriodScene(midnight, end, midnight + 300);
         var viewport = CreateViewport(start, end, GraphMetric.Dollars,
         [
-            period,
-            period,
-            CreateResetPeriodScene(start, end, null),
-            CreateResetPeriodScene(start, end, start - 1),
-            CreateResetPeriodScene(start, end, end + 1),
-            CreateResetPeriodScene(start, end, midnight + 600, empty: true),
+            midnightPeriod,
+            midnightPeriod,
+            CreateResetPeriodScene(start - 1, end, midnight + 900),
+            CreateResetPeriodScene(midnight + 600, end, end + 1),
+            CreateResetPeriodScene(start, end, null, includePublishedStart: false),
+            CreateResetPeriodScene(midnight + 1_200, end + 3_600, end + 3_600, empty: true),
+            CreateResetPeriodScene(end + 1, end + 3_600, midnight + 1_500),
         ]);
 
-        Assert.NotEqual(period.PeriodEndAt, midnight);
+        Assert.NotEqual(midnightPeriod.PeriodEndAt, midnight);
 
         var timeZoneProperty = typeof(LocalizationService).GetProperty(nameof(LocalizationService.DisplayTimeZone));
         Assert.NotNull(timeZoneProperty);
@@ -713,7 +714,7 @@ public sealed class GraphViewportRenderingTests
                 .OfType<ScottPlot.Plottables.Scatter>()
                 .ToArray();
             var resetGuides = lines.Where(line => line.LineColor.ToStringRGB() == "#E6B85C").ToArray();
-            Assert.Equal(new double[] { midnight, midnight + 600 },
+            Assert.Equal(new double[] { midnight, midnight + 600, midnight + 1_200 },
                 resetGuides.Select(line => line.Data.GetScatterPoints().First().X).Order());
             Assert.All(resetGuides, line =>
             {
@@ -817,7 +818,12 @@ public sealed class GraphViewportRenderingTests
     private static double[] TopDateTickPositions(GraphPlotControl control) =>
         control.Plot.Axes.Top.TickGenerator.Ticks.Select(tick => tick.Position).ToArray();
 
-    private static GraphScene CreateResetPeriodScene(long periodStartAt, long periodEndAt, long? resetAt, bool empty = false)
+    private static GraphScene CreateResetPeriodScene(
+        long periodStartAt,
+        long periodEndAt,
+        long? resetAt,
+        bool empty = false,
+        bool includePublishedStart = true)
     {
         var samples = empty ? Array.Empty<ApiHistorySample>() : new[]
         {
@@ -848,6 +854,7 @@ public sealed class GraphViewportRenderingTests
                 "hiddenModelNames" => null,
                 "accountOwnershipIntervals" => null,
                 "resetAt" => resetAt,
+                "publishedPeriodStartAt" => includePublishedStart ? periodStartAt : null,
                 _ when parameter.HasDefaultValue => parameter.DefaultValue,
                 _ => null,
             };

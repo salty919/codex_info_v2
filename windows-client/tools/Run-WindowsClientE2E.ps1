@@ -579,9 +579,9 @@ public static class CodexInfoGraphPixelScanner {
                             }
                             else if (grid == candidate.Length - 1 &&
                                 HasResetGuideRunNear(resetGuideColumns, candidate[grid], 3)) {
-                                // Only the period-end reset guide may mask the
-                                // final grid. It supports the anchored lattice
-                                // without becoming a visible-grid seed.
+                                // A published period-start guide at the viewport
+                                // endpoint may mask the final grid. It supports
+                                // the anchored lattice without becoming a seed.
                             }
                             else {
                                 valid = false;
@@ -3123,11 +3123,11 @@ function New-E2ENarrowPeriodCostDocuments {
     $oldestStart = $now - 518400
     $middleStart = $now - 151200
     $currentStart = $now - 75600
-    $middleReset = $currentStart
-    $oldestReset = $middleStart
-    $currentReset = $now + 75600
+    $oldestReset = $oldestStart + 604800
+    $middleReset = $middleStart + 604800
+    $currentReset = $currentStart + 604800
     $periods = @"
-{"api_version":"v3","history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$middleStart,"end_at":$middleReset,"reset_at":$middleReset,"label":"Middle period","current":false},{"id":"e2e-oldest","start_at":$oldestStart,"end_at":$oldestReset,"reset_at":$oldestReset,"label":"Oldest period","current":false}]}
+{"api_version":"v3","history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$middleStart,"end_at":$currentStart,"reset_at":$middleReset,"label":"Middle period","current":false},{"id":"e2e-oldest","start_at":$oldestStart,"end_at":$middleStart,"reset_at":$oldestReset,"label":"Oldest period","current":false}]}
 "@.Trim()
     $accounts = @"
 {"api_version":"v3","default_account_id":"account-7","accounts":[{"id":"account-7","is_current":true,"activation_at":$oldestStart,"deactivation_at":null,"login_id":"e2e@example.invalid"}]}
@@ -3135,14 +3135,14 @@ function New-E2ENarrowPeriodCostDocuments {
     $currentHistory = New-E2EPeriodCostHistoryPage -StartAt $currentStart -EndAt $now `
         -ResetAt $currentReset -ModelDollars @([decimal]36, [decimal]35, [decimal]35) `
         -ResumeCursor 'e2e-current-resume'
-    $pastHistory = New-E2EPeriodCostHistoryPage -StartAt $middleStart -EndAt $middleReset `
+    $pastHistory = New-E2EPeriodCostHistoryPage -StartAt $middleStart -EndAt $currentStart `
         -ResetAt $middleReset -ModelDollars @([decimal]100, [decimal]100, [decimal]100) `
         -ResumeCursor 'e2e-past-resume'
-    $oldestHistory = New-E2EPeriodCostHistoryPage -StartAt $oldestStart -EndAt $oldestReset `
+    $oldestHistory = New-E2EPeriodCostHistoryPage -StartAt $oldestStart -EndAt $middleStart `
         -ResetAt $oldestReset -ModelDollars @([decimal]100, [decimal]90, [decimal]84) `
         -ResumeCursor 'e2e-oldest-resume'
     $current = @"
-{"api_version":"v3","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":50.0,"reset_at":$currentReset,"window_seconds":151200,"monthly":false},"models":[{"model":"SOL","total_tokens":1500,"input_tokens":1000,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":500,"estimated_cost":{"price_version":"E2E-SOL","ordinary_input_dollars":20.00,"cached_input_dollars":10.00,"cache_write_input_dollars":0.00,"output_dollars":6.00,"total_dollars":36.00}},{"model":"TERRA","total_tokens":1800,"input_tokens":1200,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":600,"estimated_cost":{"price_version":"E2E-TERRA","ordinary_input_dollars":20.00,"cached_input_dollars":5.00,"cache_write_input_dollars":0.00,"output_dollars":10.00,"total_dollars":35.00}},{"model":"LUNA","total_tokens":2100,"input_tokens":1400,"cached_input_tokens":400,"cache_write_input_tokens":0,"output_tokens":700,"estimated_cost":{"price_version":"E2E-LUNA","ordinary_input_dollars":20.00,"cached_input_dollars":5.00,"cache_write_input_dollars":0.00,"output_dollars":10.00,"total_dollars":35.00}}],"active_thread_count":4}
+{"api_version":"v3","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":50.0,"reset_at":$currentReset,"window_seconds":604800,"monthly":false},"models":[{"model":"SOL","total_tokens":1500,"input_tokens":1000,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":500,"estimated_cost":{"price_version":"E2E-SOL","ordinary_input_dollars":20.00,"cached_input_dollars":10.00,"cache_write_input_dollars":0.00,"output_dollars":6.00,"total_dollars":36.00}},{"model":"TERRA","total_tokens":1800,"input_tokens":1200,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":600,"estimated_cost":{"price_version":"E2E-TERRA","ordinary_input_dollars":20.00,"cached_input_dollars":5.00,"cache_write_input_dollars":0.00,"output_dollars":10.00,"total_dollars":35.00}},{"model":"LUNA","total_tokens":2100,"input_tokens":1400,"cached_input_tokens":400,"cache_write_input_tokens":0,"output_tokens":700,"estimated_cost":{"price_version":"E2E-LUNA","ordinary_input_dollars":20.00,"cached_input_dollars":5.00,"cache_write_input_dollars":0.00,"output_dollars":10.00,"total_dollars":35.00}}],"active_thread_count":4}
 "@.Trim()
 
     $oldestResetAmount = @([decimal]0, [decimal]0, [decimal]0)
@@ -3156,11 +3156,11 @@ function New-E2ENarrowPeriodCostDocuments {
     $historySamples = @(
         (New-E2EPeriodCostLegacyHistorySample -Timestamp $oldestStart -ResetAt $oldestReset `
             -RemainingPercent 98 -ModelDollars $oldestResetAmount -ModelTokens $zeroTokens -TaskActive $null),
-        (New-E2EPeriodCostLegacyHistorySample -Timestamp $oldestReset -ResetAt $oldestReset `
+        (New-E2EPeriodCostLegacyHistorySample -Timestamp $middleStart -ResetAt $oldestReset `
             -RemainingPercent 88 -ModelDollars $oldestAmount -ModelTokens $observedTokens -TaskActive $true),
         (New-E2EPeriodCostLegacyHistorySample -Timestamp $middleStart -ResetAt $middleReset `
             -RemainingPercent 98 -ModelDollars $middleResetAmount -ModelTokens $zeroTokens -TaskActive $null),
-        (New-E2EPeriodCostLegacyHistorySample -Timestamp $middleReset -ResetAt $middleReset `
+        (New-E2EPeriodCostLegacyHistorySample -Timestamp $currentStart -ResetAt $middleReset `
             -RemainingPercent 78 -ModelDollars $middleAmount -ModelTokens $observedTokens -TaskActive $true),
         (New-E2EPeriodCostLegacyHistorySample -Timestamp $currentStart -ResetAt $currentReset `
             -RemainingPercent 98 -ModelDollars $currentResetAmount -ModelTokens $zeroTokens -TaskActive $null),
@@ -3203,14 +3203,17 @@ function Assert-E2ENarrowPeriodCostFixtureContract {
     foreach ($period in $periods) { $periodById[[string]$period.id] = $period }
     Assert-E2E ([Int64]$periodById['e2e-oldest'].start_at -eq ($now - 518400) -and
         [Int64]$periodById['e2e-oldest'].end_at -eq ($now - 151200) -and
-        [Int64]$periodById['e2e-oldest'].reset_at -eq ($now - 151200)) `
+        [Int64]$periodById['e2e-oldest'].reset_at -eq ([Int64]$periodById['e2e-oldest'].start_at + 604800) -and
+        [Int64]$periodById['e2e-oldest'].reset_at -ne [Int64]$periodById['e2e-oldest'].start_at) `
         'The $274 reset period must span now−6d through now−42h.'
     Assert-E2E ([Int64]$periodById['e2e-past'].start_at -eq ($now - 151200) -and
         [Int64]$periodById['e2e-past'].end_at -eq ($now - 75600) -and
-        [Int64]$periodById['e2e-past'].reset_at -eq ($now - 75600)) `
+        [Int64]$periodById['e2e-past'].reset_at -eq ([Int64]$periodById['e2e-past'].start_at + 604800) -and
+        [Int64]$periodById['e2e-past'].reset_at -ne [Int64]$periodById['e2e-past'].start_at) `
         'The $300 right-middle reset period must occupy a 21h interval.'
     Assert-E2E ([Int64]$periodById['e2e-current'].start_at -eq ($now - 75600) -and
         [Int64]$periodById['e2e-current'].end_at -eq $now -and
+        [Int64]$periodById['e2e-current'].reset_at -eq ([Int64]$periodById['e2e-current'].start_at + 604800) -and
         [Int64]$periodById['e2e-current'].reset_at -gt $now) `
         'The $106 current reset period must occupy the final 21h interval through now.'
     Assert-E2E ([Int64]$periodById['e2e-oldest'].start_at -ge ($now - 604800) -and

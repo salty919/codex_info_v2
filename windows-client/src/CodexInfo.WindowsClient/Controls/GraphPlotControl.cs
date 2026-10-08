@@ -353,9 +353,7 @@ public sealed class GraphPlotControl : Control
             amounts.Add(new GraphPeriodCostAmount(visibleStart, visibleEnd, centerAt, labelStyle));
         }
 
-        presentation.Plot.Axes.AddPanel(new GraphPeriodCostPanel(
-            amounts,
-            GraphPlotProjection.BuildResetGuides(scene)));
+        presentation.Plot.Axes.AddPanel(new GraphPeriodCostPanel(amounts));
     }
 
     private static GraphCanonicalModelLineProjection BuildModelLines(GraphScene scene, GraphSeries series) =>

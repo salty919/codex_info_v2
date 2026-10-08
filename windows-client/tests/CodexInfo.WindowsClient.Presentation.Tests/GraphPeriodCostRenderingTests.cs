@@ -152,15 +152,15 @@ public sealed class GraphPeriodCostRenderingTests
     }
 
     [Fact]
-    public void ResetSeparatorUsesThemeAmountYellowInPlotAndFooter()
+    public void ResetSeparatorUsesPublishedStartInPlotButNotInFooter()
     {
         var scene = GraphScene.CreateViewport(
             1_000,
             1_200,
             GraphMetric.Dollars,
             [
-                Period(1_000, 1_100, 1, 0, resetAt: 1_000),
-                Period(1_100, 1_200, 1, 0, resetAt: 1_100),
+                Period(1_000, 1_100, 1, 0, resetAt: 1_125),
+                Period(1_100, 1_200, 1, 0, resetAt: 1_300),
             ]);
         var control = new GraphPlotControl { Scene = scene };
         var panel = Panel(control);
@@ -170,24 +170,32 @@ public sealed class GraphPeriodCostRenderingTests
             ThemePalette.Resolve("#E6B85C")).WithOpacity(0.70);
         var dataRect = control.Plot.LastRender.DataRect;
         var footerRect = AssertRenderedRect(panel.LastRenderBounds);
-        var resetX = (int)Math.Round(control.Plot.Axes.Bottom.GetPixel(1_100, dataRect));
+        var publishedStartX = (int)Math.Round(control.Plot.Axes.Bottom.GetPixel(1_100, dataRect));
+        var deadlineX = (int)Math.Round(control.Plot.Axes.Bottom.GetPixel(1_125, dataRect));
         using var bitmap = SkiaSharp.SKBitmap.Decode(rendered.GetImageBytes());
         var footerBackground = SkiaSharp.SKColor.Parse(ThemePalette.Resolve(GraphPlotControl.PlotColorHex));
-        var footerResetPixels =
-            from x in Enumerable.Range(Math.Max(0, resetX - 1), 3)
+        var footerBoundaryPixels =
+            from x in Enumerable.Range(Math.Max(0, publishedStartX - 1), 3)
+            from y in Enumerable.Range((int)Math.Ceiling(footerRect.Top) + 2, Math.Max(0, (int)footerRect.Bottom - (int)footerRect.Top - 4))
+            let color = bitmap.GetPixel(x, y)
+            where color.Red > footerBackground.Red + 30 && color.Green > footerBackground.Green + 30
+            select color;
+        var footerDeadlinePixels =
+            from x in Enumerable.Range(Math.Max(0, deadlineX - 1), 3)
             from y in Enumerable.Range((int)Math.Ceiling(footerRect.Top) + 2, Math.Max(0, (int)footerRect.Bottom - (int)footerRect.Top - 4))
             let color = bitmap.GetPixel(x, y)
             where color.Red > footerBackground.Red + 30 && color.Green > footerBackground.Green + 30
             select color;
 
-        Assert.NotEmpty(footerResetPixels);
+        Assert.Empty(footerBoundaryPixels);
+        Assert.Empty(footerDeadlinePixels);
 
         var plotResetGuide = control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>().Any(scatter =>
         {
             var points = scatter.Data.GetScatterPoints().ToArray();
             return points.Length == 2 && points.All(point => point.X == 1_100) && scatter.Color == expectedResetColor;
         });
-        Assert.True(plotResetGuide, "The plot reset guide must use the amount theme color.");
+        Assert.True(plotResetGuide, "The plot separator must use the published period start and amount theme color.");
     }
 
     [Fact]
@@ -422,7 +430,8 @@ public sealed class GraphPeriodCostRenderingTests
             confirmedGaps: null,
             hiddenModelNames: null,
             accountOwnershipIntervals: null,
-            resetAt: resetAt);
+            resetAt: resetAt,
+            publishedPeriodStartAt: startAt);
     }
 
     private static ApiHistorySample Sample(long timestamp, params ApiHistoryModelSample[] models) =>
