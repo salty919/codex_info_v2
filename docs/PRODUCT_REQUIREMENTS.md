@@ -497,12 +497,12 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
 
    accepted raw Remainingが1点以上あり、その最初のtimestampが`period_start`より後なら、Linux rendererは
    表示専用の`(period_start,100%)`から最初のaccepted raw Remainingまでを1px破線で結ぶ。
-   Windowsでは、同一published pairとして検証済みのperiods/historyの`Current=true`とcanonical `start_at`を
-   明示的にgeometryへ渡し、確認済みの現期間開始から最初のaccepted raw Remainingまで100%起点の実線で結ぶ。
-   同じ条件で、値が確認できたmodel系列は0起点から最初の実測値へ実線で結ぶ。最初の実測が95%や正のtoken値でもよく、
+   Windowsでは、同一published pairとして検証済みのperiods/historyのcanonical `start_at`を
+   明示的にgeometryへ渡し、現期間・過去期間とも確認済みの期間開始から最初のaccepted raw Remainingまで100%起点の実線で結ぶ。
+   model系列の0起点は`Current=true`の現期間だけとし、値が確認できた系列の最初の実測値へ実線で結ぶ。最初の実測が95%や正のtoken値でもよく、
    0または100%の実測検出を開始条件にしない。これらはリセット時の表示専用起点であり、観測値ではない。
    DB/API、raw/effective anchor、hoverの実観測列に追加せず、最初のraw以降のgeometryにも混入させない。
-   Windowsの過去期間・開始authority不明の期間には開始補助線を作らず、24時間/7日間viewportの左端をreset開始と解釈しない。
+   Windowsの開始authority不明の期間には開始補助線を作らず、24時間/7日間viewportの左端をreset開始と解釈しない。
    明示欠損・model unknown・別resetを跨いで接続しない。このWindows変更はLinuxのmodel系列をbackfillしない。
 
    raw-null、`Held`、`Rejected`、上記の限定補完条件を満たさない明示的unavailableまたはconfirmed gapを含む区間だけを予測とし、両側のaccepted raw

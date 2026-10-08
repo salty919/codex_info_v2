@@ -3647,6 +3647,131 @@ public sealed class GraphPlotControlTests
         Assert.Empty(displayLines.Dashed.Line.X);
     }
 
+    [Theory]
+    [InlineData(GraphMetric.Dollars)]
+    [InlineData(GraphMetric.Tokens)]
+    public void Published_historical_period_connects_full_quota_to_first_observation(GraphMetric metric)
+    {
+        const long periodStart = 1_790_978_640;
+        const long firstRaw = 1_791_030_180;
+        const long secondRaw = 1_791_030_240;
+        const long resetAt = 1_791_580_246;
+        const long viewportStart = 1_790_891_460;
+        const long viewportEnd = 1_791_496_260;
+        var samples = new[]
+        {
+            CompleteModelSample(periodStart, null, 0, 0) with { ResetAt = resetAt },
+            CompleteModelSample(firstRaw, 89, 1, 10) with { ResetAt = resetAt },
+            CompleteModelSample(secondRaw, 88, 2, 20) with { ResetAt = resetAt },
+        };
+
+        GraphScene CreateScene(
+            long? publishedStart,
+            IReadOnlyList<GraphConfirmedGap>? gaps = null,
+            IReadOnlyList<GraphAccountOwnershipInterval>? ownership = null) => GraphScene.Create(
+                samples,
+                metric,
+                periodStart,
+                1_791_343_800,
+                gaps,
+                hiddenModelNames: null,
+                ownership,
+                resetAt,
+                isVerifiedCurrentResetStart: false,
+                publishedPeriodStartAt: publishedStart);
+
+        var scene = CreateScene(periodStart);
+        var viewport = GraphScene.CreateViewport(viewportStart, viewportEnd, metric, [scene]);
+        var periodControl = new GraphPlotControl { Scene = scene };
+        var viewportControl = new GraphPlotControl { Scene = viewport };
+        var outputDirectory = Environment.GetEnvironmentVariable("CODEX_INFO_HISTORICAL_QUOTA_RENDER_DIR");
+        if (!string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            Directory.CreateDirectory(outputDirectory);
+            var suffix = metric == GraphMetric.Tokens ? "tokens" : "dollars";
+            periodControl.Plot.SavePng(Path.Combine(outputDirectory, $"historical-quota-{suffix}-period.png"), 940, 480);
+            viewportControl.Plot.SavePng(Path.Combine(outputDirectory, $"historical-quota-{suffix}-7d.png"), 940, 480);
+        }
+
+        Assert.Equal([periodStart, firstRaw, secondRaw], scene.Timestamps.Select(value => (long)value));
+        Assert.True(double.IsNaN(scene.Remaining[0]));
+        Assert.Equal([89d, 88d], scene.Remaining.Skip(1));
+        Assert.True(double.IsNaN(scene.ObservedRemainingValues[0]));
+        Assert.Equal([89d, 88d], scene.ObservedRemainingValues.Skip(1));
+        Assert.Equal([periodStart, firstRaw, secondRaw], scene.HoverObservations.Select(value => value.Timestamp));
+        Assert.All(scene.HoverObservations, observation => Assert.Equal(resetAt, observation.ResetAt));
+
+        var remainingOnly = new HashSet<GraphSeries> { GraphSeries.Remaining };
+        foreach (var (timestamp, expected) in new[]
+        {
+            (periodStart, (double?)null),
+            (firstRaw, (double?)89),
+            (secondRaw, (double?)88),
+        })
+        {
+            var hover = GraphHoverProjection.Find(scene, timestamp, remainingOnly);
+            Assert.NotNull(hover);
+            Assert.Equal(expected, Assert.Single(hover.Rows).NumericValue);
+        }
+
+        var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.DoesNotContain((double)periodStart, rawLines.Solid.X);
+        Assert.DoesNotContain((double)periodStart, rawLines.Dashed.X);
+
+        var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        // Canonical display coordinates round the 0..100 viewbox to hundredths.
+        // Over the published 365160-second period, these raw times map to
+        // 14.11 and 14.13 percent. Raw/hover timestamps above remain exact.
+        const double firstDisplay = 1_791_030_164.076;
+        const double secondDisplay = 1_791_030_237.108;
+        var startIndex = Array.IndexOf(displayLines.Solid.Line.X.ToArray(), (double)periodStart);
+        var firstIndex = Array.FindIndex(displayLines.Solid.Line.X.ToArray(), x => Math.Abs(x - firstDisplay) < 0.000001);
+        var secondIndex = Array.FindIndex(displayLines.Solid.Line.X.ToArray(), x => Math.Abs(x - secondDisplay) < 0.000001);
+        Assert.True(startIndex >= 0);
+        Assert.True(firstIndex > startIndex);
+        Assert.True(secondIndex > firstIndex);
+        Assert.Equal(100d, displayLines.Solid.Line.Y[startIndex]);
+        Assert.Equal(89d, displayLines.Solid.Line.Y[firstIndex], precision: 8);
+        Assert.Equal(88d, displayLines.Solid.Line.Y[secondIndex], precision: 8);
+
+        var viewportLines = GraphPlotProjection.BuildViewportRemainingLines(viewport);
+        Assert.DoesNotContain((double)viewportStart, viewportLines.Solid.Line.X);
+        Assert.Contains((double)periodStart, viewportLines.Solid.Line.X);
+        Assert.Contains(viewportLines.Solid.Line.X, x => Math.Abs(x - firstDisplay) < 0.000001);
+        Assert.Contains(viewportLines.Solid.Line.X, x => Math.Abs(x - secondDisplay) < 0.000001);
+
+        var noAuthority = CreateScene(publishedStart: null);
+        var noAuthorityLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            noAuthority,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.DoesNotContain((double)periodStart, noAuthorityLines.Solid.Line.X);
+
+        var gapBlocked = CreateScene(
+            periodStart,
+            [new GraphConfirmedGap(periodStart + 1, firstRaw - 1)]);
+        var gapLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            gapBlocked,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.DoesNotContain((double)periodStart, gapLines.Solid.Line.X);
+
+        var ownershipBlocked = CreateScene(
+            periodStart,
+            ownership: [new GraphAccountOwnershipInterval(firstRaw + 7, null)]);
+        var ownershipLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            ownershipBlocked,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.DoesNotContain((double)periodStart, ownershipLines.Solid.Line.X);
+
+        var acceptedModel = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol).Rising.Line;
+        var noAuthorityModel = GraphPlotProjection.BuildCanonicalModelLines(
+            noAuthority,
+            noAuthority.Sol).Rising.Line;
+        Assert.Equal(noAuthorityModel.X, acceptedModel.X);
+        Assert.Equal(noAuthorityModel.Y, acceptedModel.Y);
+    }
+
     [Fact]
     public void Verified_current_reset_baselines_do_not_cross_a_confirmed_leading_gap()
     {
