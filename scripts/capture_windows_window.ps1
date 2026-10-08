@@ -237,7 +237,17 @@ try {
                 Start-Sleep -Milliseconds 50
             }
             if (-not $sceneReady) {
-                throw "Graph metric scene did not settle after selecting $GraphMetric within 10 seconds"
+                $failureRect = New-Object CodexInfoCaptureWin32+RECT
+                [CodexInfoCaptureWin32]::GetWindowRect($window, [ref]$failureRect) | Out-Null
+                $failureBitmap = New-Object System.Drawing.Bitmap(($failureRect.Right - $failureRect.Left), ($failureRect.Bottom - $failureRect.Top))
+                $failureGraphics = [System.Drawing.Graphics]::FromImage($failureBitmap)
+                try {
+                    $failureGraphics.CopyFromScreen($failureRect.Left, $failureRect.Top, 0, 0, $failureBitmap.Size)
+                    $failureBitmap.Save("$OutputPath.failure.png", [System.Drawing.Imaging.ImageFormat]::Png)
+                }
+                finally { $failureGraphics.Dispose(); $failureBitmap.Dispose() }
+                $currentPlotHelp = if ($null -eq $plot) { '<missing>' } else { $plot.Current.HelpText }
+                throw "Graph metric scene did not settle after selecting $GraphMetric within 10 seconds: plotVisible=$plotVisible wasSelected=$wasSelected helpChanged=$plotHelpTextChanged progressVisible=$visibleProgressBar priorHelp='$priorPlotHelpText' currentHelp='$currentPlotHelp'; diagnostic=$OutputPath.failure.png"
             }
         }
         if ($OpenGraphPeriodMenu) {
