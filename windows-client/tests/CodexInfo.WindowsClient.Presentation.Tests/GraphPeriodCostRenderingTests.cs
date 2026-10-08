@@ -115,6 +115,82 @@ public sealed class GraphPeriodCostRenderingTests
     }
 
     [Fact]
+    public void AmountsScaleToTheirVisiblePeriodAndKeepThePeriodMidpoint()
+    {
+        var periods = new[]
+        {
+            Period(900, 1_200, 274, 0),
+            Period(1_200, 1_500, 300, 0),
+            Period(1_500, 1_800, 106, 0),
+        };
+        var viewport = GraphScene.CreateViewport(0, 3_000, GraphMetric.Dollars, periods);
+        var control = new GraphPlotControl { Scene = viewport };
+        var panel = Panel(control);
+
+        using var rendered = control.Plot.GetImage(900, 640);
+        var dataRect = control.Plot.LastRender.DataRect;
+        var amounts = panel.Amounts.OrderBy(amount => amount.CenterAt).ToArray();
+
+        Assert.Equal(["$274", "$300", "$106"], amounts.Select(amount => amount.LabelStyle.Text));
+        for (var index = 0; index < amounts.Length; index++)
+        {
+            var amount = amounts[index];
+            var period = periods[index];
+            var intervalLeft = control.Plot.Axes.Bottom.GetPixel(period.PeriodStartAt, dataRect);
+            var intervalRight = control.Plot.Axes.Bottom.GetPixel(period.PeriodEndAt, dataRect);
+            var renderedBounds = AssertRenderedRect(amount.LastRenderBounds);
+            var expectedCenter = control.Plot.Axes.Bottom.GetPixel(amount.CenterAt, dataRect);
+
+            Assert.InRange(intervalRight - intervalLeft, 70, 100);
+            Assert.InRange(amount.LabelStyle.FontSize, 14, 22);
+            Assert.True(renderedBounds.Left >= intervalLeft + 8,
+                $"{amount.LabelStyle.Text} starts at {renderedBounds.Left} in [{intervalLeft}, {intervalRight}]");
+            Assert.True(renderedBounds.Right <= intervalRight - 8,
+                $"{amount.LabelStyle.Text} ends at {renderedBounds.Right} in [{intervalLeft}, {intervalRight}]");
+            Assert.InRange(Math.Abs(amount.LastRenderCenterX!.Value - expectedCenter), 0, 0.1f);
+        }
+    }
+
+    [Fact]
+    public void ResetSeparatorUsesThemeAmountYellowInPlotAndFooter()
+    {
+        var scene = GraphScene.CreateViewport(
+            1_000,
+            1_200,
+            GraphMetric.Dollars,
+            [
+                Period(1_000, 1_100, 1, 0, resetAt: 1_000),
+                Period(1_100, 1_200, 1, 0, resetAt: 1_100),
+            ]);
+        var control = new GraphPlotControl { Scene = scene };
+        var panel = Panel(control);
+
+        using var rendered = control.Plot.GetImage(900, 640);
+        var expectedResetColor = new ScottPlot.Color(
+            ThemePalette.Resolve("#E6B85C")).WithOpacity(0.70);
+        var dataRect = control.Plot.LastRender.DataRect;
+        var footerRect = AssertRenderedRect(panel.LastRenderBounds);
+        var resetX = (int)Math.Round(control.Plot.Axes.Bottom.GetPixel(1_100, dataRect));
+        using var bitmap = SkiaSharp.SKBitmap.Decode(rendered.GetImageBytes());
+        var footerBackground = SkiaSharp.SKColor.Parse(ThemePalette.Resolve(GraphPlotControl.PlotColorHex));
+        var footerResetPixels =
+            from x in Enumerable.Range(Math.Max(0, resetX - 1), 3)
+            from y in Enumerable.Range((int)Math.Ceiling(footerRect.Top) + 2, Math.Max(0, (int)footerRect.Bottom - (int)footerRect.Top - 4))
+            let color = bitmap.GetPixel(x, y)
+            where color.Red > footerBackground.Red + 30 && color.Green > footerBackground.Green + 30
+            select color;
+
+        Assert.NotEmpty(footerResetPixels);
+
+        var plotResetGuide = control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>().Any(scatter =>
+        {
+            var points = scatter.Data.GetScatterPoints().ToArray();
+            return points.Length == 2 && points.All(point => point.X == 1_100) && scatter.Color == expectedResetColor;
+        });
+        Assert.True(plotResetGuide, "The plot reset guide must use the amount theme color.");
+    }
+
+    [Fact]
     public void PartialUnavailableAndConfirmedZeroRenderOnlyTheirAmounts()
     {
         var originalLanguage = LocalizationService.Current.LanguageCode;
@@ -274,19 +350,29 @@ public sealed class GraphPeriodCostRenderingTests
         using var rendered = control.Plot.GetImage(width, height);
         var panel = Panel(control);
         var footerRect = AssertRenderedRect(panel.LastRenderBounds);
-        var amounts = panel.Amounts.OrderBy(amount => amount.LastRenderCenterX).ToArray();
+        var amounts = panel.Amounts.OrderBy(amount => amount.CenterAt).ToArray();
+        var periods = control.Scene.PeriodScenes.OrderBy(period => period.PeriodStartAt).ToArray();
         var previousRight = float.NegativeInfinity;
 
         Assert.Equal(3, amounts.Length);
-        Assert.InRange(panel.Amounts[0].LabelStyle.FontSize, 5, GraphPeriodCostPanel.BaseFontSize);
-        foreach (var amount in amounts)
+        Assert.Equal(amounts.Length, periods.Length);
+        foreach (var (amount, period) in amounts.Zip(periods))
         {
+            var periodLeft = control.Plot.Axes.Bottom.GetPixel(period.PeriodStartAt, control.Plot.LastRender.DataRect);
+            var periodRight = control.Plot.Axes.Bottom.GetPixel(period.PeriodEndAt, control.Plot.LastRender.DataRect);
+            var inset = Math.Min(8, (periodRight - periodLeft) * 0.1f);
             var rect = AssertRenderedRect(amount.LastRenderBounds);
-            Assert.True(rect.Left >= footerRect.Left + 8, $"left={rect.Left}, footer-left={footerRect.Left}");
-            Assert.True(rect.Right <= footerRect.Right - 8, $"right={rect.Right}, footer-right={footerRect.Right}");
+            var expectedCenter = control.Plot.Axes.Bottom.GetPixel(amount.CenterAt, control.Plot.LastRender.DataRect);
+
+            Assert.InRange(amount.LabelStyle.FontSize, 0.001f, GraphPeriodCostPanel.BaseFontSize);
+            Assert.True(rect.Left >= periodLeft + inset - 0.1f,
+                $"left={rect.Left}, period=[{periodLeft}, {periodRight}], inset={inset}");
+            Assert.True(rect.Right <= periodRight - inset + 0.1f,
+                $"right={rect.Right}, period=[{periodLeft}, {periodRight}], inset={inset}");
             Assert.True(rect.Top >= footerRect.Top, $"top={rect.Top}, footer-top={footerRect.Top}");
             Assert.True(rect.Bottom <= footerRect.Bottom, $"bottom={rect.Bottom}, footer-bottom={footerRect.Bottom}");
-            Assert.True(rect.Left >= previousRight + 8, $"footer amounts overlap at {rect.Left}");
+            Assert.InRange(Math.Abs(amount.LastRenderCenterX!.Value - expectedCenter), 0, 0.1f);
+            Assert.True(rect.Left >= previousRight, $"period amounts overlap at {rect.Left}");
             previousRight = rect.Right;
         }
     }
@@ -318,7 +404,12 @@ public sealed class GraphPeriodCostRenderingTests
         AssertGlyphsAvailable(renderedTypeface, text);
     }
 
-    private static GraphScene Period(long startAt, long endAt, double firstDollars, double secondDollars)
+    private static GraphScene Period(
+        long startAt,
+        long endAt,
+        double firstDollars,
+        double secondDollars,
+        long? resetAt = null)
     {
         var duration = endAt - startAt;
         var firstOffset = duration / 2;
@@ -327,7 +418,11 @@ public sealed class GraphPeriodCostRenderingTests
         [
             Sample(startAt + firstOffset, Model("gpt-6-sol", firstDollars / 2), Model("gpt-5.6-sol", secondDollars / 2)),
             Sample(startAt + secondOffset, Model("gpt-6-sol", firstDollars), Model("gpt-5.6-sol", secondDollars)),
-        ], GraphMetric.Dollars, startAt, endAt);
+        ], GraphMetric.Dollars, startAt, endAt,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: null,
+            resetAt: resetAt);
     }
 
     private static ApiHistorySample Sample(long timestamp, params ApiHistoryModelSample[] models) =>

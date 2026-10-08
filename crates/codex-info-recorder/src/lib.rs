@@ -2038,6 +2038,14 @@ pub struct TokenSnapshot {
 }
 
 impl TokenSnapshot {
+    fn is_zero(self) -> bool {
+        self.total == 0
+            && self.input == 0
+            && self.cached_input == 0
+            && self.output == 0
+            && self.cache_write_input.unwrap_or(0) == 0
+    }
+
     fn cache_write_delta_from(self, previous: Self) -> Option<u64> {
         match (self.cache_write_input, previous.cache_write_input) {
             (Some(current), Some(before)) => current.checked_sub(before),
@@ -3500,6 +3508,7 @@ impl Recorder {
         let mut durable_events = Vec::new();
         let mut token_anchor_recoveries = Vec::new();
         let mut token_anchor_resolutions = Vec::new();
+        let mut old_epoch_no_delta_proofs = Vec::<SessionPendingRange>::new();
         let mut pending_evidence = inventory_failures
             .into_iter()
             .map(|failure| {
@@ -3586,17 +3595,72 @@ impl Recorder {
                     && pending.relative_path == source.recorded.relative_path
                     && pending.reason == "checkpoint-token-anchor-missing"
             });
-            if source_token_anchor_recovery.is_none()
-                && (path_has_token_anchor_recovery || path_has_legacy_anchor_pending)
+            let current_checkpoint = state
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| {
+                    checkpoint.root_identity == source.recorded.root_identity
+                        && checkpoint.relative_path == source.recorded.relative_path
+                        && checkpoint.file_device == source.recorded.file_device
+                        && checkpoint.file_inode == source.recorded.file_inode
+                })
+                .max_by_key(|checkpoint| checkpoint.cycle_seq);
+            let legacy_replay =
+                if source_token_anchor_recovery.is_none() && !path_has_token_anchor_recovery {
+                    legacy_pending_replay(
+                        &state.checkpoints,
+                        &durable_pending,
+                        source,
+                        current_checkpoint,
+                        collector_epoch,
+                        cycle_seq,
+                    )?
+                } else {
+                    None
+                };
+            let old_epoch_no_delta_proof = if source_token_anchor_recovery.is_none()
+                && !path_has_token_anchor_recovery
+                && path_has_legacy_anchor_pending
+                && legacy_replay.is_none()
             {
-                // A pre-sidecar pending row has no durable original anchor.
-                // Keep it unresolved rather than treating the later current
-                // checkpoint as proof; other sources continue normally.
+                let accepted_ranges = self.writer.load_session_ranges()?;
+                let attempt = legacy_pending_no_delta_proof(
+                    &state.checkpoints,
+                    &durable_pending,
+                    &accepted_ranges,
+                    source,
+                    current_checkpoint,
+                    collector_epoch,
+                    cycle_seq,
+                    self.config.chunk_bytes.saturating_sub(consumed_budget),
+                );
+                consumed_budget = consumed_budget.saturating_add(attempt.bytes_read);
+                if let Some(pending) = attempt.proven_pending {
+                    old_epoch_no_delta_proofs.push(pending);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if source_token_anchor_recovery.is_none()
+                && (path_has_token_anchor_recovery
+                    || (path_has_legacy_anchor_pending
+                        && legacy_replay.is_none()
+                        && !old_epoch_no_delta_proof))
+            {
+                // Without a strict prior checkpoint and an exact digest match,
+                // a legacy pending row remains unresolved. The current cursor
+                // is never promoted to an anchor.
                 pending_ranges = pending_ranges.max(1);
                 current_cycle_unresolved = true;
                 continue;
             }
-            let prior = prior_checkpoint(&state.checkpoints, source);
+            let prior = legacy_replay
+                .as_ref()
+                .map(|legacy| &legacy.strict_prior)
+                .or_else(|| prior_checkpoint(&state.checkpoints, source));
             let baseline_existing = boundary_not_committed
                 || baseline_new_partition
                 || (state.collector_epoch == Some(collector_epoch)
@@ -3633,6 +3697,15 @@ impl Recorder {
                 ));
                 continue;
             }
+            let recovery_for_scan = source_token_anchor_recovery.or_else(|| {
+                legacy_replay
+                    .as_ref()
+                    .and_then(|legacy| legacy.recovery.as_ref())
+            });
+            let pending_for_scan = legacy_replay
+                .as_ref()
+                .map(|legacy| &legacy.pending)
+                .or_else(|| source_token_anchor_recovery.map(|recovery| &recovery.pending));
             let result = scan_source(
                 source,
                 prior,
@@ -3643,7 +3716,11 @@ impl Recorder {
                 reset_at,
                 window_start,
                 self.config.chunk_bytes.saturating_sub(consumed_budget),
-                source_token_anchor_recovery,
+                recovery_for_scan,
+                pending_for_scan,
+                legacy_replay
+                    .as_ref()
+                    .map(|legacy| legacy.prefix_generation),
                 &mut totals,
                 &mut events,
             );
@@ -3694,8 +3771,26 @@ impl Recorder {
                 ));
                 continue;
             };
+            if result.token_anchor_resolution.is_none() {
+                if let Some(recovery) = recovery_for_scan {
+                    result.pending.push(recovery.pending.clone());
+                }
+            }
             if let Some(recovery) = result.token_anchor_recovery.take() {
                 token_anchor_recoveries.push(recovery);
+            }
+            if result.token_anchor_resolution.is_some() && source_token_anchor_recovery.is_none() {
+                if let Some(recovery) = legacy_replay
+                    .as_ref()
+                    .and_then(|legacy| legacy.recovery.as_ref())
+                {
+                    let mut recovery = recovery.clone();
+                    recovery.cursor_offset = result.checkpoint.committed_offset;
+                    recovery.cursor_prefix_generation = result.checkpoint.prefix_generation;
+                    recovery.cursor_collector_epoch = result.checkpoint.collector_epoch;
+                    recovery.cursor_cycle_seq = result.checkpoint.cycle_seq;
+                    token_anchor_recoveries.push(recovery);
+                }
             }
             if let Some(resolution) = result.token_anchor_resolution.take() {
                 token_anchor_resolutions.push(resolution);
@@ -3751,13 +3846,16 @@ impl Recorder {
         // other durable or current-cycle issue incomplete; in particular,
         // ordinary accepted-range replacement retains its conservative
         // existing one-cycle behavior.
+        let mut candidate_token_anchor_recoveries = durable_token_anchor_recoveries.clone();
+        candidate_token_anchor_recoveries.extend(token_anchor_recoveries.iter().cloned());
         let candidate_model_totals_complete = !current_cycle_unresolved
             && durable_pending.iter().all(|pending| {
-                pending_range_resolved_by_anchor(
-                    pending,
-                    &durable_token_anchor_recoveries,
-                    &token_anchor_resolutions,
-                )
+                old_epoch_no_delta_proofs.contains(pending)
+                    || pending_range_resolved_by_anchor(
+                        pending,
+                        &candidate_token_anchor_recoveries,
+                        &token_anchor_resolutions,
+                    )
             });
 
         let timeline_recovery = if !period_restarted && period_available {
@@ -4207,6 +4305,18 @@ struct SourceOutcome {
     consumed_bytes: u64,
 }
 
+struct LegacyPendingReplay {
+    pending: SessionPendingRange,
+    strict_prior: SessionCheckpoint,
+    recovery: Option<SessionTokenAnchorRecovery>,
+    prefix_generation: u128,
+}
+
+struct LegacyNoDeltaProofAttempt {
+    proven_pending: Option<SessionPendingRange>,
+    bytes_read: u64,
+}
+
 struct TaskObservation {
     event_index: u64,
     timestamp: i64,
@@ -4407,6 +4517,447 @@ fn prior_checkpoint<'a>(
     })
 }
 
+fn legacy_pending_replay(
+    checkpoints: &[SessionCheckpoint],
+    pending_ranges: &[SessionPendingRange],
+    source: &Source,
+    current: Option<&SessionCheckpoint>,
+    collector_epoch: u128,
+    cycle_seq: u64,
+) -> Result<Option<LegacyPendingReplay>, RecorderError> {
+    let mut matching_pending = pending_ranges.iter().filter(|pending| {
+        pending.reason == "checkpoint-token-anchor-missing"
+            && pending.complete
+            && pending.root_identity == source.recorded.root_identity
+            && pending.relative_path == source.recorded.relative_path
+            && pending.file_device == source.recorded.file_device
+            && pending.file_inode == source.recorded.file_inode
+            && pending.start_offset == 0
+            && pending.collector_epoch == collector_epoch
+    });
+    let Some(pending) = matching_pending.next() else {
+        return Ok(None);
+    };
+    if matching_pending.next().is_some()
+        || pending.end_offset > source.recorded.file_bytes
+        || pending.cycle_seq >= cycle_seq
+    {
+        return Ok(None);
+    }
+    let Some(_current) = current.filter(|checkpoint| {
+        checkpoint.root_identity == source.recorded.root_identity
+            && checkpoint.relative_path == source.recorded.relative_path
+            && checkpoint.file_device == source.recorded.file_device
+            && checkpoint.file_inode == source.recorded.file_inode
+            && checkpoint.collector_epoch == collector_epoch
+            && checkpoint.cycle_seq >= pending.cycle_seq
+            && checkpoint.committed_offset >= pending.end_offset
+    }) else {
+        return Ok(None);
+    };
+    let Some(strict_prior) = checkpoints
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint.root_identity == pending.root_identity
+                && checkpoint.relative_path == pending.relative_path
+                && checkpoint.file_device == pending.file_device
+                && checkpoint.file_inode != pending.file_inode
+                && checkpoint.collector_epoch == pending.collector_epoch
+                && checkpoint.cycle_seq < pending.cycle_seq
+        })
+        .max_by_key(|checkpoint| checkpoint.cycle_seq)
+    else {
+        return Ok(None);
+    };
+    let anchor = strict_prior
+        .token_baseline_known
+        .then(|| SessionTokenAnchor {
+            root_identity: strict_prior.root_identity.clone(),
+            relative_path: strict_prior.relative_path.clone(),
+            file_device: strict_prior.file_device,
+            file_inode: strict_prior.file_inode,
+            prefix_generation: strict_prior.prefix_generation,
+            committed_offset: strict_prior.committed_offset,
+            prefix_sha256: strict_prior.prefix_sha256.clone(),
+            collector_epoch: strict_prior.collector_epoch,
+            cycle_seq: strict_prior.cycle_seq,
+            fully_attributed_from_zero: strict_prior.fully_attributed_from_zero,
+            total_tokens: strict_prior.previous_total,
+            input_tokens: strict_prior.previous_input,
+            cached_input_tokens: strict_prior.previous_cached_input,
+            output_tokens: strict_prior.previous_output,
+            cache_write_input_tokens: strict_prior.previous_cache_write_input,
+        });
+    let recovery_id = anchor
+        .as_ref()
+        .map(|anchor| session_token_anchor_recovery_id(pending, anchor));
+    let prefix_generation = legacy_replay_prefix_generation(pending, recovery_id.as_deref());
+    let recovery = anchor.map(|anchor| SessionTokenAnchorRecovery {
+        recovery_id: recovery_id.expect("recovery id follows an anchor"),
+        pending: pending.clone(),
+        anchor,
+        current_root_identity: source.recorded.root_identity.clone(),
+        current_relative_path: source.recorded.relative_path.clone(),
+        current_file_device: source.recorded.file_device,
+        current_file_inode: source.recorded.file_inode,
+        cursor_offset: 0,
+        cursor_prefix_generation: prefix_generation,
+        cursor_collector_epoch: collector_epoch,
+        cursor_cycle_seq: cycle_seq,
+    });
+    Ok(Some(LegacyPendingReplay {
+        pending: pending.clone(),
+        strict_prior: strict_prior.clone(),
+        recovery,
+        prefix_generation,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn legacy_pending_no_delta_proof(
+    checkpoints: &[SessionCheckpoint],
+    pending_ranges: &[SessionPendingRange],
+    accepted_ranges: &[SessionRange],
+    source: &Source,
+    current: Option<&SessionCheckpoint>,
+    collector_epoch: u128,
+    cycle_seq: u64,
+    remaining_budget: u64,
+) -> LegacyNoDeltaProofAttempt {
+    let path_pending = pending_ranges
+        .iter()
+        .filter(|pending| {
+            pending.root_identity == source.recorded.root_identity
+                && pending.relative_path == source.recorded.relative_path
+        })
+        .collect::<Vec<_>>();
+    let [pending] = path_pending.as_slice() else {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    };
+    if pending.reason != "checkpoint-token-anchor-missing"
+        || !pending.complete
+        || pending.parser_version != PARSER_VERSION
+        || pending.collector_epoch == collector_epoch
+        || pending.file_device != source.recorded.file_device
+        || pending.file_inode != source.recorded.file_inode
+        || pending.start_offset != 0
+        || pending.end_offset == 0
+        || pending.end_offset > source.recorded.file_bytes
+        || pending.end_offset > remaining_budget
+        || pending.cycle_seq >= cycle_seq
+    {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    }
+    let Some(current) = current.filter(|checkpoint| {
+        checkpoint.root_identity == source.recorded.root_identity
+            && checkpoint.relative_path == source.recorded.relative_path
+            && checkpoint.file_device == source.recorded.file_device
+            && checkpoint.file_inode == source.recorded.file_inode
+            && checkpoint.collector_epoch == collector_epoch
+            && checkpoint.cycle_seq >= pending.cycle_seq
+            && checkpoint.committed_offset >= pending.end_offset
+            && !checkpoint.discard_until_lf
+            && !checkpoint.history_base_pending
+    }) else {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    };
+    if !accepted_ranges_cover_pending_suffix(accepted_ranges, pending, current) {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    }
+    let _current = current;
+    let Some(strict_prior) = checkpoints
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint.root_identity == pending.root_identity
+                && checkpoint.relative_path == pending.relative_path
+                && checkpoint.file_device == pending.file_device
+                && checkpoint.file_inode != pending.file_inode
+                && checkpoint.collector_epoch == pending.collector_epoch
+                && checkpoint.cycle_seq < pending.cycle_seq
+        })
+        .max_by_key(|checkpoint| checkpoint.cycle_seq)
+    else {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    };
+    if strict_prior.discard_until_lf || strict_prior.history_base_pending {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    }
+    let prior_snapshot = TokenSnapshot {
+        total: strict_prior.previous_total,
+        input: strict_prior.previous_input,
+        cached_input: strict_prior.previous_cached_input,
+        output: strict_prior.previous_output,
+        cache_write_input: strict_prior.previous_cache_write_input,
+    };
+    let known_zero_anchor = strict_prior.token_baseline_known
+        && strict_prior.fully_attributed_from_zero
+        && prior_snapshot.valid()
+        && prior_snapshot.is_zero();
+    let unknown_zero_baseline =
+        !strict_prior.token_baseline_known && prior_snapshot.valid() && prior_snapshot.is_zero();
+    if !known_zero_anchor && !unknown_zero_baseline {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    }
+
+    let Ok(path_before) = fs::symlink_metadata(&source.path) else {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    };
+    if path_before.file_type().is_symlink()
+        || !path_before.is_file()
+        || file_identity(&path_before) != (source.recorded.file_device, source.recorded.file_inode)
+        || path_before.len() < pending.end_offset
+    {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    }
+    let Ok(mut file) = File::open(&source.path) else {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    };
+    let Ok(file_before) = file.metadata() else {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    };
+    if !file_before.is_file()
+        || file_identity(&file_before) != (source.recorded.file_device, source.recorded.file_inode)
+        || file_before.len() < pending.end_offset
+    {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    }
+    let Ok(buffer_len) = usize::try_from(pending.end_offset) else {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    };
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(buffer_len).is_err() {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: 0,
+        };
+    }
+    bytes.resize(buffer_len, 0);
+    let mut bytes_read = 0_usize;
+    while bytes_read < buffer_len {
+        match file.read(&mut bytes[bytes_read..]) {
+            Ok(0) | Err(_) => {
+                return LegacyNoDeltaProofAttempt {
+                    proven_pending: None,
+                    bytes_read: bytes_read as u64,
+                };
+            }
+            Ok(read) => bytes_read += read,
+        }
+    }
+    let after_file = file.metadata();
+    let after_path = fs::symlink_metadata(&source.path);
+    let Ok(after_file) = after_file else {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: bytes_read as u64,
+        };
+    };
+    let Ok(after_path) = after_path else {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: bytes_read as u64,
+        };
+    };
+    let range_digest = Sha256::digest(&bytes);
+    let record_sha256 = hex_digest(range_digest.as_slice());
+    if after_path.file_type().is_symlink()
+        || !after_path.is_file()
+        || file_identity(&after_file) != file_identity(&file_before)
+        || file_identity(&after_path) != file_identity(&path_before)
+        || after_file.len() < pending.end_offset
+        || after_path.len() < pending.end_offset
+        || record_sha256 != pending.record_sha256
+        || !legacy_pending_bytes_have_no_delta(&bytes, known_zero_anchor)
+    {
+        return LegacyNoDeltaProofAttempt {
+            proven_pending: None,
+            bytes_read: bytes_read as u64,
+        };
+    }
+    LegacyNoDeltaProofAttempt {
+        proven_pending: Some((*pending).clone()),
+        bytes_read: bytes_read as u64,
+    }
+}
+
+fn accepted_ranges_cover_pending_suffix(
+    accepted_ranges: &[SessionRange],
+    pending: &SessionPendingRange,
+    current: &SessionCheckpoint,
+) -> bool {
+    if pending.end_offset > current.committed_offset {
+        return false;
+    }
+    if pending.end_offset == current.committed_offset {
+        return true;
+    }
+    let mut ranges = accepted_ranges
+        .iter()
+        .filter(|range| {
+            range.root_identity == pending.root_identity
+                && range.relative_path == pending.relative_path
+                && range.file_device == pending.file_device
+                && range.file_inode == pending.file_inode
+                && range.collector_epoch == current.collector_epoch
+                && range.prefix_generation == current.prefix_generation
+                && range.cycle_seq <= current.cycle_seq
+                && range.start_offset < current.committed_offset
+                && range.end_offset <= current.committed_offset
+                && range.end_offset > pending.end_offset
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start_offset, range.end_offset));
+    let mut covered_until = pending.end_offset;
+    for range in ranges {
+        if range.start_offset > covered_until || range.end_offset <= covered_until {
+            continue;
+        }
+        covered_until = range.end_offset;
+        if covered_until >= current.committed_offset {
+            return true;
+        }
+    }
+    false
+}
+
+fn legacy_pending_bytes_have_no_delta(bytes: &[u8], known_zero_anchor: bool) -> bool {
+    let mut reader = BufReader::new(std::io::Cursor::new(bytes));
+    let mut consumed_bytes = 0_usize;
+    let mut first_unknown_snapshot = None;
+    loop {
+        let (summary, record_bytes) = match read_streaming_record(&mut reader) {
+            Ok(RecordRead::End) => return consumed_bytes == bytes.len(),
+            Ok(RecordRead::Present(summary, record_bytes)) => (summary, record_bytes),
+            Ok(RecordRead::Invalid(_, _) | RecordRead::Unterminated(_)) | Err(_) => return false,
+        };
+        if record_bytes == 0 {
+            return false;
+        }
+        let Ok(record_bytes) = usize::try_from(record_bytes) else {
+            return false;
+        };
+        consumed_bytes = consumed_bytes.saturating_add(record_bytes);
+        if consumed_bytes > bytes.len() || summary.history_base_continuation() {
+            return false;
+        }
+        let token_count_without_sample =
+            summary.event_type() == Some("token_count") && summary.payload.info_null;
+        if !token_count_without_sample
+            && (summary.timestamp_malformed
+                || (summary.timestamp_seen
+                    && summary
+                        .timestamp
+                        .as_deref()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .is_none()))
+        {
+            return false;
+        }
+        if summary.usage_unparsed()
+            || (summary.task_running().is_some() && summary.event_timestamp() <= 0)
+        {
+            return false;
+        }
+        let Some(snapshot) = summary.token_snapshot() else {
+            continue;
+        };
+        if !snapshot.valid() {
+            return false;
+        }
+        if known_zero_anchor {
+            if !snapshot.is_zero() {
+                return false;
+            }
+        } else if let Some(first) = first_unknown_snapshot {
+            if snapshot != first {
+                return false;
+            }
+        } else {
+            first_unknown_snapshot = Some(snapshot);
+        }
+    }
+}
+
+fn legacy_replay_prefix_generation(
+    pending: &SessionPendingRange,
+    recovery_id: Option<&str>,
+) -> u128 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-info-session-legacy-pending-replay-prefix-v1\0");
+    if let Some(recovery_id) = recovery_id {
+        hasher.update([1]);
+        hasher.update((recovery_id.len() as u64).to_be_bytes());
+        hasher.update(recovery_id.as_bytes());
+    } else {
+        hasher.update([0]);
+        for value in [
+            pending.root_identity.as_str(),
+            pending.relative_path.as_str(),
+            pending.record_sha256.as_str(),
+            pending.parser_version.as_str(),
+            pending.reason.as_str(),
+        ] {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        for value in [
+            pending.file_device,
+            pending.file_inode,
+            pending.start_offset,
+            pending.end_offset,
+            pending.cycle_seq,
+        ] {
+            hasher.update(value.to_be_bytes());
+        }
+        hasher.update(pending.collector_epoch.to_be_bytes());
+        hasher.update(pending.prefix_generation.to_be_bytes());
+        hasher.update([u8::from(pending.complete)]);
+    }
+    let digest = hasher.finalize();
+    let mut generation = [0_u8; 16];
+    generation.copy_from_slice(&digest[..16]);
+    u128::from_be_bytes(generation).max(1)
+}
+
 fn checkpoint_covers_observed_end(prior: Option<&SessionCheckpoint>, source: &Source) -> bool {
     prior.is_some_and(|checkpoint| {
         checkpoint_can_resume_offset(checkpoint, source)
@@ -4434,6 +4985,8 @@ fn scan_source(
     window_start: i64,
     max_bytes: u64,
     saved_token_anchor_recovery: Option<&SessionTokenAnchorRecovery>,
+    legacy_pending: Option<&SessionPendingRange>,
+    legacy_prefix_generation: Option<u128>,
     totals: &mut ModelTotals,
     events: &mut Vec<TimedModelUsage>,
 ) -> Result<Option<SourceOutcome>, RecorderError> {
@@ -4457,7 +5010,8 @@ fn scan_source(
     // changes inode, scan from zero and re-synchronize on the durable token
     // vector below instead of guessing that the old byte boundary survived.
     let continuous = prior.filter(|checkpoint| {
-        !baseline_existing
+        legacy_prefix_generation.is_none()
+            && !baseline_existing
             && checkpoint.collector_epoch == collector_epoch
             && checkpoint.root_identity == source.recorded.root_identity
             && checkpoint.relative_path == source.recorded.relative_path
@@ -4487,7 +5041,6 @@ fn scan_source(
                     cache_write_input: checkpoint.previous_cache_write_input,
                 })
         });
-    let mut recovery_anchor_found = recovery_anchor.is_none();
     let (
         start_offset,
         mut discard_until_lf,
@@ -4567,7 +5120,9 @@ fn scan_source(
             None,
             None,
             TokenSnapshot::default(),
-            prefix_generation(collector_epoch, &source.recorded, EMPTY_SHA256),
+            legacy_prefix_generation.unwrap_or_else(|| {
+                prefix_generation(collector_epoch, &source.recorded, EMPTY_SHA256)
+            }),
             EMPTY_SHA256.to_owned(),
         )
     };
@@ -4576,6 +5131,24 @@ fn scan_source(
     }
 
     let resumed_partial = discard_until_lf;
+    let zero_anchor_snapshot = recovery_anchor.filter(|anchor| anchor.is_zero());
+    let zero_anchor_fully_attributed = saved_token_anchor_recovery
+        .map(|recovery| recovery.anchor.fully_attributed_from_zero)
+        .or_else(|| {
+            prior
+                .filter(|checkpoint| checkpoint.token_baseline_known)
+                .map(|checkpoint| checkpoint.fully_attributed_from_zero)
+        })
+        .unwrap_or(false);
+    let zero_anchor_at_source_start = zero_anchor_snapshot
+        .filter(|_| zero_anchor_fully_attributed && (start_offset == 0 || previous.is_zero()));
+    let mut recovery_anchor_found =
+        recovery_anchor.is_none() || zero_anchor_at_source_start.is_some();
+    if let Some(anchor) = zero_anchor_at_source_start {
+        previous = anchor;
+        baseline_known = true;
+        fully_attributed = true;
+    }
     file.seek(SeekFrom::Start(start_offset))?;
     let mut reader = BufReader::new(file.take(snapshot_len - start_offset));
     let admitted_start = start_offset;
@@ -4593,7 +5166,7 @@ fn scan_source(
     // vector is what lets a later reset boundary reconstruct outage-spanning
     // usage without rereading or double-adding checkpoints.
     let mut all_candidate_events = Vec::new();
-    let mut recovery_match = None;
+    let mut recovery_match = zero_anchor_at_source_start.map(|anchor| (anchor, 0, 0));
     let mut token_count_seen = false;
     let mut read_any = false;
     let mut record_index = 0_u64;
@@ -4809,6 +5382,18 @@ fn scan_source(
         }
     }
 
+    if !unresolved && physical_offset < snapshot_len && consumed_bytes >= max_bytes {
+        unresolved = true;
+        pending_evidence.push((physical_offset, snapshot_len, "cycle-budget-backlog", false));
+    }
+    if let Some(pending) = legacy_pending {
+        if pending.end_offset > snapshot_len
+            || sha256_file_range(&source.path, pending.start_offset, pending.end_offset)?
+                != pending.record_sha256
+        {
+            return Ok(None);
+        }
+    }
     let end_offset = unresolved_start.unwrap_or(physical_offset);
     let after_file = reader.get_ref().get_ref().metadata()?;
     let after_path = fs::symlink_metadata(&source.path)?;
@@ -4837,8 +5422,10 @@ fn scan_source(
         prefix_sha256 = accepted_digest
             .clone()
             .unwrap_or_else(|| EMPTY_SHA256.to_owned());
-        prefix_generation_value =
-            prefix_generation(collector_epoch, &source.recorded, &prefix_sha256);
+        if legacy_prefix_generation.is_none() {
+            prefix_generation_value =
+                prefix_generation(collector_epoch, &source.recorded, &prefix_sha256);
+        }
     }
     if !unresolved
         && !discard_until_lf
@@ -7149,6 +7736,251 @@ mod tests {
         (root, database)
     }
 
+    fn replace_source_file_with_new_inode(path: &Path, contents: impl AsRef<[u8]>) {
+        let replacement = path.with_extension("replacement.jsonl");
+        fs::write(&replacement, contents).unwrap();
+        fs::rename(replacement, path).unwrap();
+    }
+
+    fn seed_legacy_complete_anchor_pending(
+        database: &Path,
+        source: &Path,
+        checkpoint: &SessionCheckpoint,
+    ) -> SessionPendingRange {
+        let end_offset = fs::metadata(source).unwrap().len();
+        let prefix_generation = checkpoint.prefix_generation.wrapping_add(1).max(1);
+        let pending = SessionPendingRange {
+            root_identity: checkpoint.root_identity.clone(),
+            relative_path: checkpoint.relative_path.clone(),
+            file_device: checkpoint.file_device,
+            file_inode: checkpoint.file_inode,
+            start_offset: 0,
+            end_offset,
+            collector_epoch: checkpoint.collector_epoch,
+            cycle_seq: checkpoint.cycle_seq,
+            prefix_generation,
+            record_sha256: sha256_file_range(source, 0, end_offset).unwrap(),
+            parser_version: PARSER_VERSION.to_owned(),
+            reason: "checkpoint-token-anchor-missing".to_owned(),
+            complete: true,
+        };
+        Connection::open(database)
+            .unwrap()
+            .execute(
+                "INSERT INTO session_pending_ranges (
+                    root_identity, relative_path, file_device, file_inode,
+                    start_offset, end_offset, collector_epoch, cycle_seq,
+                    prefix_generation, record_sha256, parser_version, reason, complete
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    &pending.root_identity,
+                    &pending.relative_path,
+                    pending.file_device.to_string(),
+                    pending.file_inode.to_string(),
+                    pending.start_offset as i64,
+                    pending.end_offset as i64,
+                    format!("{:032x}", pending.collector_epoch),
+                    pending.cycle_seq.to_string(),
+                    format!("{:032x}", pending.prefix_generation),
+                    &pending.record_sha256,
+                    &pending.parser_version,
+                    &pending.reason,
+                    i64::from(pending.complete),
+                ],
+            )
+            .unwrap();
+        pending
+    }
+
+    #[cfg(unix)]
+    struct OldEpochPendingFixture {
+        root: PathBuf,
+        database: PathBuf,
+        source: PathBuf,
+        start_at: i64,
+        reset_at: i64,
+        window_seconds: i64,
+        transition: String,
+        old_checkpoint: SessionCheckpoint,
+        current_checkpoint: SessionCheckpoint,
+        pending: SessionPendingRange,
+        recorder: Recorder,
+    }
+
+    #[cfg(unix)]
+    fn seed_old_epoch_pending_fixture(
+        name: &str,
+        old_baseline_unknown: bool,
+        current_bytes: impl AsRef<[u8]>,
+        chunk_bytes: u64,
+    ) -> OldEpochPendingFixture {
+        let (root, database) = prepare(name);
+        let source = root.join("sessions/one.jsonl");
+        let (reset_at, window_seconds): (i64, i64) = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT reset_at, window_seconds FROM collection_generation",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let start_at = reset_at - window_seconds;
+        let original = if old_baseline_unknown {
+            "{\"type\":\"session_meta\"}\n".to_owned()
+        } else {
+            token(0, start_at + 1)
+        };
+        fs::write(&source, original).unwrap();
+        let stable_source = root.join("sessions/two.jsonl");
+        fs::write(
+            &stable_source,
+            format!(
+                "{}\n{}{}",
+                json!({
+                        "type": "event_msg",
+                        "timestamp": DateTime::<Utc>::from_timestamp(start_at + 1, 0)
+                            .unwrap()
+                            .to_rfc3339(),
+                        "payload": {"type": "turn_context", "model": "gpt-6-astra"},
+                }),
+                token(10, start_at + 2),
+                token(15, start_at + 3)
+            ),
+        )
+        .unwrap();
+        let mut recorder = Recorder::open_partitioned(
+            config(&root, chunk_bytes.max(4096)),
+            &database,
+            &identity(),
+        )
+        .unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: start_at + 10,
+                reset_at,
+                window_seconds,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let old_checkpoint = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
+            .unwrap();
+        if old_baseline_unknown {
+            assert!(!old_checkpoint.token_baseline_known);
+            assert_eq!(old_checkpoint.previous_total, 0);
+        } else {
+            assert!(old_checkpoint.token_baseline_known);
+            assert!(old_checkpoint.fully_attributed_from_zero);
+            assert!(TokenSnapshot {
+                total: old_checkpoint.previous_total,
+                input: old_checkpoint.previous_input,
+                cached_input: old_checkpoint.previous_cached_input,
+                output: old_checkpoint.previous_output,
+                cache_write_input: old_checkpoint.previous_cache_write_input,
+            }
+            .is_zero());
+        }
+        drop(recorder);
+
+        replace_source_file_with_new_inode(&source, current_bytes);
+        let transition = "aa".repeat(32);
+        let mut recorder = Recorder::open_partitioned_for_account(
+            config(&root, chunk_bytes),
+            &database,
+            &identity(),
+            None,
+            Some(&transition),
+        )
+        .unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: start_at + 12,
+                reset_at,
+                window_seconds,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let state = recorder.state().unwrap();
+        let current_checkpoint = state
+            .checkpoints
+            .iter()
+            .find(|checkpoint| {
+                checkpoint.relative_path == "one.jsonl"
+                    && checkpoint.file_inode == fs::metadata(&source).unwrap().ino()
+            })
+            .unwrap()
+            .clone();
+        assert_ne!(
+            current_checkpoint.collector_epoch,
+            old_checkpoint.collector_epoch
+        );
+        assert_eq!(
+            current_checkpoint.committed_offset,
+            fs::metadata(&source).unwrap().len()
+        );
+        let mut pending_owner = current_checkpoint.clone();
+        pending_owner.collector_epoch = old_checkpoint.collector_epoch;
+        let pending = seed_legacy_complete_anchor_pending(&database, &source, &pending_owner);
+        assert_eq!(pending.collector_epoch, old_checkpoint.collector_epoch);
+        assert!(old_checkpoint.cycle_seq < pending.cycle_seq);
+        assert!(current_checkpoint.cycle_seq >= pending.cycle_seq);
+        // Legacy pending had made these earlier observations incomplete.
+        // Keep them on distinct minutes from the proof and later appends.
+        Connection::open(&database)
+            .unwrap()
+            .execute("UPDATE usage_model_history SET model_set_complete=0", [])
+            .unwrap();
+
+        OldEpochPendingFixture {
+            root,
+            database,
+            source,
+            start_at,
+            reset_at,
+            window_seconds,
+            transition,
+            old_checkpoint,
+            current_checkpoint,
+            pending,
+            recorder,
+        }
+    }
+
+    fn model_history_rows(database: &Path) -> Vec<(i64, i64, String, i64)> {
+        let connection = Connection::open(database).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT reset_at, timestamp, model, model_set_complete
+                 FROM usage_model_history ORDER BY reset_at, timestamp, model",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn latest_model_set_complete(database: &Path) -> i64 {
+        Connection::open(database)
+            .unwrap()
+            .query_row(
+                "SELECT model_set_complete FROM usage_model_history
+                 ORDER BY reset_at DESC, timestamp DESC, model DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn downgrade_canonical_history_to_v9(connection: &Connection) {
         connection
             .execute_batch(
@@ -8845,6 +9677,8 @@ mod tests {
             now - 60,
             4096,
             None,
+            None,
+            None,
             &mut totals,
             &mut events,
         )
@@ -8989,15 +9823,14 @@ mod tests {
             70
         );
 
-        fs::write(
+        replace_source_file_with_new_inode(
             &source,
             format!(
                 "{}{}",
                 token_with_cache_write_input(90, 1, now + 10),
                 token_with_cache_write_input(95, 1, now + 11)
             ),
-        )
-        .unwrap();
+        );
         let unresolved = recorder.run_cycle().unwrap().unwrap();
         assert_eq!(unresolved.pending_ranges, 1);
         assert_eq!(
@@ -9109,6 +9942,214 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_token_anchor_legacy_pending_replays_from_strict_prior_across_chunks_once() {
+        let (root, database) = prepare("checkpoint-anchor-legacy-prior-chunked");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        let original = (1..=8)
+            .map(|index| token_with_cache_write_input(index * 10, 0, now + index as i64))
+            .collect::<String>();
+        fs::write(&source, original).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 9,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let old_checkpoint = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
+            .unwrap();
+        assert_eq!(old_checkpoint.previous_total, 80);
+        assert!(old_checkpoint.token_baseline_known);
+        assert!(old_checkpoint.fully_attributed_from_zero);
+
+        replace_source_file_with_new_inode(
+            &source,
+            format!(
+                "{}{}",
+                token_with_cache_write_input(90, 1, now + 10),
+                token_with_cache_write_input(95, 1, now + 11)
+            ),
+        );
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 1);
+        let original_pending = recorder.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(original_pending.len(), 1);
+        assert_eq!(
+            original_pending[0].reason,
+            "checkpoint-token-anchor-missing"
+        );
+        assert_eq!(original_pending[0].start_offset, 0);
+        assert!(original_pending[0].complete);
+        assert_eq!(
+            original_pending[0].record_sha256,
+            sha256_file_range(
+                &source,
+                original_pending[0].start_offset,
+                original_pending[0].end_offset
+            )
+            .unwrap()
+        );
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("DELETE FROM session_token_anchor_recoveries", [])
+            .unwrap();
+        drop(connection);
+        drop(recorder);
+
+        // The current file keeps the exact bytes named by the legacy pending
+        // row, then appends the old five-component anchor and new deltas.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}{}",
+                    token_with_cache_write_input(80, 0, now + 20),
+                    token_with_cache_write_input(83, 0, now + 21),
+                    token_with_cache_write_input(85, 0, now + 22)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            original_pending[0].record_sha256,
+            sha256_file_range(
+                &source,
+                original_pending[0].start_offset,
+                original_pending[0].end_offset
+            )
+            .unwrap()
+        );
+
+        // Reproduce the legacy state where the current cursor had already
+        // advanced past the old anchor. Recovery must still use the strict
+        // prior checkpoint and replay from byte zero under a new lineage.
+        let current_len = fs::metadata(&source).unwrap().len();
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE session_checkpoints
+                 SET committed_offset=?1, previous_total='85', previous_input='85',
+                     previous_cached_input='0', previous_output='0',
+                     previous_cache_write_input='0', token_baseline_known=1,
+                     fully_attributed_from_zero=1
+                 WHERE root_identity=?2 AND relative_path='one.jsonl'
+                   AND file_device=?3 AND file_inode=?4",
+                (
+                    current_len as i64,
+                    &original_pending[0].root_identity,
+                    original_pending[0].file_device.to_string(),
+                    original_pending[0].file_inode.to_string(),
+                ),
+            )
+            .unwrap();
+
+        // The first scan is deliberately shorter than the exact legacy
+        // pending range. The recovery cursor starts at byte zero on a new
+        // lineage while retaining the original pending identity.
+        let mut migration =
+            Recorder::open_partitioned(config(&root, 128), &database, &identity()).unwrap();
+        let first = migration.run_cycle().unwrap().unwrap();
+        assert!(first.pending_ranges >= 1);
+        let recoveries = migration
+            .writer
+            .load_session_token_anchor_recoveries()
+            .unwrap();
+        assert_eq!(
+            recoveries.len(),
+            1,
+            "legacy source must resume from its strict prior anchor"
+        );
+        assert_eq!(recoveries[0].pending, original_pending[0]);
+        assert_eq!(recoveries[0].anchor.file_inode, old_checkpoint.file_inode);
+        assert_eq!(recoveries[0].anchor.cycle_seq, old_checkpoint.cycle_seq);
+        assert_eq!(recoveries[0].anchor.total_tokens, 80);
+        assert_eq!(recoveries[0].anchor.cache_write_input_tokens, Some(0));
+        assert!(recoveries[0].cursor_offset < original_pending[0].end_offset);
+        assert_ne!(
+            recoveries[0].cursor_prefix_generation, original_pending[0].prefix_generation,
+            "legacy replay receives its own stable prefix lineage"
+        );
+        let migration_pending = migration.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(
+            migration_pending
+                .iter()
+                .filter(|pending| pending.reason == "checkpoint-token-anchor-missing")
+                .count(),
+            1,
+            "chunk replay must not create a second complete pending identity"
+        );
+        assert!(migration_pending.contains(&original_pending[0]));
+        drop(migration);
+
+        let mut restarted =
+            Recorder::open_partitioned(config(&root, 128), &database, &identity()).unwrap();
+        let mut final_report = None;
+        for _ in 0..12 {
+            let report = restarted.run_cycle().unwrap().unwrap();
+            final_report = Some(report.clone());
+            if report.pending_ranges == 0 {
+                break;
+            }
+        }
+        assert_eq!(final_report.unwrap().pending_ranges, 0);
+        assert!(restarted
+            .writer
+            .load_session_token_anchor_recoveries()
+            .unwrap()
+            .is_empty());
+        assert!(restarted
+            .writer
+            .load_session_pending_ranges()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            75,
+            "only the two deltas after the exact strict-prior vector are admitted"
+        );
+        let event_count: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp BETWEEN ?1 AND ?2",
+                (now + 21, now + 22),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 2);
+
+        drop(restarted);
+        let mut replay =
+            Recorder::open_partitioned(config(&root, 128), &database, &identity()).unwrap();
+        replay.run_cycle().unwrap().unwrap();
+        assert_eq!(replay.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 75);
+        let replayed_event_count: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp BETWEEN ?1 AND ?2",
+                (now + 21, now + 22),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replayed_event_count, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn checkpoint_token_anchor_legacy_pending_without_sidecar_never_uses_current_checkpoint() {
         let (root, database) = prepare("checkpoint-anchor-legacy-no-sidecar");
@@ -9142,11 +10183,10 @@ mod tests {
             70
         );
 
-        fs::write(
+        replace_source_file_with_new_inode(
             &source,
             format!("{}{}", token(90, now + 10), token(95, now + 11)),
-        )
-        .unwrap();
+        );
         assert_eq!(
             recorder
                 .run_cycle_with_quota(Some(QuotaSnapshot {
@@ -9175,11 +10215,32 @@ mod tests {
                     && checkpoint.file_inode == pending_before[0].file_inode
             })
             .unwrap();
+        let old_checkpoint = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.file_inode != pending_before[0].file_inode)
+            .unwrap();
         drop(recorder);
 
         let connection = Connection::open(&database).unwrap();
         connection
             .execute("DELETE FROM session_token_anchor_recoveries", [])
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM session_checkpoints
+                 WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+                   AND file_inode=?4 AND prefix_generation=?5",
+                (
+                    &old_checkpoint.root_identity,
+                    &old_checkpoint.relative_path,
+                    old_checkpoint.file_device.to_string(),
+                    old_checkpoint.file_inode.to_string(),
+                    format!("{:032x}", old_checkpoint.prefix_generation),
+                ),
+            )
             .unwrap();
         drop(connection);
         fs::OpenOptions::new()
@@ -9248,6 +10309,808 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_token_anchor_legacy_hash_mismatch_does_not_replay() {
+        let (root, database) = prepare("checkpoint-anchor-legacy-hash-mismatch");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        let original = (1..=8)
+            .map(|index| token(index * 10, now + index as i64))
+            .collect::<String>();
+        fs::write(&source, original).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 9,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70
+        );
+
+        replace_source_file_with_new_inode(&source, token(90, now + 10));
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 1);
+        let original_pending = recorder.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(original_pending.len(), 1);
+        let expected_hash = original_pending[0].record_sha256.clone();
+        let mut changed = fs::read(&source).unwrap();
+        changed[0] = b'[';
+        fs::write(&source, changed).unwrap();
+        assert_ne!(
+            expected_hash,
+            sha256_file_range(
+                &source,
+                original_pending[0].start_offset,
+                original_pending[0].end_offset
+            )
+            .unwrap()
+        );
+        drop(recorder);
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("DELETE FROM session_token_anchor_recoveries", [])
+            .unwrap();
+        drop(connection);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(100, now + 20).as_bytes())
+            .unwrap();
+
+        let mut legacy =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        let retained = legacy.run_cycle().unwrap().unwrap();
+        assert_eq!(retained.pending_ranges, 2);
+        assert_eq!(legacy.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 70);
+        assert!(legacy
+            .writer
+            .load_session_token_anchor_recoveries()
+            .unwrap()
+            .is_empty());
+        let retained_pending = legacy.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(
+            retained_pending
+                .iter()
+                .filter(|pending| pending.reason == "checkpoint-token-anchor-missing")
+                .count(),
+            1
+        );
+        assert!(retained_pending.contains(&original_pending[0]));
+        assert!(retained_pending.iter().any(|pending| {
+            pending.reason == "source-changed-during-scan" && !pending.complete
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_token_anchor_legacy_unknown_baseline_replays_first_counter_as_baseline() {
+        let (root, database) = prepare("checkpoint-anchor-legacy-unknown-baseline");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        let original = (1..=8)
+            .map(|index| token(index * 10, now + index as i64))
+            .collect::<String>();
+        fs::write(&source, original).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 9,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70
+        );
+
+        let legacy_prefix = format!(
+            "{{\"type\":\"session_meta\",\"padding\":\"{}\"}}\n",
+            "x".repeat(256)
+        );
+        replace_source_file_with_new_inode(&source, legacy_prefix);
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 1);
+        let original_pending = recorder.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(original_pending.len(), 1);
+        let current_inode = original_pending[0].file_inode;
+        let old_checkpoint = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.file_inode != current_inode)
+            .unwrap();
+        let current_checkpoint = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.file_inode == current_inode)
+            .unwrap();
+        assert_eq!(
+            original_pending[0].prefix_generation,
+            current_checkpoint.prefix_generation
+        );
+        drop(recorder);
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("DELETE FROM session_token_anchor_recoveries", [])
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE session_checkpoints
+                 SET fully_attributed_from_zero=0, token_baseline_known=0,
+                     previous_total='0', previous_input='0',
+                     previous_cached_input='0', previous_output='0',
+                     previous_cache_write_input=NULL
+                 WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+                   AND file_inode=?4 AND prefix_generation=?5",
+                (
+                    &old_checkpoint.root_identity,
+                    &old_checkpoint.relative_path,
+                    old_checkpoint.file_device.to_string(),
+                    old_checkpoint.file_inode.to_string(),
+                    format!("{:032x}", old_checkpoint.prefix_generation),
+                ),
+            )
+            .unwrap();
+        let mismatched_pending_prefix =
+            original_pending[0].prefix_generation.wrapping_add(1).max(1);
+        assert_ne!(
+            mismatched_pending_prefix,
+            current_checkpoint.prefix_generation
+        );
+        connection
+            .execute(
+                "UPDATE session_pending_ranges SET prefix_generation=?1
+                 WHERE root_identity=?2 AND relative_path=?3 AND file_device=?4
+                   AND file_inode=?5 AND start_offset=0 AND prefix_generation=?6",
+                rusqlite::params![
+                    format!("{:032x}", mismatched_pending_prefix),
+                    &original_pending[0].root_identity,
+                    &original_pending[0].relative_path,
+                    original_pending[0].file_device.to_string(),
+                    original_pending[0].file_inode.to_string(),
+                    format!("{:032x}", original_pending[0].prefix_generation),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(90, now + 10), token(100, now + 20)).as_bytes())
+            .unwrap();
+
+        let mut legacy =
+            Recorder::open_partitioned(config(&root, 128), &database, &identity()).unwrap();
+        let before_chunk = legacy.state().unwrap();
+        let first_chunk = legacy
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 19,
+                reset_at: before_chunk.reset_at,
+                window_seconds: before_chunk.window_seconds,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_chunk.pending_ranges, 1);
+        assert_eq!(legacy.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 70);
+        let checkpoint = legacy
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.file_inode == current_inode)
+            .unwrap();
+        assert_eq!(checkpoint.previous_total, 0);
+        assert!(!checkpoint.token_baseline_known);
+        let backlog = legacy.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(backlog.len(), 1);
+        assert_eq!(backlog[0].reason, "cycle-budget-backlog");
+        assert!(!backlog[0].complete);
+        assert_eq!(backlog[0].start_offset, checkpoint.committed_offset);
+        assert!(checkpoint.committed_offset > 0);
+        assert!(!backlog
+            .iter()
+            .any(|pending| pending.reason == "checkpoint-token-anchor-missing"));
+        assert!(legacy
+            .writer
+            .load_session_token_anchor_recoveries()
+            .unwrap()
+            .is_empty());
+        let incomplete: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT model_set_complete FROM usage_model_history
+                 ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(incomplete, 0, "the unread source suffix stays incomplete");
+
+        drop(legacy);
+        let mut replay =
+            Recorder::open_partitioned(config(&root, 128), &database, &identity()).unwrap();
+        for index in 0_i64..6 {
+            let before_cycle = replay.state().unwrap();
+            replay
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at: now + 21 + index,
+                    reset_at: before_cycle.reset_at,
+                    window_seconds: before_cycle.window_seconds,
+                    remaining_percent: Some(90.0),
+                }))
+                .unwrap()
+                .unwrap();
+            let complete: i64 = Connection::open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT model_set_complete FROM usage_model_history
+                     ORDER BY timestamp DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if complete == 1 {
+                break;
+            }
+        }
+        assert!(replay
+            .writer
+            .load_session_pending_ranges()
+            .unwrap()
+            .is_empty());
+        let delta = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT CAST(total_tokens AS INTEGER) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp=?1",
+                [now + 20],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            delta, 10,
+            "the first recovered counter is baseline, not usage"
+        );
+        assert_eq!(replay.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 80);
+        let event_count: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp=?1",
+                [now + 20],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+        let complete: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT model_set_complete FROM usage_model_history
+                 ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_token_anchor_old_epoch_no_delta_proof_preserves_marker_and_boundary_baseline() {
+        let now = Utc::now().timestamp();
+        for (name, old_unknown, prefix, appended_first, appended_last) in [
+            (
+                "old-epoch-known-zero-no-delta",
+                false,
+                format!("{}{}", token(0, now + 10), token(0, now + 11)),
+                40,
+                43,
+            ),
+            (
+                "old-epoch-unknown-baseline-no-delta",
+                true,
+                format!("{}{}", token(60, now + 10), token(60, now + 11)),
+                90,
+                93,
+            ),
+        ] {
+            let mut fixture =
+                seed_old_epoch_pending_fixture(name, old_unknown, prefix.as_bytes(), 4096);
+            let prior_history = model_history_rows(&fixture.database);
+            assert!(!prior_history.is_empty());
+            let retained_marker = fixture.pending.clone();
+            assert_eq!(
+                fixture
+                    .recorder
+                    .writer
+                    .load_session_pending_ranges()
+                    .unwrap(),
+                vec![retained_marker.clone()]
+            );
+
+            let proof = fixture
+                .recorder
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at: fixture.start_at + 120,
+                    reset_at: fixture.reset_at,
+                    window_seconds: fixture.window_seconds,
+                    remaining_percent: Some(90.0),
+                }))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                proof.pending_ranges, 1,
+                "the legacy evidence remains stored"
+            );
+            assert_eq!(
+                latest_model_set_complete(&fixture.database),
+                1,
+                "the verified no-delta range must not keep the current model set incomplete"
+            );
+            assert_eq!(
+                fixture
+                    .recorder
+                    .writer
+                    .load_session_pending_ranges()
+                    .unwrap(),
+                vec![retained_marker.clone()],
+                "proof is current-only and does not delete or rewrite old evidence"
+            );
+            let after_proof = fixture.recorder.state().unwrap();
+            assert!(after_proof.checkpoints.contains(&fixture.old_checkpoint));
+            assert!(after_proof
+                .checkpoints
+                .contains(&fixture.current_checkpoint));
+            assert_eq!(
+                &model_history_rows(&fixture.database)[..prior_history.len()],
+                prior_history.as_slice(),
+                "past model-completeness flags remain unchanged"
+            );
+            assert_eq!(
+                after_proof
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| {
+                        checkpoint.file_device == fixture.current_checkpoint.file_device
+                            && checkpoint.file_inode == fixture.current_checkpoint.file_inode
+                    })
+                    .unwrap(),
+                &fixture.current_checkpoint,
+                "the current account-boundary counter baseline is not replaced by an old counter"
+            );
+
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&fixture.source)
+                .unwrap()
+                .write_all(
+                    format!(
+                        "{}{}",
+                        token(appended_first, fixture.start_at + 240),
+                        token(appended_last, fixture.start_at + 241)
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            let appended = fixture
+                .recorder
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at: fixture.start_at + 242,
+                    reset_at: fixture.reset_at,
+                    window_seconds: fixture.window_seconds,
+                    remaining_percent: Some(90.0),
+                }))
+                .unwrap()
+                .unwrap();
+            assert_eq!(appended.pending_ranges, 1);
+            assert_eq!(latest_model_set_complete(&fixture.database), 1);
+            assert_eq!(
+                fixture
+                    .recorder
+                    .model_totals()
+                    .unwrap()
+                    .get(UNATTRIBUTED_MODEL)
+                    .map_or(0, |counter| counter.total),
+                3,
+                "the new epoch's first appended counter remains a baseline; only its next delta counts"
+            );
+            let prefix_event_count: i64 = Connection::open(&fixture.database)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE relative_path='one.jsonl' AND timestamp BETWEEN ?1 AND ?2",
+                    (fixture.start_at + 10, fixture.start_at + 11),
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(prefix_event_count, 0, "proof itself creates no usage event");
+
+            drop(fixture.recorder);
+            let mut restarted = Recorder::open_partitioned_for_account(
+                config(&fixture.root, 4096),
+                &fixture.database,
+                &identity(),
+                None,
+                Some(&fixture.transition),
+            )
+            .unwrap();
+            let restart = restarted
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at: fixture.start_at + 300,
+                    reset_at: fixture.reset_at,
+                    window_seconds: fixture.window_seconds,
+                    remaining_percent: Some(90.0),
+                }))
+                .unwrap()
+                .unwrap();
+            assert_eq!(restart.pending_ranges, 1);
+            assert_eq!(latest_model_set_complete(&fixture.database), 1);
+            assert_eq!(
+                restarted
+                    .model_totals()
+                    .unwrap()
+                    .get(UNATTRIBUTED_MODEL)
+                    .map_or(0, |counter| counter.total),
+                3,
+                "restart does not double-credit the accepted post-boundary delta"
+            );
+            assert_eq!(
+                restarted.writer.load_session_pending_ranges().unwrap(),
+                vec![retained_marker],
+                "the original old-epoch marker remains durable after restart"
+            );
+            let event_count: i64 = Connection::open(&fixture.database)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE relative_path='one.jsonl' AND timestamp=?1",
+                    [fixture.start_at + 241],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(event_count, 1);
+            assert_eq!(
+                &model_history_rows(&fixture.database)[..prior_history.len()],
+                prior_history.as_slice()
+            );
+            drop(restarted);
+            let _ = fs::remove_dir_all(&fixture.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_token_anchor_old_epoch_uncollected_suffix_stays_incomplete() {
+        let now = Utc::now().timestamp();
+        let zero = token(0, now + 10);
+        let positive = token(5, now + 11);
+        let mut fixture = seed_old_epoch_pending_fixture(
+            "old-epoch-uncollected-suffix",
+            false,
+            format!("{zero}{positive}"),
+            4096,
+        );
+        let mut pending = fixture.pending.clone();
+        pending.end_offset = zero.len() as u64;
+        pending.record_sha256 =
+            sha256_file_range(&fixture.source, pending.start_offset, pending.end_offset).unwrap();
+        let changed = Connection::open(&fixture.database)
+            .unwrap()
+            .execute(
+                "UPDATE session_pending_ranges
+                 SET end_offset=?1, record_sha256=?2
+                 WHERE root_identity=?3 AND relative_path=?4 AND file_device=?5
+                   AND file_inode=?6 AND start_offset=0 AND collector_epoch=?7
+                   AND cycle_seq=?8 AND reason='checkpoint-token-anchor-missing'",
+                rusqlite::params![
+                    pending.end_offset as i64,
+                    &pending.record_sha256,
+                    &pending.root_identity,
+                    &pending.relative_path,
+                    pending.file_device.to_string(),
+                    pending.file_inode.to_string(),
+                    format!("{:032x}", pending.collector_epoch),
+                    pending.cycle_seq.to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        fixture.pending = pending.clone();
+        let persisted_ranges = fixture.recorder.writer.load_session_ranges().unwrap();
+        assert!(
+            !persisted_ranges.iter().any(|range| {
+                range.root_identity == pending.root_identity
+                    && range.relative_path == pending.relative_path
+                    && range.file_device == pending.file_device
+                    && range.file_inode == pending.file_inode
+                    && range.collector_epoch == fixture.current_checkpoint.collector_epoch
+                    && range.prefix_generation == fixture.current_checkpoint.prefix_generation
+                    && range.start_offset <= pending.end_offset
+                    && range.end_offset >= fixture.current_checkpoint.committed_offset
+            }),
+            "fixture must leave the suffix after the legacy marker unaccepted"
+        );
+        assert!(fixture.current_checkpoint.committed_offset > pending.end_offset);
+
+        let report = fixture
+            .recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: fixture.start_at + 120,
+                reset_at: fixture.reset_at,
+                window_seconds: fixture.window_seconds,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.pending_ranges, 1);
+        assert_eq!(
+            latest_model_set_complete(&fixture.database),
+            0,
+            "an unaccepted suffix after the proof range must keep the current set incomplete"
+        );
+        assert_eq!(
+            fixture
+                .recorder
+                .writer
+                .load_session_pending_ranges()
+                .unwrap(),
+            vec![pending],
+            "the old marker remains unchanged"
+        );
+        assert_eq!(
+            fixture
+                .recorder
+                .model_totals()
+                .unwrap()
+                .get(UNATTRIBUTED_MODEL)
+                .map_or(0, |counter| counter.total),
+            0,
+            "the positive suffix was not accepted or credited"
+        );
+        let positive_event_count: i64 = Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE relative_path='one.jsonl' AND timestamp=?1",
+                [now + 11],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(positive_event_count, 0);
+        drop(fixture.recorder);
+        let _ = fs::remove_dir_all(&fixture.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_token_anchor_old_epoch_unsafe_range_keeps_current_incomplete() {
+        let now = Utc::now().timestamp();
+        let bad_usage = format!(
+            "{{\"type\":\"event_msg\",\"timestamp\":\"{}\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"total_tokens\":\"invalid\",\"input_tokens\":0,\"cached_input_tokens\":0,\"output_tokens\":0}}}}}}}}\n",
+            DateTime::<Utc>::from_timestamp(now + 10, 0)
+                .unwrap()
+                .to_rfc3339()
+        );
+        let invalid_timestamp = "{\"type\":\"event_msg\",\"timestamp\":\"not-a-timestamp\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":0,\"input_tokens\":0,\"cached_input_tokens\":0,\"output_tokens\":0}}}}\n".to_owned();
+        let history_base =
+            "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"paginated\",\"history_base\":{\"id\":\"prior\"}}}\n";
+        let partial = "{\"type\":\"session_meta\"";
+        let large_prefix = format!(
+            "{{\"type\":\"session_meta\",\"padding\":\"{}\"}}\n{}",
+            "x".repeat(256),
+            token(0, now + 10)
+        );
+        let mut cases = vec![
+            (
+                "old-epoch-positive-counter-delta",
+                false,
+                format!("{}{}", token(0, now + 10), token(5, now + 11)),
+                4096,
+                false,
+            ),
+            (
+                "old-epoch-unknown-counter-changed",
+                true,
+                format!("{}{}", token(50, now + 10), token(51, now + 11)),
+                4096,
+                false,
+            ),
+            ("old-epoch-usage-unparsed", false, bad_usage, 4096, false),
+            (
+                "old-epoch-invalid-timestamp",
+                false,
+                invalid_timestamp,
+                4096,
+                false,
+            ),
+            (
+                "old-epoch-invalid-json",
+                false,
+                "{\"broken\":\n".to_owned(),
+                4096,
+                false,
+            ),
+            (
+                "old-epoch-unterminated-record",
+                false,
+                partial.to_owned(),
+                4096,
+                false,
+            ),
+            (
+                "old-epoch-history-base-continuation",
+                true,
+                history_base.to_owned(),
+                4096,
+                false,
+            ),
+            (
+                "old-epoch-proof-exceeds-cycle-budget",
+                false,
+                large_prefix,
+                128,
+                false,
+            ),
+            (
+                "old-epoch-source-hash-changed",
+                false,
+                format!("{}{}", token(0, now + 10), token(0, now + 11)),
+                4096,
+                true,
+            ),
+        ];
+        for (name, old_unknown, contents, chunk_bytes, change_hash) in cases.drain(..) {
+            let mut fixture =
+                seed_old_epoch_pending_fixture(name, old_unknown, contents.as_bytes(), chunk_bytes);
+            if change_hash {
+                let original = fs::read_to_string(&fixture.source).unwrap();
+                let changed = original.replacen(
+                    "\"total_tokens\":0,\"input_tokens\":0",
+                    "\"total_tokens\":1,\"input_tokens\":1",
+                    1,
+                );
+                assert_ne!(changed, original);
+                fs::write(&fixture.source, changed).unwrap();
+            }
+            let report = fixture
+                .recorder
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at: fixture.start_at + 120,
+                    reset_at: fixture.reset_at,
+                    window_seconds: fixture.window_seconds,
+                    remaining_percent: Some(90.0),
+                }))
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.pending_ranges, 1, "{name}");
+            assert_eq!(
+                latest_model_set_complete(&fixture.database),
+                0,
+                "unsafe old-epoch evidence cannot make the current model set complete: {name}"
+            );
+            assert_eq!(
+                fixture
+                    .recorder
+                    .writer
+                    .load_session_pending_ranges()
+                    .unwrap(),
+                vec![fixture.pending.clone()],
+                "unsafe proof retains the original marker: {name}"
+            );
+            assert_eq!(
+                fixture
+                    .recorder
+                    .model_totals()
+                    .unwrap()
+                    .get(UNATTRIBUTED_MODEL)
+                    .map_or(0, |counter| counter.total),
+                0,
+                "unverified source bytes cannot be credited: {name}"
+            );
+            let _ = fs::remove_dir_all(&fixture.root);
+        }
+    }
+
+    #[test]
+    fn current_source_unread_chunk_suffix_keeps_model_set_incomplete() {
+        let (root, database) = prepare("source-unread-chunk-suffix");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!("{}{}", token(10, now + 1), token(20, now + 2)),
+        )
+        .unwrap();
+        let mut initial =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        initial
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 3,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            initial.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            10
+        );
+        drop(initial);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(30, now + 4), token(40, now + 5)).as_bytes())
+            .unwrap();
+        let mut bounded =
+            Recorder::open_partitioned(config(&root, 128), &database, &identity()).unwrap();
+        bounded
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 6,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let checkpoint = bounded
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
+            .unwrap();
+        let observed_end = fs::metadata(&source).unwrap().len();
+        assert!(checkpoint.committed_offset < observed_end);
+        let latest_model_set_complete: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT model_set_complete FROM usage_model_history
+                 ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            latest_model_set_complete, 0,
+            "a source cursor before the inventoried end cannot publish a complete model set"
+        );
+        assert!(bounded
+            .writer
+            .load_session_pending_ranges()
+            .unwrap()
+            .iter()
+            .any(|pending| {
+                pending.reason == "cycle-budget-backlog"
+                    && !pending.complete
+                    && pending.start_offset == checkpoint.committed_offset
+                    && pending.end_offset == observed_end
+            }));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn checkpoint_token_anchor_recovery_keeps_other_verified_sources_advancing() {
         let (root, database) = prepare("checkpoint-anchor-other-source");
@@ -9311,15 +11174,34 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn checkpoint_token_anchor_recovery_preserves_zero_anchor_across_token_free_prefix() {
-        let (root, database) = prepare("checkpoint-anchor-zero-token-free");
+    fn checkpoint_token_anchor_legacy_zero_baseline_resolves_at_source_start() {
+        let (root, database) = prepare("checkpoint-anchor-legacy-zero-token-free");
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
         fs::write(&source, token(0, now)).unwrap();
         let mut recorder =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
-        recorder.run_cycle().unwrap().unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 1,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let old_checkpoint = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
+            .unwrap();
+        assert!(old_checkpoint.token_baseline_known);
+        assert!(old_checkpoint.fully_attributed_from_zero);
+        assert_eq!(old_checkpoint.previous_total, 0);
         assert_eq!(
             recorder
                 .model_totals()
@@ -9329,33 +11211,72 @@ mod tests {
             0
         );
 
-        fs::write(&source, "{\"type\":\"session_meta\"}\n").unwrap();
-        let unresolved = recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(unresolved.pending_ranges, 1);
+        replace_source_file_with_new_inode(&source, "{\"type\":\"session_meta\"}\n");
+        let partial = recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 2,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.pending_ranges, 0);
+        let current_inode = file_identity(&fs::metadata(&source).unwrap()).1;
+        let current_checkpoint = recorder
+            .state()
+            .unwrap()
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.file_inode == current_inode)
+            .unwrap();
+        assert_ne!(current_checkpoint.file_inode, old_checkpoint.file_inode);
+        assert!(current_checkpoint.token_baseline_known);
+        let legacy_pending =
+            seed_legacy_complete_anchor_pending(&database, &source, &current_checkpoint);
+        assert_ne!(
+            legacy_pending.prefix_generation,
+            current_checkpoint.prefix_generation,
+            "strict prior identity and exact pending bytes authorize replay independently of a later cursor lineage"
+        );
+        assert_eq!(
+            recorder.writer.load_session_pending_ranges().unwrap(),
+            vec![legacy_pending.clone()]
+        );
         drop(recorder);
 
-        let mut restarted =
-            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         fs::OpenOptions::new()
             .append(true)
             .open(&source)
             .unwrap()
-            .write_all(
-                format!(
-                    "{}{}{}",
-                    token(5, now + 10),
-                    token(0, now + 11),
-                    token(3, now + 12)
-                )
-                .as_bytes(),
-            )
+            .write_all(token(3, now + 12).as_bytes())
             .unwrap();
-        let recovered = restarted.run_cycle().unwrap().unwrap();
+        let mut restarted =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        let recovered = restarted
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: now + 13,
+                reset_at: now + 3600,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
         assert_eq!(recovered.pending_ranges, 0);
+        assert!(restarted
+            .writer
+            .load_session_pending_ranges()
+            .unwrap()
+            .is_empty());
+        assert!(restarted
+            .writer
+            .load_session_token_anchor_recoveries()
+            .unwrap()
+            .is_empty());
         assert_eq!(
             restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
             3,
-            "only usage after the exact zero-valued anchor is attributable"
+            "the verified source-start zero anchor allows only later usage"
         );
         let recovered_delta: i64 = Connection::open(&database)
             .unwrap()
@@ -9367,6 +11288,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recovered_delta, 3);
+        let complete: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT model_set_complete FROM usage_model_history
+                 ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete, 1);
         let _ = fs::remove_dir_all(root);
     }
 

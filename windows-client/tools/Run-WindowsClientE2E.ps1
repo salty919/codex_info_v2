@@ -9,6 +9,7 @@ param(
     [string]$OutputDirectory = '',
     [switch]$Fixture,
     [switch]$FixtureContractTest,
+    [switch]$NarrowPeriodCostFixture,
     [switch]$ThemePresets,
     [switch]$GraphThemes,
     [switch]$GraphHoverOnly,
@@ -21,6 +22,13 @@ $ErrorActionPreference = 'Stop'
 
 if ($GraphHoverOnly -and (-not $Fixture -or $ThemePresets -or $GraphThemes -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation)) {
     throw 'Graph hover validation requires only -Fixture -GraphHoverOnly.'
+}
+
+if ($NarrowPeriodCostFixture -and -not ($Fixture -or $FixtureContractTest)) {
+    throw 'Narrow period-cost validation requires -Fixture or -FixtureContractTest.'
+}
+if ($NarrowPeriodCostFixture -and ($ThemePresets -or $GraphThemes -or $GraphHoverOnly -or $CompatibilitySmoke -or $RequireCurrentPresentation)) {
+    throw 'Narrow period-cost validation cannot be combined with another specialized E2E mode.'
 }
 
 if (($ThemePresets -or $GraphThemes) -and -not $Fixture) {
@@ -86,6 +94,7 @@ $script:e2eSettingsPath = Join-Path $env:LOCALAPPDATA 'CodexInfo\settings.json'
 $script:e2eSettingsBackup = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-e2e-settings-" + [Guid]::NewGuid().ToString('N') + '.json')
 $script:e2eSettingsWasPresent = $false
 $script:e2eThemePresetsComplete = $false
+$script:e2ePeriodCostNarrowScenario = $false
 
 function Write-E2E {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -244,7 +253,7 @@ public static class CodexInfoGraphPixelScanner {
     }
 
     private static readonly Color GridColor = ColorTranslator.FromHtml("#263850");
-    private static readonly Color ResetGuideColor = ColorTranslator.FromHtml("#D6A45C");
+    private static readonly Color ResetGuideColor = ColorTranslator.FromHtml("#E6B85C");
     private static readonly Color IdleColor = ColorTranslator.FromHtml("#162232");
     private static readonly Color PlotColor = ColorTranslator.FromHtml("#121C2C");
     private const double ResetGuideOpacity = 178.0 / 255.0;
@@ -1010,6 +1019,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
     private static string periodsBody;
     private static string currentHistoryBody;
     private static string pastHistoryBody;
+    private static string oldestHistoryBody;
     private static string currentHistoryDeltaBody;
     private static string pastHistoryDeltaBody;
     private static string threadsBody;
@@ -1046,6 +1056,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
             periodsBody = periods;
             currentHistoryBody = currentHistory;
             pastHistoryBody = pastHistory;
+            oldestHistoryBody = "{\"api_version\":\"v3\",\"history_samples\":[],\"history_gaps\":[],\"next_cursor\":null,\"resume_cursor\":null}";
             currentHistoryDeltaBody = currentHistoryDelta;
             pastHistoryDeltaBody = pastHistoryDelta;
             threadsBody = threads;
@@ -1073,6 +1084,25 @@ public static class CodexInfoWindowsE2EFixtureServer {
             listener = null;
             return false;
         }
+    }
+
+    public static bool SetNarrowPeriodCostScenario(
+        string details,
+        string accounts,
+        string current,
+        string periods,
+        string currentHistory,
+        string pastHistory,
+        string oldestHistory) {
+        if (!running) return false;
+        detailsBody = details;
+        accountsBody = accounts;
+        currentBody = current;
+        periodsBody = periods;
+        currentHistoryBody = currentHistory;
+        pastHistoryBody = pastHistory;
+        oldestHistoryBody = oldestHistory;
+        return true;
     }
 
     public static bool IsRunning() { return running; }
@@ -1188,6 +1218,14 @@ public static class CodexInfoWindowsE2EFixtureServer {
                     code = 200;
                     reason = "OK";
                     body = pastHistoryBody;
+                    includePublishedPair = true;
+                }
+                else if (parts[1] == "/v3/history?period=e2e-oldest&account=account-7") {
+                    Interlocked.Increment(ref historyRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = oldestHistoryBody;
                     includePublishedPair = true;
                 }
                 else if (parts[1] == "/v3/history?period=e2e-current&account=account-7&cursor=e2e-current-resume") {
@@ -1877,7 +1915,9 @@ function Invoke-E2EGraphPixelScannerSelfTest {
     $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263850')
     $idleColor = [System.Drawing.ColorTranslator]::FromHtml('#162232')
     $background = [System.Drawing.ColorTranslator]::FromHtml('#121C2C')
-    $resetGuideColor = [System.Drawing.Color]::FromArgb(92, 84, 72)
+    # Fixed full-coverage raster sample of #E6B85C at 70% over the existing
+    # #263850 grid on #121C2C; this expected pixel is independent of the scanner.
+    $resetGuideColor = [System.Drawing.Color]::FromArgb(172, 145, 88)
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
         ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
     foreach ($case in @(
@@ -2477,6 +2517,7 @@ function Invoke-E2EFixtureRawRequest {
             '/v3/history/periods?account=account-7',
             '/v3/history?period=e2e-current&account=account-7',
             '/v3/history?period=e2e-past&account=account-7',
+            '/v3/history?period=e2e-oldest&account=account-7',
             '/v3/threads?account=account-7')]
         [string]$Path
     )
@@ -2859,6 +2900,48 @@ function Invoke-E2EFixturePreflight {
     return $responses
 }
 
+function Invoke-E2ENarrowPeriodCostFixturePreflight {
+    param([Parameter(Mandatory = $true)][psobject]$Scenario)
+
+    $responses = [ordered]@{}
+    foreach ($requestSpec in @(
+            @{ Name = 'health'; Path = '/v1/health' },
+            @{ Name = 'accounts'; Path = '/v3/accounts' },
+            @{ Name = 'current'; Path = '/v3/current?account=account-7' },
+            @{ Name = 'periods'; Path = '/v3/history/periods?account=account-7' },
+            @{ Name = 'oldest-history'; Path = '/v3/history?period=e2e-oldest&account=account-7' },
+            @{ Name = 'past-history'; Path = '/v3/history?period=e2e-past&account=account-7' },
+            @{ Name = 'current-history'; Path = '/v3/history?period=e2e-current&account=account-7' })) {
+        $response = Invoke-E2EFixtureRawRequest -Path $requestSpec.Path
+        $responses[$requestSpec.Name] = $response
+        Assert-E2E ($response.StatusCode -eq 200) `
+            "Narrow period-cost fixture endpoint '$($requestSpec.Name)' returned HTTP $($response.StatusCode)."
+        $pairValues = @(Get-E2EFixtureHeaderValues -Response $response -Name 'Codex-Info-Published-Pair')
+        $needsPair = $requestSpec.Name -notin @('health', 'accounts')
+        Assert-E2E ((-not $needsPair -and $pairValues.Count -eq 0) -or
+            ($needsPair -and $pairValues.Count -eq 1 -and [string]$pairValues[0] -ceq [string]$Scenario.PublishedPair)) `
+            "Narrow period-cost fixture endpoint '$($requestSpec.Name)' has an invalid published-pair header."
+        $rawPath = Join-Path $script:e2eOutput ("narrow-fixture-preflight-{0}.raw.json" -f $requestSpec.Name)
+        [IO.File]::WriteAllText($rawPath, [string]$response.Body, [Text.UTF8Encoding]::new($false))
+        Write-E2E ("narrow-fixture-preflight: request={0} status={1} pair-count={2} body-bytes={3} raw={4}" -f
+            $requestSpec.Name, $response.StatusCode, $pairValues.Count,
+            ([Text.Encoding]::UTF8.GetByteCount([string]$response.Body)), $rawPath)
+    }
+    foreach ($responseSpec in @(
+            @{ Response = 'current'; Scenario = 'Current' },
+            @{ Response = 'periods'; Scenario = 'Periods' },
+            @{ Response = 'oldest-history'; Scenario = 'OldestHistory' },
+            @{ Response = 'past-history'; Scenario = 'PastHistory' },
+            @{ Response = 'current-history'; Scenario = 'CurrentHistory' })) {
+        Assert-E2E ([string]$responses[$responseSpec.Response].Body -ceq [string]$Scenario.PSObject.Properties[$responseSpec.Scenario].Value) `
+            "Narrow period-cost fixture route '$($responseSpec.Response)' did not return its literal contract body."
+    }
+    $threads = Invoke-E2EFixtureRawRequest -Path '/v3/threads?account=account-7'
+    Assert-E2E ($threads.StatusCode -eq 200) 'Narrow period-cost fixture threads endpoint must remain available.'
+    Write-E2E 'narrow-period-cost-fixture-preflight: PASS three history routes and same-pair current generation'
+    return $responses
+}
+
 function New-E2EFixtureDocuments {
     $rawNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $now = $rawNow - ($rawNow % 60)
@@ -2958,7 +3041,7 @@ function New-E2EFixtureDocuments {
     $threads = $threads.Replace('"title":"E2E child task"', '"title":"task-B"')
     $threads = $threads.Replace('"title":"E2E orphan task","parent_thread_id":"missing-parent"', '"title":"task-D","parent_thread_id":null')
     $threads = $threads.Replace(',"depth":null}]}', ',"depth":null},' + $grandchild + ']}')
-    return [pscustomobject]@{
+    $documents = [pscustomobject]@{
         Details = $details.Trim()
         Accounts = $accounts.Trim()
         Current = $current.Trim()
@@ -2971,6 +3054,194 @@ function New-E2EFixtureDocuments {
         PublishedPair = $publishedPair
         Now = $now
     }
+    if ($script:e2ePeriodCostNarrowScenario) {
+        Add-Member -InputObject $documents -MemberType NoteProperty -Name NarrowPeriodCost `
+            -Value (New-E2ENarrowPeriodCostDocuments -BaseDocuments $documents)
+    }
+    return $documents
+}
+
+function New-E2EPeriodCostHistoryPage {
+    param(
+        [Parameter(Mandatory = $true)][Int64]$StartAt,
+        [Parameter(Mandatory = $true)][Int64]$EndAt,
+        [Parameter(Mandatory = $true)][Int64]$ResetAt,
+        [Parameter(Mandatory = $true)][decimal[]]$ModelDollars,
+        [Parameter(Mandatory = $true)][string]$ResumeCursor
+    )
+
+    Assert-E2E ($ModelDollars.Count -eq 3) 'Narrow period-cost history expects the three displayed model series.'
+    $modelNames = @('SOL', 'TERRA', 'LUNA')
+    $endTokens = @(1500, 1800, 2100)
+    $endInput = @(1000, 1200, 1400)
+    $endCached = @(300, 300, 400)
+    $endOutput = @(500, 600, 700)
+    $startModels = @(
+        '{"model":"SOL","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.00}',
+        '{"model":"TERRA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.00}',
+        '{"model":"LUNA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.00}'
+    )
+    $endModels = [System.Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt $modelNames.Count; $index++) {
+        $amount = $ModelDollars[$index].ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
+        $endModels.Add((
+            '{{"model":"{0}","total_tokens":{1},"input_tokens":{2},"cached_input_tokens":{3},"cache_write_input_tokens":0,"output_tokens":{4},"total_dollars":{5}}}' -f
+            $modelNames[$index], $endTokens[$index], $endInput[$index], $endCached[$index], $endOutput[$index], $amount))
+    }
+    $firstSample = @"
+{"timestamp":$StartAt,"reset_at":$ResetAt,"remaining_percent":98.0,"models":[$($startModels -join ',')],"models_complete":true,"model_source":"confirmed","task_active_since_previous":null}
+"@.Trim()
+    $lastSample = @"
+{"timestamp":$EndAt,"reset_at":$ResetAt,"remaining_percent":72.0,"models":[$($endModels -join ',')],"models_complete":true,"model_source":"confirmed","task_active_since_previous":true}
+"@.Trim()
+    return @"
+{"api_version":"v3","history_samples":[$firstSample,$lastSample],"history_gaps":[],"next_cursor":null,"resume_cursor":"$ResumeCursor"}
+"@.Trim()
+}
+
+function New-E2EPeriodCostLegacyHistorySample {
+    param(
+        [Parameter(Mandatory = $true)][Int64]$Timestamp,
+        [Parameter(Mandatory = $true)][Int64]$ResetAt,
+        [Parameter(Mandatory = $true)][double]$RemainingPercent,
+        [Parameter(Mandatory = $true)][decimal[]]$ModelDollars,
+        [Parameter(Mandatory = $true)][int[]]$ModelTokens,
+        [AllowNull()]$TaskActive
+    )
+
+    $taskActiveJson = if ($null -eq $TaskActive) { 'null' } elseif ([bool]$TaskActive) { 'true' } else { 'false' }
+    $amounts = @($ModelDollars | ForEach-Object { $_.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture) })
+    return @"
+{"timestamp":$Timestamp,"reset_at":$ResetAt,"remaining_percent":$RemainingPercent,"task_active_since_previous":$taskActiveJson,"sol_dollars":$($amounts[0]),"terra_dollars":$($amounts[1]),"luna_dollars":$($amounts[2]),"sol_tokens":$($ModelTokens[0]),"terra_tokens":$($ModelTokens[1]),"luna_tokens":$($ModelTokens[2]),"model_source":"confirmed"}
+"@.Trim()
+}
+
+function New-E2ENarrowPeriodCostDocuments {
+    param([Parameter(Mandatory = $true)][psobject]$BaseDocuments)
+
+    $now = [Int64]$BaseDocuments.Now
+    $oldestStart = $now - 518400
+    $middleStart = $now - 151200
+    $currentStart = $now - 75600
+    $middleReset = $currentStart
+    $oldestReset = $middleStart
+    $currentReset = $now + 75600
+    $periods = @"
+{"api_version":"v3","history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$middleStart,"end_at":$middleReset,"reset_at":$middleReset,"label":"Middle period","current":false},{"id":"e2e-oldest","start_at":$oldestStart,"end_at":$oldestReset,"reset_at":$oldestReset,"label":"Oldest period","current":false}]}
+"@.Trim()
+    $accounts = @"
+{"api_version":"v3","default_account_id":"account-7","accounts":[{"id":"account-7","is_current":true,"activation_at":$oldestStart,"deactivation_at":null,"login_id":"e2e@example.invalid"}]}
+"@.Trim()
+    $currentHistory = New-E2EPeriodCostHistoryPage -StartAt $currentStart -EndAt $now `
+        -ResetAt $currentReset -ModelDollars @([decimal]36, [decimal]35, [decimal]35) `
+        -ResumeCursor 'e2e-current-resume'
+    $pastHistory = New-E2EPeriodCostHistoryPage -StartAt $middleStart -EndAt $middleReset `
+        -ResetAt $middleReset -ModelDollars @([decimal]100, [decimal]100, [decimal]100) `
+        -ResumeCursor 'e2e-past-resume'
+    $oldestHistory = New-E2EPeriodCostHistoryPage -StartAt $oldestStart -EndAt $oldestReset `
+        -ResetAt $oldestReset -ModelDollars @([decimal]100, [decimal]90, [decimal]84) `
+        -ResumeCursor 'e2e-oldest-resume'
+    $current = @"
+{"api_version":"v3","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":50.0,"reset_at":$currentReset,"window_seconds":151200,"monthly":false},"models":[{"model":"SOL","total_tokens":1500,"input_tokens":1000,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":500,"estimated_cost":{"price_version":"E2E-SOL","ordinary_input_dollars":20.00,"cached_input_dollars":10.00,"cache_write_input_dollars":0.00,"output_dollars":6.00,"total_dollars":36.00}},{"model":"TERRA","total_tokens":1800,"input_tokens":1200,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":600,"estimated_cost":{"price_version":"E2E-TERRA","ordinary_input_dollars":20.00,"cached_input_dollars":5.00,"cache_write_input_dollars":0.00,"output_dollars":10.00,"total_dollars":35.00}},{"model":"LUNA","total_tokens":2100,"input_tokens":1400,"cached_input_tokens":400,"cache_write_input_tokens":0,"output_tokens":700,"estimated_cost":{"price_version":"E2E-LUNA","ordinary_input_dollars":20.00,"cached_input_dollars":5.00,"cache_write_input_dollars":0.00,"output_dollars":10.00,"total_dollars":35.00}}],"active_thread_count":4}
+"@.Trim()
+
+    $oldestResetAmount = @([decimal]0, [decimal]0, [decimal]0)
+    $oldestAmount = @([decimal]100, [decimal]90, [decimal]84)
+    $middleResetAmount = @([decimal]0, [decimal]0, [decimal]0)
+    $middleAmount = @([decimal]100, [decimal]100, [decimal]100)
+    $currentResetAmount = @([decimal]0, [decimal]0, [decimal]0)
+    $currentAmount = @([decimal]36, [decimal]35, [decimal]35)
+    $zeroTokens = @(0, 0, 0)
+    $observedTokens = @(1500, 1800, 2100)
+    $historySamples = @(
+        (New-E2EPeriodCostLegacyHistorySample -Timestamp $oldestStart -ResetAt $oldestReset `
+            -RemainingPercent 98 -ModelDollars $oldestResetAmount -ModelTokens $zeroTokens -TaskActive $null),
+        (New-E2EPeriodCostLegacyHistorySample -Timestamp $oldestReset -ResetAt $oldestReset `
+            -RemainingPercent 88 -ModelDollars $oldestAmount -ModelTokens $observedTokens -TaskActive $true),
+        (New-E2EPeriodCostLegacyHistorySample -Timestamp $middleStart -ResetAt $middleReset `
+            -RemainingPercent 98 -ModelDollars $middleResetAmount -ModelTokens $zeroTokens -TaskActive $null),
+        (New-E2EPeriodCostLegacyHistorySample -Timestamp $middleReset -ResetAt $middleReset `
+            -RemainingPercent 78 -ModelDollars $middleAmount -ModelTokens $observedTokens -TaskActive $true),
+        (New-E2EPeriodCostLegacyHistorySample -Timestamp $currentStart -ResetAt $currentReset `
+            -RemainingPercent 98 -ModelDollars $currentResetAmount -ModelTokens $zeroTokens -TaskActive $null),
+        (New-E2EPeriodCostLegacyHistorySample -Timestamp $now -ResetAt $currentReset `
+            -RemainingPercent 72 -ModelDollars $currentAmount -ModelTokens $observedTokens -TaskActive $true)
+    )
+    $details = @"
+{"api_version":"v2","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":50.0,"reset_at":$currentReset,"window_seconds":151200,"monthly":false},"models":[{"name":"SOL","input_tokens":1000,"cached_input_tokens":300,"output_tokens":500,"input_dollars":20.00,"cached_input_dollars":10.00,"output_dollars":6.00},{"name":"TERRA","input_tokens":1200,"cached_input_tokens":300,"output_tokens":600,"input_dollars":20.00,"cached_input_dollars":5.00,"output_dollars":10.00},{"name":"LUNA","input_tokens":1400,"cached_input_tokens":400,"output_tokens":700,"input_dollars":20.00,"cached_input_dollars":5.00,"output_dollars":10.00}],"active_thread_count":4,"history_periods":[$($periods -replace '^\{"api_version":"v3","history_periods":\[|\]\}$','')],"history_samples":[$($historySamples -join ',')],"history_gaps":[],"threads":$($BaseDocuments.Threads),"estimated_cost_label":"USD 106.00"}
+"@.Trim()
+    return [pscustomobject]@{
+        Now = $now
+        Details = $details
+        Accounts = $accounts
+        Current = $current
+        Periods = $periods
+        CurrentHistory = $currentHistory
+        PastHistory = $pastHistory
+        OldestHistory = $oldestHistory
+        PublishedPair = $BaseDocuments.PublishedPair
+        ExpectedTotals = [decimal[]]@(274, 300, 106)
+    }
+}
+
+function Assert-E2ENarrowPeriodCostFixtureContract {
+    param([Parameter(Mandatory = $true)][psobject]$Documents)
+
+    $scenario = $Documents.NarrowPeriodCost
+    Assert-E2E ($null -ne $scenario) 'Narrow period-cost fixture documents are missing.'
+    $now = [Int64]$scenario.Now
+    $periodsDocument = ConvertFrom-Json -InputObject ([string]$scenario.Periods)
+    $periods = @($periodsDocument.history_periods)
+    Assert-E2E ($periods.Count -eq 3) "Narrow period-cost fixture must expose exactly three reset periods; found $($periods.Count)."
+    $expectedIds = @('e2e-current', 'e2e-past', 'e2e-oldest')
+    $actualIds = @($periods | ForEach-Object { [string]$_.id })
+    Assert-E2E (($actualIds -join ',') -ceq ($expectedIds -join ',')) `
+        "Narrow period-cost fixture period order is not exact: $($actualIds -join ',')."
+    Assert-E2E (@($periods | Where-Object { $_.current -eq $true }).Count -eq 1) `
+        'Narrow period-cost fixture must identify exactly one current period.'
+    $periodById = @{}
+    foreach ($period in $periods) { $periodById[[string]$period.id] = $period }
+    Assert-E2E ([Int64]$periodById['e2e-oldest'].start_at -eq ($now - 518400) -and
+        [Int64]$periodById['e2e-oldest'].end_at -eq ($now - 151200) -and
+        [Int64]$periodById['e2e-oldest'].reset_at -eq ($now - 151200)) `
+        'The $274 reset period must span now−6d through now−42h.'
+    Assert-E2E ([Int64]$periodById['e2e-past'].start_at -eq ($now - 151200) -and
+        [Int64]$periodById['e2e-past'].end_at -eq ($now - 75600) -and
+        [Int64]$periodById['e2e-past'].reset_at -eq ($now - 75600)) `
+        'The $300 right-middle reset period must occupy a 21h interval.'
+    Assert-E2E ([Int64]$periodById['e2e-current'].start_at -eq ($now - 75600) -and
+        [Int64]$periodById['e2e-current'].end_at -eq $now -and
+        [Int64]$periodById['e2e-current'].reset_at -gt $now) `
+        'The $106 current reset period must occupy the final 21h interval through now.'
+    Assert-E2E ([Int64]$periodById['e2e-oldest'].start_at -ge ($now - 604800) -and
+        [Int64]$periodById['e2e-oldest'].end_at -eq [Int64]$periodById['e2e-past'].start_at -and
+        [Int64]$periodById['e2e-past'].end_at -eq [Int64]$periodById['e2e-current'].start_at -and
+        [Int64]$periodById['e2e-current'].end_at -eq $now) `
+        'Narrow period-cost fixture must fit one 7-day view with no reset gaps or overlaps.'
+
+    foreach ($historyCase in @(
+            @{ Id = 'e2e-oldest'; Body = [string]$scenario.OldestHistory; Expected = [decimal]274 },
+            @{ Id = 'e2e-past'; Body = [string]$scenario.PastHistory; Expected = [decimal]300 },
+            @{ Id = 'e2e-current'; Body = [string]$scenario.CurrentHistory; Expected = [decimal]106 })) {
+        $page = ConvertFrom-Json -InputObject $historyCase.Body
+        $samples = @($page.history_samples | Sort-Object { [Int64]$_.timestamp })
+        Assert-E2E ($samples.Count -eq 2 -and @($page.history_gaps).Count -eq 0) `
+            "Narrow period-cost history $($historyCase.Id) must contain two direct samples and no gaps."
+        $period = $periodById[$historyCase.Id]
+        $latest = $samples[-1]
+        Assert-E2E ([Int64]$latest.timestamp -eq [Int64]$period.end_at -and
+            [Int64]$latest.reset_at -eq [Int64]$period.reset_at -and
+            $latest.models_complete -eq $true -and $latest.model_source -ceq 'confirmed') `
+            "Narrow period-cost latest row is not a confirmed complete endpoint for $($historyCase.Id)."
+        $models = @($latest.models)
+        Assert-E2E ($models.Count -eq 3 -and @($models | Where-Object { $null -eq $_.total_dollars }).Count -eq 0) `
+            "Narrow period-cost latest row has an incomplete dollar vector for $($historyCase.Id)."
+        $actual = [decimal]0
+        foreach ($model in $models) { $actual += [decimal]$model.total_dollars }
+        Assert-E2E ($actual -eq [decimal]$historyCase.Expected) `
+            "Narrow period-cost total for $($historyCase.Id) is $actual; expected $($historyCase.Expected)."
+    }
+    Write-E2E 'narrow-period-cost-fixture-contract: PASS periods=3 spans=6d contiguous right=21h+21h totals=$274,$300,$106 confirmed=3/3'
 }
 
 function Enter-E2EFixture {
@@ -3029,7 +3300,7 @@ function Exit-E2EFixture {
     elseif (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) {
         Remove-Item -LiteralPath $script:e2eSettingsPath -Force
     }
-    if ($ThemePresets -or $GraphThemes) {
+    if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) {
         if ($script:e2eSettingsWasPresent) {
             Assert-E2E (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) 'Original settings.json was not restored.'
             $restoredBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
@@ -4202,10 +4473,107 @@ function Invoke-E2EThemePresets {
     Write-E2E 'theme-restart: PASS light restored before Main display'
 }
 
+function Invoke-E2ENarrowPeriodCostScenario {
+    param([Parameter(Mandatory = $true)][string]$ClientPath)
+
+    $script:e2ePeriodCostNarrowScenario = $true
+    $baseDocuments = New-E2EFixtureDocuments
+    $scenario = $baseDocuments.NarrowPeriodCost
+    Assert-E2ENarrowPeriodCostFixtureContract -Documents $baseDocuments
+    foreach ($resource in @(
+            @{ Name = 'details'; Body = $scenario.Details },
+            @{ Name = 'accounts'; Body = $scenario.Accounts },
+            @{ Name = 'current'; Body = $scenario.Current },
+            @{ Name = 'periods'; Body = $scenario.Periods },
+            @{ Name = 'oldest-history'; Body = $scenario.OldestHistory },
+            @{ Name = 'past-history'; Body = $scenario.PastHistory },
+            @{ Name = 'current-history'; Body = $scenario.CurrentHistory })) {
+        $rawPath = Join-Path $script:e2eOutput ("narrow-fixture-{0}.json" -f $resource.Name)
+        [IO.File]::WriteAllText($rawPath, [string]$resource.Body, [Text.UTF8Encoding]::new($false))
+    }
+
+    $defaultProcess = $script:e2eProcess
+    Assert-E2E ($null -ne $defaultProcess -and -not $defaultProcess.HasExited) `
+        'The default E2E candidate process must be running before the narrow fixture capture.'
+    $defaultPid = $defaultProcess.Id
+    Assert-E2E $defaultProcess.CloseMainWindow() 'Could not close the default E2E candidate window before switching fixture data.'
+    Wait-E2E -Description 'default E2E candidate exits before narrow fixture restart' -TimeoutSeconds 15 -Probe {
+        return $defaultProcess.HasExited
+    } | Out-Null
+    Write-E2E "narrow-period-cost-fixture: default-candidate-exited pid=$defaultPid"
+
+    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::SetNarrowPeriodCostScenario(
+        $scenario.Details,
+        $scenario.Accounts,
+        $scenario.Current,
+        $scenario.Periods,
+        $scenario.CurrentHistory,
+        $scenario.PastHistory,
+        $scenario.OldestHistory)) 'Could not switch the fixture server to the narrow period-cost scenario.'
+    Invoke-E2ENarrowPeriodCostFixturePreflight -Scenario $scenario | Out-Null
+
+    $fixturePortWasPresent = Test-Path -LiteralPath "Env:$($script:e2eFixturePortVariable)"
+    $previousFixturePort = [Environment]::GetEnvironmentVariable($script:e2eFixturePortVariable, 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable(
+            $script:e2eFixturePortVariable,
+            $script:e2eFixturePort.ToString([Globalization.CultureInfo]::InvariantCulture),
+            'Process')
+        $script:e2eProcess = Start-Process -FilePath $ClientPath -PassThru
+    }
+    finally {
+        if ($fixturePortWasPresent) {
+            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $previousFixturePort, 'Process')
+        }
+        else {
+            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $null, 'Process')
+        }
+    }
+    $narrowPid = $script:e2eProcess.Id
+    Write-E2E "narrow-period-cost-fixture: candidate-started pid=$narrowPid"
+    $mainHandle = Wait-E2E -Description 'narrow-fixture Main window' -Probe {
+        $candidate = Find-E2EWindow $narrowPid 'Codex Info Monitor'
+        if ($candidate -eq [IntPtr]::Zero) { return $false }
+        return $candidate
+    }
+    Bring-E2EWindowToFront $mainHandle
+    $mainRoot = Get-E2EUiaRoot $mainHandle
+    Wait-E2E -Description 'narrow-fixture startup generation accepted' -Probe {
+        $loading = Find-E2EElementByAutomationId $mainRoot 'Main.StartupLoading'
+        if ($null -ne $loading -and -not $loading.Current.IsOffscreen -and $loading.Current.IsEnabled) { return $false }
+        $contract = Find-E2EElementByAutomationId $mainRoot 'Main.DetailsGenerationContract'
+        return ($null -ne $contract -and [string]$contract.Current.Name -eq 'ready')
+    } | Out-Null
+
+    $graph = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Graph' `
+        -ButtonAutomationId 'Main.OpenGraph' -Title 'Codex Info Graph' -Role 'Graph' -ProcessId $narrowPid
+    Assert-E2ENoChildProductVersion $graph.Root 'Graph'
+    Wait-E2EGraphLoadSettled $graph.Root
+    $week = Find-E2EElementByAutomationId $graph.Root 'Graph.Range.Week'
+    Assert-E2E ($null -ne $week -and -not $week.Current.IsOffscreen -and $week.Current.IsEnabled) `
+        'Narrow period-cost Graph must expose its Week range control.'
+    Invoke-E2EElement $week
+    Wait-E2E -Description 'narrow period-cost one-week range selected' -Probe {
+        $range = Find-E2EElementByAutomationId $graph.Root 'Graph.Range.Label'
+        return ($null -ne $range -and [string]$range.Current.Name.StartsWith('1 week', [StringComparison]::Ordinal))
+    } | Out-Null
+    Select-E2EGraphMetric $graph.Root 'Dollars'
+    $measurement = Wait-E2EGraphPixelsReady -Root $graph.Root -WindowHandle $graph.Handle `
+        -Description 'narrow-period-cost-week-dollars'
+    $capture = Capture-E2EWindow $graph.Handle 'period-cost-narrow-week-dollars'
+    Write-E2E ('narrow-period-cost-render: PASS range=week metric=Dollars periods=3 narrow-period-hours=21,21 fixture-totals=$274,$300,$106 plot={0}x{1} series-pixels={2} capture={3}' -f
+        $measurement.PlotBoundsWidth, $measurement.PlotBoundsHeight,
+        ($measurement.Pixels.SeriesPixelCount -join ','), $capture.Path)
+}
+
 try {
     if ($FixtureContractTest) {
         Write-E2E 'fixture-contract-test: start'
+        if ($NarrowPeriodCostFixture) { $script:e2ePeriodCostNarrowScenario = $true }
         $contractDocuments = New-E2EFixtureDocuments
+        if ($NarrowPeriodCostFixture) {
+            Assert-E2ENarrowPeriodCostFixtureContract -Documents $contractDocuments
+        }
         Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start(
             $contractDocuments.Details,
             $contractDocuments.Accounts,
@@ -4224,6 +4592,18 @@ try {
         Write-E2E 'fixture-contract-test: fixture server started without launching the client'
         Invoke-E2EFixturePreflight | Out-Null
         Invoke-E2EFixtureContractTests
+        if ($NarrowPeriodCostFixture) {
+            $scenario = $contractDocuments.NarrowPeriodCost
+            Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::SetNarrowPeriodCostScenario(
+                $scenario.Details,
+                $scenario.Accounts,
+                $scenario.Current,
+                $scenario.Periods,
+                $scenario.CurrentHistory,
+                $scenario.PastHistory,
+                $scenario.OldestHistory)) 'Could not switch the fixture server to the narrow period-cost scenario.'
+            Invoke-E2ENarrowPeriodCostFixturePreflight -Scenario $scenario | Out-Null
+        }
         return
     }
     $resolvedClientPath = if ([string]::IsNullOrWhiteSpace($ClientPath)) {
@@ -4714,6 +5094,9 @@ try {
     $script:e2eWindowRecords | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $windowRecordPath -Encoding utf8
     Write-E2E "windows: PASS records=$($script:e2eWindowRecords.Count) pid=$clientPid records_path=$windowRecordPath"
 
+    if ($NarrowPeriodCostFixture) {
+        Invoke-E2ENarrowPeriodCostScenario -ClientPath $resolvedClientPath
+    }
     $graphEvidence = if ($Fixture) { 'past-period model and idle-band pixels' } else { 'past-period model pixels' }
     Write-E2E ("windows-client-e2e: PASS (Graph open, {0}, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, Legal plain text, PID/HWND records)" -f $graphEvidence)
     $script:e2eSuccess = $true
@@ -4738,11 +5121,11 @@ finally {
     if ($null -ne $script:e2eProcess) {
         try {
             if (-not $script:e2eProcess.HasExited) {
-                if ($ThemePresets -or $GraphThemes) {
-                    Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction Stop
-                    Wait-E2E -Description 'themed client cleanup exit' -Probe {
-                        return $script:e2eProcess.HasExited
-                    } | Out-Null
+        if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) {
+            Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction Stop
+            Wait-E2E -Description 'owned fixture client cleanup exit' -Probe {
+                return $script:e2eProcess.HasExited
+            } | Out-Null
                 }
                 else {
                     Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction SilentlyContinue
@@ -4754,19 +5137,19 @@ finally {
             }
         }
         catch {
-            if ($ThemePresets -or $GraphThemes) { $themeProcessCleanupFailure = $_.Exception.Message }
+            if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) { $themeProcessCleanupFailure = $_.Exception.Message }
         }
     }
     if ($Fixture) {
         try { Exit-E2EFixture }
         catch {
             Write-E2E "fixture-cleanup: FAIL $($_.Exception.Message)"
-            if ($ThemePresets -or $GraphThemes) { throw }
+            if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) { throw }
         }
     }
-    if (($ThemePresets -or $GraphThemes) -and $null -ne $themeProcessCleanupFailure) {
-        throw "ASSERT: themed client cleanup failed: $themeProcessCleanupFailure"
-    }
+if (($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) -and $null -ne $themeProcessCleanupFailure) {
+    throw "ASSERT: fixture client cleanup failed: $themeProcessCleanupFailure"
+}
 }
 
 if ($ThemePresets -and $script:e2eThemePresetsComplete) {

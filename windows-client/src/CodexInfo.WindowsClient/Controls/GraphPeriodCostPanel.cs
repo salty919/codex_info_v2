@@ -10,20 +10,22 @@ namespace CodexInfo.WindowsClient.Controls;
 /// Reserves a native ScottPlot footer below the time axis and renders each
 /// visible reset-period amount at that period's horizontal midpoint.
 /// </summary>
-internal sealed class GraphPeriodCostPanel(IReadOnlyList<GraphPeriodCostAmount> amounts) : ScottPlot.IPanel
+internal sealed class GraphPeriodCostPanel(
+    IReadOnlyList<GraphPeriodCostAmount> amounts,
+    IReadOnlyList<long> resetGuideTimestamps) : ScottPlot.IPanel
 {
     internal const float FooterHeight = 48;
-    internal const float BaseFontSize = 30;
+    internal const float BaseFontSize = 22;
 
     private const float HorizontalInset = 8;
-    private const float LabelGap = 8;
-    private const float MinimumFontSize = 5;
-    private const string AmountColorHex = "#E6B85C";
 
     internal IReadOnlyList<GraphPeriodCostAmount> Amounts { get; } = amounts;
+    internal IReadOnlyList<long> ResetGuideTimestamps { get; } = resetGuideTimestamps;
     internal ScottPlot.PixelRect? LastRenderBounds { get; private set; }
     internal ScottPlot.Color BackgroundColor => new(ThemePalette.Resolve(GraphPlotControl.PlotColorHex));
-    internal ScottPlot.Color AmountColor => new(ThemePalette.Resolve(AmountColorHex));
+    internal ScottPlot.Color AmountColor =>
+        new ScottPlot.Color(ThemePalette.Resolve(GraphPlotControl.PeriodAmountColorHex));
+    internal ScottPlot.Color ResetSeparatorColor => AmountColor.WithOpacity(0.70);
 
     public bool IsVisible { get; set; } = true;
     public float MinimumSize { get; set; } = FooterHeight;
@@ -69,125 +71,104 @@ internal sealed class GraphPeriodCostPanel(IReadOnlyList<GraphPeriodCostAmount> 
             renderPack.Canvas.DrawLine(panelRect.Left, panelRect.Top, panelRect.Right, panelRect.Top, divider);
         }
 
-        if (Amounts.Count == 0 || panelRect.Width <= 0 || panelRect.Height <= 0)
+        if (panelRect.Width <= 0 || panelRect.Height <= 0)
         {
             return;
         }
 
-        var fontSize = SelectFontSize(panelRect.Width);
-        var measurements = MeasureAmounts(fontSize);
-        var centers = PositionAmounts(renderPack, panelRect, measurements);
-        for (var index = 0; index < Amounts.Count; index++)
+        using (var resetGuide = new SKPaint
         {
-            var amount = Amounts[index];
+            Color = SKColor.Parse(ThemePalette.Resolve(GraphPlotControl.PeriodAmountColorHex)).WithAlpha(178),
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = 1,
+            IsAntialias = false,
+        })
+        {
+            foreach (var timestamp in ResetGuideTimestamps)
+            {
+                var x = renderPack.Plot.Axes.Bottom.GetPixel(timestamp, renderPack.DataRect);
+                if (x >= panelRect.Left && x <= panelRect.Right)
+                {
+                    renderPack.Canvas.DrawLine(x, panelRect.Top, x, panelRect.Bottom, resetGuide);
+                }
+            }
+        }
+
+        foreach (var amount in Amounts)
+        {
+            var periodLeft = renderPack.Plot.Axes.Bottom.GetPixel(amount.VisibleStartAt, renderPack.DataRect);
+            var periodRight = renderPack.Plot.Axes.Bottom.GetPixel(amount.VisibleEndAt, renderPack.DataRect);
+            var periodWidth = Math.Max(0, periodRight - periodLeft);
+            if (periodWidth <= 0)
+            {
+                continue;
+            }
+
+            var inset = Math.Min(HorizontalInset, periodWidth * 0.1f);
+            var availableWidth = periodWidth - (2 * inset);
+            var fontSize = SelectFontSize(amount, availableWidth);
             amount.LabelStyle.FontSize = fontSize;
 
             using var paint = ScottPlot.Paint.NewDisposablePaint();
             amount.LabelStyle.ApplyToPaint(paint);
             using var font = new SKFont(paint.SKTypeface, fontSize);
             font.MeasureText(amount.LabelStyle.Text, out var ink, paint.SKPaint);
-            // Center the painted glyphs, not ScottPlot's text layout box. Its
-            // baseline adjustment can place embedded-font ink above that box.
-            var x = centers[index] - ink.MidX;
+            var center = renderPack.Plot.Axes.Bottom.GetPixel(amount.CenterAt, renderPack.DataRect);
+            var x = center - ink.MidX;
             var baseline = panelRect.VerticalCenter - ink.MidY;
             renderPack.Canvas.DrawText(
                 amount.LabelStyle.Text, x, baseline, SKTextAlign.Left, font, paint.SKPaint);
-            amount.RecordRender(centers[index], new ScottPlot.PixelRect(
+            amount.RecordRender(center, new ScottPlot.PixelRect(
                 x + ink.Left, x + ink.Right, baseline + ink.Bottom, baseline + ink.Top));
         }
     }
 
-    private float SelectFontSize(float panelWidth)
+    private static float SelectFontSize(GraphPeriodCostAmount amount, float availableWidth)
     {
         var fontSize = BaseFontSize;
-        while (fontSize > MinimumFontSize)
+        for (var attempt = 0; attempt < 32; attempt++)
         {
-            var measurements = MeasureAmounts(fontSize);
-            var totalWidth = measurements.Sum(measurement => measurement.Width) +
-                ((Amounts.Count - 1) * LabelGap);
-            if (totalWidth <= panelWidth - (2 * HorizontalInset))
+            var width = MeasureAmountWidth(amount, fontSize);
+            if (width <= availableWidth || width <= 0)
             {
-                break;
+                return fontSize;
             }
 
-            fontSize = Math.Max(MinimumFontSize, fontSize - 1);
+            var scale = Math.Clamp((availableWidth / width) * 0.99f, 0.01f, 0.99f);
+            var nextFontSize = fontSize * scale;
+            if (nextFontSize >= fontSize || nextFontSize <= 0)
+            {
+                return fontSize;
+            }
+
+            fontSize = nextFontSize;
         }
 
         return fontSize;
     }
 
-    private AmountMeasurement[] MeasureAmounts(float fontSize)
+    private static float MeasureAmountWidth(GraphPeriodCostAmount amount, float fontSize)
     {
-        var measurements = new AmountMeasurement[Amounts.Count];
-        for (var index = 0; index < Amounts.Count; index++)
-        {
-            var style = Amounts[index].LabelStyle;
-            style.FontSize = fontSize;
-            using var paint = ScottPlot.Paint.NewDisposablePaint();
-            style.ApplyToPaint(paint);
-            using var font = new SKFont(paint.SKTypeface, fontSize);
-            font.MeasureText(style.Text, out var ink, paint.SKPaint);
-            measurements[index] = new AmountMeasurement(ink.Width);
-        }
-
-        return measurements;
+        amount.LabelStyle.FontSize = fontSize;
+        using var paint = ScottPlot.Paint.NewDisposablePaint();
+        amount.LabelStyle.ApplyToPaint(paint);
+        using var font = new SKFont(paint.SKTypeface, fontSize);
+        font.MeasureText(amount.LabelStyle.Text, out var ink, paint.SKPaint);
+        return ink.Width;
     }
-
-    private float[] PositionAmounts(
-        ScottPlot.RenderPack renderPack,
-        ScottPlot.PixelRect panelRect,
-        IReadOnlyList<AmountMeasurement> measurements)
-    {
-        var centers = Amounts
-            .Select(amount => renderPack.Plot.Axes.Bottom.GetPixel(amount.CenterAt, renderPack.DataRect))
-            .ToArray();
-        var minimumCenters = new float[centers.Length];
-        var maximumCenters = new float[centers.Length];
-
-        for (var index = 0; index < centers.Length; index++)
-        {
-            var halfWidth = measurements[index].Width / 2;
-            minimumCenters[index] = panelRect.Left + HorizontalInset + halfWidth;
-            maximumCenters[index] = panelRect.Right - HorizontalInset - halfWidth;
-            centers[index] = Math.Clamp(
-                centers[index],
-                minimumCenters[index],
-                maximumCenters[index]);
-        }
-
-        for (var index = 1; index < centers.Length; index++)
-        {
-            var minimum = centers[index - 1] + Separation(index - 1, measurements);
-            centers[index] = Math.Max(centers[index], minimum);
-        }
-
-        for (var index = centers.Length - 1; index >= 0; index--)
-        {
-            var maximum = maximumCenters[index];
-            if (index < centers.Length - 1)
-            {
-                maximum = Math.Min(maximum, centers[index + 1] - Separation(index, measurements));
-            }
-
-            centers[index] = Math.Min(centers[index], maximum);
-        }
-
-        return centers;
-    }
-
-    private static float Separation(int leftIndex, IReadOnlyList<AmountMeasurement> measurements) =>
-        (measurements[leftIndex].Width / 2) +
-        (measurements[leftIndex + 1].Width / 2) +
-        LabelGap;
 
     private static SKRect ToSKRect(ScottPlot.PixelRect rect) =>
         new(rect.Left, rect.Top, rect.Right, rect.Bottom);
-
-    private readonly record struct AmountMeasurement(float Width);
 }
 
-internal sealed class GraphPeriodCostAmount(double centerAt, ScottPlot.LabelStyle labelStyle)
+internal sealed class GraphPeriodCostAmount(
+    double visibleStartAt,
+    double visibleEndAt,
+    double centerAt,
+    ScottPlot.LabelStyle labelStyle)
 {
+    internal double VisibleStartAt { get; } = visibleStartAt;
+    internal double VisibleEndAt { get; } = visibleEndAt;
     internal double CenterAt { get; } = centerAt;
     internal ScottPlot.LabelStyle LabelStyle { get; } = labelStyle;
     internal ScottPlot.PixelRect? LastRenderBounds { get; private set; }
