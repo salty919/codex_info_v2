@@ -86,27 +86,25 @@
     <Style Selector="Button.range-mode:pointerover">
       <Setter Property="Background" Value="{DynamicResource Theme263548}" />
     </Style>
-    <Style Selector="Button.metric-choice">
-      <Setter Property="Height" Value="30" />
-      <Setter Property="Padding" Value="11,0" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-      <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="CornerRadius" Value="6" />
-      <Setter Property="Background" Value="Transparent" />
-      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="FontSize" Value="12" />
-      <Setter Property="FontWeight" Value="SemiBold" />
+    <Style Selector="ToggleSwitch.metric-switch">
+      <Setter Property="Height" Value="32" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="OnContent" Value="{x:Null}" />
+      <Setter Property="OffContent" Value="{x:Null}" />
     </Style>
-    <Style Selector="Button.metric-choice.selected">
+    <Style Selector="ToggleSwitch.metric-switch /template/ Border#OuterBorder">
+      <Setter Property="Background" Value="{DynamicResource Theme111B2C}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme405779}" />
+    </Style>
+    <Style Selector="ToggleSwitch.metric-switch:checked /template/ Border#SwitchKnobBounds">
       <Setter Property="Background" Value="{DynamicResource Theme244D74}" />
-      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
       <Setter Property="BorderBrush" Value="{DynamicResource Theme56B2F5}" />
     </Style>
-    <Style Selector="Button.metric-choice:pointerover">
-      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
-      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
+    <Style Selector="ToggleSwitch.metric-switch /template/ Ellipse#SwitchKnobOff">
+      <Setter Property="Fill" Value="{DynamicResource ThemeA8B7CA}" />
+    </Style>
+    <Style Selector="ToggleSwitch.metric-switch /template/ Ellipse#SwitchKnobOn">
+      <Setter Property="Fill" Value="{DynamicResource ThemeF2F6FC}" />
     </Style>
     <Style Selector="Button.range-nav">
       <Setter Property="Height" Value="30" />
@@ -147,26 +145,24 @@
     <Grid x:Name="GraphContent" Margin="30,16" RowDefinitions="36,40,28,*">
       <Border Grid.Row="1" Grid.RowSpan="2" Background="{DynamicResource Theme111B2C}" CornerRadius="10" />
 
-      <Grid Grid.Row="0" ColumnDefinitions="*,Auto,8,Auto" Background="Transparent">
+      <Grid Grid.Row="0" ColumnDefinitions="*,Auto,16,Auto" Background="Transparent">
         <TextBlock Margin="0,0,8,0" FontSize="22" FontWeight="Bold" VerticalAlignment="Center"
                    Text="{Binding Texts.GraphWindowTitle}" TextTrimming="CharacterEllipsis" />
-        <Border Grid.Column="1" Padding="2" CornerRadius="9" Background="{DynamicResource Theme111B2C}"
-                BorderBrush="{DynamicResource Theme405779}" BorderThickness="1" VerticalAlignment="Center">
-          <StackPanel Orientation="Horizontal" Spacing="2">
-            <Button Classes="metric-choice" Classes.selected="{Binding IsTokensMetric}"
-                    ClickMode="Press" Tag="Tokens" Click="OnMetricClick"
-                    Content="{Binding Texts.GraphTokenMetric}"
-                    AutomationProperties.Name="{Binding Texts.GraphTokenMetric}"
-                    AutomationProperties.HelpText="{Binding IsTokensMetric}"
-                    AutomationProperties.AutomationId="Graph.Metric.Tokens" />
-            <Button Classes="metric-choice" Classes.selected="{Binding IsDollarsMetric}"
-                    ClickMode="Press" Tag="Dollars" Click="OnMetricClick"
-                    Content="{Binding Texts.GraphDollarMetric}"
-                    AutomationProperties.Name="{Binding Texts.GraphDollarMetric}"
-                    AutomationProperties.HelpText="{Binding IsDollarsMetric}"
-                    AutomationProperties.AutomationId="Graph.Metric.Dollars" />
-          </StackPanel>
-        </Border>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+          <TextBlock Classes="label" VerticalAlignment="Center" Text="{Binding Texts.GraphDollarMetric}" />
+          <ToggleSwitch Classes="metric-switch"
+                        IsChecked="{Binding IsTokensMetric, Mode=TwoWay}"
+                        AutomationProperties.HelpText="{Binding IsTokensMetric}"
+                        AutomationProperties.AutomationId="Graph.Metric.Switch">
+            <AutomationProperties.Name>
+              <MultiBinding StringFormat="{}{0} / {1}">
+                <Binding Path="Texts.GraphDollarMetric" />
+                <Binding Path="Texts.GraphTokenMetric" />
+              </MultiBinding>
+            </AutomationProperties.Name>
+          </ToggleSwitch>
+          <TextBlock Classes="label" VerticalAlignment="Center" Text="{Binding Texts.GraphTokenMetric}" />
+        </StackPanel>
         <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="0" VerticalAlignment="Center">
           <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Graph.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
           <Button Classes="window-control" Click="OnMaximizeWindow" AutomationProperties.Name="{Binding Texts.Maximize}" AutomationProperties.AutomationId="Graph.Window.Maximize" Content="□" ToolTip.Tip="{Binding Texts.Maximize}" />
@@ -246,29 +242,33 @@
       </ToggleButton>
       </Grid>
 
-      <Border Grid.Row="3" Background="{DynamicResource Theme121C2C}" BorderBrush="{DynamicResource Theme3B506F}" BorderThickness="1" CornerRadius="10" ClipToBounds="True">
-        <Grid>
-          <plot:GraphPlotControl Scene="{Binding Scene}"
-                               ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}"
-                               ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}"
-                               ShowAstra="{Binding ShowAstra}"
-                               AutomationProperties.Name="{Binding Texts.Graph}"
-                               AutomationProperties.HelpText="{Binding MetricAxisText}"
-                               AutomationProperties.AutomationId="Graph.Plot"
-                               IsVisible="{Binding HasPlot}" />
-          <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8"
-                      IsVisible="{Binding IsLoading}" IsHitTestVisible="False">
-            <ProgressBar Width="72" Height="4" IsIndeterminate="True" />
-            <TextBlock Classes="label" Text="{Binding LoadingText}" />
-          </StackPanel>
-          <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
-                     IsVisible="{Binding HasBlockingLoadError}" IsHitTestVisible="False"
-                     Foreground="{DynamicResource ThemeF0A35B}" Text="{Binding LoadErrorText}" />
-          <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
-                     IsVisible="{Binding HasNoPoints}" IsHitTestVisible="False"
-                     Text="{Binding Texts.UnavailableDetails}" />
-        </Grid>
-      </Border>
+      <Grid Grid.Row="3" x:Name="GraphFrame">
+        <Border Background="{DynamicResource Theme121C2C}" BorderBrush="Transparent" BorderThickness="1" CornerRadius="10" ClipToBounds="True">
+          <Grid>
+            <plot:GraphPlotControl Scene="{Binding Scene}"
+                                   ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}"
+                                   ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}"
+                                   ShowAstra="{Binding ShowAstra}"
+                                   AutomationProperties.Name="{Binding Texts.Graph}"
+                                   AutomationProperties.HelpText="{Binding MetricAxisText}"
+                                   AutomationProperties.AutomationId="Graph.Plot"
+                                   IsVisible="{Binding HasPlot}" />
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8"
+                        IsVisible="{Binding IsLoading}" IsHitTestVisible="False">
+              <ProgressBar Width="72" Height="4" IsIndeterminate="True" />
+              <TextBlock Classes="label" Text="{Binding LoadingText}" />
+            </StackPanel>
+            <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
+                       IsVisible="{Binding HasBlockingLoadError}" IsHitTestVisible="False"
+                       Foreground="{DynamicResource ThemeF0A35B}" Text="{Binding LoadErrorText}" />
+            <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
+                       IsVisible="{Binding HasNoPoints}" IsHitTestVisible="False"
+                       Text="{Binding Texts.UnavailableDetails}" />
+          </Grid>
+        </Border>
+        <Border x:Name="GraphFrameOutline" BorderBrush="{DynamicResource Theme3B506F}"
+                BorderThickness="1" CornerRadius="10" IsHitTestVisible="False" />
+      </Grid>
 
     </Grid>
 
