@@ -304,13 +304,10 @@ public sealed class GraphPlotControl : Control
             MeasuredRemainingLineWidth);
         ApplyAxes(presentation, scene, axes);
         ApplyVisibility(presentation);
-        AddPeriodCostLabels(presentation, scene, axes);
+        AddPeriodCostPanel(presentation, scene);
     }
 
-    private void AddPeriodCostLabels(
-        PlotPresentation presentation,
-        GraphScene scene,
-        GraphAxisProjection axes)
+    private void AddPeriodCostPanel(PlotPresentation presentation, GraphScene scene)
     {
         if (!scene.HasPoints)
         {
@@ -331,54 +328,30 @@ public sealed class GraphPlotControl : Control
             return;
         }
 
-        var includePeriodStart = periods.Length > 1;
         GraphPeriodCostFontResolver.EnsureRegistered();
-        var labels = new List<ScottPlot.Plottables.Text>(periods.Length);
+        var amounts = new List<GraphPeriodCostAmount>(periods.Length);
         foreach (var period in periods)
         {
-            var labelText = LocalizationService.Current.FormatGraphPeriodCost(
-                period.PeriodCost.RecordedDollars,
-                period.PeriodCost.IsComplete);
-            if (includePeriodStart)
+            var visibleStart = Math.Max(period.PeriodStartAt, scene.PeriodStartAt);
+            var visibleEnd = Math.Min(period.PeriodEndAt, scene.PeriodEndAt);
+            var centerAt = visibleStart + ((visibleEnd - visibleStart) / 2d);
+            var labelStyle = new ScottPlot.LabelStyle
             {
-                var localStart = TimeZoneInfo.ConvertTime(
-                        DateTimeOffset.FromUnixTimeSeconds(period.PeriodStartAt),
-                        LocalizationService.DisplayTimeZone)
-                    .ToString("MM/dd HH:mm", CultureInfo.CurrentCulture);
-                labelText = $"{localStart}～\n{labelText}";
-            }
-
-            var rightEdge = Math.Min(period.PeriodEndAt, scene.PeriodEndAt);
-            var label = presentation.Plot.Add.Text(labelText, rightEdge, axes.ModelDisplayMaximum);
-            label.Alignment = ScottPlot.Alignment.UpperRight;
-            label.LabelFontName = GraphPeriodCostFontResolver.AliasForLanguage(
-                LocalizationService.Current.LanguageCode);
-            // Plot.Font.Set() installs its chosen typeface as ScottPlot's global
-            // default, which new LabelStyle instances inherit. Clear that cached
-            // typeface so rendering resolves this label's embedded-font alias.
-            label.LabelStyle.Font = null;
-            label.LabelFontSize = 11;
-            label.LabelFontColor = MutedColor;
-            label.LabelBackgroundColor = PlotColor;
-            label.LabelBorderColor = GridColor;
-            label.LabelBorderWidth = 0.5f;
-            label.LabelShadowOffset = new ScottPlot.PixelOffset(0, 0);
-            label.LabelPadding = GraphPeriodCostLabelsLayoutAction.LabelPadding;
-            labels.Add(label);
+                Text = LocalizationService.Current.FormatGraphPeriodCost(period.PeriodCost.RecordedDollars),
+                FontName = GraphPeriodCostFontResolver.AliasForLanguage(LocalizationService.Current.LanguageCode),
+                // Plot.Font.Set() installs its chosen typeface as ScottPlot's global
+                // default. Clear it so the per-label embedded-font alias is resolved.
+                Font = null,
+                FontSize = GraphPeriodCostPanel.BaseFontSize,
+                ForeColor = new ScottPlot.Color(ThemePalette.Resolve("#E6B85C")),
+                Alignment = ScottPlot.Alignment.MiddleCenter,
+                BorderWidth = 0,
+                ShadowOffset = new ScottPlot.PixelOffset(0, 0),
+            };
+            amounts.Add(new GraphPeriodCostAmount(centerAt, labelStyle));
         }
 
-        // Text is rendered by RenderPlottables. Place layout directly before
-        // that action, after ScottPlot has measured axes and finalized DataRect.
-        var renderPlottablesIndex = presentation.Plot.RenderManager.RenderActions
-            .FindIndex(action => action.GetType().Name == "RenderPlottables");
-        if (renderPlottablesIndex < 0)
-        {
-            throw new InvalidOperationException("ScottPlot's RenderPlottables action was not found.");
-        }
-
-        presentation.Plot.RenderManager.RenderActions.Insert(
-            renderPlottablesIndex,
-            new GraphPeriodCostLabelsLayoutAction(labels));
+        presentation.Plot.Axes.AddPanel(new GraphPeriodCostPanel(amounts));
     }
 
     private static GraphCanonicalModelLineProjection BuildModelLines(GraphScene scene, GraphSeries series) =>

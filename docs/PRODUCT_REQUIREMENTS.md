@@ -77,7 +77,7 @@ U128-36
 `MODEL-USAGE-DISPLAY-01`: 価格は正確なmodel IDごとに算出する。Windows Mainの内訳は価格catalogで採用済みの正確なIDごとに版名（例: 6 Astra、6.1 Sol、6 Sol、5.6 Tera、6 Luna）を表示し、今回期間の公開済み合計利用額の降順、同額はmodel keyの安定順、金額不明は末尾とする。既知IDの価格が未定でも版名を保持する。未対応の新modelはその他へ集約し、版が失われた旧familyは従来名のまま維持して最新の版へ推定変換しない。最大6行を同時表示し、超過行は表内の縦scrollで全件確認可能にする。GraphとLinux Mainは既知IDの表示family集約を維持する。DB/RESTの元model keyとtoken事実は保持し、表示対応を価格lookupに使わない。表示groupに価格未確定のmodelが含まれる場合、そのgroupの合計金額を既知部分だけの値や0として表示しない。現在期間のモデル別利用量は、LinuxとWindowsで同じ3組の表示bucketを使う。v3 wireの入力総数をI、cached入力をC、cache write入力をW、出力をOとすると、表示Inputはtoken `I-C`と概算ドル「通常入力＋cache write」、表示Cached inputはtoken Cとcached入力ドル、表示Outputはtoken Oと出力ドルを必ず隣接させる。したがって独立列を持たないcache writeはInputのtokenとドルの双方に含め、片方だけへ含めない。v3 adapterだけがraw値をこの表示契約へ正規化し、既に表示bucketを返すv1/v2を再減算しない。有限の概算ドルは小数2桁、価格未定または非有限値は0へ推測せず利用不可として表示する。
 `API-LIFECYCLE-01`: canonicalな収集・DB domainはUIの固定field、表示文言、画面構成および特定client versionへ依存させない。public APIは同じcommit済みdomain snapshotから作るversion別read-only adapterとし、client変更でcollectorまたはDB writerを変更しない。現行v3は現在値、履歴期間、選択期間の有限履歴page、Threadsを独立resourceとして公開し、各UIは可視surfaceに必要なresourceだけを取得する。全resourceは同じopaqueなpublished pairへ結合し、一つの取得cycleで一つのsurfaceが必要とする全pageを同一pairで受理した場合だけatomic表示する。履歴差分だけは、直前rootのcursorが同じperiodの既取得prefix不変を証明した場合に限り、新pairの全pageを揃えて旧prefixへatomic appendできる。prefixのsampleまたはgapが補正された場合はcursorを拒否し、先頭から再取得する。modelは固定3列でなく有界な配列として公開し、未知モデルのtoken事実と価格未確定を区別する。旧v1/v2と`/v3/details`は互換期間中だけ同一snapshotのdeprecated projectionとして保持し、旧API削除はadapter・route・client fallbackだけで完結させ、記録、DB schema、常駐監視、安定health endpointを変更しない。Sunset日時は別途明示決定されるまで推測しない。
 REST/DBの公開応答に含めるモデル数値は、同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値、または保存済みの同じmodel keyをlosslessに保持する`legacy-unknown`値だけとする。`reconstructed-from-session`、`unknown`、`unavailable`はモデル数値を公開せず、model key/sourceと欠損metadataだけを公開する。`legacy-unknown`は集計・予測のauthorityにはせず、`G137-5`の同一非空model集合・全lossless raw tokenとraw Remainingのexact不変・欠測／異常／confirmed gapなしをrun全体で満たす場合だけidle判定に利用できる。補間、hold、smoothing、予測およびそれらの派生値はUI presentation-onlyであり、API/DBへ書き戻さない。
-`MODEL-USAGE-DISPLAY-01`の部分額非表示、およびDirect以外を集計authorityにしない規則に対し、Windows Graphの`G137-7`期間注記だけは、保存済みの有効な部分額を「記録分（未確定）」として表示上合算できる。確定した期間合計やmodel groupの確定額とはせず、DB/API・モデル線・idle・予測のauthorityへ反映しない。
+`MODEL-USAGE-DISPLAY-01`の部分額非表示、およびDirect以外を集計authorityにしない規則に対し、Windows Graphの`G137-7`期間注記だけは、保存済みの有効な部分額を利用相当量として表示上合算できる。確定した期間合計やmodel groupの確定額とはせず、DB/API・モデル線・idle・予測のauthorityへ反映しない。
 `ACCOUNT-LIFECYCLE-134`: 一つのCodex profileは同時に一つの`auth.json` authorityだけを持つため、resident recorderが同時に書き込むのは現在認証を再確認できた一つのaccount partitionだけとする。認証されていないaccountを並行取得・推測更新しない。認証済みになった全accountのpartitionは削除せず、切替後も保持し、同一accountへ戻った場合は同じpartitionを境界後から再開する。REST/UIは初期化済みpartitionを列挙し、起動ごとに検証済み`/v3/accounts`の現accountを表示対象にする。現accountを確認できない新規起動では履歴accountを推測選択しない。起動後は利用者が設定画面で一つだけ選択して読み出せる。一覧に残る明示選択は同一processの一覧更新で保持し、次回起動の既定には保存しない。選択変更はcurrent、history、threads、pair、cursor、last-goodを同じaccount境界で一括破棄・再取得し、複数partitionの値を一画面へ混合しない。
 一つの外部観測可能な契約IDを複数ownerへ置かず、下流文書、要求台帳、実装、testは登録済みownerの
 契約IDを参照する。監査履歴、作業経過、文書SHA一覧、test名やagent運用は製品要件ではない。
@@ -533,20 +533,19 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    旧familyと正確なIDの独立した保存値は既存の価格契約に従って表示上だけ合算する。
    tokens/dollars、週期間/24h/7d、hoverへ同じ表示membershipを適用し、raw token、idle・予測authority、DB/APIは変更しない。
 
-   Windowsの全表示mode・両metricでは、各実reset期間の保存済みドル利用相当量を区間右上に注記する。
+   Windowsの全表示mode・両metricでは、各実reset期間の保存済みドル利用相当量を表示する。
    固定7日や表示窓の幅から期間を推定せず、canonicalなperiod start/endを使う。モデルの表示ON/OFFによって額を変えない。
    最新の非synthetic raw観測だけから全raw model keyの保存USD（旧ASTRAは既定式）を一度ずつ合算し、
    補間・hold・smoothing・予測値や過去の完全集合へfallbackしない。右端が窓内で途中まででも保存済み期間全体の累計を表す。
-   全掲載keyが最新のconfirmed完全集合に存在し、全額が有効な場合だけ「期間合計」とする。
-   不完全な集合、価格不明、無効・減少により採用できないmodel値がある場合は、そのmodelを額から除き、
-   同額の計算式と保存値の二進丸め差は減少扱いせず、最新保存額を注記だけに用いる。
-   他の有効な額だけを「記録分（未確定）」として表示する。有効な額が一つもなければ「期間合計 未取得」とし、0へ置換しない。
-   ただし過去の掲載keyもない明示的なconfirmed空集合は確定$0とする。legacy-unknownの保存値の合算はこの未確定注記だけの表示専用例外である。
-   24h/7d窓の左端が前periodの途中なら、そのperiodの注記だけを省略してグラフ線を保持する。
-   右側が部分表示のperiodは可視区間の右端を注記のanchorとし、plot内で全文を読める位置へ配置する。
-   短期間に複数resetが続いて注記が重なる場合は位置をずらし、数字を重ねたり軸・plot外で切ったりしない。
-   狭さだけを理由に注記を省略せず、複数の短い実期間と右端部分表示を含むrenderで検証する。
-   履歴0点の場合は既存の未取得・履歴なし表示を維持する。注記はテーマと言語の変更に追従し、旧model別右端ラベルやleaderを復活させない。
+   不完全な集合、価格不明、無効・減少により採用できないmodel値がある場合は、そのmodelを額から除き、他の有効な額だけを表示する。
+   同額の計算式と保存値の二進丸め差は減少扱いせず、最新保存額を使う。有効な額が一つもなければ「—」とし、0へ置換しない。
+   ただし過去の掲載keyもない明示的なconfirmed空集合は確定$0とする。legacy-unknownの保存値の合算は表示専用例外とし、完全性を昇格させない。
+   表示位置はグラフと横軸の下に設ける細い金額欄とし、各periodの可視区間の中央へ、大きく高コントラストの整数USDだけを置く。
+   小数は表示時だけ四捨五入し、「期間合計」「記録分」「未確定」などの説明、開始日時、小数点を金額欄へ付加しない。
+   24h/7d窓の左端が前periodの途中なら、そのperiodの金額だけを省略してグラフ線を保持する。
+   短い期間の金額が重なる場合は欄内で位置・大きさを調整し、線や時刻目盛りに被せたり、金額を切ったりしない。
+   履歴0点の場合は既存の未取得・履歴なし表示を維持する。金額はテーマへ追従し、個別modelの右端値やleaderを復活させない。
+   金額用tooltip、追加説明、追加警告は導入せず、既存の系列hover・収集状態・API/DBの精度を変更しない。
 8. `G137-8`: Graph candidateのpairはperiods応答のexact
    `Codex-Info-Published-Pair`を`P`とし、全history success pageの同headerがASCII
    case-sensitiveで`P`と一致した場合だけ全pageをatomic publishする。欠落、malformed、別値`Q`、
