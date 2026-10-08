@@ -509,9 +509,11 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    当該modelのunknown rowがあるnearest-finite接続、限定補完条件を満たさないraw-null補間点の両側、
    monotonic hold、bounded/terminal hold、synthetic tailは1px破線とする。raw quota同値のcontiguous区間は
    model availabilityと独立した実測実線である。raw-nullの`Interpolated`だけを欠測破線とする。model線は当該modelの当該表示metric anomaly、Remaining線はRemaining
-   anomaly、全線はgapを跨ぐ区間だけを破線bridgeとし、別metricのanomalyを正常線へ波及させない。右端model
+   anomaly、全線はgapを跨ぐ区間だけを破線bridgeとし、別metricのanomalyを正常線へ波及させない。Linuxの右端model
    labelは最後のaccepted raw model値を表示し、実測0を未掲載と同一視して隠さない。Remaining labelは最後の
-   raw観測時刻におけるeffective値を表示する。
+   raw観測時刻におけるeffective値を表示する。Windowsは右端ラベルを廃止し、選択した近傍実観測時刻の
+   全表示系列をホバーで確認する。整数Tokens・accepted/read-time補正Dollars・raw Remainingの表示条件は
+   UX ownerの§4.2に従い、欠測を補間や0として表示しない。
 8. `G137-8`: Graph candidateのpairはperiods応答のexact
    `Codex-Info-Published-Pair`を`P`とし、全history success pageの同headerがASCII
    case-sensitiveで`P`と一致した場合だけ全pageをatomic publishする。欠落、malformed、別値`Q`、
@@ -575,7 +577,7 @@ Remainingの配分または線種へ波及させず、直接観測anchor間は3p
 
 ## グラフ表示への参照
 
-Windowsのみ、既定のreset週期間に加えて現在を右端とする固定24時間／7日間の表示窓と全幅の過去移動を提供する。窓に重なる各resetは同一account/published pairで完全受理した別系列として投影し、観測終端から現在までを実測で埋めない。縦軸とreset別累計の意味は変更せず、Linux画面は対象外とする（#554）。詳細は`docs/WINDOWS_UX_SPEC.md` §4.2を正本とする。
+Windowsのみ、既定のreset週期間に加えて現在を右端とする固定24時間／7日間の表示窓と全幅の過去移動を提供する。窓に重なる各resetは同一account/published pairで完全受理した別系列として投影し、観測終端から現在までを実測で埋めない。Windowsの常時右端値ラベルと専用余白は、近い実観測時刻の日時・全表示系列の値を示すホバー表示へ置き換える。縦軸とreset別累計の意味は変更せず、Linux画面は対象外とする（#554）。詳細は`docs/WINDOWS_UX_SPEC.md` §4.2を正本とする。
 
 一般のグラフgeometry、操作、色と線幅はUX ownerの`CUM-138-06`が
 `docs/WINDOWS_UX_SPEC.md`で所有する。Issue #137で確定したcross-platformの値・線種・連続区間・

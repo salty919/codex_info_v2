@@ -10,6 +10,8 @@ param(
     [switch]$Fixture,
     [switch]$FixtureContractTest,
     [switch]$ThemePresets,
+    [switch]$GraphThemes,
+    [switch]$GraphHoverOnly,
     [switch]$CompatibilitySmoke,
     [switch]$RequireCurrentPresentation,
     [string]$SourceSha = ''
@@ -17,11 +19,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($ThemePresets -and -not $Fixture) {
-    throw '-ThemePresets requires -Fixture.'
+if ($GraphHoverOnly -and (-not $Fixture -or $ThemePresets -or $GraphThemes -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation)) {
+    throw 'Graph hover validation requires only -Fixture -GraphHoverOnly.'
 }
-if ($ThemePresets -and ($FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation)) {
-    throw '-ThemePresets cannot be combined with another E2E mode.'
+
+if (($ThemePresets -or $GraphThemes) -and -not $Fixture) {
+    throw 'Theme validation requires -Fixture.'
+}
+if (($ThemePresets -or $GraphThemes) -and ($FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation -or ($ThemePresets -and $GraphThemes))) {
+    throw 'Theme validation modes cannot be combined with another E2E mode.'
 }
 
 function Resolve-E2EOutputDirectory {
@@ -164,6 +170,10 @@ using System.Text;
 
 public static class CodexInfoWindowsE2EWin32 {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
@@ -200,9 +210,42 @@ public sealed class CodexInfoGraphPixelMeasurement {
 }
 
 public static class CodexInfoGraphPixelScanner {
+    public static bool MatchesCompositedStroke(Color actual, Color foreground, Color background) {
+        double dr = foreground.R - background.R;
+        double dg = foreground.G - background.G;
+        double db = foreground.B - background.B;
+        double norm = dr * dr + dg * dg + db * db;
+        if (norm == 0) return false;
+        double alpha = ((actual.R - background.R) * dr +
+            (actual.G - background.G) * dg + (actual.B - background.B) * db) / norm;
+        // A confirmed-idle 1px stroke has at least one pixel row with
+        // >= half coverage: 0.5 * 0.95 opacity = 0.475 before quantization.
+        if (alpha < 0.45) return false;
+        alpha = Math.Min(1.0, alpha);
+        return Math.Abs(actual.R - (background.R + alpha * dr)) <= 2 &&
+            Math.Abs(actual.G - (background.G + alpha * dg)) <= 2 &&
+            Math.Abs(actual.B - (background.B + alpha * db)) <= 2;
+    }
+
+    public static int CountCompositedStrokePixels(Bitmap bitmap, int left, int top, int right, int bottom,
+        Color foreground, Color[] backgrounds, int minimum) {
+        int count = 0;
+        for (int y = top; y < bottom && count < minimum; y++) {
+            for (int x = left; x < right && count < minimum; x++) {
+                Color actual = bitmap.GetPixel(x, y);
+                foreach (Color background in backgrounds) {
+                    if (!MatchesCompositedStroke(actual, foreground, background)) continue;
+                    count++;
+                    break;
+                }
+            }
+        }
+        return count;
+    }
+
     private static readonly Color GridColor = ColorTranslator.FromHtml("#263850");
     private static readonly Color ResetGuideColor = ColorTranslator.FromHtml("#D6A45C");
-    private static readonly Color IdleColor = ColorTranslator.FromHtml("#1A2838");
+    private static readonly Color IdleColor = ColorTranslator.FromHtml("#162232");
     private static readonly Color PlotColor = ColorTranslator.FromHtml("#121C2C");
     private const double ResetGuideOpacity = 178.0 / 255.0;
     private static readonly Color[] SeriesColors = new[] {
@@ -211,6 +254,11 @@ public static class CodexInfoGraphPixelScanner {
         ColorTranslator.FromHtml("#5DC98A"),
         ColorTranslator.FromHtml("#E6A23C"),
     };
+
+    private static bool MatchesSeriesStroke(Color actual, Color foreground) {
+        return MatchesCompositedStroke(actual, foreground, PlotColor) ||
+            MatchesCompositedStroke(actual, foreground, IdleColor);
+    }
 
     public static CodexInfoGraphPixelMeasurement Scan(
         string path,
@@ -248,7 +296,7 @@ public static class CodexInfoGraphPixelScanner {
                 int resetGuideMatches = 0;
                 for (int y = yStart; y < yEnd; y++) {
                     Color pixel = bitmap.GetPixel(plotLeft + localX, y);
-                    if (Matches(pixel, IdleColor, 8)) idleMatches++;
+                    if (Matches(pixel, IdleColor, 2)) idleMatches++;
                     if (MatchesResetGuidePixel(pixel)) resetGuideMatches++;
                     bool grid = Matches(pixel, GridColor, 8);
                     if (!grid && localX + 1 < plotWidth) {
@@ -328,7 +376,7 @@ public static class CodexInfoGraphPixelScanner {
                     bool hasBoundarySeriesPixel = false;
                     for (int localY = 0; localY < plotHeight; localY++) {
                         Color pixel = bitmap.GetPixel(plotLeft + localX, plotTop + localY);
-                        if (Matches(pixel, SeriesColors[series], 24)) {
+                        if (MatchesSeriesStroke(pixel, SeriesColors[series])) {
                             hasBoundarySeriesPixel = true;
                             break;
                         }
@@ -347,7 +395,7 @@ public static class CodexInfoGraphPixelScanner {
                 for (int localY = 0; localY < plotHeight; localY++) {
                     Color pixel = bitmap.GetPixel(plotLeft + localX, plotTop + localY);
                     for (int series = 0; series < SeriesColors.Length; series++) {
-                        if (!Matches(pixel, SeriesColors[series], 24)) continue;
+                        if (!MatchesSeriesStroke(pixel, SeriesColors[series])) continue;
                         count[series]++;
                         rightmost[series] = Math.Max(rightmost[series], localX);
                         // A measured series terminates on the period-end grid,
@@ -448,7 +496,7 @@ public static class CodexInfoGraphPixelScanner {
                         if (step < 4) continue;
                         double start = centers[first] - (firstGrid * step);
                         double end = start + (4 * step);
-                        if (start < 0 || end >= plotWidth - 4) continue;
+                        if (start < 0 || end >= plotWidth - 1) continue;
 
                         var candidate = new int[5];
                         bool increasing = true;
@@ -532,7 +580,7 @@ public static class CodexInfoGraphPixelScanner {
 
         var candidate = (int[])expected.Clone();
         for (int index = 0; index < candidate.Length; index++) {
-            if (candidate[index] < 0 || candidate[index] >= plotWidth - 4 ||
+            if (candidate[index] < 0 || candidate[index] >= plotWidth - 1 ||
                 (index > 0 && candidate[index] <= candidate[index - 1])) {
                 return null;
             }
@@ -1711,17 +1759,15 @@ function Get-E2EGraphMeasurement {
     }
     $seriesNames = @('Remaining', 'SOL', 'TERRA', 'LUNA')
     if ($AllowUnusedSeries) {
-        Assert-E2E ($measurement.SeriesPixelCount[0] -gt 0 -and
-            $measurement.SeriesGutterPixelCount[0] -gt 0) `
-            "$Description has no visible Remaining series and endpoint."
+        Assert-E2E ($measurement.SeriesPixelCount[0] -gt 0) `
+            "$Description has no visible Remaining series."
         $visibleModelEndpoints = @(1..3 | Where-Object {
-            $measurement.SeriesPixelCount[$_] -gt 0 -and
-            $measurement.SeriesGutterPixelCount[$_] -gt 0
+            $measurement.SeriesPixelCount[$_] -gt 0
         })
         Assert-E2E ($visibleModelEndpoints.Count -gt 0) `
-            "$Description has no visible used-model series and endpoint."
+            "$Description has no visible used-model series."
         foreach ($index in @(0) + $visibleModelEndpoints) {
-            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
+            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 2) `
                 "$Description clips $($seriesNames[$index]) at the right plot edge."
         }
     }
@@ -1729,13 +1775,13 @@ function Get-E2EGraphMeasurement {
         for ($index = 0; $index -lt $seriesNames.Count; $index++) {
             Assert-E2E ($measurement.SeriesPixelCount[$index] -gt 0) `
                 "$Description has no visible $($seriesNames[$index]) color pixels."
-            Assert-E2E ($measurement.SeriesGutterPixelCount[$index] -gt 0) `
-                "$Description has no $($seriesNames[$index]) leader/glyph pixels in the endpoint gutter."
-            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
+            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 2) `
                 "$Description clips $($seriesNames[$index]) at the right plot edge."
         }
     }
-    Write-E2E ("graph-resize-measurement: state={0} plot={1}x{2} grids={3} start={4} end={5} span={6} gutter={7}" -f
+    Assert-E2E (@($measurement.SeriesGutterPixelCount | Where-Object { $_ -gt 0 }).Count -eq 0) `
+        "$Description still paints persistent endpoint labels or connectors beyond the period."
+    Write-E2E ("graph-resize-measurement: state={0} plot={1}x{2} grids={3} start={4} end={5} span={6} right-margin={7}" -f
         $Description, $plotWidth, $plotHeight, ($measurement.GridCenters -join ','),
         $measurement.PeriodStartX, $measurement.PeriodEndX,
         $measurement.PlotSpan, $measurement.GutterWidth)
@@ -1780,7 +1826,7 @@ function Invoke-E2EGraphPixelScannerSelfTest {
     $resetGuideShortPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-reset-guide-short.png'
     $resetGuideOnlyPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-reset-guide-only.png'
     $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263850')
-    $idleColor = [System.Drawing.ColorTranslator]::FromHtml('#1A2838')
+    $idleColor = [System.Drawing.ColorTranslator]::FromHtml('#162232')
     $background = [System.Drawing.ColorTranslator]::FromHtml('#121C2C')
     $resetGuideColor = [System.Drawing.Color]::FromArgb(92, 84, 72)
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
@@ -1933,6 +1979,28 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         }
     }
 
+    $thinPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-thin-strokes.png'
+    $bitmap = New-Object System.Drawing.Bitmap(240, 140)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.Clear($background)
+        $gridPen = New-Object System.Drawing.Pen($gridColor, 1)
+        try { foreach ($x in @(10, 50, 90, 130, 170)) { $graphics.DrawLine($gridPen, $x, 5, $x, 135) } }
+        finally { $gridPen.Dispose() }
+        # Fixed independent half-covered 95%-opaque role colors over #121C2C.
+        $thinColors = @('#32638B', '#59518B', '#366E59', '#775C34')
+        for ($index = 0; $index -lt $thinColors.Count; $index++) {
+            $color = [System.Drawing.ColorTranslator]::FromHtml($thinColors[$index])
+            foreach ($x in 20..160) { $bitmap.SetPixel($x, 30 + $index * 20, $color) }
+        }
+        $bitmap.Save($thinPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally { $graphics.Dispose(); $bitmap.Dispose() }
+    $thin = [CodexInfoGraphPixelScanner]::Scan($thinPath, 0, 0, 240, 140)
+    Assert-E2E (@($thin.SeriesPixelCount | Where-Object { $_ -lt 100 }).Count -eq 0) `
+        'Scanner must recognize each anti-aliased thin series without endpoint labels.'
+    Write-E2E 'graph-pixel-scanner-self-test: PASS anti-aliased thin lines without endpoint labels'
+
     try {
         $resetGuideMeasurement = $null
         $resetGuideFailure = $null
@@ -1970,6 +2038,15 @@ function Invoke-E2EGraphPixelScannerSelfTest {
             $resetGuideMeasurement.GutterWidth -eq 69) `
             'Graph pixel scanner did not preserve the unanchored period geometry with a reset guide at its endpoint.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS endpoint reset guide supports only the unique unanchored five-grid lattice'
+        # A full-width plot keeps only the 2px stroke safety margin. This is a
+        # cropped independent fixture, not a product-provided expected lattice.
+        $fullWidth = [CodexInfoGraphPixelScanner]::Scan($resetGuidePath, 0, 0, 173, 140)
+        Assert-E2E ($fullWidth.PeriodStartX -eq 10 -and $fullWidth.PeriodEndX -eq 170 -and
+            $fullWidth.GutterWidth -eq 2) 'Full-width reset endpoint geometry was rejected.'
+        [int[]]$fullWidthCenters = @(10, 50, 90, 130, 170)
+        $fullWidthAnchored = [CodexInfoGraphPixelScanner]::Scan($validPath, 0, 0, 173, 140, $fullWidthCenters)
+        Assert-E2E ($fullWidthAnchored.GutterWidth -eq 2) 'Full-width anchored geometry was rejected.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS full-width geometry retains two pixel stroke safety'
 
         $valid = [CodexInfoGraphPixelScanner]::Scan($validPath, 0, 0, 240, 140)
         Assert-E2E ($valid.PeriodStartX -eq 10 -and $valid.PeriodEndX -eq 170 -and
@@ -2089,8 +2166,31 @@ function Assert-E2EImageChanged {
     Assert-E2E ($beforeHash -ne $afterHash) "$Description did not change the rendered window."
 }
 
+function Get-E2EGraphMetric {
+    param([System.Windows.Automation.AutomationElement]$Root)
+    $selected = @()
+    foreach ($metric in @('Tokens', 'Dollars')) {
+        $button = Find-E2EElementByAutomationId $Root "Graph.Metric.$metric"
+        Assert-E2E ($null -ne $button -and -not $button.Current.IsOffscreen) "Graph $metric button is missing."
+        if ([string]$button.Current.HelpText -ceq 'True') { $selected += $metric }
+    }
+    Assert-E2E ($selected.Count -eq 1) 'Exactly one graph metric button must be selected.'
+    return $selected[0]
+}
+
+function Select-E2EGraphMetric {
+    param([System.Windows.Automation.AutomationElement]$Root, [ValidateSet('Tokens', 'Dollars')][string]$Metric)
+    $button = Find-E2EElementByAutomationId $Root "Graph.Metric.$Metric"
+    Assert-E2E ($null -ne $button) "Graph $Metric button is missing."
+    Invoke-E2EElement $button
+    Wait-E2E -Description "Graph metric $Metric selected" -Probe {
+        return (Get-E2EGraphMetric $Root) -ceq $Metric
+    } | Out-Null
+    Wait-E2EGraphLoadSettled $Root
+}
+
 function Get-E2EGraphIdleBackgroundColor {
-    return [System.Drawing.ColorTranslator]::FromHtml('#1A2838')
+    return [System.Drawing.ColorTranslator]::FromHtml('#162232')
 }
 
 function Test-E2EGraphIdleBandPixel {
@@ -2098,11 +2198,11 @@ function Test-E2EGraphIdleBandPixel {
         [Parameter(Mandatory = $true)][System.Drawing.Color]$Pixel
     )
 
-    # The renderer owns the final opaque #1A2838 composite. Compare each
+    # The renderer owns the final opaque #162232 composite. Compare each
     # channel against that literal product color so the plot surface
     # (#121C2C) and grid/axis (#263850) cannot satisfy the idle-band oracle.
     $expected = Get-E2EGraphIdleBackgroundColor
-    $tolerance = 8
+    $tolerance = 2
     $redDelta = [Math]::Abs([int]$Pixel.R - [int]$expected.R)
     $greenDelta = [Math]::Abs([int]$Pixel.G - [int]$expected.G)
     $blueDelta = [Math]::Abs([int]$Pixel.B - [int]$expected.B)
@@ -2219,7 +2319,7 @@ function Assert-E2EGraphHasIdleBand {
     finally {
         $bitmap.Dispose()
     }
-    Write-E2E ("graph-past-idle-band: PASS pixels={0} columns={1}/{2} range={3}-{4} color=#1A2838 opacity=1" -f
+    Write-E2E ("graph-past-idle-band: PASS pixels={0} columns={1}/{2} range={3}-{4} color=#162232 opacity=1" -f
         $result.Hits, $result.CoveredColumns, $result.ExpectedColumns, $ExpectedStartFraction, $ExpectedEndFraction)
 }
 
@@ -2622,9 +2722,12 @@ function Assert-E2EFixtureV3PreflightResponses {
         [Int64]$pastSamples[2].timestamp -eq $expectedIdleEnd -and
         [Int64]$pastSamples[3].timestamp -eq $pastEnd) `
         'Fixture past history does not place its confirmed idle interval at the declared period fractions.'
+    # The normal fixture proves the exact admission threshold; the theme
+    # fixture spans multiple days to exercise date labels and their layout.
+    [Int64]$expectedIdleSeconds = if ($GraphThemes) { 86400 } else { $script:e2eFixtureUnusedMinimumSeconds }
     Assert-E2E (([Int64]$pastSamples[2].timestamp - [Int64]$pastSamples[1].timestamp) -eq
-        $script:e2eFixtureUnusedMinimumSeconds) `
-        'Fixture past history must prove the exact 10-minute unused threshold.'
+        $expectedIdleSeconds) `
+        "Fixture past history must prove its exact $expectedIdleSeconds-second unused interval."
     Assert-E2E (@($pastSamples[1..2] | Where-Object {
             -not $_.models_complete -or $_.model_source -cne 'confirmed' -or
             [Int64]$_.reset_at -ne [Int64]$pastPeriod[0].reset_at
@@ -2632,7 +2735,13 @@ function Assert-E2EFixtureV3PreflightResponses {
         [double]$pastSamples[1].remaining_percent -eq [double]$pastSamples[2].remaining_percent -and
         @($json['past-history'].history_gaps).Count -eq 0) `
         'Fixture past idle interval is not backed by complete direct observations without gaps.'
-    foreach ($model in @('SOL', 'TERRA', 'LUNA')) {
+    $expectedHistoryModels = @('SOL', 'TERRA', 'LUNA')
+    if ($GraphThemes) { $expectedHistoryModels += 'ASTRA' }
+    foreach ($model in $expectedHistoryModels) {
+        foreach ($sample in $pastSamples) {
+            Assert-E2E (@($sample.models | Where-Object { $_.model -ceq $model }).Count -eq 1) `
+                "Fixture past history must contain exactly one $model observation per sample."
+        }
         $idleTotals = @(1..2 | ForEach-Object {
             [Int64](($pastSamples[$_].models | Where-Object { $_.model -ceq $model }).total_tokens)
         } | Select-Object -Unique)
@@ -2671,7 +2780,7 @@ function Invoke-E2EFixturePreflight {
 function New-E2EFixtureDocuments {
     $rawNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $now = $rawNow - ($rawNow % 60)
-    $currentStart = $now - 60
+    $currentStart = if ($GraphThemes) { $now - 172800 } else { $now - 60 }
     # Theme mode needs a genuinely ready status for the UX-spec ready-color
     # oracle. The normal fixture retains its original reset-warning timing.
     $currentReset = if ($ThemePresets) { $now + 172800 } else { $now + 7200 }
@@ -2680,8 +2789,8 @@ function New-E2EFixtureDocuments {
     # The current graph contract admits an unused band only after 10 minutes
     # of unchanged direct observations. Keep the legacy compatibility document
     # compact, while the v3 UI fixture proves that real threshold explicitly.
-    $v3PastReset = $now - 3600
-    $v3PastStart = $v3PastReset - (4 * $script:e2eFixtureUnusedMinimumSeconds)
+    $v3PastReset = if ($GraphThemes) { $now - 259200 } else { $now - 3600 }
+    $v3PastStart = $v3PastReset - $(if ($GraphThemes) { 345600 } else { 4 * $script:e2eFixtureUnusedMinimumSeconds })
     $v3PastSpan = $v3PastReset - $v3PastStart
     $v3PastIdleStart = $v3PastStart + [Int64]($v3PastSpan * $script:e2eFixturePastIdleStartFraction)
     $v3PastIdleEnd = $v3PastStart + [Int64]($v3PastSpan * $script:e2eFixturePastIdleEndFraction)
@@ -2743,6 +2852,21 @@ function New-E2EFixtureDocuments {
     $pastHistory = @"
 {"api_version":"v3","history_samples":[{"timestamp":$v3PastStart,"reset_at":$v3PastReset,"remaining_percent":98.0,"models":[{"model":"SOL","total_tokens":50,"input_tokens":35,"cached_input_tokens":10,"cache_write_input_tokens":0,"output_tokens":15,"total_dollars":0.20},{"model":"TERRA","total_tokens":100,"input_tokens":70,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":30,"total_dollars":0.40},{"model":"LUNA","total_tokens":150,"input_tokens":105,"cached_input_tokens":30,"cache_write_input_tokens":0,"output_tokens":45,"total_dollars":0.60}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":null},{"timestamp":$v3PastIdleStart,"reset_at":$v3PastReset,"remaining_percent":94.0,"models":[{"model":"SOL","total_tokens":100,"input_tokens":70,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":30,"total_dollars":0.40},{"model":"TERRA","total_tokens":200,"input_tokens":140,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":60,"total_dollars":0.80},{"model":"LUNA","total_tokens":300,"input_tokens":210,"cached_input_tokens":60,"cache_write_input_tokens":0,"output_tokens":90,"total_dollars":1.20}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":true},{"timestamp":$v3PastIdleEnd,"reset_at":$v3PastReset,"remaining_percent":94.0,"models":[{"model":"SOL","total_tokens":100,"input_tokens":70,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":30,"total_dollars":0.40},{"model":"TERRA","total_tokens":200,"input_tokens":140,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":60,"total_dollars":0.80},{"model":"LUNA","total_tokens":300,"input_tokens":210,"cached_input_tokens":60,"cache_write_input_tokens":0,"output_tokens":90,"total_dollars":1.20}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":false},{"timestamp":$v3PastReset,"reset_at":$v3PastReset,"remaining_percent":84.0,"models":[{"model":"SOL","total_tokens":600,"input_tokens":400,"cached_input_tokens":100,"cache_write_input_tokens":0,"output_tokens":200,"total_dollars":0.60},{"model":"TERRA","total_tokens":1200,"input_tokens":800,"cached_input_tokens":200,"cache_write_input_tokens":0,"output_tokens":400,"total_dollars":1.20},{"model":"LUNA","total_tokens":1800,"input_tokens":1200,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":600,"total_dollars":1.80}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":true}],"history_gaps":[],"next_cursor":null,"resume_cursor":"e2e-past-resume"}
 "@
+    if ($GraphThemes) {
+        foreach ($name in @('currentHistory', 'pastHistory')) {
+            $document = Get-Variable -Name $name -ValueOnly | ConvertFrom-Json
+            foreach ($sample in $document.history_samples) {
+                $astra = ($sample.models | Where-Object model -eq 'LUNA' | ConvertTo-Json -Depth 10) | ConvertFrom-Json
+                $astra.model = 'ASTRA'
+                foreach ($field in @('total_tokens', 'input_tokens', 'cached_input_tokens', 'output_tokens')) {
+                    $astra.$field = [Int64]($astra.$field * 0.8)
+                }
+                $astra.total_dollars = $astra.total_dollars * 0.8
+                $sample.models += $astra
+            }
+            Set-Variable -Name $name -Value ($document | ConvertTo-Json -Depth 20 -Compress)
+        }
+    }
     $currentHistoryDelta = '{"api_version":"v3","history_samples":[],"history_gaps":[],"next_cursor":null,"resume_cursor":"e2e-current-resume"}'
     $pastHistoryDelta = '{"api_version":"v3","history_samples":[],"history_gaps":[],"next_cursor":null,"resume_cursor":"e2e-past-resume"}'
     $threads = @"
@@ -2823,7 +2947,7 @@ function Exit-E2EFixture {
     elseif (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) {
         Remove-Item -LiteralPath $script:e2eSettingsPath -Force
     }
-    if ($ThemePresets) {
+    if ($ThemePresets -or $GraphThemes) {
         if ($script:e2eSettingsWasPresent) {
             Assert-E2E (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) 'Original settings.json was not restored.'
             $restoredBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
@@ -2958,12 +3082,19 @@ function Assert-E2EGraphIdleBandExpectedFailure {
 }
 
 function Invoke-E2EGraphIdleBandSelfTest {
+    # WG14's literal oracle is independent of the bitmap producer/helper.
+    Assert-E2E ((Get-E2EGraphIdleBackgroundColor).ToArgb() -eq ([System.Drawing.ColorTranslator]::FromHtml('#162232')).ToArgb()) `
+        'The idle bitmap producer must use the WG14 classic color #162232.'
+    Assert-E2E (Test-E2EGraphIdleBandPixel ([System.Drawing.ColorTranslator]::FromHtml('#162232'))) `
+        'Subtle classic graph idle color #162232 must be recognized.'
+    Assert-E2E (-not (Test-E2EGraphIdleBandPixel ([System.Drawing.ColorTranslator]::FromHtml('#121C2C')))) `
+        'Plain graph background must never count as idle.'
     $validBitmap = New-E2EGraphIdleBandSyntheticBitmap -Variant 'valid'
     try {
         $validResult = Assert-E2EGraphIdleBandBitmap -Bitmap $validBitmap -Left 0 -Top 0 -Right $validBitmap.Width -Bottom $validBitmap.Height
         Assert-E2E ($validResult.CoveredColumns -ge 32) 'Graph idle-band self-test did not establish meaningful column coverage.'
         Assert-E2E ($validResult.ScanHeight -ge 40) 'Graph idle-band self-test did not establish meaningful vertical coverage.'
-        Write-E2E ("graph-idle-band-self-test: PASS valid composite=#1A2838 tolerance=8 pixels={0} columns={1}/{2} vertical={3}" -f
+        Write-E2E ("graph-idle-band-self-test: PASS valid composite=#162232 tolerance=2 pixels={0} columns={1}/{2} vertical={3}" -f
             $validResult.Hits, $validResult.CoveredColumns, $validResult.ExpectedColumns, $validResult.ScanHeight)
     }
     finally {
@@ -2982,6 +3113,23 @@ function Invoke-E2EGraphIdleBandSelfTest {
 }
 
 function Invoke-E2EFixtureContractTests {
+    # One-pixel lines cover one or two pixel rows and retain their specified
+    # opacity. Verify color after composition, without accepting other hues.
+    $foreground = [System.Drawing.ColorTranslator]::FromHtml('#A88CF5')
+    $background = [System.Drawing.ColorTranslator]::FromHtml('#162232')
+    foreach ($alpha in @(1.0, 0.95, 0.475)) {
+        $actual = [System.Drawing.Color]::FromArgb(
+            [int][Math]::Round($background.R + ($foreground.R - $background.R) * $alpha),
+            [int][Math]::Round($background.G + ($foreground.G - $background.G) * $alpha),
+            [int][Math]::Round($background.B + ($foreground.B - $background.B) * $alpha))
+        Assert-E2E ([CodexInfoGraphPixelScanner]::MatchesCompositedStroke($actual, $foreground, $background)) `
+            "Stroke color oracle rejected valid opacity/coverage $alpha."
+    }
+    foreach ($wrong in @($background, [System.Drawing.ColorTranslator]::FromHtml('#EF6A6A'), [System.Drawing.ColorTranslator]::FromHtml('#263850'))) {
+        Assert-E2E (-not [CodexInfoGraphPixelScanner]::MatchesCompositedStroke($wrong, $foreground, $background)) `
+            'Stroke color oracle accepted a background, grid or different series hue.'
+    }
+    Write-E2E 'graph-stroke-color-self-test: PASS opacity/antialias accepted; background/grid/other-series rejected'
     $documents = New-E2EFixtureDocuments
     $healthBody = '{"api_version":"v1","service":"codex-info","product_version":"' + $script:e2eProductVersion + '"}'
     $health = New-E2EContractTestResponse -StatusCode 200 -Body $healthBody -Headers ([ordered]@{})
@@ -3150,120 +3298,120 @@ function Find-E2ECloseButton {
 $script:e2eThemeColors = @{
     'classic-dark' = @{
         Window = '#0E141E'; Card = '#151F2D'; Primary = '#E9EFF8'; Secondary = '#A8B7CA'; Accent = '#56B2F5'
-        Plot = '#121C2C'; Grid = '#263850'; Idle = '#1A2838'; QuotaEmpty = '#326799'; QuotaFilled = '#56B2F5'
+        Plot = '#121C2C'; Grid = '#263850'; Idle = '#162232'; QuotaEmpty = '#326799'; QuotaFilled = '#56B2F5'
         ReadyBackground = '#143426'; ReadyBorder = '#276C49'; ReadyAccent = '#4FB878'
         ParentCard = '#1A2C40'; ChildCard = '#151F2D'; ThreadBorder = '#2B425B'; ThreadRail = '#76A7CC'; Running = '#EF6A6A'
         Remaining = '#56B2F5'; Popup = '#111B2C'; PopupSelected = '#244D74'; Focus = '#8BD4FF'
     }
     'graphite-dark' = @{
         Window = '#181A1F'; Card = '#242830'; Primary = '#F1F3F5'; Secondary = '#B5BEC9'; Accent = '#69B5F7'
-        Plot = '#20242B'; Grid = '#3C4652'; Idle = '#303944'; QuotaEmpty = '#4A6B89'; QuotaFilled = '#69B5F7'
+        Plot = '#20242B'; Grid = '#3C4652'; Idle = '#282F38'; QuotaEmpty = '#4A6B89'; QuotaFilled = '#69B5F7'
         ReadyBackground = '#18362A'; ReadyBorder = '#327653'; ReadyAccent = '#5CC88A'
         ParentCard = '#303844'; ChildCard = '#242830'; ThreadBorder = '#4B5A6B'; ThreadRail = '#8CACBF'; Running = '#EF8585'
-        Remaining = '#69B5F7'; Popup = '#222730'; PopupSelected = '#344D63'; Focus = '#9AD7F8'
+        Remaining = '#56B2F5'; Popup = '#222730'; PopupSelected = '#344D63'; Focus = '#9AD7F8'
     }
     'light' = @{
         Window = '#F4F7FB'; Card = '#FFFFFF'; Primary = '#1C2834'; Secondary = '#526579'; Accent = '#176AAB'
-        Plot = '#FFFFFF'; Grid = '#CFD9E4'; Idle = '#E4EDF5'; QuotaEmpty = '#A9CDE8'; QuotaFilled = '#176AAB'
+        Plot = '#FFFFFF'; Grid = '#CFD9E4'; Idle = '#F2F6FA'; QuotaEmpty = '#A9CDE8'; QuotaFilled = '#176AAB'
         ReadyBackground = '#E5F5EC'; ReadyBorder = '#4A9469'; ReadyAccent = '#176E42'
         ParentCard = '#DDEAF5'; ChildCard = '#FFFFFF'; ThreadBorder = '#B6C5D4'; ThreadRail = '#6B839A'; Running = '#B23553'
         Remaining = '#176AAB'; Popup = '#EEF3F8'; PopupSelected = '#D9EBF8'; Focus = '#176AAB'
     }
     'paper-light' = @{
         Window = '#F7F6F2'; Card = '#FFFFFC'; Primary = '#252B31'; Secondary = '#59636B'; Accent = '#356C91'
-        Plot = '#FFFFFC'; Grid = '#D8E0E5'; Idle = '#ECEFEB'; QuotaEmpty = '#B7CDD8'; QuotaFilled = '#356C91'
+        Plot = '#FFFFFC'; Grid = '#D8E0E5'; Idle = '#F6F7F4'; QuotaEmpty = '#B7CDD8'; QuotaFilled = '#356C91'
         ReadyBackground = '#E6F3EB'; ReadyBorder = '#5C9976'; ReadyAccent = '#216543'
         ParentCard = '#E2EDF2'; ChildCard = '#FFFFFC'; ThreadBorder = '#B7C7D0'; ThreadRail = '#708D9E'; Running = '#B23553'
-        Remaining = '#356C91'; Popup = '#F1F4F1'; PopupSelected = '#DAE9EE'; Focus = '#276A91'
+        Remaining = '#176AAB'; Popup = '#F1F4F1'; PopupSelected = '#DAE9EE'; Focus = '#276A91'
     }
     'sand-light' = @{
         Window = '#FDF6E3'; Card = '#FFFBEF'; Primary = '#334650'; Secondary = '#566367'; Accent = '#1B748A'
-        Plot = '#FFFBEF'; Grid = '#C9D6D2'; Idle = '#EBE4D2'; QuotaEmpty = '#B3C9C5'; QuotaFilled = '#1B748A'
+        Plot = '#FFFBEF'; Grid = '#C9D6D2'; Idle = '#F5F0E1'; QuotaEmpty = '#B3C9C5'; QuotaFilled = '#1B748A'
         ReadyBackground = '#E3F0E2'; ReadyBorder = '#6D9B72'; ReadyAccent = '#2B714A'
         ParentCard = '#E1E9D9'; ChildCard = '#FFFBEF'; ThreadBorder = '#BCCBBC'; ThreadRail = '#728D84'; Running = '#A83D48'
-        Remaining = '#1B748A'; Popup = '#F5EDDA'; PopupSelected = '#DCE8DB'; Focus = '#126A7F'
+        Remaining = '#176AAB'; Popup = '#F5EDDA'; PopupSelected = '#DCE8DB'; Focus = '#126A7F'
     }
     'steel-light' = @{
         Window = '#F3F5F8'; Card = '#FFFFFF'; Primary = '#202B38'; Secondary = '#586978'; Accent = '#275FA8'
-        Plot = '#FFFFFF'; Grid = '#D5DEE9'; Idle = '#E8EEF5'; QuotaEmpty = '#A9C4E1'; QuotaFilled = '#275FA8'
+        Plot = '#FFFFFF'; Grid = '#D5DEE9'; Idle = '#F4F7FA'; QuotaEmpty = '#A9C4E1'; QuotaFilled = '#275FA8'
         ReadyBackground = '#E5F2EA'; ReadyBorder = '#6EAA83'; ReadyAccent = '#1E7047'
         ParentCard = '#DDE9F6'; ChildCard = '#FFFFFF'; ThreadBorder = '#BACBDD'; ThreadRail = '#728BA9'; Running = '#B42F49'
-        Remaining = '#275FA8'; Popup = '#EDF2F8'; PopupSelected = '#D7E5F7'; Focus = '#275FA8'
+        Remaining = '#176AAB'; Popup = '#EDF2F8'; PopupSelected = '#D7E5F7'; Focus = '#275FA8'
     }
     'ocean-dark' = @{
         Window = '#10182A'; Card = '#18263D'; Primary = '#EAF3FF'; Secondary = '#ACBED3'; Accent = '#56B8F2'
-        Plot = '#111D33'; Grid = '#304968'; Idle = '#1E304B'; QuotaEmpty = '#3D668B'; QuotaFilled = '#56B8F2'
+        Plot = '#111D33'; Grid = '#304968'; Idle = '#18273F'; QuotaEmpty = '#3D668B'; QuotaFilled = '#56B8F2'
         ReadyBackground = '#16372F'; ReadyBorder = '#3A8266'; ReadyAccent = '#72CDA3'
         ParentCard = '#213958'; ChildCard = '#18263D'; ThreadBorder = '#45617F'; ThreadRail = '#82A9C5'; Running = '#F28B9B'
-        Remaining = '#56B8F2'; Popup = '#192B45'; PopupSelected = '#284B70'; Focus = '#7CD2FF'
+        Remaining = '#56B2F5'; Popup = '#192B45'; PopupSelected = '#284B70'; Focus = '#7CD2FF'
     }
     'teal-dark' = @{
         Window = '#002B36'; Card = '#073642'; Primary = '#E6F0E9'; Secondary = '#A8C0BC'; Accent = '#4FB3C3'
-        Plot = '#073642'; Grid = '#3C6570'; Idle = '#174550'; QuotaEmpty = '#3C7583'; QuotaFilled = '#4FB3C3'
+        Plot = '#073642'; Grid = '#3C6570'; Idle = '#0F3E49'; QuotaEmpty = '#3C7583'; QuotaFilled = '#4FB3C3'
         ReadyBackground = '#124B40'; ReadyBorder = '#47866A'; ReadyAccent = '#79CAA3'
         ParentCard = '#123A46'; ChildCard = '#073642'; ThreadBorder = '#3D6C75'; ThreadRail = '#76AEB3'; Running = '#F47D88'
-        Remaining = '#4FB3C3'; Popup = '#0B3D49'; PopupSelected = '#1E5B67'; Focus = '#74D2DB'
+        Remaining = '#56B2F5'; Popup = '#0B3D49'; PopupSelected = '#1E5B67'; Focus = '#74D2DB'
     }
     'ember-dark' = @{
         Window = '#202126'; Card = '#2B2D32'; Primary = '#F4F0E9'; Secondary = '#BCBDB7'; Accent = '#E7BC62'
-        Plot = '#26272C'; Grid = '#505258'; Idle = '#35373D'; QuotaEmpty = '#77725F'; QuotaFilled = '#E7BC62'
+        Plot = '#26272C'; Grid = '#505258'; Idle = '#2E2F35'; QuotaEmpty = '#77725F'; QuotaFilled = '#E7BC62'
         ReadyBackground = '#244437'; ReadyBorder = '#5D9974'; ReadyAccent = '#9FDC9E'
         ParentCard = '#3D3D47'; ChildCard = '#2B2D32'; ThreadBorder = '#686973'; ThreadRail = '#A5A3A0'; Running = '#F58A94'
-        Remaining = '#E7BC62'; Popup = '#303238'; PopupSelected = '#555147'; Focus = '#F2CB78'
+        Remaining = '#56B2F5'; Popup = '#303238'; PopupSelected = '#555147'; Focus = '#F2CB78'
     }
     'ink-dark' = @{
         Window = '#000000'; Card = '#121212'; Primary = '#FFFFFF'; Secondary = '#D8D8D8'; Accent = '#6DD3FF'
-        Plot = '#050505'; Grid = '#787878'; Idle = '#242424'; QuotaEmpty = '#808080'; QuotaFilled = '#6DD3FF'
+        Plot = '#050505'; Grid = '#787878'; Idle = '#151515'; QuotaEmpty = '#808080'; QuotaFilled = '#6DD3FF'
         ReadyBackground = '#002B17'; ReadyBorder = '#78E8A4'; ReadyAccent = '#78E8A4'
         ParentCard = '#202A34'; ChildCard = '#121212'; ThreadBorder = '#FFFFFF'; ThreadRail = '#FFFFFF'; Running = '#FF8BA1'
-        Remaining = '#6DD3FF'; Popup = '#101010'; PopupSelected = '#174A66'; Focus = '#FFFFFF'
+        Remaining = '#56B2F5'; Popup = '#101010'; PopupSelected = '#174A66'; Focus = '#FFFFFF'
     }
     'neon-dark' = @{
         Window = '#16122A'; Card = '#241C3B'; Primary = '#F2ECFF'; Secondary = '#C4B8E2'
-        Accent = '#70CBFF'; Plot = '#1B1530'; Grid = '#493B68'; Idle = '#302448'
+        Accent = '#70CBFF'; Plot = '#1B1530'; Grid = '#493B68'; Idle = '#261D3C'
         QuotaEmpty = '#37436A'; QuotaFilled = '#70CBFF'; ReadyBackground = '#163D33'; ReadyBorder = '#4D8B70'
         ReadyAccent = '#8BDEB6'; ParentCard = '#33264F'; ChildCard = '#241C3B'; ThreadBorder = '#63517D'
-        ThreadRail = '#AF9AD0'; Running = '#FF929F'; Remaining = '#70CBFF'; Popup = '#2C2144'
+        ThreadRail = '#AF9AD0'; Running = '#FF929F'; Remaining = '#56B2F5'; Popup = '#2C2144'
         PopupSelected = '#493369'; Focus = '#B19BFF'
     }
     'lavender-light' = @{
         Window = '#F2EAFB'; Card = '#FFFAFF'; Primary = '#29233C'; Secondary = '#615570'
-        Accent = '#7046AE'; Plot = '#FFFAFF'; Grid = '#D8CBE3'; Idle = '#EBE0F4'
+        Accent = '#7046AE'; Plot = '#FFFAFF'; Grid = '#D8CBE3'; Idle = '#F5EDFA'
         QuotaEmpty = '#DDD4EF'; QuotaFilled = '#7046AE'; ReadyBackground = '#E3F3E9'; ReadyBorder = '#5C9571'
         ReadyAccent = '#216C44'; ParentCard = '#E7DDF5'; ChildCard = '#FFFAFF'; ThreadBorder = '#BCAACE'
-        ThreadRail = '#78658F'; Running = '#AC2853'; Remaining = '#7046AE'; Popup = '#EFE7F8'
+        ThreadRail = '#78658F'; Running = '#AC2853'; Remaining = '#176AAB'; Popup = '#EFE7F8'
         PopupSelected = '#DDD0EF'; Focus = '#7046AE'
     }
     'mint-light' = @{
         Window = '#E8F7EE'; Card = '#F7FFFA'; Primary = '#19382F'; Secondary = '#3F5F50'
-        Accent = '#14765F'; Plot = '#F7FFFA'; Grid = '#C8DECF'; Idle = '#DDEDE3'
+        Accent = '#14765F'; Plot = '#F7FFFA'; Grid = '#C8DECF'; Idle = '#EAF6EF'
         QuotaEmpty = '#BEDCCD'; QuotaFilled = '#14765F'; ReadyBackground = '#D9F2E1'; ReadyBorder = '#579772'
         ReadyAccent = '#207343'; ParentCard = '#D7EDE0'; ChildCard = '#F7FFFA'; ThreadBorder = '#A8C8B5'
-        ThreadRail = '#4D806C'; Running = '#AF2D4C'; Remaining = '#14765F'; Popup = '#E8F6EC'
+        ThreadRail = '#4D806C'; Running = '#AF2D4C'; Remaining = '#176AAB'; Popup = '#E8F6EC'
         PopupSelected = '#C8E8D6'; Focus = '#11735B'
     }
     'forest-dark' = @{
         Window = '#11231B'; Card = '#1B3427'; Primary = '#EDF8EA'; Secondary = '#ADC9B5'
-        Accent = '#94DB75'; Plot = '#14291E'; Grid = '#355642'; Idle = '#263F30'
+        Accent = '#94DB75'; Plot = '#14291E'; Grid = '#355642'; Idle = '#1D3427'
         QuotaEmpty = '#40623A'; QuotaFilled = '#94DB75'; ReadyBackground = '#193E29'; ReadyBorder = '#508264'
         ReadyAccent = '#8CDCAC'; ParentCard = '#284833'; ChildCard = '#1B3427'; ThreadBorder = '#526F5B'
-        ThreadRail = '#8BAF90'; Running = '#FF949B'; Remaining = '#94DB75'; Popup = '#203F2E'
+        ThreadRail = '#8BAF90'; Running = '#FF949B'; Remaining = '#56B2F5'; Popup = '#203F2E'
         PopupSelected = '#31533A'; Focus = '#B5EA94'
     }
     'tangerine-dark' = @{
         Window = '#29180F'; Card = '#3B261A'; Primary = '#FFF3E5'; Secondary = '#DFC1A5'
-        Accent = '#FFB46E'; Plot = '#2C1D13'; Grid = '#614533'; Idle = '#453022'
+        Accent = '#FFB46E'; Plot = '#2C1D13'; Grid = '#614533'; Idle = '#39271B'
         QuotaEmpty = '#735035'; QuotaFilled = '#FFB46E'; ReadyBackground = '#213D28'; ReadyBorder = '#567D59'
         ReadyAccent = '#A3D892'; ParentCard = '#4D3424'; ChildCard = '#3B261A'; ThreadBorder = '#876346'
-        ThreadRail = '#D3A37A'; Running = '#FF9A96'; Remaining = '#FFB46E'; Popup = '#3D2B1D'
+        ThreadRail = '#D3A37A'; Running = '#FF9A96'; Remaining = '#56B2F5'; Popup = '#3D2B1D'
         PopupSelected = '#68462C'; Focus = '#FFCA86'
     }
     'rose-dark' = @{
         Window = '#281523'; Card = '#3A2233'; Primary = '#FCECF5'; Secondary = '#DAB9CD'
-        Accent = '#F49DC7'; Plot = '#2D1B29'; Grid = '#604258'; Idle = '#482D3F'
+        Accent = '#F49DC7'; Plot = '#2D1B29'; Grid = '#604258'; Idle = '#3B2434'
         QuotaEmpty = '#704762'; QuotaFilled = '#F49DC7'; ReadyBackground = '#1D3D32'; ReadyBorder = '#507E68'
         ReadyAccent = '#9CDBBC'; ParentCard = '#4C2F44'; ChildCard = '#3A2233'; ThreadBorder = '#835A75'
-        ThreadRail = '#CC94B5'; Running = '#FF969F'; Remaining = '#F49DC7'; Popup = '#412838'
+        ThreadRail = '#CC94B5'; Running = '#FF969F'; Remaining = '#56B2F5'; Popup = '#412838'
         PopupSelected = '#67425B'; Focus = '#FFBDDF'
     }
 }
@@ -3277,7 +3425,8 @@ function Assert-E2EThemePixel {
         [System.Windows.Automation.AutomationElement]$Element = $null,
         [psobject]$ScreenBounds = $null,
         [int]$Tolerance = 8,
-        [int]$MinimumPixels = 1
+        [int]$MinimumPixels = 1,
+        [string[]]$StrokeBackgrounds = @()
     )
 
     $target = [System.Drawing.ColorTranslator]::FromHtml($Hex)
@@ -3298,7 +3447,14 @@ function Assert-E2EThemePixel {
         }
         Assert-E2E ($left -lt $right -and $top -lt $bottom) "$Role pixel region is empty."
         $matches = 0
-        for ($y = $top; $y -lt $bottom -and $matches -lt $MinimumPixels; $y++) {
+        if ($StrokeBackgrounds.Count -gt 0) {
+            [System.Drawing.Color[]]$backgrounds = @($StrokeBackgrounds | ForEach-Object {
+                [System.Drawing.ColorTranslator]::FromHtml($_)
+            })
+            $matches = [CodexInfoGraphPixelScanner]::CountCompositedStrokePixels(
+                $bitmap, $left, $top, $right, $bottom, $target, $backgrounds, $MinimumPixels)
+        }
+        for ($y = $top; $StrokeBackgrounds.Count -eq 0 -and $y -lt $bottom -and $matches -lt $MinimumPixels; $y++) {
             for ($x = $left; $x -lt $right -and $matches -lt $MinimumPixels; $x++) {
                 $actual = $bitmap.GetPixel($x, $y)
                 if ([Math]::Abs([int]$actual.R - [int]$target.R) -le $Tolerance -and
@@ -3468,7 +3624,8 @@ function Assert-E2EThemeSurfaces {
             @{ Hex = $colors.Grid; Role = 'grid' },
             @{ Hex = $colors.Idle; Role = 'idle-band' },
             @{ Hex = $colors.Remaining; Role = 'remaining-line' })) {
-        Assert-E2EThemePixel $captures.Graph $graph.Handle $entry.Hex "$ThemeId/Graph/$($entry.Role)" -Element $plot
+        $tolerance = if ($entry.Role -eq 'idle-band') { 2 } else { 8 }
+        Assert-E2EThemePixel $captures.Graph $graph.Handle $entry.Hex "$ThemeId/Graph/$($entry.Role)" -Element $plot -Tolerance $tolerance
     }
     $threads = $Windows.Threads
     $rootTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-root'
@@ -3502,29 +3659,274 @@ function Assert-E2EThemeSurfaces {
     }
     # The popup is an overlay in the Graph HWND; capture it while UIA reports
     # a visible in-window menu and a selected row.
-    $metric = Find-E2EElementByAutomationId $graph.Root 'Graph.MetricSelector'
-    Assert-E2E ($null -ne $metric) 'Graph metric selector is missing.'
+    $period = Find-E2EElementByAutomationId $graph.Root 'Graph.PeriodSelector'
+    Assert-E2E ($null -ne $period) 'Graph period selector is missing.'
     Bring-E2EWindowToFront $graph.Handle
-    Toggle-E2EElement $metric
-    $menu = Wait-E2E -Description 'Graph metric popup UIA' -Probe {
-        $candidate = Find-E2EElementByAutomationId $graph.Root 'Graph.MetricMenu'
+    Toggle-E2EElement $period
+    $menu = Wait-E2E -Description 'Graph period popup UIA' -Probe {
+        $candidate = Find-E2EElementByAutomationId $graph.Root 'Graph.PeriodMenu'
         if ($null -ne $candidate -and -not $candidate.Current.IsOffscreen) { return $candidate }
         return $false
     }
     $menuItems = @(Get-E2EVisibleControlElements $menu ([System.Windows.Automation.ControlType]::ListItem))
     $selected = Get-E2ESelectedListItemLabel $menuItems
-    Assert-E2E (-not [string]::IsNullOrWhiteSpace($selected)) 'Graph metric popup has no selected row.'
+    Assert-E2E (-not [string]::IsNullOrWhiteSpace($selected)) 'Graph period popup has no selected row.'
     $selectedItem = $menuItems | Where-Object { [string]$_.Current.Name -eq $selected } | Select-Object -First 1
     $popupCapture = Capture-E2EWindow $graph.Handle "theme-$ThemeId-graph-popup"
     Assert-E2EThemePixel $popupCapture $graph.Handle $colors.Popup "$ThemeId/Graph/popup-surface" -Element $menu
     Assert-E2EThemePixel $popupCapture $graph.Handle $colors.PopupSelected "$ThemeId/Graph/popup-selected" -Element $selectedItem
-    Toggle-E2EElement $metric
+    Toggle-E2EElement $period
     Bring-E2EWindowToFront $Windows.Settings.Handle
     $selector = Get-E2EThemeSelector $Windows.Settings.Root
     $selector.SetFocus()
     $focusCapture = Capture-E2EWindow $Windows.Settings.Handle "theme-$ThemeId-settings-focus"
     Assert-E2EThemePixel $focusCapture $Windows.Settings.Handle $colors.Focus "$ThemeId/Settings/focus-border" -Element $selector
     Write-E2E "theme-surfaces: PASS theme=$ThemeId windows=6"
+}
+
+# Graph-only visual matrix: the five graph roles are measured inside the plot,
+# and navigation is exercised on the same visible window at the minimum width.
+function Find-E2EGraphHoverElement {
+    param([int]$ProcessId, [string]$AutomationId)
+    # ToolTip may use its own popup HWND. Restrict the desktop query to the
+    # fixture client process so another running client's tooltip is excluded.
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ProcessId),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $AutomationId))
+    $elements = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants, $condition)
+    foreach ($element in $elements) {
+        if (-not $element.Current.IsOffscreen) { return $element }
+    }
+    return $null
+}
+
+function Assert-E2EGraphHoverClosed {
+    param([int]$ProcessId, [string]$Description)
+    Wait-E2E -Description $Description -Probe {
+        return $null -eq (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp')
+    } | Out-Null
+}
+
+function Get-E2EGraphHoverHandle {
+    param($Element, [int]$ProcessId, [IntPtr]$GraphHandle)
+    # Avalonia's logical UIA parent can be Graph even when the tooltip is a
+    # separate native popup. Resolve its actual HWND from the visible bounds.
+    $script:e2eHoverRect = $Element.Current.BoundingRectangle
+    $script:e2eHoverProcessId = [uint32]$ProcessId
+    $script:e2eHoverGraphHandle = $GraphHandle
+    $script:e2eHoverWindows = [System.Collections.Generic.List[object]]::new()
+    $callback = [CodexInfoWindowsE2EWin32+EnumWindowsProc] {
+        param([IntPtr]$Handle, [IntPtr]$Extra)
+        [uint32]$owner = 0
+        [CodexInfoWindowsE2EWin32]::GetWindowThreadProcessId($Handle, [ref]$owner) | Out-Null
+        if ($owner -ne $script:e2eHoverProcessId -or $Handle -eq $script:e2eHoverGraphHandle -or
+            -not [CodexInfoWindowsE2EWin32]::IsWindowVisible($Handle)) { return $true }
+        $bounds = Get-E2EWindowBounds $Handle
+        $rect = $script:e2eHoverRect
+        if ($rect.Width -gt 0 -and $rect.Height -gt 0 -and
+            $bounds.Left -le $rect.Left -and $bounds.Top -le $rect.Top -and
+            $bounds.Left + $bounds.Width -ge $rect.Right -and $bounds.Top + $bounds.Height -ge $rect.Bottom) {
+            $script:e2eHoverWindows.Add([pscustomobject]@{ Handle=$Handle; Area=($bounds.Width * $bounds.Height) })
+        }
+        return $true
+    }
+    [CodexInfoWindowsE2EWin32]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+    $matches = @($script:e2eHoverWindows | Sort-Object Area)
+    Assert-E2E ($matches.Count -gt 0) 'No visible fixture-owned native popup encloses the hover content.'
+    Assert-E2E ($matches.Count -eq 1 -or $matches[0].Area -lt $matches[1].Area) 'Tooltip native popup ownership is ambiguous.'
+    return [IntPtr]$matches[0].Handle
+}
+
+function Move-E2EGraphHoverPointer {
+    param([int]$OutsideX, [int]$OutsideY, [int]$HoverX, [int]$HoverY, [IntPtr]$GraphHandle)
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $GraphHandle) 'Graph must own foreground input for hover validation.'
+    [CodexInfoWindowsE2EWin32]::SetCursorPos($OutsideX, $OutsideY) | Out-Null
+    Start-Sleep -Milliseconds 100
+    # A distinct in-plot move makes re-hover observable even if the OS
+    # coalesces a leave/enter pair ending at the previous cursor position.
+    [CodexInfoWindowsE2EWin32]::SetCursorPos($HoverX - 3, $HoverY) | Out-Null
+    Start-Sleep -Milliseconds 100
+    [CodexInfoWindowsE2EWin32]::SetCursorPos($HoverX, $HoverY) | Out-Null
+    $cursor = New-Object CodexInfoWindowsE2EWin32+POINT
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::GetCursorPos([ref]$cursor)) 'Cannot observe hover pointer.'
+    Assert-E2E ($cursor.X -eq $HoverX -and $cursor.Y -eq $HoverY) 'Hover pointer was moved away from the requested observation.'
+}
+
+function Invoke-E2EGraphHover {
+    param($Graph, [int]$ProcessId, $Measurement)
+    $root = Get-E2EUiaRoot $Graph.Handle
+    $plot = Find-E2EElementByAutomationId $root 'Graph.Plot'
+    $windowBounds = Get-E2EWindowBounds $Graph.Handle
+    $plotBounds = $plot.Current.BoundingRectangle
+    $hoverX = [int]($plotBounds.Left + $Measurement.Pixels.PeriodStartX + 0.35 * $Measurement.Pixels.PlotSpan)
+    $hoverY = [int]($plotBounds.Top + $plotBounds.Height * 0.5)
+    $outsideX = [int]($windowBounds.Left + 100)
+    $outsideY = [int]($windowBounds.Top + 20)
+    $history = Get-Content -Raw -LiteralPath (Join-Path $script:e2eOutput 'fixture-v3-past-history.json') | ConvertFrom-Json
+    # 35% is nearer the real 25% sample than the 50% sample. Values are
+    # literal fixture expectations; the timestamp comes from its wire input.
+    $expectedTimestamp = [DateTimeOffset]::FromUnixTimeSeconds([Int64]$history.history_samples[1].timestamp).ToString(
+        'yyyy/MM/dd HH:mm:ss zzz', [Globalization.CultureInfo]::InvariantCulture)
+    foreach ($metric in @('Tokens','Dollars')) {
+        Select-E2EGraphMetric $root $metric
+        Wait-E2EGraphLoadSettled $root
+        Assert-E2EGraphHoverClosed $ProcessId "Tooltip cleared on $metric selection"
+        Move-E2EGraphHoverPointer $outsideX $outsideY $hoverX $hoverY $Graph.Handle
+        $timestamp = Wait-E2E -Description "Graph $metric hover observation" -Probe {
+            $candidate = Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp'
+            if ($null -ne $candidate -and $candidate.Current.Name -ceq $expectedTimestamp) { return $candidate }
+            return $false
+        }
+        $expected = if ($metric -eq 'Tokens') {
+            @{ Remaining='Remaining quota: 94%'; SOL='SOL: 100 Tokens'; TERRA='TERRA: 200 Tokens'; LUNA='LUNA: 300 Tokens'; ASTRA=('ASTRA: ' + [char]0x2014 + ' Tokens') }
+        } else {
+            @{ Remaining='Remaining quota: 94%'; SOL='SOL: $0.40'; TERRA='TERRA: $0.80'; LUNA='LUNA: $1.20'; ASTRA=('ASTRA: ' + [char]0x2014) }
+        }
+        $tooltipHandle = Get-E2EGraphHoverHandle $timestamp $ProcessId $Graph.Handle
+        foreach ($series in @('Remaining','SOL','TERRA','LUNA','ASTRA')) {
+            $row = Find-E2EGraphHoverElement $ProcessId "Graph.Hover.$series"
+            Assert-E2E ($null -ne $row -and $row.Current.Name -ceq $expected[$series]) `
+                "Graph $metric hover must show the same observation's $series value: '$($expected[$series])'."
+            Assert-E2E ((Get-E2EGraphHoverHandle $row $ProcessId $Graph.Handle) -eq $tooltipHandle) `
+                "Graph $series hover must share its timestamp's popup."
+        }
+        $null = Capture-E2EWindow $tooltipHandle "graph-hover-$metric"
+
+        # UIA invocation keeps the pointer on the graph, so this tests stale
+        # tooltip invalidation by the toggle itself, not by pointer leave.
+        $solToggle = Find-E2EElementByAutomationId $root 'Graph.Toggle.SOL'
+        Toggle-E2EElement $solToggle
+        Wait-E2E -Description 'SOL toggle OFF applied' -Probe { (Get-E2EToggleState $solToggle) -eq [System.Windows.Automation.ToggleState]::Off } | Out-Null
+        Assert-E2EGraphHoverClosed $ProcessId 'Tooltip cleared after hiding SOL'
+        Move-E2EGraphHoverPointer $outsideX $outsideY $hoverX $hoverY $Graph.Handle
+        Wait-E2E -Description 'Tooltip after hiding SOL' -Probe {
+            return $null -ne (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp')
+        } | Out-Null
+        Assert-E2E ($null -eq (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.SOL')) 'Hidden SOL must not appear in the tooltip.'
+        Assert-E2E ($null -ne (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.LUNA')) 'Other visible series must remain in the tooltip.'
+        Toggle-E2EElement $solToggle
+        Wait-E2E -Description 'SOL toggle ON applied' -Probe { (Get-E2EToggleState $solToggle) -eq [System.Windows.Automation.ToggleState]::On } | Out-Null
+        Assert-E2EGraphHoverClosed $ProcessId 'Tooltip cleared after showing SOL'
+        Move-E2EGraphHoverPointer $outsideX $outsideY $hoverX $hoverY $Graph.Handle
+        Wait-E2E -Description 'Tooltip restored after showing SOL' -Probe {
+            return $null -ne (Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.SOL')
+        } | Out-Null
+        [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
+        Assert-E2EGraphHoverClosed $ProcessId 'Tooltip closed on pointer leave'
+    }
+    Select-E2EGraphMetric $root 'Tokens'
+    Wait-E2EGraphLoadSettled $root
+    Move-E2EGraphHoverPointer $outsideX $outsideY $hoverX $hoverY $Graph.Handle
+    Wait-E2E -Description 'Past tooltip before period change' -Probe {
+        $candidate = Find-E2EGraphHoverElement $ProcessId 'Graph.Hover.Timestamp'
+        return $null -ne $candidate -and $candidate.Current.Name -ceq $expectedTimestamp
+    } | Out-Null
+    Invoke-E2EElement (Find-E2EElementByAutomationId $root 'Graph.Range.Next')
+    Wait-E2EGraphLoadSettled $root
+    Assert-E2E (-not (Find-E2EElementByAutomationId $root 'Graph.Range.Next').Current.IsEnabled) 'Period next must reach the current period.'
+    Assert-E2EGraphHoverClosed $ProcessId 'Tooltip cleared after period data change'
+    Invoke-E2EElement (Find-E2EElementByAutomationId $root 'Graph.Range.Previous')
+    Wait-E2EGraphLoadSettled $root
+    Assert-E2E (Find-E2EElementByAutomationId $root 'Graph.Range.Next').Current.IsEnabled 'Period previous must restore the past period.'
+    [CodexInfoWindowsE2EWin32]::SetCursorPos($outsideX, $outsideY) | Out-Null
+    Assert-E2EGraphHoverClosed $ProcessId 'Tooltip closed after restoring past period'
+    Write-E2E 'graph-hover: PASS nearest-observation=25% series=5 metrics=Tokens,Dollars missing=unknown hidden=excluded leave=closed scene-change=closed'
+}
+
+function Invoke-E2EGraphThemes {
+    param($MainRoot, [IntPtr]$MainHandle, [int]$ProcessId)
+    $graph = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Graph' `
+        -ButtonAutomationId 'Main.OpenGraph' -Title 'Codex Info Graph' -Role 'Graph' -ProcessId $ProcessId
+    Wait-E2EGraphLoadSettled $graph.Root
+    Assert-E2E ((Get-E2EGraphMetric $graph.Root) -ceq 'Tokens') 'Graph theme matrix must start with tokens.'
+    # Previous selects the real earlier reset period, containing four days and idle evidence.
+    $previous = Find-E2EElementByAutomationId $graph.Root 'Graph.Range.Previous'
+    Assert-E2E ($null -ne $previous -and $previous.Current.IsEnabled) 'Past period navigation is unavailable.'
+    Invoke-E2EElement $previous
+    Wait-E2EGraphLoadSettled $graph.Root
+    $bounds = Get-E2EWindowBounds $graph.Handle
+    $scale = $bounds.Width / 940.0
+    $originalGraph = $graph.Handle
+    foreach ($theme in @('classic-dark','graphite-dark','light','paper-light','sand-light','steel-light',
+            'ocean-dark','teal-dark','ember-dark','ink-dark','neon-dark','lavender-light','mint-light',
+            'forest-dark','tangerine-dark','rose-dark')) {
+        if ($theme -ne 'classic-dark') {
+            $settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
+                -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+            $label = (Get-Culture).TextInfo.ToTitleCase($theme.Replace('-', ' '))
+            Select-E2ETheme $settings.Root $label
+            $save = Find-E2EButtonByName $settings.Root 'Save'
+            Invoke-E2EElement $save
+            Wait-E2E -Description "Graph theme $theme applied" -Probe {
+                return (Find-E2EWindow $ProcessId 'Codex Info Settings') -eq [IntPtr]::Zero
+            } | Out-Null
+        }
+        Assert-E2E ((Find-E2EWindow $ProcessId 'Codex Info Graph') -eq $originalGraph) 'Theme application replaced the Graph window.'
+        Bring-E2EWindowToFront $graph.Handle
+        $capture = Capture-E2EWindow $graph.Handle "graph-theme-$theme"
+        $plot = Find-E2EElementByAutomationId $graph.Root 'Graph.Plot'
+        $colors = $script:e2eThemeColors[$theme]
+        $series = if ($theme -eq 'light' -or $theme.EndsWith('-light')) {
+            @('#176AAB','#985F08','#16794B','#6A4BCC','#B23553')
+        } else { @('#56B2F5','#E6A23C','#5DC98A','#A88CF5','#EF6A6A') }
+        foreach ($hex in @($colors.Plot,$colors.Idle)) {
+            Assert-E2EThemePixel $capture $graph.Handle $hex "$theme/Graph/$hex" -Element $plot -Tolerance 2 -MinimumPixels 8
+        }
+        # The middle 40% spans the fixture's confirmed idle strokes and
+        # excludes both the left axis and right endpoint labels/connectors.
+        # Colored endpoint text alone must never prove a series stroke color.
+        $plotBounds = $plot.Current.BoundingRectangle
+        $strokeBounds = [pscustomobject]@{
+            Left = $plotBounds.Left + $plotBounds.Width * 0.2
+            Top = $plotBounds.Top
+            Right = $plotBounds.Left + $plotBounds.Width * 0.6
+            Bottom = $plotBounds.Bottom
+        }
+        foreach ($hex in $series) {
+            Assert-E2EThemePixel $capture $graph.Handle $hex "$theme/Graph/stroke/$hex" `
+                -ScreenBounds $strokeBounds -Tolerance 2 -MinimumPixels 8 -StrokeBackgrounds @($colors.Plot,$colors.Idle)
+        }
+    }
+    foreach ($mode in @('Day','Week','Period')) {
+        Invoke-E2EElement (Find-E2EElementByAutomationId $graph.Root "Graph.Range.$mode")
+        Wait-E2EGraphLoadSettled $graph.Root
+        foreach ($width in @(700,940)) {
+            $height = if ($width -eq 700) { 480 } else { 640 }
+            Set-E2EGraphLogicalSize -Handle $graph.Handle -LogicalWidth $width -LogicalHeight $height -Scale $scale
+            $root = Get-E2EUiaRoot $graph.Handle
+            $modeButton = Find-E2EElementByAutomationId $root "Graph.Range.$mode"
+            $range = if ($mode -eq 'Period') { Find-E2EElementByAutomationId $root 'Graph.PeriodSelector' } else { Find-E2EElementByAutomationId $root 'Graph.Range.Label' }
+            if ($mode -ne 'Period') {
+                $expectedModeLabel = if ($mode -eq 'Day') { '24 hours' } else { '1 week' }
+                Assert-E2E ($null -ne $range -and $range.Current.Name.StartsWith($expectedModeLabel)) `
+                    "Graph $mode click did not display the requested range mode."
+            }
+            $previous = Find-E2EElementByAutomationId $root 'Graph.Range.Previous'
+            $next = Find-E2EElementByAutomationId $root 'Graph.Range.Next'
+            foreach ($control in @($range,$previous,$next)) {
+                Assert-E2E ($null -ne $control -and -not $control.Current.IsOffscreen) "Graph $mode navigation is clipped at $width."
+                Assert-E2E ([Math]::Abs($control.Current.BoundingRectangle.Top - $modeButton.Current.BoundingRectangle.Top) -le 8 * $scale) "Graph $mode information must share the navigation row."
+            }
+            Assert-E2E ($range.Current.BoundingRectangle.Right -le $previous.Current.BoundingRectangle.Left) "Graph $mode range overlaps navigation at $width."
+            $null = Capture-E2EWindow $graph.Handle "graph-$mode-${width}x$height"
+        }
+        if ($mode -ne 'Period') {
+            $latestRangeLabel = [string]$range.Current.Name
+            Invoke-E2EElement $previous
+            Wait-E2EGraphLoadSettled $root
+            Assert-E2E $next.Current.IsEnabled 'Fixed-range previous action must enable next.'
+            Assert-E2E ($range.Current.Name -cne $latestRangeLabel) 'Previous must change the displayed fixed range.'
+            $pastRangeLabel = [string]$range.Current.Name
+            Invoke-E2EElement $next
+            Wait-E2EGraphLoadSettled $root
+            Assert-E2E (-not $next.Current.IsEnabled -and $range.Current.Name -cne $pastRangeLabel) `
+                'Next must return to the latest fixed range and disable further forward navigation.'
+        }
+    }
+    Write-E2E 'graph-themes: PASS themes=16 series=5 modes=3 sizes=700x480,940x640 navigation=previous,next'
 }
 
 function Invoke-E2EThemePresets {
@@ -3828,7 +4230,10 @@ try {
         Write-E2E 'main-estimated-cost: PASS (numeric aggregate is rendered)'
     }
 
-    if ($ThemePresets) {
+    if ($GraphThemes) {
+        Invoke-E2EGraphThemes -MainRoot $mainRoot -MainHandle $mainHandle -ProcessId $clientPid
+    }
+    elseif ($ThemePresets) {
         Invoke-E2EThemePresets -MainRoot $mainRoot -MainHandle $mainHandle `
             -ProcessId $clientPid -ClientPath $resolvedClientPath
         $script:e2eThemePresetsComplete = $true
@@ -3865,8 +4270,8 @@ try {
     Write-E2E ("graph: dpi-scale={0:N3} initial-physical={1}x{2}" -f
         $graphScale, $initialGraphBounds.Width, $initialGraphBounds.Height)
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
-    $metricSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector'
-    Assert-E2E ($null -ne $periodSelector -and $null -ne $metricSelector) 'Graph selectors are missing.'
+    Assert-E2E ($null -ne $periodSelector) 'Graph period selector is missing.'
+    Assert-E2E ((Get-E2EGraphMetric $graphRoot) -ceq 'Tokens') 'Graph must initially select Tokens.'
     $currentDisplay = Get-E2ESelectorLabel $periodSelector
     $currentLabel = $currentDisplay
     $graphCurrent = Capture-E2EWindow $graph.Handle '02-graph-current'
@@ -3910,6 +4315,11 @@ try {
         Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast $pastMeasurement `
             -ExpectedStartFraction $script:e2eFixturePastIdleStartFraction `
             -ExpectedEndFraction $script:e2eFixturePastIdleEndFraction
+        Invoke-E2EGraphHover -Graph $graph -ProcessId $clientPid -Measurement $pastMeasurement
+        if ($GraphHoverOnly) {
+            Write-E2E 'windows-client-e2e: PASS focused native graph hover capture and lifecycle'
+            return
+        }
     }
 
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
@@ -3921,46 +4331,20 @@ try {
     $graphCurrentAgain = Capture-E2EWindow $graph.Handle '04-graph-current-again'
     Assert-E2EImageChanged $graphPast $graphCurrentAgain 'Past-to-current period selection'
 
-    Write-E2E 'case-3: select both metric values'
-    $metricSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector'
-    $initialMetric = Get-E2ESelectorLabel $metricSelector
-    Toggle-E2EElement $metricSelector
-    $metricItems = Wait-E2E -Description 'two Graph metric options' -Probe {
-        $items = @(Get-E2EVisibleControlElements $graphRoot ([System.Windows.Automation.ControlType]::ListItem))
-        if ($items.Count -ge 2) { return $items }
-        return $false
-    }
-    $metricLabels = @($metricItems | ForEach-Object { [string]$_.Current.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-    Assert-E2E ($metricLabels.Count -eq 2) "Metric menu must expose exactly two values: $($metricLabels -join ', ')."
-    $selectedMetricLabel = Get-E2ESelectedListItemLabel $metricItems
-    if (-not [string]::IsNullOrWhiteSpace($selectedMetricLabel)) {
-        $initialMetric = $selectedMetricLabel
-    }
-    Assert-E2E ($metricLabels -contains $initialMetric) 'Initial metric display value is not represented by a selected menu item.'
-    $otherMetric = [string]($metricLabels | Where-Object { $_ -ne $initialMetric } | Select-Object -First 1)
-    Assert-E2E (-not [string]::IsNullOrWhiteSpace($otherMetric)) 'Second metric option is missing.'
-    Select-E2EListItem $graphRoot $otherMetric
-    Wait-E2ESelectorLabel $graphRoot 'Graph.MetricSelector' $otherMetric
-    Wait-E2EGraphLoadSettled $graphRoot
+    Write-E2E 'case-3: select both visible metric buttons'
+    $initialMetric = 'Tokens'
+    $otherMetric = 'Dollars'
+    Select-E2EGraphMetric $graphRoot $otherMetric
     $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'other-metric'
-    Wait-E2E -Description "axis for metric '$otherMetric'" -Probe {
-        $texts = Get-E2ETextValues $graphRoot
-        if ($texts -contains $otherMetric -or ($texts -join ' ') -like "*$otherMetric*") { return $true }
-        return $false
-    } | Out-Null
     $graphOtherMetric = Capture-E2EWindow $graph.Handle '05-graph-other-metric'
     Assert-E2EImageChanged $graphCurrentAgain $graphOtherMetric "Metric selection '$otherMetric'"
 
-    $metricSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector'
-    Toggle-E2EElement $metricSelector
-    Select-E2EListItem $graphRoot $initialMetric
-    Wait-E2ESelectorLabel $graphRoot 'Graph.MetricSelector' $initialMetric
-    Wait-E2EGraphLoadSettled $graphRoot
+    Select-E2EGraphMetric $graphRoot $initialMetric
     $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'initial-metric-restored'
     $graphInitialMetricAgain = Capture-E2EWindow $graph.Handle '06-graph-initial-metric'
     Assert-E2EImageChanged $graphOtherMetric $graphInitialMetricAgain "Metric selection '$initialMetric'"
 
-    Write-E2E 'case-4: fixed endpoint gutter across finite horizontal resize states'
+    Write-E2E 'case-4: full-width plot without endpoint labels across finite resize states'
     $allMetricMeasurements = @{}
     $resizeMetricLabels = @($initialMetric, $otherMetric)
     for ($metricIndex = 0; $metricIndex -lt $resizeMetricLabels.Count; $metricIndex++) {
@@ -3969,12 +4353,8 @@ try {
         # Prefix the stable selector order so evidence from one metric never
         # overwrites the other metric's captures.
         $metricKey = "metric-$metricIndex-" + ($metricLabel -replace '[^A-Za-z0-9_.-]', '_')
-        $currentMetricLabel = Get-E2ESelectorLabel (Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector')
-        if ($currentMetricLabel -ne $metricLabel -and -not $currentMetricLabel.Contains($metricLabel)) {
-            Toggle-E2EElement (Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector')
-            Select-E2EListItem $graphRoot $metricLabel
-            Wait-E2ESelectorLabel $graphRoot 'Graph.MetricSelector' $metricLabel
-            Wait-E2EGraphLoadSettled $graphRoot
+        if ((Get-E2EGraphMetric $graphRoot) -cne $metricLabel) {
+            Select-E2EGraphMetric $graphRoot $metricLabel
             $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description "metric-$metricKey"
         }
 
@@ -4005,11 +4385,6 @@ try {
         }
 
         $target = $measurements['940x640']
-        foreach ($stateName in @('700x640', '940x640', '1000x640', '700x480')) {
-            $actual = $measurements[$stateName]
-            Assert-E2E ([Math]::Abs($actual.Pixels.GutterWidth - $target.Pixels.GutterWidth) -le 2) `
-                "$metricLabel endpoint gutter changed at ${stateName}: target=$($target.Pixels.GutterWidth) actual=$($actual.Pixels.GutterWidth)."
-        }
         Assert-E2E ($measurements['700x640'].Pixels.PlotSpan -lt $target.Pixels.PlotSpan -and
             $target.Pixels.PlotSpan -lt $measurements['1000x640'].Pixels.PlotSpan) `
             "$metricLabel plot span did not grow monotonically with same-height window width."
@@ -4022,36 +4397,18 @@ try {
             Assert-E2E ([Math]::Abs($spanIncrease - $uiaWidthIncrease) -le 3) `
                 "$metricLabel plot span increase $spanIncrease does not match Graph.Plot width increase $uiaWidthIncrease."
         }
-        foreach ($sameHeightState in @('700x640', '1000x640')) {
-            for ($seriesIndex = 0; $seriesIndex -lt 4; $seriesIndex++) {
-                Assert-E2E ([Math]::Abs(
-                    $measurements[$sameHeightState].Pixels.SeriesGutterTop[$seriesIndex] -
-                    $target.Pixels.SeriesGutterTop[$seriesIndex]) -le 2) `
-                    "$metricLabel series $seriesIndex endpoint top changed at $sameHeightState."
-                Assert-E2E ([Math]::Abs(
-                    $measurements[$sameHeightState].Pixels.SeriesGutterBottom[$seriesIndex] -
-                    $target.Pixels.SeriesGutterBottom[$seriesIndex]) -le 2) `
-                    "$metricLabel series $seriesIndex endpoint bottom changed at $sameHeightState."
-            }
-        }
         $restored = $measurements['restore-940x640']
         Assert-E2E ([Math]::Abs($restored.Pixels.GutterWidth - $target.Pixels.GutterWidth) -le 2 -and
             [Math]::Abs($restored.Pixels.PlotSpan - $target.Pixels.PlotSpan) -le 2) `
-            "$metricLabel did not restore its 940x640 gutter/plot span after 1000x640."
-        Write-E2E ("graph-resize: PASS metric={0} gutter={1}px states=700x640,940x640,1000x640,700x480 restore=PASS" -f
+            "$metricLabel did not restore its 940x640 axis margin/plot span after 1000x640."
+        Write-E2E ("graph-resize: PASS metric={0} right-margin={1}px states=700x640,940x640,1000x640,700x480 restore=PASS no-endpoint-labels=PASS" -f
             $metricLabel, $target.Pixels.GutterWidth)
         $allMetricMeasurements[$metricLabel] = $measurements
     }
 
     Set-E2EGraphLogicalSize -Handle $graph.Handle -LogicalWidth 940 -LogicalHeight 640 -Scale $graphScale
     $graphRoot = Get-E2EUiaRoot $graph.Handle
-    $currentMetricLabel = Get-E2ESelectorLabel (Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector')
-    if ($currentMetricLabel -ne $initialMetric -and -not $currentMetricLabel.Contains($initialMetric)) {
-        Toggle-E2EElement (Find-E2EElementByAutomationId $graphRoot 'Graph.MetricSelector')
-        Select-E2EListItem $graphRoot $initialMetric
-        Wait-E2ESelectorLabel $graphRoot 'Graph.MetricSelector' $initialMetric
-        Wait-E2EGraphLoadSettled $graphRoot
-    }
+    Select-E2EGraphMetric $graphRoot $initialMetric
 
     Write-E2E 'case-5: each series toggle OFF then ON exactly once'
     $toggleCases = @(
@@ -4291,7 +4648,7 @@ finally {
     if ($null -ne $script:e2eProcess) {
         try {
             if (-not $script:e2eProcess.HasExited) {
-                if ($ThemePresets) {
+                if ($ThemePresets -or $GraphThemes) {
                     Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction Stop
                     Wait-E2E -Description 'themed client cleanup exit' -Probe {
                         return $script:e2eProcess.HasExited
@@ -4301,23 +4658,23 @@ finally {
                     Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction SilentlyContinue
                 }
             }
-            if ($ThemePresets) {
+            if ($ThemePresets -or $GraphThemes) {
                 Assert-E2E $script:e2eProcess.HasExited 'Themed client remained running during cleanup.'
                 Write-E2E "theme-process-cleanup: PASS pid=$($script:e2eProcess.Id) exited=True"
             }
         }
         catch {
-            if ($ThemePresets) { $themeProcessCleanupFailure = $_.Exception.Message }
+            if ($ThemePresets -or $GraphThemes) { $themeProcessCleanupFailure = $_.Exception.Message }
         }
     }
     if ($Fixture) {
         try { Exit-E2EFixture }
         catch {
             Write-E2E "fixture-cleanup: FAIL $($_.Exception.Message)"
-            if ($ThemePresets) { throw }
+            if ($ThemePresets -or $GraphThemes) { throw }
         }
     }
-    if ($ThemePresets -and $null -ne $themeProcessCleanupFailure) {
+    if (($ThemePresets -or $GraphThemes) -and $null -ne $themeProcessCleanupFailure) {
         throw "ASSERT: themed client cleanup failed: $themeProcessCleanupFailure"
     }
 }

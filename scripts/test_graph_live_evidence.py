@@ -234,6 +234,12 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         self.assertTrue(remaining_dashed)
         self.assertNotEqual(straight_remaining, remaining_dashed)
 
+    def test_canonical_dashes_terminates_on_terminal_sub_epsilon_remainder(self):
+        self.assertEqual(
+            ["M0.00 0.00 L0.45 0.00"],
+            oracle._canonical_dashes((0.0, 0.0), (0.7500000000005, 0.0)),
+        )
+
     def test_parity_fixture_matches_existing_dollar_remaining_and_idle_oracles(self):
         fixture = self.document["parity_v3"]
         expected = fixture["expected"]
@@ -1026,7 +1032,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             self.assertEqual("account-2", artifact["account_id"])
             self.assertEqual("account-2", artifact["fixture"]["account_id"])
 
-    def _assert_verify_rejects_windows_mutation(self, mutate, *, artifact_account_id=None):
+    def _assert_verify_result(self, mutate, *, artifact_account_id=None, expect_failure=True, mutate_linux=None):
         fixture = copy.deepcopy(self.document["parity_v3"])
         expected_segments, expected_idle = oracle.build_expected(fixture)
         actual_segments = [
@@ -1065,6 +1071,12 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         linux["platform"] = "linux"
         windows = copy.deepcopy(actual)
         windows["platform"] = "windows"
+        windows["render_contracts"] = oracle.build_expected_render_contracts(
+            fixture,
+            platform="windows",
+        )
+        if mutate_linux is not None:
+            mutate_linux(linux)
         mutate(windows)
         with tempfile.TemporaryDirectory() as directory:
             evidence_path = Path(directory) / "evidence.json"
@@ -1073,11 +1085,28 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             evidence_path.write_text(json.dumps(artifact), encoding="utf-8")
             linux_path.write_text(json.dumps(linux), encoding="utf-8")
             windows_path.write_text(json.dumps(windows), encoding="utf-8")
-            with self.assertRaises(oracle.EvidenceError):
+            if expect_failure:
+                with self.assertRaises(oracle.EvidenceError):
+                    oracle.verify(evidence_path, linux_path, windows_path)
+            else:
                 oracle.verify(evidence_path, linux_path, windows_path)
 
+    def test_verify_accepts_windows_subtle_idle_without_changing_linux(self):
+        self._assert_verify_result(lambda document: None, expect_failure=False)
+
+    def test_verify_rejects_old_windows_idle_color(self):
+        self._assert_verify_result(
+            lambda document: document["render_contracts"]["tokens"]["styles"].update(idle_band="#1a2838")
+        )
+
+    def test_verify_rejects_windows_idle_color_on_linux(self):
+        self._assert_verify_result(
+            lambda document: None,
+            mutate_linux=lambda document: document["render_contracts"]["tokens"]["styles"].update(idle_band="#162232"),
+        )
+
     def test_verify_rejects_raw_endpoint_value_mismatch_hidden_by_display_rounding(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: next(
                 value
                 for value in document["render_contracts"]["dollars"]["endpoint_values"]
@@ -1086,31 +1115,136 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         )
 
     def test_verify_rejects_latest_timestamp_mismatch(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: document["render_contracts"]["dollars"].update(
                 latest_timestamp=document["render_contracts"]["dollars"]["latest_timestamp"] + 60
             )
         )
 
     def test_verify_rejects_published_pair_mismatch(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: document.update(published_pair="v1:" + "f" * 64)
         )
 
     def test_verify_rejects_display_label_mismatch(self):
-        self._assert_verify_rejects_windows_mutation(
-            lambda document: document["render_contracts"]["dollars"]["endpoint_labels"][0].update(
+        self._assert_verify_result(
+            lambda document: None,
+            mutate_linux=lambda document: document["render_contracts"]["dollars"]["endpoint_labels"][0].update(
                 series="SOLX"
             )
         )
 
+    def test_windows_uses_full_width_without_rendered_endpoint_labels(self):
+        contracts = oracle.build_expected_render_contracts(self.document["parity_v3"], platform="windows")
+        for contract in contracts.values():
+            self.assertEqual([], contract["endpoint_labels"])
+            self.assertEqual(786, contract["layout"]["plot_width"])
+            self.assertEqual(2, contract["layout"]["right_padding"])
+            self.assertEqual(0, contract["layout"]["gutter_width"])
+            self.assertEqual(0, contract["layout"]["label_gap"])
+            self.assertEqual(0, contract["layout"]["label_width"])
+            self.assertTrue(contract["endpoint_values"])
+
+    def test_windows_smoothing_density_matches_native_export_and_keeps_linux_baseline(self):
+        fixture = self.document["parity_v3"]
+        linux = oracle.build_expected_render_contracts(fixture, platform="linux")
+        windows = oracle.build_expected_render_contracts(fixture, platform="windows")
+        self.assertEqual(oracle.build_expected_render_contracts(fixture), linux)
+
+        role_colors = {
+            "remaining": "#56b2f5",
+            "sol": "#a88cf5",
+            "terra": "#5dc98a",
+            "luna": "#e6a23c",
+            "astra": "#ef6a6a",
+        }
+        for metric in ("dollars", "tokens"):
+            self.assertTrue(
+                linux[metric]["models"][0]["flat"].startswith("M0.00 92.00 L0.25 92.00")
+            )
+            self.assertTrue(
+                windows[metric]["models"][0]["flat"].startswith("M0.00 92.00 L0.10 92.00")
+            )
+            self.assertEqual(
+                role_colors,
+                {
+                    key: linux[metric]["styles"][key]
+                    for key in role_colors
+                },
+            )
+            self.assertEqual(
+                {key: value.upper() for key, value in role_colors.items()},
+                {
+                    key: windows[metric]["styles"][key]
+                    for key in role_colors
+                },
+            )
+
+    def test_windows_keeps_dash_phase_across_adjacent_dashed_intervals_only(self):
+        fixture = v3_fixture(
+            [
+                {"timestamp": 0, "remaining_percent": 90, "tokens": 10},
+                {
+                    "timestamp": 120,
+                    "remaining_percent": 90,
+                    "models": None,
+                    "models_complete": False,
+                    "model_source": "unavailable",
+                },
+                {"timestamp": 240, "remaining_percent": 90, "tokens": 10},
+                {
+                    "timestamp": 360,
+                    "remaining_percent": 90,
+                    "models": None,
+                    "models_complete": False,
+                    "model_source": "unavailable",
+                },
+                {"timestamp": 480, "remaining_percent": 90, "tokens": 10},
+            ],
+            period_id="adjacent-dash-phase",
+        )
+        segments, _ = oracle.build_expected(fixture)
+        self.assertEqual(
+            [[0, 240], [240, 480]],
+            pairs(segments, "dashed", "tokens", "SOL"),
+        )
+        linux = oracle.build_expected_render_contracts(fixture, platform="linux")
+        windows = oracle.build_expected_render_contracts(fixture, platform="windows")
+        linux_path = next(
+            model["dashed"]
+            for model in linux["tokens"]["models"]
+            if model["series"] == "SOL"
+        )
+        windows_path = next(
+            model["dashed"]
+            for model in windows["tokens"]["models"]
+            if model["series"] == "SOL"
+        )
+
+        self.assertIn(
+            "M50.00 1.00 L50.25 1.00 M50.25 1.00 L50.45 1.00",
+            linux_path,
+        )
+        self.assertIn("M50.25 1.00 L50.30 1.00", windows_path)
+        self.assertNotIn("M50.00 1.00 L50.10 1.00", windows_path)
+
+    def test_verify_rejects_windows_endpoint_labels(self):
+        self._assert_verify_result(
+            lambda document: document["render_contracts"]["tokens"]["endpoint_labels"].append({"series": "SOL"})
+        )
+
+    def test_verify_rejects_windows_reserved_label_gutter(self):
+        self._assert_verify_result(
+            lambda document: document["render_contracts"]["tokens"]["layout"].update(plot_width=662, gutter_width=126)
+        )
+
     def test_verify_rejects_missing_endpoint_values_instead_of_passing_old_schema(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: document["render_contracts"]["dollars"].pop("endpoint_values")
         )
 
     def test_verify_rejects_missing_account_provenance_instead_of_mixing_accounts(self):
-        self._assert_verify_rejects_windows_mutation(
+        self._assert_verify_result(
             lambda document: None,
             artifact_account_id="account-2",
         )

@@ -35,6 +35,7 @@ public sealed class GraphWindowSelectorParityTests
         var content = graph.Descendants().Single(element =>
             element.Attribute(XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml"))?.Value == "GraphContent");
         var rows = content.Attribute("RowDefinitions")!.Value.Split(',');
+        Assert.Equal(4, rows.Length);
         for (var row = 0; row < rows.Length - 1; row++)
         {
             Assert.Contains(content.Elements(), element =>
@@ -44,22 +45,20 @@ public sealed class GraphWindowSelectorParityTests
     }
 
     [Fact]
-    public void GraphSelectorsUseOneAnchoredPopupComponent()
+    public void GraphPeriodSelectorUsesOneAnchoredPopupComponent()
     {
         var graph = XDocument.Parse(Load("GraphWindow.axaml"));
-        var selectors = new[]
-        {
-            (Name: "PeriodSelector", Id: "Graph.PeriodSelector"),
-            (Name: "MetricSelector", Id: "Graph.MetricSelector")
-        };
         var xamlName = XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml");
-        foreach (var (name, id) in selectors)
-        {
-            var selector = graph.Descendants().Single(element =>
-                element.Name.LocalName == "GraphSelect" && element.Attribute(xamlName)?.Value == name);
-            Assert.Equal(id, selector.Attribute("AutomationProperties.AutomationId")?.Value);
-            Assert.Null(selector.Attribute("SelectorAutomationId"));
-        }
+        var selector = graph.Descendants().Single(element =>
+            element.Name.LocalName == "GraphSelect" &&
+            element.Attribute(xamlName)?.Value == "PeriodSelector");
+        Assert.Equal("Graph.PeriodSelector", selector.Attribute("AutomationProperties.AutomationId")?.Value);
+        Assert.Null(selector.Attribute("SelectorAutomationId"));
+        Assert.DoesNotContain(graph.Descendants(), element =>
+            element.Name.LocalName == "GraphSelect" &&
+            element.Attribute(xamlName)?.Value == "MetricSelector");
+        Assert.DoesNotContain(graph.Descendants(), element =>
+            element.Attribute(xamlName)?.Value == "MetricMenu");
 
         var fieldStyle = graph.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&

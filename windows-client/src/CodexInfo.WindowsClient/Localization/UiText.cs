@@ -167,6 +167,20 @@ public sealed record UiText(
         _ => "Previous range",
     };
 
+    public string GraphPreviousRangeShort => LanguageCode switch
+    {
+        "ja" => "前へ",
+        "zh-Hans" => "上一段",
+        "ko" => "이전",
+        "es" => "Ant.",
+        "fr" => "Préc.",
+        "de" => "Zurück",
+        "pt" => "Ant.",
+        "it" => "Prec.",
+        "ru" => "Назад",
+        _ => "Prev",
+    };
+
     public string GraphNextRange => LanguageCode switch
     {
         "ja" => "次の範囲",
@@ -179,6 +193,20 @@ public sealed record UiText(
         "it" => "Successivo",
         "ru" => "Вперёд",
         _ => "Next range",
+    };
+
+    public string GraphNextRangeShort => LanguageCode switch
+    {
+        "ja" => "次へ",
+        "zh-Hans" => "下一段",
+        "ko" => "다음",
+        "es" => "Sig.",
+        "fr" => "Suiv.",
+        "de" => "Weiter",
+        "pt" => "Próx.",
+        "it" => "Succ.",
+        "ru" => "Далее",
+        _ => "Next",
     };
 
     public string GraphWindowTitle => LanguageCode switch

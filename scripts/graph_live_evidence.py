@@ -27,6 +27,8 @@ from typing import Any
 
 
 SUSTAINED_UNUSED_MIN_DURATION_SECONDS = 10 * 60
+LINUX_CANONICAL_CURVE_MAX_STEP = 0.25
+WINDOWS_CANONICAL_CURVE_MAX_STEP = 0.1
 
 PAIR_HEADER = "Codex-Info-Published-Pair"
 CAUSE_ORDER = (
@@ -1052,9 +1054,18 @@ def _canonical_dashes_polyline(points: list[tuple[float, float]]) -> list[str]:
             continue
         offset = 0.0
         while offset < length:
+            remaining_length = length - offset
+            if remaining_length <= epsilon:
+                phase += remaining_length
+                if phase >= period - epsilon:
+                    phase = 0.0
+                elif abs(phase - dash) <= epsilon:
+                    phase = dash
+                offset = length
+                continue
             in_dash = phase < dash
             phase_end = dash if in_dash else period
-            advance = min(phase_end - phase, length - offset)
+            advance = min(phase_end - phase, remaining_length)
             if advance <= epsilon:
                 phase = 0.0 if phase_end >= period else phase_end
                 continue
@@ -1117,6 +1128,7 @@ def _canonical_curve_interval(
     period: dict[str, Any],
     maximum: float,
     remaining: bool,
+    max_step: float,
 ) -> list[tuple[float, float]]:
     period_span = max(1, period["end_at"] - period["start_at"])
     viewbox_width = (
@@ -1124,7 +1136,7 @@ def _canonical_curve_interval(
         / period_span
         * 100.0
     )
-    steps = max(1, math.ceil(viewbox_width / 0.25))
+    steps = max(1, math.ceil(viewbox_width / max_step))
     fractions = [step / steps for step in range(steps + 1)]
     projected = _monotone_cubic_interval_values(
         [float(timestamp) for timestamp in timestamps],
@@ -1275,9 +1287,13 @@ def _canonical_smooth_path(
     maximum: float,
     remaining: bool,
     idle_intervals: list[dict[str, int]],
+    max_step: float,
+    preserve_dash_phase: bool = False,
 ) -> str:
     commands: list[str] = []
     last_end: tuple[float, float] | None = None
+    pending_dashed_points: list[tuple[float, float]] | None = None
+    pending_dashed_end_at: int | None = None
 
     def append_solid(start: tuple[float, float], end: tuple[float, float]) -> None:
         nonlocal last_end
@@ -1286,6 +1302,39 @@ def _canonical_smooth_path(
         else:
             commands.append(_canonical_segment(start, end))
         last_end = end
+
+    def flush_dashed() -> None:
+        nonlocal pending_dashed_points, pending_dashed_end_at
+        if pending_dashed_points is not None:
+            commands.extend(_canonical_dashes_polyline(pending_dashed_points))
+        pending_dashed_points = None
+        pending_dashed_end_at = None
+
+    def append_dashed(
+        points: list[tuple[float, float]], start_at: int, end_at: int
+    ) -> None:
+        nonlocal pending_dashed_points, pending_dashed_end_at
+        if not preserve_dash_phase:
+            commands.extend(_canonical_dashes_polyline(points))
+            return
+        if not points or any(
+            not math.isfinite(coordinate)
+            for point in points
+            for coordinate in point
+        ):
+            flush_dashed()
+            return
+        if (
+            pending_dashed_points is not None
+            and pending_dashed_end_at == start_at
+            and pending_dashed_points[-1] == points[0]
+        ):
+            pending_dashed_points.extend(points[1:])
+            pending_dashed_end_at = end_at
+            return
+        flush_dashed()
+        pending_dashed_points = list(points)
+        pending_dashed_end_at = end_at
 
     run_start = 0
     while run_start < len(segments):
@@ -1311,10 +1360,12 @@ def _canonical_smooth_path(
                 if style == "idle":
                     end = (end[0], start[1])
                 if style == "dashed":
-                    commands.extend(_canonical_dashes(start, end))
+                    append_dashed([start, end], segment["start_at"], segment["end_at"])
                 else:
                     append_solid(start, end)
-            elif style != "dashed":
+            elif style == "dashed":
+                flush_dashed()
+            else:
                 last_end = None
             run_start += 1
             continue
@@ -1348,7 +1399,9 @@ def _canonical_smooth_path(
         last_end = None
         for interval, segment in enumerate(run):
             if segment["style"] != style:
-                if style != "dashed":
+                if style == "dashed":
+                    flush_dashed()
+                else:
                     last_end = None
                 continue
             points = _canonical_curve_interval(
@@ -1358,13 +1411,15 @@ def _canonical_smooth_path(
                 period,
                 maximum,
                 remaining,
+                max_step,
             )
             if style == "dashed":
-                commands.extend(_canonical_dashes_polyline(points))
+                append_dashed(points, segment["start_at"], segment["end_at"])
             else:
                 for start, end in pairwise(points):
                     append_solid(start, end)
         run_start = run_end
+    flush_dashed()
     return " ".join(commands)
 
 
@@ -1376,6 +1431,8 @@ def _canonical_path(
     maximum: float,
     remaining: bool,
     idle_intervals: list[dict[str, int]],
+    max_step: float,
+    preserve_dash_phase: bool = False,
 ) -> str:
     return _canonical_smooth_path(
         segments,
@@ -1385,6 +1442,8 @@ def _canonical_path(
         maximum,
         remaining,
         idle_intervals,
+        max_step,
+        preserve_dash_phase,
     )
 
 
@@ -1514,7 +1573,14 @@ def _endpoint_labels(
     ]
 
 
-def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
+def build_expected_render_contracts(
+    fixture: dict[str, Any], *, platform: str = "linux"
+) -> dict[str, Any]:
+    # The saved v1 envelope retains its Linux baseline. Windows changes its
+    # idle role and replaces persistent endpoint labels with hover values.
+    # Endpoint data evidence remains strict and shared across platforms.
+    if platform not in {"linux", "windows"}:
+        raise EvidenceError("render contract platform must be linux or windows")
     period, samples, gaps = _validate_fixture(fixture)
     rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
     universe = _period_model_universe(samples)
@@ -1567,6 +1633,12 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
         for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)
     ]
     contracts: dict[str, Any] = {}
+    curve_max_step = (
+        WINDOWS_CANONICAL_CURVE_MAX_STEP
+        if platform == "windows"
+        else LINUX_CANONICAL_CURVE_MAX_STEP
+    )
+    color_case = str.upper if platform == "windows" else str.lower
     for metric in ("dollars", "tokens"):
         projections = token_models if metric == "tokens" else dollar_models
         renderable_projections = {
@@ -1606,16 +1678,24 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                 {
                     "series": model,
                     "idle": _canonical_path(
-                        segments, "idle", values, period, maximum, False, idle
+                        segments, "idle", values, period, maximum, False, idle, curve_max_step
                     ),
                     "flat": _canonical_path(
-                        segments, "flat", values, period, maximum, False, idle
+                        segments, "flat", values, period, maximum, False, idle, curve_max_step
                     ),
                     "rising": _canonical_path(
-                        segments, "rising", values, period, maximum, False, idle
+                        segments, "rising", values, period, maximum, False, idle, curve_max_step
                     ),
                     "dashed": _canonical_path(
-                        segments, "dashed", values, period, maximum, False, idle
+                        segments,
+                        "dashed",
+                        values,
+                        period,
+                        maximum,
+                        False,
+                        idle,
+                        curve_max_step,
+                        preserve_dash_phase=platform == "windows",
                     ),
                 }
             )
@@ -1644,7 +1724,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
             "time_ticks": time_ticks,
             "axis_labels": axis_labels,
             "axis_grid_y": [f"{fraction:.12f}" for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)],
-            "endpoint_labels": _endpoint_labels(
+            "endpoint_labels": [] if platform == "windows" else _endpoint_labels(
                 renderable_projections,
                 maximum,
                 metric,
@@ -1654,23 +1734,23 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
             "latest_timestamp": period["end_at"],
             "layout": {
                 "reference_data_width": 788,
-                "plot_width": 694 if metric == "dollars" else 662,
-                "gutter_width": 94 if metric == "dollars" else 126,
-                "label_gap": 10,
-                "label_width": 80 if metric == "dollars" else 112,
-                "right_padding": 4,
+                "plot_width": 786 if platform == "windows" else (694 if metric == "dollars" else 662),
+                "gutter_width": 0 if platform == "windows" else (94 if metric == "dollars" else 126),
+                "label_gap": 0 if platform == "windows" else 10,
+                "label_width": 0 if platform == "windows" else (80 if metric == "dollars" else 112),
+                "right_padding": 2 if platform == "windows" else 4,
                 "minimum_plot_height": 204,
             },
             "styles": {
                 "plot_surface": "#121c2c",
                 "grid": "#263850",
                 "axis_text": "#78879c",
-                "idle_band": "#1a2838",
-                "remaining": "#56b2f5",
-                "sol": "#a88cf5",
-                "terra": "#5dc98a",
-                "luna": "#e6a23c",
-                "astra": "#ef6a6a",
+                "idle_band": "#162232" if platform == "windows" else "#1a2838",
+                "remaining": color_case("#56b2f5"),
+                "sol": color_case("#a88cf5"),
+                "terra": color_case("#5dc98a"),
+                "luna": color_case("#e6a23c"),
+                "astra": color_case("#ef6a6a"),
                 "idle_width": 1,
                 "flat_width": 3,
                 "rising_width": 3,
@@ -1692,6 +1772,8 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                     100,
                     True,
                     idle,
+                    curve_max_step,
+                    preserve_dash_phase=platform == "windows",
                 ),
                 "solid": _canonical_path(
                     remaining_segments,
@@ -1701,6 +1783,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                     100,
                     True,
                     idle,
+                    curve_max_step,
                 ),
                 "dashed": _canonical_path(
                     remaining_segments,
@@ -1710,6 +1793,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                     100,
                     True,
                     idle,
+                    curve_max_step,
                 ),
             },
             "remaining_markers": markers,
@@ -2053,7 +2137,7 @@ def verify(evidence_path: Path, linux_path: Path, windows_path: Path) -> None:
         or artifact["cross_platform_mismatches"]
         or any(
             actual_by_platform[platform]["render_contracts"]
-            != artifact["expected_render_contracts"]
+            != build_expected_render_contracts(artifact["fixture"], platform=platform)
             for platform in ("linux", "windows")
         )
         or any(

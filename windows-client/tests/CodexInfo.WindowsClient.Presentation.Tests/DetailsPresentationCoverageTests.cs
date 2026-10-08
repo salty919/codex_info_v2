@@ -10,6 +10,7 @@ using System.Reflection;
 using System.Xml.Linq;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Controls;
+using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
@@ -31,6 +32,9 @@ public sealed class DetailsPresentationCoverageTests
         Assert.False(graph.Scene.HasPoints);
         Assert.Null(graph.SelectedPeriod);
         Assert.Equal($"{graph.Texts.PeriodSelectorHeading}｜{graph.Texts.UnavailableValue}", graph.SelectedPeriodText);
+        Assert.Equal(graph.Texts.GraphTokenMetric, graph.SelectedMetric);
+        Assert.True(graph.IsTokensMetric);
+        Assert.False(graph.IsDollarsMetric);
 
         var changed = new HashSet<string>();
         graph.PropertyChanged += (_, args) => changed.Add(args.PropertyName ?? string.Empty);
@@ -42,10 +46,9 @@ public sealed class DetailsPresentationCoverageTests
             LocalizationService.SetLanguage(nextLanguage);
 
             Assert.Contains(nameof(GraphWindowViewModel.Texts), changed);
-            Assert.Contains(nameof(GraphWindowViewModel.MetricOptions), changed);
             Assert.Contains(nameof(GraphWindowViewModel.MetricAxisText), changed);
-            Assert.Equal(graph.Texts.GraphDollarMetric, graph.MetricOptions[0]);
-            Assert.Equal(graph.Texts.Tokens, graph.MetricOptions[1]);
+            Assert.Equal(graph.Texts.GraphTokenMetric, graph.SelectedMetric);
+            Assert.True(graph.IsTokensMetric);
             Assert.Equal($"{graph.Texts.PeriodSelectorHeading}｜{graph.Texts.UnavailableValue}", graph.SelectedPeriodText);
         }
         finally
@@ -55,22 +58,30 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
-    public async Task GraphWindow_DetailsRefreshKeepsMetricOptionsIdentityAndNotificationSilent()
+    public async Task GraphWindow_DetailsRefreshPreservesSelectedMetricAndNotificationSilent()
     {
         var period = CreateSmallPeriod("current", 2_000_000, 2_000_120, current: false, remaining: 80, token: 100);
         using var main = await StartMainAsync(CreateDetails([period], Array.Empty<ApiThreadDetails>()));
         using var graph = new GraphWindowViewModel(main);
 
         await EventuallyAsync(() => main.CanRefresh);
-        var initialOptions = graph.MetricOptions;
+        graph.SelectedMetric = graph.Texts.GraphDollarMetric;
+        await EventuallyAsync(() =>
+            !graph.IsLoading &&
+            graph.Scene.Metric == GraphMetric.Dollars);
+        Assert.True(graph.IsDollarsMetric);
+        Assert.False(graph.IsTokensMetric);
+
         var changed = new List<string?>();
         graph.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
 
         main.RefreshCommand.Execute(null);
         await EventuallyAsync(() => changed.Contains(nameof(GraphWindowViewModel.SelectedPeriod)));
 
-        Assert.Same(initialOptions, graph.MetricOptions);
-        Assert.DoesNotContain(nameof(GraphWindowViewModel.MetricOptions), changed);
+        Assert.Equal(GraphMetric.Dollars, graph.Scene.Metric);
+        Assert.DoesNotContain(nameof(GraphWindowViewModel.SelectedMetric), changed);
+        Assert.True(graph.IsDollarsMetric);
+        Assert.False(graph.IsTokensMetric);
 
         var previousLanguage = LocalizationService.Current.LanguageCode;
         var nextLanguage = previousLanguage.Equals("en", StringComparison.OrdinalIgnoreCase) ? "ja" : "en";
@@ -79,8 +90,10 @@ public sealed class DetailsPresentationCoverageTests
             changed.Clear();
             LocalizationService.SetLanguage(nextLanguage);
 
-            Assert.Contains(nameof(GraphWindowViewModel.MetricOptions), changed);
-            Assert.NotSame(initialOptions, graph.MetricOptions);
+            Assert.Contains(nameof(GraphWindowViewModel.Texts), changed);
+            Assert.Equal(graph.Texts.GraphDollarMetric, graph.SelectedMetric);
+            Assert.True(graph.IsDollarsMetric);
+            Assert.False(graph.IsTokensMetric);
         }
         finally
         {
@@ -88,8 +101,10 @@ public sealed class DetailsPresentationCoverageTests
         }
     }
 
-    [Fact]
-    public async Task GraphWindow_CancelledLargeBuildCannotOverwriteLatestPeriod()
+    [Theory]
+    [InlineData(GraphMetric.Tokens)]
+    [InlineData(GraphMetric.Dollars)]
+    public async Task GraphWindow_CancelledLargeBuildCannotOverwriteLatestPeriod(GraphMetric metric)
     {
         var first = CreateLargePeriod("first", 2_100_000, 2_104_600, seed: 1);
         var second = CreateLargePeriod("second", 2_110_000, 2_114_600, seed: 2);
@@ -97,6 +112,9 @@ public sealed class DetailsPresentationCoverageTests
         var pendingUi = new ConcurrentQueue<Action>();
         using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
 
+        graph.SelectedMetric = metric == GraphMetric.Dollars
+            ? graph.Texts.GraphDollarMetric
+            : graph.Texts.GraphTokenMetric;
         Assert.Equal(first.Id, graph.SelectedPeriod?.Id);
         graph.SelectedPeriod = second;
 
@@ -110,6 +128,7 @@ public sealed class DetailsPresentationCoverageTests
         Assert.Equal(second.EndAt, graph.SelectedPeriodEndAt);
         Assert.NotEmpty(graph.Points);
         Assert.Equal(second.EndAt, graph.Points[^1].Timestamp);
+        Assert.Equal(metric, graph.Scene.Metric);
     }
 
     [Fact]
@@ -119,6 +138,10 @@ public sealed class DetailsPresentationCoverageTests
         var second = CreateSmallPeriod("second", 3_001_000, 3_001_120, current: false, remaining: 40, token: 200);
         using var main = await StartMainAsync(CreateDetails(new[] { first, second }, Array.Empty<ApiThreadDetails>()));
         using var graph = new GraphWindowViewModel(main);
+
+        Assert.Equal(graph.Texts.GraphTokenMetric, graph.SelectedMetric);
+        Assert.True(graph.IsTokensMetric);
+        Assert.False(graph.IsDollarsMetric);
 
         graph.SelectedPeriod = null;
         Assert.True(graph.HasNoPoints);
@@ -139,6 +162,8 @@ public sealed class DetailsPresentationCoverageTests
         Assert.Contains(graph.Points, point => point.SolValue == 200);
         graph.SelectedMetric = "unknown metric";
         Assert.True(graph.IsDollars);
+        Assert.True(graph.IsDollarsMetric);
+        Assert.False(graph.IsTokensMetric);
 
         graph.ShowRemaining = false;
         graph.ShowModels = false;
