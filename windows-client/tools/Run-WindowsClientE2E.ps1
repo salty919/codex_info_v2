@@ -190,6 +190,7 @@ public static class CodexInfoWindowsE2EWin32 {
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
@@ -3901,20 +3902,138 @@ function Select-E2ETheme {
 function Open-E2ESetupFromSettings {
     param(
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
-        [Parameter(Mandatory = $true)][int]$ProcessId
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [string]$Role = 'Setup'
     )
 
-    $button = Find-E2EButtonByName $SettingsRoot 'Setup'
+    $button = Find-E2EElementByAutomationId $SettingsRoot 'Settings.Footer.Setup'
     Assert-E2E ($null -ne $button) 'Settings Setup button is missing.'
+    Assert-E2E ([string]$button.Current.Name -ceq 'Connection settings') 'Settings connection settings button has an unexpected accessible name.'
     Invoke-E2EElement $button
     $handle = Wait-E2E -Description 'Setup window' -Probe {
         $found = Find-E2EWindow $ProcessId 'Codex Info Setup'
         if ($found -ne [IntPtr]::Zero) { return $found }
         return $false
     }
-    Bring-E2EWindowToFront $handle
-    $record = Record-E2EWindow 'Setup' $ProcessId $handle
+    Wait-E2E -Description 'Setup owns foreground immediately after opening' -Probe {
+        return [CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $handle
+    } | Out-Null
+    $record = Record-E2EWindow $Role $ProcessId $handle
     return [pscustomobject]@{ Handle = $handle; Root = Get-E2EUiaRoot $handle; Record = $record }
+}
+
+function Open-E2ELicenseFromSettings {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [string]$Role = 'License'
+    )
+
+    $button = Find-E2EElementByAutomationId $SettingsRoot 'Settings.Footer.Legal'
+    Assert-E2E ($null -ne $button -and [string]$button.Current.Name -ceq 'License information') `
+        'Settings footer License information action is missing or has an unexpected name.'
+    Invoke-E2EElement $button
+    $handle = Wait-E2E -Description 'Settings footer License information window' -Probe {
+        $found = Find-E2EWindow $ProcessId 'Codex Info License'
+        if ($found -ne [IntPtr]::Zero) { return $found }
+        return $false
+    }
+    $record = Record-E2EWindow $Role $ProcessId $handle
+    return [pscustomobject]@{ Handle = $handle; Root = Get-E2EUiaRoot $handle; Record = $record }
+}
+
+function Assert-E2ELicenseNotices {
+    param(
+        [Parameter(Mandatory = $true)]$License,
+        [Parameter(Mandatory = $true)][int]$ProcessId
+    )
+
+    $licenseRoot = $License.Root
+    Assert-E2ENoChildProductVersion $licenseRoot 'Legal'
+    $next = Find-E2EElementByAutomationId $licenseRoot 'Legal.Page.Next'
+    Assert-E2E ($null -ne $next) 'License information Next button is missing.'
+    $pagePosition = Find-E2EElementByAutomationId $licenseRoot 'Legal.Page.Position'
+    Assert-E2E ($null -ne $pagePosition) 'License information page position is missing.'
+    $pageNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $expectedPageCount = 9
+    for ($page = 1; $page -le $expectedPageCount; $page++) {
+        $expectedPositionSuffix = "$page / $expectedPageCount"
+        Wait-E2E -Description "License information page $page position" -Probe {
+            $value = [string]$pagePosition.Current.Name
+            return $value.EndsWith($expectedPositionSuffix, [StringComparison]::Ordinal)
+        } | Out-Null
+        $noticeText = Wait-E2E -Description "License information text page $page" -Probe {
+            $candidate = Find-E2EElementByAutomationId $licenseRoot 'Legal.Notice.Text'
+            if ($null -eq $candidate -or $candidate.Current.IsOffscreen) { return $false }
+            $value = [string]$candidate.Current.Name
+            if ([string]::IsNullOrWhiteSpace($value)) { return $false }
+            return $candidate
+        }
+        $noticeName = Find-E2EElementByAutomationId $licenseRoot 'Legal.Notice.Name'
+        Assert-E2E ($null -ne $noticeName) "License notice name is missing on page $page."
+        $null = $pageNames.Add([string]$noticeName.Current.Name)
+        $noticeValue = [string]$noticeText.Current.Name
+        $scanMarkdown = $page -notin @(2, 3, 6)
+        foreach ($rawLine in $noticeValue -split "`n") {
+            $line = $rawLine.TrimEnd("`r")
+            if ($line.StartsWith([string][char]0xFF3B, [StringComparison]::Ordinal) -and
+                $line.EndsWith([string][char]0xFF3D, [StringComparison]::Ordinal)) {
+                $scanMarkdown = $line.EndsWith(".md$([char]0xFF3D)", [StringComparison]::OrdinalIgnoreCase)
+                continue
+            }
+            if (-not $scanMarkdown) { continue }
+            foreach ($forbidden in @('<!--', '-->', '```', '](', '`')) {
+                Assert-E2E ($line.IndexOf($forbidden, [StringComparison]::Ordinal) -lt 0) `
+                    "License page $page exposes raw Markdown marker: $forbidden"
+            }
+            Assert-E2E (-not [regex]::IsMatch($line, '<https?://[^>]+>')) "License page $page exposes a raw Markdown autolink."
+            Assert-E2E (-not [regex]::IsMatch($line, '\*\*[^*\r\n]+\*\*')) "License page $page exposes raw Markdown strong emphasis."
+            Assert-E2E (-not [regex]::IsMatch($line, '~~[^~\r\n]+~~')) "License page $page exposes raw Markdown strikethrough."
+            Assert-E2E (-not [regex]::IsMatch($line, '(?<!\w)_[^_\r\n]+_(?!\w)')) "License page $page exposes raw Markdown emphasis."
+            Assert-E2E (-not [regex]::IsMatch($line, '^\s*#{1,6}\s+')) "License page $page exposes a raw Markdown heading."
+        }
+        if ($page -eq 1) {
+            Assert-E2E ($noticeValue.IndexOf('GPL', [StringComparison]::Ordinal) -ge 0) `
+                'License information lost the GPL legal content.'
+            $null = Capture-E2EWindow $License.Handle '11-license-information-page-1'
+        }
+        elseif ($page -eq 8) {
+            $null = Capture-E2EWindow $License.Handle '12-license-information-page-8'
+        }
+        if ($page -lt $expectedPageCount) {
+            Assert-E2E ($next.Current.IsEnabled) "License information Next button is disabled before page $expectedPageCount."
+            Invoke-E2EElement $next
+        }
+    }
+    Assert-E2E ($pageNames.Count -eq $expectedPageCount) `
+        "License information navigation did not expose $expectedPageCount distinct chapters."
+    Assert-E2E (-not $next.Current.IsEnabled) 'License information Next remains enabled on the final page.'
+    $back = Find-E2EElementByAutomationId $licenseRoot 'Legal.Page.Back'
+    Assert-E2E ($null -ne $back -and $back.Current.IsEnabled) 'License information Back is unavailable on the final page.'
+    Invoke-E2EElement $back
+    Wait-E2E -Description 'License information Back navigation to page 8' -Probe {
+        return ([string]$pagePosition.Current.Name).EndsWith('8 / 9', [StringComparison]::Ordinal)
+    } | Out-Null
+
+    $minimize = Find-E2EElementByAutomationId $licenseRoot 'Legal.Window.Minimize'
+    Assert-E2E ($null -ne $minimize -and $minimize.Current.IsEnabled) 'License information Minimize is unavailable.'
+    Invoke-E2EElement $minimize
+    Wait-E2E -Description 'License information minimize' -Probe {
+        return [CodexInfoWindowsE2EWin32]::IsIconic($License.Handle)
+    } | Out-Null
+    [CodexInfoWindowsE2EWin32]::ShowWindow($License.Handle, 9) | Out-Null
+    Wait-E2E -Description 'License information restore after minimize' -Probe {
+        return -not [CodexInfoWindowsE2EWin32]::IsIconic($License.Handle)
+    } | Out-Null
+    $licenseRoot = Get-E2EUiaRoot $License.Handle
+    Write-E2E 'license-information: PASS (all 9 rendered notices, Back, Minimize, and Close are usable)'
+
+    $close = Find-E2ECloseButton $licenseRoot
+    Assert-E2E ($null -ne $close) 'License information Close button is missing.'
+    Invoke-E2EElement $close
+    Wait-E2E -Description 'License information window close' -Probe {
+        return (Find-E2EWindow $ProcessId 'Codex Info License') -eq [IntPtr]::Zero
+    } | Out-Null
 }
 
 function Select-E2ESettingsTab {
@@ -3947,9 +4066,9 @@ function Assert-E2ESettingsCommonControls {
 
     foreach ($automationId in @(
             'Settings.AccountSelector',
-            'Settings.Footer.Setup',
-            'Settings.Footer.Legal',
-            'Settings.Footer.Save')) {
+        'Settings.Footer.Setup',
+        'Settings.Footer.Legal',
+        'Settings.Footer.Save')) {
         $control = Find-E2EElementByAutomationId $SettingsRoot $automationId
         Assert-E2E ($null -ne $control -and $control.Current.IsEnabled -and -not $control.Current.IsOffscreen) `
             "Settings common control $automationId is not visible and enabled on the selected tab."
@@ -3957,6 +4076,76 @@ function Assert-E2ESettingsCommonControls {
         Assert-E2E ($bounds.Width -gt 0 -and $bounds.Height -gt 0) `
             "Settings common control $automationId has no rendered bounds."
     }
+    $setup = Find-E2EElementByAutomationId $SettingsRoot 'Settings.Footer.Setup'
+    $license = Find-E2EElementByAutomationId $SettingsRoot 'Settings.Footer.Legal'
+    Assert-E2E ([string]$setup.Current.Name -ceq 'Connection settings') `
+        'Settings connection settings action has an unexpected accessible name.'
+    Assert-E2E ([string]$license.Current.Name -ceq 'License information') `
+        'Settings license information action has an unexpected accessible name.'
+}
+
+function Assert-E2ESettingsStatusPlacement {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
+        [Parameter(Mandatory = $true)][string]$SelectedTab,
+        [Parameter(Mandatory = $true)][bool]$SaveFailed
+    )
+
+    $connectionTitle = Find-E2EElementByAutomationId $SettingsRoot 'Settings.ConnectionStatus.Title'
+    $saveError = Find-E2EElementByAutomationId $SettingsRoot 'Settings.SaveError'
+    if ($SaveFailed) {
+        Assert-E2E ($null -ne $saveError -and -not $saveError.Current.IsOffscreen) `
+            "Save failure message is not visible on $SelectedTab."
+        Assert-E2E ([string]$saveError.Current.Name -ceq 'Settings could not be saved. Check the file permissions or location and try again.') `
+            "Save failure message is incorrect on $SelectedTab."
+        if ($SelectedTab -ceq 'Settings.Tab.ConnectionStatus') {
+            Assert-E2E ($null -ne $connectionTitle -and -not $connectionTitle.Current.IsOffscreen) `
+                'Connection status title is not visible on its tab during Save failure.'
+        }
+        else {
+            Assert-E2E ($null -eq $connectionTitle -or $connectionTitle.Current.IsOffscreen) `
+                "Connection status title is visible on unrelated tab $SelectedTab during Save failure."
+        }
+        return
+    }
+
+    Assert-E2E ($null -eq $saveError -or $saveError.Current.IsOffscreen) `
+        'Save error row is visible when Save has not failed.'
+    if ($SelectedTab -ceq 'Settings.Tab.ConnectionStatus') {
+        Assert-E2E ($null -ne $connectionTitle -and -not $connectionTitle.Current.IsOffscreen) `
+            'Connection status title is not visible on the Connection status tab.'
+    }
+    else {
+        Assert-E2E ($null -eq $connectionTitle -or $connectionTitle.Current.IsOffscreen) `
+            "Connection status title is visible on unrelated tab $SelectedTab."
+    }
+}
+
+function Invoke-E2ESettingsKeyboardFocusCheck {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
+        [Parameter(Mandatory = $true)][IntPtr]$SettingsHandle,
+        [Parameter(Mandatory = $true)][string]$AutomationId
+    )
+
+    $tab = Find-E2EElementByAutomationId $SettingsRoot $AutomationId
+    Assert-E2E ($null -ne $tab) "Settings keyboard focus target $AutomationId is missing."
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::SetForegroundWindow($SettingsHandle)) `
+        'Settings could not receive foreground input for keyboard focus validation.'
+    $tab.SetFocus()
+    [CodexInfoWindowsE2EWin32]::keybd_event(0x10, 0, 0, [UIntPtr]::Zero)
+    [CodexInfoWindowsE2EWin32]::keybd_event(0x10, 0, 2, [UIntPtr]::Zero)
+    $selection = $null
+    Assert-E2E ($tab.TryGetCurrentPattern(
+        [System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selection)) `
+        "Settings tab $AutomationId has no SelectionItemPattern for keyboard focus validation."
+    Wait-E2E -Description "Keyboard focus remains on Settings tab $AutomationId" -Probe {
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+        if ($selection.Current.IsSelected -and $focused.Current.AutomationId -ceq $AutomationId) { return $true }
+        return $false
+    } | Out-Null
+    $null = Capture-E2EWindow $SettingsHandle 'settings-tab-keyboard-focus'
+    Write-E2E "settings-tab-keyboard-focus: PASS id=$AutomationId selected=true"
 }
 
 function Get-E2ESettingsComboSelectionText {
@@ -4035,6 +4224,7 @@ function Invoke-E2ESettingsTabs {
         Select-E2ESettingsTab $settings.Root $automationId
         $settings.Root = Get-E2EUiaRoot $settings.Handle
         Assert-E2ESettingsCommonControls $settings.Root
+        Assert-E2ESettingsStatusPlacement $settings.Root $automationId $false
         switch ($automationId) {
             'Settings.Tab.Language' {
                 Select-E2ESettingsComboOption $settings.Root 'Settings.LanguageSelector' 'Deutsch'
@@ -4083,11 +4273,14 @@ function Invoke-E2ESettingsTabs {
             }
         }
     }
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    Select-E2ESettingsTab $settings.Root 'Settings.Tab.TimeZone'
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    Invoke-E2ESettingsKeyboardFocusCheck $settings.Root $settings.Handle 'Settings.Tab.TimeZone'
     Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $originalSettings) `
         'Changing Settings tabs or previewing draft selections changed settings before Save.'
 
     $saveFailureSettingsBytes = [IO.File]::ReadAllBytes($script:e2eSettingsPath)
-    $expectedSaveFailure = 'Settings could not be saved. Check the file permissions or location and try again.'
     try {
         [IO.File]::Delete($script:e2eSettingsPath)
         [IO.Directory]::CreateDirectory($script:e2eSettingsPath) | Out-Null
@@ -4103,15 +4296,12 @@ function Invoke-E2ESettingsTabs {
         foreach ($automationId in @(
                 'Settings.Tab.Language',
                 'Settings.Tab.TimeZone',
-                'Settings.Tab.Appearance')) {
+                'Settings.Tab.Appearance',
+                'Settings.Tab.ConnectionStatus')) {
             $settings.Root = Get-E2EUiaRoot $settings.Handle
             Select-E2ESettingsTab $settings.Root $automationId
             $settings.Root = Get-E2EUiaRoot $settings.Handle
-            $statusDetail = Find-E2EElementByAutomationId $settings.Root 'Settings.StatusDetail'
-            Assert-E2E ($null -ne $statusDetail -and -not $statusDetail.Current.IsOffscreen) `
-                "Save failure detail is not visible on $automationId."
-            Assert-E2E ([string]$statusDetail.Current.Name -ceq $expectedSaveFailure) `
-                "Save failure detail is incorrect on $automationId."
+            Assert-E2ESettingsStatusPlacement $settings.Root $automationId $true
         }
         Assert-E2E (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Container) `
             'Failed Save unexpectedly replaced the fixture settings path.'
@@ -4131,15 +4321,9 @@ function Invoke-E2ESettingsTabs {
     $settings.Root = Get-E2EUiaRoot $settings.Handle
     Select-E2ETheme $settings.Root 'Paper Light'
 
-    $setupButton = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Setup'
-    Invoke-E2EElement $setupButton
-    $setupHandle = Wait-E2E -Description 'Settings footer Setup window' -Probe {
-        $found = Find-E2EWindow $ProcessId 'Codex Info Setup'
-        if ($found -ne [IntPtr]::Zero) { return $found }
-        return $false
-    }
-    $null = Record-E2EWindow 'SettingsSetup' $ProcessId $setupHandle
-    $setupRoot = Get-E2EUiaRoot $setupHandle
+    $setup = Open-E2ESetupFromSettings $settings.Root $ProcessId -Role 'SettingsSetup'
+    $setupHandle = $setup.Handle
+    $setupRoot = $setup.Root
     $setupClose = Find-E2EElementByAutomationId $setupRoot 'Setup.Window.Close'
     Assert-E2E ($null -ne $setupClose) 'Setup Close button is missing.'
     Invoke-E2EElement $setupClose
@@ -4149,21 +4333,8 @@ function Invoke-E2ESettingsTabs {
 
     Bring-E2EWindowToFront $settings.Handle
     $settings.Root = Get-E2EUiaRoot $settings.Handle
-    $legalButton = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Legal'
-    Invoke-E2EElement $legalButton
-    $legalHandle = Wait-E2E -Description 'Settings footer Legal window' -Probe {
-        $found = Find-E2EWindow $ProcessId 'Codex Info Legal'
-        if ($found -ne [IntPtr]::Zero) { return $found }
-        return $false
-    }
-    $null = Record-E2EWindow 'SettingsLegal' $ProcessId $legalHandle
-    $legalRoot = Get-E2EUiaRoot $legalHandle
-    $legalClose = Find-E2EElementByAutomationId $legalRoot 'Legal.Window.Close'
-    Assert-E2E ($null -ne $legalClose) 'Legal Close button is missing.'
-    Invoke-E2EElement $legalClose
-    Wait-E2E -Description 'Settings footer Legal closes' -Probe {
-        return (Find-E2EWindow $ProcessId 'Codex Info Legal') -eq [IntPtr]::Zero
-    } | Out-Null
+    $license = Open-E2ELicenseFromSettings $settings.Root $ProcessId -Role 'SettingsLicense'
+    Assert-E2ELicenseNotices $license $ProcessId
 
     Bring-E2EWindowToFront $settings.Handle
     $settings.Root = Get-E2EUiaRoot $settings.Handle
@@ -4673,10 +4844,11 @@ function Invoke-E2EThemePresets {
             return $false
         }
     }
-    $windows.Legal = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Legal' `
-        -ButtonAutomationId 'Main.OpenLegal' -Title 'Codex Info Legal' -Role 'Legal' -ProcessId $ProcessId
     $windows.Settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
         -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+    $windows.Legal = Open-E2ELicenseFromSettings $windows.Settings.Root $ProcessId -Role 'License'
+    Bring-E2EWindowToFront $windows.Settings.Handle
+    $windows.Settings.Root = Get-E2EUiaRoot $windows.Settings.Handle
     Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Appearance'
     $windows.Setup = Open-E2ESetupFromSettings $windows.Settings.Root $ProcessId
 
@@ -4746,7 +4918,7 @@ function Invoke-E2EThemePresets {
                 @{ Role = 'Main'; Title = 'Codex Info Monitor' },
                 @{ Role = 'Graph'; Title = 'Codex Info Graph' },
                 @{ Role = 'Threads'; Title = 'Codex Info Threads' },
-                @{ Role = 'Legal'; Title = 'Codex Info Legal' },
+                @{ Role = 'Legal'; Title = 'Codex Info License' },
                 @{ Role = 'Setup'; Title = 'Codex Info Setup' })) {
             $current = Find-E2EWindow $ProcessId $entry.Title
             Assert-E2E ($current -eq $originalHandles[$entry.Role]) `
@@ -5335,90 +5507,18 @@ try {
     }
     $null = Capture-E2EWindow $threads.Handle '10-threads-rows'
 
-    Write-E2E 'case-6: open Legal and assert plain-text legal notice'
-    $legal = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Legal' -ButtonAutomationId 'Main.OpenLegal' -Title 'Codex Info Legal' -Role 'Legal' -ProcessId $clientPid
-    $legalRoot = $legal.Root
-    Assert-E2ENoChildProductVersion $legalRoot 'Legal'
-    $legalNext = Find-E2EElementByAutomationId $legalRoot 'Legal.Page.Next'
-    Assert-E2E ($null -ne $legalNext) 'Legal Next button is missing.'
-    $legalPagePosition = Find-E2EElementByAutomationId $legalRoot 'Legal.Page.Position'
-    Assert-E2E ($null -ne $legalPagePosition) 'Legal page position is missing.'
-    $legalPageNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $expectedLegalPageCount = 9
-    for ($legalPage = 1; $legalPage -le $expectedLegalPageCount; $legalPage++) {
-        $expectedPositionSuffix = "$legalPage / $expectedLegalPageCount"
-        Wait-E2E -Description "Legal page $legalPage position" -Probe {
-            $value = [string]$legalPagePosition.Current.Name
-            return $value.EndsWith($expectedPositionSuffix, [StringComparison]::Ordinal)
-        } | Out-Null
-        $legalText = Wait-E2E -Description "Legal plain-text notice page $legalPage" -Probe {
-            $candidate = Find-E2EElementByAutomationId $legalRoot 'Legal.Notice.Text'
-            if ($null -eq $candidate -or $candidate.Current.IsOffscreen) { return $false }
-            $value = [string]$candidate.Current.Name
-            if ([string]::IsNullOrWhiteSpace($value)) { return $false }
-            return $candidate
-        }
-        $legalName = Find-E2EElementByAutomationId $legalRoot 'Legal.Notice.Name'
-        Assert-E2E ($null -ne $legalName) "Legal notice name is missing on page $legalPage."
-        $null = $legalPageNames.Add([string]$legalName.Current.Name)
-        $legalValue = [string]$legalText.Current.Name
-        $scanMarkdown = $legalPage -notin @(2, 3, 6)
-        foreach ($legalRawLine in $legalValue -split "`n") {
-            $legalLine = $legalRawLine.TrimEnd("`r")
-            if ($legalLine.StartsWith([string][char]0xFF3B, [StringComparison]::Ordinal) -and
-                $legalLine.EndsWith([string][char]0xFF3D, [StringComparison]::Ordinal)) {
-                $scanMarkdown = $legalLine.EndsWith(".md$([char]0xFF3D)", [StringComparison]::OrdinalIgnoreCase)
-                continue
-            }
-            if (-not $scanMarkdown) { continue }
-            foreach ($forbidden in @('<!--', '-->', '```', '](', '`')) {
-                Assert-E2E ($legalLine.IndexOf($forbidden, [StringComparison]::Ordinal) -lt 0) "Legal page $legalPage exposes raw Markdown marker: $forbidden"
-            }
-            Assert-E2E (-not [regex]::IsMatch($legalLine, '<https?://[^>]+>')) "Legal page $legalPage exposes a raw Markdown autolink."
-            Assert-E2E (-not [regex]::IsMatch($legalLine, '\*\*[^*\r\n]+\*\*')) "Legal page $legalPage exposes raw Markdown strong emphasis."
-            Assert-E2E (-not [regex]::IsMatch($legalLine, '~~[^~\r\n]+~~')) "Legal page $legalPage exposes raw Markdown strikethrough."
-            Assert-E2E (-not [regex]::IsMatch($legalLine, '(?<!\w)_[^_\r\n]+_(?!\w)')) "Legal page $legalPage exposes raw Markdown emphasis."
-            Assert-E2E (-not [regex]::IsMatch($legalLine, '^\s*#{1,6}\s+')) "Legal page $legalPage exposes a raw Markdown heading."
-        }
-        if ($legalPage -eq 1) {
-            Assert-E2E ($legalValue.IndexOf('GPL', [StringComparison]::Ordinal) -ge 0) 'Legal notice lost the GPL legal content.'
-            $null = Capture-E2EWindow $legal.Handle '11-legal-plain-text-page-1'
-        }
-        elseif ($legalPage -eq 8) {
-            $null = Capture-E2EWindow $legal.Handle '12-legal-plain-text-page-8'
-        }
-        if ($legalPage -lt $expectedLegalPageCount) {
-            Assert-E2E ($legalNext.Current.IsEnabled) "Legal Next button is disabled before page $expectedLegalPageCount."
-            Invoke-E2EElement $legalNext
-        }
-    }
-    Assert-E2E ($legalPageNames.Count -eq $expectedLegalPageCount) "Legal page navigation did not expose $expectedLegalPageCount distinct chapters."
-    Assert-E2E (-not $legalNext.Current.IsEnabled) 'Legal Next button remains enabled on the final page.'
-    $legalBack = Find-E2EElementByAutomationId $legalRoot 'Legal.Page.Back'
-    Assert-E2E ($null -ne $legalBack -and $legalBack.Current.IsEnabled) 'Legal Back button is unavailable on the final page.'
-    Invoke-E2EElement $legalBack
-    Wait-E2E -Description 'Legal Back navigation from page 9 to page 8' -Probe {
-        return ([string]$legalPagePosition.Current.Name).EndsWith('8 / 9', [StringComparison]::Ordinal)
-    } | Out-Null
-
-    $legalMinimize = Find-E2EElementByAutomationId $legalRoot 'Legal.Window.Minimize'
-    Assert-E2E ($null -ne $legalMinimize -and $legalMinimize.Current.IsEnabled) 'Legal Minimize button is unavailable.'
-    Invoke-E2EElement $legalMinimize
-    Wait-E2E -Description 'Legal window minimize' -Probe {
-        return [CodexInfoWindowsE2EWin32]::IsIconic($legal.Handle)
-    } | Out-Null
-    [CodexInfoWindowsE2EWin32]::ShowWindow($legal.Handle, 9) | Out-Null
-    Wait-E2E -Description 'Legal window restore after minimize' -Probe {
-        return -not [CodexInfoWindowsE2EWin32]::IsIconic($legal.Handle)
-    } | Out-Null
-    $legalRoot = Get-E2EUiaRoot $legal.Handle
-    Write-E2E 'legal-plain-text: PASS (all 9 rendered notices, Back, Minimize, and Close are usable)'
-
-    $closeLegal = Find-E2ECloseButton $legalRoot
-    Assert-E2E ($null -ne $closeLegal) 'Legal Close button is missing.'
-    Invoke-E2EElement $closeLegal
-    Wait-E2E -Description 'Legal window close' -Probe {
-        return (Find-E2EWindow $clientPid 'Codex Info Legal') -eq [IntPtr]::Zero
+    Write-E2E 'case-6: open License information through Settings and verify all notices'
+    $licenseSettings = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Settings' `
+        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsLicense' -ProcessId $clientPid
+    $license = Open-E2ELicenseFromSettings $licenseSettings.Root $clientPid -Role 'License'
+    Assert-E2ELicenseNotices $license $clientPid
+    Bring-E2EWindowToFront $licenseSettings.Handle
+    $licenseSettings.Root = Get-E2EUiaRoot $licenseSettings.Handle
+    $closeLicenseSettings = Find-E2EElementByAutomationId $licenseSettings.Root 'Settings.Window.Close'
+    Assert-E2E ($null -ne $closeLicenseSettings) 'Settings Close button is missing after opening License information.'
+    Invoke-E2EElement $closeLicenseSettings
+    Wait-E2E -Description 'Settings closes after License information' -Probe {
+        return (Find-E2EWindow $clientPid 'Codex Info Settings') -eq [IntPtr]::Zero
     } | Out-Null
 
     Write-E2E 'case-7: same PID and HWND records'
@@ -5434,7 +5534,7 @@ try {
         Invoke-E2ENarrowPeriodCostScenario -ClientPath $resolvedClientPath
     }
     $graphEvidence = if ($Fixture) { 'past-period model and idle-band pixels' } else { 'past-period model pixels' }
-    Write-E2E ("windows-client-e2e: PASS (Graph open, {0}, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, Legal plain text, PID/HWND records)" -f $graphEvidence)
+    Write-E2E ("windows-client-e2e: PASS (Graph open, {0}, period current/past/current, 2 metrics, 4 toggle OFF/ON cycles, Threads rows/columns, License information, PID/HWND records)" -f $graphEvidence)
     $script:e2eSuccess = $true
     }
 }

@@ -51,9 +51,15 @@ Windows Settingsは現行の900×480を維持し、中央領域を次の4タブ�
 3. Appearance: テーマ選択と既存の説明。
 4. Connection status: 接続・認証操作、Recorder/REST version、既存status。
 
-account selectorは従来どおり上部の固定領域、Setup／Legal／Saveは下部の固定領域に置き、タブの外から常に操作できるようにする。各タブの既存項目は同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、タブ内容にroot scrollを要求しない。設定項目、保存動作、保存形式、Linux画面は変更しない。
+デスクトップ設定画面の密度を7、変化量を3、動きを1とし、既存の色tokenとフォントを使う。タブは左の176 DIP幅の縦レールに置き、各項目は40 DIP以上の高さ、12 DIPの内側余白、4 DIPの間隔を持つ。項目名は最大2行で折り返す。非選択タブは補助文字色、選択タブは面色・1 DIP枠・3 DIPのaccent表示・太字で識別する。キーボードのfocus-visibleは独立した2 DIP枠で示し、装飾アニメーションは使わない。本文は14 DIP、補助文字は13 DIPを基本とする。間隔は8／12／16／24 DIPから選ぶ。
 
-既存statusはタブ外の共通固定領域へ一度だけ表示し、4タブのどれを選択中でも確認できるようにする。特にSave失敗理由をLanguage／Time zone／Appearanceの選択中も表示し、ユーザーがタブを切り替えずに失敗を確認できるようにする。
+account selectorは上部の固定領域、接続設定／ライセンス情報／Saveは下部の固定領域に置き、タブの外から常に操作できるようにする。Mainに法的情報の重複入口を置かず、ライセンス情報はSettingsから開く。各タブの既存項目は同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、タブ内容にroot scrollを要求しない。設定項目、保存動作、保存形式、Linux画面は変更しない。
+
+右側の内容領域は16 DIPの内側余白を持ち、入力がある設定行を144 DIPのラベル列、12 DIPの間隔、残り幅の入力欄で構成する。入力欄は36 DIP高、カードは内容高に合わせて上詰めする。空欄を大きな枠で囲わず、既存の設定項目と説明だけを表示する。タブと入力欄の間に16 DIPの間隔を設ける。
+
+通常の接続詳細はConnection statusタブの中だけに表示する。Save失敗時だけ固定footer直上の共通欄を表示し、4タブのどれからも理由を確認できるようにする。失敗していない状態では、他タブに正常時のsnapshot説明を表示しない。
+
+Settings footerの接続先編集入口は`ConnectionSettings`、ライセンス画面見出しとSettings入口は`LicenseInformation`を使い、`docs/LOCALIZATION.md`の全対応localeで表示する。Main上部にはLegal入口を置かない。接続先編集ボタンは既存Setup画面を開き、クリック直後に前面で操作可能になる。
 
 ## WIN-THEME-422 — Windows版の組込みカラーテーマ
 
@@ -189,7 +195,7 @@ Graph selectorの矢印は文字本文ではなく操作アイコンとして3:1
 「画面をスクロールしないと主要操作や主要情報へ到達できない」設計はUX合格としない。
 対象はMain、Setup、Settings、Graph、Threads、Legalの全Windowであり、Main内Helpにも同じviewport条件を適用する。
 
-- Main: 残量、リセット、状態、更新、メニュー、Graph/Threads/Legal入口を同一viewportに置く。Windowsのモデル内訳だけは先頭6行を完全表示し、7行目以降を同じ表内で縦scrollする（`MODEL-USAGE-DISPLAY-01`）。
+- Main: 残量、リセット、状態、更新、メニュー、Graph/Settings入口を同一viewportに置く。ライセンス情報はSettingsから開く。Windowsのモデル内訳だけは先頭6行を完全表示し、7行目以降を同じ表内で縦scrollする（`MODEL-USAGE-DISPLAY-01`）。
 - Setup: 現在の手順、入力、検証結果、次へ/戻る/キャンセルを同一viewportに置く。
 - Settings: 編集対象、現在値、保存、取消、復旧、戻るを同一viewportに置く。
 - Graph: 期間、metric、系列操作、plot、現在値を同一viewportに置く。
@@ -301,7 +307,7 @@ page/step/detail/chapter/collapseで全主要情報、primary action、Back、Cl
 
 - 最上位の移動先はメニューまたは一貫したナビゲーション領域から開く。
 - メニュー項目はアイコンだけでなく文字名、ショートカット、アクセシブル名を持つ。
-- Main上部は`Monitor / Account / Trends / Legal / Settings`の順で両platformを一致させる。
+- Main上部は`Monitor / Account / Trends / Settings`の順で両platformを一致させる。Legal入口はSettings footerへ集約する。
   Threadsは上部に置かず、受理済みの現在accountのMain概要にある`Details`から開く。
   実行中threadが0件でも同じ導線を表示する。
 - 現在位置、戻る、閉じる、処理中、無効、エラーを同じ視覚規則で表す。

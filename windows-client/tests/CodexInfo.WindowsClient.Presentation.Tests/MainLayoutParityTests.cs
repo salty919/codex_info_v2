@@ -24,11 +24,11 @@ public sealed class MainLayoutParityTests
             .ToArray();
 
         Assert.DoesNotContain("Main.OpenThreads", ids);
+        Assert.DoesNotContain("Main.OpenLegal", ids);
         Assert.DoesNotContain("Main.AccountSelector", ids);
         Assert.DoesNotContain("Main.AccountMenu", ids);
         Assert.True(IndexOf(source, "Main.UsageStatus") < IndexOf(source, "Main.OpenGraph"));
-        Assert.True(IndexOf(source, "Main.OpenGraph") < IndexOf(source, "Main.OpenLegal"));
-        Assert.True(IndexOf(source, "Main.OpenLegal") < IndexOf(source, "Main.OpenSettings"));
+        Assert.True(IndexOf(source, "Main.OpenGraph") < IndexOf(source, "Main.OpenSettings"));
 
     }
 
@@ -328,14 +328,6 @@ public sealed class MainLayoutParityTests
         Assert.Equal("2", showLastReceived.Attribute("Grid.RowSpan")?.Value);
         Assert.Equal("0,0,4,0", showLastReceived.Attribute("Margin")?.Value);
 
-        var legalCommand = document.Descendants().Single(element =>
-            element.Name.LocalName == "Button" &&
-            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.OpenLegal");
-        var legalClasses = legalCommand.Attribute("Classes")?.Value
-            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries) ?? [];
-        Assert.Contains("command", legalClasses);
-        Assert.Contains("legal", legalClasses);
-
         var minimize = document.Descendants().Single(element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.Window.Minimize");
         var close = document.Descendants().Single(element =>
@@ -343,7 +335,10 @@ public sealed class MainLayoutParityTests
         var windowControlRow = minimize.Parent;
         Assert.NotNull(windowControlRow);
         Assert.Same(windowControlRow, close.Parent);
-        Assert.Same(legalCommand.Parent, windowControlRow.Parent);
+        var settingsCommand = document.Descendants().Single(element =>
+            element.Name.LocalName == "Button" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.OpenSettings");
+        Assert.Same(settingsCommand.Parent, windowControlRow.Parent);
         Assert.Equal("StackPanel", windowControlRow.Name.LocalName);
         Assert.Equal("Horizontal", windowControlRow.Attribute("Orientation")?.Value);
         Assert.Equal("0", windowControlRow.Attribute("Spacing")?.Value);

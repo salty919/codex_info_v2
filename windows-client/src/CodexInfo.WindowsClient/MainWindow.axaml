@@ -84,10 +84,6 @@
       <Setter Property="Background" Value="{DynamicResource Theme24415E}" />
       <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
     </Style>
-    <Style Selector="Button.command.legal">
-      <Setter Property="Width" Value="84" />
-      <Setter Property="MinWidth" Value="84" />
-    </Style>
     <!-- WeekGauge cells use a fixed two-surface template instead of a themed
          progress control.  This keeps the gauge free of hover, animation, and
          indeterminate layers. -->
@@ -169,13 +165,6 @@
                 AutomationProperties.AutomationId="Main.OpenGraph"
                 ToolTip.Tip="{Binding Texts.Graph}">
           <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="▥" /><TextBlock Text="{Binding Texts.Graph}" /></StackPanel>
-        </Button>
-        <Button Classes="command legal"
-                Click="OnOpenLegal"
-                AutomationProperties.Name="{Binding Texts.Legal}"
-                AutomationProperties.AutomationId="Main.OpenLegal"
-                ToolTip.Tip="{Binding Texts.Legal}">
-          <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="ⓘ" /><TextBlock Text="{Binding Texts.Legal}" /></StackPanel>
         </Button>
         <Button Classes="command"
                 Click="OnOpenSettings"
