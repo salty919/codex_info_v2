@@ -497,6 +497,19 @@ public sealed record UiText(
     public string LegalDetailsName => LanguageCode == "ja" ? "詳細" : "Details";
     public string LegalDistributionName => LanguageCode == "ja" ? "配布" : "Distribution";
     public string TimeZone => LanguageCode switch { "ja" => "表示タイムゾーン", "zh-Hans" => "显示时区", "ko" => "표시 시간대", "es" => "Zona horaria", "fr" => "Fuseau horaire", "de" => "Zeitzone", "pt" => "Fuso horário", "it" => "Fuso orario", "ru" => "Часовой пояс", _ => "Display time zone" };
+    public string SettingsConnectionStatus => LanguageCode switch
+    {
+        "ja" => "接続状態",
+        "zh-Hans" => "连接状态",
+        "ko" => "연결 상태",
+        "es" => "Estado de conexión",
+        "fr" => "État de la connexion",
+        "de" => "Verbindungsstatus",
+        "pt" => "Estado da conexão",
+        "it" => "Stato della connessione",
+        "ru" => "Состояние подключения",
+        _ => "Connection status"
+    };
     public string LocalTimeZone => LanguageCode switch { "ja" => "Windowsのローカル時刻", "zh-Hans" => "Windows 本地时间", "ko" => "Windows 현지 시간", "es" => "Hora local de Windows", "fr" => "Heure locale Windows", "de" => "Windows-Ortszeit", "pt" => "Hora local do Windows", "it" => "Ora locale di Windows", "ru" => "Местное время Windows", _ => "Windows local time" };
     public string UtcTimeZone => "UTC";
     public string CountUnit => LanguageCode switch { "ja" => "件", "zh-Hans" => "项", "ko" => "개", "es" => "", "fr" => "", "de" => "", "pt" => "", "it" => "", "ru" => "", _ => "" };

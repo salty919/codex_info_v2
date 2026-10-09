@@ -64,6 +64,21 @@ UTCの順で解決し、非空で不正な`TZ`はUTCへfail closedします。`T
 通常時のStatusBannerは状態名・説明・前回受信時刻を別欄に置きます。thread title、email、モデル名、製品名、
 ライセンス名、ログ生値は原文を表示し、数値とepoch秒だけを表示時のlocale・timezoneへ変換します。
 
+Windows SettingsのConnection statusタブ見出しはUiTextの`SettingsConnectionStatus`を使い、対応localeごとに次の値を表示します。
+
+| locale | SettingsConnectionStatus |
+| --- | --- |
+| `ja` | 接続状態 |
+| `en` | Connection status |
+| `zh-Hans` | 连接状态 |
+| `ko` | 연결 상태 |
+| `es` | Estado de conexión |
+| `fr` | État de la connexion |
+| `de` | Verbindungsstatus |
+| `pt` | Estado da conexão |
+| `it` | Stato della connessione |
+| `ru` | Состояние подключения |
+
 Linux/Windows Mainの観測時刻ラベルと正常時の最新snapshot説明は、観測元OS名を付けず、
 全対応localeで次の固定文言を使います。接続・認証・障害の説明でLinux側を指す文言はこの契約の対象外です。
 
