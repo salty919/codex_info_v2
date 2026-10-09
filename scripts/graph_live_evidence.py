@@ -50,6 +50,22 @@ METRIC_RANK = {"remaining": 0, "tokens": 1, "dollars": 2}
 # fixed colored model slots; unknown names are retained semantically but are
 # not emitted as painted model paths.
 RENDERABLE_MODELS = frozenset(("ASTRA", "LUNA", "SOL", "TERRA"))
+# Match only the exact model IDs currently accepted by the Windows client
+# display-family projection. Unknown names remain in the raw vector/authority
+# inputs but never acquire a colored family line by suffix guessing.
+DISPLAY_FAMILY_BY_MODEL = {
+    "sol": "SOL",
+    "gpt-6.1-sol": "SOL",
+    "gpt-6-sol": "SOL",
+    "gpt-5.6-sol": "SOL",
+    "terra": "TERRA",
+    "gpt-5.6-terra": "TERRA",
+    "luna": "LUNA",
+    "gpt-6-luna": "LUNA",
+    "gpt-5.6-luna": "LUNA",
+    "astra": "ASTRA",
+    "gpt-6-astra": "ASTRA",
+}
 # ASTRA is the only model whose history rows carry token components but no
 # stored cumulative-dollar column.  Keep this oracle calculation byte-for-
 # byte aligned with the production history projection; it is still derived
@@ -215,8 +231,6 @@ def _validate_fixture(fixture: dict[str, Any]) -> tuple[dict[str, Any], list[dic
             raise EvidenceError(f"sample {index} legacy source claims a complete model set")
         if models is None and source == "legacy-unknown":
             continue
-        if source == "confirmed" and not complete:
-            raise EvidenceError(f"sample {index} confirmed source is not complete")
         if not isinstance(models, list):
             raise EvidenceError(f"sample {index} observed source has no model array")
         names: set[str] = set()
@@ -634,6 +648,194 @@ def _period_model_universe(
     )
 
 
+def _display_family_name(model_name: str) -> str | None:
+    return DISPLAY_FAMILY_BY_MODEL.get(model_name.strip().lower())
+
+
+def _windows_family_model_projections(
+    rows: list[dict[str, Any]],
+    projections: dict[str, dict[str, list[ModelEvidence]]],
+) -> dict[str, dict[str, list[ModelEvidence]]]:
+    family_member_sets: dict[str, set[str]] = {}
+    first_publications: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        if row.get("synthetic", False) or row["model_source"] not in {
+            "confirmed",
+            "legacy-unknown",
+        }:
+            continue
+        for model in row.get("models") or []:
+            name = model["model"]
+            family = _display_family_name(name)
+            if family is not None:
+                family_member_sets.setdefault(family, set()).add(name)
+            first_publications.setdefault(name, index)
+
+    # A complete current vector can retain a prior exact zero as display-only
+    # family evidence. Positive exact evidence, including a confirmed partial
+    # row, permanently blocks that exact member's zero until the reset changes.
+    eligible_missing_zero: list[set[str]] = []
+    explicit_zero_members: set[str] = set()
+    previously_positive_members: set[str] = set()
+    previous_reset_at: int | None = None
+    for row in rows:
+        reset_at = row["reset_at"]
+        if previous_reset_at is not None and previous_reset_at != reset_at:
+            explicit_zero_members.clear()
+            previously_positive_members.clear()
+        previous_reset_at = reset_at
+
+        current_models = row.get("models") or []
+        current_names = {model["model"] for model in current_models}
+        is_confirmed_complete = (
+            not row.get("synthetic", False)
+            and row["model_source"] == "confirmed"
+            and row["models_complete"] is True
+            and row.get("models") is not None
+        )
+        eligible_missing_zero.append(
+            {
+                name
+                for name in explicit_zero_members
+                if _display_family_name(name) is not None
+                and name not in previously_positive_members
+                and name not in current_names
+            }
+            if is_confirmed_complete
+            else set()
+        )
+
+        source_can_record_zero = (
+            row["model_source"] == "legacy-unknown"
+            or is_confirmed_complete
+        )
+        source_can_invalidate_zero = (
+            not row.get("synthetic", False)
+            and row["model_source"] in {"confirmed", "legacy-unknown"}
+        )
+        if not source_can_invalidate_zero:
+            continue
+        for model in current_models:
+            name = model["model"]
+            tokens = model["total_tokens"]
+            raw_dollars = model.get("total_dollars")
+            dollars = None if raw_dollars is None else float(raw_dollars)
+            if tokens > 0 or dollars is not None and math.isfinite(dollars) and dollars > 0:
+                previously_positive_members.add(name)
+            if (
+                source_can_record_zero
+                and tokens == 0
+                and dollars is not None
+                and math.isfinite(dollars)
+                and dollars == 0
+            ):
+                explicit_zero_members.add(name)
+
+    grouped: dict[str, dict[str, list[ModelEvidence]]] = {
+        "tokens": {},
+        "dollars": {},
+    }
+    for family in sorted(family_member_sets, key=lambda value: value.encode("utf-8")):
+        members = sorted(family_member_sets[family], key=lambda value: value.encode("utf-8"))
+        for metric in ("tokens", "dollars"):
+            family_points: list[ModelEvidence] = []
+            source = projections[metric]
+            for index in range(len(rows)):
+                published = [
+                    name
+                    for name in members
+                    if first_publications.get(name, len(rows)) <= index
+                ]
+                if not published:
+                    family_points.append(ModelEvidence(None, False, "unknown"))
+                    continue
+
+                total = 0.0
+                complete = True
+                line_reliable = True
+                for name in published:
+                    if name in eligible_missing_zero[index]:
+                        continue
+                    point = source[name][index]
+                    if (
+                        point.value is None
+                        or not math.isfinite(point.value)
+                        or point.value < 0
+                    ):
+                        complete = False
+                        break
+                    total += point.value
+                    if not math.isfinite(total):
+                        complete = False
+                        break
+                    line_reliable &= (
+                        point.origin == "legacy"
+                        or point.origin == "direct" and point.reliable
+                    )
+
+                if not complete:
+                    family_points.append(ModelEvidence(None, False, "unknown"))
+                else:
+                    family_points.append(
+                        ModelEvidence(
+                            total,
+                            line_reliable,
+                            "direct" if line_reliable else "held",
+                        )
+                    )
+            grouped[metric][family] = family_points
+    return grouped
+
+
+def _windows_model_projection_data(
+    period: dict[str, Any],
+    rows: list[dict[str, Any]],
+    universe: tuple[str, ...],
+    gaps: list[dict[str, Any]],
+) -> tuple[
+    dict[str, list[ModelEvidence]],
+    dict[str, list[ModelEvidence]],
+    list[dict[str, int]],
+    dict[str, dict[str, list[ModelEvidence]]],
+]:
+    # Confirmed partial rows remain available to raw/common Linux contracts,
+    # but cannot anchor a Windows family graph line. Their exact positive
+    # values still invalidate a previous zero in the family state above.
+    projection_rows = [
+        {
+            **row,
+            "models": []
+            if row["model_source"] == "confirmed" and not row["models_complete"]
+            else row.get("models"),
+        }
+        for row in rows
+    ]
+    authority_token_models = {
+        model: _model_projection(rows, model, "tokens")
+        for model in universe
+    }
+    idle = _idle_intervals(period, rows, authority_token_models, gaps)
+    token_models = {
+        model: _model_projection(projection_rows, model, "tokens")
+        for model in universe
+    }
+    dollar_models = {
+        model: _normalize_dollars_from_token_identity(
+            projection_rows,
+            model,
+            _model_projection(projection_rows, model, "dollars"),
+            token_models[model],
+            idle,
+        )
+        for model in universe
+    }
+    grouped = _windows_family_model_projections(
+        rows,
+        {"tokens": token_models, "dollars": dollar_models},
+    )
+    return token_models, dollar_models, idle, grouped
+
+
 def _remaining_projection(
     _period: dict[str, Any],
     rows: list[dict[str, Any]],
@@ -1020,6 +1222,38 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
     return segments, idle
 
 
+def _build_windows_model_segments(fixture: dict[str, Any]) -> list[dict[str, Any]]:
+    period, samples, gaps = _validate_fixture(fixture)
+    rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
+    universe = _period_model_universe(samples)
+    token_models, _dollar_models, idle, grouped = _windows_model_projection_data(
+        period,
+        rows,
+        universe,
+        gaps,
+    )
+    remaining = _remaining_projection(period, rows, token_models, gaps)
+    segments = _remaining_segments(samples, rows, remaining, token_models, gaps, idle)
+    for metric in ("tokens", "dollars"):
+        for family in sorted(grouped[metric], key=lambda value: value.encode("utf-8")):
+            projection = grouped[metric][family]
+            segments.extend(
+                _model_segments(rows, family, metric, projection, gaps, idle)
+            )
+    segments.sort(key=_segment_key)
+    return segments
+
+
+def build_expected_segments_by_platform(
+    fixture: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    linux, _idle = build_expected(fixture)
+    return {
+        "linux": linux,
+        "windows": _build_windows_model_segments(fixture),
+    }
+
+
 def _canonical_coordinate(
     timestamp: int,
     value: float,
@@ -1289,6 +1523,7 @@ def _canonical_smooth_path(
     idle_intervals: list[dict[str, int]],
     max_step: float,
     preserve_dash_phase: bool = False,
+    preserve_observed_plateaus: bool = False,
 ) -> str:
     commands: list[str] = []
     last_end: tuple[float, float] | None = None
@@ -1390,6 +1625,8 @@ def _canonical_smooth_path(
             if segment["style"] == "dashed"
             for index in (interval, interval + 1)
         }
+        if preserve_observed_plateaus:
+            preserved_indices.update(range(len(timestamps)))
         smoothed_values = _sampling_smoothed_values(
             timestamps,
             raw_values,
@@ -1433,6 +1670,7 @@ def _canonical_path(
     idle_intervals: list[dict[str, int]],
     max_step: float,
     preserve_dash_phase: bool = False,
+    preserve_observed_plateaus: bool = False,
 ) -> str:
     return _canonical_smooth_path(
         segments,
@@ -1444,6 +1682,7 @@ def _canonical_path(
         idle_intervals,
         max_step,
         preserve_dash_phase,
+        preserve_observed_plateaus,
     )
 
 
@@ -1584,21 +1823,36 @@ def build_expected_render_contracts(
     period, samples, gaps = _validate_fixture(fixture)
     rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
     universe = _period_model_universe(samples)
-    renderable_universe = tuple(model for model in universe if model in RENDERABLE_MODELS)
-    token_models = {
-        model: _model_projection(rows, model, "tokens") for model in universe
-    }
-    idle = _idle_intervals(period, rows, token_models, gaps)
-    dollar_models = {
-        model: _normalize_dollars_from_token_identity(
-            rows,
-            model,
-            _model_projection(rows, model, "dollars"),
-            token_models[model],
-            idle,
+    if platform == "windows":
+        token_models, dollar_models, idle, renderable_projections_by_metric = (
+            _windows_model_projection_data(period, rows, universe, gaps)
         )
-        for model in universe
-    }
+        renderable_universe = tuple(
+            sorted(
+                renderable_projections_by_metric["tokens"],
+                key=lambda value: value.encode("utf-8"),
+            )
+        )
+    else:
+        renderable_universe = tuple(model for model in universe if model in RENDERABLE_MODELS)
+        token_models = {
+            model: _model_projection(rows, model, "tokens") for model in universe
+        }
+        idle = _idle_intervals(period, rows, token_models, gaps)
+        dollar_models = {
+            model: _normalize_dollars_from_token_identity(
+                rows,
+                model,
+                _model_projection(rows, model, "dollars"),
+                token_models[model],
+                idle,
+            )
+            for model in universe
+        }
+        renderable_projections_by_metric = {
+            "tokens": {model: token_models[model] for model in renderable_universe},
+            "dollars": {model: dollar_models[model] for model in renderable_universe},
+        }
     remaining_evidence = _remaining_projection(period, rows, token_models, gaps)
     remaining_values = {
         point.timestamp: point.effective for point in remaining_evidence
@@ -1640,10 +1894,7 @@ def build_expected_render_contracts(
     )
     color_case = str.upper if platform == "windows" else str.lower
     for metric in ("dollars", "tokens"):
-        projections = token_models if metric == "tokens" else dollar_models
-        renderable_projections = {
-            model: projections[model] for model in renderable_universe
-        }
+        renderable_projections = renderable_projections_by_metric[metric]
         finite_values = [
             point.value
             for projection in renderable_projections.values()
@@ -1665,13 +1916,13 @@ def build_expected_render_contracts(
                 rows,
                 model,
                 metric,
-                projections[model],
+                renderable_projections[model],
                 gaps,
                 idle,
             )
             values = {
                 row["timestamp"]: point.value
-                for row, point in zip(rows, projections[model], strict=True)
+                for row, point in zip(rows, renderable_projections[model], strict=True)
                 if point.value is not None
             }
             models.append(
@@ -1705,8 +1956,8 @@ def build_expected_render_contracts(
                 "timestamp": period["end_at"],
                 "value": (
                     None
-                    if projections[model][-1].value is None
-                    else _json_number(projections[model][-1].value)
+                    if renderable_projections[model][-1].value is None
+                    else _json_number(renderable_projections[model][-1].value)
                 ),
             }
             for model in renderable_universe
@@ -1774,6 +2025,7 @@ def build_expected_render_contracts(
                     idle,
                     curve_max_step,
                     preserve_dash_phase=platform == "windows",
+                    preserve_observed_plateaus=platform == "windows",
                 ),
                 "solid": _canonical_path(
                     remaining_segments,
@@ -1784,6 +2036,7 @@ def build_expected_render_contracts(
                     True,
                     idle,
                     curve_max_step,
+                    preserve_observed_plateaus=platform == "windows",
                 ),
                 "dashed": _canonical_path(
                     remaining_segments,
@@ -1794,6 +2047,7 @@ def build_expected_render_contracts(
                     True,
                     idle,
                     curve_max_step,
+                    preserve_observed_plateaus=platform == "windows",
                 ),
             },
             "remaining_markers": markers,
@@ -1941,7 +2195,9 @@ def capture(
         "period": period,
         "history_page": history_page,
     }
-    expected_segments, expected_idle = build_expected(fixture)
+    expected_segments_by_platform = build_expected_segments_by_platform(fixture)
+    expected_segments = expected_segments_by_platform["linux"]
+    expected_idle = build_expected(fixture)[1]
     aggregate = hashlib.sha256()
     input_records = []
     for ordinal, (resource, page_index, body) in enumerate(inputs):
@@ -1966,6 +2222,7 @@ def capture(
         "input_sha256": aggregate.hexdigest(),
         "fixture": fixture,
         "expected_segments": expected_segments,
+        "expected_segments_by_platform": expected_segments_by_platform,
         "expected_render_contracts": build_expected_render_contracts(fixture),
         "actual_projection_segments": [],
         "expected_idle_intervals": expected_idle,
@@ -2058,6 +2315,33 @@ def _actual_document(path: Path, platform: str, artifact: dict[str, Any]) -> dic
     return document
 
 
+def _cross_platform_segment_mismatches(
+    linux_segments: list[dict[str, Any]],
+    windows_segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    endpoint_key = ("metric", "series", "start_at", "end_at")
+    linux_styles = {
+        tuple(item[key] for key in endpoint_key): item["style"]
+        for item in linux_segments
+    }
+    windows_styles = {
+        tuple(item[key] for key in endpoint_key): item["style"]
+        for item in windows_segments
+    }
+    return [
+        {
+            "metric": key[0],
+            "series": key[1],
+            "start_at": key[2],
+            "end_at": key[3],
+            "linux_style": linux_styles.get(key),
+            "windows_style": windows_styles.get(key),
+        }
+        for key in sorted(set(linux_styles) | set(windows_styles))
+        if linux_styles.get(key) != windows_styles.get(key)
+    ]
+
+
 def verify(evidence_path: Path, linux_path: Path, windows_path: Path) -> None:
     raw = evidence_path.read_bytes()
     if len(raw) > MAX_EVIDENCE_BYTES:
@@ -2066,9 +2350,15 @@ def verify(evidence_path: Path, linux_path: Path, windows_path: Path) -> None:
     if artifact.get("schema_version") != "graph-evidence-v1":
         raise EvidenceError("evidence document schema_version is invalid")
     recomputed_segments, recomputed_idle = build_expected(artifact["fixture"])
+    recomputed_segments_by_platform = build_expected_segments_by_platform(artifact["fixture"])
     recomputed_render = build_expected_render_contracts(artifact["fixture"])
     if artifact["expected_segments"] != recomputed_segments or artifact["expected_idle_intervals"] != recomputed_idle:
         raise EvidenceError("captured expectations do not match the independent oracle")
+    if (
+        "expected_segments_by_platform" in artifact
+        and artifact["expected_segments_by_platform"] != recomputed_segments_by_platform
+    ):
+        raise EvidenceError("captured platform segment expectations do not match the independent oracle")
     if artifact.get("expected_render_contracts") != recomputed_render:
         raise EvidenceError("captured render contract does not match the independent oracle")
     artifact_account_id = _validate_account_id(artifact.get("account_id"))
@@ -2077,18 +2367,25 @@ def verify(evidence_path: Path, linux_path: Path, windows_path: Path) -> None:
         raise EvidenceError("captured fixture account id does not match its envelope")
     if artifact["fixture"].get("published_pair") != artifact.get("published_pair"):
         raise EvidenceError("captured fixture published pair does not match its envelope")
-    expected = [
-        {key: segment[key] for key in ("metric", "series", "start_at", "end_at", "style")}
-        for segment in artifact["expected_segments"]
-    ]
+    expected_by_platform = {
+        "linux": [
+            {key: segment[key] for key in ("metric", "series", "start_at", "end_at", "style")}
+            for segment in artifact["expected_segments"]
+        ],
+        "windows": [
+            {key: segment[key] for key in ("metric", "series", "start_at", "end_at", "style")}
+            for segment in recomputed_segments_by_platform["windows"]
+        ],
+    }
     actual_by_platform = {
         "linux": _actual_document(linux_path, "linux", artifact),
         "windows": _actual_document(windows_path, "windows", artifact),
     }
     combined: list[dict[str, Any]] = []
     comparison_keys = ("metric", "series", "start_at", "end_at", "style")
-    expected_counter = Counter(tuple(item[key] for key in comparison_keys) for item in expected)
     for platform, document in actual_by_platform.items():
+        expected = expected_by_platform[platform]
+        expected_counter = Counter(tuple(item[key] for key in comparison_keys) for item in expected)
         actual = document["segments"]
         actual_counter = Counter(tuple(item[key] for key in comparison_keys) for item in actual)
         missing = expected_counter - actual_counter
@@ -2107,26 +2404,14 @@ def verify(evidence_path: Path, linux_path: Path, windows_path: Path) -> None:
                 unexpected[key] -= 1
         artifact["actual_idle_intervals"][platform] = document["idle_intervals"]
         combined.extend(dict(item, platform=platform) for item in actual)
-    linux_styles = {
-        tuple(item[key] for key in ("metric", "series", "start_at", "end_at")): item["style"]
-        for item in actual_by_platform["linux"]["segments"]
-    }
-    windows_styles = {
-        tuple(item[key] for key in ("metric", "series", "start_at", "end_at")): item["style"]
-        for item in actual_by_platform["windows"]["segments"]
-    }
-    artifact["cross_platform_mismatches"] = [
-        {
-            "metric": key[0],
-            "series": key[1],
-            "start_at": key[2],
-            "end_at": key[3],
-            "linux_style": linux_styles.get(key),
-            "windows_style": windows_styles.get(key),
-        }
-        for key in sorted(set(linux_styles) | set(windows_styles))
-        if linux_styles.get(key) != windows_styles.get(key)
-    ]
+    artifact["cross_platform_mismatches"] = _cross_platform_segment_mismatches(
+        actual_by_platform["linux"]["segments"],
+        actual_by_platform["windows"]["segments"],
+    )
+    expected_cross_platform_mismatches = _cross_platform_segment_mismatches(
+        recomputed_segments_by_platform["linux"],
+        recomputed_segments_by_platform["windows"],
+    )
     artifact["actual_projection_segments"] = sorted(
         combined,
         key=lambda item: (item["platform"],) + _segment_key(item),
@@ -2134,7 +2419,7 @@ def verify(evidence_path: Path, linux_path: Path, windows_path: Path) -> None:
     failures = (
         any(artifact["unmatched_expected"].values())
         or any(artifact["unmatched_actual"].values())
-        or artifact["cross_platform_mismatches"]
+        or artifact["cross_platform_mismatches"] != expected_cross_platform_mismatches
         or any(
             actual_by_platform[platform]["render_contracts"]
             != build_expected_render_contracts(artifact["fixture"], platform=platform)

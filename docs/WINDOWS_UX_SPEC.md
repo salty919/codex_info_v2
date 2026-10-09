@@ -461,13 +461,16 @@ component順や表示所有者を変更しない。
   過去期間は維持する。Mainが受理したquotaのreset/window変更は期間取得を促す通知として扱い、canonical IDは
   same-pairの期間ディレクトリから決める。同じquota pairの観測更新だけでは追加取得しない。通知以前の遅延応答は
   revisionで棄却し、選択やgraphを古い期間へ戻さない。
-- 現期間の確認済み開始時刻から最初の実測へ、モデルは0、Remainingは100%を起点とする表示専用実線を引く。
-  0/100%の実測観測は不要であり、最初の実測が正のtokens/95%でも接続する。開始authorityと欠損を跨がない条件は
-  `G137-6`に従い、補助点をhoverの実測値として表示しない。過去期間や固定時間窓の左端からは値を作らない。
+- 確認済み期間開始から最初の実測へ、Remainingは現期間・過去期間とも100%を起点とする表示専用実線を引く。
+  モデルの0起点は現期間だけとする。0/100%の実測観測は不要であり、最初の実測が正のtokens/95%でも接続する。
+  開始authorityと欠損を跨がない条件は`G137-6`に従い、補助点をhoverの実測値として表示しない。
+  開始authority不明の期間や固定時間窓の左端からは値を作らない。
 - Windowsグラフの角丸枠は内容の描画に覆われず全周を連続して表示する。内容のclipと枠線の描画順を分離し、枠線はplotのhoverや入力を妨げない。通常・最小サイズとresize時にも角を保持する。
 - Windowsでは右端の常時数値ラベル・leader・専用gutterを置かず、その横幅をplotへ割り当てる。線端の切れを避ける通常の描画余白と軸ラベルの余白は、数値表示の専用領域とは分離する。横方向のresize差分はplotへ割り当て、縦軸の意味と期間の端点は変えない。Linuxの右端ラベルは従来どおり維持する。
 - Windowsのplot内でマウスを動かすと、近い一つの実観測時刻の日時と表示中の全系列をまとめたツールチップを出す。日時は表示timezone、Tokensは元の整数精度、Dollarsはその観測点のaccepted/read-time補正値、Remainingはraw観測値を用い、単位を明示する。欠けた系列は`—`とし、補間・hold・synthetic tailを実観測値として出さない。viewport内の同じreset期間だけを探索し、confirmed gapや非所有区間を越えて別時刻の値を拾わない。非表示系列は除外し、pointer離脱・scene/metric/表示系列の変更・リサイズ時に旧ツールチップを残さない。観測索引はscene生成時に保持し、pointer移動で全履歴の再投影や全件走査を行わない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
+- 完全集計から省略された未使用familyは、G137-2の同一reset・既知0・過去正値なし条件を満たす場合だけ、表示合計0を実線とhoverで示す。
+  完全な空集合と取得不能を区別し、既知0 memberの省略を実際のモデル版の利用開始後も欠測扱いにしない。未取得・既知0でないmemberの欠落・正の累計の消失は従来の欠測表示を維持する。rawモデル行、集計額、idleの証拠へ表示0を追加しない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
 - `reconstructed-from-session`、`unknown`、`unavailable`および（`legacy-unknown`を除く）`models_complete=false`ではモデル数値を表示せず、
   model key/sourceと欠損metadataだけを表示する。`legacy-unknown`は保存済みの同じmodel keyの値だけ表示でき、集計・予測には使わないが、同一runの同一非空model集合・lossless raw tokenとraw Remainingの完全不変・欠測／異常／confirmed gapなしを全て満たす場合だけidle判定に利用できる。
@@ -496,8 +499,8 @@ component順や表示所有者を変更しない。
   gapまたは利用の証拠にせず、正常なaccepted raw endpointが上記条件を満たすintervalを分断しない。ドルの変化・欠測・異常はidleの開始・分断・終了条件にしない。上記条件を満たす連続10分以上のrunだけをgray表示し、同じX範囲の全modelとRemainingを1px水平実線にする。観測点数やaccepted raw endpointを欠く欠測時間だけで確定しない。
   10分は画面幅に依存しない意味閾値とし、pixel幅filter、最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
   Remainingは`G137-6`に従い、accepted raw値を元時刻・元値の証拠として保持し、token増分またはtask lifecycleでraw値を
-  移動しない。表示geometryでは未使用と確定できないsampling由来の同値反復を折れ点にせず、有効な変化点間を単調PCHIPの
-  3px実線で滑らかにつなぐ。確定idleだけはbandと同じX範囲のexactな1px水平実線として分離する。raw-null、unavailable、confirmed gap、異常、
+  移動しない。表示geometryも同値反復を含む全accepted観測点を通過し、横ばい区間と変化時刻を保つ。隣接観測間だけを
+  単調PCHIPの3px実線でつなぎ、実測の横ばいを滑らかな減少へ置き換えない。確定idleだけはbandと同じX範囲のexactな1px水平実線として分離する。raw-null、unavailable、confirmed gap、異常、
   terminal holdだけを1px破線の予測とし、導出値をanchorへ昇格させずAPI/DBへ書き戻さない。
   `Remaining`のeffective値からmodel系列の値またはそのperiod tailを外挿しない。
   raw-null補間、gap、異常、終端hold等の欠測・予測の破線は

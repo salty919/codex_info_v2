@@ -864,6 +864,191 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         self.assertEqual([[0, 60], [60, 120], [120, 180]], pairs(fallback_segments, "solid"))
         self.assertEqual([], pairs(fallback_segments, "dashed"))
 
+    def test_windows_family_projection_requires_prior_exact_zero_and_keeps_raw_linux_contract(self):
+        fixture = v3_fixture(
+            [
+                {
+                    "timestamp": 0,
+                    "remaining_percent": 100,
+                    "models": [
+                        {"model": "SOL", "total_tokens": 0, "total_dollars": 0.0},
+                    ],
+                    "models_complete": False,
+                    "model_source": "legacy-unknown",
+                },
+                {
+                    "timestamp": 60,
+                    "remaining_percent": 100,
+                    "models": [],
+                    "models_complete": True,
+                    "model_source": "confirmed",
+                },
+                {
+                    "timestamp": 120,
+                    "remaining_percent": 99,
+                    "models": [
+                        {"model": "gpt-6-sol", "total_tokens": 5, "total_dollars": 2.5},
+                    ],
+                    "models_complete": True,
+                    "model_source": "confirmed",
+                },
+            ],
+            period_id="known-zero-sol-family",
+        )
+        fixture["published_pair"] = self.document["parity_v3"]["published_pair"]
+        common_segments, expected_idle = oracle.build_expected(fixture)
+        self.assertEqual([], expected_idle)
+        self.assertFalse(any(segment["series"] == "gpt-6-sol" for segment in common_segments))
+
+        contracts = oracle.build_expected_render_contracts(fixture, platform="windows")
+        self.assertEqual(
+            ["SOL"],
+            [model["series"] for model in contracts["tokens"]["models"]],
+        )
+
+        for metric in ("tokens", "dollars"):
+            endpoint = next(item for item in contracts[metric]["endpoint_values"] if item["series"] == "SOL")
+            self.assertEqual(5 if metric == "tokens" else 2.5, endpoint["value"])
+
+        by_platform = oracle.build_expected_segments_by_platform(fixture)
+        self.assertEqual(common_segments, by_platform["linux"])
+        for metric in ("tokens", "dollars"):
+            self.assertEqual([[0, 60]], pairs(by_platform["windows"], "flat", metric, "SOL"))
+            self.assertEqual([[60, 120]], pairs(by_platform["windows"], "rising", metric, "SOL"))
+        self._assert_verify_result(
+            lambda _document: None,
+            expect_failure=False,
+            fixture=fixture,
+        )
+        self._assert_verify_result(
+            lambda _document: None,
+            expect_failure=False,
+            fixture=fixture,
+            include_platform_segments=False,
+        )
+
+        no_prior_zero = v3_fixture(
+            [
+                {"timestamp": 0, "remaining_percent": 100, "models": [], "models_complete": True},
+                {"timestamp": 60, "remaining_percent": 100, "models": [], "models_complete": True},
+                {
+                    "timestamp": 120,
+                    "remaining_percent": 99,
+                    "models": [
+                        {"model": "gpt-6-sol", "total_tokens": 5, "total_dollars": 2.5},
+                    ],
+                    "models_complete": True,
+                },
+            ],
+            period_id="no-prior-sol-zero",
+        )
+        no_prior_segments = oracle.build_expected_segments_by_platform(no_prior_zero)["windows"]
+        self.assertEqual([], [segment for segment in no_prior_segments if segment["series"] == "SOL"])
+
+        incomplete_positive = v3_fixture(
+            [
+                {
+                    "timestamp": 0,
+                    "remaining_percent": 100,
+                    "models": [{"model": "SOL", "total_tokens": 0, "total_dollars": 0.0}],
+                    "models_complete": False,
+                    "model_source": "legacy-unknown",
+                },
+                {
+                    "timestamp": 60,
+                    "remaining_percent": 99,
+                    "models": [{"model": "SOL", "total_tokens": 5, "total_dollars": 2.5}],
+                    "models_complete": False,
+                    "model_source": "confirmed",
+                },
+                {"timestamp": 120, "remaining_percent": 98, "models": [], "models_complete": True},
+            ],
+            period_id="incomplete-positive-breaks-zero",
+        )
+        incomplete_segments = oracle.build_expected_segments_by_platform(incomplete_positive)["windows"]
+        self.assertFalse(
+            any(
+                segment["series"] == "SOL"
+                and segment["end_at"] >= 60
+                and segment["style"] != "dashed"
+                for segment in incomplete_segments
+            )
+        )
+
+        previously_positive = v3_fixture(
+            [
+                {
+                    "timestamp": 0,
+                    "remaining_percent": 100,
+                    "models": [{"model": "SOL", "total_tokens": 0, "total_dollars": 0.0}],
+                    "models_complete": False,
+                    "model_source": "legacy-unknown",
+                },
+                {
+                    "timestamp": 60,
+                    "remaining_percent": 99,
+                    "models": [{"model": "SOL", "total_tokens": 5, "total_dollars": 2.5}],
+                    "models_complete": True,
+                    "model_source": "confirmed",
+                },
+                {"timestamp": 120, "remaining_percent": 98, "models": [], "models_complete": True},
+            ],
+            period_id="prior-positive-sol",
+        )
+        positive_segments = oracle.build_expected_segments_by_platform(previously_positive)["windows"]
+        for metric in ("tokens", "dollars"):
+            self.assertEqual([[0, 60]], pairs(positive_segments, "rising", metric, "SOL"))
+            self.assertEqual([[60, 120]], pairs(positive_segments, "dashed", metric, "SOL"))
+            self.assertEqual([], pairs(positive_segments, "flat", metric, "SOL"))
+
+        unsupported_alias = v3_fixture(
+            [
+                {
+                    "timestamp": 0,
+                    "remaining_percent": 100,
+                    "models": [{"model": "SOL", "total_tokens": 0, "total_dollars": 0.0}],
+                    "models_complete": False,
+                    "model_source": "legacy-unknown",
+                },
+                {
+                    "timestamp": 60,
+                    "remaining_percent": 99,
+                    "models": [{"model": "gpt-7-sol", "total_tokens": 5, "total_dollars": 2.5}],
+                    "models_complete": True,
+                    "model_source": "confirmed",
+                },
+            ],
+            period_id="unlisted-version-is-not-a-family",
+        )
+        unsupported_segments = oracle.build_expected_segments_by_platform(unsupported_alias)["windows"]
+        self.assertEqual([[0, 60]], pairs(unsupported_segments, "flat", "tokens", "SOL"))
+        self.assertFalse(any(segment["series"] == "gpt-7-sol" for segment in unsupported_segments))
+
+    def test_windows_remaining_rendering_preserves_observed_plateaus(self):
+        fixture = v3_fixture(
+            [
+                {"timestamp": 0, "remaining_percent": 100, "tokens": 0, "dollars": 0},
+                {"timestamp": 60, "remaining_percent": 100, "tokens": 1, "dollars": 0.1},
+                {"timestamp": 120, "remaining_percent": 100, "tokens": 2, "dollars": 0.2},
+                {"timestamp": 180, "remaining_percent": 90, "tokens": 3, "dollars": 0.3},
+            ],
+            period_id="remaining-observed-plateau",
+        )
+        linux = oracle.build_expected_render_contracts(fixture, platform="linux")["tokens"]
+        windows = oracle.build_expected_render_contracts(fixture, platform="windows")["tokens"]
+        self.assertIn("L33.33 1.00", windows["remaining"]["solid"])
+        self.assertIn("L66.67 1.00", windows["remaining"]["solid"])
+        self.assertNotIn("L33.33 1.00", linux["remaining"]["solid"])
+        self.assertEqual(
+            [
+                {"timestamp": 0, "value": "100.000000000000", "origin": "raw"},
+                {"timestamp": 60, "value": "100.000000000000", "origin": "raw"},
+                {"timestamp": 120, "value": "100.000000000000", "origin": "raw"},
+                {"timestamp": 180, "value": "90.000000000000", "origin": "raw"},
+            ],
+            windows["remaining_points"],
+        )
+
     def test_task_activity_does_not_shape_model_or_remaining_geometry(self):
         def fixture(activity):
             return v3_fixture(
@@ -1031,14 +1216,37 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             artifact = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual("account-2", artifact["account_id"])
             self.assertEqual("account-2", artifact["fixture"]["account_id"])
+            self.assertEqual(
+                oracle.build_expected_segments_by_platform(artifact["fixture"]),
+                artifact["expected_segments_by_platform"],
+            )
+            self.assertEqual(
+                artifact["expected_segments_by_platform"]["linux"],
+                artifact["expected_segments"],
+            )
 
-    def _assert_verify_result(self, mutate, *, artifact_account_id=None, expect_failure=True, mutate_linux=None):
-        fixture = copy.deepcopy(self.document["parity_v3"])
-        expected_segments, expected_idle = oracle.build_expected(fixture)
-        actual_segments = [
-            {key: segment[key] for key in ("metric", "series", "start_at", "end_at", "style")}
-            for segment in expected_segments
-        ]
+    def _assert_verify_result(
+        self,
+        mutate,
+        *,
+        artifact_account_id=None,
+        expect_failure=True,
+        mutate_linux=None,
+        fixture=None,
+        include_platform_segments=True,
+        mutate_artifact=None,
+    ):
+        fixture = copy.deepcopy(fixture or self.document["parity_v3"])
+        expected_by_platform = oracle.build_expected_segments_by_platform(fixture)
+        expected_segments = expected_by_platform["linux"]
+        expected_idle = oracle.build_expected(fixture)[1]
+        actual_by_platform = {
+            platform: [
+                {key: segment[key] for key in ("metric", "series", "start_at", "end_at", "style")}
+                for segment in segments
+            ]
+            for platform, segments in expected_by_platform.items()
+        }
         expected_render = oracle.build_expected_render_contracts(fixture)
         artifact = {
             "schema_version": "graph-evidence-v1",
@@ -1058,19 +1266,28 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             "unmatched_actual": {"linux": [], "windows": []},
             "cross_platform_mismatches": [],
         }
-        actual = {
+        if include_platform_segments:
+            artifact["expected_segments_by_platform"] = expected_by_platform
+        linux = {
             "schema_version": "graph-actual-v1",
             "source_sha": "a" * 40,
             "input_sha256": "b" * 64,
             "published_pair": fixture["published_pair"],
-            "segments": actual_segments,
+            "platform": "linux",
+            "segments": actual_by_platform["linux"],
             "idle_intervals": expected_idle,
             "render_contracts": copy.deepcopy(expected_render),
         }
-        linux = copy.deepcopy(actual)
-        linux["platform"] = "linux"
-        windows = copy.deepcopy(actual)
-        windows["platform"] = "windows"
+        windows = {
+            "schema_version": "graph-actual-v1",
+            "source_sha": "a" * 40,
+            "input_sha256": "b" * 64,
+            "published_pair": fixture["published_pair"],
+            "platform": "windows",
+            "segments": actual_by_platform["windows"],
+            "idle_intervals": expected_idle,
+            "render_contracts": copy.deepcopy(expected_render),
+        }
         windows["render_contracts"] = oracle.build_expected_render_contracts(
             fixture,
             platform="windows",
@@ -1078,6 +1295,8 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         if mutate_linux is not None:
             mutate_linux(linux)
         mutate(windows)
+        if mutate_artifact is not None:
+            mutate_artifact(artifact)
         with tempfile.TemporaryDirectory() as directory:
             evidence_path = Path(directory) / "evidence.json"
             linux_path = Path(directory) / "linux.json"
@@ -1093,6 +1312,21 @@ class GraphLiveEvidenceTests(unittest.TestCase):
 
     def test_verify_accepts_windows_subtle_idle_without_changing_linux(self):
         self._assert_verify_result(lambda document: None, expect_failure=False)
+
+    def test_verify_rejects_mutated_platform_specific_segment_expectation(self):
+        self._assert_verify_result(
+            lambda _document: None,
+            mutate_artifact=lambda artifact: artifact["expected_segments_by_platform"]["windows"].append(
+                {
+                    "metric": "tokens",
+                    "series": "SOL",
+                    "start_at": 0,
+                    "end_at": 60,
+                    "style": "flat",
+                    "causes": [],
+                }
+            ),
+        )
 
     def test_verify_rejects_old_windows_idle_color(self):
         self._assert_verify_result(

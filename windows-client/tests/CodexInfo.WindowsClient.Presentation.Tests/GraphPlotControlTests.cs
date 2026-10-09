@@ -1956,8 +1956,11 @@ public sealed class GraphPlotControlTests
         AddLiveSegments(actualSegments, "remaining", "remaining", "solid", remaining.Solid);
         AddLiveSegments(actualSegments, "remaining", "remaining", "dashed", remaining.Dashed);
         var orderedActual = OrderLiveSegments(actualSegments);
+        var expectedSegmentElements = root.TryGetProperty("expected_segments_by_platform", out var platformSegments)
+            ? platformSegments.GetProperty("windows")
+            : root.GetProperty("expected_segments");
         var expectedSegments = OrderLiveSegments(
-            root.GetProperty("expected_segments")
+            expectedSegmentElements
                 .EnumerateArray()
                 .Select(segment => new LiveGraphSegment(
                     segment.GetProperty("metric").GetString()!,
@@ -2943,7 +2946,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Remaining_sampling_plateaus_are_smoothed_only_in_renderer_geometry()
+    public void Remaining_smoothing_preserves_observed_plateaus_and_change_times()
     {
         var points = new[]
         {
@@ -2978,8 +2981,8 @@ public sealed class GraphPlotControlTests
         Assert.Equal([100d, 100d, 99d, 99d, 98d], rawLines.Solid.Y);
         Assert.Equal([3_400d, 4_000d], rawLines.Idle.X);
         Assert.Equal([98d, 98d], rawLines.Idle.Y);
-        Assert.InRange(RenderedAt(rendered, 1_600), 99.000_001, 99.999_999);
-        Assert.InRange(RenderedAt(rendered, 2_800), 98.000_001, 98.999_999);
+        Assert.Equal(100d, RenderedAt(rendered, 1_600), precision: 6);
+        Assert.Equal(99d, RenderedAt(rendered, 2_800), precision: 6);
         Assert.Equal(98d, RenderedAt(renderedIdle, 3_400), precision: 6);
         Assert.Equal(98d, RenderedAt(renderedIdle, 4_000), precision: 6);
         var idle = Assert.Single(scene.IdleIntervals);
@@ -3003,7 +3006,24 @@ public sealed class GraphPlotControlTests
             .BuildCanonicalRemainingLines(activeTailScene)
             .Solid.Line;
         Assert.Empty(activeTailScene.IdleIntervals);
-        Assert.InRange(RenderedAt(activeTailRendered, 3_400), 20.000_001, 59.999_999);
+        Assert.Equal(100d, RenderedAt(activeTailRendered, 1_600), precision: 6);
+        Assert.Equal(60d, RenderedAt(activeTailRendered, 2_200), precision: 6);
+        Assert.Equal(60d, RenderedAt(activeTailRendered, 2_800), precision: 6);
+        Assert.Equal(20d, RenderedAt(activeTailRendered, 3_400), precision: 6);
+        foreach (var (start, end, value) in new[] { (1_000d, 1_600d, 100d), (2_200d, 2_800d, 60d), (3_400d, 4_000d, 20d) })
+        {
+            var plateau = activeTailRendered.X.Zip(activeTailRendered.Y)
+                .Where(pair => pair.First >= start && pair.First <= end).ToArray();
+            Assert.NotEmpty(plateau);
+            Assert.All(plateau, pair => Assert.Equal(value, pair.Second, precision: 6));
+        }
+        var renderDirectory = Environment.GetEnvironmentVariable("CODEX_INFO_REMAINING_PLATEAU_RENDER_DIR");
+        if (!string.IsNullOrWhiteSpace(renderDirectory))
+        {
+            Directory.CreateDirectory(renderDirectory);
+            new GraphPlotControl { Scene = activeTailScene }.Plot.SavePng(
+                Path.Combine(renderDirectory, "remaining-observed-plateaus.png"), 940, 480);
+        }
         Assert.Equal(20d, RenderedAt(activeTailRendered, 4_000), precision: 6);
 
         var activeModelPoints = new[]
@@ -3076,6 +3096,172 @@ public sealed class GraphPlotControlTests
         Assert.Empty(remaining.Dashed.X);
     }
 
+    [Theory]
+    [InlineData(GraphMetric.Dollars)]
+    [InlineData(GraphMetric.Tokens)]
+    public void Confirmed_complete_unused_family_remains_solid_zero(GraphMetric metric)
+    {
+        static ApiHistoryModelSample Model(string name, ulong tokens, double? dollars) =>
+            new(name, null, null, null, dollars) { TotalTokens = tokens };
+
+        static ApiHistorySample Complete(long timestamp, params ApiHistoryModelSample[] models) =>
+            new(
+                timestamp,
+                2_000,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                ModelSamples = models,
+            };
+
+        var legacyZero = CompleteModelSample(
+            1_000,
+            null,
+            0,
+            0,
+            ApiHistorySample.LegacyUnknownModelSource) with
+        {
+            ModelSamples =
+            [
+                Model("SOL", 0, 0),
+                Model("TERRA", 0, 0),
+                Model("LUNA", 0, 0),
+                Model("mystery-model", 0, 0),
+            ],
+        };
+        var samples = new[]
+        {
+            legacyZero,
+            Complete(
+                1_060,
+                Model("LUNA", 0, 0),
+                Model("ASTRA", 10, 1),
+                Model("mystery-model", 0, 0)),
+            Complete(
+                1_120,
+                Model("LUNA", 0, 0),
+                Model("ASTRA", 20, 2)),
+            Complete(
+                1_180,
+                Model("LUNA", 0, 0),
+                Model("ASTRA", 30, 3),
+                Model("gpt-6-sol", 5, 2.5),
+                Model("gpt-5.6-terra", 7, 1.75)),
+        };
+
+        var scene = GraphScene.Create(samples, metric, 1_000, 1_180);
+        var solLines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        var terraLines = GraphPlotProjection.BuildModelLines(scene, scene.Terra);
+        var visibleSol = new HashSet<GraphSeries> { GraphSeries.Sol };
+        var visibleTerra = new HashSet<GraphSeries> { GraphSeries.Terra };
+        var expectedSol = metric == GraphMetric.Tokens
+            ? new[] { 0d, 0d, 0d, 5d }
+            : new[] { 0d, 0d, 0d, 2.5d };
+        var expectedTerra = metric == GraphMetric.Tokens
+            ? new[] { 0d, 0d, 0d, 7d }
+            : new[] { 0d, 0d, 0d, 1.75d };
+
+        Assert.Equal(expectedSol, scene.Sol);
+        Assert.Equal(expectedTerra, scene.Terra);
+        Assert.All(scene.ModelLineReliability["SOL"], Assert.True);
+        Assert.All(scene.ModelLineReliability["TERRA"], Assert.True);
+        Assert.Empty(solLines.Dashed.X);
+        Assert.Empty(terraLines.Dashed.X);
+        Assert.Equal(0d, scene.ModelSeries["mystery-model"][2]);
+        Assert.False(scene.ModelReliability["mystery-model"][2]);
+        Assert.False(scene.ModelLineReliability["mystery-model"][2]);
+
+        Assert.False(scene.ModelReliability["SOL"][1]);
+        Assert.False(scene.TokenReliability["SOL"][1]);
+        Assert.False(scene.ModelVectorAvailable[1]);
+        Assert.Empty(scene.IdleIntervals);
+        Assert.Equal(7.25d, scene.PeriodCost.RecordedDollars);
+        Assert.False(scene.PeriodCost.IsComplete);
+        Assert.DoesNotContain(samples[1].ModelSamples!, model => model.Name == "SOL");
+        Assert.DoesNotContain(samples[3].ModelSamples!, model => model.Name == "SOL");
+        Assert.Equal(5d, scene.TokenModelSeries["gpt-6-sol"][3]);
+        Assert.NotEqual(5d, scene.TokenModelSeries["SOL"][3]);
+
+        foreach (var (timestamp, expectedSolTokens, expectedTerraTokens, expectedSolDollars, expectedTerraDollars) in new[]
+        {
+            (1_060L, 0UL, 0UL, 0d, 0d),
+            (1_120L, 0UL, 0UL, 0d, 0d),
+            (1_180L, 5UL, 7UL, 2.5d, 1.75d),
+        })
+        {
+            var solHover = Assert.IsType<GraphHoverSnapshot>(
+                GraphHoverProjection.Find(scene, timestamp, visibleSol));
+            var solRow = Assert.Single(solHover.Rows);
+            var terraHover = Assert.IsType<GraphHoverSnapshot>(
+                GraphHoverProjection.Find(scene, timestamp, visibleTerra));
+            var terraRow = Assert.Single(terraHover.Rows);
+            if (metric == GraphMetric.Tokens)
+            {
+                Assert.Equal(expectedSolTokens, solRow.TokenValue);
+                Assert.Equal(expectedTerraTokens, terraRow.TokenValue);
+                Assert.Null(solRow.NumericValue);
+                Assert.Null(terraRow.NumericValue);
+            }
+            else
+            {
+                Assert.Equal(expectedSolDollars, solRow.NumericValue);
+                Assert.Equal(expectedTerraDollars, terraRow.NumericValue);
+                Assert.Null(solRow.TokenValue);
+                Assert.Null(terraRow.TokenValue);
+            }
+        }
+
+        var noPublishedSol = GraphScene.Create(
+            [
+                Complete(2_000, Model("LUNA", 0, 0), Model("ASTRA", 1, 1)),
+                Complete(2_060, Model("LUNA", 0, 0), Model("ASTRA", 2, 2)),
+            ],
+            metric,
+            2_000,
+            2_060);
+        Assert.DoesNotContain("SOL", noPublishedSol.ModelSeries.Keys);
+
+        var renderDirectory = Environment.GetEnvironmentVariable("CODEX_INFO_CONFIRMED_ZERO_FAMILY_RENDER_DIR");
+        if (!string.IsNullOrWhiteSpace(renderDirectory))
+        {
+            Directory.CreateDirectory(renderDirectory);
+            var suffix = metric == GraphMetric.Tokens ? "tokens" : "dollars";
+            var imagePath = Path.Combine(renderDirectory, $"confirmed-zero-family-{suffix}.png");
+            new GraphPlotControl { Scene = scene }.Plot.SavePng(imagePath, 940, 480);
+            Assert.True(new FileInfo(imagePath).Length > 0);
+        }
+    }
+
+    [Fact]
+    public void Partial_positive_observation_disqualifies_later_omission_as_known_zero()
+    {
+        var partial = CompleteModelSample(1_060, 90, 10, 10) with { ModelsComplete = false };
+        var omitted = CompleteModelSample(1_120, 90, 0, 0) with
+        {
+            ModelSamples = [new ApiHistoryModelSample("LUNA", null, null, null, 1) { TotalTokens = 1 }],
+        };
+        var scene = GraphScene.Create(
+            [CompleteModelSample(1_000, 90, 0, 0), partial, omitted],
+            GraphMetric.Tokens,
+            1_000,
+            1_120);
+
+        // A partial positive row cannot prove a complete total, but it rules out
+        // confirmed non-use. The following omission must remain unknown.
+        Assert.False(scene.ModelLineReliability["SOL"][2]);
+        var hover = Assert.IsType<GraphHoverSnapshot>(GraphHoverProjection.Find(
+            scene, 1_120, new HashSet<GraphSeries> { GraphSeries.Sol }));
+        Assert.Null(Assert.Single(hover.Rows).TokenValue);
+        Assert.NotEmpty(GraphPlotProjection.BuildModelLines(scene, scene.Sol).Dashed.X);
+    }
+
     [Fact]
     public void Complete_model_omission_is_not_replaced_with_zero_evidence()
     {
@@ -3108,7 +3294,9 @@ public sealed class GraphPlotControlTests
         var scene = GraphScene.Create(samples, GraphMetric.Dollars, 940, 1_240);
 
         Assert.True(double.IsNaN(scene.Sol[0]));
-        Assert.Equal([0d, 5d, 10d], scene.Sol.Skip(1).Take(3));
+        Assert.Equal([0d, 0d, 10d], scene.Sol.Skip(1).Take(3));
+        Assert.Equal(5d, scene.TokenModelSeries["SOL"][2]);
+        Assert.False(scene.ModelReliability["SOL"][2]);
         Assert.Equal(10.5d, scene.Sol[4]);
         Assert.Equal(11d, scene.Sol[5]);
         Assert.Equal([false, true, false, true, false, true], scene.ModelReliability["SOL"]);
@@ -3645,6 +3833,131 @@ public sealed class GraphPlotControlTests
         Assert.InRange(displayLines.Solid.Line.X[1], firstObservation - 1d, firstObservation + 1d);
         Assert.Equal(90d, displayLines.Solid.Line.Y[1]);
         Assert.Empty(displayLines.Dashed.Line.X);
+    }
+
+    [Theory]
+    [InlineData(GraphMetric.Dollars)]
+    [InlineData(GraphMetric.Tokens)]
+    public void Published_historical_period_connects_full_quota_to_first_observation(GraphMetric metric)
+    {
+        const long periodStart = 1_790_978_640;
+        const long firstRaw = 1_791_030_180;
+        const long secondRaw = 1_791_030_240;
+        const long resetAt = 1_791_580_246;
+        const long viewportStart = 1_790_891_460;
+        const long viewportEnd = 1_791_496_260;
+        var samples = new[]
+        {
+            CompleteModelSample(periodStart, null, 0, 0) with { ResetAt = resetAt },
+            CompleteModelSample(firstRaw, 89, 1, 10) with { ResetAt = resetAt },
+            CompleteModelSample(secondRaw, 88, 2, 20) with { ResetAt = resetAt },
+        };
+
+        GraphScene CreateScene(
+            long? publishedStart,
+            IReadOnlyList<GraphConfirmedGap>? gaps = null,
+            IReadOnlyList<GraphAccountOwnershipInterval>? ownership = null) => GraphScene.Create(
+                samples,
+                metric,
+                periodStart,
+                1_791_343_800,
+                gaps,
+                hiddenModelNames: null,
+                ownership,
+                resetAt,
+                isVerifiedCurrentResetStart: false,
+                publishedPeriodStartAt: publishedStart);
+
+        var scene = CreateScene(periodStart);
+        var viewport = GraphScene.CreateViewport(viewportStart, viewportEnd, metric, [scene]);
+        var periodControl = new GraphPlotControl { Scene = scene };
+        var viewportControl = new GraphPlotControl { Scene = viewport };
+        var outputDirectory = Environment.GetEnvironmentVariable("CODEX_INFO_HISTORICAL_QUOTA_RENDER_DIR");
+        if (!string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            Directory.CreateDirectory(outputDirectory);
+            var suffix = metric == GraphMetric.Tokens ? "tokens" : "dollars";
+            periodControl.Plot.SavePng(Path.Combine(outputDirectory, $"historical-quota-{suffix}-period.png"), 940, 480);
+            viewportControl.Plot.SavePng(Path.Combine(outputDirectory, $"historical-quota-{suffix}-7d.png"), 940, 480);
+        }
+
+        Assert.Equal([periodStart, firstRaw, secondRaw], scene.Timestamps.Select(value => (long)value));
+        Assert.True(double.IsNaN(scene.Remaining[0]));
+        Assert.Equal([89d, 88d], scene.Remaining.Skip(1));
+        Assert.True(double.IsNaN(scene.ObservedRemainingValues[0]));
+        Assert.Equal([89d, 88d], scene.ObservedRemainingValues.Skip(1));
+        Assert.Equal([periodStart, firstRaw, secondRaw], scene.HoverObservations.Select(value => value.Timestamp));
+        Assert.All(scene.HoverObservations, observation => Assert.Equal(resetAt, observation.ResetAt));
+
+        var remainingOnly = new HashSet<GraphSeries> { GraphSeries.Remaining };
+        foreach (var (timestamp, expected) in new[]
+        {
+            (periodStart, (double?)null),
+            (firstRaw, (double?)89),
+            (secondRaw, (double?)88),
+        })
+        {
+            var hover = GraphHoverProjection.Find(scene, timestamp, remainingOnly);
+            Assert.NotNull(hover);
+            Assert.Equal(expected, Assert.Single(hover.Rows).NumericValue);
+        }
+
+        var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.DoesNotContain((double)periodStart, rawLines.Solid.X);
+        Assert.DoesNotContain((double)periodStart, rawLines.Dashed.X);
+
+        var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        // Canonical display coordinates round the 0..100 viewbox to hundredths.
+        // Over the published 365160-second period, these raw times map to
+        // 14.11 and 14.13 percent. Raw/hover timestamps above remain exact.
+        const double firstDisplay = 1_791_030_164.076;
+        const double secondDisplay = 1_791_030_237.108;
+        var startIndex = Array.IndexOf(displayLines.Solid.Line.X.ToArray(), (double)periodStart);
+        var firstIndex = Array.FindIndex(displayLines.Solid.Line.X.ToArray(), x => Math.Abs(x - firstDisplay) < 0.000001);
+        var secondIndex = Array.FindIndex(displayLines.Solid.Line.X.ToArray(), x => Math.Abs(x - secondDisplay) < 0.000001);
+        Assert.True(startIndex >= 0);
+        Assert.True(firstIndex > startIndex);
+        Assert.True(secondIndex > firstIndex);
+        Assert.Equal(100d, displayLines.Solid.Line.Y[startIndex]);
+        Assert.Equal(89d, displayLines.Solid.Line.Y[firstIndex], precision: 8);
+        Assert.Equal(88d, displayLines.Solid.Line.Y[secondIndex], precision: 8);
+
+        var viewportLines = GraphPlotProjection.BuildViewportRemainingLines(viewport);
+        Assert.DoesNotContain((double)viewportStart, viewportLines.Solid.Line.X);
+        Assert.Contains((double)periodStart, viewportLines.Solid.Line.X);
+        Assert.Contains(viewportLines.Solid.Line.X, x => Math.Abs(x - firstDisplay) < 0.000001);
+        Assert.Contains(viewportLines.Solid.Line.X, x => Math.Abs(x - secondDisplay) < 0.000001);
+
+        var noAuthority = CreateScene(publishedStart: null);
+        var noAuthorityLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            noAuthority,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.DoesNotContain((double)periodStart, noAuthorityLines.Solid.Line.X);
+
+        var gapBlocked = CreateScene(
+            periodStart,
+            [new GraphConfirmedGap(periodStart + 1, firstRaw - 1)]);
+        var gapLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            gapBlocked,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.DoesNotContain((double)periodStart, gapLines.Solid.Line.X);
+
+        var ownershipBlocked = CreateScene(
+            periodStart,
+            ownership: [new GraphAccountOwnershipInterval(firstRaw + 7, null)]);
+        var ownershipLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            ownershipBlocked,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.DoesNotContain((double)periodStart, ownershipLines.Solid.Line.X);
+
+        var acceptedModel = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol).Rising.Line;
+        var noAuthorityModel = GraphPlotProjection.BuildCanonicalModelLines(
+            noAuthority,
+            noAuthority.Sol).Rising.Line;
+        Assert.Equal(noAuthorityModel.X, acceptedModel.X);
+        Assert.Equal(noAuthorityModel.Y, acceptedModel.Y);
     }
 
     [Fact]
