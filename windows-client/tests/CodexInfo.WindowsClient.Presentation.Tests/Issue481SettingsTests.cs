@@ -24,8 +24,9 @@ public sealed class Issue590SettingsTests
 
         var grid = Assert.Single(document.Descendants(), element =>
             element.Name.LocalName == "Grid" && element.Attribute("RowDefinitions")?.Value == "Auto,44,*,Auto");
-        var tabs = Assert.Single(grid.Elements(), element => element.Name.LocalName == "TabControl");
-        Assert.Equal("2", tabs.Attribute("Grid.Row")?.Value);
+        var contentRegion = Assert.Single(grid.Elements(), element => element.Attribute("Grid.Row")?.Value == "2");
+        var tabs = Assert.Single(contentRegion.DescendantsAndSelf(), element => element.Name.LocalName == "TabControl");
+        Assert.Equal("2", contentRegion.Attribute("Grid.Row")?.Value);
         var items = tabs.Elements().Where(element => element.Name.LocalName == "TabItem").ToArray();
         Assert.Equal(4, items.Length);
         Assert.DoesNotContain(document.Descendants(), element => element.Name.LocalName == "ScrollViewer");
@@ -81,8 +82,11 @@ public sealed class Issue590SettingsTests
         AssertExactlyOneBinding(items[2], "SelectedValue", "{Binding SelectedThemeId}");
         AssertExactlyOneBinding(items[2], "AutomationProperties.AutomationId", "Settings.ThemeSelector");
         AssertExactlyOneBinding(items[2], "Text", "{Binding Texts.AppearanceDescription}");
+        var statusDetail = Assert.Single(contentRegion.DescendantsAndSelf(), element =>
+            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding StatusDetail}");
+        Assert.DoesNotContain(statusDetail, tabs.DescendantsAndSelf());
+        Assert.Equal("Settings.StatusDetail", statusDetail.Attribute("AutomationProperties.AutomationId")?.Value);
         AssertExactlyOneBinding(items[3], "Text", "{Binding StatusTitle}");
-        AssertExactlyOneBinding(items[3], "Text", "{Binding StatusDetail}");
         AssertExactlyOneBinding(items[3], "Click", "OnRefresh");
         AssertExactlyOneBinding(items[3], "AutomationProperties.AutomationId", "Settings.AuthCheck");
         AssertExactlyOneBinding(items[3], "Click", "OnAuth");

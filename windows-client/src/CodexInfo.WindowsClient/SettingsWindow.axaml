@@ -72,7 +72,8 @@
                      Text="⌄" />
         </Grid>
       </ToggleButton>
-    <TabControl Grid.Row="2">
+    <Grid Grid.Row="2" RowDefinitions="*,Auto" RowSpacing="8">
+    <TabControl Grid.Row="0">
       <TabItem Header="{Binding Texts.Language}"
                AutomationProperties.Name="{Binding Texts.Language}"
                AutomationProperties.AutomationId="Settings.Tab.Language">
@@ -144,12 +145,9 @@
         <Border Classes="surface" Padding="18">
           <StackPanel Spacing="14">
             <Border Background="{DynamicResource Theme101F2D}" CornerRadius="10" Padding="14">
-              <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" RowSpacing="4" ColumnSpacing="12">
-                <StackPanel>
-                  <TextBlock FontWeight="SemiBold" Text="{Binding StatusTitle}" />
-                  <TextBlock Grid.Row="1" Classes="label" Text="{Binding StatusDetail}" TextWrapping="Wrap" />
-                </StackPanel>
-                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                <TextBlock FontWeight="SemiBold" Text="{Binding StatusTitle}" VerticalAlignment="Center" />
+                <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="6">
                   <Button Classes="secondary"
                           Click="OnRefresh"
                           AutomationProperties.Name="{Binding Texts.AuthCheck}"
@@ -180,6 +178,13 @@
         </Border>
       </TabItem>
     </TabControl>
+    <Border Grid.Row="1" Background="{DynamicResource Theme101F2D}" CornerRadius="10" Padding="10">
+      <TextBlock Classes="label"
+                 Text="{Binding StatusDetail}"
+                 TextWrapping="Wrap"
+                 AutomationProperties.AutomationId="Settings.StatusDetail" />
+    </Border>
+    </Grid>
     <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
       <Button Classes="secondary" Click="OnOpenSetup" AutomationProperties.Name="{Binding Texts.Setup}" AutomationProperties.AutomationId="Settings.Footer.Setup" ToolTip.Tip="{Binding Texts.Setup}"><TextBlock Text="{Binding Texts.Setup}" /></Button>
       <Button Classes="secondary" Click="OnOpenLegal" AutomationProperties.Name="{Binding Texts.Legal}" AutomationProperties.AutomationId="Settings.Footer.Legal" ToolTip.Tip="{Binding Texts.Legal}"><TextBlock Text="{Binding Texts.Legal}" /></Button>

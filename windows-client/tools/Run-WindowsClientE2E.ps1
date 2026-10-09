@@ -4086,6 +4086,51 @@ function Invoke-E2ESettingsTabs {
     Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $originalSettings) `
         'Changing Settings tabs or previewing draft selections changed settings before Save.'
 
+    $saveFailureSettingsBytes = [IO.File]::ReadAllBytes($script:e2eSettingsPath)
+    $expectedSaveFailure = 'Settings could not be saved. Check the file permissions or location and try again.'
+    try {
+        [IO.File]::Delete($script:e2eSettingsPath)
+        [IO.Directory]::CreateDirectory($script:e2eSettingsPath) | Out-Null
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
+        Select-E2ESettingsTab $settings.Root 'Settings.Tab.Appearance'
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
+        $save = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Save'
+        Invoke-E2EElement $save
+        Wait-E2E -Description 'Settings remains open after failed Save' -Probe {
+            return (Find-E2EWindow $ProcessId 'Codex Info Settings') -ne [IntPtr]::Zero
+        } | Out-Null
+
+        foreach ($automationId in @(
+                'Settings.Tab.Language',
+                'Settings.Tab.TimeZone',
+                'Settings.Tab.Appearance')) {
+            $settings.Root = Get-E2EUiaRoot $settings.Handle
+            Select-E2ESettingsTab $settings.Root $automationId
+            $settings.Root = Get-E2EUiaRoot $settings.Handle
+            $statusDetail = Find-E2EElementByAutomationId $settings.Root 'Settings.StatusDetail'
+            Assert-E2E ($null -ne $statusDetail -and -not $statusDetail.Current.IsOffscreen) `
+                "Save failure detail is not visible on $automationId."
+            Assert-E2E ([string]$statusDetail.Current.Name -ceq $expectedSaveFailure) `
+                "Save failure detail is incorrect on $automationId."
+        }
+        Assert-E2E (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Container) `
+            'Failed Save unexpectedly replaced the fixture settings path.'
+    }
+    finally {
+        if ([IO.Directory]::Exists($script:e2eSettingsPath)) {
+            [IO.Directory]::Delete($script:e2eSettingsPath, $false)
+        }
+        [IO.File]::WriteAllBytes($script:e2eSettingsPath, $saveFailureSettingsBytes)
+    }
+    Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $originalSettings) `
+        'Failed Save did not restore the fixture settings bytes.'
+    Write-E2E 'settings-save-failure: PASS message-visible-in-all-selection-tabs=true fixture-bytes-restored=true'
+
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    Select-E2ESettingsTab $settings.Root 'Settings.Tab.Appearance'
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    Select-E2ETheme $settings.Root 'Paper Light'
+
     $setupButton = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Setup'
     Invoke-E2EElement $setupButton
     $setupHandle = Wait-E2E -Description 'Settings footer Setup window' -Probe {
@@ -4253,7 +4298,12 @@ function Assert-E2EThemeSurfaces {
             @{ Hex = $colors.Idle; Role = 'idle-band' },
             @{ Hex = $colors.Remaining; Role = 'remaining-line' })) {
         $tolerance = if ($entry.Role -eq 'idle-band') { 2 } else { 8 }
-        Assert-E2EThemePixel $captures.Graph $graph.Handle $entry.Hex "$ThemeId/Graph/$($entry.Role)" -Element $plot -Tolerance $tolerance
+        if ($entry.Role -eq 'remaining-line') {
+            Assert-E2EThemePixel $captures.Graph $graph.Handle $entry.Hex "$ThemeId/Graph/$($entry.Role)" -Element $plot -Tolerance $tolerance -StrokeBackgrounds @($colors.Plot,$colors.Idle)
+        }
+        else {
+            Assert-E2EThemePixel $captures.Graph $graph.Handle $entry.Hex "$ThemeId/Graph/$($entry.Role)" -Element $plot -Tolerance $tolerance
+        }
     }
     $threads = $Windows.Threads
     $rootTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-root'
@@ -4655,6 +4705,8 @@ function Invoke-E2EThemePresets {
         'Closing Settings without Save changed the six-key file.'
     $windows.Settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
         -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+    Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Appearance'
+    $windows.Settings.Root = Get-E2EUiaRoot $windows.Settings.Handle
     Assert-E2E ((Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $windows.Settings.Root)) -ceq 'Classic Dark') `
         'Cancelled theme selection remained in Settings.'
     $afterCancel = Capture-E2EWindow $MainHandle 'theme-after-cancel-main'
@@ -4702,6 +4754,8 @@ function Invoke-E2EThemePresets {
         }
         $windows.Settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
             -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+        Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Appearance'
+        $windows.Settings.Root = Get-E2EUiaRoot $windows.Settings.Handle
         Assert-E2E ((Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $windows.Settings.Root)) -ceq $choice.Label) `
             "Settings UIA did not reopen with saved $($choice.Id)."
         Assert-E2EThemeSurfaces $windows $choice.Id
@@ -4740,6 +4794,8 @@ function Invoke-E2EThemePresets {
         'restart/Main/window' -MinimumPixels 32
     $restartedSettings = Open-E2EChildWindow -MainRoot $restartedMain.Root -ButtonName 'Settings' `
         -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $restartedPid
+    Select-E2ESettingsTab $restartedSettings.Root 'Settings.Tab.Appearance'
+    $restartedSettings.Root = Get-E2EUiaRoot $restartedSettings.Handle
     $restartSettingsCapture = Capture-E2EWindow $restartedSettings.Handle 'theme-light-restart-settings'
     Assert-E2EThemePixel $restartSettingsCapture $restartedSettings.Handle $script:e2eThemeColors.light.Window `
         'restart/Settings/window' -MinimumPixels 32

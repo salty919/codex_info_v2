@@ -53,6 +53,8 @@ Windows Settingsは現行の900×480を維持し、中央領域を次の4タブ�
 
 account selectorは従来どおり上部の固定領域、Setup／Legal／Saveは下部の固定領域に置き、タブの外から常に操作できるようにする。各タブの既存項目は同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、タブ内容にroot scrollを要求しない。設定項目、保存動作、保存形式、Linux画面は変更しない。
 
+既存statusはタブ外の共通固定領域へ一度だけ表示し、4タブのどれを選択中でも確認できるようにする。特にSave失敗理由をLanguage／Time zone／Appearanceの選択中も表示し、ユーザーがタブを切り替えずに失敗を確認できるようにする。
+
 ## WIN-THEME-422 — Windows版の組込みカラーテーマ
 
 Windows Settingsの外観欄は`classic-dark`（従来配色・既定）、`graphite-dark`、`light`、`paper-light`、`sand-light`、`steel-light`、`ocean-dark`、`teal-dark`、`ember-dark`、`ink-dark`、`neon-dark`、`lavender-light`、`mint-light`、`forest-dark`、`tangerine-dark`、`rose-dark`の順に16種類の組込みpresetを選択できる。新規presetの表示名は順にPaper Light、Sand Light、Steel Light、Ocean Dark、Teal Dark、Ember Dark、Ink Darkとし、日本語では順にペーパー ライト、サンド ライト、スチール ライト、オーシャン ダーク、ティール ダーク、エンバー ダーク、インク ダークとする。これらは独自の配色であり、他製品の同名themeとの色互換を表明しない。VS Codeのように利用者がpresetを切り替える操作を提供し、外部themeの取込みや任意色編集は含めない。テーマ選択時に、開いているMain、Settings、Setup、Graph、Threads、Legalの全Windowへ即時プレビューする（Issue #571）。選択だけでは永続設定と実行中の保存済み設定generationを変更しない。既存の保存操作がDATA ownerの`WIN-THEME-PREF-422`に従って成功した時だけ選択を確定し、取消・設定画面を閉じる操作または保存失敗時は保存済みの配色へ戻す。保存失敗時はテーマ選択欄も保存済みの値へ戻し、表示名と配色を一致させる。保存成功後に閉じても確定済みの配色を保持する。次回起動時は保存したpresetをMain表示前に適用する。theme変更によってquota、Graph系列データ、Threadsの状態、接続、取得要求を変更しない。
