@@ -16,6 +16,7 @@ X-START-06
 X-THREAD-01
 WIN-VERSION-01
 WIN-THEME-422
+WIN-SETTINGS-TABS-590
 -->
 
 # Windowsクライアント UX設計仕様
@@ -39,6 +40,20 @@ X版はデータ意味論、状態、所有権の参照元であり、Windows版
 `WIN-PARITY-UX`、`ACCOUNT-UX-134`およびI18N ownerの`PROC-I18N-01`に属する下記Main構成と
 Linux timezone設定、Issue #422で利用者が選択したWindows版の`WIN-THEME-422`だけは有限scopeの実装・直接評価対象とする。この限定決定は本書全体の
 `PRODUCT_PENDING`を解除せず、他の未確定契約を`EXTRACTION_COMPLETE`として扱う根拠にしない。
+Issue #590で利用者が依頼したSettingsの4タブ切替に限り、`WIN-SETTINGS-TABS-590`も有限scopeの実装・直接評価対象とする。
+
+## WIN-SETTINGS-TABS-590 — Windows Settingsの4タブ切替
+
+Windows Settingsは現行の900×480を維持し、中央領域を次の4タブに分ける。
+
+1. Language: 言語選択。
+2. Time zone: タイムゾーン選択。
+3. Appearance: テーマ選択と既存の説明。
+4. Connection status: 接続・認証操作、Recorder/REST version、既存status。
+
+account selectorは従来どおり上部の固定領域、Setup／Legal／Saveは下部の固定領域に置き、タブの外から常に操作できるようにする。各タブの既存項目は同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、タブ内容にroot scrollを要求しない。設定項目、保存動作、保存形式、Linux画面は変更しない。
+
+既存statusはタブ外の共通固定領域へ一度だけ表示し、4タブのどれを選択中でも確認できるようにする。特にSave失敗理由をLanguage／Time zone／Appearanceの選択中も表示し、ユーザーがタブを切り替えずに失敗を確認できるようにする。
 
 ## WIN-THEME-422 — Windows版の組込みカラーテーマ
 
