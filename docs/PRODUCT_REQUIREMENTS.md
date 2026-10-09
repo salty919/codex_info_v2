@@ -111,6 +111,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - 同じ事実の表示所有者は1か所とし、残量、reset countdown、status、connection情報を言い換えて重複表示しない。
 - 定期的なquota再取得は不完全な中間結果であり、次のローカル使用量取得が完了するまで前回コミット済みのモデル・履歴・thread表示を保持する。認証主体の変更または明示的なログアウト以外で、主画面を空の初期状態へ戻してはならない。
 - 最小viewport、対応locale、keyboard、UIA、高contrast、text scaleで主要操作を失わない。root scrollで欠落を隠さない。
+- Windows Settingsの4タブ分類とタブ外の固定領域は、UX ownerの`WIN-SETTINGS-TABS-590`に従う。
 - Back、Close、Escape、再入、遅延callbackは世代tokenで一度だけ処理する。古いPID/HWND/generationへfocus、message、route変更を行わない。
 - 顧客向けLinux入口はinstalled launcher `$HOME/.local/bin/codex-info`一つとする。引数なし/`--start`は更新収束後にmanaged recorder/RESTを有効化・起動する。`--ui`は同じ収束後の検証済みinstalled payloadを実行し、local generation/payload identityが完全だがservice/details接続だけが失敗した場合もX UIの失敗状態と再試行手段を表示する。generation不整合またはforeign/unknown ownerの`SAFE_BLOCKED`ではpayload UIを実行しない。`--stop`は同一bootだけ有効な停止意図を記録してrecorder/REST serviceだけを停止し、timerと次回bootの自動起動を維持する。`--disable-autostart`はrecorder/REST serviceとupdate timerを停止・無効化し、`--remove`はrecorder/REST serviceとupdate service/timerの4 unitを解除する。`--status`はread-onlyの完全identityを表示し整合時だけ成功、`--update`は同じ更新authorityを即時実行、`--help`は副作用なしとする。
 - installed launcherは未知・混在・重複引数と`--port`をmutation前に拒否する。service・開発・E2Eが直接使うpayload `codex_info`のCLIは、引数なし/`--port PORT`のdaemon+REST、`--ui`/`--ui --port PORT`、検証済みownerだけを停止する`--stop`、`--help`/`--h`/`-h`に限定し、待受アドレスを常に127.0.0.1へ固定する。payloadの`--stop`はSIGKILLへ昇格せず、lock identityを証明できない場合は何もsignal・削除しない。

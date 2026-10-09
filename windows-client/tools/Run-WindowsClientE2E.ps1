@@ -10,6 +10,7 @@ param(
     [switch]$Fixture,
     [switch]$FixtureContractTest,
     [switch]$NarrowPeriodCostFixture,
+    [switch]$SettingsTabs,
     [switch]$ThemePresets,
     [switch]$GraphThemes,
     [switch]$GraphHoverOnly,
@@ -20,22 +21,25 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($GraphHoverOnly -and (-not $Fixture -or $ThemePresets -or $GraphThemes -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation)) {
+if ($GraphHoverOnly -and (-not $Fixture -or $ThemePresets -or $GraphThemes -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation -or $SettingsTabs)) {
     throw 'Graph hover validation requires only -Fixture -GraphHoverOnly.'
 }
 
 if ($NarrowPeriodCostFixture -and -not ($Fixture -or $FixtureContractTest)) {
     throw 'Narrow period-cost validation requires -Fixture or -FixtureContractTest.'
 }
-if ($NarrowPeriodCostFixture -and ($ThemePresets -or $GraphThemes -or $GraphHoverOnly -or $CompatibilitySmoke -or $RequireCurrentPresentation)) {
+if ($NarrowPeriodCostFixture -and ($ThemePresets -or $GraphThemes -or $GraphHoverOnly -or $CompatibilitySmoke -or $RequireCurrentPresentation -or $SettingsTabs)) {
     throw 'Narrow period-cost validation cannot be combined with another specialized E2E mode.'
 }
 
 if (($ThemePresets -or $GraphThemes) -and -not $Fixture) {
     throw 'Theme validation requires -Fixture.'
 }
-if (($ThemePresets -or $GraphThemes) -and ($FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation -or ($ThemePresets -and $GraphThemes))) {
+if (($ThemePresets -or $GraphThemes) -and ($FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation -or $SettingsTabs -or ($ThemePresets -and $GraphThemes))) {
     throw 'Theme validation modes cannot be combined with another E2E mode.'
+}
+if ($SettingsTabs -and (-not $Fixture -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation)) {
+    throw 'Settings tab validation requires only -Fixture -SettingsTabs.'
 }
 
 function Resolve-E2EOutputDirectory {
@@ -94,6 +98,7 @@ $script:e2eSettingsPath = Join-Path $env:LOCALAPPDATA 'CodexInfo\settings.json'
 $script:e2eSettingsBackup = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-e2e-settings-" + [Guid]::NewGuid().ToString('N') + '.json')
 $script:e2eSettingsWasPresent = $false
 $script:e2eThemePresetsComplete = $false
+$script:e2eSettingsTabsComplete = $false
 $script:e2ePeriodCostNarrowScenario = $false
 
 function Write-E2E {
@@ -3303,7 +3308,7 @@ function Exit-E2EFixture {
     elseif (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) {
         Remove-Item -LiteralPath $script:e2eSettingsPath -Force
     }
-    if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) {
+    if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture -or $SettingsTabs) {
         if ($script:e2eSettingsWasPresent) {
             Assert-E2E (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) 'Original settings.json was not restored.'
             $restoredBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
@@ -3912,6 +3917,273 @@ function Open-E2ESetupFromSettings {
     return [pscustomobject]@{ Handle = $handle; Root = Get-E2EUiaRoot $handle; Record = $record }
 }
 
+function Select-E2ESettingsTab {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
+        [Parameter(Mandatory = $true)][string]$AutomationId
+    )
+
+    $tab = Wait-E2E -Description "Settings tab $AutomationId" -Probe {
+        $candidate = Find-E2EElementByAutomationId $SettingsRoot $AutomationId
+        if ($null -ne $candidate -and $candidate.Current.IsEnabled -and -not $candidate.Current.IsOffscreen) {
+            return $candidate
+        }
+        return $false
+    }
+    $selection = $null
+    Assert-E2E ($tab.TryGetCurrentPattern(
+        [System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selection)) `
+        "Settings tab $AutomationId has no SelectionItemPattern."
+    $selection.Select()
+    Wait-E2E -Description "Settings tab $AutomationId selected" -Probe {
+        if ($selection.Current.IsSelected) { return $true }
+        return $false
+    } | Out-Null
+    Write-E2E "settings-tab: PASS id=$AutomationId"
+}
+
+function Assert-E2ESettingsCommonControls {
+    param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot)
+
+    foreach ($automationId in @(
+            'Settings.AccountSelector',
+            'Settings.Footer.Setup',
+            'Settings.Footer.Legal',
+            'Settings.Footer.Save')) {
+        $control = Find-E2EElementByAutomationId $SettingsRoot $automationId
+        Assert-E2E ($null -ne $control -and $control.Current.IsEnabled -and -not $control.Current.IsOffscreen) `
+            "Settings common control $automationId is not visible and enabled on the selected tab."
+        $bounds = $control.Current.BoundingRectangle
+        Assert-E2E ($bounds.Width -gt 0 -and $bounds.Height -gt 0) `
+            "Settings common control $automationId has no rendered bounds."
+    }
+}
+
+function Get-E2ESettingsComboSelectionText {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
+        [Parameter(Mandatory = $true)][string]$AutomationId
+    )
+
+    $selector = Find-E2EElementByAutomationId $SettingsRoot $AutomationId
+    Assert-E2E ($null -ne $selector -and $selector.Current.ControlType -eq [System.Windows.Automation.ControlType]::ComboBox) `
+        "Settings ComboBox $AutomationId is missing from UI Automation."
+    $expand = $null
+    Assert-E2E ($selector.TryGetCurrentPattern(
+        [System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) `
+        "Settings ComboBox $AutomationId has no ExpandCollapsePattern."
+    Assert-E2E ($expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) `
+        "Settings ComboBox $AutomationId must be collapsed before reading its selection."
+    $labels = @(Get-E2EVisibleControlElements $selector ([System.Windows.Automation.ControlType]::Text) |
+        ForEach-Object { [string]$_.Current.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    Assert-E2E ($labels.Count -eq 1) `
+        "Settings ComboBox $AutomationId must render one selected label; observed: $($labels -join ',')."
+    return [string]$labels[0]
+}
+
+function Select-E2ESettingsComboOption {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
+        [Parameter(Mandatory = $true)][string]$AutomationId,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $selector = Find-E2EElementByAutomationId $SettingsRoot $AutomationId
+    Assert-E2E ($null -ne $selector) "Settings ComboBox $AutomationId is missing."
+    $expand = $null
+    Assert-E2E ($selector.TryGetCurrentPattern(
+        [System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) `
+        "Settings ComboBox $AutomationId has no ExpandCollapsePattern."
+    if ($expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+        $expand.Expand()
+    }
+    Wait-E2E -Description "Settings option '$Label' for $AutomationId" -Probe {
+        $matches = @(Get-E2EVisibleControlElements $SettingsRoot ([System.Windows.Automation.ControlType]::ListItem) |
+            Where-Object { [string]$_.Current.Name -ceq $Label })
+        if ($matches.Count -eq 1) { return $matches[0] }
+        return $false
+    } | Out-Null
+    Select-E2EListItem $SettingsRoot $Label
+    if ($expand.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+        $expand.Collapse()
+    }
+    Wait-E2E -Description "Settings selection '$Label' for $AutomationId" -Probe {
+        return (Get-E2ESettingsComboSelectionText $SettingsRoot $AutomationId) -ceq $Label
+    } | Out-Null
+    Write-E2E "settings-selection: PASS id=$AutomationId value=$Label"
+}
+
+function Invoke-E2ESettingsTabs {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$MainRoot,
+        [Parameter(Mandatory = $true)][IntPtr]$MainHandle,
+        [Parameter(Mandatory = $true)][int]$ProcessId
+    )
+
+    $settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
+        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsDraft' -ProcessId $ProcessId
+    Assert-E2E ($settings.Record.width -eq 900 -and $settings.Record.height -eq 480) `
+        "Settings window dimensions are $($settings.Record.width)x$($settings.Record.height), expected 900x480."
+    $originalSettings = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
+
+    foreach ($automationId in @(
+            'Settings.Tab.Language',
+            'Settings.Tab.TimeZone',
+            'Settings.Tab.Appearance',
+            'Settings.Tab.ConnectionStatus')) {
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
+        Select-E2ESettingsTab $settings.Root $automationId
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
+        Assert-E2ESettingsCommonControls $settings.Root
+        switch ($automationId) {
+            'Settings.Tab.Language' {
+                Select-E2ESettingsComboOption $settings.Root 'Settings.LanguageSelector' 'Deutsch'
+            }
+            'Settings.Tab.TimeZone' {
+                Select-E2ESettingsComboOption $settings.Root 'Settings.TimeZoneSelector' 'Windows local time'
+            }
+            'Settings.Tab.Appearance' {
+                Select-E2ETheme $settings.Root 'Paper Light'
+            }
+            'Settings.Tab.ConnectionStatus' {
+                $authCheck = Find-E2EElementByAutomationId $settings.Root 'Settings.AuthCheck'
+                Assert-E2E ($null -ne $authCheck -and -not $authCheck.Current.IsOffscreen -and $authCheck.Current.IsEnabled) `
+                    'Connection status tab does not render the authentication check action.'
+            }
+        }
+        $null = Capture-E2EWindow $settings.Handle ("settings-draft-" + $automationId.Substring('Settings.Tab.'.Length))
+    }
+
+    foreach ($automationId in @(
+            'Settings.Tab.Language',
+            'Settings.Tab.TimeZone',
+            'Settings.Tab.Appearance',
+            'Settings.Tab.ConnectionStatus')) {
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
+        Select-E2ESettingsTab $settings.Root $automationId
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
+        Assert-E2ESettingsCommonControls $settings.Root
+        switch ($automationId) {
+            'Settings.Tab.Language' {
+                Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.LanguageSelector') -ceq 'Deutsch') `
+                    'Language draft changed after switching Settings tabs.'
+            }
+            'Settings.Tab.TimeZone' {
+                Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.TimeZoneSelector') -ceq 'Windows local time') `
+                    'Time zone draft changed after switching Settings tabs.'
+            }
+            'Settings.Tab.Appearance' {
+                Assert-E2E ((Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $settings.Root)) -ceq 'Paper Light') `
+                    'Theme draft changed after switching Settings tabs.'
+            }
+            'Settings.Tab.ConnectionStatus' {
+                $authCheck = Find-E2EElementByAutomationId $settings.Root 'Settings.AuthCheck'
+                Assert-E2E ($null -ne $authCheck -and -not $authCheck.Current.IsOffscreen) `
+                    'Connection status tab content is not visible after tab navigation.'
+            }
+        }
+    }
+    Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $originalSettings) `
+        'Changing Settings tabs or previewing draft selections changed settings before Save.'
+
+    $setupButton = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Setup'
+    Invoke-E2EElement $setupButton
+    $setupHandle = Wait-E2E -Description 'Settings footer Setup window' -Probe {
+        $found = Find-E2EWindow $ProcessId 'Codex Info Setup'
+        if ($found -ne [IntPtr]::Zero) { return $found }
+        return $false
+    }
+    $null = Record-E2EWindow 'SettingsSetup' $ProcessId $setupHandle
+    $setupRoot = Get-E2EUiaRoot $setupHandle
+    $setupClose = Find-E2EElementByAutomationId $setupRoot 'Setup.Window.Close'
+    Assert-E2E ($null -ne $setupClose) 'Setup Close button is missing.'
+    Invoke-E2EElement $setupClose
+    Wait-E2E -Description 'Settings footer Setup closes' -Probe {
+        return (Find-E2EWindow $ProcessId 'Codex Info Setup') -eq [IntPtr]::Zero
+    } | Out-Null
+
+    Bring-E2EWindowToFront $settings.Handle
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    $legalButton = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Legal'
+    Invoke-E2EElement $legalButton
+    $legalHandle = Wait-E2E -Description 'Settings footer Legal window' -Probe {
+        $found = Find-E2EWindow $ProcessId 'Codex Info Legal'
+        if ($found -ne [IntPtr]::Zero) { return $found }
+        return $false
+    }
+    $null = Record-E2EWindow 'SettingsLegal' $ProcessId $legalHandle
+    $legalRoot = Get-E2EUiaRoot $legalHandle
+    $legalClose = Find-E2EElementByAutomationId $legalRoot 'Legal.Window.Close'
+    Assert-E2E ($null -ne $legalClose) 'Legal Close button is missing.'
+    Invoke-E2EElement $legalClose
+    Wait-E2E -Description 'Settings footer Legal closes' -Probe {
+        return (Find-E2EWindow $ProcessId 'Codex Info Legal') -eq [IntPtr]::Zero
+    } | Out-Null
+
+    Bring-E2EWindowToFront $settings.Handle
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    Assert-E2ESettingsCommonControls $settings.Root
+    $save = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Save'
+    Invoke-E2EElement $save
+    Wait-E2E -Description 'Settings closes after Save' -Probe {
+        return (Find-E2EWindow $ProcessId 'Codex Info Settings') -eq [IntPtr]::Zero
+    } | Out-Null
+
+    $savedSettings = Get-Content -LiteralPath $script:e2eSettingsPath -Raw | ConvertFrom-Json
+    Assert-E2E ([string]$savedSettings.language -ceq 'de' -and
+        [string]$savedSettings.timeZoneId -ceq 'local' -and
+        [string]$savedSettings.themeId -ceq 'paper-light') `
+        'Save did not persist the selected language, time zone, and theme.'
+    Write-E2E 'settings-save: PASS language=de time-zone=local theme=paper-light'
+
+    $MainRoot = Get-E2EUiaRoot $MainHandle
+    $settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
+        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsReopened' -ProcessId $ProcessId
+    Assert-E2E ($settings.Record.width -eq 900 -and $settings.Record.height -eq 480) `
+        "Reopened Settings window dimensions are $($settings.Record.width)x$($settings.Record.height), expected 900x480."
+    foreach ($automationId in @(
+            'Settings.Tab.Language',
+            'Settings.Tab.TimeZone',
+            'Settings.Tab.Appearance',
+            'Settings.Tab.ConnectionStatus')) {
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
+        Select-E2ESettingsTab $settings.Root $automationId
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
+        Assert-E2ESettingsCommonControls $settings.Root
+        switch ($automationId) {
+            'Settings.Tab.Language' {
+                Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.LanguageSelector') -ceq 'Deutsch') `
+                    'Reopened Settings did not restore the saved language.'
+            }
+            'Settings.Tab.TimeZone' {
+                Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.TimeZoneSelector') -ceq 'Windows-Ortszeit') `
+                    'Reopened Settings did not restore the saved time zone.'
+            }
+            'Settings.Tab.Appearance' {
+                Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.ThemeSelector') -ceq 'Papier Hell') `
+                    'Reopened Settings did not restore the saved theme.'
+            }
+            'Settings.Tab.ConnectionStatus' {
+                $authCheck = Find-E2EElementByAutomationId $settings.Root 'Settings.AuthCheck'
+                Assert-E2E ($null -ne $authCheck -and -not $authCheck.Current.IsOffscreen) `
+                    'Reopened connection status tab does not render its authentication check action.'
+            }
+        }
+        $null = Capture-E2EWindow $settings.Handle ("settings-saved-" + $automationId.Substring('Settings.Tab.'.Length))
+    }
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    $close = Find-E2EElementByAutomationId $settings.Root 'Settings.Window.Close'
+    Assert-E2E ($null -ne $close) 'Reopened Settings close control is missing.'
+    Invoke-E2EElement $close
+    Wait-E2E -Description 'Reopened Settings closes' -Probe {
+        return (Find-E2EWindow $ProcessId 'Codex Info Settings') -eq [IntPtr]::Zero
+    } | Out-Null
+
+    $windowRecordPath = Join-Path $script:e2eOutput 'settings-tab-window-records.json'
+    $script:e2eWindowRecords | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $windowRecordPath -Encoding utf8
+    Write-E2E "settings-tabs: PASS tabs=4 draft-retained=True save-reopen=True window-records=$windowRecordPath"
+}
+
 function Assert-E2EThemeWindow {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Windows,
@@ -4355,6 +4627,7 @@ function Invoke-E2EThemePresets {
         -ButtonAutomationId 'Main.OpenLegal' -Title 'Codex Info Legal' -Role 'Legal' -ProcessId $ProcessId
     $windows.Settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
         -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+    Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Appearance'
     $windows.Setup = Open-E2ESetupFromSettings $windows.Settings.Root $ProcessId
 
     $null = Capture-E2EWindow $windows.Settings.Handle 'theme-settings-initial-selection'
@@ -4710,6 +4983,10 @@ try {
         Invoke-E2EThemePresets -MainRoot $mainRoot -MainHandle $mainHandle `
             -ProcessId $clientPid -ClientPath $resolvedClientPath
         $script:e2eThemePresetsComplete = $true
+    }
+    elseif ($SettingsTabs) {
+        Invoke-E2ESettingsTabs -MainRoot $mainRoot -MainHandle $mainHandle -ProcessId $clientPid
+        $script:e2eSettingsTabsComplete = $true
     }
     else {
     # Finite path: one Graph window, one period round-trip, two metrics, then
@@ -5124,7 +5401,7 @@ finally {
     if ($null -ne $script:e2eProcess) {
         try {
             if (-not $script:e2eProcess.HasExited) {
-        if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) {
+        if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture -or $SettingsTabs) {
             Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction Stop
             Wait-E2E -Description 'owned fixture client cleanup exit' -Probe {
                 return $script:e2eProcess.HasExited
@@ -5134,29 +5411,32 @@ finally {
                     Stop-Process -Id $script:e2eProcess.Id -Force -ErrorAction SilentlyContinue
                 }
             }
-            if ($ThemePresets -or $GraphThemes) {
+            if ($ThemePresets -or $GraphThemes -or $SettingsTabs) {
                 Assert-E2E $script:e2eProcess.HasExited 'Themed client remained running during cleanup.'
                 Write-E2E "theme-process-cleanup: PASS pid=$($script:e2eProcess.Id) exited=True"
             }
         }
         catch {
-            if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) { $themeProcessCleanupFailure = $_.Exception.Message }
+            if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture -or $SettingsTabs) { $themeProcessCleanupFailure = $_.Exception.Message }
         }
     }
     if ($Fixture) {
         try { Exit-E2EFixture }
         catch {
             Write-E2E "fixture-cleanup: FAIL $($_.Exception.Message)"
-            if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) { throw }
+            if ($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture -or $SettingsTabs) { throw }
         }
     }
-if (($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture) -and $null -ne $themeProcessCleanupFailure) {
+if (($ThemePresets -or $GraphThemes -or $NarrowPeriodCostFixture -or $SettingsTabs) -and $null -ne $themeProcessCleanupFailure) {
     throw "ASSERT: fixture client cleanup failed: $themeProcessCleanupFailure"
 }
 }
 
 if ($ThemePresets -and $script:e2eThemePresetsComplete) {
     Write-E2E 'windows-client-theme-e2e: PASS'
+}
+if ($SettingsTabs -and $script:e2eSettingsTabsComplete) {
+    Write-E2E 'windows-client-settings-tabs-e2e: PASS'
 }
 
 # A successful script invocation returns naturally.  Failures are thrown from
