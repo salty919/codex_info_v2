@@ -863,14 +863,14 @@ internal static class GraphPlotProjection
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
         if (baselineMode is GraphRemainingBaselineMode.PeriodStartAtFullQuota &&
-            scene.IsVerifiedCurrentResetStart &&
+            (scene.IsVerifiedCurrentResetStart || scene.PublishedPeriodStarts.Contains(scene.PeriodStartAt)) &&
             anchors.Length > 0 &&
             scene.RemainingObserved[anchors[0]] &&
             scene.Timestamps[anchors[0]] > scene.PeriodStartAt &&
             !scene.HasRemainingHardBreakBetween(scene.PeriodStartAt, scene.Timestamps[anchors[0]]) &&
             !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[anchors[0]]))
         {
-            // Verified current-reset origin is renderer-only. Keep it out of
+            // Verified published period origin is renderer-only, including past periods. Keep it out of
             // GraphScene's raw/history arrays and connect only to the first
             // accepted observation without crossing a confirmed break.
             AppendSegment(
@@ -1705,16 +1705,8 @@ internal static class GraphPlotProjection
                 .ToArray();
             var timestamps = indices.Select(index => scene.Timestamps[index]).ToArray();
             var runValues = indices.Select(index => values[index]).ToArray();
-            var preservedIndices = run
-                .SelectMany((interval, index) => interval.Dashed
-                    ? new[] { index, index + 1 }
-                    : Array.Empty<int>())
-                .ToHashSet();
-            runValues = SmoothSamplingPlateaus(
-                scene,
-                timestamps,
-                runValues,
-                preservedIndices);
+            // Retain every accepted quota anchor, including equal-value runs.
+            // Smooth only between observations so a plateau cannot become a decline.
             for (var interval = 0; interval < run.Length; interval++)
             {
                 AppendMonotoneCubicInterval(
