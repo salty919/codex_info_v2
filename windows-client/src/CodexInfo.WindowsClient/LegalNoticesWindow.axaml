@@ -16,7 +16,7 @@
         WindowDecorations="None"
         ExtendClientAreaToDecorationsHint="True"
         ExtendClientAreaTitleBarHeightHint="0"
-        Title="Codex Info Legal"
+        Title="Codex Info License"
         FontFamily="{StaticResource JapaneseFont}"
         Background="{DynamicResource Theme0E141E}"
         Foreground="{DynamicResource ThemeE9EFF8}">
@@ -64,7 +64,7 @@
   </Window.Styles>
   <Grid Margin="24" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="12">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel><TextBlock FontSize="24" FontWeight="SemiBold" Text="{Binding Texts.Legal}" /></StackPanel>
+      <StackPanel><TextBlock FontSize="24" FontWeight="SemiBold" Text="{Binding Texts.LicenseInformation}" /></StackPanel>
       <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
         <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Legal.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
         <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Legal.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />

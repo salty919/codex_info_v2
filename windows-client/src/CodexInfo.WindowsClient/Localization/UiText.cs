@@ -510,6 +510,32 @@ public sealed record UiText(
         "ru" => "Состояние подключения",
         _ => "Connection status"
     };
+    public string ConnectionSettings => LanguageCode switch
+    {
+        "ja" => "接続設定",
+        "zh-Hans" => "连接设置",
+        "ko" => "연결 설정",
+        "es" => "Configuración de conexión",
+        "fr" => "Paramètres de connexion",
+        "de" => "Verbindungseinstellungen",
+        "pt" => "Configurações de conexão",
+        "it" => "Impostazioni di connessione",
+        "ru" => "Настройки подключения",
+        _ => "Connection settings"
+    };
+    public string LicenseInformation => LanguageCode switch
+    {
+        "ja" => "ライセンス情報",
+        "zh-Hans" => "许可证信息",
+        "ko" => "라이선스 정보",
+        "es" => "Información de licencia",
+        "fr" => "Informations sur la licence",
+        "de" => "Lizenzinformationen",
+        "pt" => "Informações da licença",
+        "it" => "Informazioni sulla licenza",
+        "ru" => "Информация о лицензии",
+        _ => "License information"
+    };
     public string LocalTimeZone => LanguageCode switch { "ja" => "Windowsのローカル時刻", "zh-Hans" => "Windows 本地时间", "ko" => "Windows 현지 시간", "es" => "Hora local de Windows", "fr" => "Heure locale Windows", "de" => "Windows-Ortszeit", "pt" => "Hora local do Windows", "it" => "Ora locale di Windows", "ru" => "Местное время Windows", _ => "Windows local time" };
     public string UtcTimeZone => "UTC";
     public string CountUnit => LanguageCode switch { "ja" => "件", "zh-Hans" => "项", "ko" => "개", "es" => "", "fr" => "", "de" => "", "pt" => "", "it" => "", "ru" => "", _ => "" };
