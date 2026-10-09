@@ -184,6 +184,12 @@ using System.Text;
 
 public static class CodexInfoWindowsE2EWin32 {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int GetAwarenessFromDpiAwarenessContext(IntPtr dpiContext);
+    [DllImport("user32.dll")] public static extern IntPtr GetThreadDpiAwarenessContext();
+    [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+    [DllImport("user32.dll")] public static extern bool AreDpiAwarenessContextsEqual(IntPtr first, IntPtr second);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -198,7 +204,7 @@ public static class CodexInfoWindowsE2EWin32 {
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr extra);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr extra);
@@ -1336,6 +1342,178 @@ function Get-E2EWindowBounds {
         Width = $width
         Height = $height
     }
+}
+
+function Get-E2ESettingsDpiGeometry {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('initial', 'reopened')][string]$Stage,
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][int]$LogicalWidth,
+        [Parameter(Mandatory = $true)][int]$LogicalHeight
+    )
+
+    $hwndText = '0x{0:X}' -f $Handle.ToInt64()
+    $windowAwareness = -1
+    $windowAwarenessName = 'INVALID'
+    [uint32]$dpi = 0
+    $callerAwarenessName = 'unavailable'
+    $callerContextText = 'unavailable'
+    $actualBoundsText = 'not-measured'
+    $expectedSizeText = 'not-computable'
+
+    try {
+        if (-not [CodexInfoWindowsE2EWin32]::IsWindow($Handle)) {
+            throw 'INCONCLUSIVE: Settings HWND is no longer valid.'
+        }
+
+        $windowContext = [CodexInfoWindowsE2EWin32]::GetWindowDpiAwarenessContext($Handle)
+        if ($windowContext -eq [IntPtr]::Zero) {
+            throw 'INCONCLUSIVE: GetWindowDpiAwarenessContext returned NULL.'
+        }
+        $windowAwareness = [CodexInfoWindowsE2EWin32]::GetAwarenessFromDpiAwarenessContext($windowContext)
+        $windowAwarenessName = switch ([int]$windowAwareness) {
+            0 { 'UNAWARE' }
+            1 { 'SYSTEM_AWARE' }
+            2 { 'PER_MONITOR_AWARE' }
+            default { 'INVALID' }
+        }
+
+        $dpi = [CodexInfoWindowsE2EWin32]::GetDpiForWindow($Handle)
+        if ($windowAwareness -ne 2) {
+            throw "INCONCLUSIVE: Settings HWND awareness is $windowAwarenessName; physical-size conversion requires PER_MONITOR_AWARE."
+        }
+        if ($dpi -le 0) {
+            throw 'INCONCLUSIVE: GetDpiForWindow returned 0.'
+        }
+
+        $callerContext = [CodexInfoWindowsE2EWin32]::GetThreadDpiAwarenessContext()
+        if ($callerContext -eq [IntPtr]::Zero) {
+            throw 'INCONCLUSIVE: GetThreadDpiAwarenessContext returned NULL.'
+        }
+        $callerContextText = '0x{0:X}' -f $callerContext.ToInt64()
+        $callerAwareness = [CodexInfoWindowsE2EWin32]::GetAwarenessFromDpiAwarenessContext($callerContext)
+        $callerAwarenessName = switch ([int]$callerAwareness) {
+            0 { 'UNAWARE' }
+            1 { 'SYSTEM_AWARE' }
+            2 { 'PER_MONITOR_AWARE' }
+            default { 'INVALID' }
+        }
+        if ($callerAwareness -lt 0) {
+            throw 'INCONCLUSIVE: caller thread DPI awareness is invalid.'
+        }
+
+        $perMonitorV2 = [IntPtr](-4)
+        $previousContext = [CodexInfoWindowsE2EWin32]::SetThreadDpiAwarenessContext($perMonitorV2)
+        if ($previousContext -eq [IntPtr]::Zero) {
+            $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "INCONCLUSIVE: SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2) failed with Win32 error $errorCode."
+        }
+
+        $actualWidth = 0
+        $actualHeight = 0
+        $left = 0
+        $top = 0
+        $right = 0
+        $bottom = 0
+        $expectedWidth = 0
+        $expectedHeight = 0
+        try {
+            if (-not [CodexInfoWindowsE2EWin32]::AreDpiAwarenessContextsEqual($previousContext, $callerContext)) {
+                throw 'INCONCLUSIVE: caller thread DPI context changed before the measurement.'
+            }
+            $activeContext = [CodexInfoWindowsE2EWin32]::GetThreadDpiAwarenessContext()
+            if (-not [CodexInfoWindowsE2EWin32]::AreDpiAwarenessContextsEqual($activeContext, $perMonitorV2) -or
+                [CodexInfoWindowsE2EWin32]::GetAwarenessFromDpiAwarenessContext($activeContext) -ne 2) {
+                throw 'INCONCLUSIVE: measurement thread is not PER_MONITOR_AWARE_V2.'
+            }
+
+            $rect = New-Object CodexInfoWindowsE2EWin32+RECT
+            if (-not [CodexInfoWindowsE2EWin32]::GetWindowRect($Handle, [ref]$rect)) {
+                $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw "INCONCLUSIVE: GetWindowRect failed with Win32 error $errorCode."
+            }
+            if (-not [CodexInfoWindowsE2EWin32]::IsWindow($Handle)) {
+                throw 'INCONCLUSIVE: Settings HWND became invalid during the measurement.'
+            }
+
+            $left = $rect.Left
+            $top = $rect.Top
+            $right = $rect.Right
+            $bottom = $rect.Bottom
+            $actualWidth = $right - $left
+            $actualHeight = $bottom - $top
+            if ($actualWidth -le 0 -or $actualHeight -le 0) {
+                throw ("INCONCLUSIVE: GetWindowRect returned invalid bounds {0}x{1}." -f $actualWidth, $actualHeight)
+            }
+            $actualBoundsText = "[{0},{1},{2},{3}] {4}x{5}" -f $left, $top, $right, $bottom, $actualWidth, $actualHeight
+            $expectedWidth = [int][Math]::Floor(($LogicalWidth * [double]$dpi / 96.0) + 0.5)
+            $expectedHeight = [int][Math]::Floor(($LogicalHeight * [double]$dpi / 96.0) + 0.5)
+            $expectedSizeText = '{0}x{1}' -f $expectedWidth, $expectedHeight
+        }
+        finally {
+            $restoredFrom = [CodexInfoWindowsE2EWin32]::SetThreadDpiAwarenessContext($previousContext)
+            if ($restoredFrom -eq [IntPtr]::Zero) {
+                $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw "INCONCLUSIVE: restoring the caller thread DPI context failed with Win32 error $errorCode."
+            }
+            if (-not [CodexInfoWindowsE2EWin32]::AreDpiAwarenessContextsEqual($restoredFrom, $perMonitorV2)) {
+                throw 'INCONCLUSIVE: DPI-context restore returned an unexpected previous context.'
+            }
+            $restoredContext = [CodexInfoWindowsE2EWin32]::GetThreadDpiAwarenessContext()
+            if (-not [CodexInfoWindowsE2EWin32]::AreDpiAwarenessContextsEqual($restoredContext, $previousContext)) {
+                throw 'INCONCLUSIVE: caller thread DPI context was not restored.'
+            }
+        }
+
+        return [pscustomobject]@{
+            Hwnd = $hwndText
+            Awareness = $windowAwarenessName
+            Dpi = [int]$dpi
+            CallerAwarenessBefore = $callerAwarenessName
+            CallerContextBefore = $callerContextText
+            BoundsAwareness = 'PER_MONITOR_AWARE_V2'
+            Left = $left
+            Top = $top
+            Right = $right
+            Bottom = $bottom
+            Width = $actualWidth
+            Height = $actualHeight
+            ExpectedWidth = $expectedWidth
+            ExpectedHeight = $expectedHeight
+        }
+    }
+    catch {
+        $reason = $_.Exception.Message
+        $message = "settings-dimensions: INCONCLUSIVE stage={0} hwnd={1} awareness={2} dpi={3} callerBefore={4} callerContext={5} actual={6} expected={7} reason={8}" -f
+            $Stage, $hwndText, $windowAwarenessName, $dpi, $callerAwarenessName, $callerContextText, $actualBoundsText, $expectedSizeText, $reason
+        Write-E2E $message
+        if ($reason.StartsWith('INCONCLUSIVE:', [StringComparison]::OrdinalIgnoreCase)) {
+            throw
+        }
+        throw "INCONCLUSIVE: Settings DPI geometry could not be established: $reason"
+    }
+}
+
+function Assert-E2ESettingsDpiGeometry {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('initial', 'reopened')][string]$Stage,
+        [Parameter(Mandatory = $true)][psobject]$Geometry
+    )
+
+    $matchesExpectedSize = $Geometry.Width -eq $Geometry.ExpectedWidth -and
+        $Geometry.Height -eq $Geometry.ExpectedHeight
+    $status = if ($matchesExpectedSize) { 'PASS' } else { 'FAIL' }
+    $message = (
+        "settings-dimensions: status={0} stage={1} hwnd={2} awareness={3} dpi={4} callerBefore={5} callerContext={6} boundsContext={7} " +
+        "actualBounds=[{8},{9},{10},{11}] actual={12}x{13} expected={14}x{15}"
+    ) -f $status, $Stage, $Geometry.Hwnd, $Geometry.Awareness, $Geometry.Dpi,
+    $Geometry.CallerAwarenessBefore, $Geometry.CallerContextBefore, $Geometry.BoundsAwareness,
+    $Geometry.Left, $Geometry.Top, $Geometry.Right, $Geometry.Bottom,
+    $Geometry.Width, $Geometry.Height, $Geometry.ExpectedWidth, $Geometry.ExpectedHeight
+    Write-E2E $message
+
+    $assertionMessage = "Settings window dimensions at $Stage are $($Geometry.Width)x$($Geometry.Height), expected $($Geometry.ExpectedWidth)x$($Geometry.ExpectedHeight) at $($Geometry.Dpi) DPI."
+    Assert-E2E $matchesExpectedSize $assertionMessage
 }
 
 function Record-E2EWindow {
@@ -3579,8 +3757,18 @@ function Open-E2EChildWindow {
         [string]$ButtonAutomationId = '',
         [Parameter(Mandatory = $true)][string]$Title,
         [Parameter(Mandatory = $true)][string]$Role,
-        [Parameter(Mandatory = $true)][int]$ProcessId
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [switch]$KeyboardActivateButton,
+        [IntPtr]$KeyboardActivationOwnerHandle = [IntPtr]::Zero
     )
+
+    if ($KeyboardActivateButton) {
+        Assert-E2E ($KeyboardActivationOwnerHandle -ne [IntPtr]::Zero) 'Keyboard activation requires its owner window handle.'
+        Bring-E2EWindowToFront $KeyboardActivationOwnerHandle
+        Assert-E2E ([CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $KeyboardActivationOwnerHandle) `
+            'Keyboard activation owner must own foreground input.'
+        $MainRoot = Get-E2EUiaRoot $KeyboardActivationOwnerHandle
+    }
 
     $button = Wait-E2E -Description "main button '$ButtonName'" -Probe {
         $candidate = if ([string]::IsNullOrWhiteSpace($ButtonAutomationId)) {
@@ -3600,7 +3788,23 @@ function Open-E2EChildWindow {
         }
         return $false
     }
-    Invoke-E2EElement $button
+    if ($KeyboardActivateButton) {
+        Assert-E2E ([CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $KeyboardActivationOwnerHandle) `
+            'Keyboard activation owner lost foreground before button focus.'
+        $button.SetFocus()
+        Wait-E2E -Description "Keyboard focus on main button '$ButtonName'" -Probe {
+            if ($button.Current.HasKeyboardFocus) { return $true }
+            return $false
+        } | Out-Null
+        Assert-E2E ([CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $KeyboardActivationOwnerHandle) `
+            'Keyboard activation owner lost foreground before Enter.'
+        [CodexInfoWindowsE2EWin32]::keybd_event(0x0D, 0, 0, [UIntPtr]::Zero)
+        [CodexInfoWindowsE2EWin32]::keybd_event(0x0D, 0, 2, [UIntPtr]::Zero)
+        Write-E2E "settings-button-keyboard: button=$ButtonName focus=true key=Enter"
+    }
+    else {
+        Invoke-E2EElement $button
+    }
     $handle = Wait-E2E -Description "$Title window" -Probe {
         $candidate = Find-E2EWindow $ProcessId $Title
         if ($candidate -eq [IntPtr]::Zero) { return $false }
@@ -3899,6 +4103,35 @@ function Select-E2ETheme {
     Write-E2E "theme-selector: PASS options=16 selected=$Label"
 }
 
+function Get-E2ESettingsFooterActionNames {
+    Assert-E2E (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) `
+        'Settings footer labels cannot be checked without the saved language setting.'
+    $savedSettings = Get-Content -LiteralPath $script:e2eSettingsPath -Raw | ConvertFrom-Json
+    $languageCode = ([string]$savedSettings.language).Trim().Replace('_', '-')
+    if ([string]::IsNullOrWhiteSpace($languageCode)) { $languageCode = 'ja' }
+    if ($languageCode.StartsWith('zh', [StringComparison]::OrdinalIgnoreCase)) {
+        $languageCode = 'zh-Hans'
+    }
+    elseif ($languageCode.Contains('-')) {
+        $languageCode = $languageCode.Split('-', 2)[0]
+    }
+
+    $namesByLanguage = @{
+        'ja' = @{ Setup = '接続設定'; License = 'ライセンス情報' }
+        'en' = @{ Setup = 'Connection settings'; License = 'License information' }
+        'zh-Hans' = @{ Setup = '连接设置'; License = '许可证信息' }
+        'ko' = @{ Setup = '연결 설정'; License = '라이선스 정보' }
+        'es' = @{ Setup = 'Configuración de conexión'; License = 'Información de licencia' }
+        'fr' = @{ Setup = 'Paramètres de connexion'; License = 'Informations sur la licence' }
+        'de' = @{ Setup = 'Verbindungseinstellungen'; License = 'Lizenzinformationen' }
+        'pt' = @{ Setup = 'Configurações de conexão'; License = 'Informações da licença' }
+        'it' = @{ Setup = 'Impostazioni di connessione'; License = 'Informazioni sulla licenza' }
+        'ru' = @{ Setup = 'Настройки подключения'; License = 'Информация о лицензии' }
+    }
+    if (-not $namesByLanguage.ContainsKey($languageCode)) { $languageCode = 'en' }
+    return $namesByLanguage[$languageCode]
+}
+
 function Open-E2ESetupFromSettings {
     param(
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
@@ -3908,7 +4141,9 @@ function Open-E2ESetupFromSettings {
 
     $button = Find-E2EElementByAutomationId $SettingsRoot 'Settings.Footer.Setup'
     Assert-E2E ($null -ne $button) 'Settings Setup button is missing.'
-    Assert-E2E ([string]$button.Current.Name -ceq 'Connection settings') 'Settings connection settings button has an unexpected accessible name.'
+    $expectedNames = Get-E2ESettingsFooterActionNames
+    Assert-E2E ([string]$button.Current.Name -ceq $expectedNames.Setup) `
+        'Settings Setup button accessible name does not match the saved language.'
     Invoke-E2EElement $button
     $handle = Wait-E2E -Description 'Setup window' -Probe {
         $found = Find-E2EWindow $ProcessId 'Codex Info Setup'
@@ -4078,10 +4313,11 @@ function Assert-E2ESettingsCommonControls {
     }
     $setup = Find-E2EElementByAutomationId $SettingsRoot 'Settings.Footer.Setup'
     $license = Find-E2EElementByAutomationId $SettingsRoot 'Settings.Footer.Legal'
-    Assert-E2E ([string]$setup.Current.Name -ceq 'Connection settings') `
-        'Settings connection settings action has an unexpected accessible name.'
-    Assert-E2E ([string]$license.Current.Name -ceq 'License information') `
-        'Settings license information action has an unexpected accessible name.'
+    $expectedNames = Get-E2ESettingsFooterActionNames
+    Assert-E2E ([string]$setup.Current.Name -ceq $expectedNames.Setup) `
+        'Settings Setup action accessible name does not match the saved language.'
+    Assert-E2E ([string]$license.Current.Name -ceq $expectedNames.License) `
+        'Settings License action accessible name does not match the saved language.'
 }
 
 function Assert-E2ESettingsStatusPlacement {
@@ -4125,7 +4361,8 @@ function Invoke-E2ESettingsKeyboardFocusCheck {
     param(
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
         [Parameter(Mandatory = $true)][IntPtr]$SettingsHandle,
-        [Parameter(Mandatory = $true)][string]$AutomationId
+        [Parameter(Mandatory = $true)][string]$AutomationId,
+        [Parameter(Mandatory = $true)][string]$NextAutomationId
     )
 
     $tab = Find-E2EElementByAutomationId $SettingsRoot $AutomationId
@@ -4133,19 +4370,40 @@ function Invoke-E2ESettingsKeyboardFocusCheck {
     Assert-E2E ([CodexInfoWindowsE2EWin32]::SetForegroundWindow($SettingsHandle)) `
         'Settings could not receive foreground input for keyboard focus validation.'
     $tab.SetFocus()
-    [CodexInfoWindowsE2EWin32]::keybd_event(0x10, 0, 0, [UIntPtr]::Zero)
-    [CodexInfoWindowsE2EWin32]::keybd_event(0x10, 0, 2, [UIntPtr]::Zero)
-    $selection = $null
-    Assert-E2E ($tab.TryGetCurrentPattern(
-        [System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selection)) `
-        "Settings tab $AutomationId has no SelectionItemPattern for keyboard focus validation."
-    Wait-E2E -Description "Keyboard focus remains on Settings tab $AutomationId" -Probe {
+    # TabStripPlacement=Left: Down moves focus and selection to the next tab.
+    [CodexInfoWindowsE2EWin32]::keybd_event(0x28, 0, 0, [UIntPtr]::Zero)
+    [CodexInfoWindowsE2EWin32]::keybd_event(0x28, 0, 2, [UIntPtr]::Zero)
+    $focusedTab = Wait-E2E -Description "Down-arrow selects and focuses Settings tab $NextAutomationId" -Probe {
+        $candidate = Find-E2EElementByAutomationId $SettingsRoot $NextAutomationId
+        if ($null -eq $candidate) { return $false }
+        $selection = $null
+        if (-not $candidate.TryGetCurrentPattern(
+                [System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selection)) { return $false }
         $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
-        if ($selection.Current.IsSelected -and $focused.Current.AutomationId -ceq $AutomationId) { return $true }
+        if ($selection.Current.IsSelected -and $focused.Current.AutomationId -ceq $NextAutomationId) { return $candidate }
         return $false
-    } | Out-Null
-    $null = Capture-E2EWindow $SettingsHandle 'settings-tab-keyboard-focus'
-    Write-E2E "settings-tab-keyboard-focus: PASS id=$AutomationId selected=true"
+    }
+    $capture = Capture-E2EWindow $SettingsHandle 'settings-tab-keyboard-focus'
+    $originalBounds = $focusedTab.Current.BoundingRectangle
+    Assert-E2E (-not $focusedTab.Current.IsOffscreen -and $originalBounds.Width -gt 0 -and $originalBounds.Height -gt 0) `
+        'Settings keyboard-focused tab has invalid UIA bounds.'
+    $dpi = [CodexInfoWindowsE2EWin32]::GetDpiForWindow($SettingsHandle)
+    Assert-E2E ($dpi -gt 0) 'GetDpiForWindow returned an invalid DPI.'
+    $expandPixels = 2.0 * $dpi / 96.0
+    $expandedBounds = [pscustomobject]@{
+        Left = $originalBounds.Left - $expandPixels
+        Top = $originalBounds.Top - $expandPixels
+        Right = $originalBounds.Right + $expandPixels
+        Bottom = $originalBounds.Bottom + $expandPixels
+    }
+    Write-E2E ("settings-tab-focus-bounds: dpi=$dpi expandDIP=2 expandPixels=$expandPixels " +
+        "original=[$($originalBounds.Left),$($originalBounds.Top),$($originalBounds.Right),$($originalBounds.Bottom)] " +
+        "expanded=[$($expandedBounds.Left),$($expandedBounds.Top),$($expandedBounds.Right),$($expandedBounds.Bottom)]")
+    # SettingsWindow uses Theme5EA7E5. Paper Light resolves it to #297EB2;
+    # the general $e2eThemeColors.Focus value is for the different Theme8BD4FF role.
+    Assert-E2EThemePixel $capture $SettingsHandle '#297EB2' `
+        'Settings tab keyboard focus outline' -ScreenBounds $expandedBounds -MinimumPixels 20
+    Write-E2E "settings-tab-keyboard-focus: PASS start=$AutomationId next=$NextAutomationId selected=true visible-outline=true"
 }
 
 function Get-E2ESettingsComboSelectionText {
@@ -4210,9 +4468,10 @@ function Invoke-E2ESettingsTabs {
     )
 
     $settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
-        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsDraft' -ProcessId $ProcessId
-    Assert-E2E ($settings.Record.width -eq 900 -and $settings.Record.height -eq 480) `
-        "Settings window dimensions are $($settings.Record.width)x$($settings.Record.height), expected 900x480."
+        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsDraft' -ProcessId $ProcessId `
+        -KeyboardActivateButton -KeyboardActivationOwnerHandle $MainHandle
+    $settingsGeometry = Get-E2ESettingsDpiGeometry -Stage initial -Handle $settings.Handle -LogicalWidth 900 -LogicalHeight 480
+    Assert-E2ESettingsDpiGeometry -Stage initial -Geometry $settingsGeometry
     $originalSettings = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
 
     foreach ($automationId in @(
@@ -4276,7 +4535,8 @@ function Invoke-E2ESettingsTabs {
     $settings.Root = Get-E2EUiaRoot $settings.Handle
     Select-E2ESettingsTab $settings.Root 'Settings.Tab.TimeZone'
     $settings.Root = Get-E2EUiaRoot $settings.Handle
-    Invoke-E2ESettingsKeyboardFocusCheck $settings.Root $settings.Handle 'Settings.Tab.TimeZone'
+    Invoke-E2ESettingsKeyboardFocusCheck $settings.Root $settings.Handle `
+        'Settings.Tab.TimeZone' 'Settings.Tab.Appearance'
     Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $originalSettings) `
         'Changing Settings tabs or previewing draft selections changed settings before Save.'
 
@@ -4354,9 +4614,10 @@ function Invoke-E2ESettingsTabs {
 
     $MainRoot = Get-E2EUiaRoot $MainHandle
     $settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
-        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsReopened' -ProcessId $ProcessId
-    Assert-E2E ($settings.Record.width -eq 900 -and $settings.Record.height -eq 480) `
-        "Reopened Settings window dimensions are $($settings.Record.width)x$($settings.Record.height), expected 900x480."
+        -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsReopened' -ProcessId $ProcessId `
+        -KeyboardActivateButton -KeyboardActivationOwnerHandle $MainHandle
+    $settingsGeometry = Get-E2ESettingsDpiGeometry -Stage reopened -Handle $settings.Handle -LogicalWidth 900 -LogicalHeight 480
+    Assert-E2ESettingsDpiGeometry -Stage reopened -Geometry $settingsGeometry
     foreach ($automationId in @(
             'Settings.Tab.Language',
             'Settings.Tab.TimeZone',

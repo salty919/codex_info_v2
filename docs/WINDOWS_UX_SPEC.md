@@ -48,18 +48,18 @@ Windows Settingsは現行の900×480を維持し、中央領域を次の4タブ�
 
 1. Language: 言語選択。
 2. Time zone: タイムゾーン選択。
-3. Appearance: テーマ選択と既存の説明。
-4. Connection status: 接続・認証操作、Recorder/REST version、既存status。
+3. Appearance: テーマ選択。
+4. Connection status: 接続先、接続・認証状態、Recorder/REST version。
 
-デスクトップ設定画面の密度を7、変化量を3、動きを1とし、既存の色tokenとフォントを使う。タブは左の176 DIP幅の縦レールに置き、各項目は40 DIP以上の高さ、12 DIPの内側余白、4 DIPの間隔を持つ。項目名は最大2行で折り返す。非選択タブは補助文字色、選択タブは面色・1 DIP枠・3 DIPのaccent表示・太字で識別する。キーボードのfocus-visibleは独立した2 DIP枠で示し、装飾アニメーションは使わない。本文は14 DIP、補助文字は13 DIPを基本とする。間隔は8／12／16／24 DIPから選ぶ。
+タブは左の176 DIP幅の縦レールに置き、各項目は40 DIP以上の高さ、12 DIPの内側余白、4 DIPの間隔を持つ。項目名は最大2行で折り返す。非選択タブは補助文字色、選択タブは面色・1 DIP枠・3 DIPのaccent表示・太字で識別する。キーボードのfocus-visibleは独立した2 DIP枠で示し、装飾アニメーションは使わない。既存の色tokenとフォントを使い、本文は14 DIP、補助文字は13 DIPを基本とする。間隔は8／12／16／24 DIPから選ぶ。
 
-account selectorは上部の固定領域、接続設定／ライセンス情報／Saveは下部の固定領域に置き、タブの外から常に操作できるようにする。Mainに法的情報の重複入口を置かず、ライセンス情報はSettingsから開く。各タブの既存項目は同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、タブ内容にroot scrollを要求しない。設定項目、保存動作、保存形式、Linux画面は変更しない。
+account selectorは上部の固定領域、下部footerは`*,Auto`の2列に置く。接続設定／ライセンス情報を左のsecondary操作群、Saveを右側のprimary操作として分ける。Mainに法的情報の重複入口を置かず、ライセンス情報はSettingsから開く。各タブの既存項目は同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、設定項目、保存動作、保存形式、Linux画面は変更しない。
 
-右側の内容領域は16 DIPの内側余白を持ち、入力がある設定行を144 DIPのラベル列、12 DIPの間隔、残り幅の入力欄で構成する。入力欄は36 DIP高、カードは内容高に合わせて上詰めする。空欄を大きな枠で囲わず、既存の設定項目と説明だけを表示する。タブと入力欄の間に16 DIPの間隔を設ける。
+右側の各タブは、選択中のタブ名と一致する16 DIPの内側余白を持ち、18 DIPの見出しから始める。Language、Time zone、Appearanceの入力欄は見出しの8 DIP下に置き、幅420 DIP、高さ36 DIPとする。入力欄は左揃えにし、単独の入力欄を大きなsurface/cardで囲まない。Appearanceにはテーマ選択欄だけを置き、星印の装飾、`AppearanceDescription`の説明カード、補足段落を表示しない。
 
-通常の接続詳細はConnection statusタブの中だけに表示する。Save失敗時だけ固定footer直上の共通欄を表示し、4タブのどれからも理由を確認できるようにする。失敗していない状態では、他タブに正常時のsnapshot説明を表示しない。
+Connection statusは他のタブと同じ16 DIPの内側余白を持つ。18 DIPの見出しの下に接続先、通常status、認証操作、Recorder/REST version、version statusを実データの行としてまとめ、各version値は名称と同じ行に置く。接続先などの通常情報はこのタブ内だけに表示し、他タブやWindow見出しに重ねない。単独のsurface/cardや空欄を埋める文、snapshotの説明、装飾的な情報カードを追加しない。タブ内容にroot scrollを要求せず、入力、実status、固定操作の全てへ900×480内で到達できるようにする。
 
-Settings footerの接続先編集入口は`ConnectionSettings`、ライセンス画面見出しとSettings入口は`LicenseInformation`を使い、`docs/LOCALIZATION.md`の全対応localeで表示する。Main上部にはLegal入口を置かない。接続先編集ボタンは既存Setup画面を開き、クリック直後に前面で操作可能になる。
+Save失敗時だけ固定footer直上の共通欄を表示し、4タブのどれからも理由を確認できるようにする。失敗していない状態で正常時のsnapshot説明を表示しない。Settings footerの接続先編集入口は`ConnectionSettings`、ライセンス画面見出しとSettings入口は`LicenseInformation`を使い、`docs/LOCALIZATION.md`の全対応localeで表示する。Main上部にはLegal入口を置かない。接続先編集ボタンは既存Setup画面を開き、クリック直後に前面で操作可能になる。
 
 ## WIN-THEME-422 — Windows版の組込みカラーテーマ
 

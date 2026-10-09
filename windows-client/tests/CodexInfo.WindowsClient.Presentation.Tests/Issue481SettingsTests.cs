@@ -42,11 +42,12 @@ public sealed class Issue590SettingsTests
             element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "TabItem.settings-tab");
         Assert.Contains(document.Descendants(), element =>
             element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "TabItem.settings-tab:selected");
-        Assert.Contains(document.Descendants(), element =>
-            element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value ==
-                "TabItem.settings-tab:focus-visible /template/ Border#FocusOutline");
         var tabStyle = Assert.Single(document.Descendants(), element =>
             element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "TabItem.settings-tab");
+        var focusAdornerPropertyType = typeof(Avalonia.Controls.Control)
+            .GetProperty(nameof(Avalonia.Controls.Control.FocusAdorner))?.PropertyType;
+        Assert.NotNull(focusAdornerPropertyType);
+        Assert.True(focusAdornerPropertyType.IsAssignableFrom(typeof(Avalonia.Markup.Xaml.Templates.Template)));
         Assert.Equal("176", tabStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Width").Attribute("Value")?.Value);
         Assert.Equal("40", tabStyle.Descendants().Single(element =>
@@ -56,10 +57,20 @@ public sealed class Issue590SettingsTests
         Assert.Contains(tabStyle.Descendants(), element =>
             element.Name.LocalName == "Border" &&
             element.Attribute(XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml") + "Name")?.Value == "SelectionIndicator");
-        Assert.Contains(tabStyle.Descendants(), element =>
-            element.Name.LocalName == "Border" &&
-            element.Attribute(XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml") + "Name")?.Value == "FocusOutline" &&
-            element.Attribute("BorderThickness")?.Value == "2");
+        var focusAdornerSetter = Assert.Single(tabStyle.Elements(), element =>
+            element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "FocusAdorner");
+        var focusAdornerTemplate = Assert.Single(focusAdornerSetter.Elements(), element =>
+            element.Name.LocalName == "Template");
+        var focusAdornerBorder = Assert.Single(focusAdornerTemplate.Elements(), element =>
+            element.Name.LocalName == "Border");
+        Assert.Equal("{DynamicResource Theme5EA7E5}", focusAdornerBorder.Attribute("BorderBrush")?.Value);
+        Assert.Equal("2", focusAdornerBorder.Attribute("BorderThickness")?.Value);
+        Assert.DoesNotContain(tabStyle.Descendants(), element =>
+            element.Attribute(XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml") + "Name")?.Value == "FocusOutline");
+        var selectedTabStyle = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "TabItem.settings-tab:selected");
+        Assert.DoesNotContain(selectedTabStyle.Descendants(), element =>
+            element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "FocusAdorner");
         Assert.Contains(document.Descendants(), element =>
             element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value ==
                 "TabItem.settings-tab:selected /template/ Border#SelectionIndicator");
@@ -103,29 +114,67 @@ public sealed class Issue590SettingsTests
             Assert.Equal(expectedName, text.SettingsConnectionStatus);
         }
 
-        var languageSurface = Assert.Single(items[0].Elements(), element => element.Name.LocalName == "Border");
-        Assert.Equal("Top", languageSurface.Attribute("VerticalAlignment")?.Value);
-        Assert.Equal("16", languageSurface.Attribute("Padding")?.Value);
-        Assert.Contains(languageSurface.Descendants(), element => element.Attribute("Text")?.Value == "{Binding Texts.Language}");
-        Assert.Equal("144,12,*", languageSurface.Descendants().Single(element =>
-            element.Name.LocalName == "Grid").Attribute("ColumnDefinitions")?.Value);
+        var languageSection = Assert.Single(items[0].Elements(), element => element.Name.LocalName == "StackPanel");
+        Assert.Equal("Top", languageSection.Attribute("VerticalAlignment")?.Value);
+        Assert.Equal("16", languageSection.Attribute("Margin")?.Value);
+        Assert.Equal("8", languageSection.Attribute("Spacing")?.Value);
+        Assert.DoesNotContain(languageSection.DescendantsAndSelf(), element => element.Name.LocalName == "Border");
+        Assert.Contains(languageSection.Elements(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            element.Attribute("Text")?.Value == "{Binding Texts.Language}" &&
+            element.Attribute("FontSize")?.Value == "18");
+        var languageSelector = Assert.Single(languageSection.Elements(), element => element.Name.LocalName == "ComboBox");
+        Assert.Equal("420", languageSelector.Attribute("Width")?.Value);
+        Assert.Equal("36", languageSelector.Attribute("Height")?.Value);
         AssertExactlyOneBinding(items[0], "ItemsSource", "{Binding LanguageOptions}");
         AssertExactlyOneBinding(items[0], "SelectedValue", "{Binding SelectedLanguageCode}");
         AssertExactlyOneBinding(items[0], "SelectedValueBinding", "{Binding LanguageCode}");
         AssertExactlyOneBinding(items[0], "AutomationProperties.AutomationId", "Settings.LanguageSelector");
-        var timeZoneSurface = Assert.Single(items[1].Elements(), element => element.Name.LocalName == "Border");
-        Assert.Equal("Top", timeZoneSurface.Attribute("VerticalAlignment")?.Value);
-        Assert.Equal("16", timeZoneSurface.Attribute("Padding")?.Value);
-        Assert.Contains(timeZoneSurface.Descendants(), element => element.Attribute("Text")?.Value == "{Binding Texts.TimeZone}");
+        var timeZoneSection = Assert.Single(items[1].Elements(), element => element.Name.LocalName == "StackPanel");
+        Assert.Equal("Top", timeZoneSection.Attribute("VerticalAlignment")?.Value);
+        Assert.Equal("16", timeZoneSection.Attribute("Margin")?.Value);
+        Assert.Equal("8", timeZoneSection.Attribute("Spacing")?.Value);
+        Assert.DoesNotContain(timeZoneSection.DescendantsAndSelf(), element => element.Name.LocalName == "Border");
+        Assert.Contains(timeZoneSection.Elements(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            element.Attribute("Text")?.Value == "{Binding Texts.TimeZone}" &&
+            element.Attribute("FontSize")?.Value == "18");
+        var timeZoneSelector = Assert.Single(timeZoneSection.Elements(), element => element.Name.LocalName == "ComboBox");
+        Assert.Equal("420", timeZoneSelector.Attribute("Width")?.Value);
+        Assert.Equal("36", timeZoneSelector.Attribute("Height")?.Value);
         AssertExactlyOneBinding(items[1], "ItemsSource", "{Binding TimeZoneOptions}");
         AssertExactlyOneBinding(items[1], "SelectedValue", "{Binding SelectedTimeZoneId}");
         AssertExactlyOneBinding(items[1], "SelectedValueBinding", "{Binding Id}");
         AssertExactlyOneBinding(items[1], "AutomationProperties.AutomationId", "Settings.TimeZoneSelector");
+        var appearanceSection = Assert.Single(items[2].Elements(), element => element.Name.LocalName == "StackPanel");
+        Assert.Equal("Top", appearanceSection.Attribute("VerticalAlignment")?.Value);
+        Assert.Equal("16", appearanceSection.Attribute("Margin")?.Value);
+        Assert.Equal("8", appearanceSection.Attribute("Spacing")?.Value);
+        Assert.DoesNotContain(appearanceSection.DescendantsAndSelf(), element => element.Name.LocalName == "Border");
+        Assert.Contains(appearanceSection.Elements(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            element.Attribute("Text")?.Value == "{Binding Texts.Appearance}" &&
+            element.Attribute("FontSize")?.Value == "18");
+        var appearanceSelector = Assert.Single(appearanceSection.Elements(), element => element.Name.LocalName == "ComboBox");
+        Assert.Equal("420", appearanceSelector.Attribute("Width")?.Value);
+        Assert.Equal("36", appearanceSelector.Attribute("Height")?.Value);
+        Assert.DoesNotContain(document.Descendants(), element =>
+            element.Attribute("Text")?.Value == "{Binding Texts.AppearanceDescription}");
         AssertExactlyOneBinding(items[2], "Text", "{Binding Texts.Appearance}");
         AssertExactlyOneBinding(items[2], "ItemsSource", "{Binding ThemeOptions}");
         AssertExactlyOneBinding(items[2], "SelectedValue", "{Binding SelectedThemeId}");
         AssertExactlyOneBinding(items[2], "AutomationProperties.AutomationId", "Settings.ThemeSelector");
-        AssertExactlyOneBinding(items[2], "Text", "{Binding Texts.AppearanceDescription}");
+        Assert.DoesNotContain(document.Descendants(), element =>
+            element.Attribute("Text")?.Value == "{Binding Texts.ConnectionEndpoint}");
+        AssertExactlyOneBinding(items[3], "Text", "{Binding CurrentEndpoint}");
+        var connectionSection = Assert.Single(items[3].Elements(), element => element.Name.LocalName == "StackPanel");
+        Assert.Equal("Top", connectionSection.Attribute("VerticalAlignment")?.Value);
+        Assert.Equal("16", connectionSection.Attribute("Margin")?.Value);
+        Assert.DoesNotContain(connectionSection.DescendantsAndSelf(), element => element.Name.LocalName == "Border");
+        Assert.Contains(connectionSection.Elements(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            element.Attribute("Text")?.Value == "{Binding Texts.SettingsConnectionStatus}" &&
+            element.Attribute("FontSize")?.Value == "18");
         var connectionStatusTitle = Assert.Single(items[3].Descendants(), element =>
             element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding StatusTitle}");
         Assert.Equal("Settings.ConnectionStatus.Title", connectionStatusTitle.Attribute("AutomationProperties.AutomationId")?.Value);
@@ -136,22 +185,51 @@ public sealed class Issue590SettingsTests
         var saveErrorText = Assert.Single(saveError.Descendants(), element =>
             element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding StatusDetail}");
         Assert.Equal("Settings.SaveError", saveErrorText.Attribute("AutomationProperties.AutomationId")?.Value);
-        AssertExactlyOneBinding(items[3], "Text", "{Binding StatusTitle}");
         AssertExactlyOneBinding(items[3], "Click", "OnRefresh");
         AssertExactlyOneBinding(items[3], "AutomationProperties.AutomationId", "Settings.AuthCheck");
         AssertExactlyOneBinding(items[3], "Click", "OnAuth");
-        AssertExactlyOneBinding(items[3], "Text", "{Binding RecorderVersion}");
-        AssertExactlyOneBinding(items[3], "Text", "{Binding RestVersion}");
         AssertExactlyOneBinding(items[3], "Text", "{Binding RuntimeVersionStatus}");
+        var recorderVersion = Assert.Single(items[3].Descendants(), element =>
+            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding RecorderVersion}");
+        Assert.Equal("Grid", recorderVersion.Parent?.Name.LocalName);
+        Assert.Contains(recorderVersion.Parent!.Elements(), element =>
+            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "Recorder");
+        var restVersion = Assert.Single(items[3].Descendants(), element =>
+            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding RestVersion}");
+        Assert.Equal("Grid", restVersion.Parent?.Name.LocalName);
+        Assert.Contains(restVersion.Parent!.Elements(), element =>
+            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "REST");
+        foreach (var binding in new[]
+        {
+            "{Binding CurrentEndpoint}",
+            "{Binding StatusTitle}",
+            "{Binding RecorderVersion}",
+            "{Binding RestVersion}",
+            "{Binding RuntimeVersionStatus}",
+        })
+        {
+            Assert.DoesNotContain(items.Take(3).SelectMany(item => item.Descendants()), element =>
+                element.Attribute("Text")?.Value == binding);
+        }
 
         var accountSelector = Assert.Single(grid.Elements(), element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountSelector");
         Assert.Equal("1", accountSelector.Attribute("Grid.Row")?.Value);
         var footer = Assert.Single(grid.Elements(), element =>
-            element.Name.LocalName == "StackPanel" && element.Attribute("Grid.Row")?.Value == "3");
-        Assert.Contains(footer.Descendants(), element => element.Attribute("Text")?.Value == "{Binding Texts.ConnectionSettings}");
-        Assert.Contains(footer.Descendants(), element => element.Attribute("Text")?.Value == "{Binding Texts.LicenseInformation}");
-        Assert.Contains(footer.Descendants(), element => element.Attribute("Text")?.Value == "{Binding Texts.Save}");
+            element.Name.LocalName == "Grid" && element.Attribute("Grid.Row")?.Value == "3");
+        Assert.Equal("*,Auto", footer.Attribute("ColumnDefinitions")?.Value);
+        var secondaryActions = Assert.Single(footer.Elements(), element =>
+            element.Name.LocalName == "StackPanel" && element.Attribute("Grid.Column")?.Value == "0");
+        var saveButton = Assert.Single(footer.Elements(), element =>
+            element.Name.LocalName == "Button" && element.Attribute("Grid.Column")?.Value == "1");
+        Assert.Contains(secondaryActions.Descendants(), element => element.Attribute("Text")?.Value == "{Binding Texts.ConnectionSettings}");
+        Assert.Contains(secondaryActions.Descendants(), element => element.Attribute("Text")?.Value == "{Binding Texts.LicenseInformation}");
+        Assert.Equal("secondary", Assert.Single(secondaryActions.Elements(), element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.Footer.Setup").Attribute("Classes")?.Value);
+        Assert.Equal("secondary", Assert.Single(secondaryActions.Elements(), element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.Footer.Legal").Attribute("Classes")?.Value);
+        Assert.Contains(saveButton.DescendantsAndSelf(), element => element.Attribute("Text")?.Value == "{Binding Texts.Save}");
+        Assert.Equal("primary", saveButton.Attribute("Classes")?.Value);
         AssertExactlyOneBinding(footer, "AutomationProperties.AutomationId", "Settings.Footer.Setup");
         AssertExactlyOneBinding(footer, "AutomationProperties.AutomationId", "Settings.Footer.Legal");
         AssertExactlyOneBinding(footer, "AutomationProperties.AutomationId", "Settings.Footer.Save");
