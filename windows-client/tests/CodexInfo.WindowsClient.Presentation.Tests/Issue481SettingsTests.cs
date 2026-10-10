@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Net;
+using System.Reflection;
 using System.Text;
 using System.Xml.Linq;
 using CodexInfo.WindowsClient.Core;
@@ -14,6 +15,60 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class Issue590SettingsTests
 {
     [Fact]
+    public void FixtureDefaultSettingsPathIsIsolated()
+    {
+        const string fixturePortVariable = "CODEX_INFO_WINDOWS_E2E_FIXTURE_PORT";
+        const string fixtureSettingsPathVariable = "CODEX_INFO_WINDOWS_E2E_SETTINGS_PATH";
+        var originalFixturePort = Environment.GetEnvironmentVariable(fixturePortVariable);
+        var originalFixtureSettingsPath = Environment.GetEnvironmentVariable(fixtureSettingsPathVariable);
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "codex-info-e2e-settings-" + Guid.NewGuid().ToString("N"));
+        var expectedFixturePath = Path.Combine(temporaryDirectory, "settings.json");
+
+        try
+        {
+            Environment.SetEnvironmentVariable(fixturePortVariable, "12345");
+            Environment.SetEnvironmentVariable(fixtureSettingsPathVariable, expectedFixturePath);
+
+            var fixtureStore = new ClientSettingsStore();
+            var settingsPathField = typeof(ClientSettingsStore).GetField(
+                "path",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(settingsPathField);
+            Assert.Equal(Path.GetFullPath(expectedFixturePath), settingsPathField.GetValue(fixtureStore));
+
+            // The RED path stops above, before any write to the real profile.
+            fixtureStore.Save(ClientSettings.Default);
+            Assert.True(File.Exists(expectedFixturePath));
+
+            Environment.SetEnvironmentVariable(fixturePortVariable, null);
+            var normalStore = new ClientSettingsStore();
+            var expectedNormalPath = Path.GetFullPath(Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CodexInfo",
+                "settings.json"));
+            Assert.Equal(expectedNormalPath, settingsPathField.GetValue(normalStore));
+
+            Environment.SetEnvironmentVariable(fixturePortVariable, "12345");
+            Environment.SetEnvironmentVariable(fixtureSettingsPathVariable, null);
+            Assert.Throws<InvalidOperationException>(() => new ClientSettingsStore());
+
+            Environment.SetEnvironmentVariable(fixtureSettingsPathVariable, "relative/settings.json");
+            Assert.Throws<InvalidOperationException>(() => new ClientSettingsStore());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(fixturePortVariable, originalFixturePort);
+            Environment.SetEnvironmentVariable(fixtureSettingsPathVariable, originalFixtureSettingsPath);
+            if (Directory.Exists(temporaryDirectory))
+            {
+                Directory.Delete(temporaryDirectory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
     public void SettingsTabsContainAllExistingControlsAndKeepFooterFixed()
     {
         var document = XDocument.Parse(LoadRepositoryFile(
@@ -23,13 +78,22 @@ public sealed class Issue590SettingsTests
         Assert.Equal("480", window.Attribute("Height")?.Value);
 
         var grid = Assert.Single(document.Descendants(), element =>
-            element.Name.LocalName == "Grid" && element.Attribute("RowDefinitions")?.Value == "Auto,44,*,Auto");
+            element.Name.LocalName == "Grid" && element.Attribute("RowDefinitions")?.Value == "44,*,Auto");
         Assert.Equal("24", grid.Attribute("Margin")?.Value);
         Assert.Equal("12", grid.Attribute("RowSpacing")?.Value);
-        var contentRegion = Assert.Single(grid.Elements(), element => element.Attribute("Grid.Row")?.Value == "2");
+        var header = Assert.Single(grid.Elements(), element =>
+            element.Name.LocalName == "Grid" && element.Attribute("ColumnDefinitions")?.Value == "*,Auto,Auto");
+        var accountSelector = Assert.Single(header.Elements(), element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountSelector");
+        Assert.Equal("1", accountSelector.Attribute("Grid.Column")?.Value);
+        Assert.Null(accountSelector.Attribute("Grid.Row"));
+        Assert.Contains(header.Elements(), element =>
+            element.Name.LocalName == "Button" && element.Attribute("Grid.Column")?.Value == "2" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.Window.Close");
+        var contentRegion = Assert.Single(grid.Elements(), element => element.Attribute("Grid.Row")?.Value == "1");
         var tabs = Assert.Single(contentRegion.DescendantsAndSelf(), element => element.Name.LocalName == "TabControl");
-        Assert.Equal("2", contentRegion.Attribute("Grid.Row")?.Value);
-        Assert.Equal("Left", tabs.Attribute("TabStripPlacement")?.Value);
+        Assert.Equal("1", contentRegion.Attribute("Grid.Row")?.Value);
+        Assert.Equal("Top", tabs.Attribute("TabStripPlacement")?.Value);
         Assert.Contains("settings-tabs", tabs.Attribute("Classes")?.Value);
         var items = tabs.Elements().Where(element => element.Name.LocalName == "TabItem").ToArray();
         Assert.Equal(4, items.Length);
@@ -48,12 +112,22 @@ public sealed class Issue590SettingsTests
             .GetProperty(nameof(Avalonia.Controls.Control.FocusAdorner))?.PropertyType;
         Assert.NotNull(focusAdornerPropertyType);
         Assert.True(focusAdornerPropertyType.IsAssignableFrom(typeof(Avalonia.Markup.Xaml.Templates.Template)));
-        Assert.Equal("176", tabStyle.Descendants().Single(element =>
-            element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Width").Attribute("Value")?.Value);
+        Assert.Equal("144", tabStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "MinWidth").Attribute("Value")?.Value);
         Assert.Equal("40", tabStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "MinHeight").Attribute("Value")?.Value);
+        Assert.Equal("0,0,8,0", tabStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Margin").Attribute("Value")?.Value);
         Assert.Equal("12,8", tabStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Padding").Attribute("Value")?.Value);
+        Assert.Equal("{DynamicResource Theme151F2D}", tabStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Background").Attribute("Value")?.Value);
+        Assert.Equal("{DynamicResource Theme36516B}", tabStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "BorderBrush").Attribute("Value")?.Value);
+        var headerTemplate = Assert.Single(tabStyle.Elements(), element =>
+            element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "HeaderTemplate");
+        Assert.Equal("NoWrap", headerTemplate.Descendants().Single(element => element.Name.LocalName == "TextBlock")
+            .Attribute("TextWrapping")?.Value);
         Assert.Contains(tabStyle.Descendants(), element =>
             element.Name.LocalName == "Border" &&
             element.Attribute(XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml") + "Name")?.Value == "SelectionIndicator");
@@ -69,6 +143,11 @@ public sealed class Issue590SettingsTests
             element.Attribute(XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml") + "Name")?.Value == "FocusOutline");
         var selectedTabStyle = Assert.Single(document.Descendants(), element =>
             element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "TabItem.settings-tab:selected");
+        var selectedTabSurfaceStyle = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value ==
+                "TabItem.settings-tab:selected /template/ Border#PART_Border");
+        Assert.Equal("{DynamicResource Theme18283A}", selectedTabSurfaceStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Background").Attribute("Value")?.Value);
         Assert.DoesNotContain(selectedTabStyle.Descendants(), element =>
             element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "FocusAdorner");
         Assert.Contains(document.Descendants(), element =>
@@ -190,12 +269,14 @@ public sealed class Issue590SettingsTests
         AssertExactlyOneBinding(items[3], "Click", "OnAuth");
         AssertExactlyOneBinding(items[3], "Text", "{Binding RuntimeVersionStatus}");
         var recorderVersion = Assert.Single(items[3].Descendants(), element =>
-            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding RecorderVersion}");
+            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding RecorderVersion}" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.RuntimeVersion.Recorder");
         Assert.Equal("Grid", recorderVersion.Parent?.Name.LocalName);
         Assert.Contains(recorderVersion.Parent!.Elements(), element =>
             element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "Recorder");
         var restVersion = Assert.Single(items[3].Descendants(), element =>
-            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding RestVersion}");
+            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding RestVersion}" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.RuntimeVersion.Rest");
         Assert.Equal("Grid", restVersion.Parent?.Name.LocalName);
         Assert.Contains(restVersion.Parent!.Elements(), element =>
             element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "REST");
@@ -212,11 +293,8 @@ public sealed class Issue590SettingsTests
                 element.Attribute("Text")?.Value == binding);
         }
 
-        var accountSelector = Assert.Single(grid.Elements(), element =>
-            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountSelector");
-        Assert.Equal("1", accountSelector.Attribute("Grid.Row")?.Value);
         var footer = Assert.Single(grid.Elements(), element =>
-            element.Name.LocalName == "Grid" && element.Attribute("Grid.Row")?.Value == "3");
+            element.Name.LocalName == "Grid" && element.Attribute("Grid.Row")?.Value == "2");
         Assert.Equal("*,Auto", footer.Attribute("ColumnDefinitions")?.Value);
         var secondaryActions = Assert.Single(footer.Elements(), element =>
             element.Name.LocalName == "StackPanel" && element.Attribute("Grid.Column")?.Value == "0");
