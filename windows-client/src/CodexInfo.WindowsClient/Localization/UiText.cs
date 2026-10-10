@@ -497,6 +497,32 @@ public sealed record UiText(
     public string LegalDetailsName => LanguageCode == "ja" ? "詳細" : "Details";
     public string LegalDistributionName => LanguageCode == "ja" ? "配布" : "Distribution";
     public string TimeZone => LanguageCode switch { "ja" => "表示タイムゾーン", "zh-Hans" => "显示时区", "ko" => "표시 시간대", "es" => "Zona horaria", "fr" => "Fuseau horaire", "de" => "Zeitzone", "pt" => "Fuso horário", "it" => "Fuso orario", "ru" => "Часовой пояс", _ => "Display time zone" };
+    public string SettingsDisplayTab => LanguageCode switch
+    {
+        "ja" => "表示",
+        "zh-Hans" => "显示",
+        "ko" => "표시",
+        "es" => "Visualización",
+        "fr" => "Affichage",
+        "de" => "Anzeige",
+        "pt" => "Exibição",
+        "it" => "Visualizzazione",
+        "ru" => "Отображение",
+        _ => "Display"
+    };
+    public string SettingsDisplayTarget => LanguageCode switch
+    {
+        "ja" => "表示対象",
+        "zh-Hans" => "显示对象",
+        "ko" => "표시 대상",
+        "es" => "Cuenta mostrada",
+        "fr" => "Compte affiché",
+        "de" => "Angezeigtes Konto",
+        "pt" => "Conta exibida",
+        "it" => "Account visualizzato",
+        "ru" => "Отображаемый аккаунт",
+        _ => "Display target"
+    };
     public string SettingsConnectionStatus => LanguageCode switch
     {
         "ja" => "接続状態",

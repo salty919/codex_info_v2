@@ -40,26 +40,23 @@ X版はデータ意味論、状態、所有権の参照元であり、Windows版
 `WIN-PARITY-UX`、`ACCOUNT-UX-134`およびI18N ownerの`PROC-I18N-01`に属する下記Main構成と
 Linux timezone設定、Issue #422で利用者が選択したWindows版の`WIN-THEME-422`だけは有限scopeの実装・直接評価対象とする。この限定決定は本書全体の
 `PRODUCT_PENDING`を解除せず、他の未確定契約を`EXTRACTION_COMPLETE`として扱う根拠にしない。
-Issue #590で利用者が依頼したSettingsの4タブ切替に限り、`WIN-SETTINGS-TABS-590`も有限scopeの実装・直接評価対象とする。
+Issue #590で利用者が依頼したSettingsの2タブ切替に限り、`WIN-SETTINGS-TABS-590`も有限scopeの実装・直接評価対象とする。
 
-## WIN-SETTINGS-TABS-590 — Windows Settingsの4タブ切替
+## WIN-SETTINGS-TABS-590 — Windows Settingsの2タブ切替
 
-Windows Settingsは現行の900×480を維持し、中央領域を次の4タブに分ける。
+Windows Settingsは現行の900×480を維持し、タイトルの下に「表示」「接続状態」の2タブを置く。初期表示は「表示」タブとする。タブ内容は一度に一つだけ切り替え、設定画面下部の操作footerは常時固定する。
 
-1. Language: 言語選択。
-2. Time zone: タイムゾーン選択。
-3. Appearance: テーマ選択。
-4. Connection status: 接続先、接続・認証状態、Recorder/REST version。
+タイトルを除く設定内容は幅660 DIPの中央列に収め、タブ帯・内容フォーム・footerの左右端を揃える。タブ列は列幅660 DIPとし、各タブは高さ36 DIP、文字に合わせた幅（最小88 DIP）、間隔4 DIPとする。ラベルを折り返したり切り詰めたりせず、両タブは同じ控えめな面・枠で表示する。選択状態にだけ小さな色差を付けて現在位置を判別できるようにし、選択中のタブ自体を大きな面や独立カードとして強調しない。keyboard focus-visibleは選択状態と混同しない既存focus表示を維持し、装飾アニメーションは使わない。
 
-4タブは内容領域の上辺に横並びで置く。各項目は40 DIP以上の高さ、12 DIPの内側余白を持ち、項目間は8 DIP空ける。4項目を一目で識別できる幅を確保し、名称を折り返さない。非選択タブにも既存の面色と1 DIP枠を常時表示し、選択タブは明るい面色・accentの下線・太字で区別する。キーボードのfocus-visibleは選択状態と混同しない独立した2 DIP枠で示す。装飾アニメーションは使わない。既存の色tokenとフォントを使い、本文は14 DIP、補助文字は13 DIPを基本とする。間隔は8／12／16／24 DIPから選ぶ。
+「表示」タブには言語、表示タイムゾーン、外観（テーマ）、表示対象アカウントをまとめる。「接続状態」タブには接続先、接続・認証状態、Recorder/REST versionをまとめる。既存の項目と選択肢を欠落・重複させない。
 
-account selectorはSettings見出しと同じ上部行の右側に置き、独立した行やカードにしない。全タブで常時表示し、アカウントに紐付く表示対象を即時に切り替える既存のglobal操作を維持する。Save対象にはせず、選択を取消やCloseで戻さない。下部footerは`*,Auto`の2列に置く。接続設定／ライセンス情報を左のsecondary操作群、Saveを右側のprimary操作として分ける。Mainに法的情報の重複入口を置かず、ライセンス情報はSettingsから開く。各タブの既存項目は同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、設定項目、保存動作、保存形式、Linux画面は変更しない。
+「表示」タブの4項目は同じラベル・入力欄の整列したフォームに置き、列はラベル160 DIP、間隔12 DIP、入力488 DIP（合計660 DIP）、各入力欄は高さ36 DIP、項目間は12 DIPとする。フォームの左右に追加marginを置かず、タブ・footerと同じ中央列の端に合わせる。表示対象アカウントはこのフォームの1項目として「表示対象」と選択中アカウントを表示する。タイトル行、タブ、独立カードには置かず、アカウント別設定と誤認させる説明文を加えない。フォームは高さ36 DIPの4行を持つGridとし、account行にselectorだけを含む`SettingsAccountSelectorAnchor`を置く。`AccountMenu`の外枠は同じフォームGridの2列目に重ね、selectorの上へ開く。外枠の幅と最大幅はselectorと同じ488 DIP、最大高144 DIPとし、selectorの上端にメニュー下端を合わせる。続きの選択肢は既存ListBox内でscrollする。メニュー開閉でフォーム内容を移動させない。実際の隣接表示、画面内での操作可能性、内容が移動しないことは実Windowsで確認する。アカウント選択は既存どおりMain、Graph、Threadsと共有する表示対象を即時に切り替える。認証、設定値、Save対象にはせず、タブ切替、Save、Closeで選択を戻さない。
 
-右側の各タブは、選択中のタブ名と一致する16 DIPの内側余白を持ち、18 DIPの見出しから始める。Language、Time zone、Appearanceの入力欄は見出しの8 DIP下に置き、幅420 DIP、高さ36 DIPとする。入力欄は左揃えにし、単独の入力欄を大きなsurface/cardで囲まない。Appearanceにはテーマ選択欄だけを置き、星印の装飾、`AppearanceDescription`の説明カード、補足段落を表示しない。
+「表示」タブでは設定項目を同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、既存のdraft保持とSave動作を維持する。設定項目、選択肢、保存形式、Linux画面は変更しない。外観はテーマ選択欄だけを置き、星印の装飾、`AppearanceDescription`の説明カード、補足段落を表示しない。
 
-Connection statusは他のタブと同じ16 DIPの内側余白を持つ。18 DIPの見出しの下に接続先、通常status、認証操作、Recorder/REST version、version statusを実データの行としてまとめ、各version値は名称と同じ行に置く。接続先などの通常情報はこのタブ内だけに表示し、他タブやWindow見出しに重ねない。単独のsurface/cardや空欄を埋める文、snapshotの説明、装飾的な情報カードを追加しない。タブ内容にroot scrollを要求せず、入力、実status、固定操作の全てへ900×480内で到達できるようにする。
+「接続状態」タブでは接続先、通常status、認証操作、Recorder/REST version、version statusを実データの行としてまとめ、各version値は名称と同じ行に置く。接続先などの通常情報はこのタブ内だけに表示し、他タブやWindow見出しに重ねない。空欄を埋める文、snapshotの説明、装飾的な情報カードを追加しない。root scrollを要求せず、入力、実status、固定操作の全てへ900×480内で到達できるようにする。
 
-Save失敗時だけ固定footer直上の共通欄を表示し、4タブのどれからも理由を確認できるようにする。失敗していない状態で正常時のsnapshot説明を表示しない。Settings footerの接続先編集入口は`ConnectionSettings`、ライセンス画面見出しとSettings入口は`LicenseInformation`を使い、`docs/LOCALIZATION.md`の全対応localeで表示する。Main上部にはLegal入口を置かない。接続先編集ボタンは既存Setup画面を開き、クリック直後に前面で操作可能になる。
+Save失敗時だけ固定footer直上の共通欄を表示し、どちらのタブからも理由を確認できるようにする。失敗していない状態でsnapshot説明を表示しない。下部footerでは接続設定／ライセンス情報を左のsecondary操作群、Saveを右側のprimary操作として分ける。ライセンス情報はSettingsから開き、Main上部にはLegal入口を置かない。Settings footerの接続先編集入口は`ConnectionSettings`、ライセンス画面見出しとSettings入口は`LicenseInformation`を使い、`docs/LOCALIZATION.md`の全対応localeで表示する。接続先編集ボタンは既存Setup画面を開き、クリック直後に前面で操作可能になる。
 
 ## WIN-THEME-422 — Windows版の組込みカラーテーマ
 

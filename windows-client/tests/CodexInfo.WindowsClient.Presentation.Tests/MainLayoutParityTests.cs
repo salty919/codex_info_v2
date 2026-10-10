@@ -98,35 +98,64 @@ public sealed class MainLayoutParityTests
         AssertCurrentMarker(document, "Settings.SelectedAccountCurrentMarker", "{Binding SelectedAccount.IsCurrent}");
         AssertCurrentMarker(document, "Settings.AccountCurrentMarker", "{Binding IsCurrent}");
         Assert.Contains(document.Descendants(), element => element.Attribute("Text")?.Value == "{Binding MainDisplayLabel}");
-        var selector = document.Descendants().Single(element =>
-            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountSelector");
-        var settingsGrid = document.Descendants().Single(element =>
-            element.Name.LocalName == "Grid" && element.Attribute("RowDefinitions")?.Value == "44,*,Auto");
-        var header = settingsGrid.Elements().Single(element =>
-            element.Name.LocalName == "Grid" && element.Attribute("ColumnDefinitions")?.Value == "*,Auto,Auto");
-        Assert.Same(header, selector.Parent);
-        Assert.Equal("1", selector.Attribute("Grid.Column")?.Value);
-        Assert.Null(selector.Attribute("Grid.Row"));
-        var menu = document.Descendants().Single(element =>
-            element.Name.LocalName == "ListBox" &&
-            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountMenu").Parent!;
-        Assert.Equal("3", menu.Attribute("Grid.RowSpan")?.Value);
-        var content = selector.Elements().Single(element => element.Name.LocalName == "Grid");
-        var labelColumn = content.Descendants().Single(element =>
-            element.Name.LocalName == "StackPanel" && element.Attribute("Grid.Column")?.Value == "1");
-        var chevron = content.Descendants().Single(element =>
-            element.Attribute("Text")?.Value == "⌄");
 
-        Assert.Equal("250", selector.Attribute("Width")?.Value);
-        Assert.Equal("44", selector.Attribute("Height")?.Value);
-        Assert.Equal("Stretch", selector.Attribute("HorizontalContentAlignment")?.Value);
-        Assert.Equal("18,*,14", content.Attribute("ColumnDefinitions")?.Value);
-        Assert.Contains(labelColumn.Descendants(), element =>
-            element.Attribute("Text")?.Value == "{Binding Texts.Account}");
-        Assert.Contains(labelColumn.Descendants(), element =>
-            element.Attribute("Text")?.Value == "{Binding SelectedAccountText}");
-        Assert.Equal("2", chevron.Attribute("Grid.Column")?.Value);
-        Assert.Equal("Center", chevron.Attribute("HorizontalAlignment")?.Value);
+        var settingsGrid = Assert.Single(document.Root!.Elements(), element => element.Name.LocalName == "Grid");
+        var header = Assert.Single(settingsGrid.Elements(), element =>
+            element.Name.LocalName == "Grid" && element.Attribute("Grid.Row") is null);
+        Assert.DoesNotContain(header.DescendantsAndSelf(), element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountSelector");
+        var navigationBand = Assert.Single(settingsGrid.Elements(), element =>
+            element.Attribute("Grid.Row")?.Value == "1" &&
+            element.Descendants().Any(child => child.Name.LocalName == "TabStrip"));
+        Assert.DoesNotContain(navigationBand.DescendantsAndSelf(), element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountSelector");
+
+        var tabControl = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "TabControl" &&
+            element.Attribute("Classes")?.Value == "settings-content");
+        var displayTab = tabControl.Elements().First(element => element.Name.LocalName == "TabItem");
+        var selector = Assert.Single(displayTab.DescendantsAndSelf(), element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountSelector");
+        Assert.Equal("488", selector.Attribute("Width")?.Value);
+        Assert.Equal("36", selector.Attribute("Height")?.Value);
+        Assert.Equal("{Binding Texts.SettingsDisplayTarget}", selector.Attribute("AutomationProperties.Name")?.Value);
+        Assert.Equal("{Binding SelectedAccountText}", selector.Attribute("AutomationProperties.HelpText")?.Value);
+        Assert.Equal("{Binding SelectedAccountText}", selector.Attribute("ToolTip.Tip")?.Value);
+        Assert.Equal("Press", selector.Attribute("ClickMode")?.Value);
+        Assert.Equal("OnAccountSelectorCheckedChanged", selector.Attribute("IsCheckedChanged")?.Value);
+        Assert.Contains(displayTab.Descendants(), element =>
+            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding Texts.SettingsDisplayTarget}");
+        Assert.Contains(displayTab.Descendants(), element =>
+            element.Name.LocalName == "TextBlock" && element.Attribute("Text")?.Value == "{Binding SelectedAccountText}");
+
+        var xName = XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml") + "Name";
+        var anchor = Assert.Single(displayTab.DescendantsAndSelf(), element =>
+            element.Attribute(xName)?.Value == "SettingsAccountSelectorAnchor");
+        Assert.Contains(anchor.DescendantsAndSelf(), element => ReferenceEquals(element, selector));
+        Assert.DoesNotContain(selector.Ancestors(), element => element.Name.LocalName == "Border");
+
+        var accountMenu = Assert.Single(document.Descendants(), element =>
+            element.Name.LocalName == "ListBox" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountMenu");
+        var accountMenuHost = accountMenu.Ancestors().FirstOrDefault(element => element.Attribute(xName)?.Value == "AccountMenu");
+        Assert.NotNull(accountMenuHost);
+        var displayForm = Assert.Single(displayTab.DescendantsAndSelf(), element =>
+            element.Name.LocalName == "Grid" &&
+            element.Attribute("RowDefinitions")?.Value == "36,36,36,36" &&
+            element.Attribute("RowSpacing")?.Value == "12");
+        Assert.DoesNotContain(anchor.DescendantsAndSelf(), element => ReferenceEquals(element, accountMenuHost));
+        Assert.Contains(displayForm.Elements(), element => ReferenceEquals(element, accountMenuHost));
+        Assert.Equal("2", accountMenuHost.Attribute("Grid.Column")?.Value);
+        Assert.Equal("0", accountMenuHost.Attribute("Grid.Row")?.Value);
+        Assert.Equal("4", accountMenuHost.Attribute("Grid.RowSpan")?.Value);
+        Assert.Equal("488", accountMenuHost.Attribute("Width")?.Value);
+        Assert.Equal("488", accountMenuHost.Attribute("MaxWidth")?.Value);
+        Assert.Equal("Bottom", accountMenuHost.Attribute("VerticalAlignment")?.Value);
+        Assert.Equal("0,0,0,36", accountMenuHost.Attribute("Margin")?.Value);
+        Assert.Equal("144", accountMenuHost.Attribute("MaxHeight")?.Value);
+        Assert.Equal("{Binding Accounts}", accountMenu.Attribute("ItemsSource")?.Value);
+        Assert.Equal("{Binding SelectedAccount, Mode=TwoWay}", accountMenu.Attribute("SelectedItem")?.Value);
+        Assert.Equal("OnAccountSelectionChanged", accountMenu.Attribute("SelectionChanged")?.Value);
 
         var accountStyle = document.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&

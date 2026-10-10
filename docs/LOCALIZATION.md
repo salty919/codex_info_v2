@@ -64,20 +64,20 @@ UTCの順で解決し、非空で不正な`TZ`はUTCへfail closedします。`T
 通常時のStatusBannerは状態名・説明・前回受信時刻を別欄に置きます。thread title、email、モデル名、製品名、
 ライセンス名、ログ生値は原文を表示し、数値とepoch秒だけを表示時のlocale・timezoneへ変換します。
 
-Windows SettingsのConnection statusタブ見出しはUiTextの`SettingsConnectionStatus`を使い、対応localeごとに次の値を表示します。
+Windows Settingsの「表示」「接続状態」タブ見出しはUiTextの`SettingsDisplayTab`と`SettingsConnectionStatus`を使い、対応localeごとに次の値を表示します。
 
-| locale | SettingsConnectionStatus |
-| --- | --- |
-| `ja` | 接続状態 |
-| `en` | Connection status |
-| `zh-Hans` | 连接状态 |
-| `ko` | 연결 상태 |
-| `es` | Estado de conexión |
-| `fr` | État de la connexion |
-| `de` | Verbindungsstatus |
-| `pt` | Estado da conexão |
-| `it` | Stato della connessione |
-| `ru` | Состояние подключения |
+| locale | SettingsDisplayTab | SettingsConnectionStatus |
+| --- | --- | --- |
+| `ja` | 表示 | 接続状態 |
+| `en` | Display | Connection status |
+| `zh-Hans` | 显示 | 连接状态 |
+| `ko` | 표시 | 연결 상태 |
+| `es` | Visualización | Estado de conexión |
+| `fr` | Affichage | État de la connexion |
+| `de` | Anzeige | Verbindungsstatus |
+| `pt` | Exibição | Estado da conexão |
+| `it` | Visualizzazione | Stato della connessione |
+| `ru` | Отображение | Состояние подключения |
 
 Windows Settingsの接続先編集とライセンス情報は次のUiText keyを使います。Setupの本画面名と本文は変更せず、Settings footerの操作名だけを区別します。
 
