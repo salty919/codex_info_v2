@@ -79,6 +79,21 @@ Windows SettingsのConnection statusタブ見出しはUiTextの`SettingsConnecti
 | `it` | Stato della connessione |
 | `ru` | Состояние подключения |
 
+Windows Settingsの接続先編集とライセンス情報は次のUiText keyを使います。Setupの本画面名と本文は変更せず、Settings footerの操作名だけを区別します。
+
+| locale | ConnectionSettings | LicenseInformation |
+| --- | --- | --- |
+| `ja` | 接続設定 | ライセンス情報 |
+| `en` | Connection settings | License information |
+| `zh-Hans` | 连接设置 | 许可证信息 |
+| `ko` | 연결 설정 | 라이선스 정보 |
+| `es` | Configuración de conexión | Información de licencia |
+| `fr` | Paramètres de connexion | Informations sur la licence |
+| `de` | Verbindungseinstellungen | Lizenzinformationen |
+| `pt` | Configurações de conexão | Informações da licença |
+| `it` | Impostazioni di connessione | Informazioni sulla licenza |
+| `ru` | Настройки подключения | Информация о лицензии |
+
 Linux/Windows Mainの観測時刻ラベルと正常時の最新snapshot説明は、観測元OS名を付けず、
 全対応localeで次の固定文言を使います。接続・認証・障害の説明でLinux側を指す文言はこの契約の対象外です。
 
@@ -156,6 +171,7 @@ key欠落、未解決key、文字化け、catalog内locale混在は0とする。
 
 Main、Setup、Settings、Graph、Threads、LegalおよびMain HWND内Helpは、localeに依存しない同一
 `AutomationId`、focus topology、Tab/Shift+Tab逆順、Alt chord、Enter/Escape action、routeを使う。
+LegalはSettings footerから開き、Mainに重複入口を設けません。
 各controlのUIA manifestは`AutomationId`、catalog由来の非空`Name`、`HelpText`/`Description`、
 `AcceleratorKey`、visible `bounds`を持ち、Name/descriptionの未解決、ID重複、操作差を0とする。
 
