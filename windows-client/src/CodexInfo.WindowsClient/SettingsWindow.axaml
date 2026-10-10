@@ -50,11 +50,11 @@
       <Setter Property="Background" Value="{DynamicResource Theme24415E}" />
       <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
     </Style>
-    <Style Selector="TabItem.settings-tab">
-      <Setter Property="MinWidth" Value="144" />
-      <Setter Property="MinHeight" Value="40" />
-      <Setter Property="Margin" Value="0,0,8,0" />
-      <Setter Property="Padding" Value="12,8" />
+    <Style Selector="TabStripItem.settings-tab">
+      <Setter Property="MinWidth" Value="88" />
+      <Setter Property="Height" Value="36" />
+      <Setter Property="Margin" Value="0" />
+      <Setter Property="Padding" Value="12,4" />
       <Setter Property="Background" Value="{DynamicResource Theme151F2D}" />
       <Setter Property="BorderBrush" Value="{DynamicResource Theme36516B}" />
       <Setter Property="BorderThickness" Value="1" />
@@ -62,24 +62,23 @@
       <Setter Property="FontWeight" Value="Normal" />
       <Setter Property="HorizontalContentAlignment" Value="Stretch" />
       <Setter Property="VerticalContentAlignment" Value="Center" />
-      <Setter Property="HeaderTemplate">
+      <Setter Property="ContentTemplate">
         <DataTemplate>
-          <TextBlock Text="{Binding}" FontSize="14" TextWrapping="NoWrap" />
+          <TextBlock Text="{Binding}" FontSize="14" TextWrapping="NoWrap" TextTrimming="None" TextAlignment="Center" />
         </DataTemplate>
       </Setter>
       <Setter Property="Template">
         <ControlTemplate>
           <Grid>
             <Border x:Name="PART_Border"
-                    Margin="2"
                     Background="{TemplateBinding Background}"
                     BorderBrush="{TemplateBinding BorderBrush}"
                     BorderThickness="{TemplateBinding BorderThickness}"
                     CornerRadius="6,6,0,0">
               <Grid RowDefinitions="*,3">
                 <ContentPresenter Padding="{TemplateBinding Padding}"
-                                  Content="{TemplateBinding Header}"
-                                  ContentTemplate="{TemplateBinding HeaderTemplate}"
+                                  Content="{TemplateBinding Content}"
+                                  ContentTemplate="{TemplateBinding ContentTemplate}"
                                   HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
                                   VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}" />
                 <Border Grid.Row="1"
@@ -100,24 +99,36 @@
         </Template>
       </Setter>
     </Style>
-    <Style Selector="TabItem.settings-tab:pointerover /template/ Border#PART_Border">
+    <Style Selector="TabStripItem.settings-tab:pointerover /template/ Border#PART_Border">
       <Setter Property="Background" Value="{DynamicResource Theme1B2A3A}" />
       <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
     </Style>
-    <Style Selector="TabItem.settings-tab:selected">
+    <Style Selector="TabStripItem.settings-tab:selected">
       <Setter Property="Foreground" Value="{DynamicResource ThemeE9EFF8}" />
       <Setter Property="FontWeight" Value="SemiBold" />
     </Style>
-    <Style Selector="TabItem.settings-tab:selected /template/ Border#PART_Border">
+    <Style Selector="TabStripItem.settings-tab:selected /template/ Border#PART_Border">
       <Setter Property="Background" Value="{DynamicResource Theme18283A}" />
       <Setter Property="BorderBrush" Value="{DynamicResource Theme56B2F5}" />
     </Style>
-    <Style Selector="TabItem.settings-tab:selected /template/ Border#SelectionIndicator">
+    <Style Selector="TabStripItem.settings-tab:selected /template/ Border#SelectionIndicator">
       <Setter Property="Background" Value="{DynamicResource Theme56B2F5}" />
     </Style>
+    <Style Selector="TabControl.settings-content">
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Grid>
+            <ItemsPresenter Name="PART_ItemsPresenter" IsVisible="False" />
+            <ContentPresenter Name="PART_SelectedContentHost"
+                              Content="{TemplateBinding SelectedContent}"
+                              ContentTemplate="{TemplateBinding SelectedContentTemplate}" />
+          </Grid>
+        </ControlTemplate>
+      </Setter>
+    </Style>
   </Window.Styles>
-  <Grid Margin="24" RowDefinitions="44,*,Auto" RowSpacing="12">
-    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="12">
+  <Grid Margin="24" RowDefinitions="44,36,*,Auto" RowSpacing="12">
+    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
       <Grid Grid.Column="0" ColumnDefinitions="Auto,*" ColumnSpacing="10"
             Background="Transparent" PointerPressed="OnTitlePointerPressed">
         <TextBlock FontSize="20" Text="⚙" Foreground="{DynamicResource Theme71C7FF}"
@@ -125,43 +136,7 @@
         <TextBlock Grid.Column="1" FontSize="20" FontWeight="SemiBold"
                    Text="{Binding Texts.Settings}" VerticalAlignment="Center" />
       </Grid>
-      <ToggleButton Grid.Column="1"
-                    Classes="account-selector"
-                    x:Name="AccountSelector"
-                    Width="250"
-                    Height="44"
-                    HorizontalAlignment="Right"
-                    HorizontalContentAlignment="Stretch"
-                    ClickMode="Press"
-                    IsCheckedChanged="OnAccountSelectorCheckedChanged"
-                    IsVisible="{Binding HasAccounts}"
-                    AutomationProperties.Name="{Binding Texts.Account}"
-                    AutomationProperties.AutomationId="Settings.AccountSelector"
-                    AutomationProperties.HelpText="{Binding SelectedAccountText}"
-                    ToolTip.Tip="{Binding SelectedAccountText}">
-        <Grid ColumnDefinitions="18,*,14" ColumnSpacing="0">
-          <TextBlock Width="14"
-                     Foreground="{DynamicResource Theme5DC98A}"
-                     Text="●"
-                     IsVisible="{Binding SelectedAccount.IsCurrent}"
-                     VerticalAlignment="Center"
-                     AutomationProperties.AutomationId="Settings.SelectedAccountCurrentMarker" />
-          <StackPanel Grid.Column="1" Spacing="0" VerticalAlignment="Center">
-            <TextBlock FontSize="9" Foreground="{DynamicResource Theme56B2F5}" Text="{Binding Texts.Account}" />
-            <TextBlock FontSize="11"
-                       FontWeight="SemiBold"
-                       Text="{Binding SelectedAccountText}"
-                       TextTrimming="CharacterEllipsis"
-                       TextWrapping="NoWrap" />
-          </StackPanel>
-          <TextBlock Grid.Column="2"
-                     HorizontalAlignment="Center"
-                     VerticalAlignment="Center"
-                     Foreground="{DynamicResource Theme9FB0C5}"
-                     Text="⌄" />
-        </Grid>
-      </ToggleButton>
-      <Button Grid.Column="2"
+      <Button Grid.Column="1"
               Background="Transparent"
               BorderBrush="Transparent"
               Foreground="{DynamicResource ThemeA8B7CA}"
@@ -172,73 +147,168 @@
               FontSize="22"
               ToolTip.Tip="{Binding Texts.Close}" />
     </Grid>
-    <Grid Grid.Row="1" RowDefinitions="*,Auto" RowSpacing="8">
-      <TabControl Grid.Row="0" Classes="settings-tabs" TabStripPlacement="Top">
-        <TabItem Classes="settings-tab"
-                 Header="{Binding Texts.Language}"
-                 AutomationProperties.Name="{Binding Texts.Language}"
-                 AutomationProperties.AutomationId="Settings.Tab.Language">
-          <StackPanel Margin="16" Spacing="8" VerticalAlignment="Top">
-            <TextBlock FontSize="18" FontWeight="SemiBold" Text="{Binding Texts.Language}" />
-            <ComboBox Width="420"
-                      Height="36"
-                      ItemsSource="{Binding LanguageOptions}"
-                      SelectedValue="{Binding SelectedLanguageCode}"
-                      SelectedValueBinding="{Binding LanguageCode}"
-                      HorizontalAlignment="Left"
-                      AutomationProperties.AutomationId="Settings.LanguageSelector">
-              <ComboBox.ItemTemplate>
-                <DataTemplate><TextBlock Text="{Binding LanguageName}" /></DataTemplate>
-              </ComboBox.ItemTemplate>
+    <Grid Grid.Row="1" ColumnDefinitions="*" Width="660" HorizontalAlignment="Center">
+      <TabStrip Grid.Column="0"
+                Width="660"
+                Height="36"
+                HorizontalAlignment="Left"
+                Margin="0"
+                SelectedIndex="{Binding #SettingsTabContent.SelectedIndex, Mode=TwoWay}">
+        <TabStripItem Classes="settings-tab"
+                      Margin="0,0,4,0"
+                      Content="{Binding Texts.SettingsDisplayTab}"
+                      AutomationProperties.Name="{Binding Texts.SettingsDisplayTab}"
+                      AutomationProperties.AutomationId="Settings.Tab.Display" />
+        <TabStripItem Classes="settings-tab"
+                      Content="{Binding Texts.SettingsConnectionStatus}"
+                      AutomationProperties.Name="{Binding Texts.SettingsConnectionStatus}"
+                      AutomationProperties.AutomationId="Settings.Tab.ConnectionStatus" />
+      </TabStrip>
+    </Grid>
+    <Grid Grid.Row="2" RowDefinitions="*,Auto" RowSpacing="8" Width="660" HorizontalAlignment="Center">
+      <TabControl x:Name="SettingsTabContent"
+                  Grid.Row="0"
+                  Classes="settings-content"
+                  TabStripPlacement="Top">
+        <TabItem Classes="settings-content-item">
+          <Grid Margin="0,12"
+                Width="660"
+                ColumnDefinitions="160,12,488"
+                RowDefinitions="36,36,36,36"
+                RowSpacing="12"
+                VerticalAlignment="Top">
+            <TextBlock Grid.Row="0" Classes="field-label" Text="{Binding Texts.Language}" VerticalAlignment="Center" />
+            <ComboBox Grid.Row="0"
+                      Grid.Column="2"
+                        Width="488"
+                        Height="36"
+                        ItemsSource="{Binding LanguageOptions}"
+                        SelectedValue="{Binding SelectedLanguageCode}"
+                        SelectedValueBinding="{Binding LanguageCode}"
+                        HorizontalAlignment="Left"
+                        AutomationProperties.Name="{Binding Texts.Language}"
+                        AutomationProperties.AutomationId="Settings.LanguageSelector">
+                <ComboBox.ItemTemplate>
+                  <DataTemplate><TextBlock Text="{Binding LanguageName}" /></DataTemplate>
+                </ComboBox.ItemTemplate>
             </ComboBox>
-          </StackPanel>
-        </TabItem>
-        <TabItem Classes="settings-tab"
-                 Header="{Binding Texts.TimeZone}"
-                 AutomationProperties.Name="{Binding Texts.TimeZone}"
-                 AutomationProperties.AutomationId="Settings.Tab.TimeZone">
-          <StackPanel Margin="16" Spacing="8" VerticalAlignment="Top">
-            <TextBlock FontSize="18" FontWeight="SemiBold" Text="{Binding Texts.TimeZone}" />
-            <ComboBox Width="420"
-                      Height="36"
-                      ItemsSource="{Binding TimeZoneOptions}"
-                      SelectedValue="{Binding SelectedTimeZoneId}"
-                      SelectedValueBinding="{Binding Id}"
-                      HorizontalAlignment="Left"
-                      AutomationProperties.Name="{Binding Texts.TimeZone}"
-                      AutomationProperties.AutomationId="Settings.TimeZoneSelector"
-                      ToolTip.Tip="{Binding Texts.TimeZone}">
-              <ComboBox.ItemTemplate>
-                <DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate>
-              </ComboBox.ItemTemplate>
+            <TextBlock Grid.Row="1" Classes="field-label" Text="{Binding Texts.TimeZone}" VerticalAlignment="Center" />
+            <ComboBox Grid.Row="1"
+                      Grid.Column="2"
+                        Width="488"
+                        Height="36"
+                        ItemsSource="{Binding TimeZoneOptions}"
+                        SelectedValue="{Binding SelectedTimeZoneId}"
+                        SelectedValueBinding="{Binding Id}"
+                        HorizontalAlignment="Left"
+                        AutomationProperties.Name="{Binding Texts.TimeZone}"
+                        AutomationProperties.AutomationId="Settings.TimeZoneSelector"
+                        ToolTip.Tip="{Binding Texts.TimeZone}">
+                <ComboBox.ItemTemplate>
+                  <DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate>
+                </ComboBox.ItemTemplate>
             </ComboBox>
-          </StackPanel>
-        </TabItem>
-        <TabItem Classes="settings-tab"
-                 Header="{Binding Texts.Appearance}"
-                 AutomationProperties.Name="{Binding Texts.Appearance}"
-                 AutomationProperties.AutomationId="Settings.Tab.Appearance">
-          <StackPanel Margin="16" Spacing="8" VerticalAlignment="Top">
-            <TextBlock FontSize="18" FontWeight="SemiBold" Text="{Binding Texts.Appearance}" />
-            <ComboBox Width="420"
-                      Height="36"
-                      ItemsSource="{Binding ThemeOptions}"
-                      SelectedValue="{Binding SelectedThemeId}"
-                      SelectedValueBinding="{Binding Id}"
-                      HorizontalAlignment="Left"
-                      AutomationProperties.Name="{Binding Texts.Appearance}"
-                      AutomationProperties.AutomationId="Settings.ThemeSelector"
-                      ToolTip.Tip="{Binding Texts.Appearance}">
-              <ComboBox.ItemTemplate>
-                <DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate>
-              </ComboBox.ItemTemplate>
+            <TextBlock Grid.Row="2" Classes="field-label" Text="{Binding Texts.Appearance}" VerticalAlignment="Center" />
+            <ComboBox Grid.Row="2"
+                      Grid.Column="2"
+                        Width="488"
+                        Height="36"
+                        ItemsSource="{Binding ThemeOptions}"
+                        SelectedValue="{Binding SelectedThemeId}"
+                        SelectedValueBinding="{Binding Id}"
+                        HorizontalAlignment="Left"
+                        AutomationProperties.Name="{Binding Texts.Appearance}"
+                        AutomationProperties.AutomationId="Settings.ThemeSelector"
+                        ToolTip.Tip="{Binding Texts.Appearance}">
+                <ComboBox.ItemTemplate>
+                  <DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate>
+                </ComboBox.ItemTemplate>
             </ComboBox>
-          </StackPanel>
+            <TextBlock Grid.Row="3" Classes="field-label" Text="{Binding Texts.SettingsDisplayTarget}" VerticalAlignment="Center" />
+            <Grid Grid.Row="3" Grid.Column="2"
+                  x:Name="SettingsAccountSelectorAnchor"
+                  Width="488" Height="36" ClipToBounds="False">
+              <ToggleButton Classes="account-selector"
+                            x:Name="AccountSelector"
+                            Width="488"
+                            Height="36"
+                            HorizontalAlignment="Left"
+                            HorizontalContentAlignment="Stretch"
+                            ClickMode="Press"
+                            IsCheckedChanged="OnAccountSelectorCheckedChanged"
+                            IsVisible="{Binding HasAccounts}"
+                            AutomationProperties.Name="{Binding Texts.SettingsDisplayTarget}"
+                            AutomationProperties.AutomationId="Settings.AccountSelector"
+                            AutomationProperties.HelpText="{Binding SelectedAccountText}"
+                            ToolTip.Tip="{Binding SelectedAccountText}">
+                <Grid ColumnDefinitions="18,*,14" ColumnSpacing="0">
+                  <TextBlock Width="14"
+                             Foreground="{DynamicResource Theme5DC98A}"
+                             Text="●"
+                             IsVisible="{Binding SelectedAccount.IsCurrent}"
+                             VerticalAlignment="Center"
+                             AutomationProperties.AutomationId="Settings.SelectedAccountCurrentMarker" />
+                  <TextBlock Grid.Column="1"
+                             FontSize="14"
+                             FontWeight="SemiBold"
+                             Text="{Binding SelectedAccountText}"
+                             TextTrimming="CharacterEllipsis"
+                             TextWrapping="NoWrap"
+                             VerticalAlignment="Center" />
+                  <TextBlock Grid.Column="2"
+                             HorizontalAlignment="Center"
+                             VerticalAlignment="Center"
+                             Foreground="{DynamicResource Theme9FB0C5}"
+                             Text="⌄" />
+                </Grid>
+              </ToggleButton>
+            </Grid>
+            <Border x:Name="AccountMenu"
+                    Grid.Row="0"
+                    Grid.RowSpan="4"
+                    Grid.Column="2"
+                    ZIndex="100"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Bottom"
+                    Margin="0,0,0,36"
+                    Opacity="0"
+                    IsEnabled="False"
+                    IsHitTestVisible="False"
+                    Width="488"
+                    MaxWidth="488"
+                    MaxHeight="144"
+                    Padding="4"
+                    Background="{DynamicResource Theme1B2838}"
+                    BorderBrush="{DynamicResource Theme47769F}"
+                    BorderThickness="1"
+                    CornerRadius="6"
+                    AutomationProperties.AutomationId="Settings.AccountMenuHost">
+              <ListBox ItemsSource="{Binding Accounts}"
+                       SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
+                       SelectionChanged="OnAccountSelectionChanged"
+                       AutomationProperties.AutomationId="Settings.AccountMenu">
+                <ListBox.ItemTemplate>
+                  <DataTemplate x:DataType="core:ApiAccount">
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                      <TextBlock Foreground="{DynamicResource Theme5DC98A}"
+                                 Text="●"
+                                 IsVisible="{Binding IsCurrent}"
+                                 VerticalAlignment="Center"
+                                 AutomationProperties.AutomationId="Settings.AccountCurrentMarker" />
+                      <TextBlock Grid.Column="1"
+                                 Text="{Binding MainDisplayLabel}"
+                                 TextWrapping="Wrap"
+                                 ToolTip.Tip="{Binding MainDisplayLabel}"
+                                 AutomationProperties.Name="{Binding MainDisplayLabel}"
+                                 AutomationProperties.HelpText="{Binding MainDisplayLabel}" />
+                    </Grid>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+            </Border>
+          </Grid>
         </TabItem>
-        <TabItem Classes="settings-tab"
-                 Header="{Binding Texts.SettingsConnectionStatus}"
-                 AutomationProperties.Name="{Binding Texts.SettingsConnectionStatus}"
-                 AutomationProperties.AutomationId="Settings.Tab.ConnectionStatus">
+        <TabItem Classes="settings-content-item">
           <StackPanel Margin="16" Spacing="12" VerticalAlignment="Top">
             <TextBlock FontSize="18" FontWeight="SemiBold" Text="{Binding Texts.SettingsConnectionStatus}" />
             <TextBlock Classes="label" Text="{Binding CurrentEndpoint}" TextWrapping="Wrap" />
@@ -290,7 +360,7 @@
                    AutomationProperties.AutomationId="Settings.SaveError" />
       </Border>
     </Grid>
-    <Grid Grid.Row="2" ColumnDefinitions="*,Auto">
+    <Grid Grid.Row="3" ColumnDefinitions="*,Auto" Width="660" HorizontalAlignment="Center">
       <StackPanel Grid.Column="0" Orientation="Horizontal" HorizontalAlignment="Left" Spacing="10">
         <Button Classes="secondary"
                 Click="OnOpenSetup"
@@ -316,47 +386,5 @@
         <TextBlock Text="{Binding Texts.Save}" />
       </Button>
     </Grid>
-    <!-- Measure the account menu at its final width so opening it does not move the tabs. -->
-    <Border x:Name="AccountMenu"
-            Grid.Row="0"
-            Grid.RowSpan="3"
-            ZIndex="100"
-            HorizontalAlignment="Left"
-            VerticalAlignment="Top"
-            Margin="0,44,0,0"
-            Opacity="0"
-            IsEnabled="False"
-            IsHitTestVisible="False"
-            Width="560"
-            MaxWidth="560"
-            MaxHeight="320"
-            Padding="4"
-            Background="{DynamicResource Theme1B2838}"
-            BorderBrush="{DynamicResource Theme47769F}"
-            BorderThickness="1"
-            CornerRadius="6">
-      <ListBox ItemsSource="{Binding Accounts}"
-               SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
-               SelectionChanged="OnAccountSelectionChanged"
-               AutomationProperties.AutomationId="Settings.AccountMenu">
-        <ListBox.ItemTemplate>
-          <DataTemplate x:DataType="core:ApiAccount">
-            <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
-              <TextBlock Foreground="{DynamicResource Theme5DC98A}"
-                         Text="●"
-                         IsVisible="{Binding IsCurrent}"
-                         VerticalAlignment="Center"
-                         AutomationProperties.AutomationId="Settings.AccountCurrentMarker" />
-              <TextBlock Grid.Column="1"
-                         Text="{Binding MainDisplayLabel}"
-                         TextWrapping="Wrap"
-                         ToolTip.Tip="{Binding MainDisplayLabel}"
-                         AutomationProperties.Name="{Binding MainDisplayLabel}"
-                         AutomationProperties.HelpText="{Binding MainDisplayLabel}" />
-            </Grid>
-          </DataTemplate>
-        </ListBox.ItemTemplate>
-      </ListBox>
-    </Border>
   </Grid>
 </Window>

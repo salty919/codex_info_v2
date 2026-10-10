@@ -1,4 +1,4 @@
-# Runs the finite Windows UI Automation acceptance path against the installed
+﻿# Runs the finite Windows UI Automation acceptance path against the installed
 # client.  The normal mode uses the configured loopback service.  CI may pass
 # -Fixture to provide bounded local health and current v3 split-resource responses; this still
 # drives the installed EXE and the real rendered windows, but does not require
@@ -880,6 +880,167 @@ public static class CodexInfoGraphPixelScanner {
     }
 }
 
+public sealed class CodexInfoSettingsPopupBorderMeasurement {
+    public int Left { get; set; }
+    public int Top { get; set; }
+    public int Right { get; set; }
+    public int Bottom { get; set; }
+    public int Width { get; set; }
+    public int Height { get; set; }
+    public int ExpectedWidthPixels { get; set; }
+    public int ExpectedLeft { get; set; }
+    public int ExpectedBottom { get; set; }
+    public int HorizontalCoveragePixels { get; set; }
+    public int LeftVerticalCoveragePixels { get; set; }
+    public int RightVerticalCoveragePixels { get; set; }
+    public string BorderColor { get; set; }
+}
+
+public static class CodexInfoSettingsPopupPixelScanner {
+    private const int ColorTolerance = 5;
+
+    private static bool Matches(Color actual, Color expected) {
+        return Math.Abs(actual.R - expected.R) <= ColorTolerance &&
+            Math.Abs(actual.G - expected.G) <= ColorTolerance &&
+            Math.Abs(actual.B - expected.B) <= ColorTolerance;
+    }
+
+    private static Color DominantLineColor(Bitmap bitmap, int y, int left, int right) {
+        var counts = new Dictionary<int, int>();
+        for (int x = left; x < right; x++) {
+            Color pixel = bitmap.GetPixel(x, y);
+            int key = pixel.ToArgb();
+            int count;
+            counts.TryGetValue(key, out count);
+            counts[key] = count + 1;
+        }
+        int dominantKey = 0;
+        int dominantCount = 0;
+        foreach (var entry in counts) {
+            if (entry.Value <= dominantCount) continue;
+            dominantKey = entry.Key;
+            dominantCount = entry.Value;
+        }
+        return Color.FromArgb(dominantKey);
+    }
+
+    private static int CountLineColor(Bitmap bitmap, int y, int left, int right, Color color) {
+        int count = 0;
+        for (int x = left; x < right; x++) {
+            if (Matches(bitmap.GetPixel(x, y), color)) count++;
+        }
+        return count;
+    }
+
+    private static int CountVerticalColor(Bitmap bitmap, int x, int top, int bottom, Color color, int allowance) {
+        int count = 0;
+        for (int y = top; y < bottom; y++) {
+            bool matched = false;
+            for (int offset = -allowance; offset <= allowance; offset++) {
+                int sampleX = x + offset;
+                if (sampleX < 0 || sampleX >= bitmap.Width) continue;
+                if (!Matches(bitmap.GetPixel(sampleX, y), color)) continue;
+                matched = true;
+                break;
+            }
+            if (matched) count++;
+        }
+        return count;
+    }
+
+    public static CodexInfoSettingsPopupBorderMeasurement Measure(
+        string path,
+        int windowLeft,
+        int windowTop,
+        int windowWidth,
+        int windowHeight,
+        double selectorLeft,
+        double selectorTop,
+        int dpi,
+        int expectedWidthDip,
+        int maximumHeightDip) {
+        using (var bitmap = new Bitmap(path)) {
+            if (dpi <= 0 || windowWidth != bitmap.Width || windowHeight != bitmap.Height) {
+                throw new InvalidOperationException("Popup screenshot dimensions or DPI are invalid.");
+            }
+
+            double scale = dpi / 96.0;
+            int expectedWidth = (int)Math.Round(expectedWidthDip * scale, MidpointRounding.AwayFromZero);
+            int expectedLeft = (int)Math.Round(selectorLeft - windowLeft, MidpointRounding.AwayFromZero);
+            int expectedBottom = (int)Math.Round(selectorTop - windowTop, MidpointRounding.AwayFromZero);
+            int maximumHeight = (int)Math.Ceiling(maximumHeightDip * scale);
+            int cornerInset = (int)Math.Ceiling(8 * scale);
+            int scanLeft = Math.Max(0, expectedLeft - 2);
+            int scanTop = Math.Max(0, expectedBottom - maximumHeight - 2);
+            int scanBottom = Math.Min(bitmap.Height, expectedBottom + 3);
+            CodexInfoSettingsPopupBorderMeasurement best = null;
+            int bestGeometryError = Int32.MaxValue;
+
+            for (int left = scanLeft; left <= Math.Min(expectedLeft + 2, bitmap.Width - 1); left++) {
+                for (int widthDelta = -1; widthDelta <= 1; widthDelta++) {
+                    int width = expectedWidth + widthDelta;
+                    int right = left + width;
+                    if (width <= 2 * cornerInset || right > bitmap.Width ||
+                        Math.Abs(left - expectedLeft) > 2) continue;
+                    int lineLeft = left + cornerInset;
+                    int lineRight = right - cornerInset;
+                    int lineLength = lineRight - lineLeft;
+                    if (lineLength <= 0) continue;
+
+                    for (int bottomY = Math.Max(0, expectedBottom - 2); bottomY < scanBottom; bottomY++) {
+                        Color borderColor = DominantLineColor(bitmap, bottomY, lineLeft, lineRight);
+                        int bottomCoverage = CountLineColor(bitmap, bottomY, lineLeft, lineRight, borderColor);
+                        if (bottomCoverage < Math.Ceiling(lineLength * 0.75)) continue;
+                        int bottomError = Math.Abs((bottomY + 1) - expectedBottom);
+                        if (bottomError > 1) continue;
+
+                        int firstTop = Math.Max(scanTop, bottomY - maximumHeight + 1);
+                        for (int topY = firstTop; topY < bottomY - 2 * cornerInset; topY++) {
+                            int topCoverage = CountLineColor(bitmap, topY, lineLeft, lineRight, borderColor);
+                            if (topCoverage < Math.Ceiling(lineLength * 0.75)) continue;
+
+                            int verticalTop = topY + cornerInset;
+                            int verticalBottom = bottomY - cornerInset + 1;
+                            if (verticalBottom <= verticalTop) continue;
+                            int verticalLength = verticalBottom - verticalTop;
+                            int leftCoverage = CountVerticalColor(bitmap, left, verticalTop, verticalBottom, borderColor, 1);
+                            int rightCoverage = CountVerticalColor(bitmap, right - 1, verticalTop, verticalBottom, borderColor, 1);
+                            int minimumVerticalCoverage = (int)Math.Ceiling(verticalLength * 0.70);
+                            if (leftCoverage < minimumVerticalCoverage || rightCoverage < minimumVerticalCoverage) continue;
+
+                            int height = bottomY - topY + 1;
+                            int geometryError = Math.Abs(left - expectedLeft) + Math.Abs(width - expectedWidth) + bottomError;
+                            if (height > maximumHeight + 1 || geometryError > bestGeometryError ||
+                                (geometryError == bestGeometryError && best != null && height <= best.Height)) continue;
+                            bestGeometryError = geometryError;
+                            best = new CodexInfoSettingsPopupBorderMeasurement {
+                                Left = left,
+                                Top = topY,
+                                Right = right,
+                                Bottom = bottomY + 1,
+                                Width = width,
+                                Height = height,
+                                ExpectedWidthPixels = expectedWidth,
+                                ExpectedLeft = expectedLeft,
+                                ExpectedBottom = expectedBottom,
+                                HorizontalCoveragePixels = Math.Min(bottomCoverage, topCoverage),
+                                LeftVerticalCoveragePixels = leftCoverage,
+                                RightVerticalCoveragePixels = rightCoverage,
+                                BorderColor = String.Format("#{0:X2}{1:X2}{2:X2}", borderColor.R, borderColor.G, borderColor.B)
+                            };
+                        }
+                    }
+                }
+            }
+
+            if (best == null) {
+                throw new InvalidOperationException("No complete rounded popup border was found at the selector-aligned 488 DIP position.");
+            }
+            return best;
+        }
+    }
+}
+
 public static class CodexInfoWindowsE2ECaptureTestWindow {
     private const uint WS_POPUP = 0x80000000;
     private const uint WS_VISIBLE = 0x10000000;
@@ -1377,6 +1538,37 @@ function Get-E2EWindowBounds {
         Top = $rect.Top
         Width = $width
         Height = $height
+    }
+}
+
+function Get-E2EUiAutomationGeometryEvidence {
+    param([System.Windows.Automation.AutomationElement]$Element)
+
+    if ($null -eq $Element) { return $null }
+    $current = $Element.Current
+    $bounds = $current.BoundingRectangle
+    $values = @([double]$bounds.Left, [double]$bounds.Top, [double]$bounds.Width, [double]$bounds.Height)
+    $finite = $true
+    foreach ($value in $values) {
+        if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+            $finite = $false
+            break
+        }
+    }
+    $invariant = [Globalization.CultureInfo]::InvariantCulture
+    $serializedBounds = [ordered]@{
+        Left = $values[0].ToString('R', $invariant)
+        Top = $values[1].ToString('R', $invariant)
+        Width = $values[2].ToString('R', $invariant)
+        Height = $values[3].ToString('R', $invariant)
+    }
+    return [pscustomobject]@{
+        AutomationId = [string]$current.AutomationId
+        ControlType = [string]$current.ControlType.ProgrammaticName
+        IsEnabled = [bool]$current.IsEnabled
+        IsOffscreen = [bool]$current.IsOffscreen
+        Bounds = $serializedBounds
+        HasFinitePositiveBounds = ($finite -and $values[2] -gt 0 -and $values[3] -gt 0)
     }
 }
 
@@ -4153,16 +4345,46 @@ function Get-E2ESettingsFooterActionNames {
     }
 
     $namesByLanguage = @{
-        'ja' = @{ Setup = '接続設定'; License = 'ライセンス情報' }
-        'en' = @{ Setup = 'Connection settings'; License = 'License information' }
-        'zh-Hans' = @{ Setup = '连接设置'; License = '许可证信息' }
-        'ko' = @{ Setup = '연결 설정'; License = '라이선스 정보' }
-        'es' = @{ Setup = 'Configuración de conexión'; License = 'Información de licencia' }
-        'fr' = @{ Setup = 'Paramètres de connexion'; License = 'Informations sur la licence' }
-        'de' = @{ Setup = 'Verbindungseinstellungen'; License = 'Lizenzinformationen' }
-        'pt' = @{ Setup = 'Configurações de conexão'; License = 'Informações da licença' }
-        'it' = @{ Setup = 'Impostazioni di connessione'; License = 'Informazioni sulla licenza' }
-        'ru' = @{ Setup = 'Настройки подключения'; License = 'Информация о лицензии' }
+        'ja' = @{
+            Setup = '接続設定'
+            License = 'ライセンス情報'
+        }
+        'en' = @{
+            Setup = 'Connection settings'
+            License = 'License information'
+        }
+        'zh-Hans' = @{
+            Setup = '连接设置'
+            License = '许可证信息'
+        }
+        'ko' = @{
+            Setup = '연결 설정'
+            License = '라이선스 정보'
+        }
+        'es' = @{
+            Setup = 'Configuración de conexión'
+            License = 'Información de licencia'
+        }
+        'fr' = @{
+            Setup = 'Paramètres de connexion'
+            License = 'Informations sur la licence'
+        }
+        'de' = @{
+            Setup = 'Verbindungseinstellungen'
+            License = 'Lizenzinformationen'
+        }
+        'pt' = @{
+            Setup = 'Configurações de conexão'
+            License = 'Informações da licença'
+        }
+        'it' = @{
+            Setup = 'Impostazioni di connessione'
+            License = 'Informazioni sulla licenza'
+        }
+        'ru' = @{
+            Setup = 'Настройки подключения'
+            License = 'Информация о лицензии'
+        }
     }
     if (-not $namesByLanguage.ContainsKey($languageCode)) { $languageCode = 'en' }
     return $namesByLanguage[$languageCode]
@@ -4336,10 +4558,9 @@ function Assert-E2ESettingsCommonControls {
     param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot)
 
     foreach ($automationId in @(
-            'Settings.AccountSelector',
-        'Settings.Footer.Setup',
-        'Settings.Footer.Legal',
-        'Settings.Footer.Save')) {
+            'Settings.Footer.Setup',
+            'Settings.Footer.Legal',
+            'Settings.Footer.Save')) {
         $control = Find-E2EElementByAutomationId $SettingsRoot $automationId
         Assert-E2E ($null -ne $control -and $control.Current.IsEnabled -and -not $control.Current.IsOffscreen) `
             "Settings common control $automationId is not visible and enabled on the selected tab."
@@ -4354,6 +4575,30 @@ function Assert-E2ESettingsCommonControls {
         'Settings Setup action accessible name does not match the saved language.'
     Assert-E2E ([string]$license.Current.Name -ceq $expectedNames.License) `
         'Settings License action accessible name does not match the saved language.'
+}
+
+function Assert-E2ESettingsDisplayControls {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedAccountLabel
+    )
+
+    foreach ($automationId in @(
+            'Settings.LanguageSelector',
+            'Settings.TimeZoneSelector',
+            'Settings.ThemeSelector',
+            'Settings.AccountSelector')) {
+        $control = Find-E2EElementByAutomationId $SettingsRoot $automationId
+        Assert-E2E ($null -ne $control -and $control.Current.IsEnabled -and -not $control.Current.IsOffscreen) `
+            "Settings display control $automationId is not visible and enabled on the Display tab."
+        $bounds = $control.Current.BoundingRectangle
+        Assert-E2E ($bounds.Width -gt 0 -and $bounds.Height -gt 0) `
+            "Settings display control $automationId has no rendered bounds."
+    }
+
+    $accountSelector = Find-E2EElementByAutomationId $SettingsRoot 'Settings.AccountSelector'
+    Assert-E2E ([string]$accountSelector.Current.Name -ceq $ExpectedAccountLabel) `
+        "Settings display-target selector label differs from the active UI language; expected '$ExpectedAccountLabel', observed '$($accountSelector.Current.Name)'."
 }
 
 function Assert-E2ESettingsStatusPlacement {
@@ -4523,11 +4768,24 @@ function Invoke-E2ESettingsTabs {
     $settingsGeometry = Get-E2ESettingsDpiGeometry -Stage initial -Handle $settings.Handle -LogicalWidth 900 -LogicalHeight 480
     Assert-E2ESettingsDpiGeometry -Stage initial -Geometry $settingsGeometry
     $originalSettings = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
+    $initialSettingsRoot = Get-E2EUiaRoot $settings.Handle
+    $legacyTabIds = @(
+        'Settings.Tab.Language',
+        'Settings.Tab.TimeZone',
+        'Settings.Tab.Appearance'
+    ) | Where-Object {
+        $null -ne (Find-E2EElementByAutomationId $initialSettingsRoot $_)
+    }
+    Assert-E2E ($legacyTabIds.Count -eq 0) `
+        "Settings still exposes removed per-setting tabs: $($legacyTabIds -join ',')."
+    foreach ($requiredTabId in @('Settings.Tab.Display', 'Settings.Tab.ConnectionStatus')) {
+        $requiredTab = Find-E2EElementByAutomationId $initialSettingsRoot $requiredTabId
+        Assert-E2E ($null -ne $requiredTab -and -not $requiredTab.Current.IsOffscreen) `
+            "Required Settings tab $requiredTabId is missing or not visible."
+    }
 
     foreach ($automationId in @(
-            'Settings.Tab.Language',
-            'Settings.Tab.TimeZone',
-            'Settings.Tab.Appearance',
+            'Settings.Tab.Display',
             'Settings.Tab.ConnectionStatus')) {
         $settings.Root = Get-E2EUiaRoot $settings.Handle
         Select-E2ESettingsTab $settings.Root $automationId
@@ -4535,13 +4793,10 @@ function Invoke-E2ESettingsTabs {
         Assert-E2ESettingsCommonControls $settings.Root
         Assert-E2ESettingsStatusPlacement $settings.Root $automationId $false
         switch ($automationId) {
-            'Settings.Tab.Language' {
+            'Settings.Tab.Display' {
+                Assert-E2ESettingsDisplayControls $settings.Root 'Display target'
                 Select-E2ESettingsComboOption $settings.Root 'Settings.LanguageSelector' 'Deutsch'
-            }
-            'Settings.Tab.TimeZone' {
                 Select-E2ESettingsComboOption $settings.Root 'Settings.TimeZoneSelector' 'Windows local time'
-            }
-            'Settings.Tab.Appearance' {
                 Select-E2ETheme $settings.Root 'Paper Light'
             }
             'Settings.Tab.ConnectionStatus' {
@@ -4554,25 +4809,218 @@ function Invoke-E2ESettingsTabs {
         $null = Capture-E2EWindow $settings.Handle ("settings-draft-" + $automationId.Substring('Settings.Tab.'.Length))
     }
 
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    Select-E2ESettingsTab $settings.Root 'Settings.Tab.Display'
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    Assert-E2ESettingsCommonControls $settings.Root
+    Assert-E2ESettingsDisplayControls $settings.Root 'Display target'
+    Assert-E2ESettingsStatusPlacement $settings.Root 'Settings.Tab.Display' $false
+    $accountSelector = Find-E2EElementByAutomationId $settings.Root 'Settings.AccountSelector'
+    $displayTab = Find-E2EElementByAutomationId $settings.Root 'Settings.Tab.Display'
+    $connectionTab = Find-E2EElementByAutomationId $settings.Root 'Settings.Tab.ConnectionStatus'
+    Assert-E2E ($null -ne $accountSelector -and [string]$accountSelector.Current.Name -ceq 'Display target') `
+        'Settings display-target label does not match the English UI before the language draft is saved.'
+    Assert-E2E ($null -ne $displayTab -and $null -ne $connectionTab -and
+        -not $displayTab.Current.IsOffscreen -and -not $connectionTab.Current.IsOffscreen) `
+        'Settings navigation tabs are not both visible before opening the display-target menu.'
+    $save = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Save'
+    Assert-E2E ($null -ne $save -and -not $save.Current.IsOffscreen) `
+        'Settings content or fixed footer is not visible before opening the display-target menu.'
+    $beforePopupBounds = @{}
     foreach ($automationId in @(
-            'Settings.Tab.Language',
-            'Settings.Tab.TimeZone',
-            'Settings.Tab.Appearance',
+            'Settings.LanguageSelector',
+            'Settings.TimeZoneSelector',
+            'Settings.ThemeSelector',
+            'Settings.AccountSelector',
+            'Settings.Tab.Display',
+            'Settings.Tab.ConnectionStatus',
+            'Settings.Footer.Setup',
+            'Settings.Footer.Legal',
+            'Settings.Footer.Save')) {
+        $element = Find-E2EElementByAutomationId $settings.Root $automationId
+        Assert-E2E ($null -ne $element -and -not $element.Current.IsOffscreen) `
+            "Settings control $automationId is not visible before opening the display-target menu."
+        $beforePopupBounds[$automationId] = $element.Current.BoundingRectangle
+    }
+    Assert-E2E ((Get-E2EToggleState $accountSelector) -eq [System.Windows.Automation.ToggleState]::Off) `
+        'Settings display-target menu is unexpectedly open before the popup check.'
+    Toggle-E2EElement $accountSelector
+    Wait-E2E -Description 'Settings display-target menu opens' -Probe {
+        $root = Get-E2EUiaRoot $settings.Handle
+        $selector = Find-E2EElementByAutomationId $root 'Settings.AccountSelector'
+        $menu = Find-E2EElementByAutomationId $root 'Settings.AccountMenu'
+        return ($null -ne $selector -and $null -ne $menu -and $menu.Current.IsEnabled -and
+            (Get-E2EToggleState $selector) -eq [System.Windows.Automation.ToggleState]::On)
+    } | Out-Null
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    $accountMenu = Find-E2EElementByAutomationId $settings.Root 'Settings.AccountMenu'
+    $accountMenuHost = Find-E2EElementByAutomationId $settings.Root 'Settings.AccountMenuHost'
+    $accountSelector = Find-E2EElementByAutomationId $settings.Root 'Settings.AccountSelector'
+    $settingsBounds = Get-E2EWindowBounds $settings.Handle
+    $settingsDpi = [CodexInfoWindowsE2EWin32]::GetDpiForWindow($settings.Handle)
+    $hostRect = if ($null -ne $accountMenuHost) { $accountMenuHost.Current.BoundingRectangle } else { $null }
+    $listRect = if ($null -ne $accountMenu) { $accountMenu.Current.BoundingRectangle } else { $null }
+    $selectorRect = if ($null -ne $accountSelector) { $accountSelector.Current.BoundingRectangle } else { $null }
+    $hostGeometry = Get-E2EUiAutomationGeometryEvidence $accountMenuHost
+    $listGeometry = Get-E2EUiAutomationGeometryEvidence $accountMenu
+    $selectorGeometry = Get-E2EUiAutomationGeometryEvidence $accountSelector
+    $hostBoundsValid = $null -ne $hostGeometry -and $hostGeometry.HasFinitePositiveBounds
+    $listBoundsValid = $null -ne $listGeometry -and $listGeometry.HasFinitePositiveBounds
+    $selectorBoundsValid = $null -ne $selectorGeometry -and $selectorGeometry.HasFinitePositiveBounds
+    $maximumPopupHeight = if ($settingsDpi -gt 0) { [Math]::Ceiling(144.0 * $settingsDpi / 96.0) } else { 0 }
+    $expectedPopupWidth = if ($settingsDpi -gt 0) { [Math]::Round(488.0 * $settingsDpi / 96.0, [MidpointRounding]::AwayFromZero) } else { 0 }
+    $listAvailable = $null -ne $accountMenu -and $accountMenu.Current.IsEnabled -and -not $accountMenu.Current.IsOffscreen
+    $popupCapture = Capture-E2EWindow $settings.Handle 'settings-display-target-menu-open'
+    $pixelBorder = $null
+    $pixelBorderError = $null
+    if ($settingsDpi -gt 0 -and $selectorBoundsValid) {
+        try {
+            $pixelBorder = [CodexInfoSettingsPopupPixelScanner]::Measure(
+                $popupCapture.Path,
+                [int]$settingsBounds.Left,
+                [int]$settingsBounds.Top,
+                [int]$settingsBounds.Width,
+                [int]$settingsBounds.Height,
+                [double]$selectorRect.Left,
+                [double]$selectorRect.Top,
+                [int]$settingsDpi,
+                488,
+                144)
+        }
+        catch {
+            $pixelBorderError = $_.Exception.GetBaseException().Message
+        }
+    }
+    $pixelBorderFound = $null -ne $pixelBorder
+    $pixelBorderWidthMatches = $pixelBorderFound -and [Math]::Abs($pixelBorder.Width - $expectedPopupWidth) -le 1
+    $pixelBorderLeftAligns = $pixelBorderFound -and $selectorBoundsValid -and
+        [Math]::Abs(($settingsBounds.Left + $pixelBorder.Left) - $selectorRect.Left) -le 1
+    $pixelBorderRightAligns = $pixelBorderFound -and $selectorBoundsValid -and
+        [Math]::Abs(($settingsBounds.Left + $pixelBorder.Right) - $selectorRect.Right) -le 1
+    $pixelBorderBottomAligns = $pixelBorderFound -and $selectorBoundsValid -and
+        [Math]::Abs(($settingsBounds.Top + $pixelBorder.Bottom) - $selectorRect.Top) -le 1
+    $pixelBorderHeightWithinLimit = $pixelBorderFound -and $settingsDpi -gt 0 -and
+        $pixelBorder.Height -le ($maximumPopupHeight + 1)
+    $pixelBorderInsideWindow = $pixelBorderFound -and
+        $pixelBorder.Left -ge 0 -and $pixelBorder.Top -ge 0 -and
+        $pixelBorder.Right -le $settingsBounds.Width -and $pixelBorder.Bottom -le $settingsBounds.Height
+    $listInsidePixelBorder = $listBoundsValid -and $pixelBorderFound -and
+        ($listRect.Left - $settingsBounds.Left) -ge ($pixelBorder.Left - 1) -and
+        ($listRect.Top - $settingsBounds.Top) -ge ($pixelBorder.Top - 1) -and
+        ($listRect.Right - $settingsBounds.Left) -le ($pixelBorder.Right + 1) -and
+        ($listRect.Bottom - $settingsBounds.Top) -le ($pixelBorder.Bottom + 1)
+    $stationaryEvidence = [System.Collections.Generic.List[object]]::new()
+    $stationaryConditions = [ordered]@{}
+    foreach ($automationId in @(
+            'Settings.LanguageSelector',
+            'Settings.TimeZoneSelector',
+            'Settings.ThemeSelector',
+            'Settings.AccountSelector',
+            'Settings.Tab.Display',
+            'Settings.Tab.ConnectionStatus',
+            'Settings.Footer.Setup',
+            'Settings.Footer.Legal',
+            'Settings.Footer.Save')) {
+        $element = Find-E2EElementByAutomationId $settings.Root $automationId
+        $geometry = Get-E2EUiAutomationGeometryEvidence $element
+        $before = $beforePopupBounds[$automationId]
+        $after = if ($null -ne $element) { $element.Current.BoundingRectangle } else { $null }
+        $stationary = $null -ne $geometry -and $geometry.HasFinitePositiveBounds -and
+            -not $element.Current.IsOffscreen -and
+            [Math]::Abs($after.Left - $before.Left) -le 1 -and
+            [Math]::Abs($after.Top - $before.Top) -le 1 -and
+            [Math]::Abs($after.Width - $before.Width) -le 1 -and
+            [Math]::Abs($after.Height - $before.Height) -le 1
+        $stationaryConditions[$automationId] = [bool]$stationary
+        $stationaryEvidence.Add([pscustomobject]@{
+            AutomationId = $automationId
+            Before = [ordered]@{
+                Left = $before.Left.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)
+                Top = $before.Top.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)
+                Width = $before.Width.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)
+                Height = $before.Height.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)
+            }
+            After = $geometry
+            RemainedVisibleAndStationary = [bool]$stationary
+        })
+    }
+    $menuGeometryPath = Join-Path $script:e2eOutput 'settings-display-target-menu-geometry.json'
+    $menuGeometryEvidence = [ordered]@{
+        Stage = 'account-menu-open'
+        SettingsWindow = [ordered]@{ Left = $settingsBounds.Left; Top = $settingsBounds.Top; Width = $settingsBounds.Width; Height = $settingsBounds.Height }
+        Dpi = $settingsDpi
+        ExpectedMenuWidthDip = 488
+        ExpectedMenuWidthPixels = $expectedPopupWidth
+        MaximumMenuHeightPixels = $maximumPopupHeight
+        ScreenshotPath = $popupCapture.Path
+        MenuHost = $hostGeometry
+        MenuList = $listGeometry
+        Selector = $selectorGeometry
+        OuterBorderPixelMeasurement = $pixelBorder
+        OuterBorderScanError = $pixelBorderError
+        Conditions = [ordered]@{
+            DpiIsPositive = ($settingsDpi -gt 0)
+            MenuHostUiAutomationBoundsAvailable = [bool]$hostBoundsValid
+            MenuListHasFinitePositiveBounds = [bool]$listBoundsValid
+            SelectorHasFinitePositiveBounds = [bool]$selectorBoundsValid
+            OuterBorderMeasuredFromScreenshot = [bool]$pixelBorderFound
+            OuterBorderWidthMatches488Dip = [bool]$pixelBorderWidthMatches
+            OuterBorderLeftAlignedWithSelector = [bool]$pixelBorderLeftAligns
+            OuterBorderRightAlignedWithSelector = [bool]$pixelBorderRightAligns
+            OuterBorderBottomAlignedAboveSelector = [bool]$pixelBorderBottomAligns
+            OuterBorderHeightWithin144Dip = [bool]$pixelBorderHeightWithinLimit
+            OuterBorderInsideSettingsWindow = [bool]$pixelBorderInsideWindow
+            MenuListInsideMeasuredOuterBorder = [bool]$listInsidePixelBorder
+            MenuListEnabledAndNotOffscreen = [bool]$listAvailable
+            ControlsRemainVisibleAndStationary = $stationaryConditions
+        }
+        Controls = $stationaryEvidence.ToArray()
+    }
+    $menuGeometryEvidence | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $menuGeometryPath -Encoding utf8
+    Assert-E2E ($settingsDpi -gt 0) "GetDpiForWindow returned an invalid DPI for the display-target menu; evidence=$menuGeometryPath."
+    Assert-E2E $listBoundsValid "Settings.AccountMenu is absent or has non-finite/empty bounds; evidence=$menuGeometryPath."
+    Assert-E2E $selectorBoundsValid "Settings.AccountSelector has non-finite/empty bounds; evidence=$menuGeometryPath."
+    Assert-E2E $pixelBorderFound "Could not measure the Settings display-target menu outer border from the captured HWND; $pixelBorderError; evidence=$menuGeometryPath."
+    Assert-E2E $pixelBorderWidthMatches "Settings display-target menu is not 488 DIP wide at window DPI; measured=$($pixelBorder.Width)px expected=$expectedPopupWidth px; evidence=$menuGeometryPath."
+    Assert-E2E $pixelBorderLeftAligns "Settings display-target menu left edge does not align above its selector; evidence=$menuGeometryPath."
+    Assert-E2E $pixelBorderRightAligns "Settings display-target menu right edge does not align above its selector; evidence=$menuGeometryPath."
+    Assert-E2E $pixelBorderBottomAligns "Settings display-target menu bottom edge does not align above its selector; evidence=$menuGeometryPath."
+    Assert-E2E $pixelBorderHeightWithinLimit "Settings display-target menu exceeds 144 DIP; evidence=$menuGeometryPath."
+    Assert-E2E $pixelBorderInsideWindow "Settings display-target menu outer border is outside the Settings window; evidence=$menuGeometryPath."
+    Assert-E2E $listInsidePixelBorder "Settings.AccountMenu is outside its screenshot-measured outer border; evidence=$menuGeometryPath."
+    Assert-E2E $listAvailable "Settings.AccountMenu is not enabled/visible while open; evidence=$menuGeometryPath."
+    foreach ($automationId in $stationaryConditions.Keys) {
+        Assert-E2E $stationaryConditions[$automationId] `
+            "Settings control $automationId moved or became unavailable while the display-target menu opened; evidence=$menuGeometryPath."
+    }
+    Write-E2E "settings-display-target-menu-geometry: evidence=$menuGeometryPath screenshot=$($popupCapture.Path)"
+    Toggle-E2EElement (Find-E2EElementByAutomationId $settings.Root 'Settings.AccountSelector')
+    Wait-E2E -Description 'Settings display-target menu closes' -Probe {
+        $root = Get-E2EUiaRoot $settings.Handle
+        $selector = Find-E2EElementByAutomationId $root 'Settings.AccountSelector'
+        return ($null -ne $selector -and
+            (Get-E2EToggleState $selector) -eq [System.Windows.Automation.ToggleState]::Off)
+    } | Out-Null
+    $settings.Root = Get-E2EUiaRoot $settings.Handle
+    $accountMenu = Find-E2EElementByAutomationId $settings.Root 'Settings.AccountMenu'
+    Assert-E2E ($null -ne $accountMenu -and -not $accountMenu.Current.IsEnabled) `
+        'Settings display-target menu remains enabled after it closes.'
+    $null = Capture-E2EWindow $settings.Handle 'settings-display-target-menu-closed'
+
+    foreach ($automationId in @(
+            'Settings.Tab.Display',
             'Settings.Tab.ConnectionStatus')) {
         $settings.Root = Get-E2EUiaRoot $settings.Handle
         Select-E2ESettingsTab $settings.Root $automationId
         $settings.Root = Get-E2EUiaRoot $settings.Handle
         Assert-E2ESettingsCommonControls $settings.Root
         switch ($automationId) {
-            'Settings.Tab.Language' {
+            'Settings.Tab.Display' {
+                Assert-E2ESettingsDisplayControls $settings.Root 'Display target'
                 Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.LanguageSelector') -ceq 'Deutsch') `
                     'Language draft changed after switching Settings tabs.'
-            }
-            'Settings.Tab.TimeZone' {
                 Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.TimeZoneSelector') -ceq 'Windows local time') `
                     'Time zone draft changed after switching Settings tabs.'
-            }
-            'Settings.Tab.Appearance' {
                 Assert-E2E ((Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $settings.Root)) -ceq 'Paper Light') `
                     'Theme draft changed after switching Settings tabs.'
             }
@@ -4584,10 +5032,10 @@ function Invoke-E2ESettingsTabs {
         }
     }
     $settings.Root = Get-E2EUiaRoot $settings.Handle
-    Select-E2ESettingsTab $settings.Root 'Settings.Tab.TimeZone'
+    Select-E2ESettingsTab $settings.Root 'Settings.Tab.Display'
     $settings.Root = Get-E2EUiaRoot $settings.Handle
     Invoke-E2ESettingsKeyboardFocusCheck $settings.Root $settings.Handle `
-        'Settings.Tab.TimeZone' 'Settings.Tab.Appearance'
+        'Settings.Tab.Display' 'Settings.Tab.ConnectionStatus'
     Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $originalSettings) `
         'Changing Settings tabs or previewing draft selections changed settings before Save.'
 
@@ -4596,7 +5044,7 @@ function Invoke-E2ESettingsTabs {
         [IO.File]::Delete($script:e2eSettingsPath)
         [IO.Directory]::CreateDirectory($script:e2eSettingsPath) | Out-Null
         $settings.Root = Get-E2EUiaRoot $settings.Handle
-        Select-E2ESettingsTab $settings.Root 'Settings.Tab.Appearance'
+        Select-E2ESettingsTab $settings.Root 'Settings.Tab.Display'
         $settings.Root = Get-E2EUiaRoot $settings.Handle
         $save = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Save'
         Invoke-E2EElement $save
@@ -4604,15 +5052,19 @@ function Invoke-E2ESettingsTabs {
             return (Find-E2EWindow $ProcessId 'Codex Info Settings') -ne [IntPtr]::Zero
         } | Out-Null
 
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
+        Select-E2ESettingsTab $settings.Root 'Settings.Tab.Display'
+        $settings.Root = Get-E2EUiaRoot $settings.Handle
         foreach ($automationId in @(
-                'Settings.Tab.Language',
-                'Settings.Tab.TimeZone',
-                'Settings.Tab.Appearance',
+                'Settings.Tab.Display',
                 'Settings.Tab.ConnectionStatus')) {
             $settings.Root = Get-E2EUiaRoot $settings.Handle
             Select-E2ESettingsTab $settings.Root $automationId
             $settings.Root = Get-E2EUiaRoot $settings.Handle
             Assert-E2ESettingsStatusPlacement $settings.Root $automationId $true
+            if ($automationId -ceq 'Settings.Tab.Display') {
+                Assert-E2ESettingsDisplayControls $settings.Root 'Display target'
+            }
         }
         Assert-E2E (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Container) `
             'Failed Save unexpectedly replaced the fixture settings path.'
@@ -4628,8 +5080,9 @@ function Invoke-E2ESettingsTabs {
     Write-E2E 'settings-save-failure: PASS message-visible-in-all-selection-tabs=true fixture-bytes-restored=true'
 
     $settings.Root = Get-E2EUiaRoot $settings.Handle
-    Select-E2ESettingsTab $settings.Root 'Settings.Tab.Appearance'
+    Select-E2ESettingsTab $settings.Root 'Settings.Tab.Display'
     $settings.Root = Get-E2EUiaRoot $settings.Handle
+    Assert-E2ESettingsDisplayControls $settings.Root 'Display target'
     Select-E2ETheme $settings.Root 'Paper Light'
 
     $setup = Open-E2ESetupFromSettings $settings.Root $ProcessId -Role 'SettingsSetup'
@@ -4650,6 +5103,7 @@ function Invoke-E2ESettingsTabs {
     Bring-E2EWindowToFront $settings.Handle
     $settings.Root = Get-E2EUiaRoot $settings.Handle
     Assert-E2ESettingsCommonControls $settings.Root
+    Assert-E2ESettingsDisplayControls $settings.Root 'Display target'
     $save = Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Save'
     Invoke-E2EElement $save
     Wait-E2E -Description 'Settings closes after Save' -Probe {
@@ -4664,30 +5118,25 @@ function Invoke-E2ESettingsTabs {
     Write-E2E 'settings-save: PASS language=de time-zone=local theme=paper-light'
 
     $MainRoot = Get-E2EUiaRoot $MainHandle
-    $settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
+    $settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Einstellungen' `
         -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsReopened' -ProcessId $ProcessId `
         -KeyboardActivateButton -KeyboardActivationOwnerHandle $MainHandle
     $settingsGeometry = Get-E2ESettingsDpiGeometry -Stage reopened -Handle $settings.Handle -LogicalWidth 900 -LogicalHeight 480
     Assert-E2ESettingsDpiGeometry -Stage reopened -Geometry $settingsGeometry
     foreach ($automationId in @(
-            'Settings.Tab.Language',
-            'Settings.Tab.TimeZone',
-            'Settings.Tab.Appearance',
+            'Settings.Tab.Display',
             'Settings.Tab.ConnectionStatus')) {
         $settings.Root = Get-E2EUiaRoot $settings.Handle
         Select-E2ESettingsTab $settings.Root $automationId
         $settings.Root = Get-E2EUiaRoot $settings.Handle
         Assert-E2ESettingsCommonControls $settings.Root
         switch ($automationId) {
-            'Settings.Tab.Language' {
+            'Settings.Tab.Display' {
+                Assert-E2ESettingsDisplayControls $settings.Root 'Angezeigtes Konto'
                 Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.LanguageSelector') -ceq 'Deutsch') `
                     'Reopened Settings did not restore the saved language.'
-            }
-            'Settings.Tab.TimeZone' {
                 Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.TimeZoneSelector') -ceq 'Windows-Ortszeit') `
                     'Reopened Settings did not restore the saved time zone.'
-            }
-            'Settings.Tab.Appearance' {
                 Assert-E2E ((Get-E2ESettingsComboSelectionText $settings.Root 'Settings.ThemeSelector') -ceq 'Papier Hell') `
                     'Reopened Settings did not restore the saved theme.'
             }
@@ -4709,7 +5158,7 @@ function Invoke-E2ESettingsTabs {
 
     $windowRecordPath = Join-Path $script:e2eOutput 'settings-tab-window-records.json'
     $script:e2eWindowRecords | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $windowRecordPath -Encoding utf8
-    Write-E2E "settings-tabs: PASS tabs=4 draft-retained=True save-reopen=True window-records=$windowRecordPath"
+    Write-E2E "settings-tabs: PASS tabs=2 display-controls=4 draft-retained=True save-reopen=True german-label=Angezeigtes Konto window-records=$windowRecordPath"
 }
 
 function Assert-E2EThemeWindow {
@@ -5161,7 +5610,7 @@ function Invoke-E2EThemePresets {
     $windows.Legal = Open-E2ELicenseFromSettings $windows.Settings.Root $ProcessId -Role 'License'
     Bring-E2EWindowToFront $windows.Settings.Handle
     $windows.Settings.Root = Get-E2EUiaRoot $windows.Settings.Handle
-    Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Appearance'
+    Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Display'
     $windows.Setup = Open-E2ESetupFromSettings $windows.Settings.Root $ProcessId
 
     $null = Capture-E2EWindow $windows.Settings.Handle 'theme-settings-initial-selection'
@@ -5189,7 +5638,7 @@ function Invoke-E2EThemePresets {
         'Closing Settings without Save changed the six-key file.'
     $windows.Settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
         -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
-    Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Appearance'
+    Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Display'
     $windows.Settings.Root = Get-E2EUiaRoot $windows.Settings.Handle
     Assert-E2E ((Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $windows.Settings.Root)) -ceq 'Classic Dark') `
         'Cancelled theme selection remained in Settings.'
@@ -5238,7 +5687,7 @@ function Invoke-E2EThemePresets {
         }
         $windows.Settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
             -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
-        Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Appearance'
+        Select-E2ESettingsTab $windows.Settings.Root 'Settings.Tab.Display'
         $windows.Settings.Root = Get-E2EUiaRoot $windows.Settings.Handle
         Assert-E2E ((Get-E2EThemeSelectionLabel (Get-E2EThemeSelector $windows.Settings.Root)) -ceq $choice.Label) `
             "Settings UIA did not reopen with saved $($choice.Id)."
@@ -5262,7 +5711,7 @@ function Invoke-E2EThemePresets {
         'restart/Main/window' -MinimumPixels 32
     $restartedSettings = Open-E2EChildWindow -MainRoot $restartedMain.Root -ButtonName 'Settings' `
         -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $restartedPid
-    Select-E2ESettingsTab $restartedSettings.Root 'Settings.Tab.Appearance'
+    Select-E2ESettingsTab $restartedSettings.Root 'Settings.Tab.Display'
     $restartedSettings.Root = Get-E2EUiaRoot $restartedSettings.Handle
     $restartSettingsCapture = Capture-E2EWindow $restartedSettings.Handle 'theme-light-restart-settings'
     Assert-E2EThemePixel $restartSettingsCapture $restartedSettings.Handle $script:e2eThemeColors.light.Window `
