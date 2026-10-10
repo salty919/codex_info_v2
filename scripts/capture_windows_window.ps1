@@ -82,7 +82,7 @@ if ($ConfiguredService) {
         { $_ -in @('normal', 'auth', 'error', 'warning', 'danger', 'zero', 'full', 'update', 'model-breakdown') } { 'Codex Info Monitor' }
         'graph' { 'Codex Info Graph' }
         { $_ -in @('threads', 'threads-tree', 'threads-branches') } { 'Codex Info Threads' }
-        'legal' { 'Codex Info Legal' }
+        'legal' { 'Codex Info License' }
         'settings' { 'Codex Info Settings' }
         default { 'Codex Info Setup' }
     }

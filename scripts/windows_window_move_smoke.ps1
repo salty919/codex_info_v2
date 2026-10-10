@@ -50,7 +50,7 @@ $cases = @(
     @{ Preview = 'setup'; Title = 'Codex Info Setup' },
     @{ Preview = 'graph'; Title = 'Codex Info Graph' },
     @{ Preview = 'threads'; Title = 'Codex Info Threads' },
-    @{ Preview = 'legal'; Title = 'Codex Info Legal' },
+    @{ Preview = 'legal'; Title = 'Codex Info License' },
     @{ Preview = 'settings'; Title = 'Codex Info Settings' },
     # Keep the long cross-monitor movement in its own fresh process so its
     # deliberately off-screen traversal cannot contaminate the ordinary

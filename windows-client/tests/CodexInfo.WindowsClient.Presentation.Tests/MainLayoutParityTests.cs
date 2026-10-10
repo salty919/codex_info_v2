@@ -3,6 +3,7 @@
 
 using System.Reflection;
 using System.Globalization;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using CodexInfo.WindowsClient.Core;
 using Xunit;
@@ -220,6 +221,34 @@ public sealed class MainLayoutParityTests
         Assert.Contains("$scrollPattern.SetScrollPercent(", capture, StringComparison.Ordinal);
         Assert.Contains("[System.Windows.Automation.ScrollPattern]::NoScroll, 100)", capture, StringComparison.Ordinal);
 
+    }
+
+    [Fact]
+    public void LegalPreviewWindowTitleMatchesLicenseWindowInAllPreviewConsumers()
+    {
+        const string expectedViewerTitle = "Codex Info License";
+        var viewer = XDocument.Parse(LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "LegalNoticesWindow.axaml"));
+        var viewerTitle = viewer.Root?.Attribute("Title")?.Value;
+        Assert.Equal(expectedViewerTitle, viewerTitle);
+
+        var moveSmoke = LoadRepositoryFile("scripts", "windows_window_move_smoke.ps1");
+        var moveTitles = Regex.Matches(
+                moveSmoke,
+                @"@\{\s*Preview\s*=\s*'legal'\s*;\s*Title\s*=\s*'(?<title>[^']+)'\s*\}")
+            .Cast<Match>()
+            .Select(match => match.Groups["title"].Value)
+            .ToArray();
+        Assert.Equal(expectedViewerTitle, Assert.Single(moveTitles));
+
+        var capture = LoadRepositoryFile("scripts", "capture_windows_window.ps1");
+        var captureTitles = Regex.Matches(
+                capture,
+                @"'legal'\s*\{\s*'(?<title>[^']+)'\s*\}")
+            .Cast<Match>()
+            .Select(match => match.Groups["title"].Value)
+            .ToArray();
+        Assert.Equal(expectedViewerTitle, Assert.Single(captureTitles));
     }
 
     [Fact]
