@@ -100,8 +100,13 @@ public sealed class MainLayoutParityTests
         Assert.Contains(document.Descendants(), element => element.Attribute("Text")?.Value == "{Binding MainDisplayLabel}");
         var selector = document.Descendants().Single(element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountSelector");
-        Assert.Equal("1", selector.Attribute("Grid.Row")?.Value);
-        Assert.Null(selector.Attribute("Grid.Column"));
+        var settingsGrid = document.Descendants().Single(element =>
+            element.Name.LocalName == "Grid" && element.Attribute("RowDefinitions")?.Value == "44,*,Auto");
+        var header = settingsGrid.Elements().Single(element =>
+            element.Name.LocalName == "Grid" && element.Attribute("ColumnDefinitions")?.Value == "*,Auto,Auto");
+        Assert.Same(header, selector.Parent);
+        Assert.Equal("1", selector.Attribute("Grid.Column")?.Value);
+        Assert.Null(selector.Attribute("Grid.Row"));
         var menu = document.Descendants().Single(element =>
             element.Name.LocalName == "ListBox" &&
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.AccountMenu").Parent!;

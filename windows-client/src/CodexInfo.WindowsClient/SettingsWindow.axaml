@@ -51,12 +51,12 @@
       <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
     </Style>
     <Style Selector="TabItem.settings-tab">
-      <Setter Property="Width" Value="176" />
+      <Setter Property="MinWidth" Value="144" />
       <Setter Property="MinHeight" Value="40" />
-      <Setter Property="Margin" Value="0,0,0,4" />
+      <Setter Property="Margin" Value="0,0,8,0" />
       <Setter Property="Padding" Value="12,8" />
-      <Setter Property="Background" Value="Transparent" />
-      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="Background" Value="{DynamicResource Theme151F2D}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme36516B}" />
       <Setter Property="BorderThickness" Value="1" />
       <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
       <Setter Property="FontWeight" Value="Normal" />
@@ -64,7 +64,7 @@
       <Setter Property="VerticalContentAlignment" Value="Center" />
       <Setter Property="HeaderTemplate">
         <DataTemplate>
-          <TextBlock Text="{Binding}" FontSize="14" TextWrapping="Wrap" />
+          <TextBlock Text="{Binding}" FontSize="14" TextWrapping="NoWrap" />
         </DataTemplate>
       </Setter>
       <Setter Property="Template">
@@ -75,17 +75,17 @@
                     Background="{TemplateBinding Background}"
                     BorderBrush="{TemplateBinding BorderBrush}"
                     BorderThickness="{TemplateBinding BorderThickness}"
-                    CornerRadius="6">
-              <Grid ColumnDefinitions="3,*">
-                <Border x:Name="SelectionIndicator"
-                        CornerRadius="6,0,0,6"
-                        Background="Transparent" />
-                <ContentPresenter Grid.Column="1"
-                                  Padding="{TemplateBinding Padding}"
+                    CornerRadius="6,6,0,0">
+              <Grid RowDefinitions="*,3">
+                <ContentPresenter Padding="{TemplateBinding Padding}"
                                   Content="{TemplateBinding Header}"
                                   ContentTemplate="{TemplateBinding HeaderTemplate}"
                                   HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
                                   VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}" />
+                <Border Grid.Row="1"
+                        x:Name="SelectionIndicator"
+                        CornerRadius="0,0,6,6"
+                        Background="Transparent" />
               </Grid>
             </Border>
           </Grid>
@@ -102,6 +102,7 @@
     </Style>
     <Style Selector="TabItem.settings-tab:pointerover /template/ Border#PART_Border">
       <Setter Property="Background" Value="{DynamicResource Theme1B2A3A}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
     </Style>
     <Style Selector="TabItem.settings-tab:selected">
       <Setter Property="Foreground" Value="{DynamicResource ThemeE9EFF8}" />
@@ -109,21 +110,58 @@
     </Style>
     <Style Selector="TabItem.settings-tab:selected /template/ Border#PART_Border">
       <Setter Property="Background" Value="{DynamicResource Theme18283A}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource Theme304A63}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme56B2F5}" />
     </Style>
     <Style Selector="TabItem.settings-tab:selected /template/ Border#SelectionIndicator">
       <Setter Property="Background" Value="{DynamicResource Theme56B2F5}" />
     </Style>
   </Window.Styles>
-  <Grid Margin="24" RowDefinitions="Auto,44,*,Auto" RowSpacing="12">
-    <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel Orientation="Horizontal" Spacing="10">
-        <TextBlock FontSize="20" Text="⚙" Foreground="{DynamicResource Theme71C7FF}" />
-        <StackPanel>
-          <TextBlock FontSize="20" FontWeight="SemiBold" Text="{Binding Texts.Settings}" />
-        </StackPanel>
-      </StackPanel>
-      <Button Grid.Column="1"
+  <Grid Margin="24" RowDefinitions="44,*,Auto" RowSpacing="12">
+    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="12">
+      <Grid Grid.Column="0" ColumnDefinitions="Auto,*" ColumnSpacing="10"
+            Background="Transparent" PointerPressed="OnTitlePointerPressed">
+        <TextBlock FontSize="20" Text="⚙" Foreground="{DynamicResource Theme71C7FF}"
+                   VerticalAlignment="Center" />
+        <TextBlock Grid.Column="1" FontSize="20" FontWeight="SemiBold"
+                   Text="{Binding Texts.Settings}" VerticalAlignment="Center" />
+      </Grid>
+      <ToggleButton Grid.Column="1"
+                    Classes="account-selector"
+                    x:Name="AccountSelector"
+                    Width="250"
+                    Height="44"
+                    HorizontalAlignment="Right"
+                    HorizontalContentAlignment="Stretch"
+                    ClickMode="Press"
+                    IsCheckedChanged="OnAccountSelectorCheckedChanged"
+                    IsVisible="{Binding HasAccounts}"
+                    AutomationProperties.Name="{Binding Texts.Account}"
+                    AutomationProperties.AutomationId="Settings.AccountSelector"
+                    AutomationProperties.HelpText="{Binding SelectedAccountText}"
+                    ToolTip.Tip="{Binding SelectedAccountText}">
+        <Grid ColumnDefinitions="18,*,14" ColumnSpacing="0">
+          <TextBlock Width="14"
+                     Foreground="{DynamicResource Theme5DC98A}"
+                     Text="●"
+                     IsVisible="{Binding SelectedAccount.IsCurrent}"
+                     VerticalAlignment="Center"
+                     AutomationProperties.AutomationId="Settings.SelectedAccountCurrentMarker" />
+          <StackPanel Grid.Column="1" Spacing="0" VerticalAlignment="Center">
+            <TextBlock FontSize="9" Foreground="{DynamicResource Theme56B2F5}" Text="{Binding Texts.Account}" />
+            <TextBlock FontSize="11"
+                       FontWeight="SemiBold"
+                       Text="{Binding SelectedAccountText}"
+                       TextTrimming="CharacterEllipsis"
+                       TextWrapping="NoWrap" />
+          </StackPanel>
+          <TextBlock Grid.Column="2"
+                     HorizontalAlignment="Center"
+                     VerticalAlignment="Center"
+                     Foreground="{DynamicResource Theme9FB0C5}"
+                     Text="⌄" />
+        </Grid>
+      </ToggleButton>
+      <Button Grid.Column="2"
               Background="Transparent"
               BorderBrush="Transparent"
               Foreground="{DynamicResource ThemeA8B7CA}"
@@ -134,44 +172,8 @@
               FontSize="22"
               ToolTip.Tip="{Binding Texts.Close}" />
     </Grid>
-    <ToggleButton Grid.Row="1"
-                  Classes="account-selector"
-                  x:Name="AccountSelector"
-                  Width="250"
-                  Height="44"
-                  HorizontalAlignment="Left"
-                  HorizontalContentAlignment="Stretch"
-                  ClickMode="Press"
-                  IsCheckedChanged="OnAccountSelectorCheckedChanged"
-                  IsVisible="{Binding HasAccounts}"
-                  AutomationProperties.Name="{Binding Texts.Account}"
-                  AutomationProperties.AutomationId="Settings.AccountSelector"
-                  AutomationProperties.HelpText="{Binding SelectedAccountText}"
-                  ToolTip.Tip="{Binding SelectedAccountText}">
-      <Grid ColumnDefinitions="18,*,14" ColumnSpacing="0">
-        <TextBlock Width="14"
-                   Foreground="{DynamicResource Theme5DC98A}"
-                   Text="●"
-                   IsVisible="{Binding SelectedAccount.IsCurrent}"
-                   VerticalAlignment="Center"
-                   AutomationProperties.AutomationId="Settings.SelectedAccountCurrentMarker" />
-        <StackPanel Grid.Column="1" Spacing="0" VerticalAlignment="Center">
-          <TextBlock FontSize="9" Foreground="{DynamicResource Theme56B2F5}" Text="{Binding Texts.Account}" />
-          <TextBlock FontSize="11"
-                     FontWeight="SemiBold"
-                     Text="{Binding SelectedAccountText}"
-                     TextTrimming="CharacterEllipsis"
-                     TextWrapping="NoWrap" />
-        </StackPanel>
-        <TextBlock Grid.Column="2"
-                   HorizontalAlignment="Center"
-                   VerticalAlignment="Center"
-                   Foreground="{DynamicResource Theme9FB0C5}"
-                   Text="⌄" />
-      </Grid>
-    </ToggleButton>
-    <Grid Grid.Row="2" RowDefinitions="*,Auto" RowSpacing="8">
-      <TabControl Grid.Row="0" Classes="settings-tabs" TabStripPlacement="Left">
+    <Grid Grid.Row="1" RowDefinitions="*,Auto" RowSpacing="8">
+      <TabControl Grid.Row="0" Classes="settings-tabs" TabStripPlacement="Top">
         <TabItem Classes="settings-tab"
                  Header="{Binding Texts.Language}"
                  AutomationProperties.Name="{Binding Texts.Language}"
@@ -264,11 +266,13 @@
             <StackPanel Spacing="8">
               <Grid ColumnDefinitions="144,12,*">
                 <TextBlock Classes="label" Text="Recorder" VerticalAlignment="Center" />
-                <TextBlock Grid.Column="2" Text="{Binding RecorderVersion}" VerticalAlignment="Center" />
+                <TextBlock Grid.Column="2" Text="{Binding RecorderVersion}" VerticalAlignment="Center"
+                           AutomationProperties.AutomationId="Settings.RuntimeVersion.Recorder" />
               </Grid>
               <Grid ColumnDefinitions="144,12,*">
                 <TextBlock Classes="label" Text="REST" VerticalAlignment="Center" />
-                <TextBlock Grid.Column="2" Text="{Binding RestVersion}" VerticalAlignment="Center" />
+                <TextBlock Grid.Column="2" Text="{Binding RestVersion}" VerticalAlignment="Center"
+                           AutomationProperties.AutomationId="Settings.RuntimeVersion.Rest" />
               </Grid>
               <TextBlock Classes="label" Text="{Binding RuntimeVersionStatus}" TextWrapping="Wrap" />
             </StackPanel>
@@ -286,7 +290,7 @@
                    AutomationProperties.AutomationId="Settings.SaveError" />
       </Border>
     </Grid>
-    <Grid Grid.Row="3" ColumnDefinitions="*,Auto">
+    <Grid Grid.Row="2" ColumnDefinitions="*,Auto">
       <StackPanel Grid.Column="0" Orientation="Horizontal" HorizontalAlignment="Left" Spacing="10">
         <Button Classes="secondary"
                 Click="OnOpenSetup"
@@ -314,7 +318,7 @@
     </Grid>
     <!-- Measure the account menu at its final width so opening it does not move the tabs. -->
     <Border x:Name="AccountMenu"
-            Grid.Row="1"
+            Grid.Row="0"
             Grid.RowSpan="3"
             ZIndex="100"
             HorizontalAlignment="Left"

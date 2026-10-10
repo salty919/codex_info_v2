@@ -4,6 +4,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Globalization;
 using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Theme;
@@ -100,11 +101,34 @@ public sealed class ClientSettingsStore
     private readonly string path;
 
     public ClientSettingsStore()
-        : this(Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CodexInfo",
-            "settings.json"))
+        : this(ResolveDefaultPath())
     {
+    }
+
+    private static string ResolveDefaultPath()
+    {
+        var fixturePort = Environment.GetEnvironmentVariable("CODEX_INFO_WINDOWS_E2E_FIXTURE_PORT");
+        if (string.IsNullOrWhiteSpace(fixturePort))
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CodexInfo",
+                "settings.json");
+        }
+
+        if (!int.TryParse(fixturePort, NumberStyles.None, CultureInfo.InvariantCulture, out var port) ||
+            port is < 1 or > 65535)
+        {
+            throw new InvalidOperationException("The Windows E2E fixture port is invalid.");
+        }
+
+        var fixtureSettingsPath = Environment.GetEnvironmentVariable("CODEX_INFO_WINDOWS_E2E_SETTINGS_PATH");
+        if (string.IsNullOrWhiteSpace(fixtureSettingsPath) || !Path.IsPathFullyQualified(fixtureSettingsPath))
+        {
+            throw new InvalidOperationException("The Windows E2E fixture settings path must be absolute.");
+        }
+
+        return Path.GetFullPath(fixtureSettingsPath);
     }
 
     /// <summary>Creates a store at an explicit path for isolated tests.</summary>
