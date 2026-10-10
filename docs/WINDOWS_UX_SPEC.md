@@ -51,9 +51,9 @@ Windows Settingsは現行の900×480を維持し、中央領域を次の4タブ�
 3. Appearance: テーマ選択。
 4. Connection status: 接続先、接続・認証状態、Recorder/REST version。
 
-タブは左の176 DIP幅の縦レールに置き、各項目は40 DIP以上の高さ、12 DIPの内側余白、4 DIPの間隔を持つ。項目名は最大2行で折り返す。非選択タブは補助文字色、選択タブは面色・1 DIP枠・3 DIPのaccent表示・太字で識別する。キーボードのfocus-visibleは独立した2 DIP枠で示し、装飾アニメーションは使わない。既存の色tokenとフォントを使い、本文は14 DIP、補助文字は13 DIPを基本とする。間隔は8／12／16／24 DIPから選ぶ。
+4タブは内容領域の上辺に横並びで置く。各項目は40 DIP以上の高さ、12 DIPの内側余白を持ち、項目間は8 DIP空ける。4項目を一目で識別できる幅を確保し、名称を折り返さない。非選択タブにも既存の面色と1 DIP枠を常時表示し、選択タブは明るい面色・accentの下線・太字で区別する。キーボードのfocus-visibleは選択状態と混同しない独立した2 DIP枠で示す。装飾アニメーションは使わない。既存の色tokenとフォントを使い、本文は14 DIP、補助文字は13 DIPを基本とする。間隔は8／12／16／24 DIPから選ぶ。
 
-account selectorは上部の固定領域、下部footerは`*,Auto`の2列に置く。接続設定／ライセンス情報を左のsecondary操作群、Saveを右側のprimary操作として分ける。Mainに法的情報の重複入口を置かず、ライセンス情報はSettingsから開く。各タブの既存項目は同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、設定項目、保存動作、保存形式、Linux画面は変更しない。
+account selectorはSettings見出しと同じ上部行の右側に置き、独立した行やカードにしない。全タブで常時表示し、アカウントに紐付く表示対象を即時に切り替える既存のglobal操作を維持する。Save対象にはせず、選択を取消やCloseで戻さない。下部footerは`*,Auto`の2列に置く。接続設定／ライセンス情報を左のsecondary操作群、Saveを右側のprimary操作として分ける。Mainに法的情報の重複入口を置かず、ライセンス情報はSettingsから開く。各タブの既存項目は同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、設定項目、保存動作、保存形式、Linux画面は変更しない。
 
 右側の各タブは、選択中のタブ名と一致する16 DIPの内側余白を持ち、18 DIPの見出しから始める。Language、Time zone、Appearanceの入力欄は見出しの8 DIP下に置き、幅420 DIP、高さ36 DIPとする。入力欄は左揃えにし、単独の入力欄を大きなsurface/cardで囲まない。Appearanceにはテーマ選択欄だけを置き、星印の装飾、`AppearanceDescription`の説明カード、補足段落を表示しない。
 

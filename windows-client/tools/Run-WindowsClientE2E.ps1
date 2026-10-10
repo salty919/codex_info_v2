@@ -90,6 +90,7 @@ $script:e2eProcess = $null
 $script:e2eFixtureRunning = $false
 $script:e2eFixturePort = 0
 $script:e2eFixturePortVariable = 'CODEX_INFO_WINDOWS_E2E_FIXTURE_PORT'
+$script:e2eFixtureSettingsPathVariable = 'CODEX_INFO_WINDOWS_E2E_SETTINGS_PATH'
 $script:e2eFixtureUnusedMinimumSeconds = 10 * 60
 $script:e2eFixturePastIdleStartFraction = 0.25
 $script:e2eFixturePastIdleEndFraction = 0.50
@@ -110,6 +111,35 @@ function Write-E2E {
     # records) out of the PowerShell pipeline while still exposing the raw
     # line in an interactive/CI log.
     Write-Host $line
+}
+
+function Start-E2EFixtureClient {
+    param([Parameter(Mandatory = $true)][string]$ClientPath)
+
+    $variables = @(
+        @{ Name = $script:e2eFixturePortVariable; Value = $script:e2eFixturePort.ToString([Globalization.CultureInfo]::InvariantCulture) },
+        @{ Name = $script:e2eFixtureSettingsPathVariable; Value = [IO.Path]::GetFullPath($script:e2eSettingsPath) })
+    $previousValues = @{}
+    foreach ($variable in $variables) {
+        $previousValues[$variable.Name] = @{
+            Present = Test-Path -LiteralPath "Env:$($variable.Name)"
+            Value = [Environment]::GetEnvironmentVariable($variable.Name, 'Process')
+        }
+    }
+
+    try {
+        foreach ($variable in $variables) {
+            [Environment]::SetEnvironmentVariable($variable.Name, $variable.Value, 'Process')
+        }
+        return Start-Process -FilePath $ClientPath -PassThru
+    }
+    finally {
+        foreach ($variable in $variables) {
+            $previous = $previousValues[$variable.Name]
+            $value = if ($previous.Present) { $previous.Value } else { $null }
+            [Environment]::SetEnvironmentVariable($variable.Name, $value, 'Process')
+        }
+    }
 }
 
 function Assert-E2E {
@@ -1184,6 +1214,12 @@ public static class CodexInfoWindowsE2EFixtureServer {
                     code = 200;
                     reason = "OK";
                     body = "{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"" + productVersion + "\"}";
+                }
+                else if (parts[1] == "/v1/runtime") {
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = "{\"api_version\":\"v1\",\"rest_version\":\"1.2.3\",\"recorder_version\":\"1.2.2\",\"recorder_status\":\"mismatch\"}";
                 }
                 else if (parts[1] == "/v2/details") {
                     Interlocked.Increment(ref detailsRequests);
@@ -4357,6 +4393,20 @@ function Assert-E2ESettingsStatusPlacement {
     }
 }
 
+function Assert-E2ESettingsRuntimeVersions {
+    param([Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot)
+
+    foreach ($version in @(
+            @{ Id = 'Settings.RuntimeVersion.Recorder'; Expected = '1.2.2' },
+            @{ Id = 'Settings.RuntimeVersion.Rest'; Expected = '1.2.3' })) {
+        $element = Find-E2EElementByAutomationId $SettingsRoot $version.Id
+        Assert-E2E ($null -ne $element -and -not $element.Current.IsOffscreen -and
+            [string]$element.Current.Name -ceq $version.Expected) `
+            "Settings runtime version $($version.Id) was not retrieved and rendered accurately."
+    }
+    Write-E2E 'settings-runtime-versions: PASS recorder=1.2.2 rest=1.2.3'
+}
+
 function Invoke-E2ESettingsKeyboardFocusCheck {
     param(
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$SettingsRoot,
@@ -4370,9 +4420,9 @@ function Invoke-E2ESettingsKeyboardFocusCheck {
     Assert-E2E ([CodexInfoWindowsE2EWin32]::SetForegroundWindow($SettingsHandle)) `
         'Settings could not receive foreground input for keyboard focus validation.'
     $tab.SetFocus()
-    # TabStripPlacement=Left: Down moves focus and selection to the next tab.
-    [CodexInfoWindowsE2EWin32]::keybd_event(0x28, 0, 0, [UIntPtr]::Zero)
-    [CodexInfoWindowsE2EWin32]::keybd_event(0x28, 0, 2, [UIntPtr]::Zero)
+    # TabStripPlacement=Top: Right moves focus and selection to the next tab.
+    [CodexInfoWindowsE2EWin32]::keybd_event(0x27, 0, 0, [UIntPtr]::Zero)
+    [CodexInfoWindowsE2EWin32]::keybd_event(0x27, 0, 2, [UIntPtr]::Zero)
     $focusedTab = Wait-E2E -Description "Down-arrow selects and focuses Settings tab $NextAutomationId" -Probe {
         $candidate = Find-E2EElementByAutomationId $SettingsRoot $NextAutomationId
         if ($null -eq $candidate) { return $false }
@@ -4495,6 +4545,7 @@ function Invoke-E2ESettingsTabs {
                 Select-E2ETheme $settings.Root 'Paper Light'
             }
             'Settings.Tab.ConnectionStatus' {
+                Assert-E2ESettingsRuntimeVersions $settings.Root
                 $authCheck = Find-E2EElementByAutomationId $settings.Root 'Settings.AuthCheck'
                 Assert-E2E ($null -ne $authCheck -and -not $authCheck.Current.IsOffscreen -and $authCheck.Current.IsEnabled) `
                     'Connection status tab does not render the authentication check action.'
@@ -5197,23 +5248,7 @@ function Invoke-E2EThemePresets {
 
     Stop-Process -Id $ProcessId -Force
     Wait-E2E -Description 'first themed client exits' -Probe { return $script:e2eProcess.HasExited } | Out-Null
-    $fixturePortWasPresent = Test-Path -LiteralPath "Env:$($script:e2eFixturePortVariable)"
-    $previousFixturePort = [Environment]::GetEnvironmentVariable($script:e2eFixturePortVariable, 'Process')
-    try {
-        [Environment]::SetEnvironmentVariable(
-            $script:e2eFixturePortVariable,
-            $script:e2eFixturePort.ToString([Globalization.CultureInfo]::InvariantCulture),
-            'Process')
-        $script:e2eProcess = Start-Process -FilePath $ClientPath -PassThru
-    }
-    finally {
-        if ($fixturePortWasPresent) {
-            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $previousFixturePort, 'Process')
-        }
-        else {
-            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $null, 'Process')
-        }
-    }
+    $script:e2eProcess = Start-E2EFixtureClient -ClientPath $ClientPath
     $restartedPid = $script:e2eProcess.Id
     $restartedMainHandle = Wait-E2E -Description 'restarted Main window' -Probe {
         $found = Find-E2EWindow $restartedPid 'Codex Info Monitor'
@@ -5277,23 +5312,7 @@ function Invoke-E2ENarrowPeriodCostScenario {
         $scenario.OldestHistory)) 'Could not switch the fixture server to the narrow period-cost scenario.'
     Invoke-E2ENarrowPeriodCostFixturePreflight -Scenario $scenario | Out-Null
 
-    $fixturePortWasPresent = Test-Path -LiteralPath "Env:$($script:e2eFixturePortVariable)"
-    $previousFixturePort = [Environment]::GetEnvironmentVariable($script:e2eFixturePortVariable, 'Process')
-    try {
-        [Environment]::SetEnvironmentVariable(
-            $script:e2eFixturePortVariable,
-            $script:e2eFixturePort.ToString([Globalization.CultureInfo]::InvariantCulture),
-            'Process')
-        $script:e2eProcess = Start-Process -FilePath $ClientPath -PassThru
-    }
-    finally {
-        if ($fixturePortWasPresent) {
-            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $previousFixturePort, 'Process')
-        }
-        else {
-            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $null, 'Process')
-        }
-    }
+    $script:e2eProcess = Start-E2EFixtureClient -ClientPath $ClientPath
     $narrowPid = $script:e2eProcess.Id
     Write-E2E "narrow-period-cost-fixture: candidate-started pid=$narrowPid"
     $mainHandle = Wait-E2E -Description 'narrow-fixture Main window' -Probe {
@@ -5383,24 +5402,11 @@ try {
     if ($Fixture) {
         Invoke-E2EFixturePreflight | Out-Null
     }
-    $fixturePortWasPresent = Test-Path -LiteralPath "Env:$($script:e2eFixturePortVariable)"
-    $previousFixturePort = [Environment]::GetEnvironmentVariable($script:e2eFixturePortVariable, 'Process')
-    try {
-        if ($Fixture) {
-            [Environment]::SetEnvironmentVariable(
-                $script:e2eFixturePortVariable,
-                $script:e2eFixturePort.ToString([Globalization.CultureInfo]::InvariantCulture),
-                'Process')
-        }
-        $script:e2eProcess = Start-Process -FilePath $resolvedClientPath -PassThru
+    $script:e2eProcess = if ($Fixture) {
+        Start-E2EFixtureClient -ClientPath $resolvedClientPath
     }
-    finally {
-        if ($fixturePortWasPresent) {
-            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $previousFixturePort, 'Process')
-        }
-        else {
-            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $null, 'Process')
-        }
+    else {
+        Start-Process -FilePath $resolvedClientPath -PassThru
     }
     $clientPid = $script:e2eProcess.Id
     Write-E2E "process: pid=$clientPid"
