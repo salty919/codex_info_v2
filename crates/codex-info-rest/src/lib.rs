@@ -2281,7 +2281,24 @@ mod tests {
     }
 
     #[test]
-    fn idle_quota_rollover_commits_and_updates_rest_current() {
+    fn official_reset_datetime_rollover_commits_and_updates_rest_current() {
+        const OBSERVED: i64 = 2_000_000_040;
+        const OLD_RESET: i64 = OBSERVED + 24 * 60 * 60;
+        for (observed, reset, remaining) in [
+            (OBSERVED, OBSERVED - 79 + 604_800, 100.0),
+            (OBSERVED, OLD_RESET + 1, 9.0),
+            (OBSERVED, OLD_RESET - 1, 5.0),
+            (OBSERVED - 60, OLD_RESET + 60, 100.0),
+        ] {
+            assert_official_reset_reaches_rest(observed, reset, remaining);
+        }
+    }
+
+    fn assert_official_reset_reaches_rest(
+        next_observed_at: i64,
+        next_reset_at: i64,
+        remaining: f64,
+    ) {
         use codex_info_db_writer::{StoragePartitionIdentity, UsageStore};
         use codex_info_recorder::{QuotaSnapshot, Recorder, RecorderConfig};
 
@@ -2289,8 +2306,7 @@ mod tests {
         // No Session file, quota poller, account RPC, or production profile is used.
         const OBSERVED_AT: i64 = 2_000_000_040;
         const WINDOW: i64 = 7 * 24 * 60 * 60;
-        const NEXT_OBSERVED_AT: i64 = OBSERVED_AT + 120;
-        const NEXT_RESET_AT: i64 = OBSERVED_AT - 16 + WINDOW;
+        const REPEAT_OBSERVED_AT: i64 = OBSERVED_AT + 120;
         let root = tempfile::tempdir().expect("anonymous idle fixture");
         let sessions = root.path().join("sessions");
         fs::create_dir(&sessions).expect("empty Session directory");
@@ -2312,12 +2328,21 @@ mod tests {
             &identity,
         )
         .expect("fixture recorder");
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: next_observed_at.min(OBSERVED_AT) - 60,
+                reset_at: OBSERVED_AT + 24 * 60 * 60,
+                window_seconds: WINDOW,
+                remaining_percent: Some(10.0),
+            }))
+            .expect("previous minute")
+            .expect("previous minute commit");
         let first = recorder
             .run_cycle_with_quota(Some(QuotaSnapshot {
                 observed_at: OBSERVED_AT,
                 reset_at: OBSERVED_AT + 24 * 60 * 60,
                 window_seconds: WINDOW,
-                remaining_percent: Some(25.0),
+                remaining_percent: Some(10.0),
             }))
             .expect("old quota cycle")
             .expect("quota-only commit");
@@ -2344,7 +2369,7 @@ mod tests {
         let before_value: Value = serde_json::from_str(body(&before)).expect("old current JSON");
         assert_eq!(before_value["state"], "ready");
         assert_eq!(before_value["observed_at"], OBSERVED_AT);
-        assert_eq!(before_value["quota"]["remaining_percent"], 25.0);
+        assert_eq!(before_value["quota"]["remaining_percent"], 10.0);
         assert_eq!(
             before_value["quota"]["reset_at"],
             OBSERVED_AT + 24 * 60 * 60
@@ -2353,10 +2378,10 @@ mod tests {
 
         let rolled = recorder
             .run_cycle_with_quota(Some(QuotaSnapshot {
-                observed_at: NEXT_OBSERVED_AT,
-                reset_at: NEXT_RESET_AT,
+                observed_at: next_observed_at,
+                reset_at: next_reset_at,
                 window_seconds: WINDOW,
-                remaining_percent: Some(95.0),
+                remaining_percent: Some(remaining),
             }))
             .expect("idle rollover cycle")
             .expect("idle quota-only commit");
@@ -2378,23 +2403,29 @@ mod tests {
         assert_eq!(generation.0, rolled.generation.to_string());
         assert_eq!(
             (generation.1, generation.2, generation.3),
-            (NEXT_RESET_AT, NEXT_RESET_AT, WINDOW)
+            (next_reset_at, next_reset_at, WINDOW)
         );
         let quota_row: (i64, i64, f64) = connection
             .query_row(
                 "SELECT timestamp, reset_at, remaining_percent FROM usage_history
-                 ORDER BY timestamp DESC LIMIT 1",
-                [],
+                 WHERE reset_at=?1 ORDER BY timestamp DESC LIMIT 1",
+                [next_reset_at],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(quota_row, (NEXT_OBSERVED_AT, NEXT_RESET_AT, 95.0));
+        assert_eq!(quota_row, (next_observed_at, next_reset_at, remaining));
         let event_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(event_count, 0);
         drop(connection);
 
+        DbReader::open_partitioned(&database, &reader_identity)
+            .unwrap()
+            .read_snapshot()
+            .unwrap_or_else(|error| {
+                panic!("reset={next_reset_at} observed={next_observed_at}: {error:?}")
+            });
         server.store().refresh();
         let after = request(
             server.local_addr(),
@@ -2403,11 +2434,50 @@ mod tests {
         assert!(after.starts_with("HTTP/1.1 200"));
         let after_value: Value = serde_json::from_str(body(&after)).expect("new current JSON");
         assert_eq!(after_value["state"], "ready");
-        assert_eq!(after_value["observed_at"], NEXT_OBSERVED_AT);
-        assert_eq!(after_value["quota"]["remaining_percent"], 95.0);
-        assert_eq!(after_value["quota"]["reset_at"], NEXT_RESET_AT);
+        assert_eq!(
+            after_value["observed_at"],
+            next_observed_at.max(OBSERVED_AT)
+        );
+        assert_eq!(after_value["quota"]["remaining_percent"], remaining);
+        assert_eq!(after_value["quota"]["reset_at"], next_reset_at);
         assert_eq!(after_value["quota"]["window_seconds"], WINDOW);
         assert_ne!(published_pair(&before), published_pair(&after));
+
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: REPEAT_OBSERVED_AT,
+                reset_at: next_reset_at,
+                window_seconds: WINDOW,
+                remaining_percent: Some(99.0),
+            }))
+            .expect("repeat official reset identity")
+            .expect("repeat quota commit");
+        let state = recorder.state().expect("repeated reset state");
+        assert_eq!(state.reset_at, next_reset_at);
+        assert_eq!(state.latest_quota_reset_at, next_reset_at);
+        let period_count: i64 = Connection::open(&database)
+            .expect("fixture DB after repeated reset")
+            .query_row(
+                "SELECT COUNT(DISTINCT reset_at) FROM usage_history",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            period_count, 2,
+            "the new reset identity creates one new period"
+        );
+        server.store().refresh();
+        let repeated = request(
+            server.local_addr(),
+            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(repeated.starts_with("HTTP/1.1 200"));
+        let repeated_value: Value =
+            serde_json::from_str(body(&repeated)).expect("repeated current JSON");
+        assert_eq!(repeated_value["observed_at"], REPEAT_OBSERVED_AT);
+        assert_eq!(repeated_value["quota"]["remaining_percent"], 99.0);
+        assert_eq!(repeated_value["quota"]["reset_at"], next_reset_at);
         server.shutdown();
     }
 

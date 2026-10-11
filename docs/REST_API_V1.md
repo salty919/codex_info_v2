@@ -207,15 +207,14 @@ AccountKey/profile metadata/partition検証失敗は`error`とする。この3�
 `estimated_cost_label="概算 —"`で固定する。旧accountのquota/model/history/threadを混ぜず、同じconfirmed
 accountのtransport/quota/local一時失敗だけは従来どおり最後の完全rootを保持して`error`へ遷移する。
 
-`quota.reset_at`はhistory periodのcanonical境界ではなく、current account partition・AuthEpochで最後に受理した
-quota観測のprovider `resetsAt` Unix秒である。`quota.window_seconds`はその観測と同じtransactionの値とし、
-latestはdeadlineの大小ではなく`observed_at`とcollector generationの順序で決める。遅着した古い観測、同時刻の
-矛盾candidate、別account/epochの値を公開しない。同一periodのrolling更新では`quota.reset_at`だけが前進または
-補正され得る。current `history_periods[]`は同じquota観測から`start_at = quota.reset_at - quota.window_seconds`、
+`quota.reset_at`はcurrent account partition・AuthEpochで最後に受理したquota観測のprovider `resetsAt` Unix秒で、
+current periodの識別子でもある。同じ日時は同一periodにまとめ、より新しい観測で異なる日時が届けば新periodとして
+記録する。`quota.window_seconds`は同じ観測と同じtransactionで保存し、応答順序は直列pollerとcollector generationで保持する。ローカル`observed_at`やdeadlineの大小で公式応答を拒否しない。別account/epochの値は公開しない。current `history_periods[]`は同じquota観測から`start_at = quota.reset_at - quota.window_seconds`、
 `end_at = min(quota.reset_at, observed_at)`を一度だけ投影し、Linux/Windowsの期間欄、メイン利用期間、selected
-period start、グラフ横軸はそのpairを使う。stable `id`とcanonical `reset_at`、durable sample、model totalsは
-rolling driftだけでは書き換えず、公開windowより前のsampleだけをcurrent公開から除外する。completed/historical
+period start、グラフ横軸はそのpairを使う。period `id`、canonical `reset_at`、durable sample、model totalsは
+期間識別子が同じ間だけ維持し、新periodより前のsampleは保存したままcurrent公開から除外する。completed/historical
 periodは保存済み`start_at/end_at`を使い、リセット時刻は同じrootの`quota.reset_at`を表示する。
+履歴sample/gapの所属は正確な`reset_at`の一致を優先する。近接した公式resetの期間が存在するとき、60秒以内という理由で別期間へ結合したり、複数所属として応答全体を拒否しない。完全一致する期間がない旧wireのaliasだけに従来の許容幅を適用する。
 
 wireに `ready` boolean keyは存在しない。dataの利用可能判定は、完全schemaを受理した一つのdetails rootについて
 `state == "ready" && authenticated == true` の論理積だけである。

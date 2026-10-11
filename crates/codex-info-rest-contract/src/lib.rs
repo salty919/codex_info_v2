@@ -583,8 +583,10 @@ impl PublicDetails {
                 .history_periods
                 .iter()
                 .filter(|period| {
-                    sample.reset_at >= period.reset_at.saturating_sub(60)
-                        && sample.reset_at <= period.reset_at
+                    (sample.reset_at == period.reset_at
+                        || (!period_resets.contains(&sample.reset_at)
+                            && sample.reset_at >= period.reset_at.saturating_sub(60)
+                            && sample.reset_at <= period.reset_at))
                         && sample.timestamp >= period.start_at
                         && sample.timestamp <= period.end_at
                 })
@@ -624,8 +626,10 @@ impl PublicDetails {
                 .history_periods
                 .iter()
                 .filter(|period| {
-                    gap.reset_at >= period.reset_at.saturating_sub(60)
-                        && gap.reset_at <= period.reset_at
+                    (gap.reset_at == period.reset_at
+                        || (!period_resets.contains(&gap.reset_at)
+                            && gap.reset_at >= period.reset_at.saturating_sub(60)
+                            && gap.reset_at <= period.reset_at))
                         && gap.start_at >= period.start_at
                         && gap.end_at <= period.end_at
                 })

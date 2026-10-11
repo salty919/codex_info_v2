@@ -5153,14 +5153,20 @@ fn canonicalize_samples_with_sources(
     samples: &[UsageHistorySample],
     preserve_existing: bool,
     preserve_existing_before: Option<i64>,
+    admitted_period: Option<(i64, i64)>,
 ) -> Result<CanonicalizedSamples> {
     let canonical_storage = canonical_history_constraints_present(transaction)?;
     let incoming = if canonical_storage {
-        let (current_reset_at, window_seconds): (i64, i64) = transaction.query_row(
-            "SELECT reset_at, window_seconds FROM collection_generation WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        // Recorder has already accepted the official period. Legacy import
+        // canonicalization must not alias it back to the previous DB period.
+        let (current_reset_at, window_seconds): (i64, i64) = match admitted_period {
+            Some(period) => period,
+            None => transaction.query_row(
+                "SELECT reset_at, window_seconds FROM collection_generation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?,
+        };
         let raw = samples
             .iter()
             .map(|sample| {
@@ -5252,7 +5258,11 @@ fn canonicalize_samples_with_sources(
                 .query_row(params![incoming.reset_at, incoming.timestamp], decode)
                 .optional()?
         };
-        if let Some(existing) = existing.as_ref() {
+        let replaces_period = existing.as_ref().is_some_and(|existing| {
+            admitted_period.is_some_and(|(reset_at, _)| incoming.reset_at == reset_at)
+                && existing.reset_at != incoming.reset_at
+        });
+        if let Some(existing) = existing.as_ref().filter(|_| !replaces_period) {
             // The canonical timestamp already owns its one durable period
             // key. An incoming reset alias cannot create or rename that row.
             incoming.reset_at = existing.reset_at;
@@ -5265,6 +5275,10 @@ fn canonicalize_samples_with_sources(
             {
                 existing
             }
+            // A minute contains one canonical sample. On an official reset,
+            // replace that minute with the new period's independently rebuilt
+            // vector; never carry the previous period's larger totals into it.
+            Some(_) if replaces_period => incoming,
             Some(existing) => reconcile_existing_sample(existing, incoming)?,
             None => incoming,
         };
@@ -5301,6 +5315,7 @@ fn canonicalize_samples(
         samples,
         preserve_existing,
         preserve_existing_before,
+        None,
     )
     .map(|canonical| canonical.rows)
 }
@@ -5313,7 +5328,33 @@ fn upsert_canonical_samples(
 ) -> Result<()> {
     let mut insert_if_absent = transaction.prepare(INSERT_SAMPLE_IF_ABSENT)?;
     let mut upsert = transaction.prepare(UPSERT_SAMPLE)?;
+    let canonical_storage = canonical_history_constraints_present(transaction)?;
     for sample in samples {
+        let preserved = preserve_existing
+            || preserve_existing_before.is_some_and(|cutoff| sample.timestamp < cutoff);
+        if canonical_storage && !preserved {
+            let replaces_period: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM usage_history WHERE timestamp=?1 AND reset_at<>?2)",
+                params![sample.timestamp, sample.reset_at],
+                |row| row.get(0),
+            )?;
+            if replaces_period {
+                // Replace only this derived minute and its dependent sidecars
+                // inside the same transaction. Session source events stay intact.
+                transaction.execute(
+                    "DELETE FROM usage_model_history WHERE timestamp=?1",
+                    [sample.timestamp],
+                )?;
+                transaction.execute(
+                    "DELETE FROM durable_state WHERE singleton>=?1 AND data_generation=?2",
+                    params![DURABLE_STATE_OBSERVATION_MIN_SINGLETON, sample.timestamp],
+                )?;
+                transaction.execute(
+                    "DELETE FROM usage_history WHERE timestamp=?1",
+                    [sample.timestamp],
+                )?;
+            }
+        }
         let statement = if preserve_existing
             || preserve_existing_before.is_some_and(|cutoff| sample.timestamp < cutoff)
         {
@@ -13129,6 +13170,7 @@ impl UsageStore {
             model_totals,
             recorded_sessions,
         } = commit;
+        let admitted_period = latest_quota_reset_at.map(|_| (reset_at, window_seconds));
         let latest_quota_reset_at = latest_quota_reset_at.unwrap_or(reset_at);
         if reset_at < 0
             || latest_quota_reset_at < 0
@@ -13448,6 +13490,7 @@ impl UsageStore {
             &adjusted_samples,
             cumulative_recovery.is_some(),
             preserve_existing_before,
+            admitted_period,
         )?;
         let canonical_samples = canonical_projection.rows;
         let CanonicalizedObservations {

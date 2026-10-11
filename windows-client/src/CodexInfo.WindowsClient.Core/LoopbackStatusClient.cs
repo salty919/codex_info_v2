@@ -1860,7 +1860,7 @@ public sealed class LoopbackStatusClient :
             historyPeriods = historyPeriods
                 .Select(period => period with
                 {
-                    Samples = SamplesForCanonicalPeriod(period, historySamples),
+                    Samples = SamplesForCanonicalPeriod(period, historySamples, historyPeriods),
                 })
                 .ToList();
 
@@ -2128,7 +2128,7 @@ public sealed class LoopbackStatusClient :
             historyPeriods = historyPeriods
                 .Select(period => period with
                 {
-                    Samples = SamplesForCanonicalPeriod(period, historySamples),
+                    Samples = SamplesForCanonicalPeriod(period, historySamples, historyPeriods),
                 })
                 .ToList();
 
@@ -2335,8 +2335,7 @@ public sealed class LoopbackStatusClient :
             if (periods is not null)
             {
                 var matchingPeriods = periods
-                    .Where(period => resetAt >= period.ResetAt - ResetAtToleranceSeconds &&
-                                     resetAt <= period.ResetAt)
+                    .Where(period => PeriodOwnsReset(period, resetAt, periods))
                     .ToArray();
                 if (matchingPeriods.Length != 1 ||
                     timestamp < matchingPeriods[0].StartAt ||
@@ -2454,14 +2453,22 @@ public sealed class LoopbackStatusClient :
         return true;
     }
 
+    private static bool PeriodOwnsReset(
+        ApiHistoryPeriod period,
+        long resetAt,
+        IReadOnlyList<ApiHistoryPeriod> periods) =>
+        resetAt == period.ResetAt ||
+        (!periods.Any(candidate => candidate.ResetAt == resetAt) &&
+         resetAt >= period.ResetAt - ResetAtToleranceSeconds && resetAt <= period.ResetAt);
+
     private static IReadOnlyList<ApiHistorySample> SamplesForCanonicalPeriod(
         ApiHistoryPeriod period,
-        IReadOnlyList<ApiHistorySample> samples)
+        IReadOnlyList<ApiHistorySample> samples,
+        IReadOnlyList<ApiHistoryPeriod> periods)
     {
         return new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(
             samples
-                .Where(sample => sample.ResetAt >= period.ResetAt - ResetAtToleranceSeconds &&
-                                 sample.ResetAt <= period.ResetAt)
+                .Where(sample => PeriodOwnsReset(period, sample.ResetAt, periods))
                 .Select(sample => sample with { ResetAt = period.ResetAt })
                 .ToList());
     }
@@ -2670,8 +2677,7 @@ public sealed class LoopbackStatusClient :
             }
 
             var matchingPeriods = periods
-                .Where(period => resetAt >= period.ResetAt - ResetAtToleranceSeconds &&
-                                 resetAt <= period.ResetAt)
+                .Where(period => PeriodOwnsReset(period, resetAt, periods))
                 .ToArray();
             if (matchingPeriods.Length != 1 ||
                 timestamp < matchingPeriods[0].StartAt ||

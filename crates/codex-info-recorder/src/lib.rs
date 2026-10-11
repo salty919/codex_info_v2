@@ -10,15 +10,15 @@
 use chrono::{DateTime, Months, Utc};
 use codex_info::{security, thread_contract};
 use codex_info_db_writer::{
-    classify_quota_transition, finalize_session_timeline_recovery, session_event_is_replay,
-    session_token_anchor_recovery_id, ActiveThreadRecord, ActiveThreadSnapshot, PreviousQuotaState,
-    QuotaCandidate, QuotaTransition, RecordedSessionSource, SessionCheckpoint,
-    SessionCollectionCommit, SessionCollectionState, SessionEvent, SessionEventReattribution,
-    SessionLifecycleInterval, SessionModelTotal, SessionPendingRange, SessionRange,
-    SessionTaskEvent, SessionTaskEvidenceInput, SessionTaskIndexedRange, SessionTimelineRecovery,
-    SessionTimelineRecoveryPoint, SessionTokenAnchor, SessionTokenAnchorRecovery,
-    SessionTokenAnchorResolution, StoragePartitionIdentity, UsageHistoryObservation,
-    UsageHistorySample, UsageStore, UsageStoreError, VerifiedPartitionBackup,
+    finalize_session_timeline_recovery, session_event_is_replay, session_token_anchor_recovery_id,
+    ActiveThreadRecord, ActiveThreadSnapshot, QuotaTransition, RecordedSessionSource,
+    SessionCheckpoint, SessionCollectionCommit, SessionCollectionState, SessionEvent,
+    SessionEventReattribution, SessionLifecycleInterval, SessionModelTotal, SessionPendingRange,
+    SessionRange, SessionTaskEvent, SessionTaskEvidenceInput, SessionTaskIndexedRange,
+    SessionTimelineRecovery, SessionTimelineRecoveryPoint, SessionTokenAnchor,
+    SessionTokenAnchorRecovery, SessionTokenAnchorResolution, StoragePartitionIdentity,
+    UsageHistoryObservation, UsageHistorySample, UsageStore, UsageStoreError,
+    VerifiedPartitionBackup,
 };
 use codex_info_pricing::{estimate_legacy, family, Usage as PricingUsage};
 use serde_json::{json, Value};
@@ -4122,45 +4122,26 @@ fn admit_quota_period(
         eprintln!("recorder degraded: quota response has an invalid remaining percentage");
         return None;
     }
-    if let Some(previous) = state.last_quota_observation.as_ref() {
-        if candidate.observed_at == previous.observed_at
-            && (candidate.reset_at != state.latest_quota_reset_at
-                || candidate.window_seconds != state.window_seconds
-                || remaining_percent.to_bits() != previous.remaining_percent.to_bits())
-        {
-            eprintln!(
-                "recorder degraded: quota response conflicts with the admitted observation at observed_at={}",
-                candidate.observed_at
-            );
-            return None;
-        }
-    }
-    let previous_reset_at =
-        (state.data_generation > 0 && state.reset_at > 0).then_some(state.reset_at);
-    let previous_observation = state.last_quota_observation.as_ref();
-    let transition = classify_quota_transition(
-        PreviousQuotaState::new(
-            previous_reset_at,
-            state.window_seconds,
-            previous_observation.map(|observation| observation.observed_at),
-            previous_observation.map(|observation| observation.remaining_percent),
-        ),
-        QuotaCandidate::new(
-            candidate.reset_at,
-            candidate.window_seconds,
-            Some(remaining_percent),
-            candidate.observed_at,
-        ),
-    );
-    if transition == QuotaTransition::Rejected {
-        eprintln!(
-            "recorder degraded: quota period candidate rejected reset_at={} observed_at={}",
-            candidate.reset_at, candidate.observed_at
-        );
-        return None;
-    }
+    // QuotaPoller fetches serially and the account epoch is fenced before
+    // commit. Wall-clock timestamps are sample metadata, not response order.
+    let period_identity_exists = state.data_generation > 0
+        && state.reset_at > 0
+        && state.latest_quota_reset_at > 0
+        && state.window_seconds > 0;
+    let transition = if !period_identity_exists {
+        QuotaTransition::Initial
+    } else if candidate.reset_at == state.reset_at {
+        // The provider's exact next-reset datetime identifies one period.
+        // Repeated observations of that datetime update the same period once.
+        QuotaTransition::SamePeriod
+    } else {
+        // This is a fresh official account/rateLimits/read observation. Its
+        // reset datetime is the period identity; local window clocks, quota
+        // recovery, and deadline magnitude cannot veto the new period.
+        QuotaTransition::Boundary
+    };
     let (reset_at, window_seconds) = if transition == QuotaTransition::SamePeriod {
-        (state.reset_at, state.window_seconds)
+        (state.reset_at, candidate.window_seconds)
     } else {
         (candidate.reset_at, candidate.window_seconds)
     };
@@ -9142,6 +9123,51 @@ mod tests {
     }
 
     #[test]
+    fn official_reset_identity_replaces_stale_local_period() {
+        const WINDOW: i64 = 7 * 24 * 60 * 60;
+        const RESET: i64 = 1_792_044_505;
+        const OBSERVED: i64 = 1_791_691_140;
+        let state = SessionCollectionState {
+            data_generation: 76797,
+            reset_at: RESET,
+            latest_quota_reset_at: RESET,
+            window_seconds: WINDOW,
+            last_quota_observation: Some(codex_info_db_writer::SessionQuotaObservation {
+                observed_at: OBSERVED,
+                remaining_percent: 10.0,
+            }),
+            ..SessionCollectionState::default()
+        };
+        // Exact provider identity is the oracle. None of these local timing
+        // or percentage relationships can invalidate the official response.
+        for (reset_at, observed_at, remaining, transition) in [
+            (
+                1_792_295_861,
+                OBSERVED + 1500,
+                99.0,
+                QuotaTransition::Boundary,
+            ),
+            (RESET + 1, OBSERVED, 9.0, QuotaTransition::Boundary),
+            (RESET - 1, OBSERVED + 60, 5.0, QuotaTransition::Boundary),
+            (RESET + 60, OBSERVED - 60, 100.0, QuotaTransition::Boundary),
+            (RESET, OBSERVED, 100.0, QuotaTransition::SamePeriod),
+            (RESET, OBSERVED + 60, 99.0, QuotaTransition::SamePeriod),
+        ] {
+            let candidate = QuotaSnapshot {
+                observed_at,
+                reset_at,
+                window_seconds: WINDOW,
+                remaining_percent: Some(remaining),
+            };
+            assert_eq!(
+                admit_quota_period(&state, &candidate),
+                Some((transition, reset_at, reset_at, WINDOW)),
+                "official reset={reset_at} observed={observed_at} remaining={remaining}"
+            );
+        }
+    }
+
+    #[test]
     fn weekly_empty_model_collection_requires_complete_sources() {
         const BEFORE: i64 = 1_800_000_000;
         const AFTER: i64 = BEFORE + 120;
@@ -9417,8 +9443,73 @@ mod tests {
     }
 
     #[test]
-    fn live_quota_reset_deadline_correction_keeps_one_recorder_period() {
-        let (root, database) = prepare("reset-deadline-correction");
+    fn official_reset_same_minute_replaces_old_models_atomically() {
+        const AT: i64 = 2_000_000_040;
+        const WINDOW: i64 = 604_800;
+        let (root, database) = prepare("official-reset-same-minute");
+        fs::write(
+            root.join("sessions/one.jsonl"),
+            format!("{}{}", token(10, AT - 1), token(15, AT)),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: AT,
+                reset_at: AT + WINDOW,
+                window_seconds: WINDOW,
+                remaining_percent: Some(10.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let before = recorder.state().unwrap();
+        assert!(!before.model_totals.is_empty());
+        let db = Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_reset BEFORE UPDATE ON collection_generation BEGIN SELECT RAISE(ABORT, 'injected reset commit failure'); END;").unwrap();
+        let new_quota = QuotaSnapshot {
+            observed_at: AT + 10,
+            reset_at: AT + 10 + WINDOW,
+            window_seconds: WINDOW,
+            remaining_percent: Some(100.0),
+        };
+        assert!(recorder
+            .run_cycle_with_quota(Some(new_quota.clone()))
+            .is_err());
+        assert_eq!(
+            recorder.state().unwrap(),
+            before,
+            "failed reset transaction leaves the prior generation intact"
+        );
+        db.execute_batch("DROP TRIGGER fail_reset").unwrap();
+        recorder
+            .run_cycle_with_quota(Some(new_quota))
+            .unwrap()
+            .unwrap();
+        let after = recorder.state().unwrap();
+        assert!(after.model_totals.is_empty());
+        assert_eq!(after.checkpoints, before.checkpoints);
+        let row: (i64, f64, i64) = db.query_row(
+            "SELECT reset_at, remaining_percent, sol_tokens+terra_tokens+luna_tokens FROM usage_history WHERE timestamp=?1",
+            [AT], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(row, (AT + 10 + WINDOW, 100.0, 0));
+        let events: i64 = db
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 1, "raw usage is retained exactly once");
+        drop(recorder);
+        let reopened =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        assert_eq!(reopened.state().unwrap(), after);
+        drop(reopened);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_official_reset_datetime_starts_one_recorder_period() {
+        let (root, database) = prepare("reset-identity-rollover");
         let source = root.join("sessions/one.jsonl");
         let observed_at = Utc::now().timestamp();
         let window_seconds = 7 * 24 * 60 * 60;
@@ -9467,10 +9558,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let after = recorder.state().unwrap();
-        assert_eq!(after.reset_at, canonical_reset_at);
+        assert_eq!(after.reset_at, latest_quota_reset_at);
         assert_eq!(after.latest_quota_reset_at, latest_quota_reset_at);
         assert_eq!(after.window_seconds, window_seconds);
-        assert_eq!(after.model_totals, before.model_totals);
+        assert!(after.model_totals.is_empty());
         assert_eq!(after.checkpoints, before.checkpoints);
         assert_eq!(
             after.last_quota_observation,
@@ -9484,14 +9575,24 @@ mod tests {
                 observed_at: observed_at + 180,
                 reset_at: latest_quota_reset_at + 60,
                 window_seconds,
-                remaining_percent: Some(99.0),
+                remaining_percent: Some(100.0),
             }))
             .unwrap()
             .unwrap();
         assert_eq!(
             recorder.state().unwrap().latest_quota_reset_at,
-            latest_quota_reset_at,
-            "a conflicting result at the same observation instant is not newer"
+            latest_quota_reset_at + 60,
+            "a changed official reset datetime is accepted even when the acquisition clock has the same second"
+        );
+        assert_eq!(
+            recorder
+                .state()
+                .unwrap()
+                .last_quota_observation
+                .unwrap()
+                .remaining_percent,
+            100.0,
+            "the official quota value from the same observation second is persisted"
         );
         let reset_count: i64 = Connection::open(&database)
             .unwrap()
@@ -9501,14 +9602,17 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(reset_count, 1);
+        assert_eq!(reset_count, 2);
         drop(recorder);
         let reopened =
             Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
         let reopened_state = reopened.state().unwrap();
-        assert_eq!(reopened_state.reset_at, canonical_reset_at);
-        assert_eq!(reopened_state.latest_quota_reset_at, latest_quota_reset_at);
-        assert_eq!(reopened_state.model_totals, before.model_totals);
+        assert_eq!(reopened_state.reset_at, latest_quota_reset_at + 60);
+        assert_eq!(
+            reopened_state.latest_quota_reset_at,
+            latest_quota_reset_at + 60
+        );
+        assert!(reopened_state.model_totals.is_empty());
         drop(reopened);
         let _ = fs::remove_dir_all(root);
     }
