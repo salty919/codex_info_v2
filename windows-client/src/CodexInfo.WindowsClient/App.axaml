@@ -87,6 +87,11 @@
       <Setter Property="BorderBrush" Value="{DynamicResource Theme8BD4FF}" />
       <Setter Property="BorderThickness" Value="2" />
     </Style>
+    <!-- Fluent's hover and focus overlay otherwise replace the control border. -->
+    <Style Selector="ComboBox:focus /template/ Border#Background, ComboBox:focus /template/ Border#HighlightBackground">
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme8BD4FF}" />
+      <Setter Property="BorderThickness" Value="2" />
+    </Style>
     <Style Selector="CheckBox:focus">
       <Setter Property="BorderBrush" Value="{DynamicResource Theme8BD4FF}" />
       <Setter Property="BorderThickness" Value="2" />

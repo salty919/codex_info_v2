@@ -78,6 +78,7 @@ public sealed class Issue603UxTests
     public void AllWindowsUseSharedTitlesControlsAndVectorIcons()
     {
         var app = Read("App.axaml");
+        Assert.Contains(app.Descendants(), e => e.Attribute("Selector")?.Value == "ComboBox:focus /template/ Border#Background, ComboBox:focus /template/ Border#HighlightBackground");
         var frameStyle = Assert.Single(app.Descendants(), e => e.Attribute("Selector")?.Value == "Border.window-frame");
         Assert.Contains(frameStyle.Descendants(), e => e.Attribute("Property")?.Value == "Height" && e.Attribute("Value")?.Value == "{Binding $parent[Window].Bounds.Height}");
         Assert.Contains(frameStyle.Descendants(), e => e.Attribute("Property")?.Value == "Width" && e.Attribute("Value")?.Value == "{Binding $parent[Window].Bounds.Width}");

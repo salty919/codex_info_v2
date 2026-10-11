@@ -5303,6 +5303,11 @@ function Assert-E2EThemeSurfaces {
     Toggle-E2EElement $period
     Bring-E2EWindowToFront $Windows.Settings.Handle
     $selector = Get-E2EThemeSelector $Windows.Settings.Root
+    # Cover focus while hovered: Fluent has a separate template border here.
+    $selectorRect = $selector.Current.BoundingRectangle
+    $null = [CodexInfoWindowsE2EWin32]::SetCursorPos(
+        [int]($selectorRect.Left + $selectorRect.Width / 2),
+        [int]($selectorRect.Top + $selectorRect.Height / 2))
     $selector.SetFocus()
     Wait-E2E -Description "Settings theme selector keyboard focus ($ThemeId)" -Probe {
         return $selector.Current.HasKeyboardFocus
