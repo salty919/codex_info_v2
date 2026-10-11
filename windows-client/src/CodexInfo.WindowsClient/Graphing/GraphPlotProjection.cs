@@ -929,6 +929,9 @@ internal static class GraphPlotProjection
                     crossesPrediction ||
                     IsLongUnobservedTokenIncrease(scene, left, right) ||
                     !measured;
+                if (dashed && AppendStoppedBridge(scene, scene.Timestamps[left], before,
+                        scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
+                    continue;
                 if (!dashed && SameDoubleBits(current, before) && IsConfirmedIdleInterval(
                         scene.IdleIntervals,
                         scene.Timestamps[left],
@@ -982,7 +985,9 @@ internal static class GraphPlotProjection
             // never extend the local model vector to manufacture a current
             // observation or a consumption rate.
             var lastKnown = RemainingValue(scene, previous);
-            AppendSegment(
+            if (!AppendStoppedBridge(scene, scene.Timestamps[previous], lastKnown,
+                    scene.PeriodEndAt, lastKnown, idleX, idleY, dashedX, dashedY))
+                AppendSegment(
                 dashedX,
                 dashedY,
                 scene.Timestamps[previous],
@@ -1109,7 +1114,9 @@ internal static class GraphPlotProjection
             }
             else if (crossesCorrection)
             {
-                AppendSegment(
+                if (!AppendStoppedBridge(scene, scene.Timestamps[left], before,
+                        scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
+                    AppendSegment(
                     dashedX,
                     dashedY,
                     scene.Timestamps[left],
@@ -1124,6 +1131,9 @@ internal static class GraphPlotProjection
                         scene.Timestamps[right]) ||
                     IsLongUnobservedTokenIncrease(scene, left, right) ||
                     crossesPrediction;
+                if (dashed && AppendStoppedBridge(scene, scene.Timestamps[left], before,
+                        scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
+                    continue;
                 smoothableIntervals.Add((
                     left,
                     right,
@@ -1205,13 +1215,15 @@ internal static class GraphPlotProjection
         if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous] &&
             !scene.OverlapsNonOwnedInterval(scene.Timestamps[previous], scene.PeriodEndAt))
         {
-            AppendSegment(
-                dashedX,
-                dashedY,
-                scene.Timestamps[previous],
-                values[previous],
-                scene.PeriodEndAt,
-                values[previous]);
+            if (!AppendStoppedBridge(scene, scene.Timestamps[previous], values[previous],
+                    scene.PeriodEndAt, values[previous], idleX, idleY, dashedX, dashedY))
+                AppendSegment(
+                    dashedX,
+                    dashedY,
+                    scene.Timestamps[previous],
+                    values[previous],
+                    scene.PeriodEndAt,
+                    values[previous]);
         }
 
         return new GraphModelLineProjection(
@@ -1219,6 +1231,29 @@ internal static class GraphPlotProjection
             new GraphLineProjection(flatX, flatY),
             new GraphLineProjection(risingX, risingY),
             new GraphLineProjection(dashedX, dashedY));
+    }
+
+    // Only missing-data bridges use this projection. Measured anchors and hover data stay intact.
+    private static bool AppendStoppedBridge(
+        GraphScene scene, double start, double before, double end, double after,
+        List<double> idleX, List<double> idleY, List<double> dashedX, List<double> dashedY)
+    {
+        var stops = scene.TaskIdleIntervals.Where(interval => interval.StartAt < end && interval.EndAt > start).ToArray();
+        if (stops.Length == 0)
+            return false;
+        var cursor = start;
+        foreach (var stop in stops)
+        {
+            var from = Math.Max(start, stop.StartAt);
+            var to = Math.Min(end, stop.EndAt);
+            if (from > cursor)
+                AppendSegment(dashedX, dashedY, cursor, before, from, before);
+            AppendSegment(idleX, idleY, from, before, to, before);
+            cursor = to;
+        }
+        if (cursor < end)
+            AppendSegment(dashedX, dashedY, cursor, before, end, after);
+        return true;
     }
 
     private static bool IsConfirmedIdleInterval(
@@ -1250,7 +1285,7 @@ internal static class GraphPlotProjection
     public static IReadOnlyList<GraphUnusedInterval> BuildVisibleUnusedIntervals(GraphScene scene)
     {
         ArgumentNullException.ThrowIfNull(scene);
-        var intervals = scene.IdleIntervals
+        var intervals = scene.IdleIntervals.Concat(scene.TaskIdleIntervals)
             .Select(interval => new GraphUnusedInterval(interval.StartAt, interval.EndAt))
             .OrderBy(interval => interval.StartAt);
         var merged = new List<GraphUnusedInterval>();

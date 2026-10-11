@@ -9,6 +9,49 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 
 public sealed class GraphSceneLinuxParityTests
 {
+    [Theory]
+    [InlineData(false, true, false)]
+    [InlineData(false, true, true)]
+    [InlineData(false, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(null, true, false)]
+    public void Issue621StoppedTasksBoundMissingModelHistory(bool? active, bool resumed, bool legacyBoundary)
+    {
+        var samples = Enumerable.Range(0, 29).Select(minute =>
+            (minute == 0 || resumed && minute == 28
+                ? V3Sample(1_000 + minute * 60, minute == 0 ? 93 : 92,
+                    Model("SOL", minute == 0 ? 100ul : 200ul, minute == 0 ? 1ul : 2ul))
+                : legacyBoundary && minute == 27
+                    ? V3Sample(2_620, 93, Model("SOL", 150, 1)) with
+                    { ModelSource = ApiHistorySample.LegacyUnknownModelSource, ModelsComplete = false }
+                : new ApiHistorySample(1_000 + minute * 60, 10_000, null,
+                    null, null, null, null, null, null, ApiHistorySample.UnavailableModelSource)
+                { ModelsComplete = false }) with
+            { TaskActiveSincePrevious = minute is >= 2 and <= 27 ? active : true })
+            .ToArray();
+        foreach (var metric in new[] { GraphMetric.Tokens, GraphMetric.Dollars })
+        {
+            var scene = GraphScene.Create(samples, metric, 1_000, 2_680);
+            if (active != false)
+            {
+                Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+                continue;
+            }
+            Assert.Equal([new GraphUnusedInterval(1_060, 2_620)], GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+            var line = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+            Assert.Contains(1_060d, line.Idle.X);
+            Assert.Contains(2_620d, line.Idle.X);
+            Assert.All(line.Idle.Y.Where(double.IsFinite), y => Assert.Equal(metric == GraphMetric.Tokens ? 100 : 1, y));
+            Assert.DoesNotContain(line.Dashed.X, x => x > 1_060 && x < 2_620);
+            var quota = GraphPlotProjection.BuildRemainingLines(scene);
+            Assert.Contains(1_060d, quota.Idle.X);
+            Assert.Contains(2_620d, quota.Idle.X);
+            Assert.All(quota.Idle.Y.Where(double.IsFinite), y => Assert.Equal(93, y));
+            Assert.Null(samples[10].RemainingPercent);
+            Assert.False(samples[10].ModelsComplete);
+        }
+    }
+
     [Fact]
     public void HiddenModelsRemainSemanticAuthoritiesButOnlyAffectDisplayedSeriesAndAxis()
     {
