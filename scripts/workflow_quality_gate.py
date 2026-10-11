@@ -726,8 +726,6 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
                 or "--release-candidate" in feat_script):
             errors.append("workflow wiring feat selection: normal PR owners must not expand to release owners")
         expect("feat.classify.permissions", feat_classify.get("permissions"), {"contents": "read"})
-        if 'git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"' not in feat_script:
-            errors.append("workflow wiring feat planning: source must contain the event base")
         if "git/ref/heads/feat/next" in feat_script:
             errors.append("workflow wiring feat planning: event inputs must not depend on a moving ref")
         for forbidden in ("git push", "--method POST", "--method PATCH"):
@@ -1596,6 +1594,7 @@ def _run_version_step(
     producer_run: dict[str, object] | None = None,
     run_attempt: int = 7,
     run_id: int = 12345,
+    pr_number: int = 44,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
     remote = _fixture_path(fixture, "remote")
     base = _fixture_text(fixture, "base")
@@ -1641,7 +1640,7 @@ def _run_version_step(
             "MOCK_GH_DATABASE": str(database),
             "MOCK_GH_LOG": str(log),
             "PATH": f"{bin_dir}:{environment['PATH']}",
-            "PR_NUMBER": "44",
+            "PR_NUMBER": str(pr_number),
             "REPOSITORY": "example/project",
             "RUNNER_TEMP": str(runner_temp),
         }
@@ -1786,7 +1785,60 @@ def _version_state_tests(version_workflow: str) -> int:
             raise AssertionError("generated H1 observer published a duplicate status")
         cases += 1
 
+        # Once H0 is merged, the pending version transition is the remaining
+        # product change. The current PR must build its own release candidate.
+        fixture["base"] = h0
+        detached, detached_values = _run_version_step(
+            fixture,
+            script,
+            h1,
+            producer_run=producer_run,
+            pr_number=45,
+        )
+        if (
+            detached.returncode != 0
+            or detached_values.get("ready") != "true"
+            or detached_values.get("generated_observer") != "false"
+            or detached_values.get("quality_sha") != h1
+            or json.loads(detached_values["selection_json"])["owners"]
+            != ["LINUX_BACKEND", "LINUX_UI", "WINDOWS"]
+        ):
+            raise AssertionError("merged-source H1 did not select current release owners")
+        if _status_calls(fixture):
+            raise AssertionError("detached H1 observer published a duplicate status")
+        cases += 1
+
+        failed_producer = {**producer_run, "conclusion": "failure"}
+        recovered, recovered_values = _run_version_step(
+            fixture,
+            script,
+            h1,
+            producer_run=failed_producer,
+            pr_number=45,
+        )
+        if recovered.returncode != 0 or recovered_values.get("ready") != "true":
+            raise AssertionError("previous producer failure prevented current release evaluation")
+        cases += 1
+
         _git(seed, "pull", "--quiet", "--ff-only", "origin", "case")
+        workflow = seed / ".github/workflows/incident.yml"
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.write_text("name: incident recovery\n", encoding="utf-8")
+        later_workflow = _commit(fixture, "later workflow change")
+        current, current_values = _run_version_step(
+            fixture, script, later_workflow, producer_run=producer_run, pr_number=45
+        )
+        release_owners = ["GOVERNANCE", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"]
+        if (
+            current.returncode != 0
+            or current_values.get("ready") != "true"
+            or current_values.get("generated_observer") != "false"
+            or current_values.get("quality_sha") != later_workflow
+            or json.loads(current_values["selection_json"])["owners"] != release_owners
+        ):
+            raise AssertionError("later workflow head skipped its own release evaluation")
+        cases += 1
+
         (seed / "windows-client/src/Later.cs").write_text(
             "class Later {}\n", encoding="utf-8"
         )
@@ -1799,9 +1851,9 @@ def _version_state_tests(version_workflow: str) -> int:
             or third_values.get("quality_sha") != h2
             or third_values.get("generated_head") != "false"
             or third_values.get("generated_observer") != "false"
-            or json.loads(third_values["selection_json"])["owners"] != ["WINDOWS"]
+            or json.loads(third_values["selection_json"])["owners"] != release_owners
         ):
-            raise AssertionError("H2 retained generated version files or became an observer")
+            raise AssertionError("H2 did not retain pending release owners or became an observer")
         if _status_calls(fixture):
             raise AssertionError("H2 published a duplicate generated-head status")
         cases += 1
@@ -3999,8 +4051,6 @@ def workflow_selection_self_test() -> int:
          "needs.version-prepared.result == 'success'"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
-        ("feat-integration.yml", 'git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"',
-         'git merge-base --is-ancestor "$HEAD_SHA" "$BASE_SHA"'),
         (
             "feat-integration.yml",
             '--name-status -z "$BASE_SHA...$HEAD_SHA"',
@@ -4077,8 +4127,6 @@ def self_test() -> int:
          "needs.version-prepared.result == 'success'"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
-        ("feat-integration.yml", 'git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"',
-         'git merge-base --is-ancestor "$HEAD_SHA" "$BASE_SHA"'),
         (
             "version-prepare.yml",
             "expected_version_transition=true",
