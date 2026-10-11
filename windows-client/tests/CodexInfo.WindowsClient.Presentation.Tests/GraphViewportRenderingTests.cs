@@ -45,7 +45,7 @@ public sealed class GraphViewportRenderingTests
         Assert.Equal(tokenAxes.BottomValues, dollarAxes.BottomValues);
 
         var control = new GraphPlotControl { Scene = tokenScene };
-        Assert.NotEmpty(control.Plot.GetPlottables().Where(item => item.GetType().Name == "BarPlot"));
+        Assert.Contains(control.Plot.GetPlottables(), item => item.GetType().Name == "BarPlot");
         using var image = control.Plot.GetImage(940, 480);
         Assert.Empty(control.Plot.Axes.GetPanels().OfType<GraphPeriodCostPanel>());
     }

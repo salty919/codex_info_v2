@@ -75,7 +75,8 @@ public sealed class GraphDailyUsageProjectionTests
             Sample(Day + 10 * 3_600, reset, Model("gpt-6-sol", 100, null)),
             Sample(Day + 11 * 3_600, reset, Model("gpt-6-sol", 120, null)),
             new ApiHistorySample(Day + SecondsPerDay, reset, null, null, null, null, null, null, null,
-                ApiHistorySample.UnavailableModelSource) { ModelsComplete = false, ModelSamples = null });
+                ApiHistorySample.UnavailableModelSource)
+            { ModelsComplete = false, ModelSamples = null });
         var scene = DailyScene(Day, Day + 2 * SecondsPerDay, GraphMetric.Dollars, known);
         Assert.Equal(20UL, Value<ulong?>(Row(scene, Day, "SOL"), "Tokens"));
         Assert.Null(Value<double?>(Row(scene, Day, "SOL"), "Dollars"));
