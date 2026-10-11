@@ -25,7 +25,7 @@ public sealed class GraphWindowSelectorParityTests
             Assert.Equal($"{{Binding {enabled}}}", button.Attribute("IsEnabled")?.Value);
         }
         var plot = graph.Descendants().Single(element => element.Name.LocalName == "GraphPlotControl");
-        Assert.Equal("{Binding HasPlot}", plot.Attribute("IsVisible")?.Value);
+        Assert.Equal("{Binding HasLinePlot}", plot.Attribute("IsVisible")?.Value);
         var month = graph.Descendants().Single(element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.Range.Month");
         Assert.Equal("{Binding Texts.GraphMonthRange}", month.Attribute("Content")?.Value);
@@ -109,7 +109,7 @@ public sealed class GraphWindowSelectorParityTests
         Assert.Contains(clippedContent.Descendants(), element => ReferenceEquals(element, warning));
 
         var plot = graph.Descendants().Single(element => element.Name.LocalName == "GraphPlotControl");
-        Assert.Equal("{Binding HasPlot}", plot.Attribute("IsVisible")?.Value);
+        Assert.Equal("{Binding HasLinePlot}", plot.Attribute("IsVisible")?.Value);
         Assert.Equal("1", plot.Attribute("Grid.Row")?.Value);
         Assert.Same(warning.Parent, plot.Parent);
         Assert.Equal("Auto,*", warning.Parent?.Attribute("RowDefinitions")?.Value);

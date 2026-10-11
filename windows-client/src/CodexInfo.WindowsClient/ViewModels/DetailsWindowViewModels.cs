@@ -221,6 +221,15 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public GraphScene Scene => scene;
 
+    public IReadOnlyList<GraphCalendarDay> CalendarDays => GraphCalendarProjection.Create(
+        scene, LocalizationService.DisplayTimeZone, System.Globalization.CultureInfo.CurrentCulture, getUnixTimeSeconds());
+
+    public IReadOnlyList<string> CalendarWeekdays => Enumerable.Range(0, 7)
+        .Select(index => System.Globalization.CultureInfo.CurrentCulture.DateTimeFormat.AbbreviatedDayNames[
+            ((int)System.Globalization.CultureInfo.CurrentCulture.DateTimeFormat.FirstDayOfWeek + index) % 7]).ToArray();
+
+    public bool HasLinePlot => HasPlot && !IsMonthView;
+
     public GraphTimeRange SelectedTimeRange
     {
         get => (GraphTimeRange)Volatile.Read(ref selectedTimeRangeValue);
@@ -1093,6 +1102,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(CanGoForward));
         Notify(nameof(Points));
         Notify(nameof(Scene));
+        Notify(nameof(CalendarDays));
+        Notify(nameof(CalendarWeekdays));
+        Notify(nameof(HasLinePlot));
         Notify(nameof(HasPoints));
         Notify(nameof(HasNoPoints));
         Notify(nameof(HasBlockingLoadError));
@@ -1810,11 +1822,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         if (range == GraphTimeRange.CalendarMonth)
         {
             var rawPeriods = data.Select(item => item.Period with { Samples = item.Samples }).ToArray();
-            var hiddenNames = BuildHiddenModelNames(data.SelectMany(item => item.Samples).ToArray(),
-                options.ShowModels, options.ShowSol, options.ShowTerra, options.ShowLuna, options.ShowAstra);
             var daily = GraphScene.CreateDailyViewport(bounds.StartAt, bounds.EndAt, options.Metric,
                 rawPeriods, options.DisplayTimeZone, data.SelectMany(item => item.Gaps).ToArray(),
-                options.AccountOwnershipIntervals, hiddenNames);
+                options.AccountOwnershipIntervals, hiddenModelNames: null);
             return new WindowGraphProjection(Array.Empty<GraphPointViewModel>(), daily,
                 new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>());
         }
@@ -2025,6 +2035,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         SetLoading(false);
         Notify(nameof(Points));
         Notify(nameof(Scene));
+        Notify(nameof(CalendarDays));
+        Notify(nameof(CalendarWeekdays));
+        Notify(nameof(HasLinePlot));
         Notify(nameof(HasPoints));
         Notify(nameof(HasNoPoints));
         Notify(nameof(HasBlockingLoadError));
@@ -2067,6 +2080,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(Is24HourView));
         Notify(nameof(IsWeekView));
         Notify(nameof(IsMonthView));
+        Notify(nameof(HasLinePlot));
         Notify(nameof(CanGoBack));
         Notify(nameof(CanGoForward));
         Notify(nameof(HasPlot));
@@ -3277,6 +3291,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         SetLoading(false);
         Notify(nameof(Points));
         Notify(nameof(Scene));
+        Notify(nameof(CalendarDays));
+        Notify(nameof(CalendarWeekdays));
+        Notify(nameof(HasLinePlot));
         Notify(nameof(HasPoints));
         Notify(nameof(HasNoPoints));
         Notify(nameof(HasBlockingLoadError));

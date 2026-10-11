@@ -223,9 +223,9 @@ public sealed class GraphPeriodCostRenderingTests
                 Sample(1_000),
             ], GraphMetric.Tokens, 1_000, 1_060);
 
-            Assert.Equal("$1", Assert.Single(Panel(new GraphPlotControl { Scene = partial }).Amounts).LabelStyle.Text);
+            Assert.Equal("13", Assert.Single(Panel(new GraphPlotControl { Scene = partial }).Amounts).LabelStyle.Text);
             Assert.Equal("—", Assert.Single(Panel(new GraphPlotControl { Scene = unavailable }).Amounts).LabelStyle.Text);
-            Assert.Equal("$0", Assert.Single(Panel(new GraphPlotControl { Scene = zero }).Amounts).LabelStyle.Text);
+            Assert.Equal("0", Assert.Single(Panel(new GraphPlotControl { Scene = zero }).Amounts).LabelStyle.Text);
         }
         finally
         {
@@ -234,7 +234,7 @@ public sealed class GraphPeriodCostRenderingTests
     }
 
     [Fact]
-    public void SummaryUsesPersistedDollarsRegardlessOfMetricOrModelVisibility()
+    public void SummaryFollowsMetricAndRetainsAllModelsRegardlessOfVisibility()
     {
         var samples = new[]
         {
@@ -258,7 +258,7 @@ public sealed class GraphPeriodCostRenderingTests
         using var visibleImage = visible.Plot.GetImage(900, 542);
         using var hiddenImage = hidden.Plot.GetImage(900, 542);
         Assert.Equal("$2", Assert.Single(Panel(visible).Amounts).LabelStyle.Text);
-        Assert.Equal("$2", Assert.Single(Panel(hidden).Amounts).LabelStyle.Text);
+        Assert.Equal("26", Assert.Single(Panel(hidden).Amounts).LabelStyle.Text);
         var hiddenModelLines = hidden.Plot.GetPlottables<ScottPlot.Plottables.Scatter>()
             .Where(series => series.LineWidth >= GraphPlotControl.MeasuredModelLineWidth);
         Assert.NotEmpty(hiddenModelLines);
@@ -297,13 +297,15 @@ public sealed class GraphPeriodCostRenderingTests
         }
     }
 
-    [Fact]
-    public void ViewportIncludesLeftClippedPeriodAmountAndKeepsTheRightPartialPeriod()
+    [Theory]
+    [InlineData(GraphMetric.Dollars)]
+    [InlineData(GraphMetric.Tokens)]
+    public void ViewportIncludesLeftClippedPeriodAmountAndKeepsTheRightPartialPeriod(GraphMetric metric)
     {
-        var first = Period(0, 100, 0.10, 0.20);
-        var second = Period(100, 200, 0.40, 0.60);
-        var third = Period(200, 300, 0.75, 1.25);
-        var viewport = GraphScene.CreateViewport(50, 280, GraphMetric.Dollars, [first, second, third]);
+        var first = Period(0, 100, 0.10, 0.20, metric: metric);
+        var second = Period(100, 200, 0.40, 0.60, metric: metric);
+        var third = Period(200, 300, 0.75, 1.25, metric: metric);
+        var viewport = GraphScene.CreateViewport(50, 280, metric, [first, second, third]);
         var control = new GraphPlotControl { Scene = viewport };
         var panel = Panel(control);
 
@@ -311,7 +313,8 @@ public sealed class GraphPeriodCostRenderingTests
         var amounts = panel.Amounts;
         var dataRect = control.Plot.LastRender.DataRect;
 
-        Assert.Equal(["$0", "$1", "$2"], amounts.Select(amount => amount.LabelStyle.Text));
+        Assert.Equal(metric == GraphMetric.Dollars ? ["$0", "$1", "$2"] : ["26", "26", "26"],
+            amounts.Select(amount => amount.LabelStyle.Text));
         Assert.Equal([75d, 150d, 240d], amounts.Select(amount => amount.CenterAt));
         Assert.InRange(
             Math.Abs(amounts[0].LastRenderCenterX!.Value - control.Plot.Axes.Bottom.GetPixel(75, dataRect)),
@@ -421,7 +424,8 @@ public sealed class GraphPeriodCostRenderingTests
         long endAt,
         double firstDollars,
         double secondDollars,
-        long? resetAt = null)
+        long? resetAt = null,
+        GraphMetric metric = GraphMetric.Dollars)
     {
         var duration = endAt - startAt;
         var firstOffset = duration / 2;
@@ -430,7 +434,7 @@ public sealed class GraphPeriodCostRenderingTests
         [
             Sample(startAt + firstOffset, Model("gpt-6-sol", firstDollars / 2), Model("gpt-5.6-sol", secondDollars / 2)),
             Sample(startAt + secondOffset, Model("gpt-6-sol", firstDollars), Model("gpt-5.6-sol", secondDollars)),
-        ], GraphMetric.Dollars, startAt, endAt,
+        ], metric, startAt, endAt,
             confirmedGaps: null,
             hiddenModelNames: null,
             accountOwnershipIntervals: null,

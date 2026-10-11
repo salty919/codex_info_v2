@@ -22,7 +22,7 @@ public sealed class GraphViewportRenderingCollection
 public sealed class GraphViewportRenderingTests
 {
     [Fact]
-    public void CalendarMonthUsesDailyBarsAndSharedLocalDatePositions()
+    public void CalendarMonthKeepsDailyAttributionButDoesNotRenderABarPlot()
     {
         var start = Unix("2026-10-01T00:00:00Z");
         var end = Unix("2026-10-03T00:00:00Z");
@@ -45,7 +45,7 @@ public sealed class GraphViewportRenderingTests
         Assert.Equal(tokenAxes.BottomValues, dollarAxes.BottomValues);
 
         var control = new GraphPlotControl { Scene = tokenScene };
-        Assert.Contains(control.Plot.GetPlottables(), item => item.GetType().Name == "BarPlot");
+        Assert.Empty(control.Plot.GetPlottables());
         using var image = control.Plot.GetImage(940, 480);
         Assert.Empty(control.Plot.Axes.GetPanels().OfType<GraphPeriodCostPanel>());
     }
@@ -533,8 +533,8 @@ public sealed class GraphViewportRenderingTests
 
             Assert.Empty(axes.TopDateValues);
             Assert.Empty(topAxis.TickGenerator.Ticks);
-            Assert.Equal(axes.ModelLabels[^1], upperTick.Label);
-            Assert.Equal("1.8K", upperTick.Label);
+            // The rendered token axis follows CUM-138-06: counts below one million are unabridged.
+            Assert.Equal("1,800", upperTick.Label);
             Assert.Equal(480, pixels.GetLength(0));
             Assert.Equal(940, pixels.GetLength(1));
             Assert.InRange((double)dataTop, halfTickFontHeight, oneTickFontHeight + 4);
