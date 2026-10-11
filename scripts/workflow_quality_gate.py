@@ -1596,6 +1596,7 @@ def _run_version_step(
     producer_run: dict[str, object] | None = None,
     run_attempt: int = 7,
     run_id: int = 12345,
+    pr_number: int = 44,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
     remote = _fixture_path(fixture, "remote")
     base = _fixture_text(fixture, "base")
@@ -1641,7 +1642,7 @@ def _run_version_step(
             "MOCK_GH_DATABASE": str(database),
             "MOCK_GH_LOG": str(log),
             "PATH": f"{bin_dir}:{environment['PATH']}",
-            "PR_NUMBER": "44",
+            "PR_NUMBER": str(pr_number),
             "REPOSITORY": "example/project",
             "RUNNER_TEMP": str(runner_temp),
         }
@@ -1784,6 +1785,40 @@ def _version_state_tests(version_workflow: str) -> int:
             raise AssertionError("generated H1 was not a zero-owner observer")
         if _status_calls(fixture):
             raise AssertionError("generated H1 observer published a duplicate status")
+        cases += 1
+
+        # A version-only PR may observe the same generated H1 after its source
+        # H0 is already part of the base branch. Its filtered source diff is
+        # empty, but the exact successful producer run still owns this H1.
+        fixture["base"] = h0
+        detached, detached_values = _run_version_step(
+            fixture,
+            script,
+            h1,
+            producer_run=producer_run,
+            pr_number=45,
+        )
+        if (
+            detached.returncode != 0
+            or detached_values.get("ready") != "false"
+            or detached_values.get("generated_observer") != "true"
+            or detached_values.get("quality_sha") != h1
+        ):
+            raise AssertionError("merged-source generated H1 was not accepted as an observer")
+        if _status_calls(fixture):
+            raise AssertionError("detached H1 observer published a duplicate status")
+        cases += 1
+
+        failed_producer = {**producer_run, "conclusion": "failure"}
+        rejected, _ = _run_version_step(
+            fixture,
+            script,
+            h1,
+            producer_run=failed_producer,
+            pr_number=45,
+        )
+        if rejected.returncode == 0:
+            raise AssertionError("detached H1 with a failed producer was accepted")
         cases += 1
 
         _git(seed, "pull", "--quiet", "--ff-only", "origin", "case")
