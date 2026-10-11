@@ -1031,7 +1031,7 @@ public sealed class GraphPlotControlTests
                 ApiHistorySample.ConfirmedModelSource)
             {
                 ModelsComplete = true,
-                TaskActiveSincePrevious = false,
+                TaskActiveSincePrevious = null,
                 ModelSamples = new[] { "SOL", "TERRA", "LUNA", "ASTRA" }
                     .Select((name, index) => new ApiHistoryModelSample(
                         name,
@@ -2182,7 +2182,7 @@ public sealed class GraphPlotControlTests
                 ApiHistorySample.ConfirmedModelSource)
             {
                 ModelsComplete = true,
-                TaskActiveSincePrevious = false,
+                TaskActiveSincePrevious = null,
                 ModelSamples =
                 [
                     new ApiHistoryModelSample("LUNA", null, null, null, 0)
@@ -4755,9 +4755,8 @@ public sealed class GraphPlotControlTests
             ApiHistorySample.ConfirmedModelSource)
         {
             ModelsComplete = true,
-            // Synthetic unit-test points explicitly model a confirmed idle
-            // marker; production samples pass the nullable wire value through.
-            TaskActiveSincePrevious = false,
+            // Value-only fixtures have no Session lifecycle evidence.
+            TaskActiveSincePrevious = null,
         };
 
     private static ApiHistorySample DirectVectorPoint(
@@ -4790,7 +4789,7 @@ public sealed class GraphPlotControlTests
         double solDollars,
         ulong solTokens,
         string modelSource = ApiHistorySample.ConfirmedModelSource,
-        bool? taskActiveSincePrevious = false) =>
+        bool? taskActiveSincePrevious = null) =>
         new(
             timestamp,
             2_000,
