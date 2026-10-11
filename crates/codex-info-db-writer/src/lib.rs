@@ -4,7 +4,7 @@
 use chrono::{DateTime, Months, Utc};
 use codex_info_db_reader::{
     canonicalize_history_for_storage_with_sources, RawSample as CanonicalRawSample,
-    HISTORY_CANONICAL_SCHEMA_VERSION,
+    ACCOUNT_DB_SCHEMA_VERSION, HISTORY_CANONICAL_SCHEMA_VERSION,
 };
 use codex_info_pricing::{estimate_at, estimate_legacy, estimate_with_revision, family, Usage};
 use rusqlite::types::Value;
@@ -660,7 +660,8 @@ const DURABLE_STATE_OBSERVATION_MIN_SINGLETON: i64 = 2;
 const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
 const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
 pub const MAX_SESSION_MODEL_BYTES: usize = 512;
-const ACCOUNT_DB_SCHEMA_VERSION: i64 = HISTORY_CANONICAL_SCHEMA_VERSION;
+mod quota_receipts;
+pub use quota_receipts::QuotaReceipt;
 const LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION: i64 = 10;
 const MODEL_PRICING_PREVIOUS_SCHEMA_VERSION: i64 = 11;
 const SESSION_TOKEN_ANCHOR_PREVIOUS_SCHEMA_VERSION: i64 = 12;
@@ -8025,6 +8026,22 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     type TableContract = (&'static str, &'static [ColumnContract]);
     const TABLES: &[TableContract] = &[
         (
+            "quota_acquisition_state",
+            &[("singleton", "INTEGER", 1), ("degraded", "INTEGER", 0)],
+        ),
+        (
+            "quota_receipts",
+            &[
+                ("receipt_id", "TEXT", 1),
+                ("sequence", "INTEGER", 0),
+                ("observed_at", "INTEGER", 0),
+                ("reset_at", "INTEGER", 0),
+                ("window_seconds", "INTEGER", 0),
+                ("remaining_percent", "REAL", 0),
+                ("applied_generation", "TEXT", 0),
+            ],
+        ),
+        (
             "usage_history",
             &[
                 ("timestamp", "INTEGER", 2),
@@ -8294,13 +8311,23 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         "SELECT name FROM sqlite_schema
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )?;
-    let actual_tables = table_statement
+    let mut actual_tables = table_statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-    let expected_tables = TABLES
+    let mut expected_tables = TABLES
         .iter()
         .map(|(table, _)| (*table).to_owned())
         .collect::<BTreeSet<_>>();
+    // Receipt storage was added independently of canonical history v13.
+    // Old partitions may lack it; their existing history is already canonical.
+    let receipt_table_present = actual_tables.contains("quota_receipts");
+    let quota_health_present = actual_tables.contains("quota_acquisition_state");
+    if schema_version < ACCOUNT_DB_SCHEMA_VERSION {
+        expected_tables.remove("quota_receipts");
+        expected_tables.remove("quota_acquisition_state");
+        actual_tables.remove("quota_receipts");
+        actual_tables.remove("quota_acquisition_state");
+    }
     let expected_for_version = expected_tables.clone();
     let mut pre_session_token_anchor_tables = expected_for_version.clone();
     pre_session_token_anchor_tables.remove("session_token_anchor_recoveries");
@@ -8382,6 +8409,12 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     }
 
     for (table, expected) in TABLES {
+        if ((*table == "quota_receipts" && !receipt_table_present)
+            || (*table == "quota_acquisition_state" && !quota_health_present))
+            && schema_version < ACCOUNT_DB_SCHEMA_VERSION
+        {
+            continue;
+        }
         if (*table == "history_continuity"
             || *table == "usage_model_history"
             || *table == "session_cumulative_recoveries"
@@ -9403,6 +9436,7 @@ impl UsageStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(PARTITION_SCHEMA)?;
+        transaction.execute_batch(quota_receipts::SCHEMA)?;
         ensure_collection_generation_live_quota_schema(&transaction, false)?;
         ensure_storage_partition_login_id_schema(&transaction)?;
         ensure_durable_state_schema(&transaction)?;
@@ -9462,7 +9496,7 @@ impl UsageStore {
         // because it happens to contain the legacy fixture ledger.
         validate_storage_partition_identity(&probe, identity)?;
         let schema_version = account_db_schema_version(&probe)?;
-        if schema_version != HISTORY_CANONICAL_SCHEMA_VERSION {
+        if schema_version != ACCOUNT_DB_SCHEMA_VERSION {
             return Err(UsageStoreError::InvalidImport(
                 "account partition canonical history migration is required".into(),
             ));
@@ -9813,7 +9847,7 @@ impl UsageStore {
         let path = path.as_ref();
         let store = Self::open_read_only_partitioned(path, identity)?;
         let version = account_db_schema_version(&store.connection)?;
-        if version < HISTORY_CANONICAL_SCHEMA_VERSION {
+        if version < ACCOUNT_DB_SCHEMA_VERSION {
             return Ok(false);
         }
         validate_canonical_history_storage(&store.connection)?;
@@ -9839,12 +9873,12 @@ impl UsageStore {
         validate_partition_file(path)?;
         let probe = Self::open_read_only_partitioned(path, identity)?;
         let version = account_db_schema_version(&probe.connection)?;
-        if version > HISTORY_CANONICAL_SCHEMA_VERSION {
+        if version > ACCOUNT_DB_SCHEMA_VERSION {
             return Err(UsageStoreError::InvalidImport(
                 "account partition schema is newer than this executable".into(),
             ));
         }
-        if version == HISTORY_CANONICAL_SCHEMA_VERSION {
+        if version == ACCOUNT_DB_SCHEMA_VERSION {
             validate_canonical_history_storage(&probe.connection)?;
             return Ok(false);
         }
@@ -9869,11 +9903,13 @@ impl UsageStore {
             ));
         }
         ensure_collection_generation_live_quota_schema(&transaction, true)?;
+        transaction.execute_batch(quota_receipts::SCHEMA)?;
         if version == LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION
             || version == MODEL_PRICING_PREVIOUS_SCHEMA_VERSION
             || version == SESSION_TOKEN_ANCHOR_PREVIOUS_SCHEMA_VERSION
+            || version == HISTORY_CANONICAL_SCHEMA_VERSION
         {
-            // Versions 10 through 12 already have canonical single-table
+            // Versions 10 through 13 already have canonical single-table
             // history. Add only the columns/tables introduced by the selected
             // versions; rewriting accepted history would change no authority.
             ensure_usage_model_history_schema(&transaction)?;
@@ -20158,6 +20194,48 @@ mod tests {
     }
 
     #[test]
+    fn quota_receipt_schema_v13_preserves_history_during_upgrade() {
+        let path = database_path("quota-receipt-v13");
+        let identity = partition_identity('a', 1);
+        let row = sample(1_700_000_040, 1_700_604_800, Some(64.0), 1.5);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store.upsert_samples(std::slice::from_ref(&row)).unwrap();
+        store
+            .connection
+            .execute_batch("DROP TABLE IF EXISTS quota_receipts; PRAGMA user_version=13;")
+            .unwrap();
+        let before = legacy_raw_evidence(&store.connection).unwrap();
+        drop(store);
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 3).unwrap();
+        assert!(
+            UsageStore::migrate_partition_history_after_verified_backup(&path, &identity, &backup)
+                .unwrap(),
+            "v13 must acquire the durable quota receipt schema"
+        );
+        let restored = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(legacy_raw_evidence(&restored.connection).unwrap(), before);
+        assert_eq!(restored.load_all().unwrap(), vec![row]);
+        assert_eq!(
+            restored
+                .connection
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            14
+        );
+        assert_eq!(
+            restored
+                .connection
+                .query_row("SELECT count(*) FROM quota_receipts", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(restored);
+        remove_database(&path);
+    }
+
+    #[test]
     fn three_month_prune_removes_old_sidecars_but_keeps_new_rows_and_row_one() {
         let path = database_path("prune-observation-sidecars");
         let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 0).unwrap();
@@ -23602,7 +23680,7 @@ mod wave_b_correction_tests {
 
     #[test]
     fn issue_362_checkpoint_schema_accepts_only_supported_legacy_shapes() {
-        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
         const SHAPE_MATRIX: &[(usize, &[i64])] = &[
             (22, SUPPORTED_VERSIONS),
             (21, &[]),

@@ -2864,6 +2864,20 @@ impl UsageHistorySample {
     }
 }
 
+fn select_public_history_period(
+    periods: &[PublicHistoryPeriod],
+    selected: i64,
+) -> Option<&PublicHistoryPeriod> {
+    periods
+        .iter()
+        .find(|period| period.reset_at == selected)
+        .or_else(|| {
+            periods.iter().find(|period| {
+                period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
+            })
+        })
+}
+
 fn same_reset_period(left: i64, right: i64) -> bool {
     left.abs_diff(right) <= RESET_AT_TOLERANCE_SECONDS as u64
 }
@@ -3372,7 +3386,9 @@ fn authoritative_history_projection_samples(
         .filter_map(|sample| {
             let current_alias =
                 canonical_reset_at.abs_diff(sample.reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64;
-            if current_alias && sample.timestamp < authoritative_start {
+            if current_alias
+                && sample.timestamp < authoritative_start - authoritative_start.rem_euclid(60)
+            {
                 return None;
             }
             let mut projected = sample.clone();
@@ -15406,11 +15422,7 @@ impl CodexInfoState {
 
         let selected_reset_at = self.selected_reset_at;
         let selected_period = selected_reset_at
-            .and_then(|selected| {
-                details.history_periods.iter().find(|period| {
-                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
-                })
-            })
+            .and_then(|selected| select_public_history_period(&details.history_periods, selected))
             .or_else(|| details.history_periods.iter().find(|period| period.current))
             .or_else(|| details.history_periods.first());
         let next_selected_reset_at = selected_period.map(|period| period.reset_at);
@@ -15580,11 +15592,7 @@ impl CodexInfoState {
 
         let selected_period = self
             .selected_reset_at
-            .and_then(|selected| {
-                details.history_periods.iter().find(|period| {
-                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
-                })
-            })
+            .and_then(|selected| select_public_history_period(&details.history_periods, selected))
             .or_else(|| details.history_periods.iter().find(|period| period.current))
             .or_else(|| details.history_periods.first());
         let next_selected_reset_at = selected_period.map(|period| period.reset_at);
@@ -15929,11 +15937,7 @@ impl CodexInfoState {
         let selected_period = self
             .service_history_pending_reset_at
             .or(self.selected_reset_at)
-            .and_then(|selected| {
-                periods.iter().find(|period| {
-                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
-                })
-            })
+            .and_then(|selected| select_public_history_period(&periods, selected))
             .or_else(|| periods.iter().find(|period| period.current))
             .or_else(|| periods.first());
         // A successful page is the commit point for its period identity.
@@ -15979,11 +15983,7 @@ impl CodexInfoState {
         let selected_period = self
             .service_history_pending_reset_at
             .or(self.selected_reset_at)
-            .and_then(|selected| {
-                periods.iter().find(|period| {
-                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
-                })
-            })
+            .and_then(|selected| select_public_history_period(&periods, selected))
             .or_else(|| periods.iter().find(|period| period.current))
             .or_else(|| periods.first());
         // Metadata does not commit a history page. Keep the period id of the
@@ -17779,9 +17779,7 @@ impl CodexInfoState {
             .service_history_pending_reset_at
             .or(self.selected_reset_at)
             .and_then(|selected| {
-                self.service_history_periods.iter().find(|period| {
-                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
-                })
+                select_public_history_period(&self.service_history_periods, selected)
             })
             .or_else(|| {
                 self.service_history_periods
@@ -17986,6 +17984,14 @@ impl CodexInfoState {
     }
 
     fn selected_history_reset_for_periods(&self, periods: &[HistoryPeriod]) -> Option<i64> {
+        if let Some(selected) = self.selected_reset_at {
+            if periods
+                .iter()
+                .any(|period| period.canonical_reset_at == selected)
+            {
+                return Some(selected);
+            }
+        }
         if let Some(period) = periods
             .iter()
             .find(|period| period.label == self.selected_history_period)
@@ -18018,27 +18024,57 @@ impl CodexInfoState {
     /// sample cannot carry. Rows without numeric authority contribute only
     /// their observed timestamp/quota position; they never become model
     /// points and are never extended through an open-ended local gap.
+    fn service_owns_graph_period(&self, reset_at: i64) -> bool {
+        // V2 stores its received rows in history; only V3 owns the generic
+        // service_history_samples lane, including an explicitly empty page.
+        self.service_v3_published_pair.is_some()
+            && self
+                .service_history_periods
+                .iter()
+                .any(|period| period.reset_at == reset_at)
+    }
+
+    fn service_observation_in_graph_period(
+        &self,
+        observation: &PublicHistoryObservationV3,
+        reset_at: i64,
+        start_at: i64,
+        end_at: i64,
+    ) -> bool {
+        codex_info_rest_contract::history_minute_in_period(observation.timestamp, start_at, end_at)
+            && (observation.reset_at == reset_at
+                || (!self.service_owns_graph_period(observation.reset_at)
+                    && observation.reset_at >= reset_at.saturating_sub(RESET_AT_TOLERANCE_SECONDS)
+                    && observation.reset_at <= reset_at))
+    }
+
     fn graph_samples_for_selection(
         &self,
         selected_reset: i64,
         period_start: i64,
         period_end: i64,
     ) -> (Vec<UsageHistorySample>, BTreeSet<i64>, BTreeSet<i64>) {
-        let mut samples = self
-            .projected_history()
-            .samples_for_reset(Some(selected_reset));
+        let service_owned = self.service_owns_graph_period(selected_reset);
+        let mut samples = if service_owned {
+            Vec::new()
+        } else {
+            self.projected_history()
+                .samples_for_reset(Some(selected_reset))
+        };
         let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
         let service_rows = self
             .service_history_samples
             .iter()
             .filter(|observation| {
-                observation.timestamp >= period_start
-                    && observation.timestamp <= period_end
-                    && observation.reset_at.abs_diff(selected_reset)
-                        <= RESET_AT_TOLERANCE_SECONDS as u64
+                self.service_observation_in_graph_period(
+                    observation,
+                    selected_reset,
+                    period_start,
+                    period_end,
+                )
             })
             .collect::<Vec<_>>();
-        let direct_minutes = if !service_rows.is_empty() {
+        let direct_minutes = if service_owned || !service_rows.is_empty() {
             service_rows
                 .iter()
                 .filter(|observation| {
@@ -18065,7 +18101,7 @@ impl CodexInfoState {
                 .map(|observation| observation.timestamp.div_euclid(60) * 60)
                 .collect::<BTreeSet<_>>()
         };
-        let sampling_unavailable_minutes = if !service_rows.is_empty() {
+        let sampling_unavailable_minutes = if service_owned || !service_rows.is_empty() {
             service_rows
                 .iter()
                 .filter(|observation| observation.model_source == "unavailable")
@@ -18124,14 +18160,15 @@ impl CodexInfoState {
             }
         }
         for observation in self.history.observations.iter().filter(|observation| {
-            observation_matches_period_bounds(
-                observation,
-                selected_reset,
-                period_start,
-                period_end,
-                &reset_aliases,
-                &canonical_resets,
-            )
+            !service_owned
+                && observation_matches_period_bounds(
+                    observation,
+                    selected_reset,
+                    period_start,
+                    period_end,
+                    &reset_aliases,
+                    &canonical_resets,
+                )
         }) {
             let minute = observation.timestamp.div_euclid(60) * 60;
             if !observed_minutes.insert(minute) {
@@ -18164,10 +18201,12 @@ impl CodexInfoState {
     ) -> BTreeMap<i64, Option<bool>> {
         let mut activity = BTreeMap::new();
         for observation in self.service_history_samples.iter().filter(|observation| {
-            observation.timestamp >= period_start
-                && observation.timestamp <= period_end
-                && observation.reset_at.abs_diff(selected_reset)
-                    <= RESET_AT_TOLERANCE_SECONDS as u64
+            self.service_observation_in_graph_period(
+                observation,
+                selected_reset,
+                period_start,
+                period_end,
+            )
         }) {
             let minute = observation.timestamp.div_euclid(60) * 60;
             activity
@@ -18197,10 +18236,12 @@ impl CodexInfoState {
         let mut points = BTreeMap::new();
         let mut has_service_rows = false;
         for observation in self.service_history_samples.iter().filter(|observation| {
-            observation.timestamp >= period_start
-                && observation.timestamp <= period_end
-                && observation.reset_at.abs_diff(selected_reset)
-                    <= RESET_AT_TOLERANCE_SECONDS as u64
+            self.service_observation_in_graph_period(
+                observation,
+                selected_reset,
+                period_start,
+                period_end,
+            )
         }) {
             has_service_rows = true;
             let origin = match observation.model_source.as_str() {
@@ -18253,7 +18294,7 @@ impl CodexInfoState {
                 },
             );
         }
-        if has_service_rows {
+        if has_service_rows || self.service_owns_graph_period(selected_reset) {
             return points;
         }
 
@@ -18356,14 +18397,16 @@ impl CodexInfoState {
             .service_history_samples
             .iter()
             .filter(|observation| {
-                observation.timestamp >= period_start
-                    && observation.timestamp <= period_end
-                    && observation.reset_at.abs_diff(selected_reset)
-                        <= RESET_AT_TOLERANCE_SECONDS as u64
+                self.service_observation_in_graph_period(
+                    observation,
+                    selected_reset,
+                    period_start,
+                    period_end,
+                )
             })
             .map(|observation| observation.timestamp.div_euclid(60) * 60)
             .collect::<BTreeSet<_>>();
-        if !service_minutes.is_empty() {
+        if !service_minutes.is_empty() || self.service_owns_graph_period(selected_reset) {
             return service_minutes;
         }
         let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
@@ -18394,13 +18437,15 @@ impl CodexInfoState {
             .service_history_samples
             .iter()
             .filter(|observation| {
-                observation.timestamp >= period_start
-                    && observation.timestamp <= period_end
-                    && observation.reset_at.abs_diff(selected_reset)
-                        <= RESET_AT_TOLERANCE_SECONDS as u64
+                self.service_observation_in_graph_period(
+                    observation,
+                    selected_reset,
+                    period_start,
+                    period_end,
+                )
             })
             .collect::<Vec<_>>();
-        if !service_rows.is_empty() {
+        if !service_rows.is_empty() || self.service_owns_graph_period(selected_reset) {
             return service_rows
                 .into_iter()
                 .filter(|observation| {
@@ -22864,11 +22909,7 @@ fn poll_service_graph_resources_with<F>(
         let selected_period = state
             .service_history_pending_reset_at
             .or(state.selected_reset_at)
-            .and_then(|selected| {
-                periods.iter().find(|period| {
-                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
-                })
-            })
+            .and_then(|selected| select_public_history_period(&periods, selected))
             .or_else(|| periods.iter().find(|period| period.current))
             .or_else(|| periods.first())
             .map(|period| (period.id.clone(), period.reset_at));
@@ -43383,6 +43424,193 @@ mod tests {
     }
 
     #[test]
+    fn official_nearby_periods_do_not_mix_linux_graph_observations() {
+        let old_reset = 1_800_604_800;
+        let new_reset = 1_800_604_801;
+        let pair = published_pair(604, 1);
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_current_v3(
+                pair.clone(),
+                PublicDetailsV3 {
+                    state: super::PublicState::Ready,
+                    observed_at: Some(1_800_000_080),
+                    authenticated: true,
+                    plan_label: Some("Pro".into()),
+                    quota: Some(super::PublicQuota {
+                        remaining_percent: 99.0,
+                        reset_at: new_reset,
+                        window_seconds: 604800,
+                        monthly: false,
+                    }),
+                    models: Vec::new(),
+                    active_thread_count: 0,
+                    open_session_thread_count: 0,
+                    history_periods: Vec::new(),
+                    history_samples: Vec::new(),
+                    history_gaps: Vec::new(),
+                    threads: Vec::new(),
+                },
+            )
+            .unwrap();
+        let periods = vec![
+            super::PublicHistoryPeriod {
+                id: new_reset.to_string(),
+                start_at: 1_800_000_001,
+                end_at: 1_800_000_080,
+                reset_at: new_reset,
+                label: "new".into(),
+                current: true,
+            },
+            super::PublicHistoryPeriod {
+                id: old_reset.to_string(),
+                start_at: 1_800_000_000,
+                end_at: 1_800_000_000,
+                reset_at: old_reset,
+                label: "old".into(),
+                current: false,
+            },
+        ];
+        let observation =
+            |timestamp, reset_at, quota, model: &str, tokens| super::PublicHistoryObservationV3 {
+                timestamp,
+                reset_at,
+                remaining_percent: Some(quota),
+                task_active_since_previous: None,
+                models: Some(vec![super::PublicHistoryModelUsageV3 {
+                    model: model.into(),
+                    total_tokens: tokens,
+                    input_tokens: Some(tokens),
+                    cached_input_tokens: Some(0),
+                    cache_write_input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    total_dollars: Some(1.0),
+                }]),
+                models_complete: true,
+                model_source: "confirmed".into(),
+            };
+        state.service_history_pending_reset_at = Some(old_reset);
+        state
+            .apply_service_history_periods_resource(pair.clone(), periods.clone())
+            .unwrap();
+        assert_eq!(
+            state.selected_reset_at,
+            Some(old_reset),
+            "exact old period must beat nearby current"
+        );
+        state
+            .apply_service_history_resource(
+                pair,
+                periods,
+                vec![
+                    observation(1_800_000_000, old_reset, 10.0, "ASTRA", 30),
+                    observation(1_800_000_060, new_reset, 99.0, "SOL", 1),
+                ],
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(state.selected_reset_at, Some(old_reset));
+        assert_eq!(
+            state.service_history_period_id.as_deref(),
+            Some(old_reset.to_string().as_str())
+        );
+        assert!(!state.graph_history_loading());
+        state.selected_history_period.clear();
+        let displayed = state.history_periods_at(1_800_000_080);
+        assert_eq!(
+            state.selected_history_reset_for_periods(&displayed),
+            Some(old_reset)
+        );
+
+        let (new, _, _) =
+            state.graph_samples_for_selection(new_reset, 1_800_000_001, 1_800_000_080);
+        assert_eq!(
+            new.iter()
+                .map(|p| (p.timestamp, p.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![(1_800_000_060, 99.0)],
+            "declared old reset is never a new-period alias"
+        );
+        let (old, _, _) =
+            state.graph_samples_for_selection(old_reset, 1_800_000_000, 1_800_000_000);
+        assert_eq!(
+            old.iter()
+                .map(|p| (p.timestamp, p.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![(1_800_000_000, 10.0)]
+        );
+        assert_eq!(
+            state.graph_model_universe_for_selection(new_reset, 1_800_000_001, 1_800_000_080),
+            BTreeSet::from(["SOL".into()])
+        );
+        assert!(state
+            .graph_model_points_for_selection(new_reset, 1_800_000_001, 1_800_000_080, "ASTRA")
+            .is_empty());
+        assert_eq!(
+            state.graph_model_points_for_selection(new_reset, 1_800_000_001, 1_800_000_080, "SOL")
+                [&1_800_000_060]
+                .raw_tokens,
+            Some(1)
+        );
+        assert_eq!(
+            state
+                .graph_task_activity_for_selection(new_reset, 1_800_000_001, 1_800_000_080)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1_800_000_060]
+        );
+        state.service_history_samples.clear();
+        assert!(
+            state
+                .graph_samples_for_selection(new_reset, 1_800_000_001, 1_800_000_080)
+                .0
+                .is_empty(),
+            "empty service history cannot be replaced by the legacy mirror"
+        );
+        assert!(state
+            .graph_model_points_for_selection(new_reset, 1_800_000_001, 1_800_000_080, "SOL")
+            .is_empty());
+    }
+
+    #[test]
+    fn quota_boundary_minute_reaches_linux_graph() {
+        let reset = 1_800_604_841;
+        let start = 1_800_000_041;
+        let end = 1_800_000_080;
+        let mut state = CodexInfoState::service_client();
+        state.service_history_samples = vec![super::PublicHistoryObservationV3 {
+            timestamp: 1_800_000_000,
+            reset_at: reset,
+            remaining_percent: Some(100.0),
+            task_active_since_previous: None,
+            models: None,
+            models_complete: false,
+            model_source: "unavailable".into(),
+        }];
+        let (samples, _, _) = state.graph_samples_for_selection(reset, start, end);
+        assert_eq!(
+            samples.len(),
+            1,
+            "the first quota observation must reach graph input"
+        );
+        assert_eq!(samples[0].timestamp, 1_800_000_000);
+        assert_eq!(samples[0].remaining_percent, 100.0);
+        let projected =
+            authoritative_history_projection_samples(&samples, Some(reset), 604800, end);
+        assert_eq!(projected.len(), 1);
+        let before = super::UsageHistorySample {
+            timestamp: 1_799_999_940,
+            ..samples[0].clone()
+        };
+        assert!(
+            authoritative_history_projection_samples(&[before], Some(reset), 604800, end)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn current_quota_bounds_drive_every_linux_period_surface() {
         let fixture: GraphPeriodStartFixture = serde_json::from_str(include_str!(
             "../tests/fixtures/graph_period_start_oracle.json"
@@ -43784,8 +44012,15 @@ mod tests {
 
         let graph_samples: Vec<UsageHistorySample> =
             serde_json::from_str(&state.graph_data_at(observed_at)).expect("selected graph JSON");
-        assert_eq!(graph_samples.len(), 1);
-        assert_eq!(graph_samples[0].timestamp, current_samples[1].timestamp);
+        // The first sample owns the minute containing the exact period start.
+        // Keep that observation; drawing still clips to authoritative_start.
+        assert_eq!(
+            graph_samples
+                .iter()
+                .map(|sample| (sample.timestamp, sample.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![(floor_start, 92.0), (floor_start + 60, 80.0)]
+        );
         assert!(graph_samples
             .iter()
             .all(|sample| sample.reset_at == canonical_reset));

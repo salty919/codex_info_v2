@@ -209,11 +209,12 @@ accountのtransport/quota/local一時失敗だけは従来どおり最後の完�
 
 `quota.reset_at`はcurrent account partition・AuthEpochで最後に受理したquota観測のprovider `resetsAt` Unix秒で、
 current periodの識別子でもある。同じ日時は同一periodにまとめ、より新しい観測で異なる日時が届けば新periodとして
-記録する。`quota.window_seconds`は同じ観測と同じtransactionで保存し、応答順序は直列pollerとcollector generationで保持する。ローカル`observed_at`やdeadlineの大小で公式応答を拒否しない。別account/epochの値は公開しない。current `history_periods[]`は同じquota観測から`start_at = quota.reset_at - quota.window_seconds`、
+記録する。`quota.window_seconds`は同じ観測と同じtransactionで保存し、応答順序は直列pollerの永続取得順序で保持する（DATA owner `QUOTA-DURABLE-604`）。ローカル`observed_at`やdeadlineの大小で公式応答を拒否しない。別account/epochの値は公開しない。current `history_periods[]`は同じquota観測から`start_at = quota.reset_at - quota.window_seconds`、
 `end_at = min(quota.reset_at, observed_at)`を一度だけ投影し、Linux/Windowsの期間欄、メイン利用期間、selected
 period start、グラフ横軸はそのpairを使う。period `id`、canonical `reset_at`、durable sample、model totalsは
 期間識別子が同じ間だけ維持し、新periodより前のsampleは保存したままcurrent公開から除外する。completed/historical
 periodは保存済み`start_at/end_at`を使い、リセット時刻は同じrootの`quota.reset_at`を表示する。
+履歴projectionの失敗は現在quotaを拒否する理由にしない。受理済み現在quotaを`/v3/current`のHTTP 200・`state:error`で公開し、生成できない履歴resourceはHTTP 503・`history_unavailable`を返す。履歴は空の正常結果へ置き換えない。
 履歴sample/gapの所属は正確な`reset_at`の一致を優先する。近接した公式resetの期間が存在するとき、60秒以内という理由で別期間へ結合したり、複数所属として応答全体を拒否しない。完全一致する期間がない旧wireのaliasだけに従来の許容幅を適用する。
 
 wireに `ready` boolean keyは存在しない。dataの利用可能判定は、完全schemaを受理した一つのdetails rootについて
@@ -258,22 +259,19 @@ v2/v3 projectionを使用する。互換性のためのv1固定列へ保存済�
 `start_at <= end_at <= reset_at`、`label`はcontrol/bidi formattingなしの1..512 Unicode scalar、
 `current=true`は集合内で最大1件である。
 
-`reset_at`はperiod groupのcanonical reset境界であり、sampleの所属判定に使う。`end_at`は現在期間では
-観測時刻、途中で次期間へ切り替わった過去期間では次期間開始へclipできるため、`end_at`をcanonical
-reset境界として代用してはならない。現在periodについては、serverが`period_start = reset_at -
-window_seconds`を計算し、`period_start <= timestamp <= reset_at`のrowを、raw rowの`reset_at`が
-切替中の旧aliasであっても現在periodのcanonical resetへ正規化する。raw source keyはDB内のprovenanceとして
-保持し、同一minuteの相反値は従来どおり公開しない。completed periodでは従来のcanonical reset authorityを
-使用する。clientは`id`をparseせず、serverが正規化したsampleだけをperiodへ受理する。各sampleは
-exactly one periodへ所属し、そのperiodの`start_at <= timestamp <= end_at`を満たす。実reset境界の秒を
-minute-startへ丸めたため旧cycle末尾と新cycle先頭が同じ分になる場合は、旧cycleがその分で終了し、
-新cycleがその分から始まって後続分へ継続することを既存時系列から確認できるときだけ、新cycleが境界分を
-所有する。旧cycle側の境界rowはpublic candidateへ含めずraw SQLiteには残す。それ以外でraw
-`(sample.reset_at,timestamp)`が一意でもcanonicalize後の`(period.id,timestamp)`が衝突するcandidateは、
-同一分に異なる残量・累積値を並べて垂直変化を作り得るため全体rejectする。merge、max、last-row、null化、
-array順選択で衝突を隠さない。
+`reset_at`はperiod識別子であり、sampleの所属判定では完全一致を優先する。`end_at`は現在期間では
+観測時刻、過去期間では次期間開始の直前までclipできるため、resetの代用にしない。公式quotaの
+受理済み記録と期間はDATA owner `QUOTA-DURABLE-604`、Session由来modelのcanonical所属は
+`HISTORY-CANONICAL-134`に従う。clientは`id`をparseせず、公開された所属を変更しない。
 
-public candidateを構築する前に、resident serviceの`HistoryCanonicalizer`は同一profileが所有する一つの
+sampleの`timestamp`は観測を含む分の開始である。所属期間の開始が秒単位でも、
+`floor(start_at / 60) * 60 <= timestamp <= end_at`を満たす最初の分を受理する。
+期間の`start_at`自体は丸めず、旧期間との時刻範囲の重複を作らない。同じ分にresetが変わった場合は
+取得順序が最後の公式観測がその分のquota表示を所有し、取得原本と受理済み記録は全観測を保持する。
+modelは同じexact reset/minuteの観測だけを結合し、別期間のmodelを移さない。
+Linux/Windowsとも分の観測を開始時刻より前という理由で捨てず、描画は選択期間内へclipする。
+
+旧混合履歴・Session派生modelのpublic candidateを構築する前に、resident serviceの`HistoryCanonicalizer`は同一profileが所有する一つの
 履歴DB readをstorage scopeとし、既存の`timestamp/reset_at`観測だけで同一と検証できたcycleと同じminute-startに
 属するrowだけを一組にする。exact reset/許容内jitterと、reset前進量が観測時刻の前進量に追随するbounded rolling
 chainだけを同cycleとし、group内最大`reset_at`をcanonical resetとする。新しいpartition列や永続CycleSeqを
@@ -502,6 +500,7 @@ transfer-decoded bodyは1 KiB以下とする。
 | 431 | `request_headers_too_large` | header count/field/aggregate上限超過 |
 | 500 | `internal_error` | response commit前のserialization/invariant failure |
 | 503 | `snapshot_unavailable` | publisher/DB root/stale owner/internal read timeout、またはshutdown中 |
+| 503 | `history_unavailable` | 現在quotaは読取り可能だが、履歴projectionの読取り・公開検証に失敗した場合の`/v3/history/periods`と`/v3/history` |
 
 route/publisher faultを200や`state=error`へ丸めない。valid details generation自身の`state=error`だけはschema-valid
 200 snapshotであり、server transport faultと別物である。serialization failureがheader/body commit後に起きた場合は

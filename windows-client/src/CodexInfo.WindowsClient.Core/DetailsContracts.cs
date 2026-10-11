@@ -142,6 +142,10 @@ public sealed record ApiHistoryPeriod(
     // from the graph end.
     public long ResetAt { get; init; } = EndAt;
 
+    // History timestamps identify minutes, while period boundaries retain seconds.
+    public bool ContainsHistoryMinute(long timestamp) =>
+        timestamp >= StartAt - StartAt % 60 && timestamp <= EndAt;
+
     public long WindowSeconds => Math.Max(1, EndAt - StartAt);
 
     public bool Monthly => WindowSeconds > TimeSpan.FromDays(7).TotalSeconds + 86_400;

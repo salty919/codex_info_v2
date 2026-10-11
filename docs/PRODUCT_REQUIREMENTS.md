@@ -91,6 +91,8 @@ REST/DBの公開応答に含めるモデル数値は、同じmodel keyを持つ�
 | `I18N` | `docs/LOCALIZATION.md` | locale、固定文言、時刻、font |
 | `SECURITY` | `SECURITY.md` | trust boundary、秘密、入力検証、残余risk |
 
+利用枠の取得原本保存・再処理の契約はDATA owner `QUOTA-DURABLE-604`へ委譲する。公式応答を解釈・期間判定・Session集計より先に保存し、後段の失敗による原本消失を防ぐ。
+
 owner文書が他領域の契約を必要とする場合は、その契約を複製せずowner IDを参照する。
 `DESIGN.md`、README、Wiki、runbook、Windows説明文書、回帰規約、要求台帳は派生物でありownerではない。
 同じ契約の複数owner、未登録owner、参照先のない契約IDを検出した場合は実装・高コスト検証を開始しない。
@@ -639,7 +641,7 @@ Windowsのみ、既定のreset週期間、固定24時間／7日間、表示timez
 
 `HistoryCanonicalizer`はDATA owner `HISTORY-CANONICAL-134`が定めるcanonical `usage_history`を生成する唯一のauthorityであり、
 同じprofile-owned transaction snapshot内で、値形状ではなく既存`timestamp/reset_at`のbounded rolling規則から
-同一cycleと検証できたminuteのrowだけを対象にする。account readerはschema制約を満たす`usage_history`一表をsole period authorityとして直接読み、
+同一cycleと検証できたminuteのrowだけを対象にする。account readerはschema制約を満たす`usage_history`をSession由来modelのperiod authorityとして直接読み、公式quotaの現在値・履歴・期間は`QUOTA-DURABLE-604`の受理済み記録から導出する。
 現行periodの公開windowは最新quotaの`reset_at - window_seconds`から検証するが、保存済みcanonical `reset_at`の期間所属とsidecarのexact keyは保持する。window内の別periodのrowをcurrentへ再所属させず、rolling driftは公開windowのclippingだけへ反映する。今回の回復に新しいpartition列、永続CycleSeq、並列履歴表、revision stateを要求しない。
 quota観測のないbackfill reset群がquota確認済みcycleと重なる場合と、継続する
 quota確認済みcycleの内部だけに存在するreset断片はperiod authorityにしない。
@@ -658,7 +660,7 @@ component別max、last-row、null化、任意mergeを行わない。
 1. 同一の認証主体でquotaを定期更新している間は、受理済みモデル使用量・履歴・threadを保持する。更新途中の欠測を空、0、未取得へ置き換えない。収集済みの新しい部分観測を受理した場合は、`API-V3-MODELS-01`に従い確認できた最新model値と不完全状態を一組で表示し、古い完全集合へ戻さない。
 2. 同じ公式`reset_at`は同一期間として扱う。より新しい公式quota観測で日時が変われば、quota回復やDBの観測時計に関係なく新期間として記録・公開する。
 3. モデル使用量（ドル・token）と残量（%）は別観測として扱う。残量観測がない時間帯をモデル使用量から逆算せず、遅れて届いた残量観測はその時刻へ反映する。
-4. DATA owner `HISTORY-CANONICAL-134`に従い、同じprofile-owned transaction snapshot内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化し、`usage_history`単一表へ一括commitする。account readerはこの表のcanonical `reset_at`をperiod authorityとして読み、model・provenanceを同じexact keyで結合する。現行periodは最新quotaの公開windowでclippingするだけとし、window内の別periodのrowをcurrentへ再所属させず、読出し時に異なるsourceを再mergeしない。quota観測を持たずquota確認済みcycleと重なるbackfill reset群と、継続cycleの内部だけにあるreset断片はperiod authorityにしない。実resetの秒をminute-startへ丸めて旧cycle末尾と新cycle先頭が同じ分になり、旧cycleがそこで終了して新cycleだけが後続分へ継続すると確認できる場合は、その境界分を新cycleへ一意に所属させる。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。同一period内のquota競合・非比較・dominant不存在は値を推測せずそのminuteと対応sidecarだけをlive canonical集合から除外する。別cycle間のownerまたは境界不明はmigration transaction全体をrejectする。既知の旧`-1`だけをmigration時に`NULL`へ置換し、通常reader/writerでは範囲外値を拒否する。100%・7日窓など数値の形で除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
+4. DATA owner `HISTORY-CANONICAL-134`に従い、同じprofile-owned transaction snapshot内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化し、`usage_history`単一表へ一括commitする。account readerはこの表のcanonical `reset_at`をSession由来modelのperiod authorityとして読み、model・provenanceを同じexact keyで結合する。公式quotaの現在値・履歴・期間は`QUOTA-DURABLE-604`の受理済み記録を優先し、旧混合履歴のquota競合・vector判定を適用しない。現行periodは最新quotaの公開windowでclippingするだけとし、window内の別periodのrowをcurrentへ再所属させず、読出し時に異なるsourceを再mergeしない。quota観測を持たずquota確認済みcycleと重なるbackfill reset群と、継続cycleの内部だけにあるreset断片はperiod authorityにしない。実resetの秒をminute-startへ丸めて旧cycle末尾と新cycle先頭が同じ分になり、旧cycleがそこで終了して新cycleだけが後続分へ継続すると確認できる場合は、その境界分を新cycleへ一意に所属させる。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。同一period内のquota競合・非比較・dominant不存在は値を推測せずそのminuteと対応sidecarだけをlive canonical集合から除外する。別cycle間のownerまたは境界不明はmigration transaction全体をrejectする。既知の旧`-1`だけをmigration時に`NULL`へ置換し、通常reader/writerでは範囲外値を拒否する。100%・7日窓など数値の形で除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
 5. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の受理済み表示を保持し、失敗状態は別途表示する。取得できた部分観測のmodel値は集合全体の不完全性だけで消去せず、MainとGraphで不完全状態を可視化し、正常・最新と誤称しない。
 6. 製品バージョンはメイン画面に一度だけ表示し、子ウインドウのタイトルやボタンへ重複表示しない。値はX版・Windows版とも同じリリースversion authorityから導出する。
 7. Windows版の初回起動では、health readiness後に最初のstrict validation済み`/v3/current` generation（新resourceがexact 404の旧serviceだけ上記legacy chain）が揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。control応答とのmerge、途中fieldの順番描画をせず、初回取得失敗時はスピナーを解除して失敗状態と再試行手段を表示する。Linux / WindowsのMainに公開対象となった現在openのSession thread件数を表示するため、`open_session_thread_count>0`のcurrentに限り同じMain cycleでthreadsを1回取得し、同一published pair、open件数と行数、active件数と動作中行数が一致する組だけを一括表示する。`open_session_thread_count=0`はthreadsを要求せず同じcurrent pairのthread行を空として一括表示する。Mainの合計と`SOL/TERRA/LUNA/ASTRA/その他`はこの一つの受理済み行集合だけから導出し、常に合計＝各bucketの和とする。開いたThreads詳細はMainが新しいbundleを受理した同じUI更新でそのthread行（0件を含む）へ追従し、別のthreads requestを追加しない。Main更新前に始めた独立Threads取得の古い応答で、その更新を上書きしない。threads失敗・世代不一致・件数不一致ではcurrentだけを反映せず直前の完全表示を保持する。positive bundle失敗後は10秒後にcurrentを条件headerなしで1回だけ再取得し、そのbundleが成功するまでforce、Graph、独立Threads取得で待機を迂回せず、保持中のerrorを解除しない。Graphを開いていない間はGraph resourceを取得せず、Threads詳細windowを閉じている間はこのMain bundle以外の5秒周期threads取得を行わない。
@@ -666,7 +668,7 @@ component別max、last-row、null化、任意mergeを行わない。
 9. X版の起動ウィンドウは主モニターの可視デスクトップ内へ配置し、別モニターや負座標へ出して利用者から見えない状態にしてはならない。起動成功は、可視範囲内の実ウィンドウと内容の実画面で確認する。
 10. `--ui` のdaemon/REST起動に失敗しても、X版のGUIを消失・即時終了させず、接続失敗と再試行手段を表示する。
 11. 同一periodのモデル別累積はmodelごとに独立したログ観測として扱う。1 modelが直前の確定値より後退したrowは、そのmodelだけを回復点まで欠測とし、同じrowで確定している他modelの実測値を欠測や前回値へ置換しない。model集合が不完全でも、掲載modelの実測値は無効にしない。
-12. remote quotaとlocal Session/logは独立した取得元とする。remote transport障害中もresident local collectorとDB recorderを60秒以内の既存周期で継続し、local-only rowはquota `NULL`かつmodel source `confirmed`でcommitする。local取得失敗後も、そのcycleで取得済みのfresh remote quotaは元の観測時刻、実collector世代、model source `unavailable`として同じDB transactionへ保持し、直前のdurable model vectorを新しい確定rowとして複製しない。古いquotaを新しいtimestampへ複製しない。local取得失敗はsingle-flightを解放して次周期で再取得し、DB書込み失敗はprovenanceを含むexact pending batchを保持して同じdaemon内で再試行する。provenanceなしの旧rowは`legacy-unknown`であり、確定観測へ昇格しない。
+12. remote quotaとlocal Session/logは独立した取得元とする。remote transport障害中もresident local collectorとDB recorderを60秒以内の既存周期で継続し、local-only rowはquota `NULL`かつmodel source `confirmed`でcommitする。fresh remote quotaは`QUOTA-DURABLE-604`に従い、local取得・集計の成否と独立して取得原本と受理済み記録へ保存する。元の観測時刻と取得順序を保持し、同じminute/periodのmodelがないquota履歴はmodel source `unavailable`とする。直前のdurable model vectorを新しい確定rowとして複製しない。古いquotaを新しいtimestampへ複製しない。local取得失敗はsingle-flightを解放して次周期で再取得し、DB書込み失敗はprovenanceを含むexact pending batchを保持して同じdaemon内で再試行する。provenanceなしの旧rowは`legacy-unknown`であり、確定観測へ昇格しない。
 
 ## Linux更新の診断（Issue #479）
 

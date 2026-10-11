@@ -20,6 +20,38 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class DetailsPresentationCoverageTests
 {
     [Fact]
+    public async Task GraphWindow_BoundaryMinuteSurvivesHistoryPage()
+    {
+        const long reset = 1_800_604_841;
+        var period = new ApiHistoryPeriod("boundary", 1_800_000_041, 1_800_000_080, true, "boundary")
+        {
+            ResetAt = reset,
+            Samples = [
+                new ApiHistorySample(1_800_000_000, reset, 100, 1, 0, 0, 30, 0, 0),
+                new ApiHistorySample(1_800_000_060, reset, 99, 2, 0, 0, 40, 0, 0),
+            ],
+        };
+        var details = CreateDetails([period], []) with
+        {
+            ObservedAt = 1_800_000_080,
+            Quota = new ApiQuota(99, reset, 604800, false),
+        };
+        var client = new SequencedHistoryResourceClient([details],
+            [new ApiHistoryPeriodsSnapshot([period], details.PublishedPair!.Value)],
+            new Dictionary<string, IReadOnlyList<ApiHistorySample>> { [period.Id] = period.Samples });
+        using var main = new MainWindowViewModel(client);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
+        await PumpUiUntilAsync(pendingUi, () => !graph.IsLoading && (graph.HasPoints || graph.HasBlockingLoadError));
+        Assert.False(graph.HasBlockingLoadError);
+        Assert.Contains(graph.Points, p => p.Timestamp == 1_800_000_000);
+        Assert.Equal(1_800_000_041, graph.Scene.PeriodStartAt);
+        Assert.Equal(1_800_000_041, graph.Scene.Timestamps[0]);
+    }
+
+    [Fact]
     public async Task GraphWindow_EmptyStateAndLocaleChangeRemainObservable()
     {
         using var main = await StartMainAsync(CreateDetails(Array.Empty<ApiHistoryPeriod>(), Array.Empty<ApiThreadDetails>()));

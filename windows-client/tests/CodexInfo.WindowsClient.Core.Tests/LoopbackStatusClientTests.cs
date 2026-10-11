@@ -388,6 +388,33 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task CurrentErrorPreservesQuotaWithoutModels()
+    {
+        const string json = """
+            {"api_version":"v3","state":"error","observed_at":1800000020,
+             "authenticated":true,"plan_label":null,
+             "quota":{"remaining_percent":99.0,"reset_at":1800604800,"window_seconds":604800,"monthly":false},
+             "models":[],"active_thread_count":0}
+            """;
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            paths.Add(request.RequestUri!.AbsolutePath);
+            return JsonResponse(json, includePublishedPair: true);
+        }));
+
+        var result = await client.FetchCurrentAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(["/v3/current"], paths);
+        Assert.Equal(ApiState.Error, result.Snapshot!.State);
+        Assert.True(result.Snapshot.Authenticated);
+        Assert.Equal(99.0, result.Snapshot.Quota!.RemainingPercent);
+        Assert.Equal(1800604800, result.Snapshot.Quota.ResetAt);
+        Assert.Empty(result.Snapshot.Models);
+    }
+
+    [Fact]
     public async Task Issue362CurrentAndThreadsPreserveStoppedOpenSession()
     {
         var currentJson = ValidCurrentJson().Replace(
@@ -1770,6 +1797,30 @@ public sealed class LoopbackStatusClientTests
         Assert.Null(overlapping.Snapshot);
         Assert.Equal(DetailsFetchFailure.Response, misordered.Failure);
         Assert.Null(misordered.Snapshot);
+    }
+
+    [Theory]
+    [InlineData("v1")]
+    [InlineData("v2")]
+    [InlineData("v3")]
+    public async Task HistoryBoundaryMinuteIsAccepted(string version)
+    {
+        var json = (version switch
+        {
+            "v1" => ValidDetailsJson(),
+            "v2" => ValidDetailsV2Json(),
+            _ => ValidDetailsV3Json(),
+        }).Replace("253402300740", "1800000080", StringComparison.Ordinal)
+          .Replace("253402300799", "1800604841", StringComparison.Ordinal)
+          .Replace("253341820740", "1800000041", StringComparison.Ordinal)
+          .Replace("253402300680", "1800000000", StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri?.AbsolutePath == $"/{version}/details"
+                ? JsonResponse(json, includePublishedPair: true) : NotFoundResponse()));
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+        Assert.True(result.IsSuccess, $"{version}: {result.Failure}");
+        Assert.Equal(1_800_000_041, Assert.Single(result.Snapshot!.HistoryPeriods).StartAt);
+        Assert.Equal(1_800_000_000, Assert.Single(result.Snapshot.HistorySamples).Timestamp);
     }
 
     [Theory]

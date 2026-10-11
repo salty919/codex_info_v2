@@ -456,8 +456,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             // Both current and historical periods own their exact published
             // end. A 60-second cadence may start at any Unix-time phase, so
             // validity is bounded by the accepted period rather than modulo.
-            .Where(sample => sample.Timestamp >= period.StartAt &&
-                             sample.Timestamp <= end)
+            .Where(sample => period.ContainsHistoryMinute(sample.Timestamp))
             .OrderBy(sample => sample.Timestamp)
             .ToList();
         if (observed.Count == 0)
@@ -2879,8 +2878,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         foreach (var sample in page.Samples)
         {
-            if (sample.Timestamp < period.StartAt ||
-                sample.Timestamp > period.EndAt ||
+            if (!period.ContainsHistoryMinute(sample.Timestamp) ||
                 sample.ResetAt < period.ResetAt - 60 ||
                 sample.ResetAt > period.ResetAt)
             {
@@ -3252,7 +3250,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private static IReadOnlyList<ApiHistorySample> BuildWindowGraphSamples(ApiHistoryPeriod period) =>
         period.Samples
             .Where(sample => !sample.IsSyntheticTail &&
-                sample.Timestamp >= period.StartAt && sample.Timestamp <= period.EndAt)
+                period.ContainsHistoryMinute(sample.Timestamp))
             .OrderBy(sample => sample.Timestamp)
             .ToArray();
 
