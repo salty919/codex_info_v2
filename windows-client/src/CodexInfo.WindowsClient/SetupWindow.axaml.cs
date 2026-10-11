@@ -28,6 +28,11 @@ public partial class SetupWindow : Window
         }
     }
 
+    private void OnAuth(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if (DataContext is SetupViewModel viewModel) viewModel.StartAuthentication();
+    }
+
     private void OnRefresh(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => (DataContext as SetupViewModel)?.Refresh();
 
     private void OnContinue(object? sender, Avalonia.Interactivity.RoutedEventArgs e)

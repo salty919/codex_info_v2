@@ -122,23 +122,6 @@
       <Setter Property="Background" Value="{DynamicResource Theme263548}" />
       <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
     </Style>
-    <Style Selector="Button.window-control">
-      <Setter Property="Width" Value="36" />
-      <Setter Property="Height" Value="28" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-      <Setter Property="FontSize" Value="17" />
-      <Setter Property="Background" Value="{DynamicResource Theme111B2C}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource Theme2D3D56}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="4" />
-      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
-    </Style>
-    <Style Selector="Button.window-control:pointerover">
-      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
-      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
-    </Style>
   </Window.Styles>
 
   <Grid>
@@ -146,8 +129,8 @@
       <Border Grid.Row="1" Grid.RowSpan="2" Background="{DynamicResource Theme111B2C}" CornerRadius="10" />
 
       <Grid Grid.Row="0" ColumnDefinitions="*,Auto,16,Auto" Background="Transparent">
-        <TextBlock Margin="0,0,8,0" FontSize="22" FontWeight="Bold" VerticalAlignment="Center"
-                   Text="{Binding Texts.GraphWindowTitle}" TextTrimming="CharacterEllipsis" />
+        <Grid ColumnDefinitions="Auto,*" ColumnSpacing="8" VerticalAlignment="Center"><PathIcon Classes="heading-icon" Data="{StaticResource IconGraph}" /><TextBlock Grid.Column="1" Classes="window-title" Margin="0,0,8,0" VerticalAlignment="Center"
+                   Text="{Binding Texts.GraphWindowTitle}" TextTrimming="CharacterEllipsis" /></Grid>
         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
           <TextBlock Classes="label" VerticalAlignment="Center" Text="{Binding Texts.GraphDollarMetric}" />
           <ToggleSwitch Classes="metric-switch"
@@ -291,5 +274,7 @@
     <Border x:Name="ResizeSouth" Height="10" HorizontalAlignment="Stretch" VerticalAlignment="Bottom" Margin="18,0" Background="Transparent" PointerPressed="OnResizeSouth" />
     <Border x:Name="ResizeWest" Width="10" HorizontalAlignment="Left" VerticalAlignment="Stretch" Margin="0,18" Background="Transparent" PointerPressed="OnResizeWest" />
     <Border x:Name="ResizeEast" Width="10" HorizontalAlignment="Right" VerticalAlignment="Stretch" Margin="0,18" Background="Transparent" PointerPressed="OnResizeEast" />
+  <Border Classes="window-frame" Classes.active="{Binding $parent[Window].IsActive}"
+            Grid.RowSpan="1" Margin="0" IsHitTestVisible="False" />
   </Grid>
 </Window>

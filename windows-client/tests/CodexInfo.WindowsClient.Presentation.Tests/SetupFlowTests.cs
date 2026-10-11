@@ -36,8 +36,12 @@ public sealed class SetupFlowTests
         Assert.False(session.Current.SettingsCorrupt);
         Assert.False(session.Current.SetupCompleted);
 
+        var stepChanges = new List<string?>();
+        setup.PropertyChanged += (_, e) => stepChanges.Add(e.PropertyName);
         Assert.Equal(SetupAdvanceOutcome.StayOpen, setup.Advance());
         Assert.True(setup.IsDoneStep);
+        Assert.Contains(nameof(SetupViewModel.ContinueText), stepChanges);
+        Assert.Contains(nameof(SetupViewModel.CanContinue), stepChanges);
         Assert.Single(session.Generations);
 
         Assert.Equal(SetupAdvanceOutcome.CloseRequested, setup.Advance());

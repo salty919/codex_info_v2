@@ -21,6 +21,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private string selectedThemeId;
     private bool saveFailed;
     private ApiRuntimeVersionsSnapshot? runtimeVersions;
+    private bool refreshingVersions;
 
     public SettingsViewModel(ClientSettingsStore store, MainWindowViewModel? main = null)
     {
@@ -100,8 +101,11 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     }
     public string SelectedTimeZone => selectedTimeZoneId == "UTC" ? Texts.UtcTimeZone : Texts.LocalTimeZone;
     public string CurrentEndpoint => Texts.ConnectionEndpoint;
-    public string StatusTitle => main?.StatusTitle ?? Texts.Unavailable;
-    public string StatusDetail => saveFailed ? Texts.SettingsSaveFailed : main?.StatusDetail ?? Texts.UnavailableDetails;
+    public string StatusTitle => main?.ConnectionStatusTitle ?? Texts.Unavailable;
+    public string ConnectionStatusDetail => main?.ConnectionStatusDetail ?? Texts.UnavailableDetails;
+    public bool CanRefresh => main?.CanRefresh == true && !refreshingVersions;
+    public string RefreshButtonText => refreshingVersions || main?.CanRefresh == false ? Texts.Refreshing : Texts.RefreshStatus;
+    public string StatusDetail => saveFailed ? Texts.SettingsSaveFailed : main?.ConnectionStatusDetail ?? Texts.UnavailableDetails;
     public ReadOnlyObservableCollection<ApiAccount>? Accounts => main?.Accounts;
     public bool HasAccounts => main?.HasAccounts == true;
     public ApiAccount? SelectedAccount
@@ -127,9 +131,21 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public async Task RefreshRuntimeVersionsAsync()
     {
-        var client = main?.RuntimeVersionsClient;
-        var result = client is null ? null : await client.FetchRuntimeVersionsAsync();
-        runtimeVersions = result?.IsSuccess == true ? result.Snapshot : null;
+        refreshingVersions = true;
+        Notify(nameof(CanRefresh));
+        Notify(nameof(RefreshButtonText));
+        try
+        {
+            var client = main?.RuntimeVersionsClient;
+            var result = client is null ? null : await client.FetchRuntimeVersionsAsync();
+            runtimeVersions = result?.IsSuccess == true ? result.Snapshot : null;
+        }
+        finally
+        {
+            refreshingVersions = false;
+            Notify(nameof(CanRefresh));
+            Notify(nameof(RefreshButtonText));
+        }
         Notify(nameof(RestVersion));
         Notify(nameof(RecorderVersion));
         Notify(nameof(RuntimeVersionState));
@@ -193,6 +209,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         Notify(nameof(RuntimeVersionStatus));
         Notify(nameof(Texts));
         Notify(nameof(CurrentEndpoint));
+        Notify(nameof(ConnectionStatusDetail));
+        Notify(nameof(RefreshButtonText));
         Notify(nameof(SelectedAccountText));
         Notify(nameof(SelectedTimeZone));
         Notify(nameof(TimeZoneOptions));
@@ -205,6 +223,11 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
     {
+        if (eventArgs.PropertyName is nameof(MainWindowViewModel.CanRefresh) or nameof(MainWindowViewModel.RefreshButtonText))
+        {
+            Notify(nameof(CanRefresh));
+            Notify(nameof(RefreshButtonText));
+        }
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.Accounts) or
             nameof(MainWindowViewModel.HasAccounts) or nameof(MainWindowViewModel.SelectedAccount) or
             nameof(MainWindowViewModel.SelectedAccountText))
@@ -217,6 +240,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.StatusTitle) or nameof(MainWindowViewModel.StatusDetail) or nameof(MainWindowViewModel.IsAuthRequired))
         {
             Notify(nameof(StatusTitle)); Notify(nameof(StatusDetail)); Notify(nameof(CanAuthenticate));
+            Notify(nameof(ConnectionStatusDetail));
         }
     }
 
@@ -240,6 +264,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
     private string selectedConnectionProfile;
     private string selectedConnectionSelector;
     private int step;
+    private bool isConnectionSettings;
 
     public SetupViewModel(MainWindowViewModel main)
         : this(main, App.SettingsSession, new WindowsSetupConnectionEnvironment())
@@ -277,6 +302,18 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public UiText Texts => LocalizationService.Current;
+    public bool IsConnectionSettings => isConnectionSettings;
+    public string PageTitle => isConnectionSettings ? Texts.ConnectionSettings : Texts.SetupTitle;
+    public string WindowTitle => isConnectionSettings ? Texts.ConnectionSettings : "Codex Info Setup";
+    public bool CanRefresh => main.CanRefresh;
+    public string RefreshButtonText => main.CanRefresh ? Texts.RefreshStatus : Texts.Refreshing;
+    public void ShowConnectionSettings()
+    {
+        isConnectionSettings = true;
+        Notify(nameof(IsConnectionSettings));
+        Notify(nameof(PageTitle));
+        Notify(nameof(WindowTitle));
+    }
     public IReadOnlyList<ConnectionProfileOption> ConnectionProfileOptions =>
     [
         new(ConnectionProfiles.None, Texts.ConnectionProfileNone),
@@ -307,6 +344,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
             Notify();
             Notify(nameof(SelectedConnectionSelector));
             Notify(nameof(ConnectionSelectorOptions));
+            Notify(nameof(HasConnectionSelector));
             Notify(nameof(CanContinue));
             Notify(nameof(SshCommand));
         }
@@ -331,10 +369,12 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         ConnectionProfiles.SshConfigAlias => SshConfigAliases,
         _ => [ConnectionSelectors.None],
     };
+    public bool HasConnectionSelector => selectedConnectionProfile != ConnectionProfiles.None;
     public IReadOnlyList<string> WslDistributions { get; }
-    public int Step { get => step; private set { step = value; Notify(); Notify(nameof(IsConnectionStep)); Notify(nameof(IsAuthStep)); Notify(nameof(IsDoneStep)); } }
+    public int Step { get => step; private set { step = value; Notify(); Notify(nameof(IsConnectionStep)); Notify(nameof(IsAuthStep)); Notify(nameof(IsDoneStep)); Notify(nameof(CanContinue)); Notify(nameof(ContinueText)); Notify(nameof(CanAuthenticate)); } }
     public bool IsConnectionStep => Step == 0;
     public bool IsAuthStep => Step == 1;
+    public bool CanAuthenticate => IsAuthStep && main.IsAuthRequired;
     public bool IsDoneStep => Step == 2;
     public IReadOnlyList<string> SshConfigAliases { get; }
     public string? SelectedSshConfigAlias
@@ -401,8 +441,8 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         ? $"ssh -N -L 8787:127.0.0.1:8787 {(string.IsNullOrWhiteSpace(SshUser) ? (SelectedConnectionSelector == ConnectionSelectors.None ? SshHost : SelectedConnectionSelector) : $"{SshUser}@{(SelectedConnectionSelector == ConnectionSelectors.None ? SshHost : SelectedConnectionSelector)}")}"
         : Texts.SshCommand;
     public string ApiCommand => Texts.ApiCommand;
-    public string StatusTitle => main.StatusTitle;
-    public string StatusDetail => settingsSaveFailed ? Texts.SettingsSaveFailed : main.StatusDetail;
+    public string StatusTitle => main.ConnectionStatusTitle;
+    public string StatusDetail => settingsSaveFailed ? Texts.SettingsSaveFailed : main.ConnectionStatusDetail;
     public string ContinueText => Step == 2 ? Texts.Close : Texts.Continue;
 
     public void Refresh() => main.RefreshCommand.Execute(null);
@@ -560,6 +600,11 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
     {
+        if (eventArgs.PropertyName is nameof(MainWindowViewModel.CanRefresh) or nameof(MainWindowViewModel.RefreshButtonText))
+        {
+            Notify(nameof(CanRefresh));
+            Notify(nameof(RefreshButtonText));
+        }
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.StatusTitle)
             or nameof(MainWindowViewModel.StatusDetail)
             or nameof(MainWindowViewModel.IsAuthRequired)
@@ -570,6 +615,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(StatusTitle));
             Notify(nameof(StatusDetail));
             Notify(nameof(CanContinue));
+            Notify(nameof(CanAuthenticate));
             Notify(nameof(SettingsSaveFailed));
         }
     }
@@ -584,6 +630,9 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(ApiCommand));
         Notify(nameof(SshActionText));
         Notify(nameof(ContinueText));
+        Notify(nameof(PageTitle));
+        Notify(nameof(WindowTitle));
+        Notify(nameof(RefreshButtonText));
         Notify(nameof(StatusTitle));
         Notify(nameof(StatusDetail));
         Notify(nameof(CanContinue));

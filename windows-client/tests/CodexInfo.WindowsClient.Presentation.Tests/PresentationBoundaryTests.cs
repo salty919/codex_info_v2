@@ -215,7 +215,8 @@ public sealed class PresentationBoundaryTests
             main.RefreshCommand.Execute(null);
             await EventuallyAsync(() => main.IsAuthenticated);
             Assert.False(settings.CanAuthenticate);
-            Assert.Equal(main.StatusTitle, settings.StatusTitle);
+            Assert.Equal(LocalizationService.Current.Connected, settings.StatusTitle);
+            Assert.Equal(main.LastReceivedText, settings.ConnectionStatusDetail);
         }
         finally
         {

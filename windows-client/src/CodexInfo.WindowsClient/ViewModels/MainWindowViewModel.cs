@@ -590,6 +590,13 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
+    private bool HasReadyConnection => presentationState is ClientPresentationState.Ready
+        or ClientPresentationState.QuotaDanger or ClientPresentationState.QuotaWarning
+        or ClientPresentationState.ResetWarning;
+
+    public string ConnectionStatusTitle => HasReadyConnection ? Texts.Connected : StatusTitle;
+    public string ConnectionStatusDetail => HasReadyConnection ? LastReceivedText : StatusDetail;
+
     public string StatusTitle => presentationState switch
     {
         ClientPresentationState.Connecting => Texts.Connecting,
@@ -978,6 +985,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 authLaunchFailed = !launched;
                 authLaunchSucceeded = launched;
                 Notify(nameof(StatusDetail));
+                Notify(nameof(ConnectionStatusDetail));
                 Notify(nameof(IsAuthStartVisible));
                 Notify(nameof(IsAuthCheckVisible));
                 authCommand.RaiseCanExecuteChanged();
@@ -1003,7 +1011,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(Texts));
             Notify(nameof(RefreshButtonText));
             Notify(nameof(StatusTitle));
+            Notify(nameof(ConnectionStatusTitle));
             Notify(nameof(StatusDetail));
+            Notify(nameof(ConnectionStatusDetail));
             Notify(nameof(UpdateNotificationText));
             Notify(nameof(UpdateButtonText));
             Notify(nameof(LastReceivedText));
@@ -1873,7 +1883,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private void NotifyStatusProperties()
     {
         Notify(nameof(StatusTitle));
+        Notify(nameof(ConnectionStatusTitle));
         Notify(nameof(StatusDetail));
+        Notify(nameof(ConnectionStatusDetail));
         Notify(nameof(StatusBackground));
         Notify(nameof(StatusBorder));
         Notify(nameof(StatusAccent));

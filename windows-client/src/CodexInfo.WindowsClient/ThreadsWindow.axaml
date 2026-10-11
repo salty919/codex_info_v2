@@ -41,23 +41,10 @@
       <Setter Property="HorizontalAlignment" Value="Left" />
       <Setter Property="VerticalAlignment" Value="Top" />
     </Style>
-    <Style Selector="Button.window-control">
-      <Setter Property="Width" Value="32" />
-      <Setter Property="Height" Value="30" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="FontSize" Value="17" />
-      <Setter Property="Background" Value="Transparent" />
-      <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
-    </Style>
-    <Style Selector="Button.window-control:pointerover">
-      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
-      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
-    </Style>
   </Window.Styles>
   <Grid Margin="20" RowDefinitions="30,384" RowSpacing="6">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel VerticalAlignment="Center"><TextBlock FontSize="22" FontWeight="SemiBold" Text="{Binding Texts.RunningThreads}" /></StackPanel>
+      <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"><PathIcon Classes="heading-icon" Data="{StaticResource IconThreads}" /><TextBlock Classes="window-title" Text="{Binding Texts.RunningThreads}" /></StackPanel>
       <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
         <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Threads.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
         <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Threads.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
@@ -153,5 +140,7 @@
                                 RootRows="{Binding TreeRootRows}" />
       </Grid>
     </ScrollViewer>
+  <Border Classes="window-frame" Classes.active="{Binding $parent[Window].IsActive}"
+            Grid.RowSpan="2" Margin="-20" IsHitTestVisible="False" />
   </Grid>
 </Window>

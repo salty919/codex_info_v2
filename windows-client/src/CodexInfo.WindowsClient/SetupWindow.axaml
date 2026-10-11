@@ -8,22 +8,31 @@
         Width="900" Height="480" MinWidth="900" MinHeight="480" MaxWidth="900" MaxHeight="480"
         WindowStartupLocation="CenterOwner" CanResize="False"
         WindowDecorations="None" ExtendClientAreaToDecorationsHint="True" ExtendClientAreaTitleBarHeightHint="0"
-        Title="Codex Info Setup" FontFamily="{StaticResource JapaneseFont}"
+        Title="{Binding WindowTitle}" FontFamily="{StaticResource JapaneseFont}"
         Background="{DynamicResource Theme0E141E}" Foreground="{DynamicResource ThemeE9EFF8}">
   <Window.Styles>
     <Style Selector="TextBlock.label"><Setter Property="FontSize" Value="13" /><Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" /></Style>
     <Style Selector="Border.surface"><Setter Property="Background" Value="{DynamicResource Theme151F2D}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme2C4258}" /><Setter Property="BorderThickness" Value="1" /><Setter Property="CornerRadius" Value="14" /></Style>
-    <Style Selector="Button.primary"><Setter Property="Background" Value="{DynamicResource Theme236B9E}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme61B4EB}" /><Setter Property="Foreground" Value="{DynamicResource ThemeF5FAFF}" /><Setter Property="Padding" Value="16,8" /></Style>
-    <Style Selector="Button.primary:disabled"><Setter Property="Background" Value="{DynamicResource Theme1B2735}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme304052}" /><Setter Property="Foreground" Value="{DynamicResource Theme8EA1B5}" /></Style>
-    <Style Selector="Button.secondary"><Setter Property="Background" Value="{DynamicResource Theme1B2A3A}" /><Setter Property="BorderBrush" Value="{DynamicResource Theme36516B}" /><Setter Property="Foreground" Value="{DynamicResource ThemeE9EFF8}" /><Setter Property="Padding" Value="16,8" /></Style>
+    <Style Selector="Border.step">
+      <Setter Property="Padding" Value="12,6" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="BorderThickness" Value="0,0,0,2" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+    </Style>
+    <Style Selector="Border.step.current">
+      <Setter Property="Background" Value="{DynamicResource Theme18283A}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme56B2F5}" />
+    </Style>
   </Window.Styles>
-  <Grid Margin="28" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="18">
+  <Grid Margin="28" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="14">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel Orientation="Horizontal" Spacing="12"><Border Width="42" Height="42" CornerRadius="12" Background="{DynamicResource Theme1C5D91}" BorderBrush="{DynamicResource Theme5EA7E5}" BorderThickness="1"><TextBlock FontSize="22" Text="◈" HorizontalAlignment="Center" VerticalAlignment="Center" /></Border><StackPanel VerticalAlignment="Center"><TextBlock FontSize="25" FontWeight="SemiBold" Text="{Binding Texts.SetupTitle}" /><TextBlock Classes="label" Text="{Binding Texts.Setup}" /></StackPanel></StackPanel>
-      <Button Grid.Column="1" Background="Transparent" BorderBrush="Transparent" Foreground="{DynamicResource ThemeA8B7CA}" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Setup.Window.Close" Content="×" FontSize="22" ToolTip.Tip="{Binding Texts.Close}" />
+      <StackPanel Orientation="Horizontal" Spacing="8"><PathIcon Classes="heading-icon" Data="{StaticResource IconConnection}" /><StackPanel VerticalAlignment="Center"><TextBlock Classes="window-title" Text="{Binding PageTitle}" /><TextBlock Classes="label" Text="{Binding Texts.Setup}" IsVisible="{Binding !IsConnectionSettings}" /></StackPanel></StackPanel>
+      <Button Grid.Column="1" Classes="window-control" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Setup.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
     </Grid>
     <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8">
-      <Border Width="10" Height="10" CornerRadius="5" Background="{DynamicResource Theme5EA7E5}" /><TextBlock Classes="label" Text="{Binding Texts.StepConnection}" /><Border Width="10" Height="10" CornerRadius="5" Background="{DynamicResource Theme36516B}" Margin="14,0,0,0" /><TextBlock Classes="label" Text="{Binding Texts.StepAuth}" /><Border Width="10" Height="10" CornerRadius="5" Background="{DynamicResource Theme36516B}" Margin="14,0,0,0" /><TextBlock Classes="label" Text="{Binding Texts.StepDone}" />
+      <Border Classes="step" Classes.current="{Binding IsConnectionStep}"><TextBlock Text="{Binding Texts.StepConnection}" /></Border>
+      <Border Classes="step" Classes.current="{Binding IsAuthStep}"><TextBlock Text="{Binding Texts.StepAuth}" /></Border>
+      <Border Classes="step" Classes.current="{Binding IsDoneStep}"><TextBlock Text="{Binding Texts.StepDone}" /></Border>
     </StackPanel>
     <Border Grid.Row="2" Classes="surface" Padding="22">
       <!-- Keep a real content gutter for the vertical scrollbar.  Avalonia's
@@ -31,13 +40,10 @@
            wrapped Japanese/Arabic line at the minimum width. -->
       <ScrollViewer Padding="0,0,18,0" HorizontalScrollBarVisibility="Disabled" HorizontalContentAlignment="Stretch" VerticalScrollBarVisibility="Auto">
         <StackPanel Spacing="16" Margin="0,0,2,0">
-          <TextBlock Classes="label" Text="{Binding Texts.SetupIntro}" TextWrapping="Wrap" />
-          <TextBlock FontSize="18" FontWeight="SemiBold" Text="{Binding Texts.ConnectionGuide}" />
-          <TextBlock Classes="label" Text="{Binding Texts.ConnectionGuideBody}" TextWrapping="Wrap" />
           <Grid ColumnDefinitions="*,*" ColumnSpacing="10">
             <StackPanel Spacing="5">
               <TextBlock Classes="label" Text="{Binding Texts.ConnectionProfileLabel}" />
-              <ComboBox ItemsSource="{Binding ConnectionProfileOptions}"
+              <ComboBox HorizontalAlignment="Stretch" ItemsSource="{Binding ConnectionProfileOptions}"
                         SelectedValue="{Binding SelectedConnectionProfile, Mode=TwoWay}"
                         SelectedValueBinding="{Binding Id}"
                         AutomationProperties.Name="{Binding Texts.ConnectionProfileLabel}"
@@ -45,16 +51,23 @@
                 <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
               </ComboBox>
             </StackPanel>
-            <StackPanel Grid.Column="1" Spacing="5">
+            <StackPanel Grid.Column="1" Spacing="5" IsVisible="{Binding HasConnectionSelector}">
               <TextBlock Classes="label" Text="{Binding Texts.ConnectionSelectorLabel}" />
-              <ComboBox ItemsSource="{Binding ConnectionSelectorOptions}"
+              <ComboBox HorizontalAlignment="Stretch" ItemsSource="{Binding ConnectionSelectorOptions}"
                         SelectedItem="{Binding SelectedConnectionSelector, Mode=TwoWay}"
                         PlaceholderText="{Binding Texts.ConnectionSelectorPlaceholder}"
                         AutomationProperties.Name="{Binding Texts.ConnectionSelectorLabel}"
                         ToolTip.Tip="{Binding Texts.ConnectionSelectorLabel}" />
             </StackPanel>
           </Grid>
-          <TextBlock Classes="label" Text="SSH" />
+          <Border Background="{DynamicResource Theme101F2D}" CornerRadius="8" Padding="14"><Grid ColumnDefinitions="Auto,*" ColumnSpacing="10"><TextBlock Text="●" Foreground="{DynamicResource Theme71C7FF}" VerticalAlignment="Top" Margin="0,3,0,0" /><StackPanel Grid.Column="1"><TextBlock FontWeight="SemiBold" Text="{Binding StatusTitle}" /><TextBlock Classes="label" Text="{Binding StatusDetail}" TextWrapping="Wrap" /></StackPanel></Grid></Border>
+          <Button Classes="primary" HorizontalAlignment="Left" IsVisible="{Binding CanAuthenticate}"
+                  Click="OnAuth" Content="{Binding Texts.AuthStart}" />
+          <Expander Header="{Binding Texts.ConnectionGuide}" HorizontalAlignment="Stretch">
+            <StackPanel Spacing="12">
+              <TextBlock Classes="label" Text="{Binding Texts.SetupIntro}" TextWrapping="Wrap" />
+              <TextBlock Classes="label" Text="{Binding Texts.ConnectionGuideBody}" TextWrapping="Wrap" />
+
           <StackPanel Spacing="5">
             <TextBlock Classes="label" Text="{Binding Texts.SshConfigAliasLabel}" />
             <ComboBox ItemsSource="{Binding SshConfigAliases}" SelectedItem="{Binding SelectedSshConfigAlias, Mode=TwoWay}" PlaceholderText="{Binding Texts.SshConfigAliasPlaceholder}" AutomationProperties.Name="{Binding Texts.SshConfigAliasLabel}" />
@@ -83,15 +96,19 @@
               <Button Grid.Row="1" HorizontalAlignment="Right" Classes="secondary" Click="OnCopyApi" AutomationProperties.Name="{Binding Texts.Copy}" ToolTip.Tip="{Binding Texts.Copy}" Content="{Binding Texts.Copy}" />
             </Grid>
           </Border>
-          <Border Background="{DynamicResource Theme101F2D}" CornerRadius="8" Padding="14"><Grid ColumnDefinitions="Auto,*" ColumnSpacing="10"><TextBlock Text="●" Foreground="{DynamicResource Theme71C7FF}" VerticalAlignment="Top" Margin="0,3,0,0" /><StackPanel Grid.Column="1"><TextBlock FontWeight="SemiBold" Text="{Binding StatusTitle}" /><TextBlock Classes="label" Text="{Binding StatusDetail}" TextWrapping="Wrap" /></StackPanel></Grid></Border>
+      <Button Classes="primary" IsEnabled="{Binding CanStartSsh}" Click="OnStartOrStopSsh" AutomationProperties.Name="{Binding SshActionText}" ToolTip.Tip="{Binding SshActionText}" Content="{Binding SshActionText}" />
+            </StackPanel>
+          </Expander>
         </StackPanel>
       </ScrollViewer>
     </Border>
     <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
-      <Button Classes="primary" IsEnabled="{Binding CanStartSsh}" Click="OnStartOrStopSsh" AutomationProperties.Name="{Binding SshActionText}" ToolTip.Tip="{Binding SshActionText}" Content="{Binding SshActionText}" />
-      <Button Classes="secondary" Click="OnRefresh" AutomationProperties.Name="{Binding Texts.AuthCheck}" ToolTip.Tip="{Binding Texts.AuthCheck}" Content="{Binding Texts.AuthCheck}" />
-      <Button Classes="secondary" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" ToolTip.Tip="{Binding Texts.Close}" Content="{Binding Texts.Close}" />
+
+      <Button Classes="secondary" Click="OnRefresh" IsVisible="{Binding !IsDoneStep}" IsEnabled="{Binding CanRefresh}" AutomationProperties.AutomationId="Setup.Refresh" AutomationProperties.Name="{Binding RefreshButtonText}" ToolTip.Tip="{Binding RefreshButtonText}" Content="{Binding RefreshButtonText}" />
+      <Button Classes="secondary" IsVisible="{Binding !IsDoneStep}" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" ToolTip.Tip="{Binding Texts.Close}" Content="{Binding Texts.Close}" />
       <Button Classes="primary" IsEnabled="{Binding CanContinue}" Click="OnContinue" AutomationProperties.Name="{Binding ContinueText}" ToolTip.Tip="{Binding ContinueText}" Content="{Binding ContinueText}" />
     </StackPanel>
+  <Border Classes="window-frame" Classes.active="{Binding $parent[Window].IsActive}"
+            Grid.RowSpan="4" Margin="-28" IsHitTestVisible="False" />
   </Grid>
 </Window>

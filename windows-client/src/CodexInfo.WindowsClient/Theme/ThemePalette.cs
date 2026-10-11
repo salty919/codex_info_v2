@@ -127,9 +127,11 @@ public static class ThemePalette
         "#111B2C", "#244D74", "#8BD4FF",
     ];
 
-    private static readonly IReadOnlyDictionary<string, (string Dark, string Light)> GraphRoleColors =
+    private static readonly IReadOnlyDictionary<string, (string Dark, string Light)> SemanticRoleColors =
         new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase)
         {
+            ["WindowBorder"] = ("#8893A3", "#687586"),
+            ["WindowBorderActive"] = ("#71C7FF", "#176AAB"),
             [GraphRemaining] = ("#56B2F5", "#176AAB"),
             [GraphLuna] = ("#E6A23C", "#985F08"),
             [GraphTerra] = ("#5DC98A", "#16794B"),
@@ -208,13 +210,13 @@ public static class ThemePalette
         or PaperLight or SandLight or SteelLight or OceanDark or TealDark or EmberDark or InkDark
         or NeonDark or LavenderLight or MintLight or ForestDark or TangerineDark or RoseDark;
 
-    public static string Resolve(string classicColor) => GraphRoleColors.ContainsKey(classicColor)
-        ? ResolveGraphRoleFor(CurrentId, classicColor)
+    public static string Resolve(string classicColor) => SemanticRoleColors.ContainsKey(classicColor)
+        ? ResolveRoleFor(CurrentId, classicColor)
         : ResolveFor(CurrentId, classicColor);
 
-    private static string ResolveGraphRoleFor(string id, string roleKey)
+    private static string ResolveRoleFor(string id, string roleKey)
     {
-        if (!GraphRoleColors.TryGetValue(roleKey, out var colors))
+        if (!SemanticRoleColors.TryGetValue(roleKey, out var colors))
         {
             throw new ArgumentOutOfRangeException(nameof(roleKey), roleKey, "Unknown graph color role.");
         }
@@ -264,9 +266,9 @@ public static class ThemePalette
             key => key,
             key => (IBrush)new SolidColorBrush(Color.Parse(ResolveFor(id, key))),
             StringComparer.OrdinalIgnoreCase);
-        foreach (var roleKey in GraphRoleColors.Keys)
+        foreach (var roleKey in SemanticRoleColors.Keys)
         {
-            result[roleKey] = new SolidColorBrush(Color.Parse(ResolveGraphRoleFor(id, roleKey)));
+            result[roleKey] = new SolidColorBrush(Color.Parse(ResolveRoleFor(id, roleKey)));
         }
 
         return result;
@@ -285,7 +287,7 @@ public static class ThemePalette
                 : ThemeVariant.Dark;
             foreach (var (classic, brush) in brushes)
             {
-                if (GraphRoleColors.ContainsKey(classic))
+                if (SemanticRoleColors.ContainsKey(classic))
                 {
                     app.Resources[classic] = brush;
                 }
