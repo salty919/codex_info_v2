@@ -39,7 +39,14 @@ impl HistoryIndex {
                 periods_by_reset.range(sample.reset_at..=sample.reset_at.saturating_add(60))
             {
                 for period in periods {
-                    if sample.timestamp >= period.start_at && sample.timestamp <= period.end_at {
+                    if (sample.reset_at == period.reset_at
+                        || !periods_by_reset.contains_key(&sample.reset_at))
+                        && codex_info_rest_contract::history_minute_in_period(
+                            sample.timestamp,
+                            period.start_at,
+                            period.end_at,
+                        )
+                    {
                         index
                             .periods
                             .get_mut(&period.id)

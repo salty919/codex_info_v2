@@ -1,6 +1,7 @@
 <!-- codex-info-requirement-owner: DATA -->
 <!-- codex-info-master-ids:
 REST-LOG-RETENTION-482
+QUOTA-DURABLE-604
 RECORDER-MODEL-01
 CUM-138-01
 CUM-138-02
@@ -22,6 +23,19 @@ U128-19
 -->
 
 # Codex Info データ保護規約
+
+## QUOTA-DURABLE-604 — 利用枠の取得原本と再処理
+
+公式quotaの取得原本を先に永続化し、期間判定・Session集計・公開をその原本のconsumerにする。取得原本は派生履歴を複製する互換表ではなく、Session JSONLと同じ再処理入力である。`HISTORY-CANONICAL-134`はSession由来のmodel履歴と旧混合履歴を所有する。その判定を公式quota原本の採否に使わない。
+
+1. 完全な公式quota応答のpayload、取得時刻、取得順序、credentialを含まないaccount scopeを、quota解釈・期間採否・通知queue・Session処理より先にdurable commitする。解釈不能な応答も保持する。token、raw AccountKey、account/read payload、login IDは保存しない。
+2. 通知queueは原本を所有しない。満杯、最新値への集約、consumer停止、前回batch再試行で保存済み原本を削除・上書き・処理済みにしない。quota取得とSession集計は独立して進む。 residentはaccount/partitionとprofile leaseを確保後、Session DB初期化・復旧より先にquota原本取得を開始する。Session writerを開始できない間も原本を保存し、writer復旧後に再処理する。
+3. 不変な原本IDと取得順序を使用し、解釈済み公式quotaと適用済みIDをaccount DBの`quota_receipts`へ同じtransactionでcommitする。commit前の停止は同じ原本から再開し、commit後の通知欠落は二重加算しない。現在quotaは取得順序が最後の受理済み公式応答とし、過去再生やローカル時計の前後で巻き戻さない。履歴quotaも同じ受理済み記録から直接投影し、Session由来の派生履歴への二度目の書込みや別の完了位置を必要としない。同一分は最後に取得した公式観測を表示し、その前の観測も取得原本・受理済み記録から削除しない。modelはexactな`reset_at`とminuteが一致する観測だけを結合する。modelの欠落・読取り失敗・旧quotaとの不一致を公式quotaの破棄理由にしない。 履歴projectionのSQL失敗・公開domain/件数上限の不成立も、別に受理済みの現在quotaを取り消さない。現在値をError状態で公開し、生成できない履歴は明示的に利用不能とする。空履歴を正常な履歴として返さず、保存済み原本・receipt・Session eventは変更しない。
+4. account確認前後が不一致の応答も原本として保持し、確認済みaccountへ推測で帰属させない。原本保存と公開資格を別の状態として扱う。 当該accountへの受理済み記録があれば、再起動後の公開に新しいAPI応答や通知を要求しない。取得障害時も受理済みquotaを障害状態とともに公開する。
+5. 保存失敗時は成功通知・処理済み更新・新しい応答による未保存値の上書きを行わず、未保存応答を保持して保存再開を所有し、障害を公開する。保存後の解析・集計・公開失敗でも原本を保持し、再起動後に未反映分を再処理する。 未解釈の原本は後続の解釈可能な応答を止めず、未処理として残す。quota取得・再生の障害状態はthread記録の有無に依存せずgenerationとともに永続化・公開し、再生時に判明した未処理状態は受理済み記録と同じtransactionで確定する。別の取得成功だけで未解決の再生障害を正常化しない。
+   取得ownerのスコープ解放では新しいpollを開始せず、進行中の取得・原本保存が終了するまでworkerを所有する。周期待機は解放時に起こし、通常のreturn/Errが未保存応答を持つworkerだけを残して終了しない。SIGTERMはmainの停止要求として処理し、startup・周期・Thread結果の待機を起こして同じowner解放へ進む。保存失敗の再試行間隔は1秒とし、API取得間隔を流用しない。子app-serverも停止した場合は受信済みpayloadを原本に残し、account再確認が完了しなかった記録を確認済みに偽装しない。原本保存前のSIGKILL（保存障害中に停止猶予を超えて強制終了された場合を含む）と保存装置そのものの喪失は、ユーザー合意により保証対象外とする。通常の処理失敗・保存失敗・再処理失敗・再起動・SIGTERMでは、上記の所有と再処理を維持する。
+6. Session原本からのquota復元は元の観測時刻・出所を保持する。原本にない残量を推測・補間・旧値複製で保存しない。model利用量の復元とquota実測の復元を区別する。新期間内の誤所属履歴も原本から再構成する。
+7. 取得→保存→解釈→適用→公開→再起動の各失敗について、原本の件数・内容・順序、未反映位置、二重計上なし、現在quotaの優先、DB/REST/実画面を立証する。保証対象は処理・保存・再処理のソフトウェア上の欠落である。原本保存前のSIGKILLと保存装置そのものの喪失を対象に含めない。保証対象内の未解決境界を残して完了にせず、ソースの実装・直接検証と配布済み環境への反映を区別して報告する。
 
 ## WIN-THEME-PREF-422 — Windows theme preference
 
@@ -46,10 +60,10 @@ Windows clientの設定JSONは従来のexact 6 keyを有効な旧形式として
 ## HISTORY-CANONICAL-134 — account履歴の永続的な正規化
 
 - account registryが宣言し、`storage_partition`のidentityと`quick_check`を検証できる全初期化済みpartitionを対象とする。現在ログイン中か、過去accountか、表示用login IDがあるかを対象判定に使わない。registry外、orphan、symlink、unreadable、schema不正、identity不一致のfileは変更せずdegradedとして列挙し、空DBへの置換、別accountへのfallback、推測修復を行わない。全対象partitionが同じalgorithm versionへ到達するまでmigration完了としない。
-- この変換の目的は、旧writerが作った重複`reset_at` aliasと範囲外quota sentinelを稼働DBから完全に排除し、将来のreader・graph・修復処理がそれらを再解釈する余地をなくすことである。移行前の原形は検証済みSQLite backupだけに保存し、稼働DB内へraw互換表、canonical別表、revision同期表、例外補償用stateを追加してはならない。稼働中の履歴正本は`usage_history`一表だけとする。
+- この変換の目的は、旧writerが作った重複`reset_at` aliasと範囲外quota sentinelを稼働DBから完全に排除し、将来のreader・graph・修復処理がそれらを再解釈する余地をなくすことである。移行前の原形は検証済みSQLite backupだけに保存し、稼働DB内へraw互換表、canonical別表、revision同期表、例外補償用stateを追加してはならない。Session由来の派生model履歴と旧混合履歴の正本は`usage_history`一表だけとする。公式quota取得原本とその受理済み記録は`QUOTA-DURABLE-604`が所有し、この旧履歴の移行規則へ入力しない。
 - `HistoryCanonicalizer`はPRODUCTの既存bounded rolling・quota・componentwise-dominance・境界規則を実装する唯一のauthorityとする。migrationは保持対象の全`usage_history` rowへ同じ純粋関数を一度適用し、同一timestampを一つのcanonical periodへだけ所属させる。既知の旧sentinelであるexact numeric `-1`はmigration入力でだけ「quota未観測」と解釈して`NULL`へ置換する。通常reader/writerでは`-1`を含む範囲外値を許容しない。同一period内のquota競合・非比較・dominant不存在は値を選択・合成せず、その局所minuteと対応sidecarだけをlive canonical集合から除外して原形をverified backupへ保持する。period ownerまたはcycle境界を一意に決められない場合だけ、そのpartition全体を無変更で失敗させる。
 - 初回migrationはpartition writer lock取得後、現行SQLite connectionからonline backupを作成し、`.bak.1`〜`.bak.3`の既存検証・保持規則を通した後だけ`BEGIN IMMEDIATE`する。DB/WAL/SHMを個別file copyせず、backupはcommit済みsnapshotを含む。backupのraw row countとordered deterministic raw-row fingerprintが移行直前のsourceと一致することを確認し、transaction内で`usage_history`をcanonical row集合へ置換する。`HistoryCanonicalizer`は各canonical rowと同時に、実際に採用したraw usage rowのexact旧`timestamp/reset_at`を返す。対応する`usage_model_history`はそのexact旧キーに結び付いた一群だけを同じcanonical keyへ移し、捨てたreset aliasにだけ結び付いたmodel群を混合・補間・比較選択しない。既存`durable_state`内のhistory observationもexact旧キーが採用rowと一致し、かつ全usage vectorがcanonical rowと一致するものだけを同transactionで再所属する。所属不明、canonical vector不一致、または捨てたaliasのsidecarは正しい観測へ作り替えずlive sidecarから除去し、原形はbackupだけに残す。旧alias row、`-1`、orphan sidecar、並列履歴表を稼働DBへ残さない。
-- 移行後の`usage_history`は`timestamp`を全表で一意、`remaining_percent`を`NULL`または有限な`0..100`、cost/tokenを有限な非負値としてDB制約でも強制する。`usage_model_history`も同一timestamp/modelを一意とし、canonical `usage_history`に対応しないrowを禁止する。通常writeは既存rowとincoming batchを同じperiod判定で一つへreconcileしてから一transactionで保存し、別`reset_at` alias、不正quota、orphan sidecarを生成できない。readerはこの一表のcanonical `reset_at`を期間所属のauthorityとして直接読み、同じexact keyのmodel・provenanceだけを結合する。最新quotaの公開window内にあるという理由で別periodのrowをcurrentへ再所属させず、current quota・modelは同じcanonical periodと公開windowに所属するrowだけから選ぶ。current recorderでは同じprovider `resetsAt`を一期間へまとめ、次の公式応答で日時が変われば新periodへ保存する。同一分が旧periodと競合するときは新periodの再計算済みvectorでその分の派生rowとsidecarを同一transaction内で置換する。旧periodの大きい累計を引き継がず、Session原本・event・checkpointと他の分の履歴を保持する。raw互換分岐、読出し時merge、UI/RESTでの補償を行わない。
+- 移行後の`usage_history`は`timestamp`を全表で一意、`remaining_percent`を`NULL`または有限な`0..100`、cost/tokenを有限な非負値としてDB制約でも強制する。`usage_model_history`も同一timestamp/modelを一意とし、canonical `usage_history`に対応しないrowを禁止する。通常writeは既存rowとincoming batchを同じperiod判定で一つへreconcileしてから一transactionで保存し、別`reset_at` alias、不正quota、orphan sidecarを生成できない。readerはこの一表のcanonical `reset_at`をSession由来modelの期間所属として直接読み、同じexact keyのmodel・provenanceだけを結合する。公式quotaとその期間は`QUOTA-DURABLE-604`の受理済み記録を優先し、その公開window内にあるという理由で別periodのmodelをcurrentへ再所属させない。current recorderでは同じprovider `resetsAt`を一期間へまとめ、次の公式応答で日時が変われば新periodへ保存する。同一分が旧periodと競合するときは新periodの再計算済みvectorでその分の派生rowとsidecarを同一transaction内で置換する。旧periodの大きい累計を引き継がず、Session原本・event・checkpointと他の分の履歴を保持する。raw互換分岐、読出し時merge、UI/RESTでの補償を行わない。
 - backup、lock、identity、schema、raw fingerprint、period/cycle境界、sidecar対応、DB制約、commitのどれかが失敗した場合は全rollbackし、source DB、verified backup、last-good publicationを保持する。同一period内の局所quota/vector不成立は上記canonical除外規則で処理し、partition失敗へ読み替えない。crashがcommit前なら旧schema、commit後ならcanonical単一表とschema versionが一括で可視になる。commit後のfresh read-only readbackに失敗した場合はpublicationを進めない。完成済みschemaの再実行は履歴rowとbackup generationを変更しないno-opとする。
 - 再発防止の合格条件は、製品schema/codeに`canonical_usage_history`、`usage_history_observations`、`history_canonical_state`およびそれらの互換分岐が0件、移行後DBに範囲外quota・同一timestamp重複・旧resetのhistory observation・orphan model sidecarが0件であることを直接確認することである。新しい永続表・revision・例外補償を必要とする案は本目的のscope外として実装せず、先に要件変更の明示確認を必要とする。
 

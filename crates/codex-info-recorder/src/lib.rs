@@ -7,6 +7,8 @@
 
 #![deny(unsafe_code)]
 
+mod quota_journal;
+
 use chrono::{DateTime, Months, Utc};
 use codex_info::{security, thread_contract};
 use codex_info_db_writer::{
@@ -31,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -469,7 +471,8 @@ impl fmt::Debug for QuotaPollEvent {
 /// available to the next recorder cycle.
 pub struct QuotaPoller {
     receiver: Receiver<QuotaPollResult>,
-    _worker: JoinHandle<()>,
+    worker: Option<JoinHandle<()>>,
+    stopping: Arc<AtomicBool>,
     latest: Option<QuotaPollCandidate>,
     events: Vec<QuotaPollEvent>,
 }
@@ -480,15 +483,17 @@ impl QuotaPoller {
     }
 
     /// Start the quota lane with the caller's polling cadence. The worker
-    /// never waits on the Session recorder; a full result queue only drops a
-    /// stale observation and does not stop the lane.
+    /// never waits on the Session recorder. Every response is journaled before
+    /// this queue; coalescing notifications cannot discard the acquisition.
     pub fn start_with_interval(interval_secs: u64) -> Self {
         let (sender, receiver) = mpsc::sync_channel(2);
         let interval_secs = interval_secs.max(1);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         let worker = thread::spawn(move || {
             let mut schedule = FixedRateSchedule::new(Duration::from_secs(interval_secs));
-            loop {
-                let result = fetch_quota_snapshot();
+            while !worker_stopping.load(Ordering::Acquire) {
+                let result = fetch_quota_snapshot(&sender);
                 match sender.try_send(result) {
                     Ok(()) | Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => break,
@@ -500,14 +505,21 @@ impl QuotaPoller {
                         wait.missed_deadlines
                     );
                 }
-                if !wait.sleep_for.is_zero() {
-                    thread::sleep(wait.sleep_for);
+                let deadline = Instant::now() + wait.sleep_for;
+                while !worker_stopping.load(Ordering::Acquire) {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    // Recheck the deadline after a spurious wake. Shutdown
+                    // wakes this wait without shortening normal cadence.
+                    thread::park_timeout(remaining);
                 }
             }
         });
         Self {
             receiver,
-            _worker: worker,
+            worker: Some(worker),
+            stopping,
             latest: None,
             events: Vec::new(),
         }
@@ -544,6 +556,20 @@ impl QuotaPoller {
     }
 }
 
+impl Drop for QuotaPoller {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            // A normal process exit cannot abandon the response owned by
+            // fetch_quota_snapshot, including a pending journal write.
+            if worker.join().is_err() {
+                eprintln!("recorder degraded: quota worker terminated unexpectedly");
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActiveThreadPollResult {
     Snapshot {
@@ -569,6 +595,7 @@ enum ActiveThreadPollCommand {
 pub struct ThreadPoller {
     sender: SyncSender<ActiveThreadPollCommand>,
     receiver: Receiver<ActiveThreadPollResult>,
+    waiter: Arc<Mutex<Option<thread::Thread>>>,
     _worker: JoinHandle<()>,
 }
 
@@ -576,17 +603,23 @@ impl ThreadPoller {
     pub fn start(sessions_root: PathBuf) -> Self {
         let (sender, commands) = mpsc::sync_channel(1);
         let (results, receiver) = mpsc::sync_channel(2);
+        let waiter = Arc::new(Mutex::new(None::<thread::Thread>));
+        let worker_waiter = Arc::clone(&waiter);
         let worker = thread::spawn(move || {
             while let Ok(ActiveThreadPollCommand::Probe { checkpoints }) = commands.recv() {
                 let result = collect_active_thread_snapshot(&sessions_root, &checkpoints);
                 // Never let an app-server result block or back up the Session
                 // loop. A later cycle will request a fresh snapshot.
                 let _ = results.try_send(result);
+                if let Some(waiter) = worker_waiter.lock().unwrap().as_ref() {
+                    waiter.unpark();
+                }
             }
         });
         Self {
             sender,
             receiver,
+            waiter,
             _worker: worker,
         }
     }
@@ -613,7 +646,30 @@ impl ThreadPoller {
     /// Completed normal or adaptive thread probes can be committed without
     /// advancing Session collection; the caller tracks one in-flight probe.
     pub fn wait_for(&self, timeout: Duration) -> Option<ActiveThreadPollResult> {
-        self.receiver.recv_timeout(timeout).ok()
+        self.wait_for_interruptible(timeout, || false)
+    }
+
+    /// The shutdown owner sets its flag and unparks this caller. Register
+    /// before reading the queue so a completed probe cannot lose its wakeup.
+    pub fn wait_for_interruptible(
+        &self,
+        timeout: Duration,
+        interrupted: impl Fn() -> bool,
+    ) -> Option<ActiveThreadPollResult> {
+        *self.waiter.lock().unwrap() = Some(thread::current());
+        let deadline = Instant::now() + timeout;
+        loop {
+            if interrupted() {
+                return None;
+            }
+            match self.receiver.try_recv() {
+                Ok(result) => return Some(result),
+                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Empty) => {}
+            }
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            thread::park_timeout(remaining);
+        }
     }
 }
 
@@ -1019,8 +1075,20 @@ fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), ()> {
     .scan()
 }
 
-fn fetch_quota_snapshot() -> QuotaPollResult {
-    let authority_before = read_account_authority(&default_codex_home())?;
+fn fetch_quota_snapshot(notifications: &SyncSender<QuotaPollResult>) -> QuotaPollResult {
+    let codex_home = default_codex_home();
+    let data_root = std::env::var_os("CODEX_INFO_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| codex_home.clone());
+    let authority_before = read_account_authority(&codex_home)?;
+    let scope = codex_info_account_locator::current_account_scope_id(&codex_home, &data_root).ok();
+    if read_account_authority(&codex_home)? != authority_before {
+        return Err("Codex account authority changed before quota read".to_owned());
+    }
+    let mut receipt_id = [0_u8; 32];
+    getrandom::fill(&mut receipt_id)
+        .map_err(|_| "quota acquisition identity could not be allocated".to_owned())?;
+    let receipt_id = hex_digest(&receipt_id);
     let executable = resolve_codex_executable()?;
     let mut child = Command::new(executable)
         .args(["app-server", "--stdio"])
@@ -1065,7 +1133,16 @@ fn fetch_quota_snapshot() -> QuotaPollResult {
             "account/rateLimits/read",
             Value::Null,
         )?;
-        let snapshot = parse_app_server_quota(&rate_limits, &account.plan_type)?;
+        let receipt = quota_journal::QuotaReceipt::new(
+            Utc::now().timestamp(),
+            scope,
+            &account.plan_type,
+            &rate_limits,
+        )
+        .with_id(receipt_id);
+        // This stack frame owns the response until durable commit. Failure
+        // reports health but does not fetch a newer value or discard this one.
+        persist_quota_receipt(&receipt, &data_root, false, notifications);
         let account_recheck =
             request_app_server(&mut input, &output, 4, "account/read", json!({}))?;
         let account_after = decode_app_server_account(&account_recheck)?;
@@ -1079,6 +1156,9 @@ fn fetch_quota_snapshot() -> QuotaPollResult {
             return Err("Codex account identity changed during quota read".to_owned());
         }
         let epoch = AccountEpochProof::from_verified_authority(authority_after)?;
+        persist_quota_receipt(&receipt, &data_root, true, notifications);
+        let mut snapshot = parse_app_server_quota(&rate_limits, &account.plan_type)?;
+        snapshot.observed_at = receipt.observed_at;
         Ok(QuotaPollSuccess {
             snapshot,
             login_id: account.email,
@@ -1091,6 +1171,23 @@ fn fetch_quota_snapshot() -> QuotaPollResult {
     let _ = child.kill();
     let _ = child.wait();
     result
+}
+
+fn persist_quota_receipt(
+    receipt: &quota_journal::QuotaReceipt,
+    data_root: &Path,
+    verified: bool,
+    notifications: &SyncSender<QuotaPollResult>,
+) {
+    while let Err(error) = receipt.save(data_root, verified) {
+        // Neither a full nor a disconnected notification queue owns this
+        // unsaved response. Keep it until storage accepts the same receipt.
+        eprintln!("recorder degraded: {error}");
+        let _ = notifications.try_send(Err(error));
+        // Storage recovery owns its cadence. The API sampling interval can
+        // exceed the service stop deadline and must not delay this write.
+        thread::sleep(Duration::from_secs(1));
+    }
 }
 
 fn resolve_codex_executable() -> Result<PathBuf, String> {
@@ -3065,6 +3162,12 @@ pub fn synchronize_inactive_partition(
     Ok(())
 }
 
+/// Durable replay progress. Uninterpretable input remains in the journal.
+pub struct QuotaReplayOutcome {
+    pub generation: Option<u64>,
+    pub unresolved: usize,
+}
+
 pub struct Recorder {
     config: RecorderConfig,
     writer: UsageStore,
@@ -3287,6 +3390,14 @@ impl Recorder {
             .commit_active_thread_snapshot_with_health(snapshot, acquisition_degraded)?)
     }
 
+    pub fn set_quota_acquisition_degraded(&mut self, degraded: bool) -> Result<(), RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        Ok(self.writer.set_quota_acquisition_degraded(degraded)?)
+    }
+
     pub fn mark_active_thread_snapshot_degraded(&mut self) -> Result<u64, RecorderError> {
         let _epoch_fence = account_epoch_commit_fence()?;
         if account_boundary_changed() {
@@ -3356,11 +3467,63 @@ impl Recorder {
         &self.last_ranges
     }
 
+    /// Replay durable quota input independently of Session collection. The
+    /// target DB transaction owns both the receipt and its applied marker.
+    pub fn replay_quota_journal<F>(
+        &mut self,
+        data_root: &Path,
+        account_scope: &str,
+        commit_guard: F,
+    ) -> Result<QuotaReplayOutcome, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let applied = self.writer.applied_quota_receipt_ids()?;
+        let batch = quota_journal::read_unapplied(data_root, account_scope, &applied)
+            .map_err(RecorderError::Invalid)?;
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() || !commit_guard() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        Ok(QuotaReplayOutcome {
+            generation: self
+                .writer
+                .commit_quota_receipts(&batch.receipts, batch.unresolved != 0)?,
+            unresolved: batch.unresolved,
+        })
+    }
+
+    pub fn has_accepted_quota(&self) -> Result<bool, RecorderError> {
+        Ok(self.writer.latest_quota_receipt()?.is_some())
+    }
+
     /// Collect one bounded cycle. If a prior commit failed, the exact
     /// candidate vectors are retried without rescanning or changing their
     /// generation identity.
     pub fn run_cycle(&mut self) -> Result<Option<CycleReport>, RecorderError> {
         self.run_cycle_with_quota(None)
+    }
+
+    /// Resident collection always takes its quota input from accepted durable
+    /// receipts. Notifications and a new API response are not required after
+    /// restart. The caller's account fence still owns the commit boundary.
+    pub fn run_cycle_with_stored_quota_guarded<F>(
+        &mut self,
+        commit_guard: F,
+    ) -> Result<Option<CycleReport>, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let quota = self
+            .writer
+            .latest_quota_receipt()?
+            .map(|receipt| QuotaSnapshot {
+                observed_at: receipt.observed_at,
+                reset_at: receipt.reset_at,
+                window_seconds: receipt.window_seconds,
+                remaining_percent: Some(receipt.remaining_percent),
+            });
+        self.run_cycle_with_quota_guarded(quota, commit_guard)
     }
 
     /// Collect one cycle while optionally admitting a quota observation from
@@ -7666,6 +7829,7 @@ mod tests {
         let poller = ThreadPoller {
             sender,
             receiver,
+            waiter: Arc::new(Mutex::new(None)),
             _worker: worker,
         };
 
@@ -8392,7 +8556,8 @@ mod tests {
         let worker = thread::spawn(|| {});
         let mut poller = QuotaPoller {
             receiver,
-            _worker: worker,
+            worker: Some(worker),
+            stopping: Arc::new(AtomicBool::new(false)),
             latest: None,
             events: Vec::new(),
         };

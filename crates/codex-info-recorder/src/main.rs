@@ -18,9 +18,50 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const RECORDER_VERSION: &str = env!("CARGO_PKG_VERSION");
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+}
+
+fn shutdown_sleep(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while !shutdown_requested() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        std::thread::park_timeout(remaining);
+    }
+}
+
+fn install_shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let mut terminate = {
+            let _entered = runtime.enter();
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
+        };
+        let owner = std::thread::current();
+        std::thread::Builder::new()
+            .name("recorder-stop".into())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    if terminate.recv().await.is_some() {
+                        SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                        owner.unpark();
+                    }
+                });
+            })?;
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 struct Options {
@@ -179,6 +220,11 @@ fn desired_acquisition_degraded(quota: LaneHealth, threads: LaneHealth) -> Optio
 }
 
 fn sync_acquisition_health(recorder: &mut Recorder, quota: LaneHealth, threads: LaneHealth) {
+    if quota != LaneHealth::Unknown {
+        if let Err(error) = recorder.set_quota_acquisition_degraded(quota == LaneHealth::Failed) {
+            eprintln!("codex-info-recorder quota health commit failed: {error}");
+        }
+    }
     let result = match desired_acquisition_degraded(quota, threads) {
         Some(true) => recorder.mark_active_thread_snapshot_degraded(),
         Some(false) => recorder.clear_active_thread_snapshot_degraded(),
@@ -314,19 +360,25 @@ where
         return Err(RecorderError::AccountBoundaryChanged.into());
     }
     match publication {
-        CyclePublication::Committed { .. } if quota_health != LaneHealth::Ready => {
-            // A newly admitted account is not public-current until its own
-            // app-server quota has been committed. Leaving the prior recorder
-            // authority untouched keeps REST in `initializing` instead of
-            // exposing the previous account's reset time.
-            eprintln!("codex-info-recorder awaiting fresh current-account quota");
+        CyclePublication::Committed { .. }
+            if quota_health != LaneHealth::Ready
+                && !recorder.has_accepted_quota().unwrap_or_else(|error| {
+                    eprintln!("codex-info-recorder quota authority read failed: {error}");
+                    false
+                }) =>
+        {
+            // Accepted current-account input survives restart. Its publication
+            // does not depend on a fresh network response or queue notification.
+            eprintln!("codex-info-recorder awaiting durable current-account quota");
         }
         CyclePublication::Committed { has_pending } => match recorder.state() {
             Ok(state) => {
                 if !epoch_matches(cycle_epoch) {
                     return Err(RecorderError::AccountBoundaryChanged.into());
                 }
-                match state_writer.write_committed(&state, has_pending) {
+                match state_writer
+                    .write_committed(&state, has_pending || quota_health != LaneHealth::Ready)
+                {
                     Ok(()) => eprintln!(
                         "codex-info-recorder acknowledged generation={} cycle={}",
                         state.data_generation, state.cycle_seq
@@ -411,7 +463,7 @@ where
         quota_health,
         &mut *epoch_matches,
     )?;
-    if options.once {
+    if options.once || shutdown_requested() {
         if cadence.checkpoint_recovery.pending {
             *thread_health = LaneHealth::Failed;
             sync_acquisition_health(recorder, quota_health, *thread_health);
@@ -426,6 +478,9 @@ where
     if !remaining.is_zero() {
         let deadline = now + remaining;
         loop {
+            if shutdown_requested() {
+                return Ok(false);
+            }
             let now = clock();
             if now >= deadline {
                 break;
@@ -507,6 +562,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{RECORDER_VERSION}");
         return Ok(());
     }
+    install_shutdown_signal()?;
     let mut options = Options::parse(arguments)?;
     prepare_recorder_data_root(&options.data_root)
         .map_err(|error| format!("prepare recorder data root: {error}"))?;
@@ -566,37 +622,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             previous.partition_id.as_deref() != Some(options.identity.partition_id.as_str())
         })
         .map(|previous| previous.transition_fingerprint.as_str());
-    let lifecycle_intervals = options
+    let startup_epoch = AccountEpochProof::capture(&options.codex_home)
+        .map_err(|_| RecorderError::AccountBoundaryChanged)?;
+    // The raw input owner starts before Session storage admission. A broken
+    // derived table or a temporarily unavailable writer must not stop quota
+    // acquisition; the accepted journal can be replayed after storage recovers.
+    let mut quota_poller = QuotaPoller::start_with_interval(options.interval_secs);
+    let lifecycle_intervals: Vec<_> = options
         .partition
         .lifecycle_intervals
         .iter()
         .map(|interval| SessionLifecycleInterval::new(interval.start_at, interval.end_at))
         .collect();
-    let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
-        RecorderConfig {
-            sessions_root: options.sessions_root.clone(),
-            chunk_bytes: options.chunk_bytes,
-        },
-        &options.database,
-        &options.identity,
-        options.partition.activation_timestamp,
-        transition_fingerprint,
-        lifecycle_intervals,
-    )?;
-    let startup_epoch = AccountEpochProof::capture(&options.codex_home)
-        .map_err(|_| RecorderError::AccountBoundaryChanged)?;
-    let startup_backup = UsageStore::backup_generations_partitioned_verified(
-        &options.database,
-        &options.identity,
-        3,
-    )?;
-    if recorder.reconcile_session_lifecycle_guarded(&startup_backup, || {
-        recorder_epoch_matches(&options, &startup_epoch)
-    })? {
-        eprintln!("codex-info-recorder repaired session totals across account lifecycles");
-    }
-    mark_partition_initialized(&options.data_root, &options.partition)
-        .map_err(|error| format!("mark account partition initialized: {error}"))?;
+    let mut recorder = loop {
+        if shutdown_requested() {
+            return Ok(());
+        }
+        if !recorder_epoch_matches(&options, &startup_epoch) {
+            return Err(RecorderError::AccountBoundaryChanged.into());
+        }
+        let initialized = (|| -> Result<Recorder, Box<dyn std::error::Error>> {
+            let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+                RecorderConfig {
+                    sessions_root: options.sessions_root.clone(),
+                    chunk_bytes: options.chunk_bytes,
+                },
+                &options.database,
+                &options.identity,
+                options.partition.activation_timestamp,
+                transition_fingerprint,
+                lifecycle_intervals.clone(),
+            )?;
+            let startup_backup = UsageStore::backup_generations_partitioned_verified(
+                &options.database,
+                &options.identity,
+                3,
+            )?;
+            if recorder.reconcile_session_lifecycle_guarded(&startup_backup, || {
+                recorder_epoch_matches(&options, &startup_epoch)
+            })? {
+                eprintln!("codex-info-recorder repaired session totals across account lifecycles");
+            }
+            mark_partition_initialized(&options.data_root, &options.partition)
+                .map_err(|error| format!("mark account partition initialized: {error}"))?;
+            Ok(recorder)
+        })();
+        match initialized {
+            Ok(recorder) => break recorder,
+            Err(error) => {
+                if !recorder_epoch_matches(&options, &startup_epoch) {
+                    return Err(RecorderError::AccountBoundaryChanged.into());
+                }
+                eprintln!("codex-info-recorder degraded Session startup: {error}");
+                if options.once {
+                    return Err(error);
+                }
+                shutdown_sleep(Duration::from_secs(options.interval_secs));
+            }
+        }
+    };
     // Existing inactive partitions have no live writer. Bring every
     // initialized partition to the same durable history schema now, while
     // this process owns the profile lease. Login metadata is optional and
@@ -631,21 +715,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut state_writer =
         RecorderStateWriter::new(&options.data_root, &options.identity, &_profile_lease)?;
-    let mut quota_poller = QuotaPoller::start_with_interval(options.interval_secs);
     let thread_poller = ThreadPoller::start(options.sessions_root.clone());
     let mut schedule = FixedRateSchedule::new(Duration::from_secs(options.interval_secs));
     let mut thread_cadence = AdaptiveThreadCadence::default();
-    let mut quota_health = LaneHealth::Unknown;
+    let mut quota_poll_health = LaneHealth::Unknown;
     let mut thread_health = LaneHealth::Unknown;
     loop {
+        if shutdown_requested() {
+            return Ok(());
+        }
         let cycle_epoch = AccountEpochProof::capture(&options.codex_home)
             .map_err(|_| RecorderError::AccountBoundaryChanged)?;
         if !recorder_epoch_matches(&options, &cycle_epoch) {
             return Err(RecorderError::AccountBoundaryChanged.into());
         }
+        let replay_failed = match recorder.replay_quota_journal(
+            &options.data_root,
+            &options.partition.account_scope_id,
+            || recorder_epoch_matches(&options, &cycle_epoch),
+        ) {
+            Ok(outcome) => {
+                if outcome.unresolved != 0 {
+                    eprintln!(
+                        "codex-info-recorder quota replay unresolved={}",
+                        outcome.unresolved
+                    );
+                }
+                outcome.unresolved != 0
+            }
+            Err(RecorderError::AccountBoundaryChanged) => {
+                return Err(RecorderError::AccountBoundaryChanged.into());
+            }
+            Err(error) => {
+                eprintln!("codex-info-recorder degraded quota replay: {error}");
+                true
+            }
+        };
+        let mut quota_health = if replay_failed {
+            LaneHealth::Failed
+        } else {
+            quota_poll_health
+        };
+        sync_acquisition_health(&mut recorder, quota_health, thread_health);
         let early_recollection = if thread_cadence.checkpoint_recovery.pending {
             if !thread_cadence.begin_checkpoint_recovery(&cycle_epoch) {
-                std::thread::sleep(schedule.time_until_deadline(Instant::now()));
+                shutdown_sleep(schedule.time_until_deadline(Instant::now()));
                 schedule.complete_cycle(Instant::now());
                 continue;
             }
@@ -653,22 +767,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             false
         };
-        let quota_candidate = quota_poller.latest();
-        if quota_candidate
-            .as_ref()
-            .is_some_and(|candidate| !candidate.validate_current(&options.codex_home))
+        // Drain notifications for health reporting only. The durable receipt
+        // store, including replay after restart, owns the actual quota input.
+        let _ = quota_poller.latest();
+        let publication = match recorder
+            .run_cycle_with_stored_quota_guarded(|| recorder_epoch_matches(&options, &cycle_epoch))
         {
-            return Err(RecorderError::AccountBoundaryChanged.into());
-        }
-        let quota = quota_candidate
-            .as_ref()
-            .map(|candidate| candidate.snapshot().clone());
-        let publication = match recorder.run_cycle_with_quota_guarded(quota, || {
-            recorder_epoch_matches(&options, &cycle_epoch)
-                && quota_candidate
-                    .as_ref()
-                    .is_none_or(|candidate| candidate.validate_current(&options.codex_home))
-        }) {
             Ok(Some(report)) => {
                 eprintln!(
                     "codex-info-recorder generation={} accepted={} pending={} sources={}",
@@ -720,7 +824,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !recorder_epoch_matches(&options, &epoch) {
                         return Err(RecorderError::AccountBoundaryChanged.into());
                     }
-                    quota_health = LaneHealth::Ready;
+                    quota_poll_health = LaneHealth::Ready;
+                    quota_health = if replay_failed {
+                        LaneHealth::Failed
+                    } else {
+                        LaneHealth::Ready
+                    };
                     // A display-label failure must never stop or delay the
                     // recorder's authoritative Session/DB path.
                     if let Err(error) = recorder.set_partition_login_id(&login_id) {
@@ -747,6 +856,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("codex-info-recorder quota lane ready");
                 }
                 QuotaPollEvent::Failed => {
+                    quota_poll_health = LaneHealth::Failed;
                     quota_health = LaneHealth::Failed;
                     eprintln!("codex-info-recorder quota lane degraded");
                 }
@@ -758,8 +868,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut submit = |checkpoints: &[SessionCheckpoint]| thread_poller.submit(checkpoints);
         let mut drain = || thread_poller.drain();
-        let mut wait_for = |duration: Duration| thread_poller.wait_for(duration);
-        let mut sleep = |duration: Duration| std::thread::sleep(duration);
+        let mut wait_for =
+            |duration: Duration| thread_poller.wait_for_interruptible(duration, shutdown_requested);
+        let mut sleep = shutdown_sleep;
         let mut clock = || Instant::now();
         let mut epoch_matches = |epoch: &AccountEpochProof| recorder_epoch_matches(&options, epoch);
         if !complete_cycle_publication_and_wait(
@@ -806,7 +917,10 @@ fn run_without_account(
     }
     let heartbeat = Duration::from_secs(options.interval_secs.clamp(1, 5));
     loop {
-        std::thread::sleep(heartbeat);
+        shutdown_sleep(heartbeat);
+        if shutdown_requested() {
+            return Ok(());
+        }
         let auth_path = options.codex_home.join("auth.json");
         match fs::symlink_metadata(&auth_path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {

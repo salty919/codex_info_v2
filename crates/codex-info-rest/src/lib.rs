@@ -49,6 +49,7 @@ pub struct PublishedSnapshot {
     pub generation: u64,
     pub data_hash: String,
     pub pair: String,
+    pub history_available: bool,
     pub has_pending_ranges: bool,
     pub details: PublicDetails,
     pub models_v3: Vec<codex_info_rest_contract::PublicModelUsageV3>,
@@ -89,6 +90,7 @@ impl PublishedSnapshot {
             data_hash: snapshot.data_hash,
             pair,
             has_pending_ranges: snapshot.has_pending_ranges,
+            history_available: snapshot.history_available,
             details: snapshot.details,
             models_v3: snapshot.models_v3,
             history_samples_v3: snapshot.history_samples_v3,
@@ -120,6 +122,7 @@ impl PublishedSnapshot {
             pair: format!("v1:{:016x}{state_code:016x}{generation:032x}", 0),
             data_hash,
             has_pending_ranges: false,
+            history_available: true,
             details,
             models_v3: Vec::new(),
             history_samples_v3: Vec::new(),
@@ -1145,6 +1148,15 @@ fn write_route_error(stream: &mut TcpStream, log: &FailureLog, route: &str, erro
             None,
             false,
         ),
+        RouteError::HistoryUnavailable => write_json_response(
+            stream,
+            log,
+            route,
+            503,
+            error_body("history_unavailable"),
+            None,
+            false,
+        ),
         RouteError::Serialization => write_json_response(
             stream,
             log,
@@ -1394,6 +1406,7 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteError {
     Serialization,
+    HistoryUnavailable,
     UnknownPeriod,
     StaleCursor,
 }
@@ -1405,6 +1418,9 @@ fn serialize_route(
     cursor: Option<String>,
     degraded: bool,
 ) -> Result<Vec<u8>, RouteError> {
+    if !snapshot.history_available && matches!(route, Route::HistoryPeriodsV3 | Route::HistoryV3) {
+        return Err(RouteError::HistoryUnavailable);
+    }
     let details = &snapshot.details;
     match route {
         Route::Health => Ok(health_body()),
@@ -1765,6 +1781,7 @@ mod tests {
             data_hash: "hash".to_owned(),
             pair: "pair".to_owned(),
             has_pending_ranges: false,
+            history_available: true,
             details,
             models_v3: Vec::new(),
             history_samples_v2: Vec::new(),
@@ -1825,6 +1842,7 @@ mod tests {
             data_hash: "hash".to_owned(),
             pair: "pair".to_owned(),
             has_pending_ranges: false,
+            history_available: true,
             details,
             models_v3: Vec::new(),
             history_samples_v2: Vec::new(),
@@ -1972,6 +1990,7 @@ mod tests {
                 generation,
                 data_hash: format!("{generation:064x}"),
                 has_pending_ranges: false,
+                history_available: true,
                 details,
                 models_v3: Vec::new(),
                 history_samples_v2: Vec::new(),
@@ -2063,6 +2082,7 @@ mod tests {
             generation,
             data_hash: format!("{generation:064x}"),
             has_pending_ranges: snapshot.has_pending_ranges,
+            history_available: snapshot.history_available,
             details: snapshot.details,
             models_v3: snapshot.models_v3,
             history_samples_v2: snapshot.history_samples_v2,
@@ -2241,6 +2261,7 @@ mod tests {
                 generation: 1,
                 data_hash: format!("{:064x}", 1),
                 has_pending_ranges: false,
+                history_available: true,
                 details,
                 models_v3: Vec::new(),
                 history_samples_v2: Vec::new(),
@@ -2923,6 +2944,217 @@ mod tests {
             ),
         );
         assert!(unchanged.starts_with("HTTP/1.1 304"));
+        server.shutdown();
+    }
+
+    #[test]
+    fn quota_current_is_independent_of_history_publication_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("quota-history-failure.sqlite3");
+        fixture(&path, 10);
+        let mut server = RestServer::start(
+            DbReader::open(&path).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let current_request = "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n";
+        let previous = request(server.local_addr(), current_request);
+        assert_eq!(
+            serde_json::from_str::<Value>(body(&previous)).unwrap()["quota"]["remaining_percent"],
+            50.0
+        );
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,
+             sequence INTEGER, observed_at INTEGER, reset_at INTEGER,
+             window_seconds INTEGER, remaining_percent REAL, applied_generation TEXT);
+             WITH RECURSIVE receipts(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM receipts WHERE n<128)
+             INSERT INTO quota_receipts SELECT printf('%064x', n+1), n+1,
+                 1800000000+n*60,1800604800+n*60,604800,99.0,'2' FROM receipts;
+             UPDATE collection_generation SET data_generation='2';",
+        )
+        .unwrap();
+        let response = request(server.local_addr(), current_request);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let current: Value = serde_json::from_str(body(&response)).unwrap();
+        assert_eq!(
+            current["quota"]["remaining_percent"], 99.0,
+            "history validation must not retain the old current quota"
+        );
+        assert_eq!(current["quota"]["reset_at"], 1_800_612_480_i64);
+        assert_eq!(current["observed_at"], 1_800_007_680_i64);
+        assert_eq!(current["state"], "error");
+        assert!(current["authenticated"].as_bool().unwrap());
+        assert_ne!(published_pair(&previous), published_pair(&response));
+        for route in ["/v3/history/periods", "/v3/history?period=1800612480"] {
+            let response = request(
+                server.local_addr(),
+                &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+            assert_eq!(
+                serde_json::from_str::<Value>(body(&response)).unwrap()["error"],
+                "history_unavailable"
+            );
+        }
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM quota_receipts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            129
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn quota_boundary_minute_reaches_http() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("boundary.sqlite3");
+        fixture(&path, 10);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DELETE FROM usage_history; DELETE FROM durable_state;
+             INSERT INTO usage_history VALUES(1800000000,1800604841,100,1,0,0,30,0,0);
+             CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,
+             sequence INTEGER, observed_at INTEGER, reset_at INTEGER,
+             window_seconds INTEGER, remaining_percent REAL, applied_generation TEXT);
+             INSERT INTO quota_receipts VALUES
+             ('first',1,1800000041,1800604841,604800,100,'10'),
+             ('second',2,1800000080,1800604841,604800,99,'10');
+             UPDATE collection_generation SET data_generation='10';",
+            )
+            .unwrap();
+        let mut server = RestServer::start(
+            DbReader::open(&path).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let response = request(
+            server.local_addr(),
+            "GET /v3/history?period=1800604841 HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let page: Value = serde_json::from_str(body(&response)).unwrap();
+        let samples = page["history_samples"].as_array().unwrap();
+        assert_eq!(
+            samples.len(),
+            2,
+            "the boundary minute must survive reader and HTTP indexing"
+        );
+        assert_eq!(samples[0]["timestamp"], 1_800_000_000_i64);
+        assert_eq!(samples[0]["remaining_percent"], 100.0);
+        let sol = samples[0]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["model"] == "SOL")
+            .unwrap();
+        assert_eq!(sol["total_tokens"], 30);
+        assert_eq!(samples[1]["remaining_percent"], 99.0);
+        let response = request(
+            server.local_addr(),
+            "GET /v3/history/periods HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let periods: Value = serde_json::from_str(body(&response)).unwrap();
+        assert_eq!(periods["history_periods"][0]["start_at"], 1_800_000_041_i64);
+        server.shutdown();
+    }
+
+    #[test]
+    fn quota_receipt_history_reaches_http_without_models() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("quota-history.sqlite3");
+        fixture(&path, 10);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DELETE FROM usage_history;
+             CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,
+             sequence INTEGER, observed_at INTEGER, reset_at INTEGER,
+             window_seconds INTEGER, remaining_percent REAL, applied_generation TEXT);
+             INSERT INTO quota_receipts VALUES
+             ('first',1,1800000000,1800604800,604800,10,'10'),
+             ('second',2,1800000060,1800604801,604800,100,'10'),
+             ('third',3,1800000080,1800604801,604800,99,'10'),
+             ('fourth',4,1800000120,1800604801,604800,98,'10');
+             UPDATE collection_generation SET data_generation='10';",
+            )
+            .unwrap();
+        let mut server = RestServer::start(
+            DbReader::open(&path).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let response = request(
+            server.local_addr(),
+            "GET /v3/history/periods HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let periods: Value = serde_json::from_str(body(&response)).unwrap();
+        let periods = periods["history_periods"].as_array().unwrap();
+        assert_eq!(periods.len(), 2);
+        let new = periods.iter().find(|p| p["id"] == "1800604801").unwrap();
+        let old = periods.iter().find(|p| p["id"] == "1800604800").unwrap();
+        assert_eq!(new["start_at"], 1_800_000_001_i64);
+        assert!(old["end_at"].as_i64().unwrap() < new["start_at"].as_i64().unwrap());
+        for (reset, expected) in [("1800604800", vec![10.0]), ("1800604801", vec![99.0, 98.0])] {
+            let response = request(
+                server.local_addr(),
+                &format!("GET /v3/history?period={reset} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let page: Value = serde_json::from_str(body(&response)).unwrap();
+            let samples = page["history_samples"].as_array().unwrap();
+            assert_eq!(
+                samples
+                    .iter()
+                    .map(|p| p["remaining_percent"].as_f64().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(samples.iter().all(|p| p["models"].is_null()));
+        }
+        server.shutdown();
+    }
+
+    #[test]
+    fn quota_receipt_current_reaches_http_despite_model_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("quota-current.sqlite3");
+        fixture(&path, 10);
+        let mut server = RestServer::start(
+            DbReader::open(&path).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let wire = "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n";
+        let previous = request(server.local_addr(), wire);
+        assert_eq!(
+            serde_json::from_str::<Value>(body(&previous)).unwrap()["quota"]["remaining_percent"],
+            50.0
+        );
+
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,
+            sequence INTEGER, observed_at INTEGER, reset_at INTEGER,
+            window_seconds INTEGER, remaining_percent REAL, applied_generation TEXT);
+            INSERT INTO quota_receipts VALUES('official',1,1800000020,1800604800,604800,99.0,'2');
+            CREATE TABLE usage_model_history(broken_column INTEGER);
+            UPDATE collection_generation SET data_generation='2';",
+        )
+        .unwrap();
+        let response = request(server.local_addr(), wire);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let current: Value = serde_json::from_str(body(&response)).unwrap();
+        assert_eq!(current["state"], "error");
+        assert_eq!(current["authenticated"], true);
+        assert_eq!(current["observed_at"], 1_800_000_020_i64);
+        assert_eq!(current["quota"]["remaining_percent"], 99.0);
+        assert_eq!(current["quota"]["reset_at"], 1_800_604_800_i64);
+        assert_eq!(current["models"], serde_json::json!([]));
+        assert_ne!(published_pair(&previous), published_pair(&response));
         server.shutdown();
     }
 

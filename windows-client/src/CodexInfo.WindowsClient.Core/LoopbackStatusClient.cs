@@ -2338,8 +2338,7 @@ public sealed class LoopbackStatusClient :
                     .Where(period => PeriodOwnsReset(period, resetAt, periods))
                     .ToArray();
                 if (matchingPeriods.Length != 1 ||
-                    timestamp < matchingPeriods[0].StartAt ||
-                    timestamp > matchingPeriods[0].EndAt ||
+                    !matchingPeriods[0].ContainsHistoryMinute(timestamp) ||
                     !canonicalIdentities.Add((matchingPeriods[0].Id, timestamp)))
                 {
                     return false;
@@ -2680,8 +2679,7 @@ public sealed class LoopbackStatusClient :
                 .Where(period => PeriodOwnsReset(period, resetAt, periods))
                 .ToArray();
             if (matchingPeriods.Length != 1 ||
-                timestamp < matchingPeriods[0].StartAt ||
-                timestamp > matchingPeriods[0].EndAt ||
+                !matchingPeriods[0].ContainsHistoryMinute(timestamp) ||
                 !canonicalIdentities.Add((matchingPeriods[0].Id, timestamp)))
             {
                 return false;

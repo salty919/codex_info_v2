@@ -1755,6 +1755,38 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task ApiErrorPublishesQuotaWithoutModels()
+    {
+        var client = new SequencedSplitClient(
+            [
+                new ApiCurrentSnapshot(ApiState.Ready, 1800000000, true, "Pro",
+                    new ApiQuota(10.0, 1800003600, 604800, false),
+                    [new ApiDetailsModelUsage("gpt-6-astra", 10, 0, 0, 0, 0, 0)],
+                    0, PublishedPair(CanonicalPublishedPair)),
+                new ApiCurrentSnapshot(ApiState.Error, 1800000020, true, "Pro",
+                    new ApiQuota(99.0, 1800604800, 604800, false),
+                    [], 0, PublishedPair(CanonicalPublishedPair)),
+            ],
+            []);
+        using var viewModel = new MainWindowViewModel(client);
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.DetailsSnapshot?.ObservedAt == 1800000000);
+        Assert.Equal("10%", viewModel.RemainingPercentText);
+        Assert.Single(viewModel.Models);
+
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => viewModel.DetailsSnapshot?.ObservedAt == 1800000020);
+
+        Assert.Equal("99%", viewModel.RemainingPercentText);
+        Assert.True(viewModel.HasQuota);
+        Assert.True(viewModel.ShowAuthenticatedContent);
+        Assert.True(viewModel.HasNoModels);
+        Assert.Empty(viewModel.Models);
+        Assert.Equal(ApiState.Error, viewModel.DetailsSnapshot!.State);
+        Assert.Equal(viewModel.Texts.ApiError, viewModel.StatusTitle);
+    }
+
+    [Fact]
     public async Task ApiErrorIsNotPresentedAsTransportFailure()
     {
         static ApiCurrentSnapshot Current(

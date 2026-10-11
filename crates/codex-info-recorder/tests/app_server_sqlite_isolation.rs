@@ -12,6 +12,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -19,6 +20,799 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+struct QuotaJournalFixture {
+    _root: tempfile::TempDir,
+    child: ChildGuard,
+    calls: PathBuf,
+    database: PathBuf,
+    expected: Value,
+}
+
+impl QuotaJournalFixture {
+    fn start(malformed: bool, storage_failure: bool, responses: usize) -> Self {
+        Self::start_process(malformed, storage_failure, responses, None)
+    }
+
+    fn start_process(
+        malformed: bool,
+        storage_failure: bool,
+        responses: usize,
+        resident_interval: Option<u64>,
+    ) -> Self {
+        let root = tempfile::tempdir().expect("quota fixture root");
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        private_directory(&home);
+        private_directory(&data);
+        private_directory(&home.join("sessions"));
+        let auth = home.join("auth.json");
+        fs::write(
+            &auth,
+            br#"{"tokens":{"account_id":"fixture-private-account"}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        codex_info_account_locator::ensure_partition(&home, &data).unwrap();
+        let journal = data.join("history/quota");
+        private_directory(&journal);
+        let database = journal.join("observations.sqlite3");
+        if storage_failure {
+            fs::create_dir(&database).unwrap();
+        }
+        let expected = json!({"rateLimits":{"primary":{
+            "usedPercent": if malformed { json!("future-format") } else { json!(1) },
+            "resetsAt":1792295861_i64,"windowDurationMins":10080
+        }},"futureField":{"retained":true}});
+        let payload = root.path().join("quota.json");
+        fs::write(&payload, expected.to_string()).unwrap();
+        let calls = root.path().join("calls");
+        let server = root.path().join("server.py");
+        fs::write(&server, r#"#!/usr/bin/env python3
+import json, os, sys, time
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req:
+        continue
+    result = {}
+    if req['method'] == 'account/read':
+        result = {'requiresOpenaiAuth':False,'account':{'type':'chatgpt','email':'fixture@example.invalid','planType':'pro'}}
+    if req['method'] == 'account/rateLimits/read':
+        calls = os.environ['QUOTA_FIXTURE_CALLS']
+        count = len(open(calls).readlines()) if os.path.exists(calls) else 0
+        with open(calls, 'a') as f:
+            f.write(str(count) + '\n')
+        if count >= int(os.environ['QUOTA_FIXTURE_RESPONSES']):
+            time.sleep(30)
+            break
+        with open(os.environ['QUOTA_FIXTURE_PAYLOAD']) as f:
+            result = json.load(f)
+        result['fixtureSequence'] = count
+    print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
+"#).unwrap();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = match resident_interval {
+            Some(interval) => {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"));
+                command.process_group(0);
+                command.args(["--interval-secs", &interval.to_string()]);
+                command
+            }
+            None => {
+                let mut command = Command::new(env::current_exe().unwrap());
+                command.args(["--exact", "quota_journal_hold_poller", "--ignored"]);
+                command
+            }
+        };
+        let child = ChildGuard(
+            command
+                .env("CODEX_HOME", home)
+                .env("CODEX_INFO_DATA_DIR", data)
+                .env("CODEX_INFO_CODEX_BIN", server)
+                .env("QUOTA_FIXTURE_CALLS", &calls)
+                .env("QUOTA_FIXTURE_PAYLOAD", payload)
+                .env("QUOTA_FIXTURE_RESPONSES", responses.to_string())
+                .env("QUOTA_FIXTURE_OWNER_ROOT", root.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(File::create(root.path().join("owner.log")).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        Self {
+            _root: root,
+            child,
+            calls,
+            database,
+            expected,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        fs::read_to_string(&self.calls)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    fn wait_for_calls(&mut self, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while self.calls() < count {
+            assert!(
+                self.child.0.try_wait().unwrap().is_none(),
+                "fixture child exited"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not reach quota call {count}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn assert_saved(&self, count: usize) {
+        assert!(
+            self.database.is_file(),
+            "received quota responses have no durable journal"
+        );
+        let db =
+            Connection::open_with_flags(&self.database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mut stmt = db.prepare("SELECT payload, account_scope, observed_at FROM quota_observations ORDER BY sequence").unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), count, "every received response must survive");
+        for (index, (payload, scope, observed)) in rows.into_iter().enumerate() {
+            let mut expected = self.expected.clone();
+            expected["fixtureSequence"] = json!(index);
+            assert_eq!(serde_json::from_str::<Value>(&payload).unwrap(), expected);
+            assert!(!scope.is_empty());
+            assert!(!scope.contains("fixture-private-account"));
+            assert!(!payload.contains("fixture@example.invalid"));
+            assert!(observed > 0);
+        }
+        assert_eq!(fs::metadata(&self.database).unwrap().mode() & 0o777, 0o600);
+    }
+}
+
+fn send_sigterm_and_wait(fixture: &mut QuotaJournalFixture, restore_storage: bool) {
+    assert!(Command::new("kill")
+        .args(["-TERM", "--", &format!("-{}", fixture.child.0.id())])
+        .status()
+        .unwrap()
+        .success());
+    if restore_storage {
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            fixture.child.0.try_wait().unwrap().is_none(),
+            "SIGTERM discarded the unsaved API response"
+        );
+        fs::remove_dir(&fixture.database).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = fixture.child.0.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "SIGTERM must finish through normal cleanup: {status}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SIGTERM did not wake the recorder"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fixture.calls(), 1);
+    fixture.assert_saved(1);
+}
+
+#[test]
+fn quota_resident_sigterm_drains_unsaved_response() {
+    let mut fixture = QuotaJournalFixture::start_process(false, true, 2, Some(60));
+    fixture.wait_for_calls(1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fs::read_to_string(fixture._root.path().join("owner.log"))
+        .unwrap()
+        .contains("quota acquisition journal could not be committed")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not reach blocked persistence"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    send_sigterm_and_wait(&mut fixture, true);
+}
+
+#[test]
+fn quota_resident_sigterm_wakes_long_interval() {
+    let mut fixture = QuotaJournalFixture::start_process(false, false, 2, Some(3600));
+    fixture.wait_for_calls(1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let saved = Connection::open_with_flags(
+            &fixture.database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .and_then(|db| {
+            db.query_row(
+                "SELECT count(*) FROM quota_observations WHERE account_verified=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .unwrap_or(0);
+        let log = fs::read_to_string(fixture._root.path().join("owner.log")).unwrap();
+        if saved == 1
+            && (log.contains("awaiting durable current-account quota")
+                || log.contains("acknowledged generation="))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture recorder did not reach its scheduled wait"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    send_sigterm_and_wait(&mut fixture, false);
+}
+
+#[test]
+#[ignore = "isolated child owns the quota poller and its environment"]
+fn quota_journal_hold_poller() {
+    let poller = QuotaPoller::start_with_interval(1);
+    let owner_root = PathBuf::from(env::var_os("QUOTA_FIXTURE_OWNER_ROOT").unwrap());
+    // Deliberately never drain the capacity-two result queue.
+    loop {
+        if owner_root.join("stop-owner").exists() {
+            fs::write(owner_root.join("stopping-owner"), b"requested").unwrap();
+            drop(poller);
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn quota_journal_normal_exit_drains_unsaved_response() {
+    let mut fixture = QuotaJournalFixture::start(false, true, 2);
+    fixture.wait_for_calls(1);
+    // The blocked storage path keeps the first response owned in memory.
+    thread::sleep(Duration::from_millis(1400));
+    let root = fixture._root.path();
+    fs::write(root.join("stop-owner"), b"stop").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !root.join("stopping-owner").exists() {
+        assert!(Instant::now() < deadline, "owner did not begin shutdown");
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        fixture.child.0.try_wait().unwrap().is_none(),
+        "normal exit discarded ownership of the unsaved API response"
+    );
+    fs::remove_dir(&fixture.database).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = fixture.child.0.try_wait().unwrap() {
+            assert!(status.success(), "owner did not exit normally");
+            break;
+        }
+        assert!(Instant::now() < deadline, "owner did not finish saving");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fixture.calls(), 1, "shutdown must not start another fetch");
+    fixture.assert_saved(1);
+}
+
+#[test]
+fn quota_journal_preserves_every_response_before_queue_delivery() {
+    let mut fixture = QuotaJournalFixture::start(false, false, 3);
+    fixture.wait_for_calls(4);
+    fixture.assert_saved(3);
+}
+
+#[test]
+fn quota_journal_preserves_response_before_quota_interpretation() {
+    let mut fixture = QuotaJournalFixture::start(true, false, 1);
+    fixture.wait_for_calls(2);
+    fixture.assert_saved(1);
+}
+
+#[test]
+fn quota_journal_retries_unsaved_response_before_fetching_another() {
+    let mut fixture = QuotaJournalFixture::start(false, true, 2);
+    fixture.wait_for_calls(1);
+    thread::sleep(Duration::from_millis(1400));
+    assert!(fixture.child.0.try_wait().unwrap().is_none());
+    assert_eq!(
+        fixture.calls(),
+        1,
+        "storage failure must retain the response, not replace it with a new fetch"
+    );
+    fs::remove_dir(&fixture.database).unwrap();
+    fixture.wait_for_calls(3);
+    fixture.assert_saved(2);
+}
+
+fn replay_partition(fixture: &QuotaJournalFixture) -> PathBuf {
+    let root = fixture._root.path();
+    let partition =
+        codex_info_account_locator::ensure_partition(root.join("home"), root.join("data")).unwrap();
+    if !partition.database_path.exists() {
+        codex_info_db_writer::UsageStore::create_partitioned(
+            &partition.database_path,
+            &codex_info_db_writer::StoragePartitionIdentity {
+                schema_version: "codex-info-account-db-v1".into(),
+                profile_scope_id: partition.profile_scope_id.clone(),
+                account_scope_id: partition.account_scope_id.clone(),
+                storage_epoch: partition.storage_epoch,
+                partition_id: partition.partition_id.clone(),
+            },
+        )
+        .unwrap();
+    }
+    partition.database_path
+}
+
+fn run_quota_replay(fixture: &QuotaJournalFixture) -> String {
+    let root = fixture._root.path();
+    private_directory(&root.join("home/sessions"));
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
+            .arg("--once")
+            .env("CODEX_HOME", root.join("home"))
+            .env("CODEX_INFO_DATA_DIR", root.join("data"))
+            .env("CODEX_INFO_CODEX_BIN", root.join("absent-app-server"))
+            .env_remove("CODEX_INFO_RECORDER_DB")
+            .env_remove("CODEX_INFO_ACCOUNT_DB")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(root.join("replay.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "recorder replay did not terminate"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::read_to_string(root.join("replay.log")).unwrap()
+}
+
+fn accepted_quota_receipts(database: &Path) -> Vec<(String, i64, f64)> {
+    let db =
+        Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let present: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='quota_receipts')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(present, "durable quota replay has no account receipt store");
+    let mut statement = db
+        .prepare(
+            "SELECT receipt_id, sequence, remaining_percent FROM quota_receipts ORDER BY sequence",
+        )
+        .unwrap();
+    statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn quota_replay_restores_receipts_after_restart_without_new_api_response() {
+    let mut fixture = QuotaJournalFixture::start(false, false, 3);
+    fixture.wait_for_calls(4);
+    fixture.child.0.kill().unwrap();
+    fixture.child.0.wait().unwrap();
+    let database = replay_partition(&fixture);
+    run_quota_replay(&fixture);
+    let first = accepted_quota_receipts(&database);
+    assert_eq!(first.len(), 3);
+    assert!(first.iter().all(|(_, _, remaining)| *remaining == 99.0));
+    assert!(first.windows(2).all(|pair| pair[0].1 < pair[1].1));
+    run_quota_replay(&fixture);
+    assert_eq!(
+        accepted_quota_receipts(&database),
+        first,
+        "restart must not apply a receipt twice"
+    );
+    fixture.assert_saved(3);
+}
+
+#[test]
+fn quota_replay_restores_period_after_restart_without_new_api_response() {
+    let mut fixture = QuotaJournalFixture::start(false, false, 3);
+    fixture.wait_for_calls(4);
+    fixture.child.0.kill().unwrap();
+    fixture.child.0.wait().unwrap();
+    let database = replay_partition(&fixture);
+    let log = run_quota_replay(&fixture);
+    assert_eq!(accepted_quota_receipts(&database).len(), 3);
+    let db =
+        Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let period: (i64, i64, i64) = db.query_row(
+        "SELECT reset_at, latest_quota_reset_at, window_seconds FROM collection_generation WHERE singleton=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!(period, (1_792_295_861, 1_792_295_861, 604_800), "{log}");
+    let quota: (i64, f64) = db
+        .query_row(
+            "SELECT reset_at, remaining_percent FROM usage_history ORDER BY timestamp DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(quota, (1_792_295_861, 99.0));
+    let state_path = fixture
+        ._root
+        .path()
+        .join("data/history/recorder-state.json");
+    assert!(
+        state_path.is_file(),
+        "durable current-account quota must publish after restart: {log}"
+    );
+    let state: Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    let generation: String = db
+        .query_row(
+            "SELECT data_generation FROM collection_generation WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        state["data_generation"].as_u64(),
+        Some(generation.parse::<u64>().unwrap()),
+        "{log}"
+    );
+    assert_eq!(
+        state["write_state"], "degraded",
+        "no fresh API success is claimed"
+    );
+
+    fixture.assert_saved(3);
+}
+
+#[test]
+fn quota_replay_retains_unreadable_input_and_accepts_later_receipts() {
+    let mut fixture = QuotaJournalFixture::start(false, false, 3);
+    fixture.wait_for_calls(4);
+    fixture.child.0.kill().unwrap();
+    fixture.child.0.wait().unwrap();
+    let database = replay_partition(&fixture);
+    let raw = Connection::open(&fixture.database).unwrap();
+    raw.execute("UPDATE quota_observations SET payload='{' WHERE sequence=(SELECT MIN(sequence) FROM quota_observations)", []).unwrap();
+    let originals: Vec<(String, i64, String)> = raw
+        .prepare("SELECT receipt_id, sequence, payload FROM quota_observations ORDER BY sequence")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER quota_health_atomic BEFORE UPDATE ON collection_generation
+         WHEN EXISTS(SELECT 1 FROM quota_receipts)
+           AND NOT EXISTS(SELECT 1 FROM quota_acquisition_state WHERE singleton=1 AND degraded=1)
+         BEGIN SELECT RAISE(ABORT, 'quota receipt published before unresolved state'); END;",
+        )
+        .unwrap();
+    let log = run_quota_replay(&fixture);
+    let expected: Vec<_> = originals
+        .iter()
+        .skip(1)
+        .map(|(id, sequence, _)| (id.clone(), *sequence, 99.0))
+        .collect();
+    assert_eq!(accepted_quota_receipts(&database), expected, "{log}");
+    assert!(log.contains("quota replay unresolved=1"), "{log}");
+    let account = Connection::open(&database).unwrap();
+    let has_health: bool = account
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='quota_acquisition_state')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        has_health,
+        "quota replay failure must have durable status independent of threads"
+    );
+    let degraded: i64 = account
+        .query_row(
+            "SELECT degraded FROM quota_acquisition_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        degraded, 1,
+        "unresolved raw input must remain publicly degraded"
+    );
+
+    let retained: Vec<(String, i64, String)> = raw
+        .prepare("SELECT receipt_id, sequence, payload FROM quota_observations ORDER BY sequence")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(retained, originals, "replay must preserve unreadable input");
+}
+
+#[test]
+fn quota_replay_reports_unverified_input_without_assigning_it() {
+    let mut fixture = QuotaJournalFixture::start(false, false, 3);
+    fixture.wait_for_calls(4);
+    fixture.child.0.kill().unwrap();
+    fixture.child.0.wait().unwrap();
+    let database = replay_partition(&fixture);
+    let raw = Connection::open(&fixture.database).unwrap();
+    raw.execute("UPDATE quota_observations SET account_verified=0 WHERE sequence=(SELECT MIN(sequence) FROM quota_observations)", []).unwrap();
+    let expected: Vec<(String, i64, f64)> = raw.prepare(
+        "SELECT receipt_id, sequence, 99.0 FROM quota_observations WHERE account_verified=1 ORDER BY sequence"
+    ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap().collect::<Result<_, _>>().unwrap();
+    let log = run_quota_replay(&fixture);
+    assert_eq!(accepted_quota_receipts(&database), expected);
+    assert!(
+        log.contains("quota replay unresolved=1"),
+        "unverified input must remain visible: {log}"
+    );
+    let unverified: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM quota_observations WHERE account_verified=0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unverified, 1);
+    fixture.assert_saved(3);
+}
+
+#[test]
+fn quota_resident_keeps_replay_failure_until_raw_is_reprocessed() {
+    let mut fixture = QuotaJournalFixture::start(false, false, 3);
+    fixture.wait_for_calls(4);
+    fixture.child.0.kill().unwrap();
+    fixture.child.0.wait().unwrap();
+    let database = replay_partition(&fixture);
+    let raw = Connection::open(&fixture.database).unwrap();
+    let (first_id, original): (String, String) = raw
+        .query_row(
+            "SELECT receipt_id,payload FROM quota_observations ORDER BY sequence LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    raw.execute(
+        "UPDATE quota_observations SET payload='{}' WHERE receipt_id=?1",
+        [&first_id],
+    )
+    .unwrap();
+    let root = fixture._root.path();
+    private_directory(&root.join("home/sessions"));
+    let log_path = root.join("resident.log");
+    let mut resident = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
+            .args(["--interval-secs", "1"])
+            .env("CODEX_HOME", root.join("home"))
+            .env("CODEX_INFO_DATA_DIR", root.join("data"))
+            .env("CODEX_INFO_CODEX_BIN", root.join("server.py"))
+            .env("QUOTA_FIXTURE_CALLS", &fixture.calls)
+            .env("QUOTA_FIXTURE_PAYLOAD", root.join("quota.json"))
+            .env("QUOTA_FIXTURE_RESPONSES", "6")
+            .env_remove("CODEX_INFO_RECORDER_DB")
+            .env_remove("CODEX_INFO_ACCOUNT_DB")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(&log_path).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let account = Connection::open(&database).unwrap();
+    account.busy_timeout(Duration::from_secs(1)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        assert!(resident.0.try_wait().unwrap().is_none());
+        if fixture.calls() >= 7 && accepted_quota_receipts(&database).len() == 4 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resident did not persist new quota: {}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(fs::read_to_string(&log_path)
+        .unwrap()
+        .contains("quota lane ready"));
+    let degraded: i64 = account
+        .query_row(
+            "SELECT degraded FROM quota_acquisition_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        degraded, 1,
+        "fresh success must not erase unresolved replay"
+    );
+    let current = accepted_quota_receipts(&database).last().unwrap().clone();
+    raw.execute(
+        "UPDATE quota_observations SET payload=?1 WHERE receipt_id=?2",
+        [&original, &first_id],
+    )
+    .unwrap();
+    loop {
+        assert!(resident.0.try_wait().unwrap().is_none());
+        let degraded: i64 = account
+            .query_row(
+                "SELECT degraded FROM quota_acquisition_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if accepted_quota_receipts(&database).len() == 5 && degraded == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resident did not recover from raw: {}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fixture.calls(),
+        7,
+        "recovery must not need another API response"
+    );
+    let restored = accepted_quota_receipts(&database);
+    assert_eq!(restored.first().unwrap().0, first_id);
+    assert_eq!(
+        restored.last().unwrap(),
+        &current,
+        "old input must not replace current"
+    );
+    let raw_count: i64 = raw
+        .query_row("SELECT count(*) FROM quota_observations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(raw_count, 5);
+    resident.0.kill().unwrap();
+    resident.0.wait().unwrap();
+}
+
+#[test]
+fn quota_journal_continues_while_session_startup_is_unavailable() {
+    let mut fixture = QuotaJournalFixture::start(false, false, 3);
+    fixture.wait_for_calls(4);
+    fixture.child.0.kill().unwrap();
+    fixture.child.0.wait().unwrap();
+    let database = replay_partition(&fixture);
+    let account = Connection::open(&database).unwrap();
+    account
+        .execute_batch(
+            "ALTER TABLE usage_model_history RENAME COLUMN total_tokens TO unreadable_tokens;",
+        )
+        .unwrap();
+    let root = fixture._root.path();
+    private_directory(&root.join("home/sessions"));
+    let log_path = root.join("startup.log");
+    let mut resident = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
+            .args(["--interval-secs", "1"])
+            .env("CODEX_HOME", root.join("home"))
+            .env("CODEX_INFO_DATA_DIR", root.join("data"))
+            .env("CODEX_INFO_CODEX_BIN", root.join("server.py"))
+            .env("QUOTA_FIXTURE_CALLS", &fixture.calls)
+            .env("QUOTA_FIXTURE_PAYLOAD", root.join("quota.json"))
+            .env("QUOTA_FIXTURE_RESPONSES", "6")
+            .env_remove("CODEX_INFO_RECORDER_DB")
+            .env_remove("CODEX_INFO_ACCOUNT_DB")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(&log_path).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let raw = Connection::open(&fixture.database).unwrap();
+    raw.busy_timeout(Duration::from_secs(1)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        assert!(
+            resident.0.try_wait().unwrap().is_none(),
+            "Session startup must not terminate quota recording: {}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        let saved: i64 = raw
+            .query_row(
+                "SELECT count(*) FROM quota_observations WHERE account_verified=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if saved == 5 && fixture.calls() >= 7 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "quota acquisition stopped with Session startup: {}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(accepted_quota_receipts(&database).is_empty());
+    account
+        .execute_batch(
+            "ALTER TABLE usage_model_history RENAME COLUMN unreadable_tokens TO total_tokens;",
+        )
+        .unwrap();
+    loop {
+        assert!(resident.0.try_wait().unwrap().is_none());
+        if accepted_quota_receipts(&database).len() == 5 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Session recovery did not replay quota: {}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fixture.calls(), 7);
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM quota_observations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    resident.0.kill().unwrap();
+    resident.0.wait().unwrap();
+}
+
+#[test]
+fn quota_replay_rolls_back_receipts_with_generation_and_retries_from_raw() {
+    let mut fixture = QuotaJournalFixture::start(false, false, 3);
+    fixture.wait_for_calls(4);
+    fixture.child.0.kill().unwrap();
+    fixture.child.0.wait().unwrap();
+    let database = replay_partition(&fixture);
+    let db = Connection::open(&database).unwrap();
+    db.execute_batch("CREATE TRIGGER quota_fixture_reject BEFORE UPDATE ON collection_generation WHEN EXISTS(SELECT 1 FROM quota_receipts) BEGIN SELECT RAISE(ABORT, 'fixture quota commit rejected'); END;").unwrap();
+    let failure = run_quota_replay(&fixture);
+    assert!(failure.contains("degraded quota replay"), "{failure}");
+    assert!(
+        failure.contains("fixture quota commit rejected"),
+        "{failure}"
+    );
+    assert!(accepted_quota_receipts(&database).is_empty());
+    fixture.assert_saved(3);
+    db.execute_batch("DROP TRIGGER quota_fixture_reject")
+        .unwrap();
+    run_quota_replay(&fixture);
+    assert_eq!(accepted_quota_receipts(&database).len(), 3);
+}
 
 struct Environment(Vec<(&'static str, Option<OsString>)>);
 
