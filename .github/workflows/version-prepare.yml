@@ -186,10 +186,10 @@ jobs:
           # classifying the now-empty source diff.
           detached_generated_h1=false
           if [[ "$expected_version_transition" == true && \
-                "$version_commit" == "$HEAD_SHA" && \
                 "$head_version" == "$next_version" && \
-                "${#version_line[@]}" -eq 2 ]]; then
-            commit_message="$(git show -s --format=%B "$HEAD_SHA")"
+                "${#version_line[@]}" -eq 2 ]] && \
+             git merge-base --is-ancestor "$version_commit" "$HEAD_SHA"; then
+            commit_message="$(git show -s --format=%B "$version_commit")"
             trailer_value() {
               local key="$1"
               local -a values
