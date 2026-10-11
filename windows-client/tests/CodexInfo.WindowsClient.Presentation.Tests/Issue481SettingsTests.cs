@@ -318,11 +318,11 @@ public sealed class Issue590SettingsTests
             element.Name.LocalName == "Grid" && element.Attribute("Grid.Row")?.Value == "3");
         Assert.Equal("660", footer.Attribute("Width")?.Value);
         Assert.Equal("Center", footer.Attribute("HorizontalAlignment")?.Value);
-        Assert.Equal("*,Auto", footer.Attribute("ColumnDefinitions")?.Value);
+        Assert.Equal("*,Auto,Auto", footer.Attribute("ColumnDefinitions")?.Value);
         var secondaryActions = Assert.Single(footer.Elements(), element =>
             element.Name.LocalName == "StackPanel" && element.Attribute("Grid.Column")?.Value == "0");
         var saveButton = Assert.Single(footer.Elements(), element =>
-            element.Name.LocalName == "Button" && element.Attribute("Grid.Column")?.Value == "1");
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Settings.Footer.Save");
         Assert.Contains(secondaryActions.Descendants(), element => element.Attribute("Text")?.Value == "{Binding Texts.ConnectionSettings}");
         Assert.Contains(secondaryActions.Descendants(), element => element.Attribute("Text")?.Value == "{Binding Texts.LicenseInformation}");
         Assert.Equal("secondary", Assert.Single(secondaryActions.Elements(), element =>

@@ -377,8 +377,8 @@ public sealed class PresentationCoverageTests
             await EventuallyAsync(() => main.IsAuthenticated);
             Assert.Equal(3, setup.ConnectionProfileOptions.Count);
             Assert.Equal(LocalizationService.Current.ApiCommand, setup.ApiCommand);
-            Assert.Equal(main.StatusTitle, setup.StatusTitle);
-            Assert.Equal(main.StatusDetail, setup.StatusDetail);
+            Assert.Equal(LocalizationService.Current.Connected, setup.StatusTitle);
+            Assert.Equal(main.LastReceivedText, setup.StatusDetail);
             Assert.Equal(LocalizationService.Current.SshStart, setup.SshActionText);
             Assert.Equal(LocalizationService.Current.SshNotReady, setup.SshStatusText);
             Assert.Equal(LocalizationService.Current.Continue, setup.ContinueText);

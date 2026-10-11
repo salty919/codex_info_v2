@@ -171,14 +171,17 @@ public partial class MainWindow : Window
         ShowIndependentWindow(window);
     }
 
-    public void OpenSetupFromChild() => OpenSetup();
+    public void OpenSetupFromChild() => OpenSetup(connectionSettings: true);
 
     public void OpenLegalFromChild() => OnOpenLegal(this, new Avalonia.Interactivity.RoutedEventArgs());
 
-    private void OpenSetup()
+    private void OpenSetup() => OpenSetup(connectionSettings: false);
+
+    private void OpenSetup(bool connectionSettings)
     {
         if (setupWindow is { } existing)
         {
+            if (connectionSettings && existing.DataContext is SetupViewModel setup) setup.ShowConnectionSettings();
             existing.Activate();
             return;
         }
@@ -188,7 +191,9 @@ public partial class MainWindow : Window
             return;
         }
 
-        var window = new SetupWindow(new SetupViewModel(viewModel));
+        var setupViewModel = new SetupViewModel(viewModel);
+        if (connectionSettings) setupViewModel.ShowConnectionSettings();
+        var window = new SetupWindow(setupViewModel);
         ApplyPreviewSize(window);
         setupWindow = window;
         window.Closed += (_, _) => setupWindow = null;

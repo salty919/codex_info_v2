@@ -71,7 +71,6 @@
     </Style>
     <Style Selector="Button.command">
       <Setter Property="Padding" Value="8,5" />
-      <Setter Property="Width" Value="70" />
       <Setter Property="MinWidth" Value="70" />
       <Setter Property="FontSize" Value="12" />
       <Setter Property="HorizontalContentAlignment" Value="Center" />
@@ -100,21 +99,6 @@
       <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
       <Setter Property="BorderThickness" Value="1" />
     </Style>
-    <Style Selector="Button.window-control">
-      <Setter Property="Width" Value="30" />
-      <Setter Property="Height" Value="28" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-      <Setter Property="FontSize" Value="16" />
-      <Setter Property="Background" Value="Transparent" />
-      <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
-    </Style>
-    <Style Selector="Button.window-control:pointerover">
-      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
-      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
-    </Style>
   </Window.Styles>
 
     <!-- The six rows keep the overview on one surface while the model table
@@ -131,16 +115,10 @@
           PointerPressed="OnTitlePointerPressed">
       <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
         <Border Classes="app-mark">
-          <TextBlock FontSize="20"
-                     Foreground="{DynamicResource ThemeF2F6FC}"
-                     HorizontalAlignment="Center"
-                     VerticalAlignment="Center"
-                     Text="◈" />
+          <PathIcon Width="20" Height="20" Data="{StaticResource IconApp}" />
         </Border>
         <Grid RowDefinitions="28,17" Margin="0,3,0,0" VerticalAlignment="Top">
-          <TextBlock Grid.Row="0"
-                     FontSize="22"
-                     FontWeight="Bold"
+          <TextBlock Classes="window-title" Grid.Row="0"
                      Foreground="{DynamicResource ThemeE9EFF8}"
                      Text="{Binding Texts.UsageStatus}"
                      VerticalAlignment="Center"
@@ -164,14 +142,14 @@
                 AutomationProperties.Name="{Binding Texts.Graph}"
                 AutomationProperties.AutomationId="Main.OpenGraph"
                 ToolTip.Tip="{Binding Texts.Graph}">
-          <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="▥" /><TextBlock Text="{Binding Texts.Graph}" /></StackPanel>
+          <StackPanel Orientation="Horizontal" Spacing="8"><PathIcon Data="{StaticResource IconGraph}" /><TextBlock Text="{Binding Texts.Graph}" /></StackPanel>
         </Button>
         <Button Classes="command"
                 Click="OnOpenSettings"
                 AutomationProperties.Name="{Binding Texts.Settings}"
                 AutomationProperties.AutomationId="Main.OpenSettings"
                 ToolTip.Tip="{Binding Texts.Settings}">
-          <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="⚙" /><TextBlock Text="{Binding Texts.Settings}" /></StackPanel>
+          <StackPanel Orientation="Horizontal" Spacing="8"><PathIcon Data="{StaticResource IconSettings}" /><TextBlock Text="{Binding Texts.Settings}" /></StackPanel>
         </Button>
         <StackPanel Orientation="Horizontal"
                     Spacing="0"
@@ -506,5 +484,7 @@
     </Border>
 
 
+  <Border Classes="window-frame" Classes.active="{Binding $parent[Window].IsActive}"
+            Grid.RowSpan="6" Margin="-22,-14" IsHitTestVisible="False" />
   </Grid>
 </Window>

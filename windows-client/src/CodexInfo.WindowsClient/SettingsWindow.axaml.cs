@@ -22,6 +22,13 @@ public partial class SettingsWindow : Window
         DataContext = viewModel;
         Opened += async (_, _) => await viewModel.RefreshRuntimeVersionsAsync();
         Closed += (_, _) => viewModel.Dispose();
+        KeyDown += (_, e) =>
+        {
+            if (e.Key != Key.Escape) return;
+            if (AccountSelector.IsChecked == true) AccountSelector.IsChecked = false;
+            else Close();
+            e.Handled = true;
+        };
     }
 
     private void OnTitlePointerPressed(object? sender, PointerPressedEventArgs e)

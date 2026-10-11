@@ -17,6 +17,9 @@ X-THREAD-01
 WIN-VERSION-01
 WIN-THEME-422
 WIN-SETTINGS-TABS-590
+WIN-WINDOW-BOUNDARY-603
+WIN-SETTINGS-REFRESH-603
+WIN-CONNECTION-GUIDANCE-603
 -->
 
 # Windowsクライアント UX設計仕様
@@ -41,6 +44,15 @@ X版はデータ意味論、状態、所有権の参照元であり、Windows版
 Linux timezone設定、Issue #422で利用者が選択したWindows版の`WIN-THEME-422`だけは有限scopeの実装・直接評価対象とする。この限定決定は本書全体の
 `PRODUCT_PENDING`を解除せず、他の未確定契約を`EXTRACTION_COMPLETE`として扱う根拠にしない。
 Issue #590で利用者が依頼したSettingsの2タブ切替に限り、`WIN-SETTINGS-TABS-590`も有限scopeの実装・直接評価対象とする。
+Issue #603で利用者が依頼したWindow境界、Settings、接続案内の6点は、`WIN-WINDOW-BOUNDARY-603`、`WIN-SETTINGS-TABS-590`、`WIN-SETTINGS-REFRESH-603`、`WIN-CONNECTION-GUIDANCE-603`を有限scopeの実装・直接評価対象とする。
+
+## WIN-WINDOW-BOUNDARY-603 — Windows各Windowの境界
+
+registered top-level surfaceであるMain、Setup、Settings、Graph、Threads、Legalの各Windowは、全周に連続した可視境界を持つ。境界線は1 logical DIP以上、Window内面に対する相対輝度contrast ratioは3:1以上とする。境界は同じthemeのWindow同士が重なった場合も各Windowの端を見分けられ、shadowだけを境界の代わりにしない。6 Windowすべてで同じtheme roleを使い、既存のlogical client size、内容配置、native controls、移動・resize動作を変えない。全themeで境界が読め、主要内容や操作を隠さないことを実Windowsの重なり表示で確認する。
+
+6画面共通の視覚ルールは本節をownerとし、`App.axaml`のstyle/resourceを共通実装とする。画面見出しは22 DIP/SemiBold、補助文は13 DIP/補助色（数値表・密集した注記は12 DIP）、window操作は36×28 DIPの共通styleとし、操作のprimary/secondary役割・角丸・hover表示を共有する。枠、見出し、操作、状態色は画面別に再定義しない。本文の間隔は4 DIP単位（8/12/16/24）を基本に、情報密度と既存の固定geometryを保持する。status/モデル色の意味は既存roleを保持し、装飾色として流用しない。
+
+アイコンは共通のvector geometryを使い、設定・推移・接続・スレッド・ライセンスの見出し/入口を識別する。操作iconは16 DIP、見出しiconは20 DIP、文字との間隔は8 DIPを基本とする。閉じる等の標準window操作以外は文字を併記し、iconだけに意味を委ねない。フォントの絵文字/glyphを機能iconとして混在させない。Mainの入口buttonは最低70 DIPを維持し、iconと翻訳labelに合わせて幅を伸ばす。
 
 ## WIN-SETTINGS-TABS-590 — Windows Settingsの2タブ切替
 
@@ -50,13 +62,25 @@ Windows Settingsは現行の900×480を維持し、タイトルの下に「表�
 
 「表示」タブには言語、表示タイムゾーン、外観（テーマ）、表示対象アカウントをまとめる。「接続状態」タブには接続先、接続・認証状態、Recorder/REST versionをまとめる。既存の項目と選択肢を欠落・重複させない。
 
+各タブの本文はfooterから視覚的に分かれ、関連する設定項目を一つの控えめな枠でまとめる。「表示」の4項目は同じ枠の中に置く。「接続状態」は接続情報と更新状態を別々の枠で示す。枠は選択状態やkeyboard focusと混同しない。既存の900×480 Window、中央660 DIP列、入力寸法、固定footerを維持し、枠を加えるために主要情報を欠落・切り詰めない。
+
 「表示」タブの4項目は同じラベル・入力欄の整列したフォームに置き、列はラベル160 DIP、間隔12 DIP、入力488 DIP（合計660 DIP）、各入力欄は高さ36 DIP、項目間は12 DIPとする。フォームの左右に追加marginを置かず、タブ・footerと同じ中央列の端に合わせる。表示対象アカウントはこのフォームの1項目として「表示対象」と選択中アカウントを表示する。タイトル行、タブ、独立カードには置かず、アカウント別設定と誤認させる説明文を加えない。フォームは高さ36 DIPの4行を持つGridとし、account行にselectorだけを含む`SettingsAccountSelectorAnchor`を置く。`AccountMenu`の外枠は同じフォームGridの2列目に重ね、selectorの上へ開く。外枠の幅と最大幅はselectorと同じ488 DIP、最大高144 DIPとし、selectorの上端にメニュー下端を合わせる。続きの選択肢は既存ListBox内でscrollする。メニュー開閉でフォーム内容を移動させない。実際の隣接表示、画面内での操作可能性、内容が移動しないことは実Windowsで確認する。アカウント選択は既存どおりMain、Graph、Threadsと共有する表示対象を即時に切り替える。認証、設定値、Save対象にはせず、タブ切替、Save、Closeで選択を戻さない。
 
-「表示」タブでは設定項目を同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、既存のdraft保持とSave動作を維持する。設定項目、選択肢、保存形式、Linux画面は変更しない。外観はテーマ選択欄だけを置き、星印の装飾、`AppearanceDescription`の説明カード、補足段落を表示しない。
+「表示」タブでは設定項目を同じSettingsViewModelへbindingし、タブ切替は表示だけを切り替える。選択値の初期化、保存、破棄を発生させず、既存のdraft保持とSave動作を維持する。Saveに加えてCancelを常時表示する。Cancel、WindowのClose、Escapeは保存していない言語・timezone・theme draftを破棄してWindowを閉じ、theme previewは保存済みpaletteへ戻す。表示対象accountは即時に切り替わる既存契約を維持し、Cancel/Closeで戻さずSave対象にも含めない。設定項目、選択肢、保存形式、Linux画面は変更しない。外観はテーマ選択欄だけを置き、星印の装飾、`AppearanceDescription`の説明カード、補足段落を表示しない。
 
-「接続状態」タブでは接続先、通常status、認証操作、Recorder/REST version、version statusを実データの行としてまとめ、各version値は名称と同じ行に置く。接続先などの通常情報はこのタブ内だけに表示し、他タブやWindow見出しに重ねない。空欄を埋める文、snapshotの説明、装飾的な情報カードを追加しない。root scrollを要求せず、入力、実status、固定操作の全てへ900×480内で到達できるようにする。
+「接続状態」タブでは接続先、通常status、認証操作、Recorder/REST version、version statusを実データの行としてまとめ、各version値は名称と同じ行に置く。接続先などの通常情報はこのタブ内だけに表示し、他タブやWindow見出しに重ねない。空欄を埋める文や装飾的な情報カードを追加しない。状態の詳細は更新結果として`WIN-SETTINGS-REFRESH-603`に従って表示する。root scrollを要求せず、入力、実status、固定操作の全てへ900×480内で到達できるようにする。
 
-Save失敗時だけ固定footer直上の共通欄を表示し、どちらのタブからも理由を確認できるようにする。失敗していない状態でsnapshot説明を表示しない。下部footerでは接続設定／ライセンス情報を左のsecondary操作群、Saveを右側のprimary操作として分ける。ライセンス情報はSettingsから開き、Main上部にはLegal入口を置かない。Settings footerの接続先編集入口は`ConnectionSettings`、ライセンス画面見出しとSettings入口は`LicenseInformation`を使い、`docs/LOCALIZATION.md`の全対応localeで表示する。接続先編集ボタンは既存Setup画面を開き、クリック直後に前面で操作可能になる。
+Save失敗時だけ固定footer直上の共通欄を表示し、どちらのタブからも理由を確認できるようにする。保存エラー欄にsnapshot説明を表示しない。下部footerでは接続設定／ライセンス情報を左のsecondary操作群、CancelとSaveを右側の操作群として分け、Saveをprimaryとする。ライセンス情報はSettingsから開き、Main上部にはLegal入口を置かない。Settings footerの接続先編集入口は`ConnectionSettings`、ライセンス画面見出しとSettings入口は`LicenseInformation`を使い、`docs/LOCALIZATION.md`の全対応localeで表示する。接続先編集ボタンは既存Setup画面を開き、クリック直後に前面で操作可能になる。既存Setup画面をSettingsから開いた場合のタイトルと見出しは`WIN-CONNECTION-GUIDANCE-603`に従う。
+
+## WIN-SETTINGS-REFRESH-603 — Settings接続状態の更新
+
+Settingsの「接続状態」タブにある操作は、認証確認だけを行うように見せず、実際に呼び出す既存Main refreshとRecorder/REST runtime version更新を示すローカライズ済み「状態を更新」相当のlabelにする。操作中は更新中であることを同じタブに表示し、完了後はMainの状態ownerが返す接続結果と詳細を同じタブ内に表示する。正常接続の利用枠/リセット警告を接続失敗と混在させず「接続済み」と更新時刻を表示し、失敗/認証要求ではその理由を表示する。成功、認証が必要、接続失敗を区別できる文言を示し、結果を背面のMainだけに表示しない。Save失敗の欄は設定保存のownerとして独立して保ち、接続状態更新で上書きしない。更新は設定draftを保存・破棄しない。
+
+## WIN-CONNECTION-GUIDANCE-603 — 接続設定の目的と案内
+
+Settings footerから既存Setupを開いた時は、Setup初回導入のwelcome title/headingを再利用せず、既存`ConnectionSettings` catalog valueをWindow titleとページ見出しに使う。初回導入から開くSetupのwelcome headingは現行の全対応locale値を維持する。どちらの入口も既存のSetup状態遷移、認証順序、保存条件、完了条件を共有し、入口によって別の接続動作を作らない。
+
+Connection guideは長文で手順を説明せず、接続先・現在の状態・次の操作を近接して配置する。接続、認証、完了の現在ステップを視覚表示し、そのステップの操作を提示する。手動SSH設定と起動コマンドは展開式の詳細に収め、通常の接続選択と競合させない。既存の詳しい案内は詳細内から参照できる。手動で用意したloopback接続は「既存の接続を使う」と表示し、内部値`none`を接続先欄に見せない。更新ボタンは認証専用を意味する名前にせず、進行中と結果を表示する。設定から開いた時に「初期設定」やwelcomeを主目的として表示しない。機能、順序、保存境界を保持し、全対応localeと実Windowsで確認する。
 
 ## WIN-THEME-422 — Windows版の組込みカラーテーマ
 
@@ -599,7 +623,7 @@ component順や表示所有者を変更しない。
 - Settingsのaccount selectorは既存の表示対象を即時に切り替え、認証accountを変更しない。
   起動と選択維持は`ACCOUNT-LIFECYCLE-134`に従い、開いているSettingsも同じ一覧・選択へ追従する。
   account選択は保存操作を要さず、取消またはCloseで戻さず、永続設定へ追加しない。
-  selectorは`250×44px`とし、閉じたselector内のaccount labelとIDを左`28px`に揃え、
+  Linuxのselectorは`250×44px`とし、閉じたselector内のaccount labelとIDを左`28px`に揃え、
   矢印は幅全体の右端から`24px`の`14px`欄の中央へ置く。
 - Linux Settingsはaccount selectorとtimezoneを持つsingleton Windowとする。timezoneの選択肢と保存値はexact
   `local|UTC`で、未保存変更はMain/Graphへ反映せず、取消またはCloseで破棄する。保存成功時だけ
@@ -631,8 +655,11 @@ tunnelはそれぞれ独立したvisible+enabled Tab step/UIA actionであり、
 `action.StartForward`はforwardingだけを表し、SetupOperationGeneration・busy・stale completionは現行世代だけを
 受理し、古い完了はcommitしない。
 
+Windowsのselector寸法は`WIN-SETTINGS-TABS-590`に従う。
+
 Setupの製品名と導入見出しを一つの文字列へ結合しない。`app_title` は全localeで
-`Codex Info Monitor`、導入見出しと入口labelは次のcatalog値を正本とし、`/`で複数言語を併記しない。
+`Codex Info Monitor`、初回起動の導入見出しと入口labelは次のcatalog値を正本とし、`/`で複数言語を併記しない。
+Settingsから開く場合は`WIN-CONNECTION-GUIDANCE-603`に従って接続設定の見出しを使う。
 未知localeは英語行へ一意fallbackする。
 
 | locale | `setup_heading` | `setup_entry` |
