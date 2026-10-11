@@ -1,18 +1,30 @@
 """Exercise the CLI acceptance caller with deterministic REST startup replies."""
 
 import json
-import os
-from pathlib import Path
-import subprocess
+import subprocess  # noqa: S404  # nosec B404 # Repository-owned Bash fixture only; fixed argv/env below.
 import tempfile
 import unittest
-
+from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/cli_contract_e2e.sh"
 READY = {"state": "ready", "authenticated": True}
 
 
 class RestReadinessTests(unittest.TestCase):
+    def test_caller_does_not_run_inherited_bash_startup_hook(self):
+        with tempfile.TemporaryDirectory(prefix="cli-startup-hook-") as directory:
+            root = Path(directory)
+            marker = root / "executed"
+            hook = root / "startup.sh"
+            hook.write_text('printf seen > "$READINESS_INJECTION_MARKER"\n', encoding="utf-8")
+            with mock.patch.dict("os.environ", {
+                "BASH_ENV": str(hook), "READINESS_INJECTION_MARKER": str(marker),
+            }):
+                completed, _ = self.run_caller([json.dumps(READY)])
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(marker.exists(), "inherited shell hook was executed")
+
     def run_caller(self, replies, phase="restart"):
         source = SCRIPT.read_text(encoding="utf-8")
         helper = ""
@@ -46,9 +58,13 @@ curl() {
 }
 '''
             command = shell + helper + source[start:end] + f'printf "%s" "{result}"'
-            completed = subprocess.run(
-                ["bash", "-c", command], capture_output=True, text=True,
-                env={**os.environ, "FIXTURE": str(root)}, timeout=10, check=False,
+            # Only tracked repository code and literal fixture commands reach stdin.
+            # Replies stay in a data file; caller PATH and BASH_ENV are not inherited.
+            completed = subprocess.run(  # noqa: S603  # nosec B603 # Fixed Bash argv; intentional repository-only fixture stdin.
+                ["/bin/bash", "--noprofile", "--norc", "-s"],
+                input=command, capture_output=True, text=True,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "FIXTURE": str(root)},
+                timeout=10, check=False,
             )
             return completed, int((root / "count").read_text(encoding="utf-8"))
 
