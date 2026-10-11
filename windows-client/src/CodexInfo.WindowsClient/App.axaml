@@ -14,6 +14,71 @@
     <Style Selector="Window">
       <Setter Property="FontWeight" Value="Medium" />
     </Style>
+    <Style Selector="TextBlock.window-title">
+      <Setter Property="FontSize" Value="22" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeE9EFF8}" />
+    </Style>
+    <Style Selector="PathIcon">
+      <Setter Property="Width" Value="16" />
+      <Setter Property="Height" Value="16" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+    <Style Selector="PathIcon.heading-icon">
+      <Setter Property="Width" Value="20" />
+      <Setter Property="Height" Value="20" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
+    </Style>
+    <Style Selector="Button.window-control">
+      <Setter Property="Width" Value="36" />
+      <Setter Property="Height" Value="28" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="FontSize" Value="17" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeA8B7CA}" />
+    </Style>
+    <Style Selector="Button.window-control:pointerover">
+      <Setter Property="Background" Value="{DynamicResource Theme263548}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF2F6FC}" />
+    </Style>
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="{DynamicResource Theme236B9E}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme61B4EB}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeF5FAFF}" />
+      <Setter Property="Padding" Value="16,8" />
+      <Setter Property="CornerRadius" Value="6" />
+    </Style>
+    <Style Selector="Button.secondary">
+      <Setter Property="Background" Value="{DynamicResource Theme1B2A3A}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme36516B}" />
+      <Setter Property="Foreground" Value="{DynamicResource ThemeE9EFF8}" />
+      <Setter Property="Padding" Value="12,8" />
+      <Setter Property="CornerRadius" Value="6" />
+    </Style>
+    <Style Selector="Button.primary:disabled, Button.secondary:disabled">
+      <Setter Property="Background" Value="{DynamicResource Theme1B2735}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme304052}" />
+      <Setter Property="Foreground" Value="{DynamicResource Theme8EA1B5}" />
+    </Style>
+    <Style Selector="Button.secondary:pointerover">
+      <Setter Property="Background" Value="{DynamicResource Theme24415E}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme5EA7E5}" />
+    </Style>
+    <Style Selector="Border.window-frame">
+      <Setter Property="Width" Value="{Binding $parent[Window].Bounds.Width}" />
+      <Setter Property="Height" Value="{Binding $parent[Window].Bounds.Height}" />
+      <Setter Property="HorizontalAlignment" Value="Left" />
+      <Setter Property="VerticalAlignment" Value="Top" />
+      <Setter Property="BorderBrush" Value="{DynamicResource WindowBorder}" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="Border.window-frame.active">
+      <Setter Property="BorderBrush" Value="{DynamicResource WindowBorderActive}" />
+      <Setter Property="BorderThickness" Value="2" />
+    </Style>
     <Style Selector="Button:focus">
       <Setter Property="BorderBrush" Value="{DynamicResource Theme8BD4FF}" />
       <Setter Property="BorderThickness" Value="2" />
@@ -28,6 +93,12 @@
     </Style>
   </Application.Styles>
   <Application.Resources>
+    <StreamGeometry x:Key="IconSettings">M10,2 L14,2 15,5 18,4 21,7 19,10 22,11 22,15 19,16 20,19 17,22 14,20 13,23 9,23 8,20 5,21 2,18 4,15 1,14 1,10 4,9 3,6 6,3 9,5 Z M8,12 A4,4 0 1 0 16,12 A4,4 0 1 0 8,12 Z</StreamGeometry>
+    <StreamGeometry x:Key="IconGraph">M3,3 H5 V19 H22 V21 H3 Z M7,14 L12,9 15,12 21,6 22,8 15,15 12,12 8,16 Z</StreamGeometry>
+    <StreamGeometry x:Key="IconThreads">M3,2 H10 V9 H3 Z M5,4 V7 H8 V4 Z M6,9 H8 V13 H15 V11 H22 V18 H15 V15 H8 V20 H15 V18 H22 V25 H15 V22 H6 Z M17,13 V16 H20 V13 Z M17,20 V23 H20 V20 Z</StreamGeometry>
+    <StreamGeometry x:Key="IconConnection">M7,3 H11 V5 H7 A4,4 0 0 0 7,13 H11 V15 H7 A6,6 0 0 1 7,3 Z M13,9 H17 A6,6 0 0 1 17,21 H13 V19 H17 A4,4 0 0 0 17,11 H13 Z M7,11 H17 V13 H7 Z</StreamGeometry>
+    <StreamGeometry x:Key="IconLicense">M4,2 H15 L21,8 V23 H4 Z M6,4 V21 H19 V10 H13 V4 Z M15,5 V8 H18 Z M8,12 H17 V14 H8 Z M8,16 H17 V18 H8 Z</StreamGeometry>
+    <StreamGeometry x:Key="IconApp">M12,1 L23,12 12,23 1,12 Z M12,4 L4,12 12,20 20,12 Z M12,7 L17,12 12,17 7,12 Z</StreamGeometry>
     <FontFamily x:Key="JapaneseFont">avares://CodexInfo.WindowsClient/Assets/#Noto Sans JP Medium</FontFamily>
   </Application.Resources>
 </Application>

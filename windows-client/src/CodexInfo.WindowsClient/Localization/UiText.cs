@@ -708,7 +708,19 @@ public sealed record UiText(
     public string StepDone => LanguageCode switch { "ja" => "3. 完了", "zh-Hans" => "3. 完成", "ko" => "3. 완료", "es" => "3. Listo", "fr" => "3. Terminé", "de" => "3. Fertig", "pt" => "3. Concluído", "it" => "3. Fine", "ru" => "3. Готово", _ => "3. Done" };
     public string ConnectionProfileLabel => LanguageCode switch { "ja" => "接続プロファイル", "zh-Hans" => "连接配置", "ko" => "연결 프로필", _ => "Connection profile" };
     public string ConnectionSelectorLabel => LanguageCode switch { "ja" => "接続先", "zh-Hans" => "连接目标", "ko" => "연결 대상", _ => "Connection selector" };
-    public string ConnectionProfileNone => LanguageCode switch { "ja" => "未設定", "zh-Hans" => "未设置", "ko" => "설정 안 함", _ => "Not configured" };
+    public string ConnectionProfileNone => LanguageCode switch
+    {
+        "ja" => "既存の接続を使う",
+        "zh-Hans" => "使用现有连接",
+        "ko" => "기존 연결 사용",
+        "es" => "Usar conexión existente",
+        "fr" => "Utiliser la connexion existante",
+        "de" => "Bestehende Verbindung verwenden",
+        "pt" => "Usar conexão existente",
+        "it" => "Usa connessione esistente",
+        "ru" => "Использовать существующее подключение",
+        _ => "Use existing connection",
+    };
     public string ConnectionProfileWsl => "WSL";
     public string ConnectionProfileSsh => LanguageCode switch { "ja" => "SSH config alias", "zh-Hans" => "SSH config 别名", "ko" => "SSH config 별칭", _ => "SSH config alias" };
     public string ConnectionSelectorPlaceholder => LanguageCode switch { "ja" => "プロファイルを選択してください", "zh-Hans" => "请选择连接配置", "ko" => "연결 프로필을 선택하세요", _ => "Choose a connection profile" };
@@ -900,6 +912,20 @@ public sealed record UiText(
         _ => "Example command. Replace user@linux-host with the actual SSH user and host name or IP address before running it."
     };
 
+    public string RefreshStatus => LanguageCode switch
+    {
+        "ja" => "状態を更新",
+        "de" => "Status aktualisieren",
+        "es" => "Actualizar estado",
+        "fr" => "Actualiser l’état",
+        "pt" => "Atualizar estado",
+        "ru" => "Обновить статус",
+        "zh-Hans" => "刷新状态",
+        "it" => "Aggiorna stato",
+        "ko" => "상태 새로 고침",
+        _ => "Refresh status",
+    };
+
     public string SshUserLabel => LanguageCode switch
     {
         "ja" => "SSHユーザー名",
@@ -1088,6 +1114,7 @@ public static class LocalizationService
         ["zh-Hans"] = English with
         {
             LanguageCode = "zh-Hans",
+            Cancel = "取消",
             LanguageName = "简体中文",
             AppSubtitle = "Windows 监控客户端",
             UsageStatus = "使用情况",
@@ -1138,6 +1165,7 @@ public static class LocalizationService
         ["ko"] = English with
         {
             LanguageCode = "ko",
+            Cancel = "취소",
             LanguageName = "한국어",
             AppSubtitle = "Windows 모니터링 클라이언트",
             UsageStatus = "사용 현황",
@@ -1188,6 +1216,7 @@ public static class LocalizationService
         ["es"] = English with
         {
             LanguageCode = "es",
+            Cancel = "Cancelar",
             LanguageName = "Español",
             AppSubtitle = "Cliente de supervisión para Windows",
             UsageStatus = "Uso",
@@ -1238,6 +1267,7 @@ public static class LocalizationService
         ["fr"] = English with
         {
             LanguageCode = "fr",
+            Cancel = "Annuler",
             LanguageName = "Français",
             AppSubtitle = "Client de surveillance Windows",
             UsageStatus = "Utilisation",
@@ -1288,6 +1318,7 @@ public static class LocalizationService
         ["de"] = English with
         {
             LanguageCode = "de",
+            Cancel = "Abbrechen",
             LanguageName = "Deutsch",
             AppSubtitle = "Windows-Überwachungsclient",
             UsageStatus = "Nutzung",
@@ -1338,6 +1369,7 @@ public static class LocalizationService
         ["pt"] = English with
         {
             LanguageCode = "pt",
+            Cancel = "Cancelar",
             LanguageName = "Português",
             AppSubtitle = "Cliente de monitoramento do Windows",
             UsageStatus = "Uso",
@@ -1388,6 +1420,7 @@ public static class LocalizationService
         ["it"] = English with
         {
             LanguageCode = "it",
+            Cancel = "Annulla",
             LanguageName = "Italiano",
             AppSubtitle = "Client di monitoraggio Windows",
             UsageStatus = "Utilizzo",
@@ -1438,6 +1471,7 @@ public static class LocalizationService
         ["ru"] = English with
         {
             LanguageCode = "ru",
+            Cancel = "Отмена",
             LanguageName = "Русский",
             AppSubtitle = "Клиент мониторинга Windows",
             UsageStatus = "Использование",

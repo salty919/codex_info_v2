@@ -52,8 +52,7 @@ public sealed class MainLayoutParityTests
         Assert.Equal("0,3,0,0", titleBlock.Attribute("Margin")?.Value);
         Assert.Equal("0", title.Attribute("Grid.Row")?.Value);
         Assert.Equal("1", version.Attribute("Grid.Row")?.Value);
-        Assert.Equal("22", title.Attribute("FontSize")?.Value);
-        Assert.Equal("Bold", title.Attribute("FontWeight")?.Value);
+        Assert.Equal("window-title", title.Attribute("Classes")?.Value);
         Assert.Equal("12", version.Attribute("FontSize")?.Value);
     }
 
@@ -406,7 +405,7 @@ public sealed class MainLayoutParityTests
         Assert.Equal("Horizontal", windowControlRow.Attribute("Orientation")?.Value);
         Assert.Equal("0", windowControlRow.Attribute("Spacing")?.Value);
         Assert.Equal("12,0,0,0", windowControlRow.Attribute("Margin")?.Value);
-        var windowControlStyle = document.Descendants().Single(element =>
+        var windowControlStyle = XDocument.Parse(LoadRepositoryFile("windows-client", "src", "CodexInfo.WindowsClient", "App.axaml")).Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
             element.Attribute("Selector")?.Value == "Button.window-control");
         Assert.Equal("Center", windowControlStyle.Descendants().Single(element =>

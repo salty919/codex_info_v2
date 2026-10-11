@@ -4404,7 +4404,7 @@ function Open-E2ESetupFromSettings {
         'Settings Setup button accessible name does not match the saved language.'
     Invoke-E2EElement $button
     $handle = Wait-E2E -Description 'Setup window' -Probe {
-        $found = Find-E2EWindow $ProcessId 'Codex Info Setup'
+        $found = Find-E2EWindow $ProcessId (Get-E2ESettingsFooterActionNames).Setup
         if ($found -ne [IntPtr]::Zero) { return $found }
         return $false
     }
@@ -4803,7 +4803,14 @@ function Invoke-E2ESettingsTabs {
                 Assert-E2ESettingsRuntimeVersions $settings.Root
                 $authCheck = Find-E2EElementByAutomationId $settings.Root 'Settings.AuthCheck'
                 Assert-E2E ($null -ne $authCheck -and -not $authCheck.Current.IsOffscreen -and $authCheck.Current.IsEnabled) `
-                    'Connection status tab does not render the authentication check action.'
+                    'Connection status tab does not render the refresh action.'
+                Assert-E2E ($authCheck.Current.Name -ceq 'Refresh status') 'Refresh has a misleading label.'
+                Invoke-E2EElement $authCheck
+                Wait-E2E -Description 'Settings refresh result' -Probe {
+                    $result = Find-E2EElementByAutomationId $settings.Root 'Settings.ConnectionStatus.Detail'
+                    $button = Find-E2EElementByAutomationId $settings.Root 'Settings.AuthCheck'
+                    return $null -ne $result -and -not [string]::IsNullOrWhiteSpace($result.Current.Name) -and $button.Current.IsEnabled
+                } | Out-Null
             }
         }
         $null = Capture-E2EWindow $settings.Handle ("settings-draft-" + $automationId.Substring('Settings.Tab.'.Length))
@@ -5092,7 +5099,7 @@ function Invoke-E2ESettingsTabs {
     Assert-E2E ($null -ne $setupClose) 'Setup Close button is missing.'
     Invoke-E2EElement $setupClose
     Wait-E2E -Description 'Settings footer Setup closes' -Probe {
-        return (Find-E2EWindow $ProcessId 'Codex Info Setup') -eq [IntPtr]::Zero
+        return (Find-E2EWindow $ProcessId (Get-E2ESettingsFooterActionNames).Setup) -eq [IntPtr]::Zero
     } | Out-Null
 
     Bring-E2EWindowToFront $settings.Handle
@@ -5238,14 +5245,22 @@ function Assert-E2EThemeSurfaces {
         }
     }
     $threads = $Windows.Threads
-    $rootTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-root'
-    $childTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-child'
-    $leafTitle = Find-E2EElementByAutomationId $threads.Root 'e2e-grandchild'
-    Assert-E2E ($null -ne $rootTitle -and $null -ne $childTitle -and $null -ne $leafTitle) `
-        'Fixture parent/child/leaf Threads UIA rows are missing.'
-    $rootRect = $rootTitle.Current.BoundingRectangle
-    $childRect = $childTitle.Current.BoundingRectangle
-    $leafRect = $leafTitle.Current.BoundingRectangle
+    # A periodic fixture refresh replaces row peers. Capture visible geometry
+    # from the current peers together, instead of retaining detached elements.
+    $rowRects = Wait-E2E -Description "Visible Threads row geometry ($ThemeId)" -Probe {
+        $rects = @()
+        foreach ($id in @('e2e-root', 'e2e-child', 'e2e-grandchild')) {
+            $element = Find-E2EElementByAutomationId $threads.Root $id
+            if ($null -eq $element) { return $false }
+            $rect = $element.Current.BoundingRectangle
+            if ($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0) { return $false }
+            $rects += $rect
+        }
+        return [pscustomobject]@{ Root = $rects[0]; Child = $rects[1]; Leaf = $rects[2] }
+    }
+    $rootRect = $rowRects.Root
+    $childRect = $rowRects.Child
+    $leafRect = $rowRects.Leaf
     $threadWindowBounds = Get-E2EWindowBounds $threads.Handle
     $parentRegion = [pscustomobject]@{
         Left = $rootRect.Left - 18; Top = $rootRect.Top - 10
@@ -5289,6 +5304,9 @@ function Assert-E2EThemeSurfaces {
     Bring-E2EWindowToFront $Windows.Settings.Handle
     $selector = Get-E2EThemeSelector $Windows.Settings.Root
     $selector.SetFocus()
+    Wait-E2E -Description "Settings theme selector keyboard focus ($ThemeId)" -Probe {
+        return $selector.Current.HasKeyboardFocus
+    } | Out-Null
     $focusCapture = Capture-E2EWindow $Windows.Settings.Handle "theme-$ThemeId-settings-focus"
     Assert-E2EThemePixel $focusCapture $Windows.Settings.Handle $colors.Focus "$ThemeId/Settings/focus-border" -Element $selector
     Write-E2E "theme-surfaces: PASS theme=$ThemeId windows=6"
@@ -5628,7 +5646,7 @@ function Invoke-E2EThemePresets {
     Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $legacyBytes) `
         'Theme preview changed the persisted settings before Save.'
     Write-E2E 'theme-preview: PASS selected paper-light before Save, windows=6, settings unchanged'
-    $close = Find-E2EElementByAutomationId $windows.Settings.Root 'Settings.Window.Close'
+    $close = Find-E2EElementByAutomationId $windows.Settings.Root 'Settings.Footer.Cancel'
     Assert-E2E ($null -ne $close) 'Settings Cancel/Close control is missing.'
     Invoke-E2EElement $close
     Wait-E2E -Description 'Settings closes without Save' -Probe {
@@ -5680,7 +5698,7 @@ function Invoke-E2EThemePresets {
                 @{ Role = 'Graph'; Title = 'Codex Info Graph' },
                 @{ Role = 'Threads'; Title = 'Codex Info Threads' },
                 @{ Role = 'Legal'; Title = 'Codex Info License' },
-                @{ Role = 'Setup'; Title = 'Codex Info Setup' })) {
+                @{ Role = 'Setup'; Title = (Get-E2ESettingsFooterActionNames).Setup })) {
             $current = Find-E2EWindow $ProcessId $entry.Title
             Assert-E2E ($current -eq $originalHandles[$entry.Role]) `
                 "$($entry.Role) HWND changed or closed while applying $($choice.Id)."
@@ -5694,6 +5712,52 @@ function Invoke-E2EThemePresets {
         Assert-E2EThemeSurfaces $windows $choice.Id
         Write-E2E "theme-save: PASS theme=$($choice.Id) existing-hwnd=5"
     }
+
+    # Exercise the visible setup steps with an already authenticated fixture.
+    Bring-E2EWindowToFront $windows.Setup.Handle
+    $advance = Find-E2EButtonByName $windows.Setup.Root 'Continue'
+    Assert-E2E ($null -ne $advance -and $advance.Current.IsEnabled) 'Connected setup cannot continue.'
+    Invoke-E2EElement $advance
+    $null = Capture-E2EWindow $windows.Setup.Handle 'setup-authenticated-step'
+    Assert-E2E $advance.Current.IsEnabled 'Authenticated setup cannot advance to Done.'
+    Invoke-E2EElement $advance
+    Wait-E2E -Description 'Done exposes the completion action' -Probe {
+        return $advance.Current.Name -ceq 'Close' -and $advance.Current.IsEnabled
+    } | Out-Null
+    $null = Capture-E2EWindow $windows.Setup.Handle 'setup-done-step'
+    Invoke-E2EElement $advance
+    Wait-E2E -Description 'Setup completion closes the window' -Probe {
+        return (Find-E2EWindow $ProcessId (Get-E2ESettingsFooterActionNames).Setup) -eq [IntPtr]::Zero
+    } | Out-Null
+    Write-E2E 'setup-steps: PASS connection -> authenticated -> done -> closed'
+
+    # Individual captures do not demonstrate separation when windows overlap.
+    $settingsBounds = Get-E2EWindowBounds $windows.Settings.Handle
+    $graphBounds = Get-E2EWindowBounds $windows.Graph.Handle
+    $captureContext = [CodexInfoWindowsE2EWin32]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    try {
+        Assert-E2E ([CodexInfoWindowsE2EWin32]::SetWindowPos($windows.Settings.Handle,
+            [IntPtr]::Zero, $settingsBounds.Left + 96, $settingsBounds.Top + 96, 0, 0, [uint32]0x0015)) 'Could not offset Settings for overlap capture.'
+        Bring-E2EWindowToFront $windows.Graph.Handle
+        Bring-E2EWindowToFront $windows.Main.Handle
+        Bring-E2EWindowToFront $windows.Settings.Handle
+        $overlap = Get-E2EWindowBounds $windows.Settings.Handle
+        $left = [Math]::Min($graphBounds.Left, $overlap.Left)
+        $top = [Math]::Min($graphBounds.Top, $overlap.Top)
+        $width = [Math]::Max($graphBounds.Left + $graphBounds.Width, $overlap.Left + $overlap.Width) - $left
+        $height = [Math]::Max($graphBounds.Top + $graphBounds.Height, $overlap.Top + $overlap.Height) - $top
+        $bitmap = [Drawing.Bitmap]::new($width, $height)
+        $graphics = [Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $graphics.CopyFromScreen($left, $top, 0, 0, $bitmap.Size)
+            $bitmap.Save((Join-Path $script:e2eOutput 'window-overlap.png'), [Drawing.Imaging.ImageFormat]::Png)
+        } finally { $graphics.Dispose(); $bitmap.Dispose() }
+    } finally {
+        $null = [CodexInfoWindowsE2EWin32]::SetWindowPos($windows.Settings.Handle,
+            [IntPtr]::Zero, $settingsBounds.Left, $settingsBounds.Top, 0, 0, [uint32]0x0015)
+        $null = [CodexInfoWindowsE2EWin32]::SetThreadDpiAwarenessContext($captureContext)
+    }
+    Write-E2E 'window-overlap: captured Main, Graph and Settings'
 
     Stop-Process -Id $ProcessId -Force
     Wait-E2E -Description 'first themed client exits' -Probe { return $script:e2eProcess.HasExited } | Out-Null
