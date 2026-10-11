@@ -1519,6 +1519,51 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal(253_402_300_799, result.Snapshot.HistoryPeriods[0].ResetAt);
     }
 
+    [Theory]
+    [InlineData("v1")]
+    [InlineData("v2")]
+    [InlineData("v3")]
+    public async Task OfficialResetIdentitiesOneSecondApartStaySeparate(string version)
+    {
+        var json = System.Text.Json.Nodes.JsonNode.Parse(version switch
+        {
+            "v3" => ValidDetailsV3Json(),
+            "v2" => ValidDetailsV2Json(),
+            _ => ValidDetailsJson(),
+        })!;
+        const long oldReset = 253_402_300_798;
+        var periods = json["history_periods"]!.AsArray();
+        var oldPeriod = periods[0]!.DeepClone();
+        oldPeriod["id"] = oldReset.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        oldPeriod["reset_at"] = oldReset;
+        oldPeriod["start_at"] = 253_402_300_620L;
+        oldPeriod["end_at"] = 253_402_300_620L;
+        oldPeriod["current"] = false;
+        periods.Insert(0, oldPeriod);
+        var samples = json["history_samples"]!.AsArray();
+        var oldSample = samples[0]!.DeepClone();
+        oldSample["reset_at"] = oldReset;
+        oldSample["timestamp"] = 253_402_300_620L;
+        oldSample["remaining_percent"] = 10.0;
+        samples.Insert(0, oldSample);
+        json["quota"]!["remaining_percent"] = 100.0;
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri!.AbsolutePath == $"/{version}/details"
+                ? JsonResponse(json.ToJsonString(), includePublishedPair: true)
+                : NotFoundResponse()));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(100.0, result.Snapshot!.Quota!.RemainingPercent);
+        Assert.Equal(2, result.Snapshot.HistoryPeriods.Count);
+        Assert.All(result.Snapshot.HistoryPeriods, period =>
+        {
+            var sample = Assert.Single(period.Samples);
+            Assert.Equal(period.ResetAt, sample.ResetAt);
+        });
+    }
+
     [Fact]
     public async Task ResetJitterCanonicalCollisionRejectsTheCompleteDetailsGeneration()
     {
