@@ -181,88 +181,12 @@ jobs:
             fi
           fi
 
-          # A generated H1 can be observed by a later version-only PR after its
-          # source H0 is already in the base. Authenticate that exact H1 before
-          # classifying the now-empty source diff.
-          detached_generated_h1=false
-          if [[ "$expected_version_transition" == true && \
-                "$head_version" == "$next_version" && \
-                "${#version_line[@]}" -eq 2 ]] && \
-             git merge-base --is-ancestor "$version_commit" "$HEAD_SHA"; then
-            commit_message="$(git show -s --format=%B "$version_commit")"
-            trailer_value() {
-              local key="$1"
-              local -a values
-              mapfile -t values < <(sed -n "s/^${key}: //p" <<<"$commit_message")
-              [[ "${#values[@]}" -eq 1 ]] || return 1
-              printf '%s' "${values[0]}"
-            }
-            generator_schema=''
-            generator_pr=''
-            generator_event_head=''
-            generator_run_id=''
-            generator_run_attempt=''
-            if generator_schema="$(trailer_value Codex-Version-Prepare-Schema)" && \
-               generator_pr="$(trailer_value Codex-Version-Prepare-PR)" && \
-               generator_event_head="$(trailer_value Codex-Version-Prepare-Event-Head)" && \
-               generator_run_id="$(trailer_value Codex-Version-Prepare-Run-ID)" && \
-               generator_run_attempt="$(trailer_value Codex-Version-Prepare-Run-Attempt)" && \
-               [[ "$generator_schema" == v1 && \
-                  "$generator_pr" =~ ^[1-9][0-9]*$ && \
-                  "$generator_pr" != "$PR_NUMBER" && \
-                  "$generator_event_head" == "$parent_sha" && \
-                  "$generator_run_id" =~ ^[1-9][0-9]*$ && \
-                  "$generator_run_attempt" =~ ^[1-9][0-9]*$ ]] && \
-               git merge-base --is-ancestor "$parent_sha" "$BASE_SHA"; then
-              expected_generated_message="$(printf '%s\n\n\n%s\n%s\n%s\n%s\n%s\n%s' \
-                "chore: prepare version $head_version" \
-                'Codex-Version-Prepare-Schema: v1' \
-                "Codex-Version-Prepare-PR: $generator_pr" \
-                "Codex-Version-Prepare-Event-Head: $generator_event_head" \
-                "Codex-Version-Prepare-Run-ID: $generator_run_id" \
-                "Codex-Version-Prepare-Run-Attempt: $generator_run_attempt" \
-                'skip-checks: true')"
-              if [[ "$commit_message" == "$expected_generated_message" ]]; then
-                generator_run=''
-                if generator_run="$(gh api -H 'Accept: application/vnd.github+json' \
-                     "repos/$REPOSITORY/actions/runs/$generator_run_id/attempts/$generator_run_attempt" 2>/dev/null)"; then
-                  generator_title="$(jq -er '.display_title | select(type == "string")' <<<"$generator_run")"
-                  metadata_matches=false
-                  case "$generator_title" in
-                    "codex-main-quality-v1:pr=$generator_pr:event_head=$parent_sha:action=opened:draft=false"|\
-                    "codex-main-quality-v1:pr=$generator_pr:event_head=$parent_sha:action=synchronize:draft=false"|\
-                    "codex-main-quality-v1:pr=$generator_pr:event_head=$parent_sha:action=reopened:draft=false"|\
-                    "codex-main-quality-v1:pr=$generator_pr:event_head=$parent_sha:action=ready_for_review:draft=false")
-                      metadata_matches=true
-                      ;;
-                  esac
-                  if [[ "$metadata_matches" == true ]] && \
-                     jq -e \
-                       --arg attempt "$generator_run_attempt" \
-                       --arg id "$generator_run_id" \
-                       --arg repository "$REPOSITORY" '
-                         select((.id | tostring) == $id and
-                                (.run_attempt | tostring) == $attempt and
-                                (.path | type) == "string" and
-                                ((.path | split("@")[0]) == ".github/workflows/version-prepare.yml") and
-                                .event == "pull_request_target" and
-                                .conclusion == "success" and
-                                .repository.full_name == $repository)
-                       ' <<<"$generator_run" >/dev/null; then
-                    detached_generated_h1=true
-                  fi
-                fi
-              fi
-            fi
-          fi
-          if [[ "$detached_generated_h1" == true ]]; then
-            printf 'ready=false\nselection_json={}\nquality_sha=%s\ngenerated_head=false\ngenerated_observer=true\n' \
-              "$HEAD_SHA" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           changes="$RUNNER_TEMP/changed-paths.z"
-          if [[ "$expected_version_transition" == true ]]; then
+          # Exclude the generated bump only while its source changes are
+          # still in this PR. After H0 merges, the pending version is itself
+          # a product change and must select current release builds.
+          if [[ "$expected_version_transition" == true ]] && \
+             ! git merge-base --is-ancestor "$parent_sha" "$BASE_SHA"; then
             git diff --find-renames=50% --find-copies=50% --find-copies-harder \
               --name-status -z "$BASE_SHA...$HEAD_SHA" -- . \
               ':(exclude)Cargo.toml' \

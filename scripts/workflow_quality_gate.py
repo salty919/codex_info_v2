@@ -1785,9 +1785,8 @@ def _version_state_tests(version_workflow: str) -> int:
             raise AssertionError("generated H1 observer published a duplicate status")
         cases += 1
 
-        # A version-only PR may observe the same generated H1 after its source
-        # H0 is already part of the base branch. Its filtered source diff is
-        # empty, but the exact successful producer run still owns this H1.
+        # Once H0 is merged, the pending version transition is the remaining
+        # product change. The current PR must build its own release candidate.
         fixture["base"] = h0
         detached, detached_values = _run_version_step(
             fixture,
@@ -1798,28 +1797,48 @@ def _version_state_tests(version_workflow: str) -> int:
         )
         if (
             detached.returncode != 0
-            or detached_values.get("ready") != "false"
-            or detached_values.get("generated_observer") != "true"
+            or detached_values.get("ready") != "true"
+            or detached_values.get("generated_observer") != "false"
             or detached_values.get("quality_sha") != h1
+            or json.loads(detached_values["selection_json"])["owners"]
+            != ["LINUX_BACKEND", "LINUX_UI", "WINDOWS"]
         ):
-            raise AssertionError("merged-source generated H1 was not accepted as an observer")
+            raise AssertionError("merged-source H1 did not select current release owners")
         if _status_calls(fixture):
             raise AssertionError("detached H1 observer published a duplicate status")
         cases += 1
 
         failed_producer = {**producer_run, "conclusion": "failure"}
-        rejected, _ = _run_version_step(
+        recovered, recovered_values = _run_version_step(
             fixture,
             script,
             h1,
             producer_run=failed_producer,
             pr_number=45,
         )
-        if rejected.returncode == 0:
-            raise AssertionError("detached H1 with a failed producer was accepted")
+        if recovered.returncode != 0 or recovered_values.get("ready") != "true":
+            raise AssertionError("previous producer failure prevented current release evaluation")
         cases += 1
 
         _git(seed, "pull", "--quiet", "--ff-only", "origin", "case")
+        workflow = seed / ".github/workflows/incident.yml"
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.write_text("name: incident recovery\n", encoding="utf-8")
+        later_workflow = _commit(fixture, "later workflow change")
+        current, current_values = _run_version_step(
+            fixture, script, later_workflow, producer_run=producer_run, pr_number=45
+        )
+        release_owners = ["GOVERNANCE", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"]
+        if (
+            current.returncode != 0
+            or current_values.get("ready") != "true"
+            or current_values.get("generated_observer") != "false"
+            or current_values.get("quality_sha") != later_workflow
+            or json.loads(current_values["selection_json"])["owners"] != release_owners
+        ):
+            raise AssertionError("later workflow head skipped its own release evaluation")
+        cases += 1
+
         (seed / "windows-client/src/Later.cs").write_text(
             "class Later {}\n", encoding="utf-8"
         )
@@ -1832,9 +1851,9 @@ def _version_state_tests(version_workflow: str) -> int:
             or third_values.get("quality_sha") != h2
             or third_values.get("generated_head") != "false"
             or third_values.get("generated_observer") != "false"
-            or json.loads(third_values["selection_json"])["owners"] != ["WINDOWS"]
+            or json.loads(third_values["selection_json"])["owners"] != release_owners
         ):
-            raise AssertionError("H2 retained generated version files or became an observer")
+            raise AssertionError("H2 did not retain pending release owners or became an observer")
         if _status_calls(fixture):
             raise AssertionError("H2 published a duplicate generated-head status")
         cases += 1
