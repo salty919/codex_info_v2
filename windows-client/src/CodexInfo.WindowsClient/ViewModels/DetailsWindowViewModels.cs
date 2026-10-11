@@ -252,6 +252,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool IsWeekView => SelectedTimeRange == GraphTimeRange.Last7Days;
 
+    public bool IsMonthView => SelectedTimeRange == GraphTimeRange.CalendarMonth;
+
     public bool CanGoBack
     {
         get
@@ -290,6 +292,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 GraphTimeRange.Last24Hours => Texts.GraphDayRange,
                 GraphTimeRange.Last7Days => Texts.GraphWeekRange,
+                GraphTimeRange.CalendarMonth => Texts.GraphMonthRange,
                 _ => Texts.GraphPeriodRange,
             };
             var startAt = range == GraphTimeRange.ResetPeriod
@@ -298,6 +301,12 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             var endAt = range == GraphTimeRange.ResetPeriod
                 ? selectedPeriod?.EndAt ?? (scene.HasPoints ? scene.PeriodEndAt : 0)
                 : scene.PeriodEndAt;
+            if (range == GraphTimeRange.CalendarMonth && startAt > 0 && endAt > startAt)
+            {
+                var firstDate = GraphTimeWindow.LocalDate(startAt, LocalizationService.DisplayTimeZone);
+                var lastDate = GraphTimeWindow.LocalDate(endAt - 1, LocalizationService.DisplayTimeZone);
+                return $"{title} · {firstDate:yyyy/MM/dd} – {lastDate:yyyy/MM/dd}";
+            }
             return startAt > 0 && endAt > startAt
                 ? $"{title} · {FormatPeriodStart(startAt)} – {FormatPeriodStart(endAt)}"
                 : title;
@@ -866,12 +875,14 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         var now = getUnixTimeSeconds();
         long? pinnedEndAt = pinnedWindowEndAt == long.MinValue ? null : pinnedWindowEndAt;
-        var navigationOriginAt = windowNavigationOriginAt ?? (pinnedEndAt is { } pinned
-            ? pinned + GraphTimeWindow.GetDurationSeconds(range)
-            : now);
+        var navigationOriginAt = range == GraphTimeRange.CalendarMonth
+            ? now
+            : windowNavigationOriginAt ?? (pinnedEndAt is { } pinned
+                ? pinned + GraphTimeWindow.GetDurationSeconds(range)
+                : now);
         RequestTimeRange(
             range,
-            GraphTimeWindow.StepBack(range, now, pinnedEndAt),
+            GraphTimeWindow.StepBack(range, now, pinnedEndAt, LocalizationService.DisplayTimeZone),
             navigationOriginAt,
             now);
     }
@@ -904,7 +915,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             range,
             now,
             pinnedWindowEndAt,
-            windowNavigationOriginAt);
+            windowNavigationOriginAt,
+            LocalizationService.DisplayTimeZone);
         RequestTimeRange(range, nextEndAt, nextEndAt is null ? null : windowNavigationOriginAt, now);
     }
 
@@ -1261,7 +1273,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         var pinnedEndAt = pinnedWindowEndAt == long.MinValue ? (long?)null : pinnedWindowEndAt;
         await RefreshTimeWindowCoreAsync(
                 range,
-                GraphTimeWindow.GetBounds(range, now, pinnedEndAt),
+                GraphTimeWindow.GetBounds(range, now, pinnedEndAt, LocalizationService.DisplayTimeZone),
                 pinnedEndAt,
                 windowNavigationOriginAt,
                 Interlocked.Read(ref timeWindowRevision),
@@ -1298,7 +1310,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             ? requestedEnd
             : (long?)null;
         var navigationOriginAt = pinnedEndAt is null ? null : request.NavigationOriginAt;
-        var bounds = GraphTimeWindow.GetBounds(request.Range, now, pinnedEndAt);
+        var bounds = GraphTimeWindow.GetBounds(request.Range, now, pinnedEndAt, LocalizationService.DisplayTimeZone);
         var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeWindowRequestCancellation = linkedCancellation;
         await RefreshTimeWindowCoreAsync(
@@ -1378,9 +1390,15 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             : (long?)null;
         var navigationOriginAt = pinnedEndAt is null
             ? null
-            : requestedNavigationOriginAt ?? windowNavigationOriginAt ??
-                pinnedEndAt + GraphTimeWindow.GetDurationSeconds(range);
-        var bounds = GraphTimeWindow.GetBounds(range, now, pinnedEndAt);
+            : range == GraphTimeRange.CalendarMonth ? now
+                : requestedNavigationOriginAt ?? windowNavigationOriginAt ??
+                    pinnedEndAt + GraphTimeWindow.GetDurationSeconds(range);
+        var bounds = GraphTimeWindow.GetBounds(range, now, pinnedEndAt, LocalizationService.DisplayTimeZone);
+        if (range == GraphTimeRange.CalendarMonth)
+        {
+            pinnedEndAt = bounds.EndAt < now ? bounds.EndAt : null;
+            navigationOriginAt = pinnedEndAt is null ? null : now;
+        }
         var rangeRequestId = Interlocked.Increment(ref graphRequestRevision);
         Volatile.Write(ref pendingGraphRequest, new PendingGraphRequest(
             rangeRequestId,
@@ -1409,7 +1427,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 try
                 {
                     PublishTimeWindow(range, pinnedEndAt, navigationOriginAt, revision, data, windowPeriodDirectory,
-                        windowPublishedPair, BuildWindowProjection(bounds, data, options, cache),
+                        windowPublishedPair, BuildWindowProjection(range, bounds, data, options, cache),
                         accountId: null, accountGeneration: 0);
                 }
                 catch
@@ -1472,7 +1490,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         var pinnedEndAt = this.pinnedWindowEndAt == long.MinValue
             ? (long?)null
             : this.pinnedWindowEndAt;
-        var bounds = GraphTimeWindow.GetBounds(range, now, pinnedEndAt);
+        var bounds = GraphTimeWindow.GetBounds(range, now, pinnedEndAt, LocalizationService.DisplayTimeZone);
         var data = resourceClient is null
             ? staticWindowPeriodData.Where(item => Intersects(item.Period, bounds)).ToArray()
             : GetCachedWindowData(bounds);
@@ -1486,7 +1504,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         var rangeRevision = Interlocked.Read(ref timeWindowRevision);
         var options = CaptureWindowBuildOptions();
         var cache = new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>(windowProjectionCache);
-        var build = () => BuildWindowProjection(bounds, data, options, cache);
+        var build = () => BuildWindowProjection(range, bounds, data, options, cache);
         if (data.Sum(item => item.Samples.Count) <= BackgroundBuildThreshold)
         {
             try
@@ -1570,7 +1588,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             try
             {
-                var projection = BuildWindowProjection(bounds, data, options, cache);
+                var projection = BuildWindowProjection(range, bounds, data, options, cache);
                 PublishTimeWindow(
                     range,
                     pinnedEndAt,
@@ -1640,7 +1658,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         showAstra,
         main.SelectedAccount?.OwnershipIntervals?
             .Select(interval => new GraphAccountOwnershipInterval(interval.StartAt, interval.EndAt))
-            .ToArray());
+            .ToArray(),
+        LocalizationService.DisplayTimeZone);
 
     private async Task<WindowBuildSnapshot> CaptureWindowBuildSnapshotAsync(
         CancellationToken cancellationToken)
@@ -1677,6 +1696,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         WindowBuildSnapshot buildSnapshot)
     {
         _ = Task.Run(() => BuildWindowProjection(
+                range,
                 bounds,
                 candidateData,
                 buildSnapshot.Options,
@@ -1782,11 +1802,24 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         (left.ModelSamples is null || left.ModelSamples.SequenceEqual(right.ModelSamples!));
 
     private static WindowGraphProjection BuildWindowProjection(
+        GraphTimeRange range,
         GraphTimeBounds bounds,
         IReadOnlyList<GraphWindowPeriodData> data,
         WindowBuildOptions options,
         IReadOnlyDictionary<WindowProjectionCacheKey, CachedWindowProjection> priorCache)
     {
+        if (range == GraphTimeRange.CalendarMonth)
+        {
+            var rawPeriods = data.Select(item => item.Period with { Samples = item.Samples }).ToArray();
+            var hiddenNames = BuildHiddenModelNames(data.SelectMany(item => item.Samples).ToArray(),
+                options.ShowModels, options.ShowSol, options.ShowTerra, options.ShowLuna, options.ShowAstra);
+            var daily = GraphScene.CreateDailyViewport(bounds.StartAt, bounds.EndAt, options.Metric,
+                rawPeriods, options.DisplayTimeZone, data.SelectMany(item => item.Gaps).ToArray(),
+                options.AccountOwnershipIntervals, hiddenNames);
+            return new WindowGraphProjection(Array.Empty<GraphPointViewModel>(), daily,
+                new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>());
+        }
+
         var points = new List<GraphPointViewModel>();
         var children = new List<GraphScene>();
         var nextCache = new Dictionary<WindowProjectionCacheKey, CachedWindowProjection>();
@@ -2034,6 +2067,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(IsPeriodView));
         Notify(nameof(Is24HourView));
         Notify(nameof(IsWeekView));
+        Notify(nameof(IsMonthView));
         Notify(nameof(CanGoBack));
         Notify(nameof(CanGoForward));
         Notify(nameof(HasPlot));
@@ -2105,7 +2139,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 : this.pinnedWindowEndAt;
             await RefreshTimeWindowCoreAsync(
                     range,
-                    GraphTimeWindow.GetBounds(range, now, pinnedEndAt),
+                    GraphTimeWindow.GetBounds(range, now, pinnedEndAt, LocalizationService.DisplayTimeZone),
                     pinnedEndAt,
                     windowNavigationOriginAt,
                     Interlocked.Read(ref timeWindowRevision),
@@ -3279,7 +3313,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         bool ShowTerra,
         bool ShowLuna,
         bool ShowAstra,
-        IReadOnlyList<GraphAccountOwnershipInterval>? AccountOwnershipIntervals);
+        IReadOnlyList<GraphAccountOwnershipInterval>? AccountOwnershipIntervals,
+        TimeZoneInfo DisplayTimeZone);
 
     private sealed record WindowBuildSnapshot(
         WindowBuildOptions Options,

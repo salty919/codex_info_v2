@@ -170,7 +170,7 @@
         </StackPanel>
       </Grid>
 
-      <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto" Margin="0,4,0,4">
+      <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="12" Margin="0,4,0,4">
         <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
           <Button Classes="range-mode" Classes.selected="{Binding IsPeriodView}" Tag="Period" Click="OnTimeRangeClick"
                   Content="{Binding Texts.GraphPeriodRange}" AutomationProperties.AutomationId="Graph.Range.Period" />
@@ -178,6 +178,8 @@
                   Content="{Binding Texts.GraphDayRange}" AutomationProperties.AutomationId="Graph.Range.Day" />
           <Button Classes="range-mode" Classes.selected="{Binding IsWeekView}" Tag="Week" Click="OnTimeRangeClick"
                   Content="{Binding Texts.GraphWeekRange}" AutomationProperties.AutomationId="Graph.Range.Week" />
+          <Button Classes="range-mode" Classes.selected="{Binding IsMonthView}" Tag="Month" Click="OnTimeRangeClick"
+                  Content="{Binding Texts.GraphMonthRange}" AutomationProperties.AutomationId="Graph.Range.Month" />
         </StackPanel>
         <TextBlock Grid.Column="1" Margin="12,0" VerticalAlignment="Center" FontWeight="SemiBold"
                    Text="{Binding RangeLabel}" TextTrimming="CharacterEllipsis" IsVisible="{Binding !IsPeriodView}"
@@ -225,7 +227,7 @@
 
       <Grid Grid.Row="2" Width="504" Height="24" Margin="4,1,0,1" HorizontalAlignment="Left"
             ColumnDefinitions="120,90,90,90,90" ColumnSpacing="6">
-      <ToggleButton Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowRemaining}" AutomationProperties.Name="{Binding Texts.RemainingQuota}" AutomationProperties.AutomationId="Graph.Toggle.Remaining" ToolTip.Tip="{Binding Texts.RemainingQuota}">
+      <ToggleButton Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowRemaining}" IsVisible="{Binding !IsMonthView}" AutomationProperties.Name="{Binding Texts.RemainingQuota}" AutomationProperties.AutomationId="Graph.Toggle.Remaining" ToolTip.Tip="{Binding Texts.RemainingQuota}">
         <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource GraphRemaining}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="{Binding Texts.RemainingQuota}" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="1" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowLuna}" AutomationProperties.Name="LUNA" AutomationProperties.AutomationId="Graph.Toggle.LUNA" ToolTip.Tip="LUNA">

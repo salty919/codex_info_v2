@@ -12,7 +12,7 @@ public sealed class GraphWindowSelectorParityTests
     public void GraphTimeWindowsExposeModesAndBoundedNavigation()
     {
         var graph = XDocument.Parse(Load("GraphWindow.axaml"));
-        foreach (var id in new[] { "Graph.Range.Period", "Graph.Range.Day", "Graph.Range.Week",
+        foreach (var id in new[] { "Graph.Range.Period", "Graph.Range.Day", "Graph.Range.Week", "Graph.Range.Month",
                      "Graph.Range.Previous", "Graph.Range.Next", "Graph.Range.Label" })
         {
             Assert.Single(graph.Descendants(), element =>
@@ -26,6 +26,18 @@ public sealed class GraphWindowSelectorParityTests
         }
         var plot = graph.Descendants().Single(element => element.Name.LocalName == "GraphPlotControl");
         Assert.Equal("{Binding HasPlot}", plot.Attribute("IsVisible")?.Value);
+        var month = graph.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.Range.Month");
+        Assert.Equal("{Binding Texts.GraphMonthRange}", month.Attribute("Content")?.Value);
+        Assert.Equal("{Binding IsMonthView}", month.Attribute("Classes.selected")?.Value);
+        var monthText = typeof(CodexInfo.WindowsClient.Localization.UiText).GetProperty("GraphMonthRange");
+        Assert.NotNull(monthText);
+        foreach (var (language, expected) in new[] { ("ja", "1か月"), ("en", "1 month") })
+        {
+            var text = CodexInfo.WindowsClient.Localization.LocalizationService.Languages
+                .Single(candidate => candidate.LanguageCode == language);
+            Assert.Equal(expected, monthText.GetValue(text));
+        }
     }
 
     [Fact]
@@ -37,6 +49,9 @@ public sealed class GraphWindowSelectorParityTests
         var rows = content.Attribute("RowDefinitions")!.Value.Split(',');
         Assert.Equal(4, rows.Length);
         Assert.Equal("8", content.Attribute("RowSpacing")?.Value);
+        var rangeRow = content.Elements().Single(element =>
+            element.Name.LocalName == "Grid" && element.Attribute("Grid.Row")?.Value == "1");
+        Assert.Equal("12", rangeRow.Attribute("ColumnSpacing")?.Value);
         for (var row = 0; row < rows.Length - 1; row++)
         {
             Assert.Contains(content.Elements(), element =>
