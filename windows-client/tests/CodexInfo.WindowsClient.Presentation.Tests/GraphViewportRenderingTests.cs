@@ -533,8 +533,8 @@ public sealed class GraphViewportRenderingTests
 
             Assert.Empty(axes.TopDateValues);
             Assert.Empty(topAxis.TickGenerator.Ticks);
-            Assert.Equal(axes.ModelLabels[^1], upperTick.Label);
-            Assert.Equal("1.8K", upperTick.Label);
+            // The rendered token axis follows CUM-138-06: counts below one million are unabridged.
+            Assert.Equal("1,800", upperTick.Label);
             Assert.Equal(480, pixels.GetLength(0));
             Assert.Equal(940, pixels.GetLength(1));
             Assert.InRange((double)dataTop, halfTickFontHeight, oneTickFontHeight + 4);
