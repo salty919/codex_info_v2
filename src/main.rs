@@ -18025,9 +18025,13 @@ impl CodexInfoState {
     /// their observed timestamp/quota position; they never become model
     /// points and are never extended through an open-ended local gap.
     fn service_owns_graph_period(&self, reset_at: i64) -> bool {
-        self.service_history_periods
-            .iter()
-            .any(|period| period.reset_at == reset_at)
+        // V2 stores its received rows in history; only V3 owns the generic
+        // service_history_samples lane, including an explicitly empty page.
+        self.service_v3_published_pair.is_some()
+            && self
+                .service_history_periods
+                .iter()
+                .any(|period| period.reset_at == reset_at)
     }
 
     fn service_observation_in_graph_period(
@@ -44008,8 +44012,15 @@ mod tests {
 
         let graph_samples: Vec<UsageHistorySample> =
             serde_json::from_str(&state.graph_data_at(observed_at)).expect("selected graph JSON");
-        assert_eq!(graph_samples.len(), 1);
-        assert_eq!(graph_samples[0].timestamp, current_samples[1].timestamp);
+        // The first sample owns the minute containing the exact period start.
+        // Keep that observation; drawing still clips to authoritative_start.
+        assert_eq!(
+            graph_samples
+                .iter()
+                .map(|sample| (sample.timestamp, sample.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![(floor_start, 92.0), (floor_start + 60, 80.0)]
+        );
         assert!(graph_samples
             .iter()
             .all(|sample| sample.reset_at == canonical_reset));
