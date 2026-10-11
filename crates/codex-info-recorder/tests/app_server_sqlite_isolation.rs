@@ -99,6 +99,8 @@ for line in sys.stdin:
                 command
             }
             None => {
+                // Run a same-UID test helper; this path is not used as a security identity.
+                // nosemgrep: rust.lang.security.current-exe.current-exe
                 let mut command = Command::new(env::current_exe().unwrap());
                 command.args(["--exact", "quota_journal_hold_poller", "--ignored"]);
                 command

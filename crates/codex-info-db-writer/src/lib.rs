@@ -23680,7 +23680,7 @@ mod wave_b_correction_tests {
 
     #[test]
     fn issue_362_checkpoint_schema_accepts_only_supported_legacy_shapes() {
-        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+        const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
         const SHAPE_MATRIX: &[(usize, &[i64])] = &[
             (22, SUPPORTED_VERSIONS),
             (21, &[]),
