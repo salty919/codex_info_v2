@@ -124,8 +124,10 @@ public sealed class GraphScene
         long? resetAt = null,
         IReadOnlyList<GraphObservedSample>? hoverObservations = null,
         bool isVerifiedCurrentResetStart = false,
-        GraphPeriodCostSummary periodCost = default)
+        GraphPeriodCostSummary periodCost = default,
+        IReadOnlyList<GraphIdleInterval>? taskIdleIntervals = null)
     {
+        TaskIdleIntervals = taskIdleIntervals ?? [];
         PeriodStartAt = periodStartAt;
         PeriodEndAt = periodEndAt;
         ResetAt = resetAt;
@@ -167,6 +169,8 @@ public sealed class GraphScene
         HasUnambiguousHoverResetAt = HoverObservations.Count == 0 ||
             HoverObservations.All(observation => observation.ResetAt == HoverResetAt);
     }
+
+    internal IReadOnlyList<GraphIdleInterval> TaskIdleIntervals { get; }
 
     public long PeriodStartAt { get; }
 
@@ -508,6 +512,7 @@ public sealed class GraphScene
                 .ToArray();
         var nonOwnedIntervals = BuildNonOwnedIntervals(start, end, accountOwnershipIntervals);
         var latestCostObservation = samples.LastOrDefault(sample => !sample.IsSyntheticTail);
+        var taskIdleIntervals = BuildTaskIdleIntervals(samples, start, end, nonOwnedIntervals);
         samples = WithoutRecoverableSamplingJitter(samples, normalizedGaps);
         var allModelNames = samples
             .SelectMany(PublishedModels)
@@ -687,7 +692,8 @@ public sealed class GraphScene
                 firstModelPublications,
                 eligibleMissingZeroModels),
             isVerifiedCurrentResetStart: isVerifiedCurrentResetStart,
-            periodCost: periodCost);
+            periodCost: periodCost,
+            taskIdleIntervals: taskIdleIntervals);
     }
 
     private static GraphPeriodCostSummary BuildPeriodCost(
@@ -1859,6 +1865,41 @@ public sealed class GraphScene
     /// renderer may add holds, smoothing, and interpolation, but those values
     /// are intentionally absent from this authority path.
     /// </summary>
+    private static IReadOnlyList<GraphIdleInterval> BuildTaskIdleIntervals(
+        IReadOnlyList<ApiHistorySample> samples, long start, long end,
+        IReadOnlyList<GraphUnusedInterval> nonOwned)
+    {
+        var intervals = new List<GraphIdleInterval>();
+        for (var index = 1; index < samples.Count; index++)
+        {
+            var left = samples[index - 1];
+            var right = samples[index];
+            if (right.TaskActiveSincePrevious != false || left.ResetAt != right.ResetAt ||
+                left.IsSyntheticTail || right.IsSyntheticTail)
+                continue;
+            var from = Math.Max(start, left.Timestamp);
+            var to = Math.Min(end, right.Timestamp);
+            if (to > from && !nonOwned.Any(gap => gap.StartAt < to && gap.EndAt > from))
+                intervals.Add(new GraphIdleInterval(from, to, false));
+        }
+        return MergeIdleIntervals(intervals)
+            .Where(interval => interval.EndAt - interval.StartAt >= SustainedUnusedMinimumSeconds)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<GraphIdleInterval> MergeIdleIntervals(IEnumerable<GraphIdleInterval> intervals)
+    {
+        var merged = new List<GraphIdleInterval>();
+        foreach (var interval in intervals.OrderBy(item => item.StartAt))
+        {
+            if (merged.Count > 0 && interval.StartAt <= merged[^1].EndAt)
+                merged[^1] = merged[^1] with { EndAt = Math.Max(merged[^1].EndAt, interval.EndAt) };
+            else
+                merged.Add(interval);
+        }
+        return merged;
+    }
+
     private static IReadOnlyList<GraphIdleInterval> BuildConfirmedIdleIntervals(
         IReadOnlyList<ApiHistorySample> samples,
         long periodStart,

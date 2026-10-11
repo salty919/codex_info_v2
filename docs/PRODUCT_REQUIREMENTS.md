@@ -465,11 +465,18 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    model集合変更は、未掲載または新規model自身の線と未使用判定にだけ反映し、Remainingの形状・線種には反映しない。
    集合変更区間でも共通modelのaccepted値は実線を維持し、raw Remainingの両endpointがacceptedなら
    Remainingも実線を維持する。`source_mismatch`は欠測または利用不能という主原因があるbridgeの補助理由に限定する。
-5. `G137-5`: idle判定はsame `reset_at`のperiod内でのみ行う。両endpointと全interior raw rowに同じ非空model key集合が揃い、
+5. `G137-5`: idle判定はsame `reset_at`のperiod内でのみ行う。Session原本から検証された
+   `task_active_since_previous=false`は直前row時刻から当該row時刻までの停止を表す独立したauthorityである。
+   同一期間内の連続した明示停止が10分以上なら、model/Remainingの欠測によって停止帯を拒否しない。
+   true/null、synthetic tail、別reset、非所有区間へ停止を延長しない。
+   停止区間と重なる欠測bridgeは左の既知値を表示専用の1px水平線で保持し、増分は停止終了後の
+   不確かな接続にのみ残す。右実測が停止終端そのものなら元値・元時刻を保ち、垂直線や架空の使用時刻を追加しない。
+   この水平線は欠測の復元ではなく、DB/API/raw/hoverの値を補完しない。直接観測の線は変更しない。
+   以下のraw vectorによる判定は、明示停止とは独立した未使用根拠として維持する。両endpointと全interior raw rowに同じ非空model key集合が揃い、
    各rowが`model_source=confirmed && models_complete=true`または保存済みlossless token vectorを持つ`legacy-unknown`であり、
    全modelのraw `total_tokens`がexact equal、raw `remaining_percent`がfiniteかつbitwise equalで、confirmed gap、欠測、
    観測値の矛盾がないことを必須とする。`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値をendpointまたは矛盾なしの証拠にはせず、
-   lifecycle metadataを値変化または非変化のauthorityにしない。ただしexact 60秒の1 sampling slotだけが
+   lifecycle metadataをraw値変化またはraw非変化のauthorityにしない。ただしexact 60秒の1 sampling slotだけが
    `unavailable`で、その前後がsame reset、同一model集合、全modelのraw token exact equal、raw Remaining
    bitwise equalかつgapなしの場合は、周期不足／sampling jitterとしてそのrowだけをread-time表示入力から除外し、idle候補を
    分断しない。この限定補完はDB、history、API rawを書き換えず、`unavailable` rowをauthorityへ昇格させない。2 slot以上連続、
@@ -597,7 +604,7 @@ parse済みでtimestamp重複なしとして次の相対offsetを固定する。
 | 540 | `V3`の`SOL:(21,0.000021)`版 | `false,legacy-unknown` | 88 | `false` | token/dollar recovery。破線bridgeで未使用でない |
 | 600 | sampleなし | — | — | `null` | 全系列をexact period endまで破線hold |
 
-このliteral oracleの期待する未使用帯は`[]`である。明示的な`false`があっても、same `reset_at`、両endpointの
+このliteral oracleの明示停止runは10分未満のため、期待する未使用帯は`[]`である。明示的な`false`があっても、same `reset_at`、両endpointの
 `confirmed`＋`models_complete=true`、同じmodel key集合、全raw tokenのexact equal、finite raw Remainingのbitwise equal、
 confirmed gap／欠測／直接観測値の矛盾なしが全て揃わない区間は帯にしない。active metadataだけは値変化の証拠にしない。
 このliteral oracleの`legacy-unknown`列はmodel集合変更、途中欠測、token異常またはRemaining変化を含むため、限定idle条件を満たさず、集計・予測・idleへ使わない。

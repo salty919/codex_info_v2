@@ -24,7 +24,40 @@ fail() {
     if [[ -n "${tmp_root:-}" && -s "$tmp_root/rest.log" ]]; then
         tail -n 40 "$tmp_root/rest.log" >&2
     fi
+    if [[ -n "${tmp_root:-}" && -s "$tmp_root/rest-restart.log" ]]; then
+        tail -n 40 "$tmp_root/rest-restart.log" >&2
+    fi
     exit 1
+}
+
+# A listening health endpoint is not a ready account snapshot. Both initial
+# startup and REST-only restart use the same bounded details readiness rule.
+wait_for_ready_details() {
+    local port="$1" details_body='' details_state='unavailable'
+    for _ in $(seq 1 40); do
+        details_body="$(curl --fail --silent --max-time 1 \
+            "http://127.0.0.1:$port/v1/details" 2>/dev/null || true)"
+        details_state="$(python3 - "$details_body" <<'PY_READY'
+import json
+import sys
+
+try:
+    details = json.loads(sys.argv[1])
+    if not isinstance(details, dict):
+        raise ValueError("details must be an object")
+    print(f'{details.get("state")}|{details.get("authenticated") is True}')
+except ValueError:
+    print("invalid-json")
+PY_READY
+)"
+        if [[ "$details_state" == 'ready|True' ]]; then
+            printf '%s\n' "$details_body"
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "REST details remained non-ready ($details_state)" >&2
+    return 1
 }
 
 [[ "$ROOT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
@@ -447,33 +480,9 @@ baseline_models="$(model_total)"
     || fail 'recorder acknowledgement readback is not numeric'
 
 details_before="$tmp_root/details-before.json"
-details_body=''
-for _ in $(seq 1 40); do
-    details_body="$(curl --fail --silent --max-time 1 \
-        "http://127.0.0.1:$port/v1/details" 2>/dev/null || true)"
-    if python3 - "$details_body" <<'PY' >/dev/null 2>&1
-import json
-import sys
-
-details = json.loads(sys.argv[1])
-raise SystemExit(0 if details.get("state") == "ready" and details.get("authenticated") is True else 1)
-PY
-    then
-        break
-    fi
-    sleep 0.1
-done
+details_body="$(wait_for_ready_details "$port")" \
+    || fail 'initial REST details did not become ready/authenticated'
 printf '%s\n' "$details_body" >"$details_before"
-details_state="$(python3 - "$details_body" <<'PY'
-import json
-import sys
-
-details = json.loads(sys.argv[1])
-print(f'{details.get("state")}|{details.get("authenticated")}')
-PY
-)"
-[[ "$details_state" == 'ready|True' ]] \
-    || fail "REST details remained non-ready ($details_state)"
 
 # REST details must be backed by recorder-produced UsageStore values. Empty
 # quota/history/models are a failure, never a successful fixture shortcut.
@@ -587,7 +596,8 @@ if (health["api_version"], health["service"], health["product_version"]) != (
 ):
     raise SystemExit("restart health wire identity changed")
 PY
-details_after="$(curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/details")"
+details_after="$(wait_for_ready_details "$port")" \
+    || fail 'restarted REST details did not become ready/authenticated'
 python3 - "$details_before" "$details_after" "$database" <<'PY'
 import json
 import sqlite3
