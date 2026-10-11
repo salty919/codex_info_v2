@@ -50,6 +50,7 @@ public partial class GraphWindow : Window
             {
                 "Day" => GraphTimeRange.Last24Hours,
                 "Week" => GraphTimeRange.Last7Days,
+                "Month" => GraphTimeRange.CalendarMonth,
                 _ => GraphTimeRange.ResetPeriod,
             };
         }

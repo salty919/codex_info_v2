@@ -198,6 +198,15 @@ internal static class GraphPlotProjection
         }
         var midnightGuideTimestamps = BuildLocalMidnightGuides(scene, displayTimeZone);
         var topDateAxis = BuildTopDateAxis(scene, displayTimeZone, midnightGuideTimestamps, currentPlotWidth);
+        if (scene.IsDaily)
+        {
+            var days = GraphTimeWindow.LocalDays(scene.PeriodStartAt, scene.PeriodEndAt, displayTimeZone);
+            bottomValues = days.Select(day => day.StartAt + (day.EndAt - day.StartAt) / 2d).ToArray();
+            bottomTimestampValues = days.Select(day => day.StartAt).ToArray();
+            bottomLabels = days.Select(day => GraphTimeWindow.LocalDate(day.StartAt, displayTimeZone)
+                .ToString("M/d", culture)).ToArray();
+            topDateAxis = (Array.Empty<double>(), Array.Empty<string>());
+        }
         var plotLimitEndAt = scene.PeriodStartAt + span * currentDataAreaWidth / currentPlotWidth;
 
         return new GraphAxisProjection(
