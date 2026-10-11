@@ -1,7 +1,7 @@
 """Exercise the CLI acceptance caller with deterministic REST startup replies."""
 
 import json
-import subprocess  # noqa: S404  # nosec B404 # Repository-owned Bash fixture only; fixed argv/env below.
+import subprocess  # nosec B404 # Repository-owned Bash fixture only; fixed argv/env below.
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,7 +60,7 @@ curl() {
             command = shell + helper + source[start:end] + f'printf "%s" "{result}"'
             # Only tracked repository code and literal fixture commands reach stdin.
             # Replies stay in a data file; caller PATH and BASH_ENV are not inherited.
-            completed = subprocess.run(  # noqa: S603  # nosec B603 # Fixed Bash argv; intentional repository-only fixture stdin.
+            completed = subprocess.run(  # nosec B603 # Fixed Bash argv; intentional repository-only fixture stdin.
                 ["/bin/bash", "--noprofile", "--norc", "-s"],
                 input=command, capture_output=True, text=True,
                 env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "FIXTURE": str(root)},
