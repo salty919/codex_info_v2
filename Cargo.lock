@@ -794,6 +794,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -823,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "codex_info"
-version = "1.0.149"
+version = "1.0.150"
 dependencies = [
  "axum",
  "chrono",

@@ -124,6 +124,12 @@ pub fn current_period_bounds(
     (end_at >= start_at).then_some((start_at, end_at))
 }
 
+/// A history timestamp names its whole minute. Keep the first minute when
+/// the authoritative period starts partway through it; do not round the period.
+pub fn history_minute_in_period(timestamp: i64, start_at: i64, end_at: i64) -> bool {
+    timestamp >= start_at - start_at.rem_euclid(60) && timestamp <= end_at
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicState {
@@ -587,8 +593,11 @@ impl PublicDetails {
                         || (!period_resets.contains(&sample.reset_at)
                             && sample.reset_at >= period.reset_at.saturating_sub(60)
                             && sample.reset_at <= period.reset_at))
-                        && sample.timestamp >= period.start_at
-                        && sample.timestamp <= period.end_at
+                        && history_minute_in_period(
+                            sample.timestamp,
+                            period.start_at,
+                            period.end_at,
+                        )
                 })
                 .collect::<Vec<_>>();
             if matching_periods.len() != 1 {
@@ -1051,6 +1060,39 @@ mod tests {
         }
         let unknown = r#"{"api_version":"v1","rest_version":"1.2.3","recorder_version":null,"recorder_status":"unavailable","extra":true}"#;
         assert!(serde_json::from_str::<PublicRuntimeVersions>(unknown).is_err());
+    }
+
+    #[test]
+    fn history_boundary_minute_is_valid_without_rounding_period() {
+        let mut details = PublicDetails {
+            observed_at: Some(1_800_000_080),
+            ..PublicDetails::default()
+        };
+        details.history_periods.push(PublicHistoryPeriod {
+            id: "boundary".into(),
+            start_at: 1_800_000_041,
+            end_at: 1_800_000_080,
+            reset_at: 1_800_604_841,
+            label: "boundary".into(),
+            current: false,
+        });
+        details.history_samples.push(PublicHistorySample {
+            timestamp: 1_800_000_000,
+            reset_at: 1_800_604_841,
+            remaining_percent: Some(100.0),
+            sol_dollars: 1.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 30,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        });
+        details
+            .validate()
+            .expect("first minute intersects the exact period start");
+        assert_eq!(details.history_periods[0].start_at, 1_800_000_041);
+        details.history_samples[0].timestamp = 1_799_999_940;
+        assert_eq!(details.validate(), Err(ContractError::InvalidSample));
     }
 
     #[test]

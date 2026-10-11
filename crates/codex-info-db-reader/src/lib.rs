@@ -23,9 +23,12 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod quota_history;
+
 const MAX_HISTORY_ROWS: usize = 31 * 24 * 60;
 const HISTORY_WINDOW_SECONDS: i64 = 31 * 24 * 60 * 60;
 pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 13;
+pub const ACCOUNT_DB_SCHEMA_VERSION: i64 = 14;
 const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
 const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
@@ -39,6 +42,9 @@ const MAX_LOGIN_ID_SCALARS: usize = 254;
 pub struct DbSnapshot {
     pub generation: u64,
     pub data_hash: String,
+    /// A failed derived history must not revoke the independently accepted
+    /// current quota, nor be published as an empty successful history.
+    pub history_available: bool,
     /// A pending recorder range means the durable snapshot is usable but not
     /// complete.  REST exposes this as `state:error` while retaining values.
     pub has_pending_ranges: bool,
@@ -439,7 +445,9 @@ impl DbReader {
             &transaction,
             &self.read_intervals,
         );
-        let has_pending_ranges = read_pending_ranges(&transaction)? || acquisition_degraded;
+        let has_pending_ranges = read_pending_ranges(&transaction)?
+            || acquisition_degraded
+            || read_quota_acquisition_degraded(&transaction)?;
         transaction.commit()?;
         Ok(Some(DbChangeMarker {
             generation,
@@ -447,9 +455,8 @@ impl DbReader {
         }))
     }
 
-    /// Build a completely new snapshot.  Domain-invalid rows are omitted from
-    /// the projection; schema and transient SQLite errors still reject the
-    /// candidate so the REST layer can retain the preceding generation.
+    /// Build a new snapshot. Separately accepted quota remains available when
+    /// derived model/history projection fails, with an explicit error state.
     pub fn read_snapshot(&self) -> Result<DbSnapshot, ReaderError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -457,42 +464,114 @@ impl DbReader {
             &transaction,
             &self.read_intervals,
         );
-        let has_pending_ranges = read_pending_ranges(&transaction)? || acquisition_degraded;
         let history_is_canonical = self.expected_partition_identity.is_some();
-        let all_history = read_history(&transaction, history_is_canonical)?;
-        let raw = all_history
-            .iter()
-            .filter(|row| {
-                if history_is_canonical {
-                    self.read_intervals
-                        .intersects_canonical_minute(row.timestamp)
-                } else {
-                    self.read_intervals.contains(row.timestamp)
-                }
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let generation = read_generation(&transaction, raw.iter().map(|row| row.timestamp))?;
-        let task_evidence = read_task_activity_evidence_for_intervals(
-            &transaction,
-            !raw.is_empty(),
-            &self.read_intervals,
-        );
-        let (details, models_v3, history_samples_v2, history_samples_v3) =
-            build_details_for_intervals(
+        let authority = ProjectionAuthority {
+            history_is_canonical,
+            quota: read_latest_quota_receipt(&transaction)?,
+        };
+        let projection = (|| -> Result<_, ReaderError> {
+            let has_pending_ranges = read_pending_ranges(&transaction)?
+                || acquisition_degraded
+                || read_quota_acquisition_degraded(&transaction)?;
+            let all_history = read_history(&transaction, history_is_canonical)?;
+            let raw = all_history
+                .iter()
+                .filter(|row| {
+                    if history_is_canonical {
+                        self.read_intervals
+                            .intersects_canonical_minute(row.timestamp)
+                    } else {
+                        self.read_intervals.contains(row.timestamp)
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let generation = read_generation(&transaction, raw.iter().map(|row| row.timestamp))?;
+            let task_evidence = read_task_activity_evidence_for_intervals(
                 &transaction,
-                &raw,
-                &all_history,
-                &threads,
-                &task_evidence,
+                !raw.is_empty(),
                 &self.read_intervals,
-                history_is_canonical,
-            )?;
-        details.validate()?;
+            );
+            let (details, models_v3, history_samples_v2, history_samples_v3) =
+                build_details_for_intervals(
+                    &transaction,
+                    &raw,
+                    &all_history,
+                    &threads,
+                    &task_evidence,
+                    &self.read_intervals,
+                    &authority,
+                )?;
+            Ok((
+                details,
+                models_v3,
+                history_samples_v2,
+                history_samples_v3,
+                generation,
+                has_pending_ranges,
+            ))
+        })();
+        let (
+            mut details,
+            mut models_v3,
+            mut history_samples_v2,
+            mut history_samples_v3,
+            generation,
+            mut has_pending_ranges,
+        ) = match projection {
+            Ok(value) => value,
+            Err(error) => {
+                let Some(receipt) = authority.quota.as_ref() else {
+                    return Err(error);
+                };
+                // The failure belongs to the derived history/model lane.
+                // Its error state does not revoke separately accepted quota.
+                let generation = read_generation(&transaction, std::iter::empty())?;
+                (
+                    quota_only_details(receipt, &threads),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    generation,
+                    true,
+                )
+            }
+        };
+        let publication = (|| -> Result<(), ReaderError> {
+            if authority.quota.is_some() {
+                quota_history::project(
+                    &transaction,
+                    &self.read_intervals,
+                    &mut details,
+                    &mut history_samples_v2,
+                    &mut history_samples_v3,
+                )?;
+            }
+            details.validate()?;
+            Ok(())
+        })();
+        let history_available = match publication {
+            Ok(()) => true,
+            Err(error) => {
+                let Some(receipt) = authority.quota.as_ref() else {
+                    return Err(error);
+                };
+                // Only the failed derived publication is unavailable. The
+                // accepted acquisition record remains the current authority.
+                details = quota_only_details(receipt, &[]);
+                details.validate()?;
+                models_v3.clear();
+                history_samples_v2.clear();
+                history_samples_v3.clear();
+                has_pending_ranges = true;
+                false
+            }
+        };
         let mut hasher = Sha256::new();
         hasher.update(generation.to_be_bytes());
         hasher.update(
             serde_json::to_vec(&(
+                history_available,
                 &details,
                 &models_v3,
                 &history_samples_v2,
@@ -507,6 +586,7 @@ impl DbReader {
         Ok(DbSnapshot {
             generation,
             data_hash,
+            history_available,
             has_pending_ranges,
             details,
             models_v3,
@@ -996,7 +1076,7 @@ fn read_history(
 
 fn validate_canonical_history_tables(connection: &Connection) -> Result<(), ReaderError> {
     let schema_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if schema_version != HISTORY_CANONICAL_SCHEMA_VERSION {
+    if !(HISTORY_CANONICAL_SCHEMA_VERSION..=ACCOUNT_DB_SCHEMA_VERSION).contains(&schema_version) {
         return Err(ReaderError::Schema(
             "account history canonical migration is incomplete".to_owned(),
         ));
@@ -1196,6 +1276,71 @@ type DetailsBuild = (
     Vec<PublicHistoryObservationV3>,
 );
 
+struct AcceptedQuota {
+    observed_at: i64,
+    quota: PublicQuota,
+}
+
+struct ProjectionAuthority {
+    history_is_canonical: bool,
+    quota: Option<AcceptedQuota>,
+}
+
+fn read_quota_acquisition_degraded(connection: &Connection) -> Result<bool, ReaderError> {
+    if !table_exists(connection, "quota_acquisition_state")? {
+        return Ok(false);
+    }
+    let value: Option<i64> = connection
+        .query_row(
+            "SELECT degraded FROM quota_acquisition_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(value.is_some_and(|value| value != 0))
+}
+
+fn read_latest_quota_receipt(
+    connection: &Connection,
+) -> Result<Option<AcceptedQuota>, ReaderError> {
+    if !table_exists(connection, "quota_receipts")? {
+        return Ok(None);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT observed_at, remaining_percent, reset_at, window_seconds
+         FROM quota_receipts ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| {
+                Ok(AcceptedQuota {
+                    observed_at: row.get(0)?,
+                    quota: PublicQuota {
+                        remaining_percent: row.get(1)?,
+                        reset_at: row.get(2)?,
+                        window_seconds: row.get(3)?,
+                        monthly: false,
+                    },
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn quota_only_details(receipt: &AcceptedQuota, threads: &[PublicThread]) -> PublicDetails {
+    PublicDetails {
+        state: PublicState::Error,
+        authenticated: true,
+        observed_at: Some(receipt.observed_at),
+        quota: Some(receipt.quota.clone()),
+        active_thread_count: threads
+            .iter()
+            .filter(|thread| thread.activity_status == Some(PublicThreadActivityStatus::Running))
+            .count() as u64,
+        threads: threads.to_vec(),
+        ..PublicDetails::default()
+    }
+}
+
 fn build_details_for_intervals(
     connection: &Connection,
     raw: &[RawSample],
@@ -1203,9 +1348,18 @@ fn build_details_for_intervals(
     threads: &[PublicThread],
     task_evidence: &TaskActivityEvidence,
     intervals: &ReadIntervals,
-    history_is_canonical: bool,
+    authority: &ProjectionAuthority,
 ) -> Result<DetailsBuild, ReaderError> {
+    let history_is_canonical = authority.history_is_canonical;
     if raw.is_empty() {
+        if let Some(receipt) = &authority.quota {
+            return Ok((
+                quota_only_details(receipt, threads),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
         let details = PublicDetails {
             active_thread_count: threads
                 .iter()
@@ -1218,9 +1372,21 @@ fn build_details_for_intervals(
         };
         return Ok((details, Vec::new(), Vec::new(), Vec::new()));
     }
-    let observed_at = raw.iter().map(|row| row.timestamp).max().unwrap_or(0);
-    let (current_reset_at, latest_quota_reset_at, window_seconds) =
-        read_collection_config(connection)?;
+    // Acquisition sequence selected the receipt. Its wall clock is metadata,
+    // not an ordering check against older history rows.
+    let observed_at = authority
+        .quota
+        .as_ref()
+        .map(|receipt| receipt.observed_at)
+        .unwrap_or_else(|| raw.iter().map(|row| row.timestamp).max().unwrap_or(0));
+    let (current_reset_at, latest_quota_reset_at, window_seconds) = match &authority.quota {
+        Some(receipt) => (
+            Some(receipt.quota.reset_at),
+            Some(receipt.quota.reset_at),
+            receipt.quota.window_seconds,
+        ),
+        None => read_collection_config(connection)?,
+    };
     let current_window_reset_at = latest_quota_reset_at.or(current_reset_at);
     let cutoff = observed_at.saturating_sub(HISTORY_WINDOW_SECONDS);
     let samples = if history_is_canonical {
@@ -1280,25 +1446,31 @@ fn build_details_for_intervals(
         window_seconds,
     );
     clip_history_periods(&mut periods, intervals);
-    let quota = latest_quota_reset_at
-        .and_then(|latest_reset_at| {
-            latest_quota_row(
-                raw,
-                current_reset_at,
-                current_window_reset_at,
-                window_seconds,
-                history_is_canonical,
-            )
-            .and_then(|row| {
-                row.remaining_percent.map(|remaining_percent| PublicQuota {
-                    remaining_percent,
-                    reset_at: latest_reset_at,
-                    window_seconds,
-                    monthly: false,
+    let quota = authority
+        .quota
+        .as_ref()
+        .map(|receipt| receipt.quota.clone())
+        .or_else(|| {
+            latest_quota_reset_at
+                .and_then(|latest_reset_at| {
+                    latest_quota_row(
+                        raw,
+                        current_reset_at,
+                        current_window_reset_at,
+                        window_seconds,
+                        history_is_canonical,
+                    )
+                    .and_then(|row| {
+                        row.remaining_percent.map(|remaining_percent| PublicQuota {
+                            remaining_percent,
+                            reset_at: latest_reset_at,
+                            window_seconds,
+                            monthly: false,
+                        })
+                    })
                 })
-            })
-        })
-        .filter(|quota| quota.window_seconds > 0);
+                .filter(|quota| quota.window_seconds > 0)
+        });
     let history_projection_context = HistoryProjectionContext {
         task_evidence,
         intervals,
@@ -1367,7 +1539,9 @@ fn build_details_for_intervals(
         non_overlapping_gaps.push(gap);
     }
     let gaps = non_overlapping_gaps;
-    let state = if samples.is_empty() {
+    let state = if authority.quota.is_some() && current_model_observation.is_none() {
+        PublicState::Error
+    } else if samples.is_empty() {
         PublicState::Initializing
     } else if model_projection.incomplete {
         PublicState::Error
@@ -1378,7 +1552,7 @@ fn build_details_for_intervals(
         PublicDetails {
             state,
             observed_at: Some(observed_at),
-            authenticated: !samples.is_empty(),
+            authenticated: authority.quota.is_some() || !samples.is_empty(),
             plan_label: None,
             quota,
             models,
@@ -1939,24 +2113,6 @@ fn read_history_projection_for_intervals(
         observations_by_key.insert((observation.reset_at, observation.timestamp), observation);
     }
 
-    // Unavailable quota observations are not present in usage_history. The
-    // root v2/v3 projection extends the containing period to those minutes so
-    // the graph can retain the observed quota/time metadata without
-    // fabricating model values or classifying the point as idle.
-    for observation in observations
-        .iter()
-        .filter(|observation| observation.model_source == HistoryModelSource::Unavailable)
-    {
-        if let Some(period) = periods.iter_mut().find(|period| {
-            observation.reset_at >= period.reset_at.saturating_sub(RESET_AT_TOLERANCE_SECONDS)
-                && observation.reset_at <= period.reset_at
-                && observation.timestamp >= period.start_at
-                && observation.timestamp <= period.end_at
-        }) {
-            period.start_at = period.start_at.min(observation.timestamp);
-        }
-    }
-
     let mut history = BTreeMap::<(i64, i64), PublicHistoryObservationV3>::new();
     for sample in samples {
         let quota_only = context
@@ -2046,8 +2202,11 @@ fn read_history_projection_for_intervals(
         let Some(period) = periods.iter().find(|period| {
             observation.reset_at >= period.reset_at.saturating_sub(RESET_AT_TOLERANCE_SECONDS)
                 && observation.reset_at <= period.reset_at
-                && observation.timestamp >= period.start_at
-                && observation.timestamp <= period.end_at
+                && codex_info_rest_contract::history_minute_in_period(
+                    observation.timestamp,
+                    period.start_at,
+                    period.end_at,
+                )
         }) else {
             continue;
         };
@@ -2102,8 +2261,11 @@ fn assign_task_activity_for_intervals(
             .keys()
             .filter(|(reset_at, timestamp)| {
                 reset_at.abs_diff(period.reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-                    && *timestamp >= period.start_at
-                    && *timestamp <= period.end_at
+                    && codex_info_rest_contract::history_minute_in_period(
+                        *timestamp,
+                        period.start_at,
+                        period.end_at,
+                    )
             })
             .map(|(_, timestamp)| *timestamp)
             .collect::<Vec<_>>();
@@ -2166,8 +2328,11 @@ fn assign_task_activity_for_intervals(
             .keys()
             .filter(|(reset_at, timestamp)| {
                 reset_at.abs_diff(period.reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-                    && *timestamp >= period.start_at
-                    && *timestamp <= period.end_at
+                    && codex_info_rest_contract::history_minute_in_period(
+                        *timestamp,
+                        period.start_at,
+                        period.end_at,
+                    )
             })
             .copied()
             .collect::<Vec<_>>();
@@ -3093,7 +3258,7 @@ fn quota_only_history_projection_samples(
         let Some(remaining_percent) = row.remaining_percent else {
             continue;
         };
-        if row.timestamp < authoritative_start
+        if row.timestamp < authoritative_start - authoritative_start.rem_euclid(60)
             || row.timestamp > window_reset_at
             || row.timestamp >= prefix_end
             || row.timestamp > observed_at
@@ -3170,7 +3335,7 @@ fn authoritative_history_projection_samples(
         .into_iter()
         .filter(|sample| {
             !(sample.reset_at.abs_diff(current_reset) <= RESET_AT_TOLERANCE_SECONDS as u64
-                && sample.timestamp < authoritative_start)
+                && sample.timestamp < authoritative_start - authoritative_start.rem_euclid(60))
         })
         .collect()
 }
@@ -5942,6 +6107,236 @@ mod tests {
             .all(|period| period.start_at == quota_start));
 
         fs::remove_file(path).expect("cleanup");
+    }
+
+    fn quota_receipt_current_fixture(name: &str) -> (PathBuf, StoragePartitionIdentity) {
+        let path = temp_db(name);
+        make_boundary_db(&path, 1_800_000_000);
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 13,
+            partition_id: "33".repeat(32),
+        };
+        add_partition_identity(&path, &identity);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "PRAGMA user_version=14;
+            CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY, sequence INTEGER UNIQUE,
+                observed_at INTEGER,reset_at INTEGER,window_seconds INTEGER,
+                remaining_percent REAL,applied_generation TEXT);
+            INSERT INTO quota_receipts VALUES
+                ('first',1,1800000200,1800003600,86400,10.0,'8'),
+                ('second',2,1800000100,1800604800,604800,100.0,'9'),
+                ('third',3,1800000000,1800604800,604800,99.0,'10');
+            UPDATE collection_generation SET data_generation='10';",
+        )
+        .unwrap();
+        (path, identity)
+    }
+
+    fn assert_latest_receipt_quota(snapshot: &DbSnapshot) {
+        let quota = snapshot
+            .details
+            .quota
+            .as_ref()
+            .expect("accepted official quota remains public");
+        assert_eq!(quota.remaining_percent, 99.0);
+        assert_eq!(quota.reset_at, 1_800_604_800);
+        assert_eq!(quota.window_seconds, 604_800);
+        assert_eq!(snapshot.details.observed_at, Some(1_800_000_000));
+        assert_eq!(snapshot.generation, 10);
+    }
+
+    #[test]
+    fn quota_receipt_current_uses_acquisition_order_without_old_period_models() {
+        let (path, identity) = quota_receipt_current_fixture("quota-receipt-current-order");
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_snapshot()
+            .unwrap();
+        assert_latest_receipt_quota(&snapshot);
+        assert!(
+            snapshot.models_v3.is_empty(),
+            "prior period models must not accompany the new quota"
+        );
+        assert_eq!(snapshot.details.state, PublicState::Error);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn quota_replay_failure_marks_current_and_change_marker() {
+        let (path, identity) = quota_receipt_current_fixture("quota-replay-health");
+        Connection::open(&path).unwrap().execute_batch(
+            "CREATE TABLE quota_acquisition_state(singleton INTEGER PRIMARY KEY, degraded INTEGER NOT NULL);
+             INSERT INTO quota_acquisition_state VALUES(1,1);"
+        ).unwrap();
+        let reader = DbReader::open_partitioned(&path, &identity).unwrap();
+        assert!(
+            reader
+                .read_change_marker()
+                .unwrap()
+                .unwrap()
+                .has_pending_ranges,
+            "quota failure must invalidate current even without thread data"
+        );
+        let snapshot = reader.read_snapshot().unwrap();
+        assert_latest_receipt_quota(&snapshot);
+        assert!(snapshot.has_pending_ranges);
+        assert_eq!(snapshot.details.state, PublicState::Error);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn quota_receipt_current_survives_missing_history() {
+        let (path, identity) = quota_receipt_current_fixture("quota-receipt-current-no-history");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM usage_model_history; DELETE FROM usage_history;")
+            .unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_snapshot()
+            .unwrap();
+        assert_latest_receipt_quota(&snapshot);
+        assert!(snapshot.models_v3.is_empty());
+        assert_eq!(snapshot.details.state, PublicState::Error);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn quota_receipt_current_survives_model_projection_failure() {
+        let (path, identity) = quota_receipt_current_fixture("quota-receipt-current-model-failure");
+        Connection::open(&path).unwrap().execute_batch("ALTER TABLE usage_model_history RENAME COLUMN total_tokens TO broken_total_tokens;").unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_snapshot()
+            .expect("model projection failure must not suppress an accepted quota");
+        assert_latest_receipt_quota(&snapshot);
+        assert!(snapshot.models_v3.is_empty());
+        assert_eq!(snapshot.details.state, PublicState::Error);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn quota_receipt_history_survives_without_session_rows() {
+        let (path, identity) = quota_receipt_history_fixture("quota-history-no-session");
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_snapshot()
+            .unwrap();
+        assert_quota_receipt_history(&snapshot);
+        assert!(snapshot
+            .history_samples_v3
+            .iter()
+            .all(|point| point.models.is_none()));
+        let count: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM quota_receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 4,
+            "minute projection must retain every accepted observation"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn quota_receipt_history_survives_model_sql_failure() {
+        let (path, identity) = quota_receipt_history_fixture("quota-history-model-failure");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "INSERT INTO usage_history VALUES(1800000060,1800604801,55.0,3.0,0.0,0.0,30,0,0);
+            ALTER TABLE usage_model_history RENAME COLUMN total_tokens TO broken_total_tokens;",
+        )
+        .unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_snapshot()
+            .unwrap();
+        assert_quota_receipt_history(&snapshot);
+        assert!(snapshot
+            .history_samples_v3
+            .iter()
+            .all(|point| point.models.is_none()));
+        assert_eq!(snapshot.details.state, PublicState::Error);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn quota_receipt_history_preserves_exact_model_vector() {
+        let (path, identity) = quota_receipt_history_fixture("quota-history-model-vector");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("INSERT INTO usage_history VALUES(1800000060,1800604801,55.0,3.0,0.0,0.0,30,0,0);
+            INSERT INTO usage_model_history VALUES(1800604801,1800000060,'SOL','30','30','0','0',NULL,1);").unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_snapshot()
+            .unwrap();
+        assert_quota_receipt_history(&snapshot);
+        let point = snapshot
+            .history_samples_v3
+            .iter()
+            .find(|point| point.timestamp == 1_800_000_060)
+            .unwrap();
+        let model = point
+            .models
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|model| model.model == "SOL")
+            .unwrap();
+        assert_eq!(model.model, "SOL");
+        assert_eq!(model.total_tokens, 30);
+        assert!(snapshot.history_samples_v3.last().unwrap().models.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    fn quota_receipt_history_fixture(name: &str) -> (PathBuf, StoragePartitionIdentity) {
+        let (path, identity) = quota_receipt_current_fixture(name);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DELETE FROM usage_model_history;
+            DELETE FROM usage_history; DELETE FROM quota_receipts;
+            INSERT INTO quota_receipts VALUES
+                ('first',1,1800000000,1800604800,604800,10.0,'10'),
+                ('second',2,1800000060,1800604801,604800,100.0,'10'),
+                ('third',3,1800000080,1800604801,604800,99.0,'10'),
+                ('fourth',4,1800000120,1800604801,604800,98.0,'10');",
+            )
+            .unwrap();
+        (path, identity)
+    }
+
+    fn assert_quota_receipt_history(snapshot: &DbSnapshot) {
+        let points = snapshot
+            .history_samples_v3
+            .iter()
+            .map(|point| (point.reset_at, point.timestamp, point.remaining_percent))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            points,
+            vec![
+                (1_800_604_800, 1_800_000_000, Some(10.0)),
+                (1_800_604_801, 1_800_000_060, Some(99.0)),
+                (1_800_604_801, 1_800_000_120, Some(98.0)),
+            ]
+        );
+        assert_eq!(snapshot.history_samples_v2.len(), 3);
+        assert_eq!(snapshot.details.history_periods.len(), 2);
+        let current = &snapshot.details.history_periods[0];
+        let previous = &snapshot.details.history_periods[1];
+        assert!(current.current);
+        assert!(!previous.current);
+        assert_eq!(current.reset_at, 1_800_604_801);
+        assert_eq!(current.start_at, 1_800_000_001);
+        assert!(previous.end_at < current.start_at);
+        assert_eq!(
+            snapshot.details.quota.as_ref().unwrap().remaining_percent,
+            98.0
+        );
     }
 
     #[test]
