@@ -182,7 +182,11 @@ jobs:
           fi
 
           changes="$RUNNER_TEMP/changed-paths.z"
-          if [[ "$expected_version_transition" == true ]]; then
+          # Exclude the generated bump only while its source changes are
+          # still in this PR. After H0 merges, the pending version is itself
+          # a product change and must select current release builds.
+          if [[ "$expected_version_transition" == true ]] && \
+             ! git merge-base --is-ancestor "$parent_sha" "$BASE_SHA"; then
             git diff --find-renames=50% --find-copies=50% --find-copies-harder \
               --name-status -z "$BASE_SHA...$HEAD_SHA" -- . \
               ':(exclude)Cargo.toml' \

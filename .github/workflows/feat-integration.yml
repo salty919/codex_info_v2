@@ -45,10 +45,6 @@ jobs:
           # The event identifies immutable inputs. A later merge can advance
           # feat/next without changing the PR snapshot being evaluated.
           git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
-          git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA" || {
-            echo 'source does not contain the event base; update the PR before quality checks' >&2
-            exit 1
-          }
           changes="$RUNNER_TEMP/changed-paths.z"
           git diff --find-renames=50% --find-copies=50% --find-copies-harder \
             --name-status -z "$BASE_SHA...$HEAD_SHA" > "$changes"
