@@ -73,6 +73,63 @@ public sealed class GraphTimeWindowTests
         return type!;
     }
 
+    [Fact]
+    public void CalendarMonthUsesDisplayTimezoneAndStopsAtCurrentNow()
+    {
+        var rangeType = RequiredType(RangeTypeName);
+        Assert.Contains("CalendarMonth", Enum.GetNames(rangeType));
+        var range = Enum.Parse(rangeType, "CalendarMonth");
+        var getBounds = RequiredMethod(RequiredType(WindowTypeName), "GetBounds",
+            rangeType, typeof(long), typeof(long?), typeof(TimeZoneInfo));
+        var tokyo = TimeZoneInfo.FindSystemTimeZoneById("Asia/Tokyo");
+        var now = Unix("2026-10-11T03:00:00Z");
+        var current = getBounds.Invoke(null, [range, now, null, tokyo]);
+        Assert.NotNull(current);
+        Assert.Equal(Unix("2026-09-30T15:00:00Z"), ReadLong(current, "StartAt"));
+        Assert.Equal(now, ReadLong(current, "EndAt"));
+
+        var newYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+        var historicalEnd = Unix("2024-04-01T04:00:00Z");
+        var historical = getBounds.Invoke(null, [range, now, historicalEnd, newYork]);
+        Assert.NotNull(historical);
+        Assert.Equal(Unix("2024-03-01T05:00:00Z"), ReadLong(historical, "StartAt"));
+        Assert.Equal(historicalEnd, ReadLong(historical, "EndAt"));
+        Assert.Equal(31 * 86_400L - 3_600, ReadLong(historical, "EndAt") - ReadLong(historical, "StartAt"));
+    }
+
+    [Fact]
+    public void CalendarMonthNavigationMovesByCalendarMonthAndNeverEntersFuture()
+    {
+        var rangeType = RequiredType(RangeTypeName);
+        Assert.Contains("CalendarMonth", Enum.GetNames(rangeType));
+        var range = Enum.Parse(rangeType, "CalendarMonth");
+        var windowType = RequiredType(WindowTypeName);
+        var back = RequiredMethod(windowType, "StepBack", rangeType, typeof(long), typeof(long?), typeof(TimeZoneInfo));
+        var forward = RequiredMethod(windowType, "StepForward", rangeType, typeof(long), typeof(long?), typeof(long?), typeof(TimeZoneInfo));
+        var getBounds = RequiredMethod(windowType, "GetBounds", rangeType, typeof(long), typeof(long?), typeof(TimeZoneInfo));
+        foreach (var (nowText, expectedDays) in new[]
+        {
+            ("2024-03-15T12:00:00Z", 29),
+            ("2025-03-15T12:00:00Z", 28),
+            ("2026-05-15T12:00:00Z", 30),
+            ("2026-02-15T12:00:00Z", 31),
+        })
+        {
+            var now = Unix(nowText);
+            var firstOfCurrent = new DateTimeOffset(DateTimeOffset.FromUnixTimeSeconds(now).Year,
+                DateTimeOffset.FromUnixTimeSeconds(now).Month, 1, 0, 0, 0, TimeSpan.Zero).ToUnixTimeSeconds();
+            var pinned = Assert.IsType<long>(back.Invoke(null, [range, now, null, TimeZoneInfo.Utc]));
+            Assert.Equal(firstOfCurrent, pinned);
+            var bounds = getBounds.Invoke(null, [range, now, pinned, TimeZoneInfo.Utc]);
+            Assert.NotNull(bounds);
+            Assert.Equal(expectedDays * 86_400L, ReadLong(bounds, "EndAt") - ReadLong(bounds, "StartAt"));
+            Assert.Null(forward.Invoke(null, [range, now, pinned, null, TimeZoneInfo.Utc]));
+            Assert.Null(forward.Invoke(null, [range, now, null, null, TimeZoneInfo.Utc]));
+        }
+    }
+
+    private static long Unix(string value) => DateTimeOffset.Parse(value).ToUnixTimeSeconds();
+
     private static MethodInfo RequiredMethod(Type type, string name, params Type[] parameterTypes)
     {
         var method = type.GetMethod(

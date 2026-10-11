@@ -153,6 +153,12 @@ public sealed record UiText(
         _ => "1 week",
     };
 
+    public string GraphMonthRange => LanguageCode == "ja" ? "1か月" : "1 month";
+
+    public string GraphRecordedPartial => LanguageCode == "ja" ? "記録分" : "Recorded part";
+
+    public string GraphUnmeasured => LanguageCode == "ja" ? "未計測" : "Unmeasured";
+
     public string GraphPreviousRange => LanguageCode switch
     {
         "ja" => "前の範囲",

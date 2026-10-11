@@ -21,6 +21,35 @@ public sealed class GraphViewportRenderingCollection
 [Collection("Graph viewport rendering")]
 public sealed class GraphViewportRenderingTests
 {
+    [Fact]
+    public void CalendarMonthUsesDailyBarsAndSharedLocalDatePositions()
+    {
+        var start = Unix("2026-10-01T00:00:00Z");
+        var end = Unix("2026-10-03T00:00:00Z");
+        var reset = Unix("2026-10-08T00:00:00Z");
+        var period = GraphDailyUsageProjectionTests.Period("daily", start, reset,
+            GraphDailyUsageProjectionTests.Sample(start + 3_600, reset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", 100, 1)),
+            GraphDailyUsageProjectionTests.Sample(start + 2 * 3_600, reset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", 140, 1.4)),
+            GraphDailyUsageProjectionTests.Sample(start + 86_400, reset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", 180, 1.8)),
+            GraphDailyUsageProjectionTests.Sample(start + 86_400 + 3_600, reset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", 200, 2)));
+        var tokenScene = GraphDailyUsageProjectionTests.DailyScene(start, end, GraphMetric.Tokens, period);
+        var dollarScene = GraphDailyUsageProjectionTests.DailyScene(start, end, GraphMetric.Dollars, period);
+        var tokenAxes = GraphPlotProjection.BuildAxes(tokenScene, TimeZoneInfo.Utc, CultureInfo.InvariantCulture);
+        var dollarAxes = GraphPlotProjection.BuildAxes(dollarScene, TimeZoneInfo.Utc, CultureInfo.InvariantCulture);
+        Assert.Equal(new[] { start + 43_200d, start + 86_400 + 43_200d }, tokenAxes.BottomValues);
+        Assert.Equal(new[] { "10/1", "10/2" }, tokenAxes.BottomLabels);
+        Assert.Equal(tokenAxes.BottomValues, dollarAxes.BottomValues);
+
+        var control = new GraphPlotControl { Scene = tokenScene };
+        Assert.Contains(control.Plot.GetPlottables(), item => item.GetType().Name == "BarPlot");
+        using var image = control.Plot.GetImage(940, 480);
+        Assert.Empty(control.Plot.Axes.GetPanels().OfType<GraphPeriodCostPanel>());
+    }
+
     private const BindingFlags StaticMembers = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
 
     [Fact]

@@ -298,7 +298,7 @@ public sealed class GraphPeriodCostRenderingTests
     }
 
     [Fact]
-    public void ViewportOmitsOnlyTheLeftClippedPeriodAmountAndKeepsTheRightPartialPeriod()
+    public void ViewportIncludesLeftClippedPeriodAmountAndKeepsTheRightPartialPeriod()
     {
         var first = Period(0, 100, 0.10, 0.20);
         var second = Period(100, 200, 0.40, 0.60);
@@ -311,14 +311,18 @@ public sealed class GraphPeriodCostRenderingTests
         var amounts = panel.Amounts;
         var dataRect = control.Plot.LastRender.DataRect;
 
-        Assert.Equal(["$1", "$2"], amounts.Select(amount => amount.LabelStyle.Text));
-        Assert.Equal([150d, 240d], amounts.Select(amount => amount.CenterAt));
+        Assert.Equal(["$0", "$1", "$2"], amounts.Select(amount => amount.LabelStyle.Text));
+        Assert.Equal([75d, 150d, 240d], amounts.Select(amount => amount.CenterAt));
         Assert.InRange(
-            Math.Abs(amounts[0].LastRenderCenterX!.Value - control.Plot.Axes.Bottom.GetPixel(150, dataRect)),
+            Math.Abs(amounts[0].LastRenderCenterX!.Value - control.Plot.Axes.Bottom.GetPixel(75, dataRect)),
             0,
             1);
         Assert.InRange(
-            Math.Abs(amounts[1].LastRenderCenterX!.Value - control.Plot.Axes.Bottom.GetPixel(240, dataRect)),
+            Math.Abs(amounts[1].LastRenderCenterX!.Value - control.Plot.Axes.Bottom.GetPixel(150, dataRect)),
+            0,
+            1);
+        Assert.InRange(
+            Math.Abs(amounts[2].LastRenderCenterX!.Value - control.Plot.Axes.Bottom.GetPixel(240, dataRect)),
             0,
             1);
         Assert.Contains(control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>()

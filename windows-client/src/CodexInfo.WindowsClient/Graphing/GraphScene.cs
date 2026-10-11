@@ -249,7 +249,11 @@ public sealed class GraphScene
 
     public IReadOnlyList<GraphIdleInterval> IdleIntervals { get; }
 
-    public double ModelMaximum { get; }
+    public double ModelMaximum { get; private set; }
+
+    internal bool IsDaily { get; private set; }
+
+    internal IReadOnlyList<GraphDailyUsageValue> DailyUsage { get; private set; } = Array.Empty<GraphDailyUsageValue>();
 
     public bool IsViewport { get; }
 
@@ -266,9 +270,33 @@ public sealed class GraphScene
 
     internal bool HasUnambiguousHoverResetAt { get; }
 
-    private bool HasViewportPoints { get; }
+    private bool HasViewportPoints { get; set; }
 
     public bool HasPoints => IsViewport ? HasViewportPoints : Timestamps.Count > 0;
+
+    internal static GraphScene CreateDailyViewport(
+        long startAt,
+        long endAt,
+        GraphMetric metric,
+        IReadOnlyList<ApiHistoryPeriod> periods,
+        TimeZoneInfo displayTimeZone,
+        IReadOnlyList<ApiHistoryGap>? gaps,
+        IReadOnlyList<GraphAccountOwnershipInterval>? ownershipIntervals,
+        IReadOnlySet<string>? hiddenModelNames)
+    {
+        var scene = CreateViewport(startAt, endAt, metric, Array.Empty<GraphScene>(),
+            periods.Select(period => period.StartAt).ToArray());
+        var daily = GraphDailyUsageProjection.Create(periods, startAt, endAt, displayTimeZone, gaps, ownershipIntervals)
+            .Where(day => hiddenModelNames is null || !hiddenModelNames.Contains(day.ModelName)).ToArray();
+        scene.IsDaily = true;
+        scene.DailyUsage = Array.AsReadOnly(daily);
+        var values = daily.Select(day => metric == GraphMetric.Tokens
+            ? day.Tokens is { } tokens ? (double?)tokens : null
+            : day.Dollars).Where(value => value is not null).Select(value => value!.Value).ToArray();
+        scene.HasViewportPoints = values.Length > 0;
+        scene.ModelMaximum = values.Length > 0 ? Math.Max(1, values.Max()) : 1;
+        return scene;
+    }
 
     public static GraphScene Empty(GraphMetric metric = GraphMetric.Dollars) => Empty(metric, null);
 
