@@ -3303,6 +3303,19 @@ impl Recorder {
             }
         }
         writer.prune_older_than_three_months(Utc::now())?;
+        // Older versions retained Session quota responses without projecting
+        // them into history. Recover exact missing minutes once on startup;
+        // a recovery error must not stop new official quota acquisition.
+        match writer.recover_session_quota_history(
+            &config.sessions_root,
+            Utc::now().timestamp().saturating_sub(31 * 24 * 60 * 60),
+        ) {
+            Ok(restored) if restored > 0 => {
+                eprintln!("recorder recovered {restored} historical quota minutes");
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("recorder historical quota recovery failed: {error}"),
+        }
         Ok(Self {
             config,
             writer,
@@ -11786,6 +11799,51 @@ mod tests {
         assert_eq!(repeated_backup_count, backup_count);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restart_recovers_session_quota_without_replaying_model_usage() {
+        let (root, database) = prepare("startup-session-quota-recovery");
+        let minute = Utc::now().timestamp().div_euclid(60) * 60 - 120;
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1,latest_quota_reset_at=?1",
+                [minute + 3000],
+            )
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
+        let reset = recorder.state().unwrap().reset_at;
+        let mut event: Value = serde_json::from_str(&token(100, minute + 10)).unwrap();
+        event["payload"]["rate_limits"] = json!({"secondary": {
+            "used_percent": 12, "resets_at": reset, "window_minutes": 60
+        }});
+        fs::write(
+            root.join("sessions/one.jsonl"),
+            format!("{}{}\n", token(0, minute - 60), event),
+        )
+        .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let before = recorder.model_totals().unwrap();
+        let quota = || {
+            Connection::open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT remaining_percent FROM usage_history WHERE timestamp=?1",
+                    [minute],
+                    |row| row.get::<_, Option<f64>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(quota(), None);
+        drop(recorder);
+        let restarted =
+            Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
+        assert_eq!(quota(), Some(88.0));
+        assert_eq!(restarted.model_totals().unwrap(), before);
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

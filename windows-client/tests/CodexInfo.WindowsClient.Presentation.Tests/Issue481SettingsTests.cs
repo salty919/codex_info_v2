@@ -439,6 +439,52 @@ public sealed class Issue481SettingsTests
         }
     }
 
+    [Fact]
+    public async Task OpenSettingsRecoversRuntimeVersionOnMainReception()
+    {
+        var client = new RecoveringRuntimeClient();
+        using var main = new MainWindowViewModel(client);
+        var root = Directory.CreateTempSubdirectory("codex-info-runtime-recovery-");
+        var settings = new SettingsViewModel(new ClientSettingsStore(Path.Combine(root.FullName, "settings.json")), main);
+        try
+        {
+            await settings.RefreshRuntimeVersionsAsync();
+            Assert.Equal(settings.Texts.UnavailableValue, settings.RecorderVersion);
+            Assert.Equal("1.0.151", settings.RestVersion);
+            var recovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            settings.PropertyChanged += (_, e) =>
+            {
+                if (e.PropertyName == nameof(SettingsViewModel.RecorderVersion) && settings.RecorderVersion == "1.0.151")
+                    recovered.TrySetResult();
+            };
+            client.RecorderAvailable = true;
+            main.Start();
+            await recovered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal("available", settings.RuntimeVersionState);
+            Assert.True(main.IsAuthenticated);
+        }
+        finally
+        {
+            settings.Dispose();
+            root.Delete(recursive: true);
+        }
+    }
+
+    private sealed class RecoveringRuntimeClient : HealthyDetailsClientBase, ILoopbackRuntimeVersionsClient
+    {
+        public bool RecorderAvailable { get; set; }
+        public Task<RuntimeVersionsFetchResult> FetchRuntimeVersionsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(new RuntimeVersionsFetchResult(new ApiRuntimeVersionsSnapshot("v1", "1.0.151",
+                RecorderAvailable ? "1.0.151" : null, RecorderAvailable ? "available" : "unavailable"), null));
+
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
+        {
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            return Task.FromResult(DetailsFetchResult.Success(PublishedPairTestFixtures.DetailsGeneration(
+                ApiState.Ready, now, true, "Pro", new ApiQuota(75, now + 604_800, 604_800, false), [], 0)));
+        }
+    }
+
     private sealed class RuntimeHandler : HttpMessageHandler
     {
         public bool Unavailable { get; set; }

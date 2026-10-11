@@ -131,6 +131,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public async Task RefreshRuntimeVersionsAsync()
     {
+        if (refreshingVersions) return;
         refreshingVersions = true;
         Notify(nameof(CanRefresh));
         Notify(nameof(RefreshButtonText));
@@ -223,6 +224,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
     {
+        if (eventArgs.PropertyName == nameof(MainWindowViewModel.LastReceivedText))
+        {
+            _ = RefreshRuntimeVersionsAsync();
+        }
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.CanRefresh) or nameof(MainWindowViewModel.RefreshButtonText))
         {
             Notify(nameof(CanRefresh));

@@ -661,6 +661,7 @@ const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
 const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
 pub const MAX_SESSION_MODEL_BYTES: usize = 512;
 mod quota_receipts;
+mod session_quota_recovery;
 pub use quota_receipts::QuotaReceipt;
 const LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION: i64 = 10;
 const MODEL_PRICING_PREVIOUS_SCHEMA_VERSION: i64 = 11;

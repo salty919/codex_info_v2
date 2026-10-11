@@ -1216,6 +1216,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
     private static TcpListener listener;
     private static Thread worker;
     private static volatile bool running;
+    public static volatile bool RecorderVersionAvailable = true;
     private static string detailsBody;
     private static string accountsBody;
     private static string currentBody;
@@ -1380,7 +1381,9 @@ public static class CodexInfoWindowsE2EFixtureServer {
                     RecordRequestPhase(request);
                     code = 200;
                     reason = "OK";
-                    body = "{\"api_version\":\"v1\",\"rest_version\":\"1.2.3\",\"recorder_version\":\"1.2.2\",\"recorder_status\":\"mismatch\"}";
+                    body = RecorderVersionAvailable
+                        ? "{\"api_version\":\"v1\",\"rest_version\":\"1.2.3\",\"recorder_version\":\"1.2.2\",\"recorder_status\":\"mismatch\"}"
+                        : "{\"api_version\":\"v1\",\"rest_version\":\"1.2.3\",\"recorder_version\":null,\"recorder_status\":\"unavailable\"}";
                 }
                 else if (parts[1] == "/v2/details") {
                     Interlocked.Increment(ref detailsRequests);
@@ -4762,6 +4765,7 @@ function Invoke-E2ESettingsTabs {
         [Parameter(Mandatory = $true)][int]$ProcessId
     )
 
+    [CodexInfoWindowsE2EFixtureServer]::RecorderVersionAvailable = $false
     $settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' `
         -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsDraft' -ProcessId $ProcessId `
         -KeyboardActivateButton -KeyboardActivationOwnerHandle $MainHandle
@@ -4800,6 +4804,18 @@ function Invoke-E2ESettingsTabs {
                 Select-E2ETheme $settings.Root 'Paper Light'
             }
             'Settings.Tab.ConnectionStatus' {
+                Wait-E2E -Description 'Recorder version initially unavailable' -Probe {
+                    $version = Find-E2EElementByAutomationId $settings.Root 'Settings.RuntimeVersion.Recorder'
+                    return $null -ne $version -and $version.Current.Name -ceq 'Unavailable'
+                } | Out-Null
+                $null = Capture-E2EWindow $settings.Handle 'runtime-before-recovery'
+                [CodexInfoWindowsE2EFixtureServer]::RecorderVersionAvailable = $true
+                Wait-E2E -Description 'Recorder version recovers through normal polling without a click' -Probe {
+                    $version = Find-E2EElementByAutomationId $settings.Root 'Settings.RuntimeVersion.Recorder'
+                    return $null -ne $version -and $version.Current.Name -ceq '1.2.2'
+                } | Out-Null
+                $null = Capture-E2EWindow $settings.Handle 'runtime-after-recovery'
+                Write-E2E 'settings-runtime-recovery: PASS unavailable -> 1.2.2 without refresh or reopen'
                 Assert-E2ESettingsRuntimeVersions $settings.Root
                 $authCheck = Find-E2EElementByAutomationId $settings.Root 'Settings.AuthCheck'
                 Assert-E2E ($null -ne $authCheck -and -not $authCheck.Current.IsOffscreen -and $authCheck.Current.IsEnabled) `
