@@ -22,7 +22,7 @@ public sealed class GraphViewportRenderingCollection
 public sealed class GraphViewportRenderingTests
 {
     [Fact]
-    public void CalendarMonthUsesDailyBarsAndSharedLocalDatePositions()
+    public void CalendarMonthKeepsDailyAttributionButDoesNotRenderABarPlot()
     {
         var start = Unix("2026-10-01T00:00:00Z");
         var end = Unix("2026-10-03T00:00:00Z");
@@ -45,7 +45,7 @@ public sealed class GraphViewportRenderingTests
         Assert.Equal(tokenAxes.BottomValues, dollarAxes.BottomValues);
 
         var control = new GraphPlotControl { Scene = tokenScene };
-        Assert.Contains(control.Plot.GetPlottables(), item => item.GetType().Name == "BarPlot");
+        Assert.Empty(control.Plot.GetPlottables());
         using var image = control.Plot.GetImage(940, 480);
         Assert.Empty(control.Plot.Axes.GetPanels().OfType<GraphPeriodCostPanel>());
     }

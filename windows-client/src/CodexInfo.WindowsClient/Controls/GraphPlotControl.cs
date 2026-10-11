@@ -234,21 +234,13 @@ public sealed class GraphPlotControl : Control
         ApplyTheme(presentation);
 
         var scene = presentation.Scene;
-        if (!scene.HasPoints && !scene.IsViewport)
+        if (scene.IsDaily || !scene.HasPoints && !scene.IsViewport)
         {
             return;
         }
 
         var axes = BuildAxesForCurrentWidth(scene);
         AddPlotGrid(presentation, scene, axes);
-        if (scene.IsDaily)
-        {
-            AddBoundaryGuides(presentation, scene, axes);
-            AddDailyBars(presentation, scene);
-            ApplyAxes(presentation, scene, axes);
-            ApplyVisibility(presentation);
-            return;
-        }
         var idleIntervals = scene.IsViewport
             ? GraphPlotProjection.BuildViewportUnusedIntervals(scene)
             : GraphPlotProjection.BuildVisibleUnusedIntervals(scene);
@@ -346,7 +338,7 @@ public sealed class GraphPlotControl : Control
             var centerAt = visibleStart + ((visibleEnd - visibleStart) / 2d);
             var labelStyle = new ScottPlot.LabelStyle
             {
-                Text = LocalizationService.Current.FormatGraphPeriodCost(period.PeriodCost.RecordedDollars),
+                Text = GraphUsageSummary.PeriodText(period),
                 FontName = GraphPeriodCostFontResolver.AliasForLanguage(LocalizationService.Current.LanguageCode),
                 // Plot.Font.Set() installs its chosen typeface as ScottPlot's global
                 // default. Clear it so the per-label embedded-font alias is resolved.
@@ -361,62 +353,6 @@ public sealed class GraphPlotControl : Control
         }
 
         presentation.Plot.Axes.AddPanel(new GraphPeriodCostPanel(amounts));
-    }
-
-    private void AddDailyBars(PlotPresentation presentation, GraphScene scene)
-    {
-        var models = scene.DailyUsage.Select(day => day.ModelName).Distinct(StringComparer.Ordinal)
-            .Where(name => name is "SOL" or "TERRA" or "LUNA" or "ASTRA")
-            .OrderBy(name => name, StringComparer.Ordinal).ToArray();
-        for (var index = 0; index < models.Length; index++)
-        {
-            var name = models[index];
-            var color = name switch
-            {
-                "SOL" => SolColor,
-                "TERRA" => TerraColor,
-                "LUNA" => LunaColor,
-                _ => AstraColor,
-            };
-            var bars = new List<ScottPlot.Bar>();
-            foreach (var day in scene.DailyUsage.Where(day => day.ModelName == name))
-            {
-                var value = scene.Metric == GraphMetric.Tokens
-                    ? day.Tokens is { } tokens ? (double?)tokens : null
-                    : day.Dollars;
-                if (value is not { } recorded) continue;
-                var cellWidth = day.EndAt - day.StartAt;
-                var barWidth = cellWidth * 0.8 / models.Length;
-                bars.Add(new ScottPlot.Bar
-                {
-                    Position = day.StartAt + cellWidth * 0.1 + barWidth * (index + 0.5),
-                    Value = recorded,
-                    Size = barWidth * 0.9,
-                    FillColor = color,
-                });
-            }
-            if (bars.Count > 0)
-            {
-                presentation.DailySeries[name] = presentation.Plot.Add.Bars(bars);
-            }
-        }
-
-        foreach (var days in scene.DailyUsage.GroupBy(day => day.StartAt))
-        {
-            if (days.Any(day => scene.Metric == GraphMetric.Tokens ? day.Tokens is not null : day.Dollars is not null)) continue;
-            var day = days.First();
-            var text = presentation.Plot.Add.Text("—", day.StartAt + (day.EndAt - day.StartAt) / 2d, 0);
-            text.LabelFontSize = 9;
-            text.LabelFontColor = MutedColor;
-            text.LabelAlignment = ScottPlot.Alignment.LowerCenter;
-        }
-        if (scene.DailyUsage.Count == 0)
-        {
-            var text = presentation.Plot.Add.Text(LocalizationService.Current.GraphUnmeasured,
-                scene.PeriodStartAt + (scene.PeriodEndAt - scene.PeriodStartAt) / 2d, scene.ModelMaximum / 2);
-            text.LabelFontColor = MutedColor;
-            text.LabelAlignment = ScottPlot.Alignment.MiddleCenter;
-        }
     }
 
     private static GraphCanonicalModelLineProjection BuildModelLines(GraphScene scene, GraphSeries series) =>
@@ -573,7 +509,10 @@ public sealed class GraphPlotControl : Control
         presentation.Plot.Axes.Bottom.TickLabelStyle.FontName = PlotFontFamily;
         presentation.Plot.Axes.Left.TickGenerator = new NumericManual(
             axes.ModelValues.ToArray(),
-            axes.ModelLabels.ToArray());
+            scene.Metric == GraphMetric.Tokens
+                ? Enumerable.Range(0, axes.ModelValues.Count).Select(index => GraphUsageSummary.FormatTokens(
+                    (decimal)(scene.ModelMaximum * index / (axes.ModelValues.Count - 1)), CultureInfo.CurrentCulture)).ToArray()
+                : axes.ModelLabels.ToArray());
         var rightAxis = presentation.Plot.Axes.Right;
         rightAxis.TickGenerator = new NumericManual(
             axes.RemainingValues.ToArray(),
@@ -781,11 +720,6 @@ public sealed class GraphPlotControl : Control
             new ScottPlot.Pixel((float)pointer.X, (float)pointer.Y),
             current.Plot.Axes.Bottom,
             current.Plot.Axes.Left);
-        if (current.Scene.IsDaily)
-        {
-            ShowDailyHover(current.Scene, coordinates.X);
-            return;
-        }
         var snapshot = GraphHoverProjection.Find(current.Scene, coordinates.X, visibleSeries);
         if (snapshot is null)
         {
@@ -824,33 +758,6 @@ public sealed class GraphPlotControl : Control
         if (ShowModels && ShowLuna) visible.Add(GraphSeries.Luna);
         if (ShowModels && ShowAstra) visible.Add(GraphSeries.Astra);
         return visible;
-    }
-
-    private void ShowDailyHover(GraphScene scene, double timestamp)
-    {
-        var rows = scene.DailyUsage.Where(day => timestamp >= day.StartAt && timestamp < day.EndAt &&
-            IsModelVisible(day.ModelName)).ToArray();
-        if (rows.Length == 0)
-        {
-            CloseHover();
-            return;
-        }
-        var culture = CultureInfo.CurrentCulture;
-        var panel = new StackPanel { Spacing = 2, Margin = new Thickness(8) };
-        panel.SetValue(Avalonia.Automation.AutomationProperties.AutomationIdProperty, "Graph.Hover");
-        AddHoverRow(panel, "Graph.Hover.Timestamp", GraphTimeWindow.LocalDate(rows[0].StartAt,
-            LocalizationService.DisplayTimeZone).ToString("yyyy/MM/dd", culture));
-        foreach (var day in rows)
-        {
-            var value = scene.Metric == GraphMetric.Tokens
-                ? day.Tokens is { } tokens ? $"{tokens.ToString("N0", culture)} {LocalizationService.Current.Tokens}" : null
-                : day.Dollars is { } dollars ? $"${dollars.ToString("N2", culture)}" : null;
-            var label = value is null ? LocalizationService.Current.GraphUnmeasured
-                : $"{value} ({LocalizationService.Current.GraphRecordedPartial})";
-            AddHoverRow(panel, $"Graph.Hover.{day.ModelName}", $"{day.ModelName}: {label}");
-        }
-        ToolTip.SetTip(this, panel);
-        ToolTip.SetIsOpen(this, true);
     }
 
     private bool IsModelVisible(string name) => ShowModels && (name switch
@@ -893,7 +800,7 @@ public sealed class GraphPlotControl : Control
                     ? FormatRemainingPercent(remaining, culture)
                     : "—%",
                 _ when metric == GraphMetric.Tokens => row.TokenValue is { } tokens
-                    ? $"{tokens.ToString("N0", culture)} {LocalizationService.Current.Tokens}"
+                    ? $"{GraphUsageSummary.FormatTokens(tokens, culture)} {LocalizationService.Current.Tokens}"
                     : $"— {LocalizationService.Current.Tokens}",
                 _ => row.NumericValue is { } amount
                     ? GraphPlotProjection.FormatAxisValue(amount, GraphMetric.Dollars, culture)

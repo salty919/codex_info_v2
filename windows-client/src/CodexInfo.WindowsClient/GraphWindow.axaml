@@ -5,6 +5,7 @@
         xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
         xmlns:core="using:CodexInfo.WindowsClient.Core"
         xmlns:plot="using:CodexInfo.WindowsClient.Controls"
+        xmlns:graph="using:CodexInfo.WindowsClient.Graphing"
         xmlns:controls="using:CodexInfo.WindowsClient.Controls"
         x:Class="CodexInfo.WindowsClient.GraphWindow"
         x:DataType="vm:GraphWindowViewModel"
@@ -22,6 +23,19 @@
         Background="{DynamicResource Theme0E141E}"
         Foreground="{DynamicResource ThemeE9EFF8}">
   <Window.Styles>
+    <Style Selector="Border.calendar-day">
+      <Setter Property="Background" Value="{DynamicResource Theme111B2C}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme3B506F}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+    </Style>
+    <Style Selector="Border.calendar-day.today">
+      <Setter Property="BorderBrush" Value="{DynamicResource ThemeE6B85C}" />
+      <Setter Property="BorderThickness" Value="2" />
+    </Style>
+    <Style Selector="Border.calendar-day.future">
+      <Setter Property="Opacity" Value="0.45" />
+    </Style>
     <Style Selector="controls|GraphSelect.graph-select-field">
       <Setter Property="Background" Value="{DynamicResource Theme111B2C}" />
       <Setter Property="BorderBrush" Value="{DynamicResource Theme405779}" />
@@ -125,7 +139,7 @@
   </Window.Styles>
 
   <Grid>
-    <Grid x:Name="GraphContent" Margin="30,16" RowDefinitions="36,40,28,*" RowSpacing="8">
+    <Grid x:Name="GraphContent" Margin="30,16" RowDefinitions="36,40,Auto,*" RowSpacing="8">
       <Border Grid.Row="1" Grid.RowSpan="2" Background="{DynamicResource Theme111B2C}" CornerRadius="10" />
 
       <Grid Grid.Row="0" ColumnDefinitions="*,Auto,16,Auto" Background="Transparent">
@@ -209,7 +223,7 @@
       </Grid>
 
       <Grid Grid.Row="2" Width="504" Height="24" Margin="4,1,0,1" HorizontalAlignment="Left"
-            ColumnDefinitions="120,90,90,90,90" ColumnSpacing="6">
+            ColumnDefinitions="120,90,90,90,90" ColumnSpacing="6" IsVisible="{Binding !IsMonthView}" MinHeight="28">
       <ToggleButton Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowRemaining}" IsVisible="{Binding !IsMonthView}" AutomationProperties.Name="{Binding Texts.RemainingQuota}" AutomationProperties.AutomationId="Graph.Toggle.Remaining" ToolTip.Tip="{Binding Texts.RemainingQuota}">
         <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="{DynamicResource GraphRemaining}" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="{Binding Texts.RemainingQuota}" /></Grid>
       </ToggleButton>
@@ -246,7 +260,39 @@
                                    AutomationProperties.Name="{Binding Texts.Graph}"
                                    AutomationProperties.HelpText="{Binding MetricAxisText}"
                                    AutomationProperties.AutomationId="Graph.Plot"
-                                   IsVisible="{Binding HasPlot}" />
+                                   IsVisible="{Binding HasLinePlot}" />
+            <Grid Grid.Row="1" Margin="10" RowDefinitions="Auto,*" RowSpacing="6"
+                  IsVisible="{Binding IsMonthView}" AutomationProperties.AutomationId="Graph.Calendar">
+              <ItemsControl ItemsSource="{Binding CalendarWeekdays}" Margin="3,0">
+                <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Columns="7" /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="x:String">
+                    <TextBlock Text="{Binding}" FontSize="12" HorizontalAlignment="Center"
+                               Foreground="{DynamicResource Theme78879C}" />
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+              <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+                <ItemsControl ItemsSource="{Binding CalendarDays}" VerticalAlignment="Stretch">
+                  <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Columns="7" /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="graph:GraphCalendarDay">
+                      <Border Classes="calendar-day" Classes.today="{Binding IsToday}" Classes.future="{Binding IsFuture}"
+                              IsVisible="{Binding IsInMonth}" Margin="3" Padding="8,6" MinHeight="64"
+                              ToolTip.Tip="{Binding AccessibleText}" AutomationProperties.Name="{Binding AccessibleText}">
+                        <Grid RowDefinitions="Auto,*,Auto" RowSpacing="2">
+                          <TextBlock Text="{Binding DayText}" FontSize="12" FontWeight="SemiBold" />
+                          <TextBlock Grid.Row="1" Text="{Binding ValueText}" FontSize="17" FontWeight="SemiBold"
+                                     VerticalAlignment="Center" HorizontalAlignment="Right" TextTrimming="CharacterEllipsis" />
+                          <TextBlock Grid.Row="2" Text="{Binding StatusText}" FontSize="12"
+                                     HorizontalAlignment="Right" Foreground="{DynamicResource Theme78879C}" />
+                        </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </ScrollViewer>
+            </Grid>
             <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8"
                         IsVisible="{Binding IsLoading}" IsHitTestVisible="False">
               <ProgressBar Width="72" Height="4" IsIndeterminate="True" />
