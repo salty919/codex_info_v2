@@ -643,6 +643,7 @@ const RECORDER_GAP_TEXT_BYTES: usize = 512;
 const MAX_RECORDER_GAP_SOURCE_MINUTES: usize = 31 * 24 * 60;
 
 const RESET_GROUP_TOLERANCE_SECONDS: i128 = 60;
+const RESET_WINDOW_START_OVERLAP_TOLERANCE_SECONDS: i64 = 120;
 const HISTORY_TIMESTAMP_RESET_INDEX: &str = "usage_history_timestamp_reset_idx";
 const HISTORY_TIMESTAMP_RESET_INDEX_COLUMNS: &[&str] = &[
     "timestamp",
@@ -2845,9 +2846,12 @@ fn reset_window_started_between_observations(
     let tracks_observation_clock =
         reset_advance.abs_diff(observation_advance) <= RESET_GROUP_TOLERANCE_SECONDS as u64;
     // Provider window start and acquisition completion are different clocks.
-    // Use the existing boundary equivalence when the response finishes just
-    // after the window starts; quota recovery is still required by the caller.
-    (next_start_at > previous_observed_at || same_reset_group(next_start_at, previous_observed_at))
+    // A recovered official quota can arrive just after the inferred window
+    // start; the incident's authoritative start was 79 seconds before the
+    // last stored observation. Keep this separate from reset grouping and
+    // require the caller's quota-recovery evidence before admitting a boundary.
+    next_start_at
+        >= previous_observed_at.saturating_sub(RESET_WINDOW_START_OVERLAP_TOLERANCE_SECONDS)
         && next_start_at <= observed_at
         && !tracks_observation_clock
 }
@@ -14603,6 +14607,30 @@ mod tests {
                 QuotaTransition::Rejected
             );
         }
+    }
+
+    #[test]
+    fn quota_transition_accepts_provider_reset_start_79_seconds_before_stale_observation() {
+        const WINDOW: i64 = 7 * 24 * 60 * 60;
+
+        assert_eq!(
+            classify_quota_transition(
+                PreviousQuotaState::new(
+                    Some(1_792_044_505),
+                    WINDOW,
+                    Some(1_791_691_140),
+                    Some(10.0),
+                ),
+                QuotaCandidate::new(
+                    1_792_295_861,
+                    WINDOW,
+                    Some(100.0),
+                    1_791_692_640,
+                ),
+            ),
+            QuotaTransition::Boundary,
+            "the official quota reset must replace a stale local period when its window began 79 seconds before the last stored observation"
+        );
     }
 
     fn active_thread(id: &str, updated_at: i64) -> ActiveThreadRecord {
