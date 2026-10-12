@@ -33,6 +33,9 @@ public sealed record ApiDetailsSnapshot(
     /// <summary>The wire contract version of this accepted details document.</summary>
     public string ApiVersion { get; init; } = "v1";
 
+    /// <summary>Completeness reported by current v4; unknown in older documents.</summary>
+    public ApiCurrentModelsStatus? ModelsStatus { get; init; }
+
     /// <summary>The opaque identity of the accepted details response pair.</summary>
     public PublishedPairIdentity? PublishedPair { get; init; }
 
@@ -462,7 +465,14 @@ public sealed record ApiAccountsSnapshot(
     public string ApiVersion { get; init; } = "v3";
 }
 
-/// <summary>The v3/current resource. History and thread rows are intentionally absent.</summary>
+public enum ApiCurrentModelsStatus
+{
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+/// <summary>The current resource. History and thread rows are intentionally absent.</summary>
 public sealed record ApiCurrentSnapshot(
     ApiState State,
     long? ObservedAt,
@@ -474,6 +484,9 @@ public sealed record ApiCurrentSnapshot(
     PublishedPairIdentity PublishedPair)
 {
     public ulong OpenSessionThreadCount { get; init; } = ActiveThreadCount;
+
+    /// <summary>Null for older API generations that do not report model completeness.</summary>
+    public ApiCurrentModelsStatus? ModelsStatus { get; init; }
 
     public string ApiVersion { get; init; } = "v3";
 
@@ -495,6 +508,7 @@ public sealed record ApiCurrentSnapshot(
         {
             ApiVersion = details.ApiVersion,
             OpenSessionThreadCount = details.OpenSessionThreadCount,
+            ModelsStatus = details.ModelsStatus,
         };
     }
 }

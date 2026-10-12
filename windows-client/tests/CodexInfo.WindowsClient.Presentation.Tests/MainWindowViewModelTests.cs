@@ -117,8 +117,10 @@ public sealed class MainWindowViewModelTests
         Assert.True(viewModel.UpdateCommand!.CanExecute(null));
     }
 
-    [Fact]
-    public async Task RecoveredV3CurrentShowsTheExactCrossPlatformCostTotal()
+    [Theory]
+    [InlineData("v3")]
+    [InlineData("v4")]
+    public async Task RecoveredCurrentShowsTheExactCrossPlatformCostTotal(string apiVersion)
     {
         var current = new ApiCurrentSnapshot(
             ApiState.Ready,
@@ -156,6 +158,11 @@ public sealed class MainWindowViewModelTests
             ],
             0,
             PublishedPair(CanonicalPublishedPair));
+        current = current with
+        {
+            ApiVersion = apiVersion,
+            ModelsStatus = apiVersion == "v4" ? ApiCurrentModelsStatus.Partial : null,
+        };
         using var viewModel = new MainWindowViewModel(new SingleCurrentClient(current));
 
         viewModel.Start();
@@ -165,6 +172,7 @@ public sealed class MainWindowViewModelTests
         Assert.NotEqual("概算 $0.19", viewModel.EstimatedCostText);
         Assert.Equal(555_312_427UL, viewModel.DetailsSnapshot!.Models.Single(model => model.Name == "SOL").TotalTokens);
         Assert.Equal(25_262_756UL, viewModel.DetailsSnapshot.Models.Single(model => model.Name == "LUNA").TotalTokens);
+        Assert.Equal(current.ModelsStatus, viewModel.DetailsSnapshot.ModelsStatus);
     }
 
     [Fact]
@@ -333,8 +341,10 @@ public sealed class MainWindowViewModelTests
         Assert.Equal(ulong.MaxValue, viewModel.DetailsSnapshot.Models[0].InputTokens);
     }
 
-    [Fact]
-    public async Task V3EstimatedCostIsUnavailableWhenAnyModelPriceIsUnknown()
+    [Theory]
+    [InlineData("v3")]
+    [InlineData("v4")]
+    public async Task V3EstimatedCostIsUnavailableWhenAnyModelPriceIsUnknown(string apiVersion)
     {
         var current = new ApiCurrentSnapshot(
             ApiState.Ready,
@@ -358,7 +368,8 @@ public sealed class MainWindowViewModelTests
                 },
             ],
             0,
-            PublishedPair(CanonicalPublishedPair));
+            PublishedPair(CanonicalPublishedPair))
+        { ApiVersion = apiVersion };
         using var viewModel = new MainWindowViewModel(new SingleCurrentClient(current));
 
         viewModel.Start();
@@ -367,10 +378,12 @@ public sealed class MainWindowViewModelTests
         Assert.Equal("概算 —", viewModel.EstimatedCostText);
     }
 
-    [Fact]
-    public async Task V3CurrentAndThreadsPublishOneSolThreadAtomically()
+    [Theory]
+    [InlineData("v3")]
+    [InlineData("v4")]
+    public async Task CurrentAndThreadsPublishOneSolThreadAtomically(string apiVersion)
     {
-        var current = CurrentSnapshot(activeThreadCount: 1);
+        var current = CurrentSnapshot(activeThreadCount: 1) with { ApiVersion = apiVersion };
         var thread = ThreadDetails("gpt-5.6-sol");
         var client = new SplitCurrentThreadsClient(
             current,
@@ -544,11 +557,14 @@ public sealed class MainWindowViewModelTests
         Assert.Equal("error", viewModel.DetailsStatusAutomationText);
     }
 
-    [Fact]
-    public async Task Issue419StoppedOpenRootIsHiddenInSameMainCycle()
+    [Theory]
+    [InlineData("v3")]
+    [InlineData("v4")]
+    public async Task Issue419StoppedOpenRootIsHiddenInSameMainCycle(string apiVersion)
     {
         var current = CurrentSnapshot(activeThreadCount: 0) with
         {
+            ApiVersion = apiVersion,
             OpenSessionThreadCount = 1,
         };
         var stopped = ThreadDetails("gpt-5.6-sol") with
@@ -571,11 +587,14 @@ public sealed class MainWindowViewModelTests
         Assert.Empty(main.DetailsSnapshot!.Threads);
     }
 
-    [Fact]
-    public async Task MainWindowModelCountsPairRunningAndOpen()
+    [Theory]
+    [InlineData("v3")]
+    [InlineData("v4")]
+    public async Task MainWindowModelCountsPairRunningAndOpen(string apiVersion)
     {
         var current = CurrentSnapshot(activeThreadCount: 1) with
         {
+            ApiVersion = apiVersion,
             OpenSessionThreadCount = 3,
         };
         var stoppedSol = ThreadDetails("gpt-5.6-sol", "stopped-sol") with
@@ -617,11 +636,14 @@ public sealed class MainWindowViewModelTests
         Assert.Equal("0", typeof(MainWindowViewModel).GetProperty("ActiveOtherCountLabel")?.GetValue(main));
     }
 
-    [Fact]
-    public async Task StoppedParentAndDescendantsAreAbsentFromMainAndThreadsWithoutReparenting()
+    [Theory]
+    [InlineData("v3")]
+    [InlineData("v4")]
+    public async Task StoppedParentAndDescendantsAreAbsentFromMainAndThreadsWithoutReparenting(string apiVersion)
     {
         var current = CurrentSnapshot(activeThreadCount: 4) with
         {
+            ApiVersion = apiVersion,
             OpenSessionThreadCount = 6,
         };
         static ApiThreadDetails Row(

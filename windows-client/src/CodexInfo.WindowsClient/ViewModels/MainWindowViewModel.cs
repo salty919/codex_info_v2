@@ -397,7 +397,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// model breakdown use the same accepted rows. Legacy details retain their
     /// running-only scalar contract.
     /// </summary>
-    public ulong ActiveThreadCount => detailsSnapshot is { ApiVersion: "v3" } v3
+    public ulong ActiveThreadCount => detailsSnapshot is { ApiVersion: "v3" or "v4" } v3
         ? (ulong)v3.Threads.Count
         : detailsSnapshot?.ActiveThreadCount ?? 0;
 
@@ -545,7 +545,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string EstimatedCostText => detailsSnapshot switch
     {
-        { ApiVersion: "v3" } snapshot => FormatV3EstimatedCost(snapshot.Models),
+        { ApiVersion: "v3" or "v4" } snapshot => FormatV3EstimatedCost(snapshot.Models),
         { } snapshot => snapshot.EstimatedCostLabel,
         _ => Texts.EstimatedUnavailable,
     };
@@ -1638,7 +1638,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             validatedDetails.AccountId == accountId;
         acceptedWireOpenSessionThreadCount = validatedDetails.OpenSessionThreadCount;
         acceptedWireActiveThreadCount = validatedDetails.ActiveThreadCount;
-        if (validatedDetails.ApiVersion == "v3" && !historical)
+        if ((validatedDetails.ApiVersion is "v3" or "v4") && !historical)
         {
             var visibleThreads = WithoutStoppedParentSubtrees(validatedDetails.Threads);
             validatedDetails = validatedDetails with
@@ -1753,6 +1753,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             "概算 —")
         {
             ApiVersion = current.ApiVersion,
+            ModelsStatus = current.ModelsStatus,
             OpenSessionThreadCount = historical ? 0 : current.OpenSessionThreadCount,
             PublishedPair = current.PublishedPair,
             AccountId = current.AccountId,
@@ -2144,7 +2145,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private string FormatThreadModelCount(string model, int generated)
     {
-        if (generated == 0 || detailsSnapshot is not { ApiVersion: "v3" } snapshot)
+        if (generated == 0 || detailsSnapshot is not { ApiVersion: "v3" or "v4" } snapshot)
         {
             return generated.ToString(CultureInfo.CurrentCulture);
         }

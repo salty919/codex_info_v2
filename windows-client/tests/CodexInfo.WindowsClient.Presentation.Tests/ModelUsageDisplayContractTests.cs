@@ -19,8 +19,12 @@ public sealed class ModelUsageDisplayContractTests
     private const string PublishedPair =
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
-    [Fact]
-    public async Task V3ParserAndPresentationMatchTheSharedCrossPlatformOracle()
+    [Theory]
+    [InlineData("v3", null)]
+    [InlineData("v4", "complete")]
+    [InlineData("v4", "partial")]
+    public async Task V3ParserAndPresentationMatchTheSharedCrossPlatformOracle(
+        string apiVersion, string? modelsStatus)
     {
         var previousCulture = CultureInfo.CurrentCulture;
         var previousLanguage = LocalizationService.Current.LanguageCode;
@@ -41,17 +45,30 @@ public sealed class ModelUsageDisplayContractTests
                 ",",
                 rows.Select(row => row.GetProperty("wire").GetRawText()));
             var currentJson =
-                "{\"api_version\":\"v3\",\"state\":\"ready\",\"observed_at\":1790000000," +
+                "{\"api_version\":\"" + apiVersion + "\"," +
+                (modelsStatus is null ? "" : "\"models_status\":\"" + modelsStatus + "\",") +
+                "\"state\":\"ready\",\"observed_at\":1790000000," +
                 "\"authenticated\":true,\"plan_label\":\"Pro\"," +
                 "\"quota\":{\"remaining_percent\":50.0,\"reset_at\":1790604800," +
                 "\"window_seconds\":604800,\"monthly\":false},\"models\":[" +
                 wireModels + "],\"active_thread_count\":0}";
-            using var client = new LoopbackStatusClient(
-                new CurrentFixtureHandler(Encoding.UTF8.GetBytes(currentJson)));
+            using var handler = new CurrentFixtureHandler(
+                Encoding.UTF8.GetBytes(currentJson), apiVersion);
+            using var client = new LoopbackStatusClient(handler);
 
             var result = await client.FetchCurrentAsync(CancellationToken.None);
 
             Assert.True(result.IsSuccess);
+            Assert.Equal(apiVersion, result.Snapshot!.ApiVersion);
+            Assert.Equal(
+                apiVersion == "v3" ? ["/v4/current", "/v3/current"] : ["/v4/current"],
+                handler.Paths);
+            Assert.Equal(modelsStatus switch
+            {
+                "complete" => ApiCurrentModelsStatus.Complete,
+                "partial" => ApiCurrentModelsStatus.Partial,
+                _ => (ApiCurrentModelsStatus?)null,
+            }, result.Snapshot.ModelsStatus);
             Assert.Equal(rows.Length, result.Snapshot!.Models.Count);
             foreach (var row in rows)
             {
@@ -121,16 +138,23 @@ public sealed class ModelUsageDisplayContractTests
         }
     }
 
-    private sealed class CurrentFixtureHandler(byte[] body) : HttpMessageHandler
+    private sealed class CurrentFixtureHandler(byte[] body, string apiVersion) : HttpMessageHandler
     {
         private readonly byte[] body = body.ToArray();
+        public List<string> Paths { get; } = [];
 
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
             Assert.Equal(HttpMethod.Get, request.Method);
-            Assert.Equal("/v3/current", request.RequestUri?.AbsolutePath);
+            var path = request.RequestUri!.AbsolutePath;
+            Paths.Add(path);
+            if (apiVersion == "v3" && path == "/v4/current")
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+            }
+            Assert.Equal($"/{apiVersion}/current", path);
             var response = new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new ByteArrayContent(body),

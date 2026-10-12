@@ -12,9 +12,32 @@ API-V3-MODELS-01
 API-DEPRECATION-01
 -->
 
-# Loopback REST API v1 / v2 / v3
+# Loopback REST API v1 / v2 / v3 / v4
 
 ## API世代と廃止境界
+
+### current v4: 取得状態とモデル集計品質の分離
+
+`API-V3-MODELS-01`: `GET /v4/current` は `/v3/current` と同じ取得済み値に、
+`models_status`（`complete` / `partial` / `unavailable`）を加え、`api_version` を `v4` とする。
+`state` は取得・読取り・公開処理の状態を表す。未完のSession行や未解決の過去ログがあることだけで、
+取得できた利用枠を `error` としない。集計済みの有効なモデル値はそのまま返す。
+
+| 状況 | state | models_status | 保存済み利用枠・モデル値 |
+| --- | --- | --- | --- |
+| 取得成功・モデル集合が完全 | ready | complete | 最新の受理済み値 |
+| 取得成功・モデル集合が部分的 | ready | partial | 最新の部分集合。以前の完全集合へ戻さない |
+| 取得成功・モデル値が未取得 | ready | unavailable | 利用枠を保持。モデルは空配列 |
+| 完全な空集合を観測 | ready | complete | モデルは空配列。未取得とは区別する |
+| 不正な保存値・投影失敗 | error | partial または unavailable | 利用枠と、有効性を確認できたモデル値を保持 |
+| 取得失敗・公開済み世代の再読取り失敗 | error | 保持世代の品質 | 最後の有効な値を保持 |
+
+未認証・初期化中・アカウント境界では既存のstrict empty契約を維持し、
+`models_status=unavailable` とする。`account` selector、published pair、ETag、HTTP headerの制約は
+v3 split resourceと共通であり、状態または品質の変化を古い304で隠さない。
+履歴・スレッドは同じ公開世代のv3 resourceを使用する。
+旧v1〜v3のschemaは変更せず、集計未完了を `error` に含める旧契約の互換経路として維持する。
+client移行時はv4を優先し、exact 404の場合だけv3以下の既存経路を使用する。
 
 `ACCOUNT-SELECT-134`: `GET /v3/accounts`は初期化済みaccount partitionの有限catalogを返す。各要素は
 `id`（`account-<StorageEpoch>`形式の非秘密selector）、`is_current`、nullableな`activation_at`、
@@ -24,7 +47,7 @@ API-DEPRECATION-01
 返してもよい）。`login_id`は前後の同一
 `account/read`で確認し、owner-onlyな当該account DBへ保存した1..254 Unicode scalar、trim済み・control文字なしの
 表示専用値であり、欠落時はnullとする。AccountScopeId、partition ID、raw AccountKey、token、pathをwireへ出さない。
-`/v3/details`、`/v3/current`、`/v3/history/periods`、`/v3/history`、`/v3/threads`は
+`/v4/current`、`/v3/details`、`/v3/current`、`/v3/history/periods`、`/v3/history`、`/v3/threads`は
 任意の`account=<id>`を一つだけ受理し、省略時は現accountを選ぶ。未知・重複・不正selectorは別accountへfallbackせず
 400とする。published pairとcursorはaccount IDへnamespace bindし、別accountのETag、cursor、last-goodを受理しない。
 ログアウト、account切替、またはidentity検証失敗中のselectorなしrouteは、旧accountのquota・reset・model・threadを
@@ -35,7 +58,7 @@ API-DEPRECATION-01
 `MODEL-PRICING-463`の正確なモデルIDはv3のmodel keyとして保持する。currentの`estimated_cost`は共通料金表で計算できた場合だけ返し、historyの`total_dollars`は保存済みの観測時参考額を返す。保存額がないモデル版へ最新単価を遡及適用しない。旧SOL/TERRA/LUNA固定列は従来のfamily単価で集約した互換値を維持し、新しいexact-ID行の公式料金authorityにはしない。v3はfamily行を含め保存済みsidecar金額を優先し、旧family行に保存額がない場合だけ旧固定列を参照する。不完全な履歴へ旧family行を補完する場合も、同じfamilyの正確なID行が存在するなら重複した固定列合計を追加しない。画面向けfamily集約はwireの後段で行う。
 
 v3の各履歴rowは`models`、`models_complete`、nullable boolean `task_active_since_previous`を持つ。
-currentのモデル値は、選択account・公開period/window内の最新観測を先に固定し、そのexact keyの検証済み内訳から投影する。最新集合が不完全でも取得済みmodelを表示可能なまま公開し、旧complete集合へ戻さない。不完全・欠測・不正なmodelがある場合は既存の`state=error`を併記し、数値の存在を全件収集成功へ読み替えない。最新観測が明示的な確定空集合なら空集合を採用し、未提供・不完全空集合を確定zeroにしない。履歴の保存価格や固定family補完をcurrentの数値正本にしない。回復は新しいcommitの値・状態を同じpublished pairで置換し、error時のETagが正常回復を隠さない。これは取得途中・通信失敗時のlast-good保持と区別する。
+currentのモデル値は、選択account・公開period/window内の最新観測を先に固定し、そのexact keyの検証済み内訳から投影する。最新集合が不完全でも取得済みmodelを表示可能なまま公開し、旧complete集合へ戻さない。v1〜v3では不完全・欠測・不正なmodelがある場合に既存の`state=error`を併記する。v4では上記の取得状態と`models_status`を使い分け、数値の存在を全件収集成功へ読み替えない。最新観測が明示的な確定空集合なら空集合を採用し、未提供・不完全空集合を確定zeroにしない。履歴の保存価格や固定family補完をcurrentの数値正本にしない。回復は新しいcommitの値・状態を同じpublished pairで置換し、error時のETagが正常回復を隠さない。これは取得途中・通信失敗時のlast-good保持と区別する。
 `task_active_since_previous`は同じcanonical periodの直前rowより後から当該row時刻までにtaskが実行中だったかを表し、
 graphのinterval判定ではafter rowの値として扱う。
 完全に索引済みのtask lifecycleで1件以上のoverlapを確認した場合だけ`true`、完全coverageで0件の場合だけ`false`、
@@ -50,7 +73,7 @@ Graphでgray idleを表示するclientはsame `reset_at`のperiod内で、run全
 ただしexact 60秒の1 sampling slotだけが`unavailable`で、その前後がsame reset、同一model集合、全raw token／Remaining exact equalかつgapなしなら、そのrowをread-time表示入力から除外して境界済み不変区間を分断しない。2 slot以上、前後値またはmodel集合の相違、`unknown`、その他の不完全rowは分断する。timestamp sparsityだけからgapや利用を推測せず、上記条件を満たす連続10分以上のrunだけを
 gray表示し、同じ区間の全表示系列を1px水平実線にする。同じmodelのtoken不変runでドルだけが変化または欠測した場合は、DB/API rawを変更せずread-time表示を左端の有限ドル値へ水平補正する。短い水平線はgray表示せず通常実線のままとする。詳しい表示判定は`G137-GRAPH-01`に従う。
 
-`API-DEPRECATION-01`: `/v1/details`、`/v2/details`、全表示情報を一体化した`/v3/details`は互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3 split resourceを優先し、`/v3/current`がexact 404の場合だけ`/v3/details`、さらにexact 404の場合だけv2、v1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
+`API-DEPRECATION-01`: `/v1/details`、`/v2/details`、全表示情報を一体化した`/v3/details`は互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientは`/v4/current`とv3のhistory/threads resourceを優先し、`/v4/current`がexact 404の場合だけ`/v3/current`、さらにexact 404の場合だけ`/v3/details`、さらにexact 404の場合だけv2、v1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
 
 RESTの`api_version`はwire互換性だけのauthorityであり、製品Release版およびdaemonのrecorder-state/DB schema版から独立させる。daemon内部形式だけの変更でREST版を進めず、wireの意味またはschemaを非互換に変更するときだけ新しいREST版を追加する。同一binaryで稼働するdaemonとRESTに、独立deployを装う重複SemVerを設けない。
 
@@ -564,7 +587,7 @@ history全体を取得しない。history cursorはperiod、最後の`(reset_at,
 
 選択periodの先頭pageはGraphが実際に要求した時点でだけ同じimmutable published pair内へ遅延生成し、そのpairを読む全loopback接続で再利用する。未選択periodを先行serializeせず、新しいpairへのatomic switchで旧page cacheも同時に破棄する。cursor付きpageは同pairなら304、更新pairでは検証済みcursor後のsuffixだけをserializeし、request処理からDB、Session、履歴canonicalizationへ戻らない。
 
-`/v3/current`のexact 404を受けたclientは、その接続中をlegacy details modeとし、fallback列で受理した一つの完全details rootをMain、Graph、Threadsへ同時投影する。legacy modeではsplit history/threads routeを追加要求せず、Mainの10秒周期で同じdetails列だけを更新し、Graph/Threadsは最新の受理済みrootを表示する。再接続時には`/v3/current`から能力判定をやり直す。これにより旧serviceでもsurfaceを欠落させず、splitとlegacy rootを混在させない。
+`/v3/current`のexact 404を受けたclientは、その接続中をlegacy details modeとし、fallback列で受理した一つの完全details rootをMain、Graph、Threadsへ同時投影する。legacy modeではsplit history/threads routeを追加要求せず、Mainの10秒周期で同じdetails列だけを更新し、Graph/Threadsは最新の受理済みrootを表示する。再接続時には`/v4/current`から能力判定をやり直す。これにより旧serviceでもsurfaceを欠落させず、splitとlegacy rootを混在させない。
 
 schema-validなdetailsの`state=auth_required|initializing|error,authenticated=false`が上記exact empty契約を満たす場合、
 その同じdetails rootで旧account可視値を空にする。認証開始・確認controlの成功・失敗だけではdata rootを変更しない。

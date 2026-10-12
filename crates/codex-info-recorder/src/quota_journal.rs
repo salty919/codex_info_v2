@@ -258,6 +258,42 @@ mod tests {
     }
 
     #[test]
+    fn nullable_window_replays_weekly_quota_without_changing_saved_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = json!({"rateLimits": {
+            "primary": {"usedPercent": 0, "resetsAt": null, "windowDurationMins": null},
+            "secondary": {"usedPercent": 1, "resetsAt": 1800604800, "windowDurationMins": 10080}
+        }});
+        let receipt = receipt("nullable-window", payload.clone());
+        receipt.save(temp.path(), true).unwrap();
+        drop(receipt);
+        let replay = read_unapplied(temp.path(), "account", &BTreeSet::new()).unwrap();
+        assert_eq!(replay.unresolved, 0);
+        assert_eq!(replay.latest_input_unresolved, Some(false));
+        assert_eq!(replay.receipts.len(), 1);
+        let restored = &replay.receipts[0];
+        assert_eq!(restored.observed_at, 1791763418);
+        assert_eq!(restored.remaining_percent, 99.0);
+        assert_eq!(restored.reset_at, 1800604800);
+        assert_eq!(restored.window_seconds, 604800);
+        let applied = BTreeSet::from(["nullable-window".to_owned()]);
+        assert!(read_unapplied(temp.path(), "account", &applied)
+            .unwrap()
+            .receipts
+            .is_empty());
+        let db = Connection::open(temp.path().join("history/quota/observations.sqlite3")).unwrap();
+        let saved: String = db
+            .query_row(
+                "SELECT payload FROM quota_observations WHERE receipt_id='nullable-window'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, payload.to_string());
+        assert_eq!(raw_count(temp.path()), 1);
+    }
+
+    #[test]
     fn active_verification_is_pending_then_replayable_without_losing_raw_input() {
         let temp = tempfile::tempdir().unwrap();
         let receipt = receipt("active-verification", valid_payload());
