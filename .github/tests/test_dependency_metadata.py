@@ -251,7 +251,10 @@ class DependencyMetadataTests(unittest.TestCase):
     def test_metadata_workflow_is_read_only_and_propagates_failure(self):
         data = self.workflow("dependency-metadata.yml")
         events = data.get("on", data.get(True))
-        self.assertEqual(events, {"pull_request": {"branches": ["feat/next", "main"]}})
+        self.assertEqual(events, {
+            "pull_request": {"branches": ["feat/next"]},
+            "workflow_call": {"inputs": {"source_sha": {"required": True, "type": "string"}}},
+        })
         self.assertEqual(data["permissions"], {"contents": "read"})
         self.assertEqual(len(data["jobs"]), 1)
         job = next(iter(data["jobs"].values()))
@@ -262,7 +265,8 @@ class DependencyMetadataTests(unittest.TestCase):
                 self.assertRegex(step["uses"], r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$")
         checkout = job["steps"][0]
         self.assertFalse(checkout["with"]["persist-credentials"])
-        self.assertEqual(checkout["with"]["ref"], "$" + "{{ github.event.pull_request.head.sha }}")
+        self.assertEqual(checkout["with"]["ref"],
+                         "${{ inputs.source_sha || github.event.pull_request.head.sha }}")
         audit = next(s for s in job["steps"] if s.get("name") == "Collect and audit dependency metadata")
         self.assertIn("set -euo pipefail", audit["run"])
         self.assertIn("python3 .github/scripts/dependency_metadata.py", audit["run"])

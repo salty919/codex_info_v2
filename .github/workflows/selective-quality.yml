@@ -29,6 +29,34 @@ permissions:
   contents: read
 
 jobs:
+  # Main owns these existing audits in the H0 -> prepared H1 run. A bot
+  # synchronize event must not create approval-required dependency runs.
+  # Feature PRs keep their standalone read-only pull_request audits.
+  dependency-review:
+    if: inputs.release_candidate
+    uses: ./.github/workflows/dependency-review.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+      base_sha: ${{ inputs.base_sha }}
+    permissions:
+      contents: read
+
+  dependency-metadata:
+    if: inputs.release_candidate
+    uses: ./.github/workflows/dependency-metadata.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+    permissions:
+      contents: read
+
+  rust-dependencies:
+    if: inputs.release_candidate
+    uses: ./.github/workflows/rust-dependencies.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+    permissions:
+      contents: read
+
   docs-quality:
     name: docs-quality
     if: contains(fromJSON(inputs.selection_json).owners, 'DOCS')

@@ -21,8 +21,10 @@ class DependencySecurityWorkflowTests(unittest.TestCase):
         self.assertTrue(path.is_file(), f"unimplemented dependency workflow: {name}")
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         events = data.get("on", data.get(True))
-        self.assertEqual(set(events), {"pull_request"})
-        self.assertEqual(set(events["pull_request"]["branches"]), {"feat/next", "main"})
+        self.assertEqual(set(events), {"pull_request", "workflow_call"})
+        self.assertEqual(events["pull_request"]["branches"], ["feat/next"])
+        self.assertEqual(events["workflow_call"]["inputs"]["source_sha"],
+                         {"required": True, "type": "string"})
         self.assertNotIn("paths", events["pull_request"])
         self.assertNotIn("paths-ignore", events["pull_request"])
         self.assertEqual(data["permissions"], {"contents": "read"})
@@ -41,7 +43,8 @@ class DependencySecurityWorkflowTests(unittest.TestCase):
     def test_rust_workflow_contract(self):
         job = self.workflow("rust-dependencies.yml")
         checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
-        self.assertEqual(checkout["with"]["ref"], "$" + "{{ github.event.pull_request.head.sha }}")
+        self.assertEqual(checkout["with"]["ref"],
+                         "${{ inputs.source_sha || github.event.pull_request.head.sha }}")
         self.assertFalse(checkout["with"]["persist-credentials"])
         install = next(s for s in job["steps"] if s.get("uses", "").startswith("taiki-e/install-action@"))
         self.assertRegex(install["with"]["tool"], r"^cargo-deny@\d+\.\d+\.\d+$")
@@ -100,6 +103,8 @@ class DependencySecurityWorkflowTests(unittest.TestCase):
         self.assertEqual(
             review["with"],
             {
+                "base-ref": "${{ inputs.base_sha || github.event.pull_request.base.sha }}",
+                "head-ref": "${{ inputs.source_sha || github.event.pull_request.head.sha }}",
                 "fail-on-severity": "low",
                 "fail-on-scopes": "runtime,development,unknown",
                 "license-check": "false",
@@ -110,6 +115,36 @@ class DependencySecurityWorkflowTests(unittest.TestCase):
                 "warn-only": "false",
             },
         )
+
+    def test_main_dependencies_use_prepared_sha_in_existing_quality_run(self):
+        selective = yaml.safe_load((WORKFLOWS / "selective-quality.yml").read_text())
+        main = yaml.safe_load((WORKFLOWS / "version-prepare.yml").read_text())
+        feat = yaml.safe_load((WORKFLOWS / "feat-integration.yml").read_text())
+        caller = main["jobs"]["selective-quality"]
+        self.assertEqual(caller["needs"], ["version-prepared"])
+        self.assertIn("needs.version-prepared.outputs.ready == 'true'", caller["if"])
+        self.assertEqual(caller["with"]["source_sha"],
+                         "${{ needs.version-prepared.outputs.quality_sha }}")
+        self.assertTrue(caller["with"]["release_candidate"])
+        self.assertFalse(feat["jobs"]["selective-quality"]["with"]["release_candidate"])
+        self.assertIn("selective-quality", main["jobs"]["acceptance"]["needs"])
+        for name in ("dependency-review", "dependency-metadata", "rust-dependencies"):
+            with self.subTest(workflow=name):
+                job = selective["jobs"].get(name)
+                self.assertIsNotNone(job, "main dependency audit is not wired")
+                self.assertEqual(job["if"], "inputs.release_candidate")
+                self.assertEqual(job["uses"], f"./.github/workflows/{name}.yml")
+                self.assertEqual(job["with"]["source_sha"], "${{ inputs.source_sha }}")
+                self.assertEqual(job["permissions"], {"contents": "read"})
+                self.assertNotIn("continue-on-error", job)
+                self.assertNotIn("secrets", job)
+        review = selective["jobs"].get("dependency-review")
+        self.assertIsNotNone(review)
+        self.assertEqual(review["with"]["base_sha"], "${{ inputs.base_sha }}")
+        workflow = yaml.safe_load((WORKFLOWS / "dependency-review.yml").read_text())
+        events = workflow.get("on", workflow.get(True))
+        self.assertEqual(events["workflow_call"]["inputs"]["base_sha"],
+                         {"required": True, "type": "string"})
 
 
 if __name__ == "__main__":
