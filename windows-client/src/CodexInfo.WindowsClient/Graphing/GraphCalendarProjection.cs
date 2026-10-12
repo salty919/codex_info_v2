@@ -46,7 +46,7 @@ internal static class GraphCalendarProjection
                 {
                     var known = contributions.Where(item => item.Tokens is not null).ToArray();
                     var tokens = known.Sum(item => (decimal)item.Tokens!.Value);
-                    value = known.Length == 0 ? "—" : GraphUsageSummary.FormatCalendarTokens(tokens, culture);
+                    value = known.Length == 0 ? "—" : GraphUsageSummary.FormatTokens(tokens, culture);
                     if (known.Length > 0)
                         exactTokens = tokens.ToString("N0", culture) + " " + LocalizationService.Current.GraphTokenMetric;
                 }
