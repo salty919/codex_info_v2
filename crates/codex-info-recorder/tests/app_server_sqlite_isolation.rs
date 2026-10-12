@@ -510,15 +510,6 @@ fn quota_replay_retains_unreadable_input_and_accepts_later_receipts() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    Connection::open(&database)
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER quota_health_atomic BEFORE UPDATE ON collection_generation
-         WHEN EXISTS(SELECT 1 FROM quota_receipts)
-           AND NOT EXISTS(SELECT 1 FROM quota_acquisition_state WHERE singleton=1 AND degraded=1)
-         BEGIN SELECT RAISE(ABORT, 'quota receipt published before unresolved state'); END;",
-        )
-        .unwrap();
     let log = run_quota_replay(&fixture);
     let expected: Vec<_> = originals
         .iter()
@@ -548,7 +539,7 @@ fn quota_replay_retains_unreadable_input_and_accepts_later_receipts() {
         .unwrap();
     assert_eq!(
         degraded, 1,
-        "unresolved raw input must remain publicly degraded"
+        "the absent app-server is a real transport failure, independent of retained historical input"
     );
 
     let retained: Vec<(String, i64, String)> = raw
@@ -592,18 +583,18 @@ fn quota_replay_reports_unverified_input_without_assigning_it() {
 }
 
 #[test]
-fn quota_resident_keeps_replay_failure_until_raw_is_reprocessed() {
+fn quota_resident_accepts_fresh_quota_while_retaining_old_unresolved_input() {
     let mut fixture = QuotaJournalFixture::start(false, false, 3);
     fixture.wait_for_calls(4);
     fixture.child.0.kill().unwrap();
     fixture.child.0.wait().unwrap();
     let database = replay_partition(&fixture);
     let raw = Connection::open(&fixture.database).unwrap();
-    let (first_id, original): (String, String) = raw
+    let first_id: String = raw
         .query_row(
-            "SELECT receipt_id,payload FROM quota_observations ORDER BY sequence LIMIT 1",
+            "SELECT receipt_id FROM quota_observations ORDER BY sequence LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .unwrap();
     raw.execute(
@@ -651,51 +642,44 @@ fn quota_resident_keeps_replay_failure_until_raw_is_reprocessed() {
         .contains("quota lane ready"));
     let degraded: i64 = account
         .query_row(
-            "SELECT degraded FROM quota_acquisition_state WHERE singleton=1",
+            "SELECT COALESCE((SELECT degraded OR input_degraded FROM quota_acquisition_state WHERE singleton=1),0)",
             [],
             |r| r.get(0),
         )
         .unwrap();
     assert_eq!(
-        degraded, 1,
-        "fresh success must not erase unresolved replay"
+        degraded, 0,
+        "fresh accepted quota recovers current acquisition independently of old unresolved input"
     );
-    let current = accepted_quota_receipts(&database).last().unwrap().clone();
-    raw.execute(
-        "UPDATE quota_observations SET payload=?1 WHERE receipt_id=?2",
-        [&original, &first_id],
-    )
-    .unwrap();
-    loop {
-        assert!(resident.0.try_wait().unwrap().is_none());
-        let degraded: i64 = account
-            .query_row(
-                "SELECT degraded FROM quota_acquisition_state WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        if accepted_quota_receipts(&database).len() == 5 && degraded == 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "resident did not recover from raw: {}",
-            fs::read_to_string(&log_path).unwrap()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    let accepted = accepted_quota_receipts(&database);
+    assert_eq!(accepted.len(), 4);
+    assert!(accepted.iter().all(|(id, _, _)| id != &first_id));
+    let latest_raw: (String, i64) = raw
+        .query_row(
+            "SELECT receipt_id,sequence FROM quota_observations ORDER BY sequence DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        accepted.last().unwrap(),
+        &(latest_raw.0, latest_raw.1, 99.0)
+    );
+    let retained: String = raw
+        .query_row(
+            "SELECT payload FROM quota_observations WHERE receipt_id=?1",
+            [&first_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retained, "{}",
+        "recovery does not rewrite or remove unresolved original input"
+    );
     assert_eq!(
         fixture.calls(),
         7,
-        "recovery must not need another API response"
-    );
-    let restored = accepted_quota_receipts(&database);
-    assert_eq!(restored.first().unwrap().0, first_id);
-    assert_eq!(
-        restored.last().unwrap(),
-        &current,
-        "old input must not replace current"
+        "recovery does not require another API response"
     );
     let raw_count: i64 = raw
         .query_row("SELECT count(*) FROM quota_observations", [], |r| r.get(0))
@@ -703,6 +687,95 @@ fn quota_resident_keeps_replay_failure_until_raw_is_reprocessed() {
     assert_eq!(raw_count, 5);
     resident.0.kill().unwrap();
     resident.0.wait().unwrap();
+}
+
+#[test]
+fn quota_resident_separates_saved_uninterpretable_input_from_transport_failure() {
+    let fixture = QuotaJournalFixture::start_process(true, false, 3, Some(1));
+    let root = fixture._root.path();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let database = loop {
+        if let Ok(partition) = codex_info_account_locator::locate_existing_partition(
+            root.join("home"),
+            root.join("data"),
+        ) {
+            let db = Connection::open(&partition.database_path).unwrap();
+            if db
+                .query_row(
+                    "SELECT input_degraded FROM quota_acquisition_state WHERE singleton=1",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+                == Some(1)
+            {
+                break partition.database_path;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resident did not retain uninterpretable input: {}",
+            fs::read_to_string(root.join("owner.log")).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let db = Connection::open(&database).unwrap();
+    let health = || {
+        db.query_row(
+            "SELECT degraded,input_degraded FROM quota_acquisition_state WHERE singleton=1",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        health(),
+        (0, 1),
+        "a verified and saved response is not a transport failure"
+    );
+    assert!(accepted_quota_receipts(&database).is_empty());
+    let raw = Connection::open(&fixture.database).unwrap();
+    let original: (String,String,i64) = raw.query_row("SELECT receipt_id,payload,account_verified FROM quota_observations ORDER BY sequence LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(original.2, 1);
+    let mut valid = fixture.expected.clone();
+    valid["rateLimits"]["primary"]["usedPercent"] = json!(1);
+    fs::write(root.join("quota-next.json"), valid.to_string()).unwrap();
+    fs::rename(root.join("quota-next.json"), root.join("quota.json")).unwrap();
+    loop {
+        let accepted = accepted_quota_receipts(&database);
+        if health() == (0, 0) && accepted.last().is_some_and(|r| r.2 == 99.0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resident did not recover from a later valid saved response: {}",
+            fs::read_to_string(root.join("owner.log")).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let retained: (String, i64) = raw
+        .query_row(
+            "SELECT payload,account_verified FROM quota_observations WHERE receipt_id=?1",
+            [&original.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retained, (original.1, 1));
+    let rows: Vec<(i64, String)> = raw
+        .prepare("SELECT sequence,payload FROM quota_observations ORDER BY sequence")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    for (index, (sequence, payload)) in rows.iter().enumerate() {
+        assert!(*sequence > 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(payload).unwrap()["fixtureSequence"],
+            index
+        );
+    }
 }
 
 #[test]

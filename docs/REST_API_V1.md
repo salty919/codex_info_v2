@@ -578,4 +578,4 @@ schema-validなdetailsの`state=auth_required|initializing|error,authenticated=f
 ## REST失敗の診断（Issue #482）
 
 `REST-FAILURE-482`: 全登録routeと共有failure ownerはrequest解析、route/input拒否、snapshot/DB読取り、projection/応答生成、応答書込みの失敗を診断できるようにする。HTTP失敗は既存の固定error code、内部失敗は固定categoryとOS/SQLite error kindを理由として記録する。記録項目はtimestamp、canonical routeまたは固定の未解析/未知route識別子、stage、reason、HTTP status。raw URL/query/body/header、token、credential、account識別子、DB値・例外のraw文言を記録しない。ログ保存・閲覧境界はDATA owner `REST-LOG-RETENTION-482` に従う。
-HTTP 200の本文で`state=error`を返す場合も記録する。未完了収集または取得laneのdegraded、refresh失敗によるlast-good保持、account境界のerrorを固定categoryで区別する。未完了収集と取得laneのdegradedはreaderが統合した値のため、REST側でどちらかに断定しない。
+HTTP 200の本文で`state=error`を返す場合も記録する。現在の取得lane失敗は`acquisition_failed`、現在値projectionの不完全さは`incomplete_current_projection`、refresh失敗によるlast-good保持は`last_good_after_refresh_failure`、account境界のerrorは`account_boundary_error`として区別する。readerは履歴sourceの未処理rangeと現在の取得lane失敗を独立して渡す。過去の未処理rangeだけでは、正常に取得・保存されたcurrent/detailsをerrorへ変更しない。未処理range、モデルの欠測・部分値、履歴gapを削除・完全扱いせず保持する。usage generationが変わらない取得失敗・回復もcacheへ反映し、error時のETagが正常回復を304で隠さない。
