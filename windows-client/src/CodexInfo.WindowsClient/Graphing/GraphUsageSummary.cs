@@ -12,6 +12,11 @@ internal static class GraphUsageSummary
         tokens < 1_000_000m ? tokens.ToString("N0", culture)
             : (tokens / 1_000_000m).ToString("#,0.######", culture) + " M";
 
+    internal static string FormatCalendarTokens(decimal tokens, CultureInfo culture) =>
+        tokens < 1_000_000m ? FormatTokens(tokens, culture)
+            : decimal.Round(tokens / 1_000_000m, 0, MidpointRounding.AwayFromZero)
+                .ToString("N0", culture) + " M";
+
     internal static string PeriodText(GraphScene scene)
     {
         if (scene.Metric == GraphMetric.Dollars)

@@ -5,7 +5,12 @@ name: Dependency metadata and Python/Actions advisories
 
 on:
   pull_request:
-    branches: [feat/next, main]
+    branches: [feat/next]
+  workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ inputs.source_sha || github.event.pull_request.head.sha }}
           persist-credentials: false
       - name: Collect and audit dependency metadata
         shell: bash

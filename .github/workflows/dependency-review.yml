@@ -5,7 +5,15 @@ name: Dependency review
 
 on:
   pull_request:
-    branches: [feat/next, main]
+    branches: [feat/next]
+  workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+      base_sha:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -19,6 +27,8 @@ jobs:
       # Rust licenses remain owned by deny.toml; NuGet allow rules are unspecified.
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
+          base-ref: ${{ inputs.base_sha || github.event.pull_request.base.sha }}
+          head-ref: ${{ inputs.source_sha || github.event.pull_request.head.sha }}
           fail-on-severity: low
           fail-on-scopes: runtime,development,unknown
           license-check: 'false'
