@@ -45,6 +45,19 @@ check IDの追加は、既存checkでは観測できない独立した失敗境�
 
 ## 失敗と証拠
 
+- current取得契約を変更するPRでは、`windows-contract`の直接検証として
+  `bash scripts/windows_client_contract_gate.sh --current-acquisition`を提出前に実行する。
+  `LoopbackStatusClientTests`（HTTP・schema・cache・互換）、`MainWindowViewModelTests`
+  （受理世代から表示・thread・復旧）、`ModelUsageDisplayContractTests`
+  （実HTTP parserから共有数値oracle）の3 consumerを一つの受入境界にする。
+  編集したtest名だけのfilterやViewModel単独の成功で代替しない。
+  full Windows gateはこの3 consumerを含むため代替可能だが、無関係な全suiteを追加実行しない。
+  focused gateは3 consumerの実行証拠欠落・SKIP・失敗・0件を拒否する。
+- 上記の実行は影響範囲の確定を代替しない。PR全差分を製品正本の契約、producer、
+  全直接consumer、独立期待値、検証結果へ対応づけ、未対応がある間は提出不可とする。
+  hosted failure時はこの対応とPR全体の受入を無効化し、原因と漏れを既存Issueへ記録する。
+  変更していない経路のnamed結果は保持するが、単独でPR全体の合格とはしない。
+
 - PASSは、実際に実行した直接オラクルの原始結果だけで示す。0件、SKIP、INCONCLUSIVEをPASSに変換しない。
 - 外部環境でしか得られない証拠は、local gateの成功に混ぜず未確認として残す。
 - Actionsの基盤・制御失敗はIssueへrevision、症状、原因、過剰checkの有無、再発防止を記録する。

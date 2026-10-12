@@ -2956,6 +2956,44 @@ mod tests {
     }
 
     #[test]
+    fn current_v4_initializing_and_account_boundary_are_strictly_empty() {
+        let path = temp_db("current-v4-empty-states");
+        fixture(&path, 10);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM usage_history; DELETE FROM durable_state;")
+            .unwrap();
+        let reader = DbReader::open(&path).unwrap();
+        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
+        for state in ["initializing", "auth_required"] {
+            if state == "auth_required" {
+                server
+                    .store()
+                    .publish_account_boundary(PublicState::AuthRequired);
+            }
+            let response = request(
+                server.local_addr(),
+                "GET /v4/current HTTP/1.1\r\nHost:x\r\n\r\n",
+            );
+            assert!(response.starts_with("HTTP/1.1 200"));
+            assert!(!published_pair(&response).is_empty());
+            let value: serde_json::Value = serde_json::from_str(body(&response)).unwrap();
+            assert_eq!(value["api_version"], "v4");
+            assert_eq!(value["state"], state);
+            assert_eq!(value["models_status"], "unavailable");
+            assert_eq!(value["authenticated"], false);
+            assert!(value["observed_at"].is_null());
+            assert!(value["quota"].is_null());
+            assert!(value["plan_label"].is_null());
+            assert_eq!(value["models"], serde_json::json!([]));
+            assert_eq!(value["active_thread_count"], 0);
+            assert_eq!(value["open_session_thread_count"], 0);
+        }
+        server.shutdown();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn issue_637_v4_cache_exposes_read_failure_and_recovery_without_losing_quota() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("v4-current.sqlite3");

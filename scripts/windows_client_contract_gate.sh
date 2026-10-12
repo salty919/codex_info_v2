@@ -14,6 +14,8 @@ if [[ $# -eq 1 && "$1" == --history-graph ]]; then
     profile='history-graph'
 elif [[ $# -eq 1 && "$1" == --model-history ]]; then
     profile='model-history'
+elif [[ $# -eq 1 && "$1" == --current-acquisition ]]; then
+    profile='current-acquisition'
 elif [[ $# -ne 0 ]]; then
     fail "unexpected argument: $1"
 fi
@@ -24,7 +26,29 @@ test_targets=("$solution")
 test_filters=('')
 test_log_prefixes=('windows-client')
 expected_methods=()
-if [[ "$profile" == history-graph ]]; then
+current_consumers=(
+    CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests
+    CodexInfo.WindowsClient.Presentation.Tests.MainWindowViewModelTests
+    CodexInfo.WindowsClient.Presentation.Tests.ModelUsageDisplayContractTests
+)
+if [[ "$profile" == full ]]; then
+    expected_methods=("${current_consumers[@]}")
+fi
+if [[ "$profile" == current-acquisition ]]; then
+    # The HTTP parser, Main consumer and shared numeric oracle are one
+    # acceptance boundary. Selecting only the edited test methods misses
+    # consumers in the other project (the regression in PR #640).
+    expected_methods=("${current_consumers[@]}")
+    test_targets=(
+        'windows-client/tests/CodexInfo.WindowsClient.Core.Tests/CodexInfo.WindowsClient.Core.Tests.csproj'
+        'windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj'
+    )
+    test_filters=(
+        "FullyQualifiedName~${expected_methods[0]}"
+        "FullyQualifiedName~${expected_methods[1]}|FullyQualifiedName~${expected_methods[2]}"
+    )
+    test_log_prefixes=('windows-current-core' 'windows-current-presentation')
+elif [[ "$profile" == history-graph ]]; then
     test_targets=('windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj')
     test_log_prefixes=('windows-history-graph')
     expected_methods=(
@@ -93,7 +117,14 @@ case "$results_dir" in
     "${TMPDIR:-/tmp}"/codex-info-windows-tests.*) ;;
     *) fail "unsafe temporary result path: $results_dir" ;;
 esac
-trap 'rm -rf -- "$results_dir"' EXIT
+cleanup_results() {
+    find "$results_dir" -type f -name '*.trx' -delete
+    find "$results_dir" -depth -type d -empty -delete
+    if [[ -e "$results_dir" ]]; then
+        echo "windows-client-contract-gate: retained non-TRX artifacts: $results_dir" >&2
+    fi
+}
+trap cleanup_results EXIT
 
 # Restore, formatting, and unit behavior form one Windows-source check.  The
 # gate owns each command once and deliberately does not mirror test names,
@@ -135,6 +166,7 @@ if not reports:
 
 totals = {name: 0 for name in ("total", "executed", "passed", "failed", "notExecuted")}
 observed_methods = set()
+observed_classes = set()
 for report in reports:
     root = ET.parse(report).getroot()
     counters = [element for element in root.iter() if element.tag.endswith("Counters")]
@@ -156,6 +188,7 @@ for report in reports:
             method_name = element.attrib.get("name")
             if class_name and method_name:
                 observed_methods.add(f"{class_name}.{method_name}")
+                observed_classes.add(class_name)
 
 # A positive passing observation is required.  Skipped/not-executed tests are
 # reported but are not converted into failures merely to satisfy a count.
@@ -163,6 +196,15 @@ if totals["total"] <= 0 or totals["executed"] <= 0 or totals["passed"] <= 0:
     raise SystemExit("windows-client-contract-gate: FAIL: zero Windows tests executed")
 if totals["failed"] != 0:
     raise SystemExit("windows-client-contract-gate: FAIL: Windows test failure recorded")
+if profile in {"current-acquisition", "full"}:
+    missing = sorted(expected_methods - observed_classes)
+    unexpected = sorted(observed_classes - expected_methods) if profile == "current-acquisition" else []
+    if missing or unexpected or totals["notExecuted"] != 0:
+        raise SystemExit(
+            "windows-client-contract-gate: FAIL: current acquisition consumer evidence incomplete "
+            f"missing={missing} unexpected={unexpected} "
+            f"skipped={totals['notExecuted']}"
+        )
 if profile in {"history-graph", "model-history"}:
     missing = sorted(expected_methods - observed_methods)
     unexpected = sorted(observed_methods - expected_methods)
@@ -177,7 +219,9 @@ print(
 )
 PY
 
-if [[ "$profile" == history-graph ]]; then
+if [[ "$profile" == current-acquisition ]]; then
+    echo 'windows-client-contract-gate: PASS check=windows-current-acquisition'
+elif [[ "$profile" == history-graph ]]; then
     echo "windows-client-contract-gate: PASS check=windows-history-graph methods=${#expected_methods[@]}"
 elif [[ "$profile" == model-history ]]; then
     echo "windows-client-contract-gate: PASS check=windows-model-history methods=${#expected_methods[@]}"

@@ -108,6 +108,16 @@ class PrePrPythonQualityTests(unittest.TestCase):
         result = self.gate("import os\n\nprint(os.name)\n")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_requested_subset_does_not_report_pr_gate_pass(self):
+        windows = self.root / "windows-client/src"
+        windows.mkdir(parents=True)
+        (windows / "Probe.cs").write_text("class Probe {}\n")
+        result = self.gate("print('fixture')\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("pre-pr-gate: PARTIAL", result.stdout)
+        self.assertIn("not-executed=windows-contract", result.stdout)
+        self.assertNotIn("pre-pr-gate: PASS", result.stdout)
+
     def test_trusted_caller_without_ruff_can_run_the_gate(self):
         self.tool_path = "/usr/bin:/bin"
         result = self.gate("import os\n\nprint(os.name)\n")
