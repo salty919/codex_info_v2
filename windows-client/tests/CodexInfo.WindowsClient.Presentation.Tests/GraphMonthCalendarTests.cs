@@ -53,7 +53,7 @@ public sealed class GraphMonthCalendarTests
     [Theory]
     [InlineData(999999, "999,999")]
     [InlineData(1000000, "1 M")]
-    [InlineData(1250000, "1.25 M")]
+    [InlineData(1250000, "1 M")]
     [InlineData(1000000000, "1,000 M")]
     public void TokenUnitsUseMillionsWithoutChangingSmallCounts(long tokens, string expected)
     {

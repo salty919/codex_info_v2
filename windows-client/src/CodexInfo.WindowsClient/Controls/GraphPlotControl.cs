@@ -510,8 +510,7 @@ public sealed class GraphPlotControl : Control
         presentation.Plot.Axes.Left.TickGenerator = new NumericManual(
             axes.ModelValues.ToArray(),
             scene.Metric == GraphMetric.Tokens
-                ? Enumerable.Range(0, axes.ModelValues.Count).Select(index => GraphUsageSummary.FormatTokens(
-                    (decimal)(scene.ModelMaximum * index / (axes.ModelValues.Count - 1)), CultureInfo.CurrentCulture)).ToArray()
+                ? GraphUsageSummary.TokenAxisLabels(scene.ModelMaximum, axes.ModelValues.Count, CultureInfo.CurrentCulture)
                 : axes.ModelLabels.ToArray());
         var rightAxis = presentation.Plot.Axes.Right;
         rightAxis.TickGenerator = new NumericManual(
@@ -800,7 +799,7 @@ public sealed class GraphPlotControl : Control
                     ? FormatRemainingPercent(remaining, culture)
                     : "—%",
                 _ when metric == GraphMetric.Tokens => row.TokenValue is { } tokens
-                    ? $"{GraphUsageSummary.FormatTokens(tokens, culture)} {LocalizationService.Current.Tokens}"
+                    ? $"{tokens.ToString("N0", culture)} {LocalizationService.Current.Tokens}"
                     : $"— {LocalizationService.Current.Tokens}",
                 _ => row.NumericValue is { } amount
                     ? GraphPlotProjection.FormatAxisValue(amount, GraphMetric.Dollars, culture)
