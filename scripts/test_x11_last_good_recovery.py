@@ -6,7 +6,7 @@ import select
 import sqlite3
 
 # This test executes only fixed local interpreters and repository fixtures.
-import subprocess  # noqa: S404, B404  # nosec B404
+import subprocess  # noqa: B404  # nosec B404
 import tempfile
 import time
 import unittest
@@ -25,7 +25,7 @@ class LastGoodRecoveryTests(unittest.TestCase):
         env = {"PATH": "/usr/bin:/bin", "CODEX_INFO_FAKE_RESET_AT": "1800000000"}
         env.update(variables)
         # Static argv, isolated Python, private fixture values, no caller environment.
-        process = subprocess.Popen(  # noqa: S603, B603  # nosec B603
+        process = subprocess.Popen(  # noqa: B603  # nosec B603
             ["/usr/bin/python3", "-I", "fake_codex_app_server.py"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -140,7 +140,7 @@ class LastGoodRecoveryTests(unittest.TestCase):
         )
         # stdin contains only the repository function and literal fixture commands.
         # Values remain environment data; no caller shell startup hooks are inherited.
-        result = subprocess.run(  # noqa: S603, B603  # nosec B603
+        result = subprocess.run(  # noqa: B603  # nosec B603
             ["/bin/bash", "--noprofile", "--norc", "-s"],
             input=script,
             capture_output=True,
@@ -199,7 +199,7 @@ class LastGoodRecoveryTests(unittest.TestCase):
                     "service_last_good_error\n"
                 )
                 # Execute the fixed repository function; JSON is environment data.
-                result = subprocess.run(  # noqa: S603, B603  # nosec B603
+                result = subprocess.run(  # noqa: B603  # nosec B603
                     ["/bin/bash", "--noprofile", "--norc", "-s"],
                     input=script,
                     capture_output=True,
