@@ -6,7 +6,6 @@ import os
 import sys
 import time
 
-
 reset_at = int(os.environ.get("CODEX_INFO_FAKE_RESET_AT", int(time.time()) + 604800 - 3600))
 failure_file = os.environ.get("CODEX_INFO_FAKE_FAILURE_FILE")
 quota_pause_file = os.environ.get("CODEX_INFO_FAKE_QUOTA_PAUSE_FILE")
@@ -62,7 +61,11 @@ for line in sys.stdin:
     # Stop at the source boundary, before deciding whether this quota response
     # succeeds. The gate can then pin REST's completed generation and inject
     # failure without a successful response racing past its baseline.
-    if method == "account/rateLimits/read" and quota_pause_file and os.path.exists(quota_pause_file):
+    if (
+        method == "account/rateLimits/read"
+        and quota_pause_file
+        and os.path.exists(quota_pause_file)
+    ):
         with open(f"{quota_pause_file}.ack", "w", encoding="utf-8"):
             pass
         deadline = time.monotonic() + 10

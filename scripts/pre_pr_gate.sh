@@ -70,6 +70,7 @@ fi
 
 run_governance_contract() {
     local path run_authority_fixtures=0 run_selector_fixtures=0 run_regression_guard_fixture=0 run_workflow_fixtures=0 run_codeql_fixture=0 run_codacy_coverage_fixture=0
+    local run_python_quality_fixtures=0
     for path in "${changed_paths[@]}"; do
         if [[ "$path" == *.sh && -f "$path" ]]; then
             bash -n "$path"
@@ -97,6 +98,11 @@ PY
                 run_workflow_fixtures=1
                 ;;
         esac
+        case "$path" in
+            scripts/pre_pr_gate.sh|scripts/python_quality_gate.sh|scripts/python_quality.toml|scripts/test_pre_pr_python_quality.py|.github/requirements-python-quality.txt|.github/workflows/selective-quality.yml)
+                run_python_quality_fixtures=1
+                ;;
+        esac
         if [[ "$path" == .github/workflows/codeql.yml || "$path" == scripts/test_codeql_workflow.py ]]; then
             run_codeql_fixture=1
         fi
@@ -107,6 +113,10 @@ PY
         esac
     done
 
+    bash scripts/python_quality_gate.sh "${changed_paths[@]}"
+    if ((run_python_quality_fixtures != 0)); then
+        python3 scripts/test_pre_pr_python_quality.py
+    fi
     ((run_authority_fixtures == 0)) || python3 scripts/test_requirements_authority.py
     if ((run_selector_fixtures != 0)); then
         python3 scripts/test_quality_plan.py

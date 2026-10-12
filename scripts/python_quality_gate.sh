@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+python_paths=()
+for path in "$@"; do
+    if [[ "$path" == *.py && -f "$path" ]]; then
+        python_paths+=("$path")
+    fi
+done
+((${#python_paths[@]} > 0)) || exit 0
+
+# Ruff intentionally skips EXE001 on WSL. Check the mode that Git will publish
+# on both WSL and Actions, using filesystem mode only for untracked files.
+python3 - "${python_paths[@]}" <<'PY'
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+entries = subprocess.check_output(["/usr/bin/git", "ls-files", "--stage", "-z"])
+modes = {}
+for entry in entries.split(b"\0"):
+    if entry:
+        metadata, name = entry.split(b"\t", 1)
+        modes[os.fsdecode(name)] = int(metadata.split(b" ", 1)[0], 8)
+failed = False
+for name in sys.argv[1:]:
+    path = Path(name)
+    mode = modes.get(name, path.stat().st_mode)
+    with path.open("rb") as source:
+        if source.read(2) == b"#!" and not mode & 0o111:
+            print(f"{name}:1: EXE001 shebang is present but Git mode is not executable")
+            failed = True
+raise SystemExit(1 if failed else 0)
+PY
+
+if ! command -v ruff >/dev/null 2>&1; then
+    echo 'python-quality: Ruff is required; install .github/requirements-python-quality.txt in your development venv (pip --require-hashes).' >&2
+    exit 1
+fi
+ruff check --config "$repo_root/scripts/python_quality.toml" -- "${python_paths[@]}"
