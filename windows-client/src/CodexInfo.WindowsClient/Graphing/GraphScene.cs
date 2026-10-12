@@ -219,6 +219,9 @@ public sealed class GraphScene
 
     internal IReadOnlyDictionary<string, IReadOnlyList<bool>> ModelLineReliability { get; }
 
+    private IReadOnlyDictionary<string, IReadOnlyList<bool>> ModelMemberLineReliability { get; init; } =
+        new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal);
+
     internal IReadOnlyList<IReadOnlySet<string>> PublishedModelNames { get; }
 
     /// <summary>
@@ -513,7 +516,15 @@ public sealed class GraphScene
                 .OrderBy(gap => gap.StartAt)
                 .ToArray();
         var nonOwnedIntervals = BuildNonOwnedIntervals(start, end, accountOwnershipIntervals);
-        var latestCostObservation = samples.LastOrDefault(sample => !sample.IsSyntheticTail);
+        // Quota acquisition and model recording advance independently. A
+        // quota-only row cannot erase the period's recorded model amount.
+        // Select the latest model observation, not a prior complete vector.
+        var latestCostObservation = samples.LastOrDefault(sample =>
+            !sample.IsSyntheticTail &&
+            sample.ModelSource is ApiHistorySample.ConfirmedModelSource or ApiHistorySample.LegacyUnknownModelSource &&
+            (PublishedModels(sample).Any() ||
+             sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
+             sample.ModelsComplete && sample.ModelSamples is { Count: 0 }));
         var taskIdleIntervals = BuildTaskIdleIntervals(samples, start, end, nonOwnedIntervals);
         samples = WithoutRecoverableSamplingJitter(samples, normalizedGaps);
         var allModelNames = samples
@@ -698,6 +709,7 @@ public sealed class GraphScene
             taskIdleIntervals: taskIdleIntervals)
         {
             RecordedPeriodTokens = BuildRecordedPeriodTokens(latestCostObservation, firstModelPublications.Count),
+            ModelMemberLineReliability = rawDisplayProjection.LineReliability,
         };
     }
 
@@ -1160,6 +1172,14 @@ public sealed class GraphScene
         series.TryGetValue(name, out var values)
             ? values as double[] ?? values.ToArray()
             : Enumerable.Repeat(double.NaN, count).ToArray();
+
+    internal bool HasRecordedModelContribution(IReadOnlyList<double> values, int index)
+    {
+        var name = ModelSeries.FirstOrDefault(pair => ReferenceEquals(pair.Value, values)).Key;
+        return name is not null && ModelMemberLineReliability.Any(member =>
+            (ModelUsageViewModel.DisplayFamilyName(member.Key) ?? member.Key) == name &&
+            member.Value[index]);
+    }
 
     internal bool IsModelIntervalReliable(
         IReadOnlyList<double> values,

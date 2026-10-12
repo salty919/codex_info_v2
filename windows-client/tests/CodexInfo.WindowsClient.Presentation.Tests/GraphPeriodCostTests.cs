@@ -52,7 +52,7 @@ public sealed class GraphPeriodCostTests
     [InlineData(ApiHistorySample.UnavailableModelSource)]
     [InlineData(ApiHistorySample.ReconstructedFromSessionModelSource)]
     [InlineData("unknown")]
-    public void LatestUnavailableDoesNotFallBackToPriorCompleteOrInventZero(string source)
+    public void LaterNonModelObservationDoesNotEraseRecordedPeriodUsage(string source)
     {
         var samples = new[]
         {
@@ -60,7 +60,9 @@ public sealed class GraphPeriodCostTests
             Sample(1_060, Model("SOL", 20)) with { ModelSource = source, ModelsComplete = false },
         };
 
-        Assert.Equal(default, Scene(samples).PeriodCost);
+        // The later row is not a model observation. Its untrusted numerics
+        // cannot replace the already recorded amount, including with zero.
+        Assert.Equal(new GraphPeriodCostSummary(10, true), Scene(samples).PeriodCost);
     }
 
     [Fact]
