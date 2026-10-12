@@ -9,6 +9,7 @@ import time
 
 reset_at = int(os.environ.get("CODEX_INFO_FAKE_RESET_AT", int(time.time()) + 604800 - 3600))
 failure_file = os.environ.get("CODEX_INFO_FAKE_FAILURE_FILE")
+quota_pause_file = os.environ.get("CODEX_INFO_FAKE_QUOTA_PAUSE_FILE")
 thread_id = os.environ.get("CODEX_INFO_FAKE_THREAD_ID")
 thread_path = os.environ.get("CODEX_INFO_FAKE_THREAD_PATH")
 thread_title = os.environ.get("CODEX_INFO_FAKE_THREAD_TITLE")
@@ -58,6 +59,17 @@ for line in sys.stdin:
     if not isinstance(request_id, int):
         continue
     method = request.get("method")
+    # Stop at the source boundary, before deciding whether this quota response
+    # succeeds. The gate can then pin REST's completed generation and inject
+    # failure without a successful response racing past its baseline.
+    if method == "account/rateLimits/read" and quota_pause_file and os.path.exists(quota_pause_file):
+        with open(f"{quota_pause_file}.ack", "w", encoding="utf-8"):
+            pass
+        deadline = time.monotonic() + 10
+        while os.path.exists(quota_pause_file):
+            if time.monotonic() >= deadline:
+                raise SystemExit("quota fixture pause was not released")
+            time.sleep(0.01)
     if method == "initialize":
         result = {}
     elif method == "account/read":
