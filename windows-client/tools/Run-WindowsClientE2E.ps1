@@ -72,15 +72,14 @@ $script:e2eProductVersion = [string]$versionProps.Project.PropertyGroup.Version
 if ($script:e2eProductVersion -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
     throw "E2E product version is not stable X.Y.Z: '$script:e2eProductVersion'."
 }
+$artifactRoot = (Join-Path $script:e2eRepositoryRoot 'artifacts') + [IO.Path]::DirectorySeparatorChar
 if ($script:e2eOutput.Equals($script:e2eRepositoryRoot, [StringComparison]::OrdinalIgnoreCase) -or
-    $script:e2eOutput.StartsWith($script:e2eRepositoryRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'E2E artifacts must be written outside the repository.'
+    ($script:e2eOutput.StartsWith($script:e2eRepositoryRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and
+     -not $script:e2eOutput.StartsWith($artifactRoot, [StringComparison]::OrdinalIgnoreCase))) {
+    throw 'E2E output inside the repository must use an artifacts subdirectory.'
 }
-if (Test-Path -LiteralPath $script:e2eOutput -PathType Container) {
-    # Evidence must belong to this invocation.  Never append to or reuse a
-    # prior run's log/screenshots, even when a hosted runner reuses its temp
-    # directory after a retry.
-    Remove-Item -LiteralPath $script:e2eOutput -Recurse -Force
+if (Test-Path -LiteralPath $script:e2eOutput) {
+    throw 'E2E output already exists; use a new directory to preserve earlier results.'
 }
 New-Item -ItemType Directory -Path $script:e2eOutput -Force | Out-Null
 $script:e2eLogPath = Join-Path $script:e2eOutput 'windows-client-e2e.log'
@@ -95,7 +94,10 @@ $script:e2eFixtureUnusedMinimumSeconds = 10 * 60
 $script:e2eFixturePastIdleStartFraction = 0.25
 $script:e2eFixturePastIdleEndFraction = 0.50
 $script:e2ePreviewEnabled = -not [string]::IsNullOrWhiteSpace($env:CODEX_INFO_WINDOWS_PREVIEW)
-$script:e2eSettingsPath = Join-Path $env:LOCALAPPDATA 'CodexInfo\settings.json'
+$script:e2eSettingsPath = if ($Fixture -or $FixtureContractTest) {
+    Join-Path $script:e2eOutput 'fixture-settings.json'
+}
+else { Join-Path $env:LOCALAPPDATA 'CodexInfo\settings.json' }
 $script:e2eSettingsBackup = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-e2e-settings-" + [Guid]::NewGuid().ToString('N') + '.json')
 $script:e2eSettingsWasPresent = $false
 $script:e2eThemePresetsComplete = $false
@@ -131,7 +133,10 @@ function Start-E2EFixtureClient {
         foreach ($variable in $variables) {
             [Environment]::SetEnvironmentVariable($variable.Name, $variable.Value, 'Process')
         }
-        return Start-Process -FilePath $ClientPath -PassThru
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $ClientPath
+        $startInfo.UseShellExecute = $false
+        return [Diagnostics.Process]::Start($startInfo)
     }
     finally {
         foreach ($variable in $variables) {
@@ -222,6 +227,9 @@ public static class CodexInfoWindowsE2EWin32 {
     [DllImport("user32.dll")] public static extern bool AreDpiAwarenessContextsEqual(IntPtr first, IntPtr second);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -1787,6 +1795,38 @@ function Get-E2EUiaRoot {
     param([Parameter(Mandatory = $true)][IntPtr]$Handle)
 
     return [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+}
+
+function Focus-E2EInputWindow {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+
+    [uint32]$owner = 0
+    [CodexInfoWindowsE2EWin32]::GetWindowThreadProcessId($Handle, [ref]$owner) | Out-Null
+    Assert-E2E ($null -ne $script:e2eProcess -and $owner -eq $script:e2eProcess.Id) `
+        'Input target must belong to the E2E client.'
+    Bring-E2EWindowToFront $Handle
+    if ([CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $Handle) { return }
+    # Windows may refuse programmatic foreground activation. Activate the
+    # owned title area through ordinary input; never click a covering window.
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::SetWindowPos($Handle, [IntPtr]::Zero, 0, 0, 0, 0, 0x13)) `
+        'Cannot expose the E2E title area.'
+    $bounds = Get-E2EWindowBounds $Handle
+    $point = New-Object CodexInfoWindowsE2EWin32+POINT
+    $point.X = $bounds.Left + 100
+    $point.Y = $bounds.Top + 30
+    $hit = [CodexInfoWindowsE2EWin32]::WindowFromPoint($point)
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::GetAncestor($hit, 2) -eq $Handle) `
+        'Another window covers the E2E title area; no input was sent.'
+    $previous = New-Object CodexInfoWindowsE2EWin32+POINT
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::GetCursorPos([ref]$previous)) 'Cannot save input position.'
+    try {
+        Assert-E2E ([CodexInfoWindowsE2EWin32]::SetCursorPos($point.X, $point.Y)) 'Cannot reach the E2E title area.'
+        [CodexInfoWindowsE2EWin32]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+        [CodexInfoWindowsE2EWin32]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+    }
+    finally { [CodexInfoWindowsE2EWin32]::SetCursorPos($previous.X, $previous.Y) | Out-Null }
+    Assert-E2E ([CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $Handle) `
+        'E2E window did not receive foreground input.'
 }
 
 function Get-E2EAllDescendants {
@@ -3995,7 +4035,7 @@ function Open-E2EChildWindow {
 
     if ($KeyboardActivateButton) {
         Assert-E2E ($KeyboardActivationOwnerHandle -ne [IntPtr]::Zero) 'Keyboard activation requires its owner window handle.'
-        Bring-E2EWindowToFront $KeyboardActivationOwnerHandle
+        Focus-E2EInputWindow $KeyboardActivationOwnerHandle
         Assert-E2E ([CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $KeyboardActivationOwnerHandle) `
             'Keyboard activation owner must own foreground input.'
         $MainRoot = Get-E2EUiaRoot $KeyboardActivationOwnerHandle
@@ -4665,8 +4705,7 @@ function Invoke-E2ESettingsKeyboardFocusCheck {
 
     $tab = Find-E2EElementByAutomationId $SettingsRoot $AutomationId
     Assert-E2E ($null -ne $tab) "Settings keyboard focus target $AutomationId is missing."
-    Assert-E2E ([CodexInfoWindowsE2EWin32]::SetForegroundWindow($SettingsHandle)) `
-        'Settings could not receive foreground input for keyboard focus validation.'
+    Focus-E2EInputWindow $SettingsHandle
     $tab.SetFocus()
     # TabStripPlacement=Top: Right moves focus and selection to the next tab.
     [CodexInfoWindowsE2EWin32]::keybd_event(0x27, 0, 0, [UIntPtr]::Zero)
@@ -5391,6 +5430,7 @@ function Get-E2EGraphHoverHandle {
 
 function Move-E2EGraphHoverPointer {
     param([int]$OutsideX, [int]$OutsideY, [int]$HoverX, [int]$HoverY, [IntPtr]$GraphHandle)
+    Focus-E2EInputWindow $GraphHandle
     Assert-E2E ([CodexInfoWindowsE2EWin32]::GetForegroundWindow() -eq $GraphHandle) 'Graph must own foreground input for hover validation.'
     [CodexInfoWindowsE2EWin32]::SetCursorPos($OutsideX, $OutsideY) | Out-Null
     Start-Sleep -Milliseconds 100
