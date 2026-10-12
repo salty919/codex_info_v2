@@ -1,0 +1,2 @@
+# Linux x86_64 development/Actions wheel from official PyPI; no dependencies.
+ruff==0.16.8 --hash=sha256:15e7d226246961db9235098333caa13063906d3851136b84c2900b82f5daa1df
