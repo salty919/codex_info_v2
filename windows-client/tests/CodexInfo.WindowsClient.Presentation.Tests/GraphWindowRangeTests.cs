@@ -820,6 +820,31 @@ public sealed class GraphWindowRangeTests
         Assert.All(client.AccountIds, accountId => Assert.Contains(accountId, new[] { "account-1", "account-2" }));
     }
 
+    [Fact]
+    public async Task CalendarShowsAllModelsAndSwitchesUnitsWhilePreservingOtherModeSelection()
+    {
+        var start = DateTimeOffset.Parse("2026-10-01T00:00:00Z").ToUnixTimeSeconds();
+        var reset = start + WeekSeconds;
+        var period = GraphDailyUsageProjectionTests.Period("calendar", start, reset,
+            GraphDailyUsageProjectionTests.Sample(start + 60, reset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", 1_000_000, 2.5),
+                GraphDailyUsageProjectionTests.Model("gpt-6-astra", 2_000_000, 5)));
+        using var main = await StartMainAsync([period]);
+        using var graph = CreateGraph(main, () => start + DaySeconds);
+        graph.ShowSol = false;
+        graph.SelectedTimeRange = GraphTimeRange.CalendarMonth;
+        await EventuallyAsync(() => graph.IsMonthView && graph.Scene.IsDaily);
+        Assert.False(graph.HasLinePlot);
+        Assert.Contains(graph.CalendarDays, day => day.ValueText == "3 M");
+        graph.IsTokensMetric = false;
+        await EventuallyAsync(() => graph.Scene.Metric == GraphMetric.Dollars);
+        Assert.Contains(graph.CalendarDays, day => day.ValueText == "$7.50");
+        Assert.False(graph.ShowSol);
+        graph.SelectedTimeRange = GraphTimeRange.ResetPeriod;
+        await EventuallyAsync(() => graph.IsPeriodView && graph.HasLinePlot);
+        Assert.False(graph.ShowSol);
+    }
+
     private static async Task<MainWindowViewModel> StartMainAsync(IReadOnlyList<ApiHistoryPeriod> periods)
     {
         var details = CreateDetails(periods, Pair);

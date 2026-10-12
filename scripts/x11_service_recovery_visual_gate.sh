@@ -769,6 +769,7 @@ common_env=(
     "CODEX_INFO_CODEX_BIN=$fake_codex"
     "CODEX_INFO_FAKE_RESET_AT=$fixture_reset_at"
     "CODEX_INFO_FAKE_FAILURE_FILE=$temp_root/app-server-failure"
+    "CODEX_INFO_FAKE_QUOTA_PAUSE_FILE=$temp_root/app-server-quota-pause"
     "CODEX_INFO_FAKE_THREAD_ID=fixture-thread"
     "CODEX_INFO_FAKE_THREAD_PATH=$session_fixture"
     "CODEX_INFO_FAKE_THREAD_TITLE=fixture active thread"
@@ -1003,29 +1004,52 @@ wait_service_thread_bundle_ready() {
     return 1
 }
 
+inject_app_server_failure() {
+    local pause="$temp_root/app-server-quota-pause"
+    touch "$pause"
+    for _ in $(seq 1 80); do
+        if [[ -f "$pause.ack" ]]; then
+            # No further success can be acquired. The previous response may
+            # still be in the recorder/publication queue: pin the baseline only
+            # after REST has published the last durable observation.
+            curl --fail --silent --show-error --max-time 1 \
+                "http://127.0.0.1:$port/v3/current" >"$ready_current" || return 1
+            if python3 - "$ready_current" "$temp_root/data/history/quota/observations.sqlite3" <<'PY'
+import json
+from pathlib import Path
+import sqlite3
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    current = json.load(stream)
+with sqlite3.connect(Path(sys.argv[2]).as_uri() + "?mode=ro", uri=True) as db:
+    latest = db.execute("SELECT observed_at, account_verified FROM quota_observations "
+                        "ORDER BY sequence DESC LIMIT 1").fetchone()
+raise SystemExit(0 if current.get("state") == "ready"
+                 and current.get("authenticated") is True
+                 and latest is not None and latest[1] == 1
+                 and current.get("observed_at") == latest[0] else 1)
+PY
+            then
+                touch "$temp_root/app-server-failure"
+                rm -- "$pause" "$pause.ack"
+                return 0
+            fi
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
 service_last_good_error() {
     local current
     current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" 2>/dev/null)" || return 1
     python3 - "$current" "$ready_current" <<'PY'
 import json
-import os
 import sys
 try:
     current = json.loads(sys.argv[1])
     ready = json.loads(open(sys.argv[2], encoding="utf-8").read())
 except (IndexError, json.JSONDecodeError):
-    raise SystemExit(1)
-
-# A recorder cycle that started before failure injection may still commit one
-# valid generation afterwards.  That generation is the actual last-good root,
-# so retain it as the comparison baseline while waiting for the first error.
-if current.get("state") == "ready" and current.get("authenticated") is True:
-    temporary = f"{sys.argv[2]}.tmp"
-    with open(temporary, "w", encoding="utf-8") as stream:
-        stream.write(sys.argv[1])
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, sys.argv[2])
     raise SystemExit(1)
 
 raise SystemExit(0 if (
@@ -1044,6 +1068,9 @@ wait_service_last_good_error() {
         sleep 0.25
     done
     sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
+    printf '\nPinned last-good baseline:\n' >&2
+    cat "$ready_current" >&2
+    printf '\nCurrent response:\n' >&2
     curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >&2 || true
     return 1
 }
@@ -1403,8 +1430,7 @@ done
 cp -- "$frame" "$ready_frame"
 assert_thread_summary_components "$ready_frame" \
     || fail 'Main thread summary changed before failure injection'
-curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >"$ready_current"
-touch "$temp_root/app-server-failure"
+inject_app_server_failure || fail 'could not pin the last-good root before app-server failure'
 wait_service_last_good_error || fail 'resident service did not publish authenticated last-good error state'
 assert_recorder_unchanged || fail 'recorder changed during the app-server failure'
 error_frame=0

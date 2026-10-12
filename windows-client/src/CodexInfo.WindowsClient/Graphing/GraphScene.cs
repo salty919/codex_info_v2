@@ -189,6 +189,8 @@ public sealed class GraphScene
 
     internal GraphPeriodCostSummary PeriodCost { get; }
 
+    internal decimal? RecordedPeriodTokens { get; private init; }
+
     public IReadOnlyList<double> Timestamps { get; }
 
     public IReadOnlyList<double> Remaining { get; }
@@ -693,7 +695,28 @@ public sealed class GraphScene
                 eligibleMissingZeroModels),
             isVerifiedCurrentResetStart: isVerifiedCurrentResetStart,
             periodCost: periodCost,
-            taskIdleIntervals: taskIdleIntervals);
+            taskIdleIntervals: taskIdleIntervals)
+        {
+            RecordedPeriodTokens = BuildRecordedPeriodTokens(latestCostObservation, firstModelPublications.Count),
+        };
+    }
+
+    private static decimal? BuildRecordedPeriodTokens(ApiHistorySample? latest, int publishedModelCount)
+    {
+        if (latest is null || latest.ModelSource is not
+            (ApiHistorySample.ConfirmedModelSource or ApiHistorySample.LegacyUnknownModelSource)) return null;
+        var models = PublishedModels(latest).ToArray();
+        if (models.Length == 0)
+            return latest.ModelSource == ApiHistorySample.ConfirmedModelSource &&
+                latest.ModelsComplete && latest.ModelSamples is { Count: 0 } && publishedModelCount == 0 ? 0 : null;
+        decimal? total = null;
+        foreach (var group in models.GroupBy(model => model.Name, StringComparer.Ordinal))
+        {
+            var members = group.ToArray();
+            if (members.Length == 1 && members[0].TotalTokens is { } tokens)
+                total = (total ?? 0) + tokens;
+        }
+        return total;
     }
 
     private static GraphPeriodCostSummary BuildPeriodCost(
