@@ -217,12 +217,17 @@ class WorkflowStageTests(unittest.TestCase):
              {"windows-quality", "codeql-quality", "linux-distribution", "selected-quality"}),
             (True, ["LINUX_UI"], [], False, {"linux-ui-quality", "selected-quality"}),
         )
+        main_dependency_jobs = {
+            "dependency-review", "dependency-metadata", "rust-dependencies",
+        }
         for release, owners, languages, binary, expected in cases:
             with self.subTest(release=release, owners=owners):
                 inputs = self.inputs(release, owners, languages, binary)
                 actual = {name for name, job in jobs.items()
                           if expression(job.get("if", True), inputs)}
-                self.assertEqual(actual, expected)
+                self.assertEqual(
+                    actual, expected | (main_dependency_jobs if release else set())
+                )
 
     def test_release_behavior_and_candidates_execute_only_at_main(self):
         selective = workflow("selective-quality.yml")["jobs"]
