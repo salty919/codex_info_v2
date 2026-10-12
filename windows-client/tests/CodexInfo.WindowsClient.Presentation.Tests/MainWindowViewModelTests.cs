@@ -117,8 +117,10 @@ public sealed class MainWindowViewModelTests
         Assert.True(viewModel.UpdateCommand!.CanExecute(null));
     }
 
-    [Fact]
-    public async Task RecoveredV3CurrentShowsTheExactCrossPlatformCostTotal()
+    [Theory]
+    [InlineData("v3")]
+    [InlineData("v4")]
+    public async Task RecoveredCurrentShowsTheExactCrossPlatformCostTotal(string apiVersion)
     {
         var current = new ApiCurrentSnapshot(
             ApiState.Ready,
@@ -156,6 +158,11 @@ public sealed class MainWindowViewModelTests
             ],
             0,
             PublishedPair(CanonicalPublishedPair));
+        current = current with
+        {
+            ApiVersion = apiVersion,
+            ModelsStatus = apiVersion == "v4" ? ApiCurrentModelsStatus.Partial : null,
+        };
         using var viewModel = new MainWindowViewModel(new SingleCurrentClient(current));
 
         viewModel.Start();
@@ -165,6 +172,7 @@ public sealed class MainWindowViewModelTests
         Assert.NotEqual("概算 $0.19", viewModel.EstimatedCostText);
         Assert.Equal(555_312_427UL, viewModel.DetailsSnapshot!.Models.Single(model => model.Name == "SOL").TotalTokens);
         Assert.Equal(25_262_756UL, viewModel.DetailsSnapshot.Models.Single(model => model.Name == "LUNA").TotalTokens);
+        Assert.Equal(current.ModelsStatus, viewModel.DetailsSnapshot.ModelsStatus);
     }
 
     [Fact]
@@ -367,10 +375,12 @@ public sealed class MainWindowViewModelTests
         Assert.Equal("概算 —", viewModel.EstimatedCostText);
     }
 
-    [Fact]
-    public async Task V3CurrentAndThreadsPublishOneSolThreadAtomically()
+    [Theory]
+    [InlineData("v3")]
+    [InlineData("v4")]
+    public async Task CurrentAndThreadsPublishOneSolThreadAtomically(string apiVersion)
     {
-        var current = CurrentSnapshot(activeThreadCount: 1);
+        var current = CurrentSnapshot(activeThreadCount: 1) with { ApiVersion = apiVersion };
         var thread = ThreadDetails("gpt-5.6-sol");
         var client = new SplitCurrentThreadsClient(
             current,

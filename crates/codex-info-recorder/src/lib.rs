@@ -2102,6 +2102,13 @@ fn parse_app_server_quota(value: &Value, plan_type: &str) -> Result<QuotaSnapsho
         let Some(window) = limits.get(key).and_then(Value::as_object) else {
             continue;
         };
+        // The protocol permits an unbounded/unknown window. Its missing
+        // metadata must not veto a fully reported window in the same response.
+        if window.get("resetsAt").is_some_and(Value::is_null)
+            || window.get("windowDurationMins").is_some_and(Value::is_null)
+        {
+            continue;
+        }
         let used = window
             .get("usedPercent")
             .and_then(Value::as_i64)
@@ -9389,9 +9396,12 @@ mod tests {
             receipt.save(&root, true).unwrap();
         };
         let payload = |used: i64| {
-            json!({"rateLimits": {"primary": {
-                "usedPercent": used, "resetsAt": 1800604800_i64, "windowDurationMins": 10080
-            }}})
+            json!({"rateLimits": {
+                "primary": {"usedPercent": 0, "resetsAt": null, "windowDurationMins": null},
+                "secondary": {
+                    "usedPercent": used, "resetsAt": 1800604800_i64, "windowDurationMins": 10080
+                }
+            }})
         };
         save("aa", 1_800_000_000, json!({"unrecognized": true}));
         save("bb", 1_800_000_060, payload(0));
@@ -12738,27 +12748,239 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn app_server_quota_parser_uses_canonical_longest_window() {
+    fn issue_637_source_read_failure_retains_cursor_and_other_source_and_quota() {
+        let (root, database) = prepare("issue-637-source-read-failure");
+        let unavailable = root.join("sessions/unavailable.jsonl");
+        let available = root.join("sessions/available.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&unavailable, token(10, now)).unwrap();
+        fs::write(&available, token(10, now)).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let before = recorder.state().unwrap();
+        let old_cursor = before
+            .checkpoints
+            .iter()
+            .find(|row| row.relative_path == "unavailable.jsonl")
+            .unwrap()
+            .committed_offset;
+        for (path, total) in [(&unavailable, 15), (&available, 20)] {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(token(total, now + 1).as_bytes())
+                .unwrap();
+        }
+        let source_bytes = fs::read(&unavailable).unwrap();
+        let good_bytes = fs::read(&available).unwrap();
+        let receipt = codex_info_db_writer::QuotaReceipt {
+            receipt_id: "ab".repeat(32),
+            sequence: 1,
+            observed_at: now + 1,
+            reset_at: before.reset_at,
+            window_seconds: before.window_seconds,
+            remaining_percent: 99.0,
+        };
+        recorder
+            .writer
+            .commit_quota_receipts(std::slice::from_ref(&receipt), false)
+            .unwrap();
+        let permissions = fs::metadata(&unavailable).unwrap().permissions();
+        fs::set_permissions(&unavailable, fs::Permissions::from_mode(0o0)).unwrap();
+        let denied = File::open(&unavailable).err().map(|error| error.kind());
+        let result = recorder.run_cycle_with_stored_quota_guarded(|| true);
+        // Restore the test input even if the collection unexpectedly failed.
+        fs::set_permissions(&unavailable, permissions).unwrap();
+        assert_eq!(denied, Some(io::ErrorKind::PermissionDenied));
+        let report = result
+            .expect("one unreadable source must not stop other sources")
+            .unwrap();
+        assert!(report.pending_ranges > 0);
+        let after = recorder.state().unwrap();
+        assert_eq!(
+            after
+                .checkpoints
+                .iter()
+                .find(|row| row.relative_path == "unavailable.jsonl")
+                .unwrap()
+                .committed_offset,
+            old_cursor
+        );
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            10
+        );
+        assert_eq!(
+            recorder.writer.latest_quota_receipt().unwrap(),
+            Some(receipt.clone())
+        );
+        recorder
+            .run_cycle_with_stored_quota_guarded(|| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            15
+        );
+        recorder
+            .run_cycle_with_stored_quota_guarded(|| true)
+            .unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            15
+        );
+        assert_eq!(
+            recorder.writer.latest_quota_receipt().unwrap(),
+            Some(receipt)
+        );
+        assert_eq!(fs::read(&unavailable).unwrap(), source_bytes);
+        assert_eq!(fs::read(&available).unwrap(), good_bytes);
+        let db = Connection::open(&database).unwrap();
+        let facts: (i64, i64) = db
+            .query_row(
+                "SELECT COUNT(*), SUM(CAST(total_tokens AS INTEGER)) FROM session_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            facts,
+            (2, 15),
+            "each physical source delta is committed once"
+        );
+        drop(db);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn app_server_quota_parser_selects_weekly_over_short_window() {
         let value = json!({
             "rateLimits": {
                 "primary": {
                     "usedPercent": 10,
                     "resetsAt": 1_800,
-                    "windowDurationMins": 60
+                    "windowDurationMins": 300
                 },
                 "secondary": {
                     "usedPercent": 20,
                     "resetsAt": 2_000,
-                    "windowDurationMins": 120
+                    "windowDurationMins": 10_080
                 }
             }
         });
         let snapshot = parse_app_server_quota(&value, "pro").unwrap();
         assert_eq!(snapshot.reset_at, 2_000);
-        assert_eq!(snapshot.window_seconds, 120 * 60);
+        assert_eq!(snapshot.window_seconds, 604_800);
         assert_eq!(snapshot.remaining_percent, Some(80.0));
         assert!(snapshot.observed_at > 0);
+    }
+
+    #[test]
+    fn issue_637_nullable_window_does_not_reject_official_weekly_quota() {
+        // Official RateLimitWindow permits null duration and reset fields.
+        // Neither nullable field may veto a different, fully reported window.
+        for (duration, reset) in [
+            (Value::Null, json!(1_800_000_000)),
+            (json!(300), Value::Null),
+            (Value::Null, Value::Null),
+        ] {
+            let unavailable = json!({
+                "usedPercent": 10,
+                "windowDurationMins": duration,
+                "resetsAt": reset,
+            });
+            let weekly = json!({
+                "usedPercent": 1,
+                "windowDurationMins": 10_080,
+                "resetsAt": 1_800_604_800,
+            });
+            for (primary, secondary) in [(&unavailable, &weekly), (&weekly, &unavailable)] {
+                let response = json!({"rateLimits": {
+                    "primary": primary,
+                    "secondary": secondary,
+                }});
+                let snapshot = parse_app_server_quota(&response, "pro")
+                    .expect("a nullable window must not reject the reported weekly quota");
+                assert_eq!(snapshot.reset_at, 1_800_604_800);
+                assert_eq!(snapshot.window_seconds, 604_800);
+                assert_eq!(snapshot.remaining_percent, Some(99.0));
+            }
+            let response = json!({"rateLimits": {
+                "primary": unavailable,
+                "secondary": null,
+            }});
+            assert!(
+                parse_app_server_quota(&response, "pro").is_err(),
+                "a missing period must not be invented when no bounded window is reported"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_637_session_commit_and_restart_with_reader_snapshot() {
+        let (root, database) = prepare("issue-637-session-reader-snapshot");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&source, token(10, now)).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let reader =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        reader.execute_batch("PRAGMA query_only=ON; BEGIN").unwrap();
+        let count = || {
+            reader
+                .query_row("SELECT COUNT(*) FROM session_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(), 0);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(15, now + 1).as_bytes())
+            .unwrap();
+        let original = fs::read(&source).unwrap();
+        recorder
+            .run_cycle()
+            .expect("reader snapshot must not block a Session commit")
+            .unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            5
+        );
+        assert_eq!(
+            count(),
+            0,
+            "the reader keeps its consistent previous snapshot"
+        );
+        reader.execute_batch("COMMIT").unwrap();
+        assert_eq!(count(), 1, "new readers can see the committed source delta");
+        drop(recorder);
+        let mut restarted =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        restarted.run_cycle().unwrap();
+        assert_eq!(
+            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            5
+        );
+        assert_eq!(
+            count(),
+            1,
+            "restart must not credit the same source range twice"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+        drop(restarted);
+        drop(reader);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

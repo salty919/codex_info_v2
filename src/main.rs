@@ -13718,6 +13718,7 @@ struct CodexInfoState {
     /// closed; history samples remain lazy and are fetched only for an open
     /// graph.
     service_current_snapshot: Option<PublicDetailsV3>,
+    service_current_models_status: Option<ServiceCurrentModelsStatus>,
     service_current_active_thread_count: Option<u64>,
     service_current_pair: Option<String>,
     service_current_last_poll: Instant,
@@ -14555,6 +14556,7 @@ impl CodexInfoState {
             service_published_pair: None,
             service_v3_published_pair: None,
             service_current_snapshot: None,
+            service_current_models_status: None,
             service_current_active_thread_count: None,
             service_current_pair: None,
             service_current_last_poll: service_now
@@ -14717,6 +14719,7 @@ impl CodexInfoState {
             service_published_pair: None,
             service_v3_published_pair: None,
             service_current_snapshot: None,
+            service_current_models_status: None,
             service_current_active_thread_count: None,
             service_current_pair: None,
             service_current_last_poll: resident_now,
@@ -15318,6 +15321,7 @@ impl CodexInfoState {
         self.service_published_pair = None;
         self.service_v3_published_pair = None;
         self.service_current_snapshot = None;
+        self.service_current_models_status = None;
         self.service_current_active_thread_count = None;
         self.service_current_pair = None;
         self.service_current_last_poll = Instant::now()
@@ -15717,6 +15721,7 @@ impl CodexInfoState {
         self.service_v3_published_pair = None;
         self.service_current_pair = Some(published_pair.clone());
         self.service_current_snapshot = None;
+        self.service_current_models_status = None;
         self.service_current_active_thread_count = Some(self.active_threads.len() as u64);
         self.service_split_capable = false;
         self.service_history_periods = next_history_periods;
@@ -15886,9 +15891,11 @@ impl CodexInfoState {
         self.service_history_force_poll = false;
         self.service_current_bundle_retry_pending = false;
         self.service_current_snapshot = Some(full_snapshot);
+        self.service_current_models_status = None;
         Ok(true)
     }
 
+    #[cfg(test)]
     fn apply_service_current_v3(
         &mut self,
         published_pair: String,
@@ -15908,6 +15915,7 @@ impl CodexInfoState {
         Ok(self.commit_service_current_bundle(staged))
     }
 
+    #[cfg(test)]
     fn apply_service_current_bundle(
         &mut self,
         published_pair: String,
@@ -16045,6 +16053,7 @@ impl CodexInfoState {
         self.service_published_pair = Some(published_pair.clone());
         self.service_v3_published_pair = Some(published_pair.clone());
         self.service_current_snapshot = Some(current.clone());
+        self.service_current_models_status = None;
         self.service_current_active_thread_count = Some(current.open_session_thread_count);
         self.service_current_pair = Some(published_pair.clone());
         self.service_split_capable = true;
@@ -16656,6 +16665,7 @@ impl CodexInfoState {
         self.selected_reset_at = None;
         self.selected_history_period = "履歴なし".into();
         self.service_current_snapshot = None;
+        self.service_current_models_status = None;
         self.service_current_active_thread_count = None;
         self.service_current_pair = None;
         self.service_current_last_poll = Instant::now();
@@ -21791,6 +21801,14 @@ where
     Ok(ServiceDetailsV3Fetch::FreshV3 { pair, details })
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum ServiceCurrentModelsStatus {
+    Complete,
+    Partial,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ServiceCurrentV3Document {
@@ -21805,12 +21823,15 @@ struct ServiceCurrentV3Document {
     open_session_thread_count: Option<u64>,
 }
 
-fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
+fn parse_service_current_document(
+    bytes: &[u8],
+    version: &str,
+) -> Result<(PublicDetailsV3, Option<ServiceCurrentModelsStatus>), String> {
     let mut document = decode_unique_json(bytes)?;
     let object = document
         .as_object_mut()
         .ok_or_else(|| "current document is not an object".to_owned())?;
-    let expected = BTreeSet::from([
+    let mut expected = BTreeSet::from([
         "active_thread_count",
         "api_version",
         "authenticated",
@@ -21820,11 +21841,14 @@ fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, St
         "quota",
         "state",
     ]);
+    if version == "v4" {
+        expected.insert("models_status");
+    }
     let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
     let mut with_open_count = expected.clone();
     with_open_count.insert("open_session_thread_count");
     if actual != expected && actual != with_open_count {
-        return Err("current document fields differ from v3".into());
+        return Err(format!("current document fields differ from {version}"));
     }
     if object
         .get("open_session_thread_count")
@@ -21836,10 +21860,18 @@ fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, St
         .remove("api_version")
         .as_ref()
         .and_then(Value::as_str)
-        != Some("v3")
+        != Some(version)
     {
-        return Err("current document api_version is not v3".into());
+        return Err(format!("current document api_version is not {version}"));
     }
+    let models_status = if version == "v4" {
+        Some(
+            serde_json::from_value(object.remove("models_status").unwrap())
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let current: ServiceCurrentV3Document =
         serde_json::from_value(document).map_err(|error| error.to_string())?;
     let open_session_thread_count = current
@@ -21876,7 +21908,7 @@ fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, St
     {
         return Err("ready current is incomplete".into());
     }
-    Ok(details)
+    Ok((details, models_status))
 }
 
 fn parse_service_history_periods_document(
@@ -22050,10 +22082,11 @@ fn parse_service_threads_document(
 }
 
 #[derive(Debug, PartialEq)]
-enum ServiceCurrentV3Fetch {
+enum ServiceCurrentFetch {
     Fresh {
         pair: String,
         current: PublicDetailsV3,
+        models_status: Option<ServiceCurrentModelsStatus>,
     },
     Legacy(ServiceDetailsV3Fetch),
     NotModified {
@@ -22061,10 +22094,11 @@ enum ServiceCurrentV3Fetch {
     },
 }
 
-fn fetch_service_current_v3_with_etag<F>(
+fn fetch_service_current_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
-) -> Result<ServiceCurrentV3Fetch, String>
+    prior_models_status: Option<ServiceCurrentModelsStatus>,
+) -> Result<ServiceCurrentFetch, String>
 where
     F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
 {
@@ -22073,27 +22107,41 @@ where
             return Err("invalid current generation header".into());
         }
     }
-    let response = request("/v3/current", prior_pair)?;
-    if response.status == 304 {
-        let pair = response_published_pair(&response)?;
-        if prior_pair != Some(pair.as_str()) || !response.body.is_empty() {
-            return Err("cacheless current 304 or generation mismatch".into());
+    for (version, route) in [("v4", "/v4/current"), ("v3", "/v3/current")] {
+        // A published pair identifies the data, not the response schema.
+        // Only send a conditional request for the cached schema version.
+        let conditional = if (version == "v4") == prior_models_status.is_some() {
+            prior_pair
+        } else {
+            None
+        };
+        let response = request(route, conditional)?;
+        if response.status == 304 {
+            let pair = response_published_pair(&response)?;
+            if conditional != Some(pair.as_str()) || !response.body.is_empty() {
+                return Err("cacheless current 304 or generation mismatch".into());
+            }
+            return Ok(ServiceCurrentFetch::NotModified { pair });
         }
-        return Ok(ServiceCurrentV3Fetch::NotModified { pair });
+        if response.status == 404 {
+            continue;
+        }
+        if response.status != 200 {
+            return Err("current response is not HTTP 200".into());
+        }
+        let pair = response_published_pair(&response)?;
+        let (current, models_status) = parse_service_current_document(&response.body, version)?;
+        return Ok(ServiceCurrentFetch::Fresh {
+            pair,
+            current,
+            models_status,
+        });
     }
-    if response.status == 404 {
-        let legacy = fetch_service_details_v3_with_etag(
-            |route, conditional| request(route, conditional),
-            prior_pair,
-        )?;
-        return Ok(ServiceCurrentV3Fetch::Legacy(legacy));
-    }
-    if response.status != 200 {
-        return Err("current response is not HTTP 200".into());
-    }
-    let pair = response_published_pair(&response)?;
-    let current = parse_service_current_v3_document(&response.body)?;
-    Ok(ServiceCurrentV3Fetch::Fresh { pair, current })
+    let legacy = fetch_service_details_v3_with_etag(
+        |route, conditional| request(route, conditional),
+        prior_pair.filter(|_| prior_models_status.is_none()),
+    )?;
+    Ok(ServiceCurrentFetch::Legacy(legacy))
 }
 
 #[derive(Debug, PartialEq)]
@@ -22201,11 +22249,11 @@ fn service_main_account_options(accounts: &[ServiceAccountV3]) -> Vec<(String, b
         .collect()
 }
 
-/// Add the selected public account to every v3 data read. `/v3/accounts` is
+/// Add the selected public account to current v4 and every v3 data read. `/v3/accounts` is
 /// the directory itself and therefore intentionally has no account selector.
 /// Legacy v1/v2 fallback routes remain unchanged.
 fn service_route_with_account(route: &str, account_id: Option<&str>) -> String {
-    if !route.starts_with("/v3/") || route == "/v3/accounts" {
+    if (!route.starts_with("/v3/") && route != "/v4/current") || route == "/v3/accounts" {
         return route.to_owned();
     }
     let Some(account_id) = account_id else {
@@ -22834,16 +22882,21 @@ where
         })
         .flatten();
     let selected_account = state.service_selected_account_id.clone();
-    let fetched = fetch_service_current_v3_with_etag(
+    let fetched = fetch_service_current_with_etag(
         |route, if_none_match| {
             let route = service_route_with_account(route, selected_account.as_deref());
             request(&route, if_none_match)
         },
         previous_pair.as_deref(),
+        state.service_current_models_status,
     );
     let mut positive_bundle_attempted = false;
     let result = fetched.and_then(|result| match result {
-        ServiceCurrentV3Fetch::Fresh { pair, current } => {
+        ServiceCurrentFetch::Fresh {
+            pair,
+            current,
+            models_status,
+        } => {
             let fresh = published_pair_is_fresh(
                 state
                     .service_current_pair
@@ -22851,14 +22904,16 @@ where
                     .or(state.service_published_pair.as_deref()),
                 &pair,
             )?;
-            if !fresh {
+            let schema_changed =
+                models_status.is_some() != state.service_current_models_status.is_some();
+            if !fresh && !schema_changed {
                 if retry_pending {
                     return Err("bundle retry current did not advance last-good generation".into());
                 }
                 return Ok(false);
             }
-            let changed = if current.open_session_thread_count == 0 {
-                state.apply_service_current_v3(pair, current)?
+            let threads_resource = if current.open_session_thread_count == 0 {
+                None
             } else {
                 positive_bundle_attempted = true;
                 let threads = fetch_service_threads_with_etag(
@@ -22880,12 +22935,18 @@ where
                 if threads_pair != pair {
                     return Err("threads generation differs from current".into());
                 }
-                state.apply_service_current_bundle(pair, current, active_thread_count, threads)?
+                Some((active_thread_count, threads))
             };
+            // Freshness was checked above. A schema change may legitimately
+            // publish different health semantics for the same data pair.
+            let staged = stage_service_current_bundle(None, pair, current, threads_resource)?
+                .ok_or_else(|| "current bundle was not staged".to_owned())?;
+            let changed = state.commit_service_current_bundle(staged);
+            state.service_current_models_status = models_status;
             state.service_threads_last_poll = now;
             Ok(changed)
         }
-        ServiceCurrentV3Fetch::Legacy(legacy) => match legacy {
+        ServiceCurrentFetch::Legacy(legacy) => match legacy {
             ServiceDetailsV3Fetch::FreshV3 { pair, details } => {
                 let changed = state.apply_service_details_v3(pair, details)?;
                 if retry_pending && !changed {
@@ -22915,7 +22976,7 @@ where
                 Ok(false)
             }
         },
-        ServiceCurrentV3Fetch::NotModified { pair } => {
+        ServiceCurrentFetch::NotModified { pair } => {
             if retry_pending {
                 return Err("bundle retry received a cacheless current 304".into());
             }
@@ -25184,7 +25245,8 @@ mod tests {
 
     fn split_current_body(current: &PublicDetailsV3) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
-            "api_version": "v3",
+            "api_version": "v4",
+            "models_status": "complete",
             "state": current.state,
             "observed_at": current.observed_at,
             "authenticated": current.authenticated,
@@ -25250,6 +25312,7 @@ mod tests {
         state
             .apply_service_current_bundle(pair.to_owned(), current, None, threads)
             .expect("same-generation current and threads fixture is admitted");
+        state.service_current_models_status = Some(super::ServiceCurrentModelsStatus::Complete);
         state
     }
 
@@ -25491,9 +25554,10 @@ mod tests {
     }
 
     #[test]
-    fn every_selected_v3_read_route_carries_the_encoded_account() {
+    fn every_selected_read_route_carries_the_encoded_account() {
         let account = Some("account-13");
         for route in [
+            "/v4/current",
             "/v3/current",
             "/v3/details",
             "/v3/history/periods",
@@ -25775,7 +25839,7 @@ mod tests {
                     pair: None,
                     body: ACCOUNTS_B_CURRENT.to_vec(),
                 },
-                "/v3/current?account=account-13" => super::ServiceDetailsHttpResponse {
+                "/v4/current?account=account-13" => super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(new_pair.clone()),
                     body: current_body.clone(),
@@ -25794,7 +25858,7 @@ mod tests {
             requests,
             [
                 ("/v3/accounts".into(), None),
-                ("/v3/current?account=account-13".into(), None),
+                ("/v4/current?account=account-13".into(), None),
                 ("/v3/threads?account=account-13".into(), None),
             ]
         );
@@ -42392,6 +42456,198 @@ mod tests {
     }
 
     #[test]
+    fn issue_637_linux_current_v4_preserves_quota_and_acquisition_state() {
+        let (mut current, _) = split_current_fixture();
+        current.active_thread_count = 0;
+        current.open_session_thread_count = 0;
+        current.quota.as_mut().unwrap().remaining_percent = 99.0;
+        let mut state = CodexInfoState::service_client();
+        disable_account_directory_for_fixture(&mut state);
+        for (index, (health, quality)) in [
+            (PublicState::Ready, "partial"),
+            (PublicState::Error, "partial"),
+            (PublicState::Ready, "unavailable"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            current.state = health;
+            if quality == "unavailable" {
+                current.models.clear();
+            }
+            let mut body: Value = serde_json::from_slice(&split_current_body(&current)).unwrap();
+            body["api_version"] = json!("v4");
+            body["models_status"] = json!(quality);
+            let pair = published_pair(637, index as u128 + 1);
+            let now = Instant::now();
+            state.service_current_force_poll = true;
+            let outcome =
+                super::poll_service_current_resources_with(&mut state, now, |route, etag| {
+                    assert_eq!(route, "/v4/current");
+                    if index == 0 {
+                        assert_eq!(etag, None);
+                    }
+                    Ok(super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: serde_json::to_vec(&body).unwrap(),
+                    })
+                });
+            assert_eq!(outcome, super::ServiceCurrentPollOutcome::Success);
+            assert_eq!(state.remaining_percent, Some(99.0));
+            assert_eq!(state.account_error.is_some(), health == PublicState::Error);
+            assert_eq!(
+                state.service_current_snapshot.as_ref().unwrap().models,
+                current.models
+            );
+            state.service_current_force_poll = true;
+            let cached =
+                super::poll_service_current_resources_with(&mut state, now, |route, etag| {
+                    assert_eq!(route, "/v4/current");
+                    assert_eq!(etag, Some(pair.as_str()));
+                    Ok(super::ServiceDetailsHttpResponse {
+                        status: 304,
+                        pair: Some(pair.clone()),
+                        body: vec![],
+                    })
+                });
+            assert_eq!(cached, super::ServiceCurrentPollOutcome::Success);
+            assert_eq!(state.account_error.is_some(), health == PublicState::Error);
+        }
+    }
+
+    #[test]
+    fn issue_637_linux_current_version_switch_keeps_cache_and_same_pair_state() {
+        let (mut current, _) = split_current_fixture();
+        current.active_thread_count = 0;
+        current.open_session_thread_count = 0;
+        current.state = PublicState::Error;
+        let mut legacy: Value = serde_json::from_slice(&split_current_body(&current)).unwrap();
+        legacy["api_version"] = json!("v3");
+        legacy.as_object_mut().unwrap().remove("models_status");
+        let legacy_body = serde_json::to_vec(&legacy).unwrap();
+        let mut v4: Value = serde_json::from_slice(&legacy_body).unwrap();
+        v4["api_version"] = json!("v4");
+        v4["state"] = json!("ready");
+        v4["models_status"] = json!("partial");
+        let pair = published_pair(637, 9);
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_accounts(
+                super::parse_service_accounts_v3_document(ACCOUNTS_A_CURRENT).unwrap(),
+            )
+            .unwrap();
+        disable_account_directory_for_fixture(&mut state);
+        for cycle in 0..4 {
+            state.service_current_force_poll = true;
+            let mut routes = vec![];
+            let result = super::poll_service_current_resources_with(
+                &mut state,
+                Instant::now(),
+                |route, etag| {
+                    routes.push(route.to_owned());
+                    match route {
+                        "/v4/current?account=account-7" => {
+                            assert_eq!(etag, (cycle == 3).then_some(pair.as_str()));
+                            Ok(super::ServiceDetailsHttpResponse {
+                                status: if cycle < 2 {
+                                    404
+                                } else if cycle == 2 {
+                                    200
+                                } else {
+                                    304
+                                },
+                                pair: (cycle >= 2).then(|| pair.clone()),
+                                body: if cycle == 2 {
+                                    serde_json::to_vec(&v4).unwrap()
+                                } else {
+                                    vec![]
+                                },
+                            })
+                        }
+                        "/v3/current?account=account-7" => {
+                            assert_eq!(etag, (cycle == 1).then_some(pair.as_str()));
+                            Ok(super::ServiceDetailsHttpResponse {
+                                status: if cycle == 0 { 200 } else { 304 },
+                                pair: Some(pair.clone()),
+                                body: if cycle == 0 {
+                                    legacy_body.clone()
+                                } else {
+                                    vec![]
+                                },
+                            })
+                        }
+                        _ => panic!("unexpected route {route}"),
+                    }
+                },
+            );
+            assert_eq!(result, super::ServiceCurrentPollOutcome::Success);
+            assert_eq!(routes[0], "/v4/current?account=account-7");
+            assert_eq!(routes.len(), if cycle < 2 { 2 } else { 1 });
+            assert_eq!(state.account_error.is_some(), cycle < 2);
+            assert_eq!(state.service_current_pair.as_ref(), Some(&pair));
+        }
+    }
+
+    #[test]
+    fn issue_637_linux_current_rejects_invalid_v4_without_legacy_fallback() {
+        let (mut current, _) = split_current_fixture();
+        current.active_thread_count = 0;
+        current.open_session_thread_count = 0;
+        let mut valid: Value = serde_json::from_slice(&split_current_body(&current)).unwrap();
+        valid["api_version"] = json!("v4");
+        valid["models_status"] = json!("partial");
+        for mutation in [
+            "missing",
+            "unknown",
+            "null",
+            "version",
+            "extra",
+            "duplicate",
+        ] {
+            let mut document = valid.clone();
+            match mutation {
+                "missing" => {
+                    document.as_object_mut().unwrap().remove("models_status");
+                }
+                "unknown" => document["models_status"] = json!("invented"),
+                "null" => document["models_status"] = Value::Null,
+                "version" => document["api_version"] = json!("v3"),
+                "extra" => document["extra"] = json!(true),
+                _ => {}
+            }
+            let mut body = serde_json::to_string(&document).unwrap();
+            if mutation == "duplicate" {
+                body.insert_str(1, "\"models_status\":\"complete\",");
+            }
+            let mut state = CodexInfoState::service_client();
+            disable_account_directory_for_fixture(&mut state);
+            state.service_current_force_poll = true;
+            let mut calls = 0;
+            let result = super::poll_service_current_resources_with(
+                &mut state,
+                Instant::now(),
+                |route, _| {
+                    calls += 1;
+                    assert_eq!(route, "/v4/current");
+                    Ok(super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(published_pair(637, 1)),
+                        body: body.as_bytes().to_vec(),
+                    })
+                },
+            );
+            assert_eq!(
+                result,
+                super::ServiceCurrentPollOutcome::Failure,
+                "{mutation}"
+            );
+            assert_eq!(calls, 1);
+            assert!(state.service_current_snapshot.is_none());
+        }
+    }
+
+    #[test]
     fn linux_current_uses_exact_404_legacy_fallback_chain() {
         let pair = format!("v1:{:032x}{:032x}", 1_u128, 2_u128);
         let mut v1_document =
@@ -42402,11 +42658,11 @@ mod tests {
             .insert("api_version".into(), Value::String("v1".into()));
         let v1_body = serde_json::to_vec(&v1_document).unwrap();
         let mut requests = Vec::new();
-        let fallback = super::fetch_service_current_v3_with_etag(
+        let fallback = super::fetch_service_current_with_etag(
             |route, conditional| {
                 requests.push((route.to_owned(), conditional.map(str::to_owned)));
                 Ok(match route {
-                    "/v3/current" | "/v3/details" | "/v2/details" => {
+                    "/v4/current" | "/v3/current" | "/v3/details" | "/v2/details" => {
                         super::ServiceDetailsHttpResponse {
                             status: 404,
                             pair: None,
@@ -42422,15 +42678,17 @@ mod tests {
                 })
             },
             Some("v1:0000000000000000000000000000000100000000000000000000000000000001"),
+            None,
         )
         .unwrap();
         assert!(matches!(
             fallback,
-            super::ServiceCurrentV3Fetch::Legacy(super::ServiceDetailsV3Fetch::LegacyV2 { .. })
+            super::ServiceCurrentFetch::Legacy(super::ServiceDetailsV3Fetch::LegacyV2 { .. })
         ));
         assert_eq!(
             requests,
             [
+                ("/v4/current".into(), None),
                 (
                     "/v3/current".into(),
                     Some(
@@ -42478,7 +42736,7 @@ mod tests {
                     pair: None,
                     body: accounts_body.clone(),
                 },
-                "/v3/current?account=account-7" => super::ServiceDetailsHttpResponse {
+                "/v4/current?account=account-7" => super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(pair.clone()),
                     body: current_body.clone(),
@@ -42497,7 +42755,7 @@ mod tests {
             requests,
             [
                 ("/v3/accounts".into(), None),
-                ("/v3/current?account=account-7".into(), None),
+                ("/v4/current?account=account-7".into(), None),
                 ("/v3/threads?account=account-7".into(), None),
             ]
         );
@@ -42547,7 +42805,7 @@ mod tests {
                     pair: None,
                     body: accounts_body.clone(),
                 },
-                "/v3/current?account=account-7" => super::ServiceDetailsHttpResponse {
+                "/v4/current?account=account-7" => super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(pair.clone()),
                     body: current_body.clone(),
@@ -42649,7 +42907,7 @@ mod tests {
                     pair: None,
                     body: accounts_body.clone(),
                 },
-                "/v3/current?account=account-7" => super::ServiceDetailsHttpResponse {
+                "/v4/current?account=account-7" => super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(pair.clone()),
                     body: current_body.clone(),
@@ -42769,7 +43027,7 @@ mod tests {
 
         let outcome = super::poll_service_current_resources_with(&mut state, now, |route, etag| {
             requests.push((route.to_owned(), etag.map(str::to_owned)));
-            assert_eq!(route, "/v3/current");
+            assert_eq!(route, "/v4/current");
             Ok(super::ServiceDetailsHttpResponse {
                 status: 200,
                 pair: Some(new_pair.clone()),
@@ -42778,7 +43036,7 @@ mod tests {
         });
 
         assert_eq!(outcome, super::ServiceCurrentPollOutcome::Success);
-        assert_eq!(requests, [("/v3/current".into(), Some(old_pair))]);
+        assert_eq!(requests, [("/v4/current".into(), Some(old_pair))]);
         assert!(state.active_threads.is_empty());
         assert_eq!(state.service_current_active_thread_count, Some(0));
         assert_eq!(
@@ -42836,7 +43094,7 @@ mod tests {
                 |state, _| {
                     super::poll_service_current_resources_with(state, now, |route, etag| {
                         requests.push((route.to_owned(), etag.map(str::to_owned)));
-                        if route == "/v3/current" {
+                        if route == "/v4/current" {
                             return Ok(super::ServiceDetailsHttpResponse {
                                 status: 200,
                                 pair: Some(new_pair.clone()),
@@ -42872,7 +43130,7 @@ mod tests {
                     .iter()
                     .map(|request| request.0.as_str())
                     .collect::<Vec<_>>(),
-                ["/v3/current", "/v3/threads"],
+                ["/v4/current", "/v3/threads"],
                 "{failure}"
             );
             assert_eq!(state.service_current_snapshot, old_snapshot, "{failure}");
@@ -42919,7 +43177,7 @@ mod tests {
         let mut state = seeded_split_service_client(&old_pair);
         state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
         let failed = super::poll_service_current_resources_with(&mut state, now, |route, _| {
-            if route == "/v3/current" {
+            if route == "/v4/current" {
                 Ok(super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(new_pair.clone()),
@@ -42994,7 +43252,7 @@ mod tests {
                     etag.is_none(),
                     "bundle retry must bypass conditional caches"
                 );
-                Ok(if route == "/v3/current" {
+                Ok(if route == "/v4/current" {
                     super::ServiceDetailsHttpResponse {
                         status: 200,
                         pair: Some(new_pair.clone()),
@@ -43036,7 +43294,7 @@ mod tests {
         let mut state = seeded_split_service_client(&old_pair);
         state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
         let failed = super::poll_service_current_resources_with(&mut state, now, |route, _| {
-            if route == "/v3/current" {
+            if route == "/v4/current" {
                 Ok(super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(new_pair.clone()),
@@ -43055,7 +43313,7 @@ mod tests {
             &mut state,
             now + super::SERVICE_CURRENT_POLL_INTERVAL,
             |route, etag| {
-                assert_eq!(route, "/v3/current");
+                assert_eq!(route, "/v4/current");
                 assert!(etag.is_none());
                 Ok(super::ServiceDetailsHttpResponse {
                     status: 304,
@@ -43096,7 +43354,7 @@ mod tests {
             super::poll_service_current_resources_with(&mut legacy_state, now, |route, _| {
                 legacy_routes.push(route.to_owned());
                 Ok(match route {
-                    "/v3/current" | "/v3/details" | "/v2/details" => {
+                    "/v4/current" | "/v3/current" | "/v3/details" | "/v2/details" => {
                         super::ServiceDetailsHttpResponse {
                             status: 404,
                             pair: None,
@@ -43114,7 +43372,13 @@ mod tests {
         assert_eq!(legacy_outcome, super::ServiceCurrentPollOutcome::Success);
         assert_eq!(
             legacy_routes,
-            ["/v3/current", "/v3/details", "/v2/details", "/v1/details"]
+            [
+                "/v4/current",
+                "/v3/current",
+                "/v3/details",
+                "/v2/details",
+                "/v1/details"
+            ]
         );
         assert!(!legacy_routes.iter().any(|route| route == "/v3/threads"));
 
@@ -43125,7 +43389,7 @@ mod tests {
         state.service_threads_force_poll = true;
         let current_outcome =
             super::poll_service_current_resources_with(&mut state, now, |route, etag| {
-                assert_eq!(route, "/v3/current");
+                assert_eq!(route, "/v4/current");
                 assert_eq!(etag, Some(pair.as_str()));
                 Ok(super::ServiceDetailsHttpResponse {
                     status: 304,

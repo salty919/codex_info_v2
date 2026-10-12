@@ -8,7 +8,7 @@
 mod diagnostics;
 mod history;
 
-use codex_info_db_reader::{DbReader, DbSnapshot, ReaderError};
+use codex_info_db_reader::{CurrentPublication, DbReader, DbSnapshot, ReaderError};
 use codex_info_rest_contract::{
     PublicAccountV3, PublicAccountsV3, PublicDetails, PublicDetailsV2, PublicDetailsV3,
     PublicRuntimeVersions, PublicState, API_VERSION, API_VERSION_V2, API_VERSION_V3,
@@ -52,6 +52,7 @@ pub struct PublishedSnapshot {
     pub history_available: bool,
     pub has_pending_ranges: bool,
     pub acquisition_degraded: bool,
+    pub current: CurrentPublication,
     pub details: PublicDetails,
     pub models_v3: Vec<codex_info_rest_contract::PublicModelUsageV3>,
     pub history_samples_v3: Vec<codex_info_rest_contract::PublicHistoryObservationV3>,
@@ -93,6 +94,7 @@ impl PublishedSnapshot {
             has_pending_ranges: snapshot.has_pending_ranges,
             acquisition_degraded: snapshot.acquisition_degraded,
             history_available: snapshot.history_available,
+            current: snapshot.current,
             details: snapshot.details,
             models_v3: snapshot.models_v3,
             history_samples_v3: snapshot.history_samples_v3,
@@ -126,6 +128,7 @@ impl PublishedSnapshot {
             has_pending_ranges: false,
             acquisition_degraded: false,
             history_available: true,
+            current: CurrentPublication::unavailable(details.state),
             details,
             models_v3: Vec::new(),
             history_samples_v3: Vec::new(),
@@ -843,6 +846,7 @@ enum Route {
     DetailsV3,
     AccountsV3,
     CurrentV3,
+    CurrentV4,
     HistoryPeriodsV3,
     HistoryV3,
     ThreadsV3,
@@ -858,6 +862,7 @@ impl Route {
             Self::DetailsV3 => "/v3/details",
             Self::AccountsV3 => "/v3/accounts",
             Self::CurrentV3 => "/v3/current",
+            Self::CurrentV4 => "/v4/current",
             Self::HistoryPeriodsV3 => "/v3/history/periods",
             Self::HistoryV3 => "/v3/history",
             Self::ThreadsV3 => "/v3/threads",
@@ -869,6 +874,7 @@ impl Route {
             Self::DetailsV3
                 | Self::AccountsV3
                 | Self::CurrentV3
+                | Self::CurrentV4
                 | Self::HistoryPeriodsV3
                 | Self::HistoryV3
                 | Self::ThreadsV3
@@ -1119,8 +1125,17 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
         Ok(body) => {
             if matches!(
                 route,
-                Route::Details | Route::DetailsV2 | Route::DetailsV3 | Route::CurrentV3
-            ) && (degraded || snapshot.details.state == PublicState::Error)
+                Route::Details
+                    | Route::DetailsV2
+                    | Route::DetailsV3
+                    | Route::CurrentV3
+                    | Route::CurrentV4
+            ) && (degraded
+                || if route == Route::CurrentV4 {
+                    snapshot.current.state == PublicState::Error
+                } else {
+                    snapshot.details.state == PublicState::Error
+                })
             {
                 let reason = if degraded && snapshot.acquisition_degraded {
                     "acquisition_failed"
@@ -1349,6 +1364,7 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
         "/v3/details" => Some(Route::DetailsV3),
         "/v3/accounts" => Some(Route::AccountsV3),
         "/v3/current" => Some(Route::CurrentV3),
+        "/v4/current" => Some(Route::CurrentV4),
         "/v3/history/periods" => Some(Route::HistoryPeriodsV3),
         "/v3/history" => Some(Route::HistoryV3),
         "/v3/threads" => Some(Route::ThreadsV3),
@@ -1450,13 +1466,15 @@ fn serialize_route(
             flatten_with_version(API_VERSION_V3, &details)
         }
         Route::AccountsV3 => Err(RouteError::Serialization),
-        Route::CurrentV3 => {
+        Route::CurrentV3 | Route::CurrentV4 => {
             let state = if degraded {
                 PublicState::Error
+            } else if route == Route::CurrentV4 {
+                snapshot.current.state
             } else {
                 details.state
             };
-            serialize_json(&json!({
+            let mut current = json!({
                 "api_version": API_VERSION_V3,
                 "state": state,
                 "observed_at": details.observed_at,
@@ -1466,7 +1484,12 @@ fn serialize_route(
                 "models": snapshot.models_v3,
                 "active_thread_count": details.active_thread_count,
                 "open_session_thread_count": details.threads.len(),
-            }))
+            });
+            if route == Route::CurrentV4 {
+                current["api_version"] = json!("v4");
+                current["models_status"] = json!(snapshot.current.models_status);
+            }
+            serialize_json(&current)
         }
         Route::HistoryPeriodsV3 => serialize_json(&json!({
             "api_version": API_VERSION_V3,
@@ -1795,6 +1818,7 @@ mod tests {
             has_pending_ranges: false,
             acquisition_degraded: false,
             history_available: true,
+            current: CurrentPublication::unavailable(details.state),
             details,
             models_v3: Vec::new(),
             history_samples_v2: Vec::new(),
@@ -1857,6 +1881,7 @@ mod tests {
             has_pending_ranges: false,
             acquisition_degraded: false,
             history_available: true,
+            current: CurrentPublication::unavailable(details.state),
             details,
             models_v3: Vec::new(),
             history_samples_v2: Vec::new(),
@@ -2006,6 +2031,7 @@ mod tests {
                 has_pending_ranges: false,
                 acquisition_degraded: false,
                 history_available: true,
+                current: CurrentPublication::unavailable(details.state),
                 details,
                 models_v3: Vec::new(),
                 history_samples_v2: Vec::new(),
@@ -2099,6 +2125,7 @@ mod tests {
             has_pending_ranges: snapshot.has_pending_ranges,
             acquisition_degraded: snapshot.acquisition_degraded,
             history_available: snapshot.history_available,
+            current: snapshot.current,
             details: snapshot.details,
             models_v3: snapshot.models_v3,
             history_samples_v2: snapshot.history_samples_v2,
@@ -2279,6 +2306,7 @@ mod tests {
                 has_pending_ranges: false,
                 acquisition_degraded: false,
                 history_available: true,
+                current: CurrentPublication::unavailable(details.state),
                 details,
                 models_v3: Vec::new(),
                 history_samples_v2: Vec::new(),
@@ -2405,10 +2433,11 @@ mod tests {
             DbReader::open_partitioned(&database, &reader_identity).expect("fixture reader");
         let mut server =
             RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("test REST");
-        let before = request(
-            server.local_addr(),
-            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        let current_request = format!(
+            "GET /{}/current HTTP/1.1\r\nHost:x\r\n\r\n",
+            if pending_history { "v4" } else { "v3" }
         );
+        let before = request(server.local_addr(), &current_request);
         assert!(before.starts_with("HTTP/1.1 200"));
         let before_value: Value = serde_json::from_str(body(&before)).expect("old current JSON");
         assert_eq!(before_value["state"], "ready");
@@ -2480,14 +2509,18 @@ mod tests {
                 panic!("reset={next_reset_at} observed={next_observed_at}: {error:?}")
             });
         server.store().refresh();
-        let after = request(
-            server.local_addr(),
-            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
-        );
+        let after = request(server.local_addr(), &current_request);
         assert!(after.starts_with("HTTP/1.1 200"));
         let after_value: Value = serde_json::from_str(body(&after)).expect("new current JSON");
-        assert_eq!(after_value["state"], if pending_history { "error" } else { "ready" },
-            "a genuinely incomplete current model set stays incomplete without rejecting official quota");
+        assert_eq!(
+            after_value["state"], "ready",
+            "an incomplete Session record is not an acquisition or publication failure"
+        );
+        if pending_history {
+            assert_eq!(after_value["api_version"], "v4");
+            assert_eq!(before_value["models_status"], "complete");
+            assert_eq!(after_value["models_status"], "unavailable");
+        }
         assert_eq!(
             server.store().snapshot().unwrap().has_pending_ranges,
             pending_history
@@ -2526,10 +2559,7 @@ mod tests {
             "the new reset identity creates one new period"
         );
         server.store().refresh();
-        let repeated = request(
-            server.local_addr(),
-            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
-        );
+        let repeated = request(server.local_addr(), &current_request);
         assert!(repeated.starts_with("HTTP/1.1 200"));
         let repeated_value: Value =
             serde_json::from_str(body(&repeated)).expect("repeated current JSON");
@@ -2537,7 +2567,8 @@ mod tests {
         assert_eq!(repeated_value["quota"]["remaining_percent"], 99.0);
         assert_eq!(repeated_value["quota"]["reset_at"], next_reset_at);
         if pending_history {
-            assert_eq!(repeated_value["state"], "error");
+            assert_eq!(repeated_value["state"], "ready");
+            assert_eq!(repeated_value["models_status"], "unavailable");
             assert_eq!(fs::read(&partial).unwrap(), PARTIAL_BYTES);
             assert_eq!(
                 Connection::open(&database)
@@ -2922,6 +2953,54 @@ mod tests {
         assert_eq!(recovered_json["state"], "ready");
         server.shutdown();
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn issue_637_v4_cache_exposes_read_failure_and_recovery_without_losing_quota() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("v4-current.sqlite3");
+        fixture(&path, 10);
+        let mut server = RestServer::start(
+            DbReader::open(&path).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let get = |pair: Option<&str>| {
+            let conditional = pair.map_or(String::new(), |pair| {
+                format!("If-None-Match: \"{pair}\"\r\n")
+            });
+            request(
+                server.local_addr(),
+                &format!("GET /v4/current HTTP/1.1\r\nHost:x\r\n{conditional}\r\n"),
+            )
+        };
+        let initial = get(None);
+        assert!(initial.starts_with("HTTP/1.1 200"));
+        let initial_json: Value = serde_json::from_str(body(&initial)).unwrap();
+        assert_eq!(initial_json["state"], "ready");
+        assert_eq!(initial_json["api_version"], "v4");
+        let pair = published_pair(&initial);
+        assert!(get(Some(pair)).starts_with("HTTP/1.1 304"));
+        let moved = path.with_extension("unavailable");
+        fs::rename(&path, &moved).unwrap();
+        let failure = get(Some(pair));
+        assert!(failure.starts_with("HTTP/1.1 200"));
+        let error_json: Value = serde_json::from_str(body(&failure)).unwrap();
+        assert_eq!(error_json["state"], "error");
+        assert_eq!(error_json["quota"], initial_json["quota"]);
+        assert_eq!(error_json["models"], initial_json["models"]);
+        assert_eq!(error_json["models_status"], initial_json["models_status"]);
+        let failed_pair = published_pair(&failure);
+        assert_ne!(failed_pair, pair);
+        fs::rename(moved, path).unwrap();
+        let recovered = get(Some(failed_pair));
+        assert!(recovered.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            serde_json::from_str::<Value>(body(&recovered)).unwrap(),
+            initial_json
+        );
+        assert_eq!(published_pair(&recovered), pair);
+        server.shutdown();
     }
 
     #[test]
@@ -3518,6 +3597,16 @@ mod tests {
         assert!(logged_out["models"].as_array().is_some_and(Vec::is_empty));
         assert_eq!(logged_out["active_thread_count"], 0);
 
+        let v4 = request(
+            server.local_addr(),
+            "GET /v4/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let mut v4: Value = serde_json::from_str(body(&v4)).unwrap();
+        assert_eq!(v4["models_status"], "unavailable");
+        v4.as_object_mut().unwrap().remove("models_status");
+        v4["api_version"] = json!("v3");
+        assert_eq!(v4, logged_out, "v4 must clear the same account-owned data");
+
         server.shutdown();
         fs::remove_file(path).expect("account boundary cleanup");
     }
@@ -3993,6 +4082,9 @@ mod tests {
         let initial: Value = serde_json::from_str(body(&get("/v3/current"))).unwrap();
         assert_eq!(initial["state"], "ready");
         assert_eq!(initial["models"][0]["total_tokens"], 14_534_996);
+        let initial_v4: Value = serde_json::from_str(body(&get("/v4/current"))).unwrap();
+        assert_eq!(initial_v4["state"], "ready");
+        assert_eq!(initial_v4["models_status"], "complete");
         connection.execute_batch(
             "INSERT INTO usage_history VALUES(1800000060,1800000060,5,0,0,0,0,0,0);
              INSERT INTO usage_model_history VALUES
@@ -4023,6 +4115,13 @@ mod tests {
             }
             assert_eq!(pair, error_pair);
         }
+        let partial_v4 = get("/v4/current");
+        assert_eq!(published_pair(&partial_v4), error_pair);
+        let partial_v4: Value = serde_json::from_str(body(&partial_v4)).unwrap();
+        assert_eq!(partial_v4["state"], "ready");
+        assert_eq!(partial_v4["models_status"], "partial");
+        assert_eq!(partial_v4["models"][0]["total_tokens"], 201_416_126);
+        assert_eq!(partial_v4["quota"]["remaining_percent"], 5.0);
         let history = get("/v3/history?period=1800000060");
         assert_eq!(published_pair(&history), error_pair);
         let history: Value = serde_json::from_str(body(&history)).unwrap();
@@ -4098,6 +4197,26 @@ mod tests {
             next_history["history_samples"][0]["models"][0]["total_tokens"],
             440
         );
+        connection
+            .execute_batch(
+                "UPDATE usage_model_history SET total_tokens='invalid' WHERE timestamp=1800000120;
+             UPDATE collection_generation SET data_generation='5';",
+            )
+            .unwrap();
+        let invalid: Value = serde_json::from_str(body(&get("/v4/current"))).unwrap();
+        assert_eq!(invalid["state"], "error");
+        assert_eq!(invalid["models_status"], "unavailable");
+        assert_eq!(invalid["quota"]["remaining_percent"], 98.0);
+        assert_eq!(invalid["quota"]["reset_at"], 1_800_003_660);
+        connection
+            .execute_batch(
+                "UPDATE usage_model_history SET total_tokens='440' WHERE timestamp=1800000120;
+             UPDATE collection_generation SET data_generation='6';",
+            )
+            .unwrap();
+        let repaired: Value = serde_json::from_str(body(&get("/v4/current"))).unwrap();
+        assert_eq!(repaired["state"], "ready");
+        assert_eq!(repaired["models_status"], "complete");
         server.shutdown();
         fs::remove_file(path).unwrap();
     }
