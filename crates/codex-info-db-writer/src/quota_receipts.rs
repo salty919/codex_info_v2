@@ -17,8 +17,30 @@ CREATE TABLE IF NOT EXISTS quota_receipts (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS quota_acquisition_state (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-    degraded INTEGER NOT NULL CHECK(degraded IN (0,1))
+    degraded INTEGER NOT NULL DEFAULT 0 CHECK(degraded IN (0,1)),
+    input_degraded INTEGER NOT NULL DEFAULT 0 CHECK(input_degraded IN (0,1))
 );";
+
+pub(super) fn ensure_health_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='quota_acquisition_state')",
+        [],
+        |row| row.get(0),
+    )?;
+    if present {
+        let input_present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('quota_acquisition_state') WHERE name='input_degraded')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !input_present {
+            // A legacy acquisition failure has no reliable source identity.
+            // Preserve it until the acquisition owner confirms recovery.
+            tx.execute_batch("ALTER TABLE quota_acquisition_state ADD COLUMN input_degraded INTEGER NOT NULL DEFAULT 0 CHECK(input_degraded IN(0,1));")?;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaReceipt {
@@ -99,9 +121,10 @@ impl UsageStore {
     pub fn commit_quota_receipts(
         &mut self,
         receipts: &[QuotaReceipt],
-        has_unresolved: bool,
+        input_degraded: impl Into<Option<bool>>,
     ) -> Result<Option<u64>> {
-        if receipts.is_empty() && !has_unresolved {
+        let input_degraded = input_degraded.into();
+        if receipts.is_empty() && input_degraded.is_none() {
             return Ok(None);
         }
         let tx = self
@@ -141,14 +164,15 @@ impl UsageStore {
                     receipt.window_seconds,receipt.remaining_percent,next.to_string()],
             )?;
         }
-        // The receipt publication must already carry any unresolved input.
-        // Clearing the flag belongs to the caller after both replay and the
-        // acquisition lane are ready; replay alone cannot hide a fetch failure.
-        let health_changed = if has_unresolved {
+        // Interpretation owns only the latest settled input. It may recover
+        // after restart without a new poll, while a real acquisition/storage
+        // failure remains independently degraded.
+        let health_changed = if let Some(degraded) = input_degraded {
             tx.execute(
-                "INSERT INTO quota_acquisition_state(singleton,degraded) VALUES(1,1)
-                 ON CONFLICT(singleton) DO UPDATE SET degraded=1 WHERE degraded!=1",
-                [],
+                "INSERT INTO quota_acquisition_state(singleton,degraded,input_degraded) VALUES(1,0,?1)
+                 ON CONFLICT(singleton) DO UPDATE SET input_degraded=excluded.input_degraded
+                 WHERE input_degraded!=excluded.input_degraded",
+                [degraded],
             )?
         } else {
             0

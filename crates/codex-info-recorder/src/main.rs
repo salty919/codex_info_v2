@@ -219,16 +219,21 @@ fn desired_acquisition_degraded(quota: LaneHealth, threads: LaneHealth) -> Optio
     }
 }
 
-fn sync_acquisition_health(recorder: &mut Recorder, quota: LaneHealth, threads: LaneHealth) {
+fn sync_quota_poll_health(recorder: &mut Recorder, quota: LaneHealth) {
     if quota != LaneHealth::Unknown {
         if let Err(error) = recorder.set_quota_acquisition_degraded(quota == LaneHealth::Failed) {
             eprintln!("codex-info-recorder quota health commit failed: {error}");
         }
     }
-    let result = match desired_acquisition_degraded(quota, threads) {
-        Some(true) => recorder.mark_active_thread_snapshot_degraded(),
-        Some(false) => recorder.clear_active_thread_snapshot_degraded(),
-        None => return,
+}
+
+fn sync_acquisition_health(recorder: &mut Recorder, _quota: LaneHealth, threads: LaneHealth) {
+    // A thread failure and a quota failure have independent durable owners.
+    // Duplicating a quota failure here would keep it latched after replay.
+    let result = match threads {
+        LaneHealth::Failed => recorder.mark_active_thread_snapshot_degraded(),
+        LaneHealth::Ready => recorder.clear_active_thread_snapshot_degraded(),
+        LaneHealth::Unknown => return,
     };
     if let Err(error) = result {
         eprintln!("codex-info-recorder acquisition health commit failed: {error}");
@@ -312,15 +317,13 @@ where
         // while quota is still unknown. Preserve the entire last publication
         // (including an existing failure), just as health synchronization
         // does, until a normal cycle has a decided quota outcome.
-        let Some(acquisition_degraded) =
-            desired_acquisition_degraded(quota_health, LaneHealth::Ready)
-        else {
+        if desired_acquisition_degraded(quota_health, LaneHealth::Ready).is_none() {
             return Ok(false);
-        };
+        }
         if !epoch_matches(&epoch) {
             return Err(RecorderError::AccountBoundaryChanged.into());
         }
-        match recorder.commit_active_thread_snapshot(&snapshot, acquisition_degraded) {
+        match recorder.commit_active_thread_snapshot(&snapshot, false) {
             Ok(generation) => {
                 if !epoch_matches(cycle_epoch) {
                     return Err(RecorderError::AccountBoundaryChanged.into());
@@ -741,7 +744,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         outcome.unresolved
                     );
                 }
-                outcome.unresolved != 0
+                outcome.latest_input_unresolved
             }
             Err(RecorderError::AccountBoundaryChanged) => {
                 return Err(RecorderError::AccountBoundaryChanged.into());
@@ -756,6 +759,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             quota_poll_health
         };
+        sync_quota_poll_health(&mut recorder, quota_poll_health);
         sync_acquisition_health(&mut recorder, quota_health, thread_health);
         let early_recollection = if thread_cadence.checkpoint_recovery.pending {
             if !thread_cadence.begin_checkpoint_recovery(&cycle_epoch) {
@@ -817,19 +821,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !recorder_epoch_matches(&options, &cycle_epoch) {
                 return Err(RecorderError::AccountBoundaryChanged.into());
             }
+            let input_unrecognized = matches!(event, QuotaPollEvent::InputStored { .. });
             match event {
                 QuotaPollEvent::Ready {
                     login_id, epoch, ..
-                } => {
+                }
+                | QuotaPollEvent::InputStored { login_id, epoch } => {
                     if !recorder_epoch_matches(&options, &epoch) {
                         return Err(RecorderError::AccountBoundaryChanged.into());
                     }
                     quota_poll_health = LaneHealth::Ready;
-                    quota_health = if replay_failed {
+                    quota_health = if replay_failed || input_unrecognized {
                         LaneHealth::Failed
                     } else {
                         LaneHealth::Ready
                     };
+                    if input_unrecognized {
+                        if let Err(error) = recorder.mark_quota_input_degraded() {
+                            eprintln!("codex-info-recorder input health commit failed: {error}");
+                        }
+                    }
                     // A display-label failure must never stop or delay the
                     // recorder's authoritative Session/DB path.
                     if let Err(error) = recorder.set_partition_login_id(&login_id) {
@@ -864,6 +875,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !recorder_epoch_matches(&options, &cycle_epoch) {
                 return Err(RecorderError::AccountBoundaryChanged.into());
             }
+            sync_quota_poll_health(&mut recorder, quota_poll_health);
             sync_acquisition_health(&mut recorder, quota_health, thread_health);
         }
         let mut submit = |checkpoints: &[SessionCheckpoint]| thread_poller.submit(checkpoints);
@@ -1826,15 +1838,30 @@ mod tests {
                 LaneHealth::Unknown,
                 ActiveThreadPollResult::Failed("test failure".to_owned()),
                 1,
+                0,
+                1,
             ),
             (
                 LaneHealth::Failed,
                 fixture.poll_result("quota-failed", 2),
+                0,
+                1,
                 1,
             ),
-            (LaneHealth::Ready, fixture.poll_result("both-ready", 3), 0),
+            (
+                LaneHealth::Ready,
+                fixture.poll_result("both-ready", 3),
+                0,
+                0,
+                0,
+            ),
         ];
-        for (quota, result, expected_degraded) in cases {
+        for (quota, result, expected_thread_degraded, expected_quota_degraded, expected_combined) in
+            cases
+        {
+            // The real owner loop persists quota health independently before
+            // consuming a thread result. A healthy thread cannot clear it.
+            sync_quota_poll_health(&mut fixture.recorder, quota);
             commit_thread_poll_result(
                 result,
                 &epoch,
@@ -1846,8 +1873,26 @@ mod tests {
                 |_| true,
             )
             .unwrap();
-            let (payload, degraded) = issue_134_thread_row(&fixture);
-            assert_eq!(degraded, expected_degraded);
+            let (payload, thread_degraded) = issue_134_thread_row(&fixture);
+            let (quota_degraded, input_degraded): (i64, i64) =
+                rusqlite::Connection::open(&fixture.options.database).unwrap()
+                    .query_row(
+                        "SELECT COALESCE((SELECT degraded FROM quota_acquisition_state WHERE singleton=1),0),
+                                COALESCE((SELECT input_degraded FROM quota_acquisition_state WHERE singleton=1),0)",
+                        [], |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).unwrap();
+            let combined =
+                i64::from(thread_degraded != 0 || quota_degraded != 0 || input_degraded != 0);
+            assert_eq!(
+                (thread_degraded, quota_degraded, input_degraded, combined),
+                (
+                    expected_thread_degraded,
+                    expected_quota_degraded,
+                    0,
+                    expected_combined
+                ),
+                "each lane retains its failure until its own confirmed recovery"
+            );
             if quota == LaneHealth::Unknown {
                 assert_eq!(
                     payload, before_payload,

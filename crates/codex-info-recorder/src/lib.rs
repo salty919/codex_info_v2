@@ -406,7 +406,7 @@ pub struct QuotaSnapshot {
 
 #[derive(Clone, PartialEq)]
 struct QuotaPollSuccess {
-    snapshot: QuotaSnapshot,
+    snapshot: Option<QuotaSnapshot>,
     login_id: String,
     epoch: AccountEpochProof,
 }
@@ -450,6 +450,12 @@ pub enum QuotaPollEvent {
         login_id: String,
         epoch: AccountEpochProof,
     },
+    /// Acquisition and account verification succeeded, but the saved input
+    /// requires interpretation. This is not a transport/storage failure.
+    InputStored {
+        login_id: String,
+        epoch: AccountEpochProof,
+    },
     Failed,
 }
 
@@ -462,6 +468,7 @@ impl fmt::Debug for QuotaPollEvent {
                 .field("login_id", &"[redacted]")
                 .finish(),
             Self::Failed => formatter.write_str("QuotaPollEvent::Failed"),
+            Self::InputStored { .. } => formatter.write_str("QuotaPollEvent::InputStored"),
         }
     }
 }
@@ -529,15 +536,22 @@ impl QuotaPoller {
         while let Ok(result) = self.receiver.try_recv() {
             match result {
                 Ok(success) => {
-                    self.latest = Some(QuotaPollCandidate {
-                        snapshot: success.snapshot.clone(),
-                        epoch: success.epoch.clone(),
-                    });
-                    self.events.push(QuotaPollEvent::Ready {
-                        snapshot: success.snapshot,
-                        login_id: success.login_id,
-                        epoch: success.epoch,
-                    });
+                    if let Some(snapshot) = success.snapshot {
+                        self.latest = Some(QuotaPollCandidate {
+                            snapshot: snapshot.clone(),
+                            epoch: success.epoch.clone(),
+                        });
+                        self.events.push(QuotaPollEvent::Ready {
+                            snapshot,
+                            login_id: success.login_id,
+                            epoch: success.epoch,
+                        });
+                    } else {
+                        self.events.push(QuotaPollEvent::InputStored {
+                            login_id: success.login_id,
+                            epoch: success.epoch,
+                        });
+                    }
                 }
                 Err(error) => {
                     eprintln!("recorder degraded: quota poll failed: {error}");
@@ -1157,8 +1171,12 @@ fn fetch_quota_snapshot(notifications: &SyncSender<QuotaPollResult>) -> QuotaPol
         }
         let epoch = AccountEpochProof::from_verified_authority(authority_after)?;
         persist_quota_receipt(&receipt, &data_root, true, notifications);
-        let mut snapshot = parse_app_server_quota(&rate_limits, &account.plan_type)?;
-        snapshot.observed_at = receipt.observed_at;
+        let snapshot = parse_app_server_quota(&rate_limits, &account.plan_type)
+            .ok()
+            .map(|mut snapshot| {
+                snapshot.observed_at = receipt.observed_at;
+                snapshot
+            });
         Ok(QuotaPollSuccess {
             snapshot,
             login_id: account.email,
@@ -3166,6 +3184,7 @@ pub fn synchronize_inactive_partition(
 pub struct QuotaReplayOutcome {
     pub generation: Option<u64>,
     pub unresolved: usize,
+    pub latest_input_unresolved: bool,
 }
 
 pub struct Recorder {
@@ -3411,6 +3430,17 @@ impl Recorder {
         Ok(self.writer.set_quota_acquisition_degraded(degraded)?)
     }
 
+    /// A saved, verified response may still be uninterpretable. Its input
+    /// state is independent of transport and is reconciled by journal replay.
+    pub fn mark_quota_input_degraded(&mut self) -> Result<(), RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        self.writer.commit_quota_receipts(&[], true)?;
+        Ok(())
+    }
+
     pub fn mark_active_thread_snapshot_degraded(&mut self) -> Result<u64, RecorderError> {
         let _epoch_fence = account_epoch_commit_fence()?;
         if account_boundary_changed() {
@@ -3501,8 +3531,9 @@ impl Recorder {
         Ok(QuotaReplayOutcome {
             generation: self
                 .writer
-                .commit_quota_receipts(&batch.receipts, batch.unresolved != 0)?,
+                .commit_quota_receipts(&batch.receipts, batch.latest_input_unresolved)?,
             unresolved: batch.unresolved,
+            latest_input_unresolved: batch.latest_input_unresolved.unwrap_or(false),
         })
     }
 
@@ -8554,12 +8585,12 @@ mod tests {
         write_test_account_authority(&root, "authority-1");
         let epoch = AccountEpochProof::capture(&root).unwrap();
         let success = QuotaPollSuccess {
-            snapshot: QuotaSnapshot {
+            snapshot: Some(QuotaSnapshot {
                 observed_at: 100,
                 reset_at: 200,
                 window_seconds: 100,
                 remaining_percent: Some(90.0),
-            },
+            }),
             login_id: "person@example.invalid".to_owned(),
             epoch,
         };
@@ -8579,7 +8610,9 @@ mod tests {
         assert!(candidate.validate_current(&root));
         let event_epoch = match poller.take_events().pop().expect("ready event") {
             QuotaPollEvent::Ready { epoch, .. } => epoch,
-            QuotaPollEvent::Failed => panic!("unexpected failed event"),
+            QuotaPollEvent::Failed | QuotaPollEvent::InputStored { .. } => {
+                panic!("unexpected failed event")
+            }
         };
         assert!(event_epoch.validate_current(&root));
         assert!(!format!("{candidate:?}").contains("authority-1"));
@@ -9343,6 +9376,220 @@ mod tests {
                 "official reset={reset_at} observed={observed_at} remaining={remaining}"
             );
         }
+    }
+
+    #[test]
+    fn issue_637_journal_replay_keeps_old_unresolved_input_without_poisoning_current_quota() {
+        let (root, database) = prepare("issue637-journal-current");
+        let scope = identity().account_scope_id;
+        let save = |id: &str, observed_at: i64, payload: Value| {
+            let receipt =
+                quota_journal::QuotaReceipt::new(observed_at, Some(scope.clone()), "pro", &payload)
+                    .with_id(id.repeat(32));
+            receipt.save(&root, true).unwrap();
+        };
+        let payload = |used: i64| {
+            json!({"rateLimits": {"primary": {
+                "usedPercent": used, "resetsAt": 1800604800_i64, "windowDurationMins": 10080
+            }}})
+        };
+        save("aa", 1_800_000_000, json!({"unrecognized": true}));
+        save("bb", 1_800_000_060, payload(0));
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        assert!(matches!(
+            recorder.replay_quota_journal(&root, &scope, || false),
+            Err(RecorderError::AccountBoundaryChanged)
+        ));
+        let db = Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TRIGGER reject_receipt BEFORE INSERT ON quota_receipts BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert!(recorder
+            .replay_quota_journal(&root, &scope, || true)
+            .is_err());
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM quota_receipts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        db.execute_batch("DROP TRIGGER reject_receipt").unwrap();
+        let replay = recorder
+            .replay_quota_journal(&root, &scope, || true)
+            .unwrap();
+        assert_eq!(
+            replay.unresolved, 1,
+            "old raw input is retained for later interpretation"
+        );
+        let current = recorder.writer.latest_quota_receipt().unwrap().unwrap();
+        assert_eq!(
+            (
+                current.sequence,
+                current.reset_at,
+                current.remaining_percent
+            ),
+            (2, 1_800_604_800, 100.0)
+        );
+        let degraded = || {
+            db.query_row("SELECT COALESCE((SELECT degraded OR input_degraded FROM quota_acquisition_state WHERE singleton=1),0)", [], |r| r.get::<_, i64>(0)).unwrap()
+        };
+        assert_eq!(
+            degraded(),
+            0,
+            "an old uninterpretable response cannot veto a later accepted response"
+        );
+        drop(recorder);
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        let replay = recorder
+            .replay_quota_journal(&root, &scope, || true)
+            .unwrap();
+        assert_eq!(replay.unresolved, 1);
+        assert_eq!(
+            replay.generation, None,
+            "restart must not reapply accepted input"
+        );
+        assert_eq!(degraded(), 0);
+        save("cc", 1_800_000_120, json!({"unrecognized": true}));
+        recorder
+            .replay_quota_journal(&root, &scope, || true)
+            .unwrap();
+        assert_eq!(degraded(), 1, "the latest input really is unrecognized");
+        // A subsequent successful acquisition owns recovery. Its clock may
+        // move backwards; durable acquisition sequence still owns current.
+        save("dd", 1_800_000_030, payload(1));
+        let replay = recorder
+            .replay_quota_journal(&root, &scope, || true)
+            .unwrap();
+        assert_eq!(replay.unresolved, 2);
+        assert_eq!(degraded(), 0);
+        let current = recorder.writer.latest_quota_receipt().unwrap().unwrap();
+        assert_eq!(
+            (
+                current.sequence,
+                current.observed_at,
+                current.remaining_percent
+            ),
+            (4, 1_800_000_030, 99.0)
+        );
+        recorder
+            .run_cycle_with_stored_quota_guarded(|| true)
+            .unwrap();
+        assert_eq!(recorder.state().unwrap().reset_at, 1_800_604_800);
+        let journal = Connection::open(root.join("history/quota/observations.sqlite3")).unwrap();
+        assert_eq!(
+            journal
+                .query_row("SELECT COUNT(*) FROM quota_observations", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        drop(journal);
+        drop(db);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue_637_replay_preserves_actual_acquisition_failure_after_restart() {
+        let (root, database) = prepare("issue637-restart-actual-failure");
+        let scope = identity().account_scope_id;
+        quota_journal::QuotaReceipt::new(
+            1_800_000_000,
+            Some(scope.clone()),
+            "pro",
+            &json!({"rateLimits":{"primary":{
+                "usedPercent":1,"resetsAt":1800604800_i64,"windowDurationMins":10080
+            }}}),
+        )
+        .with_id("bb".repeat(32))
+        .save(&root, true)
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        recorder.set_quota_acquisition_degraded(true).unwrap();
+        drop(recorder);
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        let replay = recorder
+            .replay_quota_journal(&root, &scope, || true)
+            .unwrap();
+        assert_eq!(replay.unresolved, 0);
+        let current = recorder.writer.latest_quota_receipt().unwrap().unwrap();
+        assert_eq!((current.sequence, current.remaining_percent), (1, 99.0));
+        let db = Connection::open(&database).unwrap();
+        let degraded: i64 = db
+            .query_row(
+                "SELECT degraded FROM quota_acquisition_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            degraded, 1,
+            "replay must not claim that a real acquisition failure recovered"
+        );
+        drop(db);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue_637_replay_recovers_latest_saved_input_after_restart_without_health_override() {
+        let (root, database) = prepare("issue637-restart-health");
+        let scope = identity().account_scope_id;
+        let save = |id: &str, payload: Value| {
+            quota_journal::QuotaReceipt::new(1_800_000_000, Some(scope.clone()), "pro", &payload)
+                .with_id(id.repeat(32))
+                .save(&root, true)
+                .unwrap();
+        };
+        save("aa", json!({"unknown": true}));
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        recorder
+            .replay_quota_journal(&root, &scope, || true)
+            .unwrap();
+        let db = Connection::open(&database).unwrap();
+        let health = || {
+            db.query_row(
+                "SELECT degraded OR input_degraded FROM quota_acquisition_state WHERE singleton=1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(health(), 1);
+        save(
+            "bb",
+            json!({"rateLimits":{"primary":{
+                "usedPercent":1,"resetsAt":1800604800_i64,"windowDurationMins":10080
+            }}}),
+        );
+        drop(recorder);
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        let replay = recorder
+            .replay_quota_journal(&root, &scope, || true)
+            .unwrap();
+        assert_eq!(replay.unresolved, 1);
+        let current = recorder.writer.latest_quota_receipt().unwrap().unwrap();
+        assert_eq!((current.sequence, current.remaining_percent), (2, 99.0));
+        assert_eq!(
+            health(),
+            0,
+            "a saved later official response recovers replay after restart without a new poll"
+        );
+        let raw = Connection::open(root.join("history/quota/observations.sqlite3")).unwrap();
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM quota_observations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(raw);
+        drop(db);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

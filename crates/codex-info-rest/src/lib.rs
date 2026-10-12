@@ -51,6 +51,7 @@ pub struct PublishedSnapshot {
     pub pair: String,
     pub history_available: bool,
     pub has_pending_ranges: bool,
+    pub acquisition_degraded: bool,
     pub details: PublicDetails,
     pub models_v3: Vec<codex_info_rest_contract::PublicModelUsageV3>,
     pub history_samples_v3: Vec<codex_info_rest_contract::PublicHistoryObservationV3>,
@@ -90,6 +91,7 @@ impl PublishedSnapshot {
             data_hash: snapshot.data_hash,
             pair,
             has_pending_ranges: snapshot.has_pending_ranges,
+            acquisition_degraded: snapshot.acquisition_degraded,
             history_available: snapshot.history_available,
             details: snapshot.details,
             models_v3: snapshot.models_v3,
@@ -122,6 +124,7 @@ impl PublishedSnapshot {
             pair: format!("v1:{:016x}{state_code:016x}{generation:032x}", 0),
             data_hash,
             has_pending_ranges: false,
+            acquisition_degraded: false,
             history_available: true,
             details,
             models_v3: Vec::new(),
@@ -189,17 +192,24 @@ impl AccountStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .current
             .as_ref()
-            .map(|snapshot| (snapshot.generation, snapshot.has_pending_ranges));
-        if let Some((current_generation, current_pending)) = current {
+            .map(|snapshot| {
+                (
+                    snapshot.generation,
+                    snapshot.has_pending_ranges,
+                    snapshot.acquisition_degraded,
+                )
+            });
+        if let Some((current_generation, current_pending, current_acquisition_degraded)) = current {
             match self.reader.read_change_marker() {
                 Ok(Some(marker))
                     if marker.generation == current_generation
-                        && marker.has_pending_ranges == current_pending =>
+                        && marker.has_pending_ranges == current_pending
+                        && marker.acquisition_degraded == current_acquisition_degraded =>
                 {
                     self.inner
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .degraded = marker.has_pending_ranges;
+                        .degraded = marker.acquisition_degraded;
                     return RefreshStatus::Unchanged {
                         generation: current_generation,
                     };
@@ -248,7 +258,7 @@ impl AccountStore {
                 match current {
                     None => {
                         let generation = candidate.generation;
-                        let degraded = candidate.has_pending_ranges;
+                        let degraded = candidate.acquisition_degraded;
                         inner.current = Some(Arc::new(candidate));
                         inner.degraded = degraded;
                         RefreshStatus::Updated { generation }
@@ -263,7 +273,9 @@ impl AccountStore {
                         if candidate.generation == current_generation
                             && candidate.data_hash == current_hash =>
                     {
-                        inner.degraded = candidate.has_pending_ranges;
+                        inner.degraded = candidate.acquisition_degraded;
+                        // Health/backlog can change without changing usage generation.
+                        inner.current = Some(Arc::new(candidate));
                         RefreshStatus::Unchanged {
                             generation: current_generation,
                         }
@@ -279,7 +291,7 @@ impl AccountStore {
                     }
                     Some(_) => {
                         let generation = candidate.generation;
-                        let degraded = candidate.has_pending_ranges;
+                        let degraded = candidate.acquisition_degraded;
                         inner.current = Some(Arc::new(candidate));
                         inner.degraded = degraded;
                         RefreshStatus::Updated { generation }
@@ -1110,12 +1122,12 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
                 Route::Details | Route::DetailsV2 | Route::DetailsV3 | Route::CurrentV3
             ) && (degraded || snapshot.details.state == PublicState::Error)
             {
-                let reason = if degraded && snapshot.has_pending_ranges {
-                    "incomplete_source_or_acquisition"
+                let reason = if degraded && snapshot.acquisition_degraded {
+                    "acquisition_failed"
                 } else if degraded {
                     "last_good_after_refresh_failure"
                 } else if snapshot.details.authenticated {
-                    "incomplete_source_or_acquisition"
+                    "incomplete_current_projection"
                 } else {
                     "account_boundary_error"
                 };
@@ -1781,6 +1793,7 @@ mod tests {
             data_hash: "hash".to_owned(),
             pair: "pair".to_owned(),
             has_pending_ranges: false,
+            acquisition_degraded: false,
             history_available: true,
             details,
             models_v3: Vec::new(),
@@ -1842,6 +1855,7 @@ mod tests {
             data_hash: "hash".to_owned(),
             pair: "pair".to_owned(),
             has_pending_ranges: false,
+            acquisition_degraded: false,
             history_available: true,
             details,
             models_v3: Vec::new(),
@@ -1990,6 +2004,7 @@ mod tests {
                 generation,
                 data_hash: format!("{generation:064x}"),
                 has_pending_ranges: false,
+                acquisition_degraded: false,
                 history_available: true,
                 details,
                 models_v3: Vec::new(),
@@ -2082,6 +2097,7 @@ mod tests {
             generation,
             data_hash: format!("{generation:064x}"),
             has_pending_ranges: snapshot.has_pending_ranges,
+            acquisition_degraded: snapshot.acquisition_degraded,
             history_available: snapshot.history_available,
             details: snapshot.details,
             models_v3: snapshot.models_v3,
@@ -2261,6 +2277,7 @@ mod tests {
                 generation: 1,
                 data_hash: format!("{:064x}", 1),
                 has_pending_ranges: false,
+                acquisition_degraded: false,
                 history_available: true,
                 details,
                 models_v3: Vec::new(),
@@ -2311,20 +2328,26 @@ mod tests {
             (OBSERVED, OLD_RESET - 1, 5.0),
             (OBSERVED - 60, OLD_RESET + 60, 100.0),
         ] {
-            assert_official_reset_reaches_rest(observed, reset, remaining);
+            assert_official_reset_reaches_rest(observed, reset, remaining, false);
         }
+    }
+
+    #[test]
+    fn issue_637_official_weekly_reset_reaches_current_with_partial_session() {
+        assert_official_reset_reaches_rest(2_000_000_040, 2_000_604_761, 100.0, true);
     }
 
     fn assert_official_reset_reaches_rest(
         next_observed_at: i64,
         next_reset_at: i64,
         remaining: f64,
+        pending_history: bool,
     ) {
         use codex_info_db_writer::{StoragePartitionIdentity, UsageStore};
         use codex_info_recorder::{QuotaSnapshot, Recorder, RecorderConfig};
 
         // Fixed anonymous timestamps and percentages are an independent oracle.
-        // No Session file, quota poller, account RPC, or production profile is used.
+        // The partial-session case uses real recorder collection; no production profile is used.
         const OBSERVED_AT: i64 = 2_000_000_040;
         const WINDOW: i64 = 7 * 24 * 60 * 60;
         const REPEAT_OBSERVED_AT: i64 = OBSERVED_AT + 120;
@@ -2397,6 +2420,11 @@ mod tests {
         );
         assert_eq!(before_value["quota"]["window_seconds"], WINDOW);
 
+        let partial = sessions.join("incomplete.jsonl");
+        const PARTIAL_BYTES: &[u8] = br#"{"type":"response_item","payload":"#;
+        if pending_history {
+            fs::write(&partial, PARTIAL_BYTES).unwrap();
+        }
         let rolled = recorder
             .run_cycle_with_quota(Some(QuotaSnapshot {
                 observed_at: next_observed_at,
@@ -2408,11 +2436,15 @@ mod tests {
             .expect("idle quota-only commit");
         assert!(rolled.generation > first.generation);
         assert_eq!(rolled.accepted_ranges, 0);
-        assert_eq!(rolled.pending_ranges, 0);
-        assert_eq!(rolled.sources_seen, 0);
-        assert_eq!(fs::read_dir(&sessions).unwrap().count(), 0);
+        assert_eq!(rolled.pending_ranges, usize::from(pending_history));
+        assert_eq!(rolled.sources_seen, usize::from(pending_history));
+        assert_eq!(
+            fs::read_dir(&sessions).unwrap().count(),
+            usize::from(pending_history)
+        );
 
         let connection = Connection::open(&database).expect("fixture DB assertions");
+
         let generation: (String, i64, i64, i64) = connection
             .query_row(
                 "SELECT data_generation, reset_at, latest_quota_reset_at, window_seconds
@@ -2454,7 +2486,12 @@ mod tests {
         );
         assert!(after.starts_with("HTTP/1.1 200"));
         let after_value: Value = serde_json::from_str(body(&after)).expect("new current JSON");
-        assert_eq!(after_value["state"], "ready");
+        assert_eq!(after_value["state"], if pending_history { "error" } else { "ready" },
+            "a genuinely incomplete current model set stays incomplete without rejecting official quota");
+        assert_eq!(
+            server.store().snapshot().unwrap().has_pending_ranges,
+            pending_history
+        );
         assert_eq!(
             after_value["observed_at"],
             next_observed_at.max(OBSERVED_AT)
@@ -2499,6 +2536,25 @@ mod tests {
         assert_eq!(repeated_value["observed_at"], REPEAT_OBSERVED_AT);
         assert_eq!(repeated_value["quota"]["remaining_percent"], 99.0);
         assert_eq!(repeated_value["quota"]["reset_at"], next_reset_at);
+        if pending_history {
+            assert_eq!(repeated_value["state"], "error");
+            assert_eq!(fs::read(&partial).unwrap(), PARTIAL_BYTES);
+            assert_eq!(
+                Connection::open(&database)
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM session_pending_ranges WHERE complete=0",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+            assert!(
+                !server.store().snapshot().unwrap().acquisition_degraded,
+                "source incompleteness is not an acquisition failure"
+            );
+        }
         server.shutdown();
     }
 
@@ -3172,14 +3228,14 @@ mod tests {
         let wire = "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n";
         let _ = request(server.local_addr(), wire);
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch("CREATE TABLE session_pending_ranges(source_id TEXT, range_start INTEGER, complete INTEGER); INSERT INTO session_pending_ranges VALUES('private-source-name',0,0); UPDATE collection_generation SET data_generation='2';").unwrap();
+        connection.execute_batch("CREATE TABLE session_pending_ranges(source_id TEXT, range_start INTEGER, complete INTEGER); INSERT INTO session_pending_ranges VALUES('private-source-name',0,0); CREATE TABLE quota_acquisition_state(singleton INTEGER PRIMARY KEY, degraded INTEGER); INSERT INTO quota_acquisition_state VALUES(1,1); UPDATE collection_generation SET data_generation='2';").unwrap();
         let pending = request(server.local_addr(), wire);
         assert_eq!(
             serde_json::from_str::<Value>(body(&pending)).unwrap()["state"],
             "error"
         );
         connection
-            .execute_batch("DELETE FROM session_pending_ranges; UPDATE collection_generation SET data_generation='3';")
+            .execute_batch("UPDATE quota_acquisition_state SET degraded=0; UPDATE collection_generation SET data_generation='3';")
             .unwrap();
         drop(connection);
         let _ = request(server.local_addr(), wire);
@@ -3211,7 +3267,7 @@ mod tests {
             "every HTTP200 error state must be diagnosed; ready/initializing are not errors: {log}"
         );
         for (row, reason) in publication.iter().zip([
-            "incomplete_source_or_acquisition",
+            "acquisition_failed",
             "last_good_after_refresh_failure",
             "account_boundary_error",
         ]) {
@@ -3988,7 +4044,7 @@ mod tests {
             .collect();
         assert_eq!(publications.len(), 4);
         for row in publications {
-            assert_eq!(row["reason"], "incomplete_source_or_acquisition");
+            assert_eq!(row["reason"], "incomplete_current_projection");
         }
         connection
             .execute_batch(
@@ -4047,7 +4103,68 @@ mod tests {
     }
 
     #[test]
-    fn only_incomplete_ranges_mark_details_degraded_without_clearing_data() {
+    fn issue_637_acquisition_failure_and_recovery_are_independent_of_pending_history() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("usage.sqlite3");
+        fixture(&path, 10);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE session_pending_ranges(source_id TEXT, range_start INTEGER, complete INTEGER);
+             INSERT INTO session_pending_ranges VALUES('incomplete',0,0);
+             CREATE TABLE quota_acquisition_state(singleton INTEGER PRIMARY KEY, degraded INTEGER);
+             INSERT INTO quota_acquisition_state VALUES(1,1);").unwrap();
+        let mut server = RestServer::start(
+            DbReader::open(&path).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let routes = ["/v1/details", "/v2/details", "/v3/details", "/v3/current"];
+        let failures = routes.map(|route| {
+            let response = request(
+                server.local_addr(),
+                &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(body(&response)).unwrap()["state"],
+                "error"
+            );
+            response
+        });
+        // Health can recover without a new usage generation. The error ETag
+        // must not trap a client in its previous error state.
+        connection
+            .execute("UPDATE quota_acquisition_state SET degraded=0", [])
+            .unwrap();
+        for (route, failure) in routes.into_iter().zip(failures) {
+            let response = request(
+                server.local_addr(),
+                &format!(
+                    "GET {route} HTTP/1.1\r\nHost:x\r\nIf-None-Match: \"{}\"\r\n\r\n",
+                    published_pair(&failure)
+                ),
+            );
+            assert!(response.starts_with("HTTP/1.1 200"));
+            let recovered: Value = serde_json::from_str(body(&response)).unwrap();
+            let failed: Value = serde_json::from_str(body(&failure)).unwrap();
+            assert_eq!(recovered["state"], "ready");
+            assert_eq!(recovered["quota"], failed["quota"]);
+            assert_eq!(recovered["models"], failed["models"]);
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_pending_ranges WHERE complete=0",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn issue_637_pending_history_does_not_revoke_successful_acquisition() {
         let path = temp_db("pending-ranges-wire");
         fixture(&path, 10);
         let reader = DbReader::open(&path).expect("reader");
@@ -4091,9 +4208,30 @@ mod tests {
             let response = request(server.local_addr(), &wire_request);
             let value: serde_json::Value =
                 serde_json::from_str(body(&response)).expect("pending JSON");
-            assert_eq!(value["state"], "error");
+            assert_eq!(value["state"], "ready");
             assert_eq!(value["history_samples"], previous["history_samples"]);
         }
+
+        // The current endpoint used by the Windows footer must agree with
+        // all details versions. Pending source evidence must remain durable.
+        let current = request(
+            server.local_addr(),
+            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let current: Value = serde_json::from_str(body(&current)).unwrap();
+        assert_eq!(current["state"], "ready");
+        assert_eq!(current["quota"], initial[2]["quota"]);
+        assert!(server.store().snapshot().unwrap().has_pending_ranges);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_pending_ranges WHERE complete=0",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
 
         connection
             .execute("DELETE FROM session_pending_ranges", [])

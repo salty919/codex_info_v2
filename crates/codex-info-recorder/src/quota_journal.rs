@@ -28,6 +28,8 @@ pub(super) struct QuotaReceipt {
 pub(super) struct ReplayBatch {
     pub receipts: Vec<codex_info_db_writer::QuotaReceipt>,
     pub unresolved: usize,
+    /// Failure of the latest settled input, not the historical backlog size.
+    pub latest_input_unresolved: Option<bool>,
 }
 
 pub(super) fn read_unapplied(
@@ -61,11 +63,13 @@ pub(super) fn read_unapplied(
         while let Some(row) = rows.next()? {
             let receipt_id: String = row.get(0)?;
             if applied.contains(&receipt_id) {
+                pending.latest_input_unresolved = Some(false);
                 continue;
             }
             if row.get::<_, i64>(5)? != 1 {
                 if !active.contains(&receipt_id) {
                     pending.unresolved += 1;
+                    pending.latest_input_unresolved = Some(true);
                 }
                 continue;
             }
@@ -73,18 +77,22 @@ pub(super) fn read_unapplied(
             let payload: String = row.get(4)?;
             let Ok(value) = serde_json::from_str::<Value>(&payload) else {
                 pending.unresolved += 1;
+                pending.latest_input_unresolved = Some(true);
                 continue;
             };
             let Ok(snapshot) = super::parse_app_server_quota(&value, &plan) else {
                 pending.unresolved += 1;
+                pending.latest_input_unresolved = Some(true);
                 // This record remains unapplied and is retried by a later
                 // parser. It cannot prevent subsequent valid inputs advancing.
                 continue;
             };
             let Some(remaining_percent) = snapshot.remaining_percent else {
                 pending.unresolved += 1;
+                pending.latest_input_unresolved = Some(true);
                 continue;
             };
+            pending.latest_input_unresolved = Some(false);
             pending.receipts.push(codex_info_db_writer::QuotaReceipt {
                 receipt_id,
                 sequence: row.get(1)?,

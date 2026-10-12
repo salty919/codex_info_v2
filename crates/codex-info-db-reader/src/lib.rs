@@ -45,9 +45,11 @@ pub struct DbSnapshot {
     /// A failed derived history must not revoke the independently accepted
     /// current quota, nor be published as an empty successful history.
     pub history_available: bool,
-    /// A pending recorder range means the durable snapshot is usable but not
-    /// complete.  REST exposes this as `state:error` while retaining values.
+    /// Historical source work remains incomplete. This does not describe
+    /// whether the current acquisition succeeded.
     pub has_pending_ranges: bool,
+    /// Current acquisition health, independent of historical pending work.
+    pub acquisition_degraded: bool,
     pub details: PublicDetails,
     /// The v3 model projection is kept beside the legacy details DTO.  v1/v2
     /// intentionally expose only SOL/TERRA/LUNA, while v3 must retain ASTRA
@@ -67,6 +69,7 @@ pub struct DbSnapshot {
 pub struct DbChangeMarker {
     pub generation: u64,
     pub has_pending_ranges: bool,
+    pub acquisition_degraded: bool,
 }
 
 /// Durable identity expected for one physical account database.
@@ -445,13 +448,14 @@ impl DbReader {
             &transaction,
             &self.read_intervals,
         );
-        let has_pending_ranges = read_pending_ranges(&transaction)?
-            || acquisition_degraded
-            || read_quota_acquisition_degraded(&transaction)?;
+        let has_pending_ranges = read_pending_ranges(&transaction)?;
+        let acquisition_degraded =
+            acquisition_degraded || read_quota_acquisition_degraded(&transaction)?;
         transaction.commit()?;
         Ok(Some(DbChangeMarker {
             generation,
             has_pending_ranges,
+            acquisition_degraded,
         }))
     }
 
@@ -469,10 +473,10 @@ impl DbReader {
             history_is_canonical,
             quota: read_latest_quota_receipt(&transaction)?,
         };
+        let has_pending_ranges = read_pending_ranges(&transaction)?;
+        let acquisition_degraded =
+            acquisition_degraded || read_quota_acquisition_degraded(&transaction)?;
         let projection = (|| -> Result<_, ReaderError> {
-            let has_pending_ranges = read_pending_ranges(&transaction)?
-                || acquisition_degraded
-                || read_quota_acquisition_degraded(&transaction)?;
             let all_history = read_history(&transaction, history_is_canonical)?;
             let raw = all_history
                 .iter()
@@ -508,7 +512,6 @@ impl DbReader {
                 history_samples_v2,
                 history_samples_v3,
                 generation,
-                has_pending_ranges,
             ))
         })();
         let (
@@ -517,7 +520,6 @@ impl DbReader {
             mut history_samples_v2,
             mut history_samples_v3,
             generation,
-            mut has_pending_ranges,
         ) = match projection {
             Ok(value) => value,
             Err(error) => {
@@ -533,7 +535,6 @@ impl DbReader {
                     Vec::new(),
                     Vec::new(),
                     generation,
-                    true,
                 )
             }
         };
@@ -563,7 +564,6 @@ impl DbReader {
                 models_v3.clear();
                 history_samples_v2.clear();
                 history_samples_v3.clear();
-                has_pending_ranges = true;
                 false
             }
         };
@@ -588,6 +588,7 @@ impl DbReader {
             data_hash,
             history_available,
             has_pending_ranges,
+            acquisition_degraded,
             details,
             models_v3,
             history_samples_v2,
@@ -1290,13 +1291,17 @@ fn read_quota_acquisition_degraded(connection: &Connection) -> Result<bool, Read
     if !table_exists(connection, "quota_acquisition_state")? {
         return Ok(false);
     }
-    let value: Option<i64> = connection
-        .query_row(
-            "SELECT degraded FROM quota_acquisition_state WHERE singleton=1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let input_present: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('quota_acquisition_state') WHERE name='input_degraded')",
+        [],
+        |row| row.get(0),
+    )?;
+    let query = if input_present {
+        "SELECT degraded OR input_degraded FROM quota_acquisition_state WHERE singleton=1"
+    } else {
+        "SELECT degraded FROM quota_acquisition_state WHERE singleton=1"
+    };
+    let value: Option<i64> = connection.query_row(query, [], |r| r.get(0)).optional()?;
     Ok(value.is_some_and(|value| value != 0))
 }
 
@@ -5724,7 +5729,7 @@ mod tests {
             .expect("reader")
             .read_snapshot()
             .expect("usage history remains readable");
-        assert!(snapshot.has_pending_ranges);
+        assert!(snapshot.acquisition_degraded);
         assert_eq!(snapshot.details.history_samples.len(), 1);
         assert_eq!(snapshot.history_samples_v3.len(), 1);
         assert_eq!(
@@ -5746,7 +5751,7 @@ mod tests {
             .expect("reader")
             .read_snapshot()
             .expect("usage history remains readable");
-        assert!(snapshot.has_pending_ranges);
+        assert!(snapshot.acquisition_degraded);
         assert_eq!(snapshot.details.history_samples.len(), 1);
         assert_eq!(snapshot.history_samples_v3.len(), 1);
         assert_eq!(
@@ -5765,14 +5770,15 @@ mod tests {
         add_active_thread_table(&path, &json, 1);
         let reader = DbReader::open(&path).expect("reader");
         let snapshot = reader.read_snapshot().expect("degraded snapshot");
-        assert!(snapshot.has_pending_ranges);
+        assert!(snapshot.acquisition_degraded);
         assert_eq!(snapshot.details.active_thread_count, 1);
         assert_eq!(snapshot.details.threads[0].id, "thread-sol");
         assert_eq!(
             reader.read_change_marker().expect("change marker"),
             Some(DbChangeMarker {
                 generation: 7,
-                has_pending_ranges: true,
+                has_pending_ranges: false,
+                acquisition_degraded: true,
             })
         );
         fs::remove_file(path).expect("cleanup");
@@ -6178,12 +6184,12 @@ mod tests {
                 .read_change_marker()
                 .unwrap()
                 .unwrap()
-                .has_pending_ranges,
+                .acquisition_degraded,
             "quota failure must invalidate current even without thread data"
         );
         let snapshot = reader.read_snapshot().unwrap();
         assert_latest_receipt_quota(&snapshot);
-        assert!(snapshot.has_pending_ranges);
+        assert!(snapshot.acquisition_degraded);
         assert_eq!(snapshot.details.state, PublicState::Error);
         fs::remove_file(path).unwrap();
     }
@@ -6730,6 +6736,7 @@ mod tests {
             Some(DbChangeMarker {
                 generation: 7,
                 has_pending_ranges: false,
+                acquisition_degraded: false,
             })
         );
 
@@ -6748,6 +6755,7 @@ mod tests {
             Some(DbChangeMarker {
                 generation: 7,
                 has_pending_ranges: false,
+                acquisition_degraded: false,
             })
         );
 
@@ -6762,6 +6770,7 @@ mod tests {
             Some(DbChangeMarker {
                 generation: 7,
                 has_pending_ranges: true,
+                acquisition_degraded: false,
             })
         );
         connection
@@ -6775,6 +6784,7 @@ mod tests {
             Some(DbChangeMarker {
                 generation: 8,
                 has_pending_ranges: true,
+                acquisition_degraded: false,
             })
         );
         fs::remove_file(path).expect("cleanup");
