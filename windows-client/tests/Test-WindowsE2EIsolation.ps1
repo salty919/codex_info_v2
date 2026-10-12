@@ -16,6 +16,8 @@ $testRoot = Join-Path ([IO.Path]::GetFullPath($OutputDirectory)) ([Guid]::NewGui
 $originalLocalAppData = $env:LOCALAPPDATA
 $failures = [System.Collections.Generic.List[string]]::new()
 $focusCases = @()
+$popupCases = @()
+$hoverCases = @()
 
 try {
     $cases = if ($CallerOnly) { @() } else {
@@ -76,8 +78,10 @@ try {
     $null = New-Item -ItemType Directory -Path $callerRoot -Force
     $runner = Join-Path $callerRoot 'Runner.ps1'
     [IO.File]::WriteAllText($runner, @'
-param([string]$ClientPath, [string]$OutputDirectory, [switch]$Fixture, [switch]$SettingsTabs)
-@{ fixture = [bool]$Fixture; settings = [bool]$SettingsTabs; output = $OutputDirectory } |
+param([string]$ClientPath, [string]$OutputDirectory, [switch]$Fixture,
+    [switch]$SettingsTabs, [switch]$ThemePresets, [switch]$GraphThemes, [switch]$CalendarOnly)
+@{ fixture = [bool]$Fixture; settings = [bool]$SettingsTabs;
+    themes = [bool]$ThemePresets; graph = [bool]$GraphThemes; calendar = [bool]$CalendarOnly; output = $OutputDirectory } |
     ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $PSScriptRoot 'calls.jsonl')
 '@)
     $moveSmoke = Join-Path $callerRoot 'Move.ps1'
@@ -99,14 +103,26 @@ param([string]$ClientPath, [switch]$AllowPhysicalInput)
     $body = $invokeBlock.Body.Extent.Text
     & ([ScriptBlock]::Create($body.Substring(1, $body.Length - 2)))
     $calls = @(Get-Content -LiteralPath (Join-Path $callerRoot 'calls.jsonl') | ConvertFrom-Json)
-    $callerPassed = $calls.Count -eq 2 -and $calls[0].fixture -and $calls[1].fixture -and
-        -not $calls[0].settings -and $calls[1].settings -and
-        $calls[0].output -eq (Join-Path $OutputDirectory 'standard') -and
-        $calls[1].output -eq (Join-Path $OutputDirectory 'settings')
-    if ($callerPassed) { Write-Host 'windows-e2e-isolation: PASS caller-settings-route' }
+    $expectedRoutes = @(
+        @{ Directory = 'standard'; Settings = $false; Themes = $false; Graph = $false; Calendar = $false },
+        @{ Directory = 'settings'; Settings = $true; Themes = $false; Graph = $false; Calendar = $false },
+        @{ Directory = 'theme-presets'; Settings = $false; Themes = $true; Graph = $false; Calendar = $false },
+        @{ Directory = 'graph-themes'; Settings = $false; Themes = $false; Graph = $true; Calendar = $false },
+        @{ Directory = 'calendar'; Settings = $false; Themes = $false; Graph = $false; Calendar = $true }
+    )
+    $callerPassed = $calls.Count -eq $expectedRoutes.Count
+    for ($index = 0; $callerPassed -and $index -lt $expectedRoutes.Count; $index++) {
+        $actual = $calls[$index]
+        $expected = $expectedRoutes[$index]
+        $callerPassed = $actual.fixture -and $actual.settings -eq $expected.Settings -and
+            $actual.themes -eq $expected.Themes -and $actual.graph -eq $expected.Graph -and
+            $actual.calendar -eq $expected.Calendar -and
+            $actual.output -eq (Join-Path $OutputDirectory $expected.Directory)
+    }
+    if ($callerPassed) { Write-Host 'windows-e2e-isolation: PASS caller-screen-routes' }
     else {
-        $failures.Add('caller-settings-route')
-        Write-Host "windows-e2e-isolation: FAIL caller-settings-route calls=$($calls.Count)"
+        $failures.Add('caller-screen-routes')
+        Write-Host "windows-e2e-isolation: FAIL caller-screen-routes calls=$($calls.Count)"
     }
     $priorLog = Join-Path $OutputDirectory 'window-move-smoke.log'
     [IO.File]::WriteAllText($priorLog, 'preserve prior caller evidence')
@@ -114,13 +130,180 @@ param([string]$ClientPath, [switch]$AllowPhysicalInput)
     try { & ([ScriptBlock]::Create($body.Substring(1, $body.Length - 2))) }
     catch { $failure = $_.Exception.Message }
     $afterCalls = @(Get-Content -LiteralPath (Join-Path $callerRoot 'calls.jsonl'))
-    if ($null -ne $failure -and $afterCalls.Count -eq 2 -and
+    if ($null -ne $failure -and $afterCalls.Count -eq $calls.Count -and
         [IO.File]::ReadAllText($priorLog) -eq 'preserve prior caller evidence') {
         Write-Host 'windows-e2e-isolation: PASS caller-existing-evidence'
     }
     else {
         $failures.Add('caller-existing-evidence')
         Write-Host 'windows-e2e-isolation: FAIL caller-existing-evidence'
+    }
+
+    if (-not $CallerOnly) {
+        # These caller tests use no desktop or UIA runtime. The desktop double
+        # rejects global subtree searches, even when a PID condition is supplied.
+        Add-Type -TypeDefinition @'
+using System;
+using System.Linq;
+namespace System.Windows.Automation {
+    public static class ControlType { public static readonly object ListItem = new object(); }
+    public enum TreeScope { Children, Descendants }
+    public abstract class Condition { public abstract bool Matches(AutomationElement element); }
+    public class PropertyCondition : Condition {
+        readonly object property, value;
+        public PropertyCondition(object property, object value) { this.property=property; this.value=value; }
+        public override bool Matches(AutomationElement element) {
+            return property == AutomationElement.ProcessIdProperty
+                ? element.ProcessId == Convert.ToInt32(value) : element.AutomationId == (string)value;
+        }
+    }
+    public class AndCondition : Condition {
+        readonly Condition left, right;
+        public AndCondition(Condition left, Condition right) { this.left=left; this.right=right; }
+        public override bool Matches(AutomationElement element) { return left.Matches(element) && right.Matches(element); }
+    }
+    public class AutomationElement {
+        public static readonly object ProcessIdProperty = new object(), AutomationIdProperty = new object();
+        public static AutomationElement RootElement;
+        public bool Desktop, Fail, IsOffscreen;
+        public int ProcessId;
+        public string AutomationId;
+        public AutomationElement Current { get { return this; } }
+        public AutomationElement[] Elements = new AutomationElement[0];
+        public AutomationElement[] FindAll(TreeScope scope, Condition condition) {
+            if (Desktop && scope == TreeScope.Descendants) throw new InvalidOperationException("Global desktop subtree query");
+            if (Fail) throw new InvalidOperationException("Owned provider failure");
+            return Elements.Where(condition.Matches).ToArray();
+        }
+    }
+}
+'@
+        $hoverAst = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
+        $hoverHelper = $hoverAst.Find({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Find-E2EGraphHoverElement'
+        }, $false)
+        if ($null -eq $hoverHelper) { throw 'Graph hover query helper is missing.' }
+        . ([ScriptBlock]::Create($hoverHelper.Extent.Text))
+        $hoverCases = @('owned-popup', 'foreign-popup', 'hidden-popup', 'provider-error')
+        foreach ($case in $hoverCases) {
+            $timestamp = New-Object System.Windows.Automation.AutomationElement
+            $timestamp.ProcessId = 42
+            $timestamp.AutomationId = 'Graph.Hover.Timestamp'
+            $timestamp.IsOffscreen = $case -eq 'hidden-popup'
+            $owned = New-Object System.Windows.Automation.AutomationElement
+            $owned.ProcessId = 42
+            if ($case -ne 'foreign-popup') { $owned.Elements = @($timestamp) }
+            $owned.Fail = $case -eq 'provider-error'
+            $foreign = New-Object System.Windows.Automation.AutomationElement
+            $foreign.ProcessId = 99
+            $foreign.Elements = @($timestamp)
+            $foreign.Fail = $true
+            $desktop = New-Object System.Windows.Automation.AutomationElement
+            $desktop.Desktop = $true
+            $desktop.Elements = @($foreign, $owned)
+            [System.Windows.Automation.AutomationElement]::RootElement = $desktop
+            $failure = $null
+            $actual = $null
+            try { $actual = Find-E2EGraphHoverElement 42 'Graph.Hover.Timestamp' }
+            catch { $failure = $_.Exception.Message }
+            $passed = if ($case -eq 'provider-error') {
+                $null -ne $failure -and $failure.Contains('Owned provider failure')
+            } elseif ($case -eq 'owned-popup') {
+                $null -eq $failure -and [object]::ReferenceEquals($actual, $timestamp)
+            } else { $null -eq $failure -and $null -eq $actual }
+            if ($passed) { Write-Host "windows-e2e-isolation: PASS hover-$case" }
+            else { $failures.Add("hover-$case"); Write-Host "windows-e2e-isolation: FAIL hover-$case error=$failure" }
+        }
+        $popupStart = $source.IndexOf("    # The popup is an overlay in the Graph HWND", [StringComparison]::Ordinal)
+        $popupEnd = $source.IndexOf('    Bring-E2EWindowToFront $Windows.Settings.Handle', $popupStart, [StringComparison]::Ordinal)
+        if ($popupStart -lt 0 -or $popupEnd -le $popupStart) { throw 'Theme popup capture block is missing.' }
+        $popupBody = [ScriptBlock]::Create($source.Substring($popupStart, $popupEnd - $popupStart))
+        Add-Type -AssemblyName System.Drawing
+        $pixelAst = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
+        $pixelHelper = $pixelAst.Find({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Assert-E2EThemePixel'
+        }, $false)
+        if ($null -eq $pixelHelper) { throw 'Theme pixel helper is missing.' }
+        $imageRoot = Join-Path $testRoot 'popup-pixels'
+        $null = New-Item -ItemType Directory -Path $imageRoot -Force
+        $popupCases = @('visible', 'closed-after-capture', 'hidden-before-capture',
+            'selection-hidden-before-capture', 'missing-popup-color', 'missing-selected-color')
+        foreach ($case in $popupCases) {
+            $passed = & {
+                param($Case, $Body, $PixelHelper, $ImageRoot)
+                $graph = @{ Root = 'graph'; Handle = [IntPtr]7 }
+                $ThemeId = 'fixed-theme'
+                $colors = @{ Popup = '#112233'; PopupSelected = '#445566' }
+                $menu = [pscustomobject]@{ Current = [pscustomobject]@{
+                    IsOffscreen = $Case -eq 'hidden-before-capture'
+                    BoundingRectangle = [pscustomobject]@{ Left=10; Top=20; Width=60; Height=40; Right=70; Bottom=60 }
+                } }
+                $item = [pscustomobject]@{ Current = [pscustomobject]@{
+                    Name = 'Past'; IsOffscreen = $false
+                    BoundingRectangle = [pscustomobject]@{ Left=10; Top=40; Width=60; Height=20; Right=70; Bottom=60 }
+                } }
+                $state = @{ Captured=$false; PixelChecks=0 }
+                function Assert-E2E { param($Condition,$Message) if (-not $Condition) { throw $Message } }
+                function Find-E2EElementByAutomationId { param($Root,$Id) if ($Id -eq 'Graph.PeriodMenu') { return $menu }; return 'selector' }
+                function Bring-E2EWindowToFront { param($Handle) }
+                function Toggle-E2EElement { param($Element) }
+                function Wait-E2E { param($Description,$Probe) $value = & $Probe; if (-not $value) { throw 'Menu is hidden before capture.' }; return $value }
+                function Get-E2EVisibleControlElements { param($Root,$Type) return $item }
+                function Get-E2ESelectedListItemLabel {
+                    param($Items)
+                    if ($Case -eq 'selection-hidden-before-capture') { $item.Current.IsOffscreen = $true }
+                    return 'Past'
+                }
+                function Get-E2EWindowBounds { param($Handle) return @{ Left=0; Top=0 } }
+                function Write-E2E { param($Message) $state.PixelChecks++ }
+                . ([ScriptBlock]::Create($PixelHelper))
+                function Capture-E2EWindow {
+                    param($Handle,$Name)
+                    $state.Captured = $true
+                    $path = Join-Path $ImageRoot ($Case + '.png')
+                    $bitmap = New-Object System.Drawing.Bitmap(80, 80)
+                    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                    $background = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(17,34,51))
+                    $selectedBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(68,85,102))
+                    try {
+                        $graphics.Clear([System.Drawing.Color]::Black)
+                        if ($Case -ne 'missing-popup-color') { $graphics.FillRectangle($background, 10, 20, 60, 40) }
+                        if ($Case -notin @('missing-popup-color', 'missing-selected-color')) {
+                            $graphics.FillRectangle($selectedBrush, 10, 40, 60, 20)
+                        }
+                        $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+                    }
+                    finally { $selectedBrush.Dispose(); $background.Dispose(); $graphics.Dispose(); $bitmap.Dispose() }
+                    if ($Case -eq 'closed-after-capture') {
+                        $menu.Current.IsOffscreen = $true
+                        $item.Current.IsOffscreen = $true
+                        $menu.Current.BoundingRectangle = [pscustomobject]@{ Left=0; Top=0; Width=0; Height=0; Right=0; Bottom=0 }
+                        $item.Current.BoundingRectangle = $menu.Current.BoundingRectangle
+                    }
+                    return @{ Path=$path }
+                }
+                $failure = $null
+                try { & $Body } catch { $failure = $_.Exception.Message }
+                if ($Case -eq 'hidden-before-capture') {
+                    return $failure -eq 'Menu is hidden before capture.' -and -not $state.Captured -and $state.PixelChecks -eq 0
+                }
+                if ($Case -eq 'selection-hidden-before-capture') {
+                    return $failure -eq 'Graph period selection is not visible before capture.' -and -not $state.Captured
+                }
+                if ($Case -in @('missing-popup-color', 'missing-selected-color')) {
+                    $role = if ($Case -eq 'missing-popup-color') { 'popup-surface' } else { 'popup-selected' }
+                    $successfulChecks = if ($Case -eq 'missing-popup-color') { 0 } else { 1 }
+                    return $null -ne $failure -and $failure.StartsWith("fixed-theme/Graph/$role has no rendered ") -and
+                        $state.Captured -and $state.PixelChecks -eq $successfulChecks
+                }
+                if ($null -ne $failure) { Write-Host "popup evidence detail: $failure" }
+                return $null -eq $failure -and $state.PixelChecks -eq 2
+            } $case $popupBody $pixelHelper.Extent.Text $imageRoot
+            if ($passed) { Write-Host "windows-e2e-isolation: PASS popup-$case" }
+            else { $failures.Add("popup-$case"); Write-Host "windows-e2e-isolation: FAIL popup-$case" }
+        }
     }
 
     if (-not $CallerOnly) {
@@ -182,4 +365,7 @@ finally { $env:LOCALAPPDATA = $originalLocalAppData }
 if ($failures.Count -ne 0) {
     throw "E2E isolation failures: $($failures -join ', ')"
 }
-Write-Host "windows-e2e-isolation: PASS $($cases.Count + 2 + $focusCases.Count) cases"
+Write-Host "windows-e2e-isolation: PASS $($cases.Count + 2 + $focusCases.Count + $popupCases.Count + $hoverCases.Count) cases"
+& (Join-Path $PSScriptRoot 'Test-WindowsCalendarE2E.ps1')
+& (Join-Path $PSScriptRoot 'Test-WindowsMainRecoveryE2E.ps1')
+& (Join-Path $PSScriptRoot 'Test-WindowsSetupE2E.ps1')

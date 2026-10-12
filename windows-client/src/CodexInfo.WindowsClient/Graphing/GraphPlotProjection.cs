@@ -927,7 +927,6 @@ internal static class GraphPlotProjection
                         scene.Timestamps[left],
                         scene.Timestamps[right]) ||
                     crossesPrediction ||
-                    IsLongUnobservedTokenIncrease(scene, left, right) ||
                     !measured;
                 if (dashed && AppendStoppedBridge(scene, scene.Timestamps[left], before,
                         scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
@@ -1137,7 +1136,6 @@ internal static class GraphPlotProjection
                 var dashed = scene.HasConfirmedGapBetween(
                         scene.Timestamps[left],
                         scene.Timestamps[right]) ||
-                    IsLongUnobservedTokenIncrease(scene, left, right) ||
                     crossesPrediction;
                 if (dashed && AppendStoppedBridge(scene, scene.Timestamps[left], before,
                         scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
@@ -1276,12 +1274,6 @@ internal static class GraphPlotProjection
         double timestamp) =>
         intervals.Any(interval =>
             timestamp >= interval.StartAt && timestamp <= interval.EndAt);
-
-    private static bool IsLongUnobservedTokenIncrease(GraphScene scene, int left, int right) =>
-        scene.Metric == GraphMetric.Tokens &&
-        scene.Timestamps[right] - scene.Timestamps[left] >= GraphScene.SustainedUnusedMinimumSeconds &&
-        scene.TryGetTokenIntervalEvidence(left, right, out var advanced) &&
-        advanced;
 
     /// <summary>Returns every evidence interval without a pixel-width filter.</summary>
     public static IReadOnlyList<GraphIdleInterval> BuildVisibleIdleIntervals(GraphScene scene)

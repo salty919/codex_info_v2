@@ -834,10 +834,12 @@ public sealed class GraphWindowRangeTests
         graph.ShowSol = false;
         graph.SelectedTimeRange = GraphTimeRange.CalendarMonth;
         await EventuallyAsync(() => graph.IsMonthView && graph.Scene.IsDaily);
+        Assert.Equal("2026/10", graph.RangeLabel);
         Assert.False(graph.HasLinePlot);
         Assert.Contains(graph.CalendarDays, day => day.ValueText == "3 M");
         graph.IsTokensMetric = false;
         await EventuallyAsync(() => graph.Scene.Metric == GraphMetric.Dollars);
+        Assert.Equal("2026/10", graph.RangeLabel);
         Assert.Contains(graph.CalendarDays, day => day.ValueText == "$7.50");
         Assert.False(graph.ShowSol);
         graph.SelectedTimeRange = GraphTimeRange.ResetPeriod;

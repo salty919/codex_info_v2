@@ -136,26 +136,24 @@ public sealed class GraphAccountOwnershipIntervalTests
         Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(noOwnershipScene));
         Assert.Empty(noOwnershipScene.IdleIntervals);
 
-        var noOwnershipModelLines = GraphPlotProjection.BuildCanonicalModelLines(
+        var noOwnershipModelLines = GraphPlotProjection.BuildModelLines(
             noOwnershipScene,
             noOwnershipScene.Luna);
-        AssertNoOwnershipGapCrossings(
-            ownershipGapStartAt,
-            ownershipGapEndAt,
-            noOwnershipModelLines.Idle.Line,
-            noOwnershipModelLines.Flat.Line,
-            noOwnershipModelLines.Rising.Line);
-        Assert.NotEmpty(noOwnershipModelLines.Dashed.Line.X);
+        // Without ownership or gap metadata, spacing alone cannot turn
+        // confirmed observations into missing data. Only the tail is inferred.
+        Assert.Contains((double)firstTimestamp, noOwnershipModelLines.Rising.X);
+        Assert.Contains((double)secondTimestamp, noOwnershipModelLines.Rising.X);
+        Assert.NotEmpty(noOwnershipModelLines.Dashed.X);
+        Assert.All(noOwnershipModelLines.Dashed.X.Where(double.IsFinite),
+            timestamp => Assert.True(timestamp >= secondTimestamp));
 
-        var noOwnershipRemainingLines = GraphPlotProjection.BuildCanonicalRemainingLines(
-            noOwnershipScene,
-            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
-        AssertNoOwnershipGapCrossings(
-            ownershipGapStartAt,
-            ownershipGapEndAt,
-            noOwnershipRemainingLines.Idle.Line,
-            noOwnershipRemainingLines.Solid.Line);
-        Assert.NotEmpty(noOwnershipRemainingLines.Dashed.Line.X);
+        var noOwnershipRemainingLines = GraphPlotProjection.BuildRemainingLines(
+            noOwnershipScene);
+        Assert.Contains((double)firstTimestamp, noOwnershipRemainingLines.Solid.X);
+        Assert.Contains((double)secondTimestamp, noOwnershipRemainingLines.Solid.X);
+        Assert.NotEmpty(noOwnershipRemainingLines.Dashed.X);
+        Assert.All(noOwnershipRemainingLines.Dashed.X.Where(double.IsFinite),
+            timestamp => Assert.True(timestamp >= secondTimestamp));
     }
 
     private static void AssertOwnershipDashedSegments(

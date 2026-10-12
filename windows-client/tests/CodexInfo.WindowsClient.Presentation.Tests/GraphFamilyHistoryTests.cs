@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Graphing;
 using Xunit;
 
@@ -9,6 +10,154 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 
 public sealed class GraphFamilyHistoryTests
 {
+    [Theory]
+    [InlineData(GraphMetric.Tokens, 599, false)]
+    [InlineData(GraphMetric.Tokens, 600, false)]
+    [InlineData(GraphMetric.Tokens, 1_200, false)]
+    [InlineData(GraphMetric.Dollars, 1_200, false)]
+    [InlineData(GraphMetric.Tokens, 1_200, true)]
+    [InlineData(GraphMetric.Dollars, 1_200, true)]
+    public void ConfirmedObservationSpacingDoesNotInventMissingData(GraphMetric metric, long spacing, bool hasGap)
+    {
+        var samples = new[]
+        {
+            Sample(1_000, Model("gpt-6-luna", 100, 1)) with
+            { ModelSource = ApiHistorySample.ConfirmedModelSource, ModelsComplete = true, RemainingPercent = 90 },
+            Sample(1_000 + spacing, Model("gpt-6-luna", 200, 2)) with
+            { ModelSource = ApiHistorySample.ConfirmedModelSource, ModelsComplete = true, RemainingPercent = 80 },
+        };
+        var scene = GraphScene.Create(samples, metric, 1_000, 1_000 + spacing,
+            hasGap ? [new GraphConfirmedGap(1_010, 990 + spacing)] : []);
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Equal(hasGap, model.Dashed.X.Count > 0);
+        Assert.Equal(hasGap, remaining.Dashed.X.Count > 0);
+        var viewport = GraphScene.CreateViewport(1_000, 1_000 + spacing, metric, [scene]);
+        Assert.Equal(hasGap, GraphPlotProjection.BuildViewportModelLines(viewport, GraphSeries.Luna).Dashed.Line.X.Count > 0);
+        Assert.Equal(hasGap, GraphPlotProjection.BuildViewportRemainingLines(viewport).Dashed.Line.X.Count > 0);
+        Assert.Equal(metric == GraphMetric.Tokens ? new[] { 100d, 200d } : [1d, 2d], scene.Luna);
+        Assert.Equal(new[] { 90d, 80d }, scene.Remaining);
+        Assert.Equal(200UL, samples[1].Models[0].TotalTokens);
+        Assert.Empty(scene.IdleIntervals);
+        SaveLineImage(scene, $"confirmed-spacing-{metric}-{spacing}-gap-{hasGap}");
+    }
+
+    [Theory]
+    [InlineData(GraphMetric.Tokens)]
+    [InlineData(GraphMetric.Dollars)]
+    public void FamilyNameChangeKeepsMetricEvidenceIndependent(GraphMetric knownMetric)
+    {
+        var oldFamily = new ApiHistoryModelSample("LUNA", null, null, null,
+            knownMetric == GraphMetric.Dollars ? 0d : null)
+        {
+            TotalTokens = knownMetric == GraphMetric.Tokens ? 0UL : null,
+        };
+        var samples = new[]
+        {
+            Sample(1_000, oldFamily),
+            Sample(1_060, Model("gpt-6-luna", 200, 20)),
+            Sample(1_120, Model("gpt-6-luna", 300, 30)),
+        };
+        var known = GraphScene.Create(samples, knownMetric, 1_000, 1_120);
+        Assert.Equal(knownMetric == GraphMetric.Tokens ? new[] { 0d, 200d, 300d } : [0d, 20d, 30d], known.Luna);
+        Assert.Empty(GraphPlotProjection.BuildModelLines(known, known.Luna).Dashed.X);
+        var hover = Assert.IsType<GraphHoverSnapshot>(GraphHoverProjection.Find(
+            known, 1_060, new HashSet<GraphSeries> { GraphSeries.Luna }));
+        if (knownMetric == GraphMetric.Tokens)
+            Assert.Equal(200UL, Assert.Single(hover.Rows).TokenValue);
+        else
+            Assert.Equal(20d, Assert.Single(hover.Rows).NumericValue);
+
+        var unknownMetric = knownMetric == GraphMetric.Tokens ? GraphMetric.Dollars : GraphMetric.Tokens;
+        var unknown = GraphScene.Create(samples, unknownMetric, 1_000, 1_120);
+        Assert.All(unknown.Luna, value => Assert.True(double.IsNaN(value)));
+        var unknownHover = Assert.IsType<GraphHoverSnapshot>(GraphHoverProjection.Find(
+            unknown, 1_060, new HashSet<GraphSeries> { GraphSeries.Luna }));
+        Assert.Null(Assert.Single(unknownHover.Rows).TokenValue);
+        Assert.Null(Assert.Single(unknownHover.Rows).NumericValue);
+        Assert.Same(oldFamily, Assert.Single(samples[0].Models));
+    }
+
+    [Theory]
+    [InlineData("LUNA", "gpt-6-luna", GraphMetric.Tokens)]
+    [InlineData("LUNA", "gpt-6-luna", GraphMetric.Dollars)]
+    [InlineData("SOL", "gpt-6.1-sol", GraphMetric.Tokens)]
+    [InlineData("SOL", "gpt-6.1-sol", GraphMetric.Dollars)]
+    [InlineData("TERRA", "gpt-5.6-terra", GraphMetric.Tokens)]
+    [InlineData("TERRA", "gpt-5.6-terra", GraphMetric.Dollars)]
+    [InlineData("ASTRA", "gpt-6-astra", GraphMetric.Tokens)]
+    [InlineData("ASTRA", "gpt-6-astra", GraphMetric.Dollars)]
+    public void PublishedFamilyNameChangeKeepsRecordedLineAndHover(
+        string family, string model, GraphMetric metric)
+    {
+        // The history endpoint supplies its old family column until exact model
+        // rows for that family are available. Both names belong to one curve.
+        var samples = new[]
+        {
+            Sample(1_000, Model(family, 0, 0)),
+            Sample(1_060, Model(model, 200, 20)),
+            Sample(1_120, Model(model, 300, 30)),
+        };
+        var scene = GraphScene.Create(samples, metric, 1_000, 1_120);
+        var series = Enum.Parse<GraphSeries>(family, ignoreCase: true);
+        var values = scene.ModelSeries[family];
+        Assert.Equal(metric == GraphMetric.Tokens ? new[] { 0d, 200d, 300d } : [0d, 20d, 30d], values);
+        var lines = GraphPlotProjection.BuildModelLines(scene, values);
+        Assert.Empty(lines.Dashed.X);
+        Assert.Contains((1_060d, metric == GraphMetric.Tokens ? 200d : 20d), lines.Rising.X.Zip(lines.Rising.Y));
+        Assert.Contains((1_120d, metric == GraphMetric.Tokens ? 300d : 30d), lines.Rising.X.Zip(lines.Rising.Y));
+
+        var viewport = GraphScene.CreateViewport(1_000, 1_120, metric, [scene]);
+        foreach (var view in new[] { scene, viewport })
+        {
+            var hover = Assert.IsType<GraphHoverSnapshot>(GraphHoverProjection.Find(
+                view, 1_060, new HashSet<GraphSeries> { series }));
+            var row = Assert.Single(hover.Rows);
+            if (metric == GraphMetric.Tokens)
+                Assert.Equal(200UL, row.TokenValue);
+            else
+                Assert.Equal(20d, row.NumericValue);
+        }
+
+        // Display grouping must not manufacture raw model rows or idle evidence.
+        Assert.Single(samples[0].Models);
+        Assert.Equal(family, samples[0].Models[0].Name);
+        Assert.Equal(model, Assert.Single(samples[1].Models).Name);
+        Assert.True(double.IsNaN(scene.TokenModelSeries[model][0]));
+        Assert.All(scene.ModelReliability[family], Assert.False);
+        Assert.Empty(scene.IdleIntervals);
+        if (family == "LUNA")
+            SaveLineImage(scene, $"recorded-{metric}");
+    }
+
+    [Theory]
+    [InlineData(GraphMetric.Tokens)]
+    [InlineData(GraphMetric.Dollars)]
+    public void FamilyNameChangeDoesNotHideARealMissingInterval(GraphMetric metric)
+    {
+        var samples = new[]
+        {
+            Sample(1_000, Model("LUNA", 0, 0)),
+            Sample(1_060, Model("gpt-6-luna", 200, 20)),
+            Sample(1_120) with { ModelSource = ApiHistorySample.UnavailableModelSource, ModelSamples = null },
+            Sample(1_180, Model("gpt-6-luna", 300, 30)),
+            Sample(1_240, Model("gpt-6-luna", 400, 40)),
+        };
+        var scene = GraphScene.Create(samples, metric, 1_000, 1_240);
+        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
+        var observed = lines.Rising.X.Zip(lines.Rising.Y).ToArray();
+        Assert.Contains((1_180d, metric == GraphMetric.Tokens ? 300d : 30d), observed);
+        Assert.Contains((1_240d, metric == GraphMetric.Tokens ? 400d : 40d), observed);
+        Assert.Contains(1_060d, lines.Dashed.X);
+        Assert.Contains(1_180d, lines.Dashed.X);
+        Assert.DoesNotContain(lines.Dashed.X, time => double.IsFinite(time) && (time < 1_060 || time > 1_180));
+        var hover = Assert.IsType<GraphHoverSnapshot>(GraphHoverProjection.Find(
+            scene, 1_120, new HashSet<GraphSeries> { GraphSeries.Luna }));
+        Assert.Null(Assert.Single(hover.Rows).TokenValue);
+        Assert.Null(Assert.Single(hover.Rows).NumericValue);
+        SaveLineImage(scene, $"missing-interval-{metric}");
+    }
+
     [Theory]
     [InlineData(GraphMetric.Tokens, 24)]
     [InlineData(GraphMetric.Tokens, 168)]
@@ -124,6 +273,15 @@ public sealed class GraphFamilyHistoryTests
             ModelsComplete = false,
             ModelSamples = models,
         };
+
+    private static void SaveLineImage(GraphScene scene, string name)
+    {
+        var directory = Environment.GetEnvironmentVariable("CODEX_INFO_FAMILY_LINE_RENDER_DIR");
+        if (string.IsNullOrWhiteSpace(directory))
+            return;
+        Directory.CreateDirectory(directory);
+        new GraphPlotControl { Scene = scene }.Plot.SavePng(Path.Combine(directory, $"{name}.png"), 940, 480);
+    }
 
     private static ApiHistoryModelSample Model(string name, ulong tokens, double? dollars) =>
         new(name, null, null, null, dollars) { TotalTokens = tokens };

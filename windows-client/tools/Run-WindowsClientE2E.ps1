@@ -14,6 +14,9 @@ param(
     [switch]$ThemePresets,
     [switch]$GraphThemes,
     [switch]$GraphHoverOnly,
+    [switch]$CalendarOnly,
+    [switch]$MainRecoveryOnly,
+    [switch]$SetupOnly,
     [switch]$CompatibilitySmoke,
     [switch]$RequireCurrentPresentation,
     [string]$SourceSha = ''
@@ -21,14 +24,22 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($GraphHoverOnly -and (-not $Fixture -or $ThemePresets -or $GraphThemes -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation -or $SettingsTabs)) {
-    throw 'Graph hover validation requires only -Fixture -GraphHoverOnly.'
+if ($SetupOnly -and (-not $Fixture -or $MainRecoveryOnly -or $GraphHoverOnly -or $CalendarOnly -or $ThemePresets -or $GraphThemes -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation -or $SettingsTabs -or $NarrowPeriodCostFixture)) {
+    throw 'Setup validation requires only -Fixture -SetupOnly.'
+}
+
+if ($MainRecoveryOnly -and (-not $Fixture -or $GraphHoverOnly -or $CalendarOnly -or $ThemePresets -or $GraphThemes -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation -or $SettingsTabs -or $NarrowPeriodCostFixture)) {
+    throw 'Main recovery validation requires only -Fixture -MainRecoveryOnly.'
+}
+
+if (($GraphHoverOnly -or $CalendarOnly) -and (-not $Fixture -or $ThemePresets -or $GraphThemes -or $FixtureContractTest -or $CompatibilitySmoke -or $RequireCurrentPresentation -or $SettingsTabs -or ($GraphHoverOnly -and $CalendarOnly))) {
+    throw 'Focused graph validation requires -Fixture and exactly one focused mode.'
 }
 
 if ($NarrowPeriodCostFixture -and -not ($Fixture -or $FixtureContractTest)) {
     throw 'Narrow period-cost validation requires -Fixture or -FixtureContractTest.'
 }
-if ($NarrowPeriodCostFixture -and ($ThemePresets -or $GraphThemes -or $GraphHoverOnly -or $CompatibilitySmoke -or $RequireCurrentPresentation -or $SettingsTabs)) {
+if ($NarrowPeriodCostFixture -and ($ThemePresets -or $GraphThemes -or $GraphHoverOnly -or $CalendarOnly -or $CompatibilitySmoke -or $RequireCurrentPresentation -or $SettingsTabs)) {
     throw 'Narrow period-cost validation cannot be combined with another specialized E2E mode.'
 }
 
@@ -1225,6 +1236,11 @@ public static class CodexInfoWindowsE2EFixtureServer {
     private static Thread worker;
     private static volatile bool running;
     public static volatile bool RecorderVersionAvailable = true;
+    public static volatile bool CurrentUnavailable;
+    public static volatile bool AuthenticationRequired;
+    public static volatile bool PartialCurrentV4;
+    public static volatile bool EmptyThreads;
+    public static int PartialCurrentV4Requests;
     private static string detailsBody;
     private static string accountsBody;
     private static string currentBody;
@@ -1265,6 +1281,11 @@ public static class CodexInfoWindowsE2EFixtureServer {
             detailsBody = details;
             accountsBody = accounts;
             currentBody = current;
+            CurrentUnavailable = false;
+            AuthenticationRequired = false;
+            PartialCurrentV4 = false;
+            EmptyThreads = false;
+            PartialCurrentV4Requests = 0;
             periodsBody = periods;
             currentHistoryBody = currentHistory;
             pastHistoryBody = pastHistory;
@@ -1408,13 +1429,29 @@ public static class CodexInfoWindowsE2EFixtureServer {
                     reason = "OK";
                     body = accountsBody;
                 }
-                else if (parts[1] == "/v3/current?account=account-7") {
+                else if (parts[1] == "/v3/current?account=account-7" ||
+                    (PartialCurrentV4 && parts[1] == "/v4/current?account=account-7")) {
                     Interlocked.Increment(ref currentRequests);
                     RecordRequestPhase(request);
-                    code = 200;
-                    reason = "OK";
-                    body = currentBody;
-                    includePublishedPair = true;
+                    code = CurrentUnavailable ? 503 : 200;
+                    reason = code == 503 ? "Service Unavailable" : "OK";
+                    body = code == 503 ? "{\"api_version\":\"v3\",\"error\":\"unavailable\"}" : currentBody;
+                    if (code == 200 && AuthenticationRequired) {
+                        body = "{\"api_version\":\"v3\",\"state\":\"auth_required\",\"observed_at\":null,\"authenticated\":false,\"plan_label\":null,\"quota\":null,\"models\":[],\"active_thread_count\":0}";
+                    }
+                    if (code == 200 && parts[1].StartsWith("/v4/", StringComparison.Ordinal)) {
+                        Interlocked.Increment(ref PartialCurrentV4Requests);
+                        body = System.Text.RegularExpressions.Regex.Replace(body,
+                            "\"api_version\"\\s*:\\s*\"v3\"",
+                            "\"api_version\":\"v4\",\"models_status\":\"" +
+                            (AuthenticationRequired ? "unavailable" : "partial") + "\"");
+                    }
+                    if (code == 200 && EmptyThreads) {
+                        body = System.Text.RegularExpressions.Regex.Replace(body,
+                            "\"(active_thread_count|open_session_thread_count)\"\\s*:\\s*[0-9]+",
+                            "\"$1\":0");
+                    }
+                    includePublishedPair = code == 200;
                 }
                 else if (parts[1] == "/v3/history/periods?account=account-7") {
                     Interlocked.Increment(ref periodsRequests);
@@ -1469,7 +1506,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
                     RecordRequestPhase(request);
                     code = 200;
                     reason = "OK";
-                    body = threadsBody;
+                    body = EmptyThreads ? "{\"api_version\":\"v3\",\"threads\":[]}" : threadsBody;
                     includePublishedPair = true;
                 }
             }
@@ -1884,6 +1921,102 @@ function Assert-E2EMainProductVersion {
     $value = [string]$versions[0].Current.Name
     Assert-E2E ($value -match '^v[0-9]+\.[0-9]+\.[0-9]+$') "Main product version is malformed: '$value'."
     Write-E2E "main-product-version: PASS value=$value count=$($versions.Count)"
+}
+
+function Assert-E2EMainRecoverySnapshot {
+    param([hashtable]$Snapshot, [bool]$HasRecordedValues, [bool]$Failed)
+
+    $generation = if ($Failed) { 'error' } else { 'ready' }
+    $retryCount = if ($Failed) { 1 } else { 0 }
+    Assert-E2E ($Snapshot.Generation -ceq $generation) "Main generation must be $generation."
+    Assert-E2E ($Snapshot.RetryCount -eq $retryCount) "Main must expose $retryCount enabled Retry action."
+    if (-not $HasRecordedValues) {
+        Assert-E2E ([string]::IsNullOrEmpty($Snapshot.Quota) -and [string]::IsNullOrEmpty($Snapshot.Estimate) -and $Snapshot.Rows.Count -eq 0) `
+            'Initial failure must not invent quota, cost, or model values.'
+        return
+    }
+    # Independent literal fixture expectations: input excludes cached input;
+    # rows are ordered by complete recorded cost (3.60, 2.40, 1.20).
+    $expectedRows = @('LUNA|1,800|$2.00|700|$0.70|1,100|$0.90', 'TERRA|1,100|$1.40|500|$0.50|800|$0.50', 'SOL|600|$0.70|200|$0.20|400|$0.30')
+    Assert-E2E ($Snapshot.Quota -ceq '72%') 'Main must retain the recorded 72% quota.'
+    Assert-E2E ($Snapshot.Estimate -cmatch '^.+ \$7\.20$') 'Main must retain the complete $7.20 cost.'
+    Assert-E2E (($Snapshot.Rows -join ';') -ceq ($expectedRows -join ';')) `
+        "Main recorded model rows differ: $($Snapshot.Rows -join ';')"
+}
+
+function Get-E2EMainRecoverySnapshot {
+    param([System.Windows.Automation.AutomationElement]$Root)
+
+    $texts = @(Get-E2EVisibleControlElements $Root ([System.Windows.Automation.ControlType]::Text))
+    $names = @($texts | ForEach-Object { [string]$_.Current.Name })
+    $quota = @($names | Where-Object { $_ -cmatch '^\d+(\.\d+)?%$' })
+    $estimate = @($names | Where-Object { $_ -cmatch '^.+ \$[0-9,.]+$' })
+    Assert-E2E ($quota.Count -le 1 -and $estimate.Count -le 1) 'Main shows duplicate quota or total values.'
+    $rows = @()
+    $scroll = Find-E2EElementByAutomationId $Root 'Main.ModelUsageScroll'
+    if ($null -ne $scroll -and -not $scroll.Current.IsOffscreen) {
+        $cells = @(Get-E2EVisibleControlElements $scroll ([System.Windows.Automation.ControlType]::Text) | Sort-Object { $_.Current.BoundingRectangle.Top }, { $_.Current.BoundingRectangle.Left })
+        foreach ($label in @($cells | Where-Object { $_.Current.Name -cin @('LUNA', 'TERRA', 'SOL') })) {
+            $center = $label.Current.BoundingRectangle.Top + $label.Current.BoundingRectangle.Height / 2
+            $row = @($cells | Where-Object {
+                $rect = $_.Current.BoundingRectangle
+                [Math]::Abs(($rect.Top + $rect.Height / 2) - $center) -lt 3
+            } | Sort-Object { $_.Current.BoundingRectangle.Left } | ForEach-Object { [string]$_.Current.Name })
+            $rows += $row -join '|'
+        }
+    }
+    $retry = @(Get-E2EElementsByAutomationId $Root 'Main.Status.Retry' | Where-Object { -not $_.Current.IsOffscreen -and $_.Current.IsEnabled })
+    $contract = Find-E2EElementByAutomationId $Root 'Main.DetailsGenerationContract'
+    return @{ Generation = if ($null -eq $contract) { '' } else { [string]$contract.Current.Name }; RetryCount = $retry.Count; Quota = $quota -join ''; Estimate = $estimate -join ''; Rows = $rows }
+}
+
+function Invoke-E2EMainRecovery {
+    param([System.Windows.Automation.AutomationElement]$Root, [IntPtr]$Handle, [int]$ProcessId)
+
+    Wait-E2E -Description 'Main initial HTTP failure exposes Retry' -Probe {
+        $button = Find-E2EElementByAutomationId $Root 'Main.Status.Retry'
+        return $null -ne $button -and -not $button.Current.IsOffscreen -and $button.Current.IsEnabled
+    } | Out-Null
+    Assert-E2EMainRecoverySnapshot -Snapshot (Get-E2EMainRecoverySnapshot $Root) -HasRecordedValues $false -Failed $true
+    $null = Capture-E2EWindow $Handle 'main-initial-failure'
+    [CodexInfoWindowsE2EFixtureServer]::CurrentUnavailable = $false
+    Invoke-E2EElement (Find-E2EElementByAutomationId $Root 'Main.Status.Retry')
+    Wait-E2E -Description 'Main Retry accepts a complete generation' -Probe {
+        $contract = Find-E2EElementByAutomationId $Root 'Main.DetailsGenerationContract'
+        return $null -ne $contract -and $contract.Current.Name -ceq 'ready'
+    } | Out-Null
+    Assert-E2EMainRecoverySnapshot -Snapshot (Get-E2EMainRecoverySnapshot $Root) -HasRecordedValues $true -Failed $false
+    $null = Capture-E2EWindow $Handle 'main-first-recovery'
+    $observed = [string](Find-E2EElementByAutomationId $Root 'Main.QuotaObservedAt').Current.Name
+    $reset = [string](Find-E2EElementByAutomationId $Root 'Main.QuotaResetAt').Current.Name
+
+    $settings = Open-E2EChildWindow -MainRoot $Root -ButtonName 'Settings' -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+    Select-E2ESettingsTab $settings.Root 'Settings.Tab.ConnectionStatus'
+    [CodexInfoWindowsE2EFixtureServer]::CurrentUnavailable = $true
+    Invoke-E2EElement (Find-E2EElementByAutomationId $settings.Root 'Settings.AuthCheck')
+    Wait-E2E -Description 'Main records the subsequent HTTP failure' -Probe {
+        $contract = Find-E2EElementByAutomationId $Root 'Main.DetailsGenerationContract'
+        return $null -ne $contract -and $contract.Current.Name -ceq 'error'
+    } | Out-Null
+    Invoke-E2EElement (Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Cancel')
+    Wait-E2E -Description 'Settings closes after refresh failure' -Probe {
+        return -not [CodexInfoWindowsE2EWin32]::IsWindow($settings.Handle)
+    } | Out-Null
+    Assert-E2EMainRecoverySnapshot -Snapshot (Get-E2EMainRecoverySnapshot $Root) -HasRecordedValues $true -Failed $true
+    Assert-E2E ([string](Find-E2EElementByAutomationId $Root 'Main.QuotaObservedAt').Current.Name -ceq $observed -and [string](Find-E2EElementByAutomationId $Root 'Main.QuotaResetAt').Current.Name -ceq $reset) `
+        'Failure must retain the recorded observation and reset timestamps.'
+    $null = Capture-E2EWindow $Handle 'main-last-good-failure'
+    [CodexInfoWindowsE2EFixtureServer]::CurrentUnavailable = $false
+    [CodexInfoWindowsE2EFixtureServer]::PartialCurrentV4 = $true
+    Invoke-E2EElement (Find-E2EElementByAutomationId $Root 'Main.Status.Retry')
+    Wait-E2E -Description 'Main second Retry clears the error' -Probe {
+        $contract = Find-E2EElementByAutomationId $Root 'Main.DetailsGenerationContract'
+        return $null -ne $contract -and $contract.Current.Name -ceq 'ready'
+    } | Out-Null
+    Assert-E2EMainRecoverySnapshot -Snapshot (Get-E2EMainRecoverySnapshot $Root) -HasRecordedValues $true -Failed $false
+    $null = Capture-E2EWindow $Handle 'main-last-good-recovery'
+    [CodexInfoWindowsE2EFixtureServer]::PartialCurrentV4 = $false
+    Write-E2E 'main-recovery: PASS initial failure -> ready -> retained last-good failure -> ready; recorded quota, cost, model rows, timestamps and Retry'
 }
 
 function Assert-E2ENoChildProductVersion {
@@ -3397,9 +3530,19 @@ function Invoke-E2ENarrowPeriodCostFixturePreflight {
     return $responses
 }
 
+function Get-E2EFixtureObservationTime {
+    param([DateTimeOffset]$Now, [bool]$CalendarBoundary)
+    $seconds = $Now.ToUnixTimeSeconds()
+    if ($CalendarBoundary) {
+        $utc = $Now.UtcDateTime
+        $firstDay = [DateTimeOffset]::new($utc.Year, $utc.Month, 1, 0, 30, 0, [TimeSpan]::Zero)
+        $seconds = [Math]::Min($seconds, $firstDay.ToUnixTimeSeconds())
+    }
+    return $seconds - ($seconds % 60)
+}
+
 function New-E2EFixtureDocuments {
-    $rawNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $now = $rawNow - ($rawNow % 60)
+    $now = Get-E2EFixtureObservationTime -Now ([DateTimeOffset]::UtcNow) -CalendarBoundary ([bool]$CalendarOnly)
     $currentStart = if ($GraphThemes) { $now - 172800 } else { $now - 60 }
     # Theme mode needs a genuinely ready status for the UX-spec ready-color
     # oracle. The normal fixture retains its original reset-warning timing.
@@ -3704,6 +3847,7 @@ function Assert-E2ENarrowPeriodCostFixtureContract {
 
 function Enter-E2EFixture {
     $documents = New-E2EFixtureDocuments
+    $script:e2eFixtureNow = $documents.Now
     [IO.File]::WriteAllText(
         (Join-Path $script:e2eOutput 'fixture-details.json'),
         $documents.Details,
@@ -4456,6 +4600,84 @@ function Open-E2ESetupFromSettings {
     } | Out-Null
     $record = Record-E2EWindow $Role $ProcessId $handle
     return [pscustomobject]@{ Handle = $handle; Root = Get-E2EUiaRoot $handle; Record = $record }
+}
+
+function Assert-E2ESetupAuthState {
+    param([bool]$CanContinue, [bool]$CanAuthenticate,
+        [ValidateSet('AuthRequired', 'Unavailable', 'Authenticated')][string]$State)
+
+    Assert-E2E ($CanContinue -eq ($State -eq 'Authenticated')) `
+        "Setup may complete only after an authenticated current response; state=$State."
+    Assert-E2E ($CanAuthenticate -eq ($State -eq 'AuthRequired')) `
+        "Setup authentication action differs from the current acquisition state=$State."
+}
+
+function Invoke-E2ESetupRecovery {
+    param([System.Windows.Automation.AutomationElement]$MainRoot, [int]$ProcessId)
+
+    $beforeCancel = [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))
+    $settings = Open-E2EChildWindow -MainRoot $MainRoot -ButtonName 'Settings' -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'Settings' -ProcessId $ProcessId
+    $setup = Open-E2ESetupFromSettings $settings.Root $ProcessId
+    $profiles = @(Get-E2EVisibleControlElements $setup.Root ([System.Windows.Automation.ControlType]::ComboBox) | Where-Object { $_.Current.Name -ceq 'Connection profile' })
+    Assert-E2E ($profiles.Count -eq 1) 'Setup must expose one connection profile selector.'
+    $expand = $null
+    Assert-E2E ($profiles[0].TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$expand)) 'Setup connection profile cannot be opened.'
+    $expand.Expand()
+    Wait-E2E -Description 'Setup SSH profile option' -Probe {
+        return @(Get-E2EVisibleControlElements $setup.Root ([System.Windows.Automation.ControlType]::ListItem) | Where-Object { $_.Current.Name -ceq 'SSH config alias' }).Count -eq 1
+    } | Out-Null
+    Select-E2EListItem $setup.Root 'SSH config alias'
+    if ($expand.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Collapsed) { $expand.Collapse() }
+    $null = Capture-E2EWindow $setup.Handle 'setup-unsaved-profile'
+    Invoke-E2EElement (Find-E2EElementByAutomationId $setup.Root 'Setup.Window.Close')
+    Wait-E2E -Description 'Setup draft closes' -Probe { return -not [CodexInfoWindowsE2EWin32]::IsWindow($setup.Handle) } | Out-Null
+    Assert-E2E (([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:e2eSettingsPath))) -ceq $beforeCancel) `
+        'Closing a changed Setup draft must preserve every saved settings byte.'
+
+    $setup = Open-E2ESetupFromSettings $settings.Root $ProcessId
+    [CodexInfoWindowsE2EFixtureServer]::AuthenticationRequired = $true
+    Invoke-E2EElement (Find-E2EElementByAutomationId $setup.Root 'Setup.Refresh')
+    Wait-E2E -Description 'Current response requires authentication' -Probe {
+        $auth = Find-E2EElementByAutomationId $MainRoot 'Main.Status.AuthStart'
+        return $null -ne $auth -and -not $auth.Current.IsOffscreen
+    } | Out-Null
+    $continue = Find-E2EButtonByName $setup.Root 'Continue'
+    Assert-E2E ($null -ne $continue -and $continue.Current.IsEnabled) 'Observed connection must reach the authentication step.'
+    Invoke-E2EElement $continue
+    foreach ($state in @('AuthRequired', 'Unavailable', 'Authenticated')) {
+        if ($state -ne 'AuthRequired') {
+            [CodexInfoWindowsE2EFixtureServer]::CurrentUnavailable = $state -eq 'Unavailable'
+            [CodexInfoWindowsE2EFixtureServer]::AuthenticationRequired = $state -ne 'Authenticated'
+            Invoke-E2EElement (Find-E2EElementByAutomationId $setup.Root 'Setup.Refresh')
+            $expectedGeneration = if ($state -eq 'Unavailable') { 'error' } else { 'ready' }
+            Wait-E2E -Description "Setup current generation $state" -Probe {
+                $contract = Find-E2EElementByAutomationId $MainRoot 'Main.DetailsGenerationContract'
+                return $null -ne $contract -and $contract.Current.Name -ceq $expectedGeneration
+            } | Out-Null
+        }
+        Wait-E2E -Description "Setup refresh settles $state" -Probe {
+            return (Find-E2EElementByAutomationId $setup.Root 'Setup.Refresh').Current.IsEnabled
+        } | Out-Null
+        $continue = Find-E2EButtonByName $setup.Root 'Continue'
+        Assert-E2E ($null -ne $continue -and -not $continue.Current.IsOffscreen) 'Setup Continue must remain visible.'
+        $auth = Find-E2EButtonByName $setup.Root 'Start authentication'
+        $canAuthenticate = $null -ne $auth -and -not $auth.Current.IsOffscreen -and $auth.Current.IsEnabled
+        Assert-E2ESetupAuthState -CanContinue $continue.Current.IsEnabled -CanAuthenticate $canAuthenticate -State $state
+        $null = Capture-E2EWindow $setup.Handle "setup-auth-$state"
+    }
+    Invoke-E2EElement $continue
+    Wait-E2E -Description 'Setup completion becomes available after authentication' -Probe {
+        return $continue.Current.Name -ceq 'Close' -and $continue.Current.IsEnabled
+    } | Out-Null
+    $null = Capture-E2EWindow $setup.Handle 'setup-auth-done'
+    Invoke-E2EElement $continue
+    Wait-E2E -Description 'Setup completion closes' -Probe { return -not [CodexInfoWindowsE2EWin32]::IsWindow($setup.Handle) } | Out-Null
+    $saved = [IO.File]::ReadAllText($script:e2eSettingsPath) | ConvertFrom-Json
+    Assert-E2E ($saved.setupCompleted -eq $true -and $saved.connectionProfile -ceq 'none' -and $saved.connectionSelector -ceq 'none') `
+        'Completed Setup must persist the confirmed connection, not the cancelled SSH draft.'
+    Invoke-E2EElement (Find-E2EElementByAutomationId $settings.Root 'Settings.Footer.Cancel')
+    Wait-E2E -Description 'Settings closes after Setup evaluation' -Probe { return -not [CodexInfoWindowsE2EWin32]::IsWindow($settings.Handle) } | Out-Null
+    Write-E2E 'setup-recovery: PASS changed draft cancellation preserves bytes; unauthenticated and unavailable cannot complete; authenticated current enables completion'
 }
 
 function Open-E2ELicenseFromSettings {
@@ -5352,9 +5574,15 @@ function Assert-E2EThemeSurfaces {
     $selected = Get-E2ESelectedListItemLabel $menuItems
     Assert-E2E (-not [string]::IsNullOrWhiteSpace($selected)) 'Graph period popup has no selected row.'
     $selectedItem = $menuItems | Where-Object { [string]$_.Current.Name -eq $selected } | Select-Object -First 1
+    # Retain value-type rectangles for this frame. A later light-dismiss must
+    # not make a correctly captured popup image fail a live-peer visibility test.
+    $menuRect = $menu.Current.BoundingRectangle
+    $selectedRect = $selectedItem.Current.BoundingRectangle
+    Assert-E2E (-not $menu.Current.IsOffscreen -and $menuRect.Width -gt 0 -and $menuRect.Height -gt 0) 'Graph period popup is not visible before capture.'
+    Assert-E2E (-not $selectedItem.Current.IsOffscreen -and $selectedRect.Width -gt 0 -and $selectedRect.Height -gt 0) 'Graph period selection is not visible before capture.'
     $popupCapture = Capture-E2EWindow $graph.Handle "theme-$ThemeId-graph-popup"
-    Assert-E2EThemePixel $popupCapture $graph.Handle $colors.Popup "$ThemeId/Graph/popup-surface" -Element $menu
-    Assert-E2EThemePixel $popupCapture $graph.Handle $colors.PopupSelected "$ThemeId/Graph/popup-selected" -Element $selectedItem
+    Assert-E2EThemePixel $popupCapture $graph.Handle $colors.Popup "$ThemeId/Graph/popup-surface" -ScreenBounds $menuRect
+    Assert-E2EThemePixel $popupCapture $graph.Handle $colors.PopupSelected "$ThemeId/Graph/popup-selected" -ScreenBounds $selectedRect
     Toggle-E2EElement $period
     Bring-E2EWindowToFront $Windows.Settings.Handle
     $selector = Get-E2EThemeSelector $Windows.Settings.Root
@@ -5374,19 +5602,197 @@ function Assert-E2EThemeSurfaces {
 
 # Graph-only visual matrix: the five graph roles are measured inside the plot,
 # and navigation is exercised on the same visible window at the minimum width.
+function Get-E2ECalendarExpectedDays {
+    param([long]$Now)
+    # Literal totals from the standard fixture. Attribute only same-day
+    # differences; a difference across midnight has no recorded daily split.
+    $days = @{}
+    foreach ($period in @(
+        @{ Offsets=@(-6000,-5400,-4800,-3600); Tokens=@(300,600,600,3600); Dollars=@(1.20,2.40,2.40,3.60) },
+        @{ Offsets=@(-60,0); Tokens=@(600,7200); Dollars=@(1.50,7.20) })) {
+        $previousDate = ''
+        for ($index = 0; $index -lt $period.Offsets.Count; $index++) {
+            $date = [DateTimeOffset]::FromUnixTimeSeconds($Now + $period.Offsets[$index]).UtcDateTime.ToString('yyyy/MM/dd')
+            if ($index -eq 0 -or $date -ceq $previousDate) {
+                if (-not $days.ContainsKey($date)) { $days[$date] = @{ Tokens=[long]0; Dollars=[decimal]0 } }
+                $tokens = [long]$period.Tokens[$index]
+                $dollars = [decimal]$period.Dollars[$index]
+                if ($index -gt 0) {
+                    $tokens -= [long]$period.Tokens[$index - 1]
+                    $dollars -= [decimal]$period.Dollars[$index - 1]
+                }
+                $days[$date].Tokens += $tokens
+                $days[$date].Dollars += $dollars
+            }
+            $previousDate = $date
+        }
+    }
+    return $days
+}
+
+function Assert-E2ECalendarDays {
+    param([AllowEmptyCollection()][string[]]$Names, [hashtable]$Expected,
+        [datetime]$Month, [datetime]$Today, [string]$Metric)
+    $count = [datetime]::DaysInMonth($Month.Year, $Month.Month)
+    Assert-E2E ($Names.Count -eq $count) "Calendar must expose exactly $count dated cells."
+    $culture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
+    for ($index = 0; $index -lt $count; $index++) {
+        $day = $Month.AddDays($index)
+        $date = $day.ToString('yyyy/MM/dd')
+        $matches = @($Names | Where-Object { $_ -ceq $date -or $_.StartsWith($date + ' ', [StringComparison]::Ordinal) })
+        Assert-E2E ($matches.Count -eq 1) "Calendar date missing or duplicated: $date"
+        if ($day -gt $Today.Date) {
+            $expectedName = $date
+        } elseif ($Expected.ContainsKey($date)) {
+            $amount = if ($Metric -eq 'Tokens') {
+                ([long]$Expected[$date].Tokens).ToString('N0', $culture) + ' Tokens'
+            } else { '$' + ([decimal]$Expected[$date].Dollars).ToString('N2', $culture) }
+            $expectedName = "$date $amount Recorded part"
+        } else { $expectedName = $date + ' ' + [char]0x2014 + ' Unmeasured' }
+        Assert-E2E ($matches[0] -ceq $expectedName) "Calendar value mismatch: expected '$expectedName', found '$($matches[0])'."
+    }
+}
+
+function Assert-E2ECalendarVisibleValues {
+    param([hashtable]$Cells, [hashtable]$Expected, [datetime]$Today, [string]$Metric)
+    Assert-E2E ($Cells.Count -gt 0) 'Calendar must expose visible day text, not only accessible names.'
+    foreach ($key in $Cells.Keys) {
+        $date = [datetime]::ParseExact($key, 'yyyy/MM/dd', [Globalization.CultureInfo]::InvariantCulture)
+        $texts = @($date.Day.ToString([Globalization.CultureInfo]::InvariantCulture))
+        if ($date -le $Today) {
+            if ($Expected.ContainsKey($key)) {
+                $amount = if ($Metric -eq 'Dollars') { '$' + ([decimal]$Expected[$key].Dollars).ToString('N2', [Globalization.CultureInfo]::InvariantCulture) }
+                elseif ($Expected[$key].Tokens -ge 1000000) { ([decimal]$Expected[$key].Tokens / 1000000).ToString('N0', [Globalization.CultureInfo]::InvariantCulture) + ' M' }
+                else { ([long]$Expected[$key].Tokens).ToString('N0', [Globalization.CultureInfo]::InvariantCulture) }
+                $texts += @($amount, 'Recorded part')
+            }
+            else { $texts += @([string][char]0x2014, 'Unmeasured') }
+        }
+        Assert-E2E (($Cells[$key] -join '|') -ceq ($texts -join '|')) `
+            "Calendar visible text differs for $key/$Metric`: $($Cells[$key] -join '|')"
+    }
+}
+
+function Get-E2ECalendarVisibleCells {
+    param([System.Windows.Automation.AutomationElement]$Calendar)
+    $bounds = $Calendar.Current.BoundingRectangle
+    $cells = @{}
+    foreach ($day in Get-E2EAllDescendants $Calendar) {
+        $name = [string]$day.Current.Name
+        $rect = $day.Current.BoundingRectangle
+        if ($name -cmatch '^(\d{4}/\d{2}/\d{2})( |$)' -and -not $day.Current.IsOffscreen -and
+            $rect.Top -ge $bounds.Top -and $rect.Bottom -le $bounds.Bottom) {
+            $key = $Matches[1]
+            $cells[$key] = @(Get-E2EVisibleControlElements $day ([System.Windows.Automation.ControlType]::Text) |
+                ForEach-Object { [string]$_.Current.Name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+    }
+    return $cells
+}
+
+function Set-E2ECalendarScrollPosition {
+    param([System.Windows.Automation.AutomationElement]$Calendar, [double]$Percent)
+    foreach ($element in Get-E2EAllDescendants $Calendar) {
+        $scroll = $null
+        if ($element.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern, [ref]$scroll) -and $scroll.Current.VerticallyScrollable) {
+            $scroll.SetScrollPercent([System.Windows.Automation.ScrollPattern]::NoScroll, $Percent)
+            break
+        }
+    }
+}
+
+function Scroll-E2ECalendarToLastDay {
+    param([System.Windows.Automation.AutomationElement]$Calendar, [datetime]$Month)
+    Set-E2ECalendarScrollPosition -Calendar $Calendar -Percent 100
+    $last = $Month.AddMonths(1).AddDays(-1).ToString('yyyy/MM/dd')
+    Wait-E2E -Description "Calendar last day $last is visible" -Probe {
+        return (Get-E2ECalendarVisibleCells $Calendar).ContainsKey($last)
+    } | Out-Null
+}
+
+function Invoke-E2ECalendar {
+    param($Graph, [double]$Scale)
+    $expected = Get-E2ECalendarExpectedDays -Now $script:e2eFixtureNow
+    $today = [datetime]::UtcNow.Date
+    $month = [datetime]::new($today.Year, $today.Month, 1)
+    Invoke-E2EElement (Find-E2EElementByAutomationId $Graph.Root 'Graph.Range.Month')
+    Wait-E2EGraphLoadSettled $Graph.Root
+    foreach ($metric in @('Tokens', 'Dollars')) {
+        Select-E2EGraphMetric $Graph.Root $metric
+        Wait-E2EGraphLoadSettled $Graph.Root
+        foreach ($width in @(940,700)) {
+            $height = if ($width -eq 700) { 480 } else { 640 }
+            Set-E2EGraphLogicalSize -Handle $Graph.Handle -LogicalWidth $width -LogicalHeight $height -Scale $Scale
+            $calendar = Find-E2EElementByAutomationId $Graph.Root 'Graph.Calendar'
+            if ($null -eq $calendar -or $calendar.Current.IsOffscreen) {
+                $null = Capture-E2EWindow $Graph.Handle 'calendar-unavailable'
+                @(Get-E2EAllDescendants $Graph.Root | ForEach-Object {
+                    @{ Name=[string]$_.Current.Name; Id=[string]$_.Current.AutomationId; Offscreen=$_.Current.IsOffscreen }
+                }) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $script:e2eOutput 'calendar-uia.json') -Encoding UTF8
+            }
+            Assert-E2E ($null -ne $calendar -and -not $calendar.Current.IsOffscreen) 'Month calendar must be visible.'
+            Set-E2ECalendarScrollPosition -Calendar $calendar -Percent 0
+            $heading = Find-E2EElementByAutomationId $Graph.Root 'Graph.Range.Label'
+            Assert-E2E ($heading.Current.Name -ceq $month.ToString('yyyy/MM')) 'Calendar heading must identify the month without a repeated date range.'
+            $names = @(Get-E2EAllDescendants $calendar | ForEach-Object { [string]$_.Current.Name } |
+                Where-Object { $_ -cmatch '^\d{4}/\d{2}/\d{2}( |$)' })
+            Assert-E2ECalendarDays -Names $names -Expected $expected -Month $month -Today $today -Metric $metric
+            Assert-E2ECalendarVisibleValues -Cells (Get-E2ECalendarVisibleCells $calendar) -Expected $expected -Today $today -Metric $metric
+            foreach ($id in @('Graph.Plot','Graph.Toggle.LUNA','Graph.Toggle.SOL')) {
+                $element = Find-E2EElementByAutomationId $Graph.Root $id
+                Assert-E2E ($null -eq $element -or $element.Current.IsOffscreen) "Month must hide $id."
+            }
+            Assert-E2E (-not (Find-E2EElementByAutomationId $Graph.Root 'Graph.Range.Next').Current.IsEnabled) 'Current month must disable future navigation.'
+            $null = Capture-E2EWindow $Graph.Handle "calendar-$metric-$width"
+            if ($width -eq 700) {
+                Scroll-E2ECalendarToLastDay -Calendar $calendar -Month $month
+                Assert-E2ECalendarVisibleValues -Cells (Get-E2ECalendarVisibleCells $calendar) -Expected $expected -Today $today -Metric $metric
+                $null = Capture-E2EWindow $Graph.Handle "calendar-$metric-last-day"
+            }
+        }
+    }
+    # The standard fixture has no earlier month except when its recorded
+    # interval crosses the current month boundary. Never invent older data.
+    $earliest = [DateTimeOffset]::FromUnixTimeSeconds($script:e2eFixtureNow - 6000).UtcDateTime
+    $previous = Find-E2EElementByAutomationId $Graph.Root 'Graph.Range.Previous'
+    $hasPreviousMonth = $earliest -lt $month
+    Assert-E2E ($previous.Current.IsEnabled -eq $hasPreviousMonth) 'Previous month availability must match recorded history.'
+    if ($hasPreviousMonth) {
+        Invoke-E2EElement (Find-E2EElementByAutomationId $Graph.Root 'Graph.Range.Previous')
+        Wait-E2EGraphLoadSettled $Graph.Root
+        $calendar = Find-E2EElementByAutomationId $Graph.Root 'Graph.Calendar'
+        $names = @(Get-E2EAllDescendants $calendar | ForEach-Object { [string]$_.Current.Name } |
+            Where-Object { $_ -cmatch '^\d{4}/\d{2}/\d{2}( |$)' })
+        Assert-E2ECalendarDays -Names $names -Expected $expected -Month $month.AddMonths(-1) -Today $today -Metric 'Dollars'
+        Scroll-E2ECalendarToLastDay -Calendar $calendar -Month $month.AddMonths(-1)
+        Assert-E2ECalendarVisibleValues -Cells (Get-E2ECalendarVisibleCells $calendar) -Expected $expected -Today $today -Metric 'Dollars'
+        $null = Capture-E2EWindow $Graph.Handle 'calendar-previous-month-last-day'
+        $next = Find-E2EElementByAutomationId $Graph.Root 'Graph.Range.Next'
+        Assert-E2E $next.Current.IsEnabled 'Past month must allow return to current month.'
+        Invoke-E2EElement $next
+        Wait-E2EGraphLoadSettled $Graph.Root
+        Assert-E2E (-not $next.Current.IsEnabled) 'Returning to current month must disable further forward navigation.'
+    }
+    Write-E2E 'calendar: PASS daily totals and visible values, two metrics, future/unmeasured, 940/700 widths, last-day scrolling, previous/current navigation'
+}
+
 function Find-E2EGraphHoverElement {
     param([int]$ProcessId, [string]$AutomationId)
-    # ToolTip may use its own popup HWND. Restrict the desktop query to the
-    # fixture client process so another running client's tooltip is excluded.
-    $condition = [System.Windows.Automation.AndCondition]::new(
-        [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ProcessId),
+    # ToolTip may use its own popup HWND. Select owned top-level windows
+    # before entering subtrees; a PID filter on a desktop-wide descendant
+    # query still visits unrelated providers and can fail inside another app.
+    $owner = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ProcessId)
+    $condition = [System.Windows.Automation.AndCondition]::new($owner,
         [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $AutomationId))
-    $elements = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants, $condition)
-    foreach ($element in $elements) {
-        if (-not $element.Current.IsOffscreen) { return $element }
+    $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+        [System.Windows.Automation.TreeScope]::Children, $owner)
+    foreach ($window in $windows) {
+        $elements = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        foreach ($element in $elements) {
+            if (-not $element.Current.IsOffscreen) { return $element }
+        }
     }
     return $null
 }
@@ -5976,6 +6382,8 @@ try {
     if ($Fixture) {
         Invoke-E2EFixturePreflight | Out-Null
     }
+    $runMainRecovery = $Fixture -and -not ($ThemePresets -or $GraphThemes -or $SettingsTabs -or $GraphHoverOnly -or $CalendarOnly -or $SetupOnly -or $NarrowPeriodCostFixture -or $CompatibilitySmoke -or $RequireCurrentPresentation)
+    if ($runMainRecovery) { [CodexInfoWindowsE2EFixtureServer]::CurrentUnavailable = $true }
     $script:e2eProcess = if ($Fixture) {
         Start-E2EFixtureClient -ClientPath $resolvedClientPath
     }
@@ -5993,6 +6401,11 @@ try {
     Bring-E2EWindowToFront $mainHandle
     $mainRecord = Record-E2EWindow 'Main' $clientPid $mainHandle
     $mainRoot = Get-E2EUiaRoot $mainHandle
+    if ($runMainRecovery) {
+        Invoke-E2EMainRecovery -Root $mainRoot -Handle $mainHandle -ProcessId $clientPid
+        Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::PartialCurrentV4Requests -gt 0) 'Main recovery must render an accepted v4 partial response.'
+        if ($MainRecoveryOnly) { return }
+    }
     $mainGauge = Wait-E2E -Description 'Main quota period gauge' -Probe {
         $candidate = Find-E2EElementByAutomationId $mainRoot 'Main.QuotaPeriodGauge'
         if ($null -ne $candidate) {
@@ -6036,6 +6449,10 @@ try {
     Assert-E2E ($detailsIsLatest -and -not $detailsHasFailure) `
         "Main details status is not a complete accepted generation: '$detailsStatusText'"
     Write-E2E 'main-details-status: PASS (single details generation accepted)'
+    if ($runMainRecovery -or $SetupOnly) {
+        Invoke-E2ESetupRecovery -MainRoot $mainRoot -ProcessId $clientPid
+        if ($SetupOnly) { return }
+    }
     if ($RequireCurrentPresentation) {
         $estimatedValues = @(Get-E2EAllDescendants $mainRoot | ForEach-Object {
             try { [string]$_.Current.Name } catch { '' }
@@ -6066,6 +6483,11 @@ try {
     $graphRoot = $graph.Root
     Assert-E2ENoChildProductVersion $graphRoot 'Graph'
     Wait-E2EGraphLoadSettled $graphRoot
+    if ($CalendarOnly) {
+        $bounds = Get-E2EWindowBounds $graph.Handle
+        Invoke-E2ECalendar -Graph $graph -Scale ($bounds.Width / 940.0)
+        return
+    }
     $plot = Wait-E2E -Description 'Graph plot' -Probe {
         $candidate = Find-E2EElementByAutomationId $graphRoot 'Graph.Plot'
         if ($null -eq $candidate) { return $false }
@@ -6347,6 +6769,30 @@ try {
         }
     }
     $null = Capture-E2EWindow $threads.Handle '10-threads-rows'
+
+    if ($Fixture) {
+        [CodexInfoWindowsE2EFixtureServer]::EmptyThreads = $true
+        $emptySettings = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Settings' `
+            -ButtonAutomationId 'Main.OpenSettings' -Title 'Codex Info Settings' -Role 'SettingsEmptyThreads' -ProcessId $clientPid
+        Select-E2ESettingsTab $emptySettings.Root 'Settings.Tab.ConnectionStatus'
+        Invoke-E2EElement (Find-E2EElementByAutomationId $emptySettings.Root 'Settings.AuthCheck')
+        Invoke-E2EElement (Find-E2EElementByAutomationId $emptySettings.Root 'Settings.Footer.Cancel')
+        Wait-E2E -Description 'Settings closes after zero-thread refresh' -Probe {
+            return -not [CodexInfoWindowsE2EWin32]::IsWindow($emptySettings.Handle)
+        } | Out-Null
+        Bring-E2EWindowToFront $threads.Handle
+        Wait-E2E -Description 'Threads displays the accepted empty generation' -Probe {
+            return @(Get-E2EVisibleControlElements $threadsRoot ([System.Windows.Automation.ControlType]::Text) |
+                Where-Object { $_.Current.Name -ceq 'No threads in open sessions' }).Count -eq 1
+        } | Out-Null
+        $emptyCaption = @(Get-E2EVisibleControlElements $threadsRoot ([System.Windows.Automation.ControlType]::Text) |
+            Where-Object { $_.Current.Name -ceq 'No threads in open sessions' })
+        Assert-E2E ($emptyCaption.Count -eq 1) 'Threads must show the confirmed empty state after a zero-count generation.'
+        foreach ($row in $fixtureRows) {
+            Assert-E2E ($null -eq (Find-E2EElementByAutomationId $threadsRoot $row.Id)) "Empty Threads retained an old row: $($row.Id)"
+        }
+        $null = Capture-E2EWindow $threads.Handle '10-threads-empty'
+    }
 
     Write-E2E 'case-6: open License information through Settings and verify all notices'
     $licenseSettings = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Settings' `

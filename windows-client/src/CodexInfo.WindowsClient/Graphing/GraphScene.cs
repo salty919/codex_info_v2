@@ -575,7 +575,10 @@ public sealed class GraphScene
             ? dollarProjection
             : tokenProjection;
         var rawDisplayProjection = semanticProjection.Filter(visibleModelNames);
-        var eligibleMissingZeroModels = BuildEligibleMissingZeroModels(samples);
+        var eligibleMissingZeroModels = BuildEligibleMissingZeroModels(samples, metric);
+        var eligibleMissingTokenZeros = metric == GraphMetric.Tokens
+            ? eligibleMissingZeroModels
+            : BuildEligibleMissingZeroModels(samples, GraphMetric.Tokens);
         var displayProjection = GroupDisplayProjection(
             rawDisplayProjection,
             visibleModelNames,
@@ -703,7 +706,7 @@ public sealed class GraphScene
                 samples,
                 points,
                 firstModelPublications,
-                eligibleMissingZeroModels),
+                eligibleMissingTokenZeros),
             isVerifiedCurrentResetStart: isVerifiedCurrentResetStart,
             periodCost: periodCost,
             taskIdleIntervals: taskIdleIntervals)
@@ -829,10 +832,12 @@ public sealed class GraphScene
     }
 
     private static IReadOnlyList<IReadOnlySet<string>> BuildEligibleMissingZeroModels(
-        IReadOnlyList<ApiHistorySample> samples)
+        IReadOnlyList<ApiHistorySample> samples,
+        GraphMetric metric)
     {
-        // A complete vector can display a prior exact known-zero family member as
-        // zero when it is omitted. This map never changes raw values or authority.
+        // Keep display-only zero membership separate from raw authority. An old
+        // family-column zero is also superseded by that family's model records:
+        // LUNA -> gpt-6-luna is not the disappearance of another used model.
         var eligibleBySample = new IReadOnlySet<string>[samples.Count];
         var explicitlyZeroMembers = new HashSet<string>(StringComparer.Ordinal);
         var previouslyPositiveMembers = new HashSet<string>(StringComparer.Ordinal);
@@ -851,15 +856,23 @@ public sealed class GraphScene
             var currentNames = currentModels
                 .Select(model => model.Name)
                 .ToHashSet(StringComparer.Ordinal);
+            var completeVector = sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
+                sample.ModelsComplete;
             if (!sample.IsSyntheticTail &&
-                sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
-                sample.ModelsComplete &&
+                (completeVector || sample.ModelSource == ApiHistorySample.LegacyUnknownModelSource) &&
                 sample.ModelSamples is not null)
             {
                 eligibleBySample[index] = explicitlyZeroMembers
-                    .Where(name => ModelUsageViewModel.DisplayFamilyName(name) is not null &&
-                        !previouslyPositiveMembers.Contains(name) &&
-                        !currentNames.Contains(name))
+                    .Where(name =>
+                    {
+                        var family = ModelUsageViewModel.DisplayFamilyName(name);
+                        return family is not null &&
+                            !previouslyPositiveMembers.Contains(name) &&
+                            !currentNames.Contains(name) &&
+                            (completeVector ||
+                             string.Equals(name, family, StringComparison.OrdinalIgnoreCase) &&
+                             currentModels.Any(model => ModelUsageViewModel.DisplayFamilyName(model.Name) == family));
+                    })
                     .ToHashSet(StringComparer.Ordinal);
             }
             else
@@ -882,10 +895,8 @@ public sealed class GraphScene
                 }
 
                 var model = models[0];
-                var tokens = model.TotalTokens;
-                var dollars = model.TotalDollars;
-                if (tokens is > 0 || dollars is { } positiveDollars &&
-                    double.IsFinite(positiveDollars) && positiveDollars > 0)
+                double? value = metric == GraphMetric.Tokens ? model.TotalTokens : model.TotalDollars;
+                if (value is > 0 && double.IsFinite(value.Value))
                 {
                     previouslyPositiveMembers.Add(model.Name);
                 }
@@ -893,8 +904,7 @@ public sealed class GraphScene
                 // establish it. Keep this distinction separate from raw authority.
                 if ((sample.ModelSource == ApiHistorySample.LegacyUnknownModelSource ||
                      sample.ModelsComplete && sample.ModelSamples is not null) &&
-                    tokens == 0 && dollars is { } zeroDollars &&
-                    double.IsFinite(zeroDollars) && zeroDollars == 0)
+                    value == 0)
                 {
                     explicitlyZeroMembers.Add(model.Name);
                 }

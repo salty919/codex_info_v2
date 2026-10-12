@@ -2190,6 +2190,7 @@ public sealed class LoopbackStatusClient :
                 })
                 .ToList();
 
+            // v3 intentionally has no estimated_cost_label root field.
             snapshot = new ApiDetailsSnapshot(
                 state,
                 observedAt,
@@ -2201,7 +2202,6 @@ public sealed class LoopbackStatusClient :
                 new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryPeriod>(historyPeriods),
                 new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(historySamples),
                 new System.Collections.ObjectModel.ReadOnlyCollection<ApiThreadDetails>(threads),
-                // v3 intentionally has no estimated_cost_label root field.
                 "概算 —")
             {
                 ApiVersion = apiVersion,
