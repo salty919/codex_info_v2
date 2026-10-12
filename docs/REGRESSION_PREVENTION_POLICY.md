@@ -14,6 +14,9 @@
    README、運用文書へ実装を合わせない。
 4. 高コストの確認前に `scripts/quality_plan.py` で完全な変更pathを分類する。分類できないpath、
    未知のcheck、重複check、影響領域外のcheckは実行前に停止する。
+   提出前のGit差分もCIと同じrename/copy検出と`paths_from_name_status`を用い、両端を分類する。
+   committed・staged・unstaged・untrackedの読取りが全て成功するまで計画を公開しない。
+   一部の読取り失敗を、先に取得できたpathだけの検証で代替しない。
 5. 選択されたcheckは共有呼出しをまとめ、同一revisionで各1回だけ実行する。失敗を確認なしのrerunで
    上書きせず、原因または外部状態が変わった新しい入力でだけ1回再実行する。
 

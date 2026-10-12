@@ -35,18 +35,38 @@ if [[ -n "$base_revision" ]]; then
         fail "base is not a commit: $base_revision"
 fi
 
-mapfile -d '' changed_paths < <({
-    if [[ -n "$base_revision" ]]; then
-        git -c core.quotePath=false diff --no-renames --name-only -z \
-            "$base_revision" HEAD
-    fi
-    git -c core.quotePath=false diff --no-renames --name-only -z
-    git -c core.quotePath=false diff --cached --no-renames --name-only -z
-    git -c core.quotePath=false ls-files --others --exclude-standard -z |
-        while IFS= read -r -d '' path; do
-            [[ "$path" == */__pycache__/*.pyc ]] || printf '%s\0' "$path"
-        done
-} | sort -zu)
+# Complete the reads before exposing any paths to the plan. Process
+# substitution would otherwise hide a failed later diff behind earlier output.
+changed_paths_json="$(python3 - "$base_revision" <<'PY'
+import json
+import subprocess
+import sys
+
+sys.path.insert(0, "scripts")
+from ci_change_scope import paths_from_name_status
+
+diff = ["git", "-c", "core.quotePath=false", "diff", "--name-status", "-z",
+        "--find-renames=50%", "--find-copies=50%", "--find-copies-harder"]
+revisions = [[sys.argv[1], "HEAD"]] if sys.argv[1] else []
+paths = set()
+try:
+    for revision in [*revisions, [], ["--cached"]]:
+        raw = subprocess.check_output([*diff, *revision, "--"])
+        if raw:
+            paths.update(paths_from_name_status(raw))
+    raw = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"])
+    for path in raw.decode("utf-8").split("\0"):
+        if path and not ("/__pycache__/" in path and path.endswith(".pyc")):
+            paths.add(path)
+except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    raise SystemExit(f"pre-pr-gate: FAIL: cannot read complete change set: {error}") from error
+print(json.dumps(sorted(paths)))
+PY
+)" || exit $?
+mapfile -d '' changed_paths < <(
+    python3 -c 'import json,sys; sys.stdout.buffer.write(b"".join(p.encode()+b"\0" for p in json.loads(sys.argv[1])))' \
+        "$changed_paths_json"
+)
 
 ((${#changed_paths[@]} > 0)) || fail 'no changed paths to validate'
 
