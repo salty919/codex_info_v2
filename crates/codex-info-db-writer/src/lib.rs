@@ -8028,7 +8028,11 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     const TABLES: &[TableContract] = &[
         (
             "quota_acquisition_state",
-            &[("singleton", "INTEGER", 1), ("degraded", "INTEGER", 0)],
+            &[
+                ("singleton", "INTEGER", 1),
+                ("degraded", "INTEGER", 0),
+                ("input_degraded", "INTEGER", 0),
+            ],
         ),
         (
             "quota_receipts",
@@ -8450,6 +8454,9 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         let legacy_history_continuity = *table == "history_continuity"
             && actual.len() + 1 == expected.len()
             && actual == expected[..actual.len()];
+        let legacy_quota_health = *table == "quota_acquisition_state"
+            && actual.len() + 1 == expected.len()
+            && actual == expected[..actual.len()];
         let legacy_cache_write_columns = *table == "session_model_totals"
             && actual.len() + 1 == expected.len()
             && actual == expected[..actual.len()];
@@ -8493,6 +8500,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             && !legacy_storage_partition_login_id
             && !legacy_usage_model_pricing_columns
             && !legacy_collection_generation_quota_reset
+            && !legacy_quota_health
         {
             return Err(UsageStoreError::InvalidImport(format!(
                 "account partition {table} schema mismatch"
@@ -9398,6 +9406,20 @@ fn ensure_durable_state_schema(transaction: &rusqlite::Transaction<'_>) -> Resul
     Ok(())
 }
 
+// A REST snapshot may remain open while the recorder commits accepted input.
+// Account partitions use WAL so readers cannot hold the writer's COMMIT hostage.
+// Enable it only after ownership/schema admission; legacy replacement migrations
+// continue to use their existing rollback-journal path.
+fn enable_partition_wal(connection: &Connection) -> Result<()> {
+    let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(UsageStoreError::InvalidImport(
+            "account partition requires WAL journal mode".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 impl UsageStore {
     /// Creates a brand-new account partition. Existing paths are recovery
@@ -9434,10 +9456,12 @@ impl UsageStore {
 
         let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.busy_timeout(Duration::from_secs(2))?;
+        enable_partition_wal(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(PARTITION_SCHEMA)?;
         transaction.execute_batch(quota_receipts::SCHEMA)?;
+        quota_receipts::ensure_health_schema(&transaction)?;
         ensure_collection_generation_live_quota_schema(&transaction, false)?;
         ensure_storage_partition_login_id_schema(&transaction)?;
         ensure_durable_state_schema(&transaction)?;
@@ -9504,7 +9528,10 @@ impl UsageStore {
         }
         validate_canonical_history_storage(&probe)?;
         drop(probe);
-        let mut store = Self::open(path)?;
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        enable_partition_wal(&connection)?;
+        let mut store = Self::initialize_connection(connection)?;
         let transaction = store
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -9905,6 +9932,7 @@ impl UsageStore {
         }
         ensure_collection_generation_live_quota_schema(&transaction, true)?;
         transaction.execute_batch(quota_receipts::SCHEMA)?;
+        quota_receipts::ensure_health_schema(&transaction)?;
         if version == LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION
             || version == MODEL_PRICING_PREVIOUS_SCHEMA_VERSION
             || version == SESSION_TOKEN_ANCHOR_PREVIOUS_SCHEMA_VERSION
@@ -10005,7 +10033,11 @@ impl UsageStore {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
 
-        let mut connection = Connection::open(path)?;
+        let connection = Connection::open(path)?;
+        Self::initialize_connection(connection)
+    }
+
+    fn initialize_connection(mut connection: Connection) -> Result<Self> {
         // Multiple Codex Info instances are allowed to observe the same
         // history DB. SQLite remains the serialization authority; a bounded
         // busy timeout prevents a transient writer collision from discarding
@@ -10014,6 +10046,7 @@ impl UsageStore {
         let transaction = connection.transaction()?;
         transaction.execute_batch(SCHEMA)?;
         ensure_durable_state_schema(&transaction)?;
+        quota_receipts::ensure_health_schema(&transaction)?;
         // A database must already have the current schema. Older formats are
         // intentionally not migrated or read.
         for column in ["sol_tokens", "terra_tokens", "luna_tokens"] {
@@ -10198,7 +10231,17 @@ impl UsageStore {
                 return Err(error.into());
             }
         }
-        if let Err(error) = quick_check_database(&temporary) {
+        // Online backup copies the source journal mode. Seal this private
+        // destination as one file before validation/rotation, so restoring or
+        // reading a backup never depends on an unrotated WAL/SHM sidecar.
+        let finalize = (|| -> Result<()> {
+            let destination =
+                Connection::open_with_flags(&temporary, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            destination.pragma_update(None, "journal_mode", "DELETE")?;
+            drop(destination);
+            quick_check_database(&temporary)
+        })();
+        if let Err(error) = finalize {
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
@@ -14537,6 +14580,236 @@ mod tests {
             path, identity, &backup
         )
         .unwrap());
+    }
+
+    #[test]
+    fn issue_637_legacy_quota_health_migration_preserves_acquisition_failure() {
+        let path = database_path("issue637-legacy-quota-health");
+        let identity = partition_identity('a', 1);
+        drop(UsageStore::create_partitioned(&path, &identity).unwrap());
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "DROP TABLE quota_acquisition_state;
+             CREATE TABLE quota_acquisition_state (
+               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+               degraded INTEGER NOT NULL CHECK(degraded IN(0,1))
+             );
+             INSERT INTO quota_acquisition_state VALUES(1,1);",
+            )
+            .unwrap();
+        let original_schema: String = legacy
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='quota_acquisition_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original_generation: String = legacy
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(legacy);
+
+        let readonly = UsageStore::open_read_only_partitioned(&path, &identity).unwrap();
+        let readonly_schema: String = readonly
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='quota_acquisition_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            readonly_schema, original_schema,
+            "a reader must not migrate the old exact two-column schema"
+        );
+        let readonly_health: i64 = readonly
+            .connection
+            .query_row(
+                "SELECT degraded FROM quota_acquisition_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(readonly_health, 1);
+        assert_eq!(readonly.latest_quota_receipt().unwrap(), None);
+        drop(readonly);
+
+        let mut writer = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let input_columns: i64 = writer.connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('quota_acquisition_state') WHERE name='input_degraded' AND type='INTEGER' AND \"notnull\"=1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            input_columns, 1,
+            "the writer owns the input-health migration"
+        );
+        let health = |db: &Connection| -> (i64, i64) {
+            db.query_row(
+                "SELECT degraded,input_degraded FROM quota_acquisition_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            health(&writer.connection),
+            (1, 0),
+            "migration preserves the existing acquisition failure"
+        );
+        let migrated_generation: String = writer
+            .connection
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_generation, original_generation);
+        let receipt = QuotaReceipt {
+            receipt_id: "ab".repeat(32),
+            sequence: 1,
+            observed_at: 1_800_000_000,
+            reset_at: 1_800_604_800,
+            window_seconds: 604_800,
+            remaining_percent: 99.0,
+        };
+        assert!(writer
+            .commit_quota_receipts(std::slice::from_ref(&receipt), false)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            health(&writer.connection),
+            (1, 0),
+            "a valid receipt cannot erase an independently recorded acquisition failure"
+        );
+        assert_eq!(
+            writer.latest_quota_receipt().unwrap(),
+            Some(receipt.clone())
+        );
+        let accepted_generation: String = writer
+            .connection
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(writer);
+
+        let mut reopened = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(health(&reopened.connection), (1, 0));
+        assert_eq!(
+            reopened.latest_quota_receipt().unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            reopened
+                .commit_quota_receipts(std::slice::from_ref(&receipt), false)
+                .unwrap(),
+            None
+        );
+        let reopened_generation: String = reopened
+            .connection
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reopened_generation, accepted_generation);
+        drop(reopened);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue_637_new_partition_commits_quota_while_reader_holds_snapshot() {
+        assert_issue_637_quota_commit_with_reader(false);
+    }
+
+    #[test]
+    fn issue_637_existing_partition_commits_quota_while_reader_holds_snapshot() {
+        assert_issue_637_quota_commit_with_reader(true);
+    }
+
+    fn assert_issue_637_quota_commit_with_reader(existing: bool) {
+        let path = database_path(if existing {
+            "issue637-existing"
+        } else {
+            "issue637-new"
+        });
+        let identity = partition_identity('a', 1);
+        let mut writer = UsageStore::create_partitioned(&path, &identity).unwrap();
+        if existing {
+            drop(writer);
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+            drop(old);
+            writer = UsageStore::open_partitioned(&path, &identity).unwrap();
+        }
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        reader.execute_batch("PRAGMA query_only=ON; BEGIN").unwrap();
+        let receipt_count = || {
+            reader
+                .query_row("SELECT COUNT(*) FROM quota_receipts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(receipt_count(), 0);
+        let receipt = QuotaReceipt {
+            receipt_id: "ab".repeat(32),
+            sequence: 1,
+            observed_at: 1_800_000_000,
+            reset_at: 1_800_604_800,
+            window_seconds: 604_800,
+            remaining_percent: 99.0,
+        };
+        let result = writer.commit_quota_receipts(std::slice::from_ref(&receipt), false);
+        if let Err(error) = result {
+            drop(reader);
+            drop(writer);
+            remove_database(&path);
+            panic!("a read-only snapshot must not prevent accepted quota persistence: {error}");
+        }
+        assert!(result.unwrap().is_some());
+        assert_eq!(
+            receipt_count(),
+            0,
+            "the reader retains its consistent old snapshot"
+        );
+        UsageStore::backup_generations(&path, 1).unwrap();
+        let backup = Connection::open_with_flags(
+            path.with_extension("sqlite3.bak.1"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let backup_mode: String = backup
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            backup_mode, "delete",
+            "a rotated backup must be a standalone database"
+        );
+        let saved: f64 = backup
+            .query_row("SELECT remaining_percent FROM quota_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(saved, 99.0, "online backup includes the committed receipt");
+        drop(backup);
+        reader.execute_batch("COMMIT").unwrap();
+        assert_eq!(receipt_count(), 1);
+        drop(reader);
+        drop(writer);
+        let reopened = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(reopened.latest_quota_receipt().unwrap(), Some(receipt));
+        drop(reopened);
+        remove_database(&path);
     }
 
     #[test]

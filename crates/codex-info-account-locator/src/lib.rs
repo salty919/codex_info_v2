@@ -946,13 +946,15 @@ fn load_metadata(data_root: &Path) -> Result<ProfileMetadata> {
 }
 
 fn is_known_epoch_artifact(name: &str) -> bool {
-    // SQLite's rollback journal is part of an active transaction on the
+    // SQLite's journals and shared-memory file belong to the active
     // canonical database, not a second storage authority. Keep the allowlist
     // exact so similarly named or unrelated files still fail closed.
     matches!(
         name,
         "usage_history.sqlite3"
             | "usage_history.sqlite3-journal"
+            | "usage_history.sqlite3-wal"
+            | "usage_history.sqlite3-shm"
             | "usage_history.sqlite3.candidate"
             | "account-writer.lock"
             | "account-recorder.lock"
@@ -1727,6 +1729,45 @@ mod tests {
             LocatorErrorKind::RecoveryRequired
         );
         let _ = fs::remove_dir_all(data_root.parent().unwrap());
+    }
+
+    #[test]
+    fn issue_637_wal_sidecars_preserve_initialized_partition() {
+        let (codex_home, data_root, scope_a, _, _) = fixture();
+        let epoch = data_root
+            .join("history/accounts/v1")
+            .join(&scope_a)
+            .join("epoch-7");
+        for suffix in ["-wal", "-shm"] {
+            write_private_file(
+                &epoch.join(format!("usage_history.sqlite3{suffix}")),
+                b"SQLite sidecar",
+            );
+        }
+        assert_eq!(
+            locate_existing_partition(&codex_home, &data_root)
+                .unwrap()
+                .storage_epoch,
+            7
+        );
+        assert_eq!(
+            locate_existing_partitions(&codex_home, &data_root)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            current_account_scope_id(&codex_home, &data_root).unwrap(),
+            scope_a
+        );
+        write_private_file(&epoch.join("usage_history.sqlite3-wal.unowned"), b"unknown");
+        assert_eq!(
+            locate_existing_partition(&codex_home, &data_root)
+                .unwrap_err()
+                .kind(),
+            LocatorErrorKind::RecoveryRequired
+        );
+        fs::remove_dir_all(data_root.parent().unwrap()).unwrap();
     }
 
     #[test]

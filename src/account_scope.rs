@@ -837,6 +837,8 @@ fn validate_registry_artifacts(data_root: &Path, metadata: &ProfileMetadata) -> 
                 .into_string()
                 .map_err(|_| AccountScopeError::new(AccountScopeErrorKind::RecoveryRequired))?;
             let allowed = name == "usage_history.sqlite3"
+                || name == "usage_history.sqlite3-wal"
+                || name == "usage_history.sqlite3-shm"
                 || name == "usage_history.sqlite3.candidate"
                 || name == "account-writer.lock"
                 || matches!(
@@ -1312,6 +1314,33 @@ mod tests {
                 .kind(),
             AccountScopeErrorKind::RecoveryRequired
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_637_wal_sidecars_preserve_initialized_partition() {
+        let root = temp_root("issue637-wal");
+        let account = AccountKey::new("workspace-A".into()).unwrap();
+        let partition = resolve_partition(&root, &account).unwrap();
+        let epoch = partition.database_path.parent().unwrap();
+        fs::create_dir_all(epoch).unwrap();
+        fs::set_permissions(epoch.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(epoch, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in [
+            "usage_history.sqlite3",
+            "usage_history.sqlite3-wal",
+            "usage_history.sqlite3-shm",
+        ] {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(epoch.join(name))
+                .unwrap();
+        }
+        mark_partition_initialized(&partition).unwrap();
+        assert_eq!(resolve_partition(&root, &account).unwrap(), partition);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
