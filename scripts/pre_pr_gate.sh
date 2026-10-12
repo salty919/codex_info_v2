@@ -47,7 +47,7 @@ from ci_change_scope import paths_from_name_status
 
 diff = ["git", "-c", "core.quotePath=false", "diff", "--name-status", "-z",
         "--find-renames=50%", "--find-copies=50%", "--find-copies-harder"]
-revisions = [[sys.argv[1], "HEAD"]] if sys.argv[1] else []
+revisions = [[f"{sys.argv[1]}...HEAD"]] if sys.argv[1] else []
 paths = set()
 try:
     for revision in [*revisions, [], ["--cached"]]:

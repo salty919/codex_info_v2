@@ -163,6 +163,34 @@ class PrePrPythonQualityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("pre-pr-gate: run check=", result.stdout)
 
+    def test_advanced_base_does_not_select_changes_outside_the_pr(self):
+        windows = self.root / "windows-client/src"
+        windows.mkdir(parents=True)
+        (windows / "Probe.cs").write_text("class Probe {}\n")
+        result = self.shell(
+            "git add windows-client\n"
+            "git -c user.name=fixture -c user.email=fixture@example.invalid "
+            "-c core.hooksPath=/dev/null commit -qm common\n"
+            "common=$(git rev-parse HEAD)\n"
+            "printf 'class UpdatedProbe {}\\n' > windows-client/src/Probe.cs\n"
+            "git add windows-client\n"
+            "target_tree=$(git write-tree)\n"
+            "target=$(git -c user.name=fixture -c user.email=fixture@example.invalid "
+            "commit-tree \"$target_tree\" -p \"$common\" -m target)\n"
+            "printf 'class Probe {}\\n' > windows-client/src/Probe.cs\n"
+            "printf 'exit 0\\n' > scripts/probe.sh\n"
+            "git add windows-client scripts/probe.sh\n"
+            "git -c user.name=fixture -c user.email=fixture@example.invalid "
+            "-c core.hooksPath=/dev/null commit -qm feature\n"
+            "bash scripts/pre_pr_gate.sh --base \"$target\" "
+            "--requested-check governance-contract\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(line for line in result.stdout.splitlines() if line.startswith("pre-pr-gate: plan "))
+        plan = json.loads(line.removeprefix("pre-pr-gate: plan "))
+        self.assertEqual(plan["affected_owners"], ["GOVERNANCE"])
+        self.assertIn("pre-pr-gate: PASS checks=governance-contract", result.stdout)
+
     def test_trusted_caller_without_ruff_can_run_the_gate(self):
         self.tool_path = "/usr/bin:/bin"
         result = self.gate("import os\n\nprint(os.name)\n")
