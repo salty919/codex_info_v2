@@ -1041,7 +1041,8 @@ internal static class GraphPlotProjection
         var anchors = Enumerable.Range(0, values.Count)
             .Where(index => double.IsFinite(values[index]) && values[index] >= 0 &&
                 !scene.ModelSynthetic[index] &&
-                scene.IsModelIntervalReliable(values, index, index))
+                (scene.IsModelIntervalReliable(values, index, index) ||
+                 scene.HasRecordedModelContribution(values, index)))
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, ProjectionStyle Style)>();
         for (var anchor = 1; anchor < anchors.Length; anchor++)
@@ -1069,6 +1070,13 @@ internal static class GraphPlotProjection
                 (!scene.IsModelIntervalReliable(values, left, left) ||
                  !scene.IsModelIntervalReliable(values, right, right)))
             {
+                // Partial family observations remain visible at their saved
+                // times. Keep uncertainty in the line style, not by replacing
+                // the recorded contribution with an older horizontal hold.
+                if (!AppendStoppedBridge(scene, scene.Timestamps[left], before,
+                        scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
+                    AppendSegment(dashedX, dashedY, scene.Timestamps[left], before,
+                        scene.Timestamps[right], current);
                 continue;
             }
             var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)

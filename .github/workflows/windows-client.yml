@@ -31,6 +31,11 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "10.0.x"
+      - name: Verify UI test isolation and required screen routes
+        shell: pwsh
+        run: >-
+          ./windows-client/tests/Test-WindowsE2EIsolation.ps1
+          -OutputDirectory (Join-Path $env:RUNNER_TEMP 'codex-info-e2e-contract')
       - name: Run Windows unit tests
         shell: pwsh
         env:

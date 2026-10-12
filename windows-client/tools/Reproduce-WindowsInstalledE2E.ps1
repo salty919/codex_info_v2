@@ -78,9 +78,13 @@ if ($actualProductVersion -cne $expectedProductVersion) {
 }
 
 try {
-    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+    if (Test-Path -LiteralPath $OutputDirectory) {
+        throw 'E2E output already exists; use a new directory to preserve earlier results.'
+    }
+    New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
     $moveSmokeLog = Join-Path $OutputDirectory 'window-move-smoke.log'
-    & $runner -ClientPath $ClientPath -OutputDirectory $OutputDirectory -Fixture
+    & $runner -ClientPath $ClientPath -OutputDirectory (Join-Path $OutputDirectory 'standard') -Fixture
+    & $runner -ClientPath $ClientPath -OutputDirectory (Join-Path $OutputDirectory 'settings') -Fixture -SettingsTabs
     $moveSmokeOutput = @(& $moveSmoke -ClientPath $ClientPath -AllowPhysicalInput *>&1)
     $moveSmokeOutput | Tee-Object -FilePath $moveSmokeLog -Append
     if ($moveSmokeOutput.Count -eq 0 -or [string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS') {
