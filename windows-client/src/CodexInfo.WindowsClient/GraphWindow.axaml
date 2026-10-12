@@ -262,7 +262,8 @@
                                    AutomationProperties.AutomationId="Graph.Plot"
                                    IsVisible="{Binding HasLinePlot}" />
             <Grid Grid.Row="1" Margin="10" RowDefinitions="Auto,*" RowSpacing="6"
-                  IsVisible="{Binding IsMonthView}" AutomationProperties.AutomationId="Graph.Calendar">
+                  IsVisible="{Binding IsMonthView}" AutomationProperties.AutomationId="Graph.Calendar"
+                  AutomationProperties.AccessibilityView="Control">
               <ItemsControl ItemsSource="{Binding CalendarWeekdays}" Margin="3,0">
                 <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Columns="7" /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
                 <ItemsControl.ItemTemplate>
@@ -278,14 +279,15 @@
                   <ItemsControl.ItemTemplate>
                     <DataTemplate x:DataType="graph:GraphCalendarDay">
                       <Border Classes="calendar-day" Classes.today="{Binding IsToday}" Classes.future="{Binding IsFuture}"
-                              IsVisible="{Binding IsInMonth}" Margin="3" Padding="8,6" MinHeight="64"
-                              ToolTip.Tip="{Binding AccessibleText}" AutomationProperties.Name="{Binding AccessibleText}">
+                              IsVisible="{Binding IsInMonth}" Margin="3" Padding="3,6" MinHeight="64"
+                              ToolTip.Tip="{Binding AccessibleText}" AutomationProperties.Name="{Binding AccessibleText}"
+                              AutomationProperties.AccessibilityView="Content">
                         <Grid RowDefinitions="Auto,*,Auto" RowSpacing="2">
                           <TextBlock Text="{Binding DayText}" FontSize="12" FontWeight="SemiBold" />
                           <TextBlock Grid.Row="1" Text="{Binding ValueText}" FontSize="17" FontWeight="SemiBold"
                                      VerticalAlignment="Center" HorizontalAlignment="Right" TextTrimming="CharacterEllipsis" />
                           <TextBlock Grid.Row="2" Text="{Binding StatusText}" FontSize="12"
-                                     HorizontalAlignment="Right" Foreground="{DynamicResource Theme78879C}" />
+                                     TextWrapping="Wrap" HorizontalAlignment="Right" Foreground="{DynamicResource Theme78879C}" />
                         </Grid>
                       </Border>
                     </DataTemplate>

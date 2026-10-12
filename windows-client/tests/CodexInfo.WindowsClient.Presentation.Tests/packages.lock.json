@@ -2,6 +2,17 @@
   "version": 1,
   "dependencies": {
     "net10.0": {
+      "Avalonia.Headless": {
+        "type": "Direct",
+        "requested": "[12.1.1, )",
+        "resolved": "12.1.1",
+        "contentHash": "+iIeqFnh3/Z91hrQjlhpR6I72fV7q6zjAksQvenPblqgHvsF2PY63eXfBz7H7bmk0WHtuROiFQKLxx//AHInJQ==",
+        "dependencies": {
+          "Avalonia": "12.1.1",
+          "Avalonia.Fonts.Inter": "12.1.1",
+          "Avalonia.HarfBuzz": "12.1.1"
+        }
+      },
       "Microsoft.NET.Test.Sdk": {
         "type": "Direct",
         "requested": "[17.11.1, )",
@@ -60,6 +71,14 @@
           "Avalonia.Skia": "12.1.1",
           "Avalonia.Win32": "12.1.1",
           "Avalonia.X11": "12.1.1"
+        }
+      },
+      "Avalonia.Fonts.Inter": {
+        "type": "Transitive",
+        "resolved": "12.1.1",
+        "contentHash": "V2d7OM1jybcl31KThdhf8XSl5SjQ6Ll/tXIfwQ00kMeWuPegRcOx8DLVpECHOOEKO9JZelXW0enuUu1D7Svikg==",
+        "dependencies": {
+          "Avalonia": "12.1.1"
         }
       },
       "Avalonia.FreeDesktop": {
@@ -318,7 +337,7 @@
           "Avalonia": "[12.1.1, )",
           "Avalonia.Desktop": "[12.1.1, )",
           "Avalonia.Themes.Fluent": "[12.1.1, )",
-          "CodexInfo.WindowsClient.Core": "[1.0.0, )",
+          "CodexInfo.WindowsClient.Core": "[1.0.159, )",
           "ScottPlot.Avalonia": "[5.1.59, )"
         }
       },

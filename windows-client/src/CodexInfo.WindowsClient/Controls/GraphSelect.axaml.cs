@@ -10,11 +10,14 @@ using Avalonia.Data;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.VisualTree;
+using CodexInfo.WindowsClient.Core;
 
 namespace CodexInfo.WindowsClient.Controls;
 
 public partial class GraphSelect : ToggleButton
 {
+    private string? openedPeriodId;
+
     public static readonly StyledProperty<string> FieldLabelProperty =
         AvaloniaProperty.Register<GraphSelect, string>(nameof(FieldLabel), "");
     public static readonly StyledProperty<bool> HasFieldLabelProperty =
@@ -91,6 +94,7 @@ public partial class GraphSelect : ToggleButton
         MenuPopup.Placement = PopupOnLeft
             ? PlacementMode.LeftEdgeAlignedTop
             : PlacementMode.BottomEdgeAlignedLeft;
+        openedPeriodId = (SelectedItem as ApiHistoryPeriod)?.Id;
         MenuPopup.IsOpen = true;
         Chevron.Text = "⌃";
     }
@@ -99,6 +103,10 @@ public partial class GraphSelect : ToggleButton
     {
         if (MenuPopup.IsOpen && e.AddedItems.Count > 0)
         {
+            if (e.AddedItems[0] is ApiHistoryPeriod period && period.Id == openedPeriodId)
+            {
+                return;
+            }
             Close();
         }
     }
