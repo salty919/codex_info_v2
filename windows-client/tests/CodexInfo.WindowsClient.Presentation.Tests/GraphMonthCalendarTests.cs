@@ -64,6 +64,29 @@ public sealed class GraphMonthCalendarTests
         Assert.Equal(expected, format.Invoke(null, [(decimal)tokens, CultureInfo.InvariantCulture]));
     }
 
+    [Theory]
+    [InlineData(89_543_950, "90 M", "89,543,950")]
+    [InlineData(303_150_800, "303 M", "303,150,800")]
+    [InlineData(1_500_000, "2 M", "1,500,000")]
+    [InlineData(1_000_000, "1 M", "1,000,000")]
+    [InlineData(999_999, "999,999", "999,999")]
+    [InlineData(0, "0", "0")]
+    public void CalendarPrioritizesDailyComparisonAndRetainsExactCount(
+        ulong tokens, string expected, string exact)
+    {
+        var start = DateTimeOffset.Parse("2026-10-01T00:00:00Z").ToUnixTimeSeconds();
+        var reset = start + 604_800;
+        var period = GraphDailyUsageProjectionTests.Period("month", start, reset,
+            GraphDailyUsageProjectionTests.Sample(start + 60, reset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", tokens, 1)));
+        var scene = GraphDailyUsageProjectionTests.DailyScene(
+            start, start + 86_400, GraphMetric.Tokens, period);
+        var day = Days(scene, start + 43_200)[4];
+        Assert.Equal(expected, Property<string>(day, "ValueText"));
+        Assert.Contains(exact, Property<string>(day, "AccessibleText"));
+        Assert.Equal(tokens, scene.DailyUsage.Single().Tokens);
+    }
+
     private static object[] Days(GraphScene scene, long now)
     {
         var type = typeof(GraphScene).Assembly.GetType("CodexInfo.WindowsClient.Graphing.GraphCalendarProjection");

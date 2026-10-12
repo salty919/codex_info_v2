@@ -36,6 +36,7 @@ internal static class GraphCalendarProjection
             var date = first.AddDays(number - 1);
             var future = date > today;
             var value = "";
+            string? exactTokens = null;
             var status = "";
             if (!future)
             {
@@ -44,8 +45,10 @@ internal static class GraphCalendarProjection
                 if (scene.Metric == GraphMetric.Tokens)
                 {
                     var known = contributions.Where(item => item.Tokens is not null).ToArray();
-                    value = known.Length == 0 ? "—" : GraphUsageSummary.FormatTokens(
-                        known.Sum(item => (decimal)item.Tokens!.Value), culture);
+                    var tokens = known.Sum(item => (decimal)item.Tokens!.Value);
+                    value = known.Length == 0 ? "—" : GraphUsageSummary.FormatCalendarTokens(tokens, culture);
+                    if (known.Length > 0)
+                        exactTokens = tokens.ToString("N0", culture) + " " + LocalizationService.Current.GraphTokenMetric;
                 }
                 else
                 {
@@ -58,7 +61,7 @@ internal static class GraphCalendarProjection
                     contributions.Any(item => item.IsPartial) ? LocalizationService.Current.GraphRecordedPartial : "";
             }
             cells.Add(new(number.ToString(culture), value, status,
-                $"{date:yyyy/MM/dd} {value} {status}".Trim(), true, date == today, future));
+                $"{date:yyyy/MM/dd} {exactTokens ?? value} {status}".Trim(), true, date == today, future));
         }
         return cells;
     }
