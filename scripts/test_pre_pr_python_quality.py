@@ -19,7 +19,17 @@ class PrePrPythonQualityTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory(dir=artifacts)
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        self.tool_path = (
+            str(ROOT / "artifacts/python-quality-venv/bin")
+            + os.pathsep
+            + os.environ["PATH"]
+        )
         (self.root / "scripts").mkdir()
+        (self.root / ".github").mkdir()
+        shutil.copy2(
+            ROOT / ".github/requirements-python-quality.txt",
+            self.root / ".github/requirements-python-quality.txt",
+        )
         for name in (
             "pre_pr_gate.sh",
             "quality_plan.py",
@@ -32,7 +42,7 @@ class PrePrPythonQualityTests(unittest.TestCase):
                 shutil.copy2(source, self.root / "scripts" / name)
         result = self.shell(
             "git init -q\n"
-            "git add scripts\n"
+            "git add scripts .github\n"
             "git -c user.name=fixture -c user.email=fixture@example.invalid "
             "-c core.hooksPath=/dev/null commit -qm baseline\n"
         )
@@ -45,7 +55,7 @@ class PrePrPythonQualityTests(unittest.TestCase):
             input="set -eu\n" + script,
             cwd=self.root,
             env={
-                "PATH": os.environ["PATH"],
+                "PATH": self.tool_path,
                 "HOME": str(self.root),
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",
@@ -54,7 +64,7 @@ class PrePrPythonQualityTests(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
-            timeout=20,
+            timeout=60,
         )
 
     def gate(self, source, name="probe.py"):
@@ -97,6 +107,14 @@ class PrePrPythonQualityTests(unittest.TestCase):
     def test_valid_python_is_accepted(self):
         result = self.gate("import os\n\nprint(os.name)\n")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_trusted_caller_without_ruff_can_run_the_gate(self):
+        self.tool_path = "/usr/bin:/bin"
+        result = self.gate("import os\n\nprint(os.name)\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(
+            (self.root / "artifacts/python-quality-venv/bin/ruff").is_file()
+        )
 
     def test_non_python_change_is_accepted(self):
         result = self.gate("exit 0\n", "probe.sh")

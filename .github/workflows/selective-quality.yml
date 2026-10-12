@@ -69,8 +69,7 @@ jobs:
           printf '%s\n' 'defusedxml==0.7.1 --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61' > "$RUNNER_TEMP/native-proof-requirements.txt"
           "$RUNNER_TEMP/native-proof-venv/bin/python" -I -m pip install \
             --disable-pip-version-check --only-binary=:all: --no-deps --require-hashes \
-            -r "$RUNNER_TEMP/native-proof-requirements.txt" \
-            -r .github/requirements-python-quality.txt
+            -r "$RUNNER_TEMP/native-proof-requirements.txt"
       - name: Check changed Python for main
         if: inputs.release_candidate
         env:

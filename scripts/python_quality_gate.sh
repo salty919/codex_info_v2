@@ -35,8 +35,25 @@ for name in sys.argv[1:]:
 raise SystemExit(1 if failed else 0)
 PY
 
-if ! command -v ruff >/dev/null 2>&1; then
-    echo 'python-quality: Ruff is required; install .github/requirements-python-quality.txt in your development venv (pip --require-hashes).' >&2
-    exit 1
+version="$(python3 - "$repo_root/scripts/python_quality.toml" <<'PY'
+import sys
+import tomllib
+with open(sys.argv[1], "rb") as source:
+    print(tomllib.load(source)["required-version"].removeprefix("=="))
+PY
+)"
+ruff_bin="$(command -v ruff || true)"
+if [[ -z "$ruff_bin" ]] || [[ "$("$ruff_bin" --version)" != "ruff $version" ]]; then
+    # The trusted main workflow may predate this check. The check owns its
+    # dependency, so it can run before that workflow is updated as well.
+    tool_env="$repo_root/artifacts/python-quality-venv"
+    ruff_bin="$tool_env/bin/ruff"
+    if [[ ! -x "$ruff_bin" ]] || [[ "$("$ruff_bin" --version)" != "ruff $version" ]]; then
+        python3 -m venv "$tool_env"
+        "$tool_env/bin/python" -I -m pip --isolated install \
+            --disable-pip-version-check --index-url https://pypi.org/simple \
+            --only-binary=:all: --no-deps --require-hashes \
+            -r "$repo_root/.github/requirements-python-quality.txt"
+    fi
 fi
-ruff check --config "$repo_root/scripts/python_quality.toml" -- "${python_paths[@]}"
+"$ruff_bin" check --config "$repo_root/scripts/python_quality.toml" -- "${python_paths[@]}"
