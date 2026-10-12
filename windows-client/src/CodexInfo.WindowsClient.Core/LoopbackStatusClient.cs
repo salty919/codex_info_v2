@@ -28,6 +28,7 @@ public sealed class LoopbackStatusClient :
     private static readonly string EndpointRoot = ResolveEndpointRoot();
     private static readonly string AccountsEndpoint = $"{EndpointRoot}/v3/accounts";
     private static readonly string CurrentEndpoint = $"{EndpointRoot}/v3/current";
+    private static readonly string CurrentV4Endpoint = $"{EndpointRoot}/v4/current";
     private static readonly string HistoryPeriodsEndpoint = $"{EndpointRoot}/v3/history/periods";
     private static readonly string HistoryEndpoint = $"{EndpointRoot}/v3/history";
     private static readonly string ThreadsEndpoint = $"{EndpointRoot}/v3/threads";
@@ -135,6 +136,12 @@ public sealed class LoopbackStatusClient :
 
     private static readonly HashSet<string> CurrentTopLevelPropertiesWithOpenCount =
         new(CurrentTopLevelProperties, StringComparer.Ordinal) { "open_session_thread_count" };
+
+    private static readonly HashSet<string> CurrentV4TopLevelProperties =
+        new(CurrentTopLevelProperties, StringComparer.Ordinal) { "models_status" };
+
+    private static readonly HashSet<string> CurrentV4TopLevelPropertiesWithOpenCount =
+        new(CurrentV4TopLevelProperties, StringComparer.Ordinal) { "open_session_thread_count" };
 
     private static readonly HashSet<string> HistoryPeriodsTopLevelProperties = CreatePropertySet(
         "api_version",
@@ -503,20 +510,43 @@ public sealed class LoopbackStatusClient :
             return CurrentFetchResult.Success(ApiCurrentSnapshot.FromDetails(legacyDetails));
         }
 
-        var endpoint = AppendAccountQuery(CurrentEndpoint, accountId);
-        var current = await FetchSplitResourceAsync(
+        async Task<SplitFetchResult<ApiCurrentSnapshot>> FetchCurrentVersionAsync(
+            string currentEndpoint,
+            string apiVersion)
+        {
+            var endpoint = AppendAccountQuery(currentEndpoint, accountId);
+            var cached = GetCurrentCache();
+            if (cached?.ApiVersion != apiVersion)
+            {
+                cached = null;
+            }
+
+            return await FetchSplitResourceAsync(
                 endpoint,
                 cacheKey: endpoint,
-                cached: GetCurrentCache(),
-                (body, pair) => ParseCurrent(body, pair) is { } parsed
+                cached: cached,
+                (body, pair) => ParseCurrent(body, pair, apiVersion) is { } parsed
                     ? parsed with { AccountId = accountId }
                     : null,
                 static value => value.PublishedPair,
                 value => StoreCurrentCache(value, accountScope),
-                () => EvictCurrentCache(accountScope),
+                () =>
+                {
+                    if (cached is not null)
+                    {
+                        EvictCurrentCache(accountScope);
+                    }
+                },
                 cancellationToken,
                 scopeIsCurrent: () => IsAccountScopeCurrent(accountId, accountScope))
-            .ConfigureAwait(false);
+                .ConfigureAwait(false);
+        }
+
+        var current = await FetchCurrentVersionAsync(CurrentV4Endpoint, "v4").ConfigureAwait(false);
+        if (current.NotFound)
+        {
+            current = await FetchCurrentVersionAsync(CurrentEndpoint, "v3").ConfigureAwait(false);
+        }
 
         if (!current.NotFound)
         {
@@ -1903,7 +1933,8 @@ public sealed class LoopbackStatusClient :
 
     private static ApiCurrentSnapshot? ParseCurrent(
         byte[] body,
-        PublishedPairIdentity publishedPair)
+        PublishedPairIdentity publishedPair,
+        string expectedApiVersion)
     {
         try
         {
@@ -1916,10 +1947,15 @@ public sealed class LoopbackStatusClient :
                     MaxDepth = 24,
                 });
             var root = document.RootElement;
-            var hasOpenCount = HasExactlyProperties(root, CurrentTopLevelPropertiesWithOpenCount, 9);
-            if ((!hasOpenCount && !HasExactlyProperties(root, CurrentTopLevelProperties, 8)) ||
+            var isV4 = expectedApiVersion == "v4";
+            var properties = isV4 ? CurrentV4TopLevelProperties : CurrentTopLevelProperties;
+            var withOpenCount = isV4
+                ? CurrentV4TopLevelPropertiesWithOpenCount
+                : CurrentTopLevelPropertiesWithOpenCount;
+            var hasOpenCount = HasExactlyProperties(root, withOpenCount, withOpenCount.Count);
+            if ((!hasOpenCount && !HasExactlyProperties(root, properties, properties.Count)) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
-                apiVersion != "v3" ||
+                apiVersion != expectedApiVersion ||
                 !TryGetState(root, out var state) ||
                 !TryGetNullableUnixSeconds(root, "observed_at", out var observedAt) ||
                 !TryGetBoolean(root, "authenticated", out var authenticated) ||
@@ -1930,6 +1966,27 @@ public sealed class LoopbackStatusClient :
                 !TryGetUInt64(root, "active_thread_count", out var activeThreadCount))
             {
                 return null;
+            }
+
+            ApiCurrentModelsStatus? modelsStatus = null;
+            if (isV4)
+            {
+                if (!TryGetString(root, "models_status", out var status))
+                {
+                    return null;
+                }
+
+                modelsStatus = status switch
+                {
+                    "complete" => ApiCurrentModelsStatus.Complete,
+                    "partial" => ApiCurrentModelsStatus.Partial,
+                    "unavailable" => ApiCurrentModelsStatus.Unavailable,
+                    _ => null,
+                };
+                if (modelsStatus is null)
+                {
+                    return null;
+                }
             }
 
             var openCount = activeThreadCount;
@@ -1952,6 +2009,7 @@ public sealed class LoopbackStatusClient :
             {
                 ApiVersion = apiVersion,
                 OpenSessionThreadCount = openCount,
+                ModelsStatus = modelsStatus,
             };
         }
         catch (Exception)

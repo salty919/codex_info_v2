@@ -40,6 +40,22 @@ impl QuotaJournalFixture {
         responses: usize,
         resident_interval: Option<u64>,
     ) -> Self {
+        Self::start_process_with_account_change(
+            malformed,
+            storage_failure,
+            responses,
+            resident_interval,
+            false,
+        )
+    }
+
+    fn start_process_with_account_change(
+        malformed: bool,
+        storage_failure: bool,
+        responses: usize,
+        resident_interval: Option<u64>,
+        account_change: bool,
+    ) -> Self {
         let root = tempfile::tempdir().expect("quota fixture root");
         let home = root.path().join("home");
         let data = root.path().join("data");
@@ -70,6 +86,7 @@ impl QuotaJournalFixture {
         let server = root.path().join("server.py");
         fs::write(&server, r#"#!/usr/bin/env python3
 import json, os, sys, time
+quota_read = False
 for line in sys.stdin:
     req = json.loads(line)
     if 'id' not in req:
@@ -77,7 +94,10 @@ for line in sys.stdin:
     result = {}
     if req['method'] == 'account/read':
         result = {'requiresOpenaiAuth':False,'account':{'type':'chatgpt','email':'fixture@example.invalid','planType':'pro'}}
+        if quota_read and os.environ.get('QUOTA_FIXTURE_ACCOUNT_CHANGE') == '1':
+            result['account']['email'] = 'other@example.invalid'
     if req['method'] == 'account/rateLimits/read':
+        quota_read = True
         calls = os.environ['QUOTA_FIXTURE_CALLS']
         count = len(open(calls).readlines()) if os.path.exists(calls) else 0
         with open(calls, 'a') as f:
@@ -114,6 +134,10 @@ for line in sys.stdin:
                 .env("QUOTA_FIXTURE_CALLS", &calls)
                 .env("QUOTA_FIXTURE_PAYLOAD", payload)
                 .env("QUOTA_FIXTURE_RESPONSES", responses.to_string())
+                .env(
+                    "QUOTA_FIXTURE_ACCOUNT_CHANGE",
+                    if account_change { "1" } else { "0" },
+                )
                 .env("QUOTA_FIXTURE_OWNER_ROOT", root.path())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -324,6 +348,41 @@ fn quota_journal_preserves_every_response_before_queue_delivery() {
     let mut fixture = QuotaJournalFixture::start(false, false, 3);
     fixture.wait_for_calls(4);
     fixture.assert_saved(3);
+}
+
+#[test]
+fn quota_account_change_preserves_unverified_input_without_applying_it() {
+    let mut fixture =
+        QuotaJournalFixture::start_process_with_account_change(false, false, 1, None, true);
+    // The second fetch starts only after the first identity recheck finished.
+    fixture.wait_for_calls(2);
+    fixture.assert_saved(1);
+    let journal = Connection::open_with_flags(
+        &fixture.database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let verified: i64 = journal
+        .query_row(
+            "SELECT account_verified FROM quota_observations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        verified, 0,
+        "a changed identity must not certify the response"
+    );
+    drop(journal);
+    fixture.child.0.kill().unwrap();
+    fixture.child.0.wait().unwrap();
+    let database = replay_partition(&fixture);
+    let _replay_log = run_quota_replay(&fixture);
+    assert!(
+        accepted_quota_receipts(&database).is_empty(),
+        "restart must not assign the unverified response to an account"
+    );
+    fixture.assert_saved(1);
 }
 
 #[test]

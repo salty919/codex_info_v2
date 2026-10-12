@@ -50,6 +50,8 @@ pub struct DbSnapshot {
     pub has_pending_ranges: bool,
     /// Current acquisition health, independent of historical pending work.
     pub acquisition_degraded: bool,
+    /// Current publication health and model completeness are independent.
+    pub current: CurrentPublication,
     pub details: PublicDetails,
     /// The v3 model projection is kept beside the legacy details DTO.  v1/v2
     /// intentionally expose only SOL/TERRA/LUNA, while v3 must retain ASTRA
@@ -61,6 +63,29 @@ pub struct DbSnapshot {
     /// v2 keeps the same nullable legacy fields while exposing source
     /// provenance and unavailable observations.
     pub history_samples_v2: Vec<PublicHistoryObservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CurrentModelsStatus {
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct CurrentPublication {
+    pub state: PublicState,
+    pub models_status: CurrentModelsStatus,
+}
+
+impl CurrentPublication {
+    pub fn unavailable(state: PublicState) -> Self {
+        Self {
+            state,
+            models_status: CurrentModelsStatus::Unavailable,
+        }
+    }
 }
 
 /// Cheap, transactionally consistent publication marker used by REST to
@@ -496,7 +521,7 @@ impl DbReader {
                 !raw.is_empty(),
                 &self.read_intervals,
             );
-            let (details, models_v3, history_samples_v2, history_samples_v3) =
+            let (details, models_v3, history_samples_v2, history_samples_v3, current) =
                 build_details_for_intervals(
                     &transaction,
                     &raw,
@@ -512,6 +537,7 @@ impl DbReader {
                 history_samples_v2,
                 history_samples_v3,
                 generation,
+                current,
             ))
         })();
         let (
@@ -520,6 +546,7 @@ impl DbReader {
             mut history_samples_v2,
             mut history_samples_v3,
             generation,
+            mut current,
         ) = match projection {
             Ok(value) => value,
             Err(error) => {
@@ -535,6 +562,7 @@ impl DbReader {
                     Vec::new(),
                     Vec::new(),
                     generation,
+                    CurrentPublication::unavailable(PublicState::Error),
                 )
             }
         };
@@ -560,6 +588,7 @@ impl DbReader {
                 // Only the failed derived publication is unavailable. The
                 // accepted acquisition record remains the current authority.
                 details = quota_only_details(receipt, &[]);
+                current = CurrentPublication::unavailable(PublicState::Error);
                 details.validate()?;
                 models_v3.clear();
                 history_samples_v2.clear();
@@ -572,6 +601,7 @@ impl DbReader {
         hasher.update(
             serde_json::to_vec(&(
                 history_available,
+                current,
                 &details,
                 &models_v3,
                 &history_samples_v2,
@@ -589,6 +619,7 @@ impl DbReader {
             history_available,
             has_pending_ranges,
             acquisition_degraded,
+            current,
             details,
             models_v3,
             history_samples_v2,
@@ -1275,6 +1306,7 @@ type DetailsBuild = (
     Vec<PublicModelUsageV3>,
     Vec<PublicHistoryObservation>,
     Vec<PublicHistoryObservationV3>,
+    CurrentPublication,
 );
 
 struct AcceptedQuota {
@@ -1363,6 +1395,7 @@ fn build_details_for_intervals(
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                CurrentPublication::unavailable(PublicState::Ready),
             ));
         }
         let details = PublicDetails {
@@ -1375,7 +1408,13 @@ fn build_details_for_intervals(
             threads: threads.to_vec(),
             ..PublicDetails::default()
         };
-        return Ok((details, Vec::new(), Vec::new(), Vec::new()));
+        return Ok((
+            details,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            CurrentPublication::unavailable(PublicState::Initializing),
+        ));
     }
     // Acquisition sequence selected the receipt. Its wall clock is metadata,
     // not an ordering check against older history rows.
@@ -1510,6 +1549,29 @@ fn build_details_for_intervals(
         history_is_canonical,
         current_model_observation,
     )?;
+    let models_status = if model_projection.incomplete {
+        if model_projection.v3.is_empty() {
+            CurrentModelsStatus::Unavailable
+        } else {
+            CurrentModelsStatus::Partial
+        }
+    } else if current_model_observation.is_some_and(|observation| observation.models_complete) {
+        CurrentModelsStatus::Complete
+    } else if model_projection.v3.is_empty() {
+        CurrentModelsStatus::Unavailable
+    } else {
+        CurrentModelsStatus::Partial
+    };
+    let current = CurrentPublication {
+        state: if model_projection.invalid {
+            PublicState::Error
+        } else if authority.quota.is_some() || !samples.is_empty() {
+            PublicState::Ready
+        } else {
+            PublicState::Initializing
+        },
+        models_status,
+    };
     let models = model_projection.v1;
     clip_history_periods(&mut periods, intervals);
     assign_history_period_labels(&mut periods, current_window_reset_at);
@@ -1579,6 +1641,7 @@ fn build_details_for_intervals(
         model_projection.v3,
         history_samples_v2,
         history_samples_v3,
+        current,
     ))
 }
 
@@ -4232,6 +4295,8 @@ struct ModelProjection {
     v1: Vec<PublicDetailedModelUsage>,
     v3: Vec<PublicModelUsageV3>,
     incomplete: bool,
+    /// Invalid persisted facts, unlike an ordinarily unfinished source.
+    invalid: bool,
 }
 
 fn latest_current_model_observation<'a>(
@@ -4465,6 +4530,7 @@ fn read_model_projection_for_intervals(
     };
     let mut group_key = None;
     let mut group_complete = true;
+    let mut group_invalid = false;
     let mut group = BTreeMap::<String, RawModelTotal>::new();
     let mut ambiguous_models = BTreeSet::new();
     while let Some(row) = rows.next()? {
@@ -4506,11 +4572,13 @@ fn read_model_projection_for_intervals(
             if anchor.is_some() || (group_complete && !group.is_empty()) {
                 let mut projection = project_model_totals(group.into_values());
                 projection.incomplete |= !group_complete;
+                projection.invalid |= group_invalid;
                 return Ok(projection);
             }
             group.clear();
             ambiguous_models.clear();
             group_complete = true;
+            group_invalid = false;
         }
         group_key = Some(key);
         let complete_index = if has_cache_write { 8 } else { 7 };
@@ -4519,27 +4587,32 @@ fn read_model_projection_for_intervals(
         }
         let Some(model) = sql_text(row, 2) else {
             group_complete = false;
+            group_invalid = true;
             continue;
         };
         let Some(total_tokens) = sql_text(row, 3).and_then(|value| value.parse::<u64>().ok())
         else {
             group_complete = false;
+            group_invalid = true;
             continue;
         };
         let Some(input_tokens) = sql_text(row, 4).and_then(|value| value.parse::<u64>().ok())
         else {
             group_complete = false;
+            group_invalid = true;
             continue;
         };
         let Some(cached_input_tokens) =
             sql_text(row, 5).and_then(|value| value.parse::<u64>().ok())
         else {
             group_complete = false;
+            group_invalid = true;
             continue;
         };
         let Some(output_tokens) = sql_text(row, 6).and_then(|value| value.parse::<u64>().ok())
         else {
             group_complete = false;
+            group_invalid = true;
             continue;
         };
         let cache_write_input_tokens = if has_cache_write {
@@ -4550,6 +4623,7 @@ fn read_model_projection_for_intervals(
             };
             let Some(parsed) = parsed else {
                 group_complete = false;
+                group_invalid = true;
                 continue;
             };
             parsed
@@ -4566,6 +4640,7 @@ fn read_model_projection_for_intervals(
                 continue;
             }
             group_complete = false;
+            group_invalid = true;
             group.remove(&model);
             ambiguous_models.insert(model);
             continue;
@@ -4586,6 +4661,7 @@ fn read_model_projection_for_intervals(
     if anchor.is_some() || group_complete {
         let mut projection = project_model_totals(group.into_values());
         projection.incomplete |= !group_complete;
+        projection.invalid |= group_invalid;
         return Ok(projection);
     }
     Ok(ModelProjection::default())
@@ -4792,6 +4868,7 @@ fn project_model_totals(rows: impl IntoIterator<Item = RawModelTotal>) -> ModelP
     });
     projection.v3.truncate(MAX_PUBLIC_MODELS_V3);
     projection.incomplete = incomplete;
+    projection.invalid = incomplete;
     projection
 }
 
@@ -7320,6 +7397,42 @@ mod tests {
     }
 
     #[test]
+    fn issue_637_current_quality_requires_complete_observation() {
+        for (source, expected) in [
+            ("confirmed", CurrentModelsStatus::Complete),
+            ("legacy-unknown", CurrentModelsStatus::Partial),
+        ] {
+            let path = temp_db(&format!("issue-637-quality-{source}"));
+            make_db(&path);
+            let connection = Connection::open(&path).unwrap();
+            issue_575_model_schema(&connection);
+            issue_575_set_current_reset(&connection);
+            issue_575_observation(
+                &connection,
+                1_800_000_000,
+                ISSUE_575_RESET_AT,
+                source,
+                None,
+                &[Issue575ModelFact {
+                    model: "ASTRA",
+                    total_tokens: 10,
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
+                    complete: true,
+                }],
+            );
+            let snapshot = DbReader::open(&path).unwrap().read_snapshot().unwrap();
+            assert_eq!(snapshot.current.state, PublicState::Ready, "{source}");
+            assert_eq!(snapshot.current.models_status, expected, "{source}");
+            assert_eq!(snapshot.models_v3[0].total_tokens, 10, "{source}");
+            drop(connection);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn issue_575_current_empty_or_unavailable_latest_observation_never_falls_back() {
         let reset_at = ISSUE_575_RESET_AT;
         for (label, source, empty_marker, expected_state) in [
@@ -7372,6 +7485,16 @@ mod tests {
                 .read_snapshot()
                 .expect("latest empty or unavailable observation remains readable");
             assert_eq!(snapshot.details.state, expected_state, "case {label}");
+            assert_eq!(snapshot.current.state, PublicState::Ready, "case {label}");
+            assert_eq!(
+                snapshot.current.models_status,
+                if empty_marker == Some(true) {
+                    CurrentModelsStatus::Complete
+                } else {
+                    CurrentModelsStatus::Unavailable
+                },
+                "case {label}"
+            );
             assert!(snapshot.details.models.is_empty(), "case {label}");
             assert!(snapshot.models_v3.is_empty(), "case {label}");
             drop(connection);

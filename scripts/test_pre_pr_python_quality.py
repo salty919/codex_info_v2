@@ -1,5 +1,6 @@
 """Exercise Python diagnostics through the real pre-PR caller."""
 
+import json
 import os
 import shutil
 import subprocess  # noqa: B404  # nosec B404 - fixed shell, literal commands only
@@ -107,6 +108,88 @@ class PrePrPythonQualityTests(unittest.TestCase):
     def test_valid_python_is_accepted(self):
         result = self.gate("import os\n\nprint(os.name)\n")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_requested_subset_does_not_report_pr_gate_pass(self):
+        windows = self.root / "windows-client/src"
+        windows.mkdir(parents=True)
+        (windows / "Probe.cs").write_text("class Probe {}\n")
+        result = self.gate("print('fixture')\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("pre-pr-gate: PARTIAL", result.stdout)
+        self.assertIn("not-executed=windows-contract", result.stdout)
+        self.assertNotIn("pre-pr-gate: PASS", result.stdout)
+
+    def test_copy_keeps_source_and_destination_quality_owners(self):
+        windows = self.root / "windows-client/src"
+        windows.mkdir(parents=True)
+        source = windows / "Probe.cs"
+        source.write_text("class Probe {}\n")
+        baseline = self.shell(
+            "git add windows-client\n"
+            "git -c user.name=fixture -c user.email=fixture@example.invalid "
+            "-c core.hooksPath=/dev/null commit -qm source\n"
+        )
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        (self.root / "docs").mkdir()
+        shutil.copy2(source, self.root / "docs/probe.md")
+        staged = self.shell("git add docs/probe.md\n")
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+        result = self.gate("print('fixture')\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(line for line in result.stdout.splitlines() if line.startswith("pre-pr-gate: plan "))
+        plan = json.loads(line.removeprefix("pre-pr-gate: plan "))
+        self.assertEqual(plan["affected_owners"], ["DOCS", "GOVERNANCE", "WINDOWS"])
+
+    def test_diff_read_failure_cannot_leave_partial_plan(self):
+        tracked = self.root / "scripts/tracked.sh"
+        tracked.write_text("exit 0\n")
+        baseline = self.shell(
+            "git add scripts/tracked.sh\n"
+            "git -c user.name=fixture -c user.email=fixture@example.invalid "
+            "-c core.hooksPath=/dev/null commit -qm tracked\n"
+        )
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        tracked.write_text("exit 0\n# changed\n")
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        git = binaries / "git"
+        git.write_text(
+            '#!/bin/sh\ncase " $* " in *" --cached "*) exit 1;; esac\n'
+            'exec /usr/bin/git "$@"\n'
+        )
+        git.chmod(0o755)
+        self.tool_path = str(binaries) + os.pathsep + self.tool_path
+        result = self.gate("print('fixture')\n")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("pre-pr-gate: run check=", result.stdout)
+
+    def test_advanced_base_does_not_select_changes_outside_the_pr(self):
+        windows = self.root / "windows-client/src"
+        windows.mkdir(parents=True)
+        (windows / "Probe.cs").write_text("class Probe {}\n")
+        result = self.shell(
+            "git add windows-client\n"
+            "git -c user.name=fixture -c user.email=fixture@example.invalid "
+            "-c core.hooksPath=/dev/null commit -qm common\n"
+            "common=$(git rev-parse HEAD)\n"
+            "printf 'class UpdatedProbe {}\\n' > windows-client/src/Probe.cs\n"
+            "git add windows-client\n"
+            "target_tree=$(git write-tree)\n"
+            "target=$(git -c user.name=fixture -c user.email=fixture@example.invalid "
+            "commit-tree \"$target_tree\" -p \"$common\" -m target)\n"
+            "printf 'class Probe {}\\n' > windows-client/src/Probe.cs\n"
+            "printf 'exit 0\\n' > scripts/probe.sh\n"
+            "git add windows-client scripts/probe.sh\n"
+            "git -c user.name=fixture -c user.email=fixture@example.invalid "
+            "-c core.hooksPath=/dev/null commit -qm feature\n"
+            "bash scripts/pre_pr_gate.sh --base \"$target\" "
+            "--requested-check governance-contract\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(line for line in result.stdout.splitlines() if line.startswith("pre-pr-gate: plan "))
+        plan = json.loads(line.removeprefix("pre-pr-gate: plan "))
+        self.assertEqual(plan["affected_owners"], ["GOVERNANCE"])
+        self.assertIn("pre-pr-gate: PASS checks=governance-contract", result.stdout)
 
     def test_trusted_caller_without_ruff_can_run_the_gate(self):
         self.tool_path = "/usr/bin:/bin"

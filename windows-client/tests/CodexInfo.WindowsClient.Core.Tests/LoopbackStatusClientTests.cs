@@ -382,16 +382,20 @@ public sealed class LoopbackStatusClientTests
         var result = await client.FetchCurrentAsync(CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(["/v3/current"], paths);
+        Assert.Equal(["/v4/current"], paths);
         Assert.Equal("ASTRA", result.Snapshot!.Models.Single().Name);
         Assert.Equal(1UL, result.Snapshot.ActiveThreadCount);
     }
 
-    [Fact]
-    public async Task CurrentErrorPreservesQuotaWithoutModels()
+    [Theory]
+    [InlineData("error", ApiState.Error)]
+    [InlineData("ready", ApiState.Ready)]
+    public async Task CurrentKeepsQuotaWithoutModelsAndPreservesAcquisitionState(
+        string state,
+        ApiState expectedState)
     {
         const string json = """
-            {"api_version":"v3","state":"error","observed_at":1800000020,
+            {"api_version":"v4","models_status":"unavailable","state":"error","observed_at":1800000020,
              "authenticated":true,"plan_label":null,
              "quota":{"remaining_percent":99.0,"reset_at":1800604800,"window_seconds":604800,"monthly":false},
              "models":[],"active_thread_count":0}
@@ -400,14 +404,16 @@ public sealed class LoopbackStatusClientTests
         using var client = new LoopbackStatusClient(new StubHandler(request =>
         {
             paths.Add(request.RequestUri!.AbsolutePath);
-            return JsonResponse(json, includePublishedPair: true);
+            return JsonResponse(json.Replace("\"state\":\"error\"", $"\"state\":\"{state}\"", StringComparison.Ordinal),
+                includePublishedPair: true);
         }));
 
         var result = await client.FetchCurrentAsync(CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(["/v3/current"], paths);
-        Assert.Equal(ApiState.Error, result.Snapshot!.State);
+        Assert.Equal(["/v4/current"], paths);
+        Assert.Equal(expectedState, result.Snapshot!.State);
+        Assert.Equal(ApiCurrentModelsStatus.Unavailable, result.Snapshot.ModelsStatus);
         Assert.True(result.Snapshot.Authenticated);
         Assert.Equal(99.0, result.Snapshot.Quota!.RemainingPercent);
         Assert.Equal(1800604800, result.Snapshot.Quota.ResetAt);
@@ -430,7 +436,7 @@ public sealed class LoopbackStatusClientTests
         using var client = new LoopbackStatusClient(new StubHandler(request =>
             request.RequestUri!.AbsolutePath switch
             {
-                "/v3/current" => JsonResponse(currentJson, includePublishedPair: true),
+                "/v4/current" => JsonResponse(currentJson, includePublishedPair: true),
                 "/v3/threads" => JsonResponse(threadsJson, includePublishedPair: true),
                 _ => throw new InvalidOperationException("unexpected route"),
             }));
@@ -625,7 +631,7 @@ public sealed class LoopbackStatusClientTests
         using var client = new LoopbackStatusClient(new StubHandler(request =>
         {
             requests.Add(request);
-            return request.RequestUri!.AbsolutePath == "/v3/current"
+            return request.RequestUri!.AbsolutePath == "/v4/current"
                 ? JsonResponse(ValidCurrentJson(), includePublishedPair: true)
                 : NotFoundResponse();
         }));
@@ -665,7 +671,7 @@ public sealed class LoopbackStatusClientTests
             requests.Add(request.RequestUri!);
             return request.RequestUri!.AbsolutePath switch
             {
-                "/v3/current" => JsonResponse(ValidCurrentJson(), includePublishedPair: true),
+                "/v4/current" => JsonResponse(ValidCurrentJson(), includePublishedPair: true),
                 "/v3/history/periods" => JsonResponse(
                     "{\"api_version\":\"v3\",\"history_periods\":[]}",
                     includePublishedPair: true),
@@ -723,6 +729,124 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task CurrentV4KeepsSuccessfulAcquisitionWithPartialModels()
+    {
+        var json = ValidCurrentJson().Replace(
+            "\"models_status\":\"complete\"",
+            "\"models_status\":\"partial\"",
+            StringComparison.Ordinal);
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            paths.Add(request.RequestUri!.AbsolutePath);
+            return JsonResponse(json, includePublishedPair: true);
+        }));
+
+        var result = await client.FetchCurrentAsync(CancellationToken.None);
+
+        Assert.Equal(["/v4/current"], paths);
+        Assert.True(result.IsSuccess);
+        Assert.Equal(ApiState.Ready, result.Snapshot!.State);
+        Assert.Equal(98.5, result.Snapshot.Quota!.RemainingPercent);
+        Assert.Single(result.Snapshot.Models);
+        Assert.Equal(ApiCurrentModelsStatus.Partial, result.Snapshot.ModelsStatus);
+    }
+
+    [Fact]
+    public async Task CurrentV4RejectsMalformedMetadataWithoutFallingBack()
+    {
+        var valid = ValidCurrentJson();
+        foreach (var json in new[]
+        {
+            valid.Replace("\"models_status\":\"complete\",", "", StringComparison.Ordinal),
+            valid.Replace("\"models_status\":\"complete\"", "\"models_status\":\"invented\"", StringComparison.Ordinal),
+            valid.Replace("\"models_status\":\"complete\"", "\"models_status\":null", StringComparison.Ordinal),
+            valid.Insert(1, "\"models_status\":\"partial\","),
+            valid.Insert(1, "\"unexpected\":true,"),
+            valid.Replace("\"api_version\":\"v4\"", "\"api_version\":\"v3\"", StringComparison.Ordinal),
+        })
+        {
+            var paths = new List<string>();
+            using var client = new LoopbackStatusClient(new StubHandler(request =>
+            {
+                paths.Add(request.RequestUri!.AbsolutePath);
+                return JsonResponse(json, includePublishedPair: true);
+            }));
+            var result = await client.FetchCurrentAsync(CancellationToken.None);
+            Assert.False(result.IsSuccess);
+            Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+            Assert.Equal(["/v4/current"], paths);
+        }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("account-7")]
+    public async Task CurrentV4NotFoundPreservesTheAcceptedV3ConditionalCache(string? accountId)
+    {
+        var v3 = ValidCurrentJson()
+            .Replace("\"api_version\":\"v4\"", "\"api_version\":\"v3\"", StringComparison.Ordinal)
+            .Replace("\"models_status\":\"complete\",", "", StringComparison.Ordinal);
+        var v3Requests = 0;
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            if (request.RequestUri!.AbsolutePath == "/v4/current")
+            {
+                Assert.Empty(request.Headers.IfNoneMatch);
+                return NotFoundResponse();
+            }
+            Assert.Equal("/v3/current", request.RequestUri.AbsolutePath);
+            if (++v3Requests == 1)
+            {
+                Assert.Empty(request.Headers.IfNoneMatch);
+                return JsonResponse(v3, includePublishedPair: true);
+            }
+            Assert.Equal($"\"{CanonicalPublishedPair}\"", Assert.Single(request.Headers.IfNoneMatch).Tag);
+            return NotModifiedResponse();
+        }));
+        Task<CurrentFetchResult> Fetch() => accountId is null
+            ? client.FetchCurrentAsync(CancellationToken.None)
+            : client.FetchCurrentAsync(accountId, CancellationToken.None);
+        var first = await Fetch();
+        var second = await Fetch();
+        Assert.True(first.IsSuccess);
+        Assert.True(second.IsSuccess);
+        Assert.Same(first.Snapshot, second.Snapshot);
+        Assert.Equal(2, v3Requests);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("account-7")]
+    public async Task CurrentV4FallsBackToV3ForTheSameAccountOnlyAfter404(string? accountId)
+    {
+        var v3 = ValidCurrentJson()
+            .Replace("\"api_version\":\"v4\"", "\"api_version\":\"v3\"", StringComparison.Ordinal)
+            .Replace("\"models_status\":\"complete\",", "", StringComparison.Ordinal);
+        var requests = new List<Uri>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            requests.Add(request.RequestUri!);
+            return request.RequestUri!.AbsolutePath switch
+            {
+                "/v4/current" => NotFoundResponse(),
+                "/v3/current" => JsonResponse(v3, includePublishedPair: true),
+                _ => throw new InvalidOperationException("unexpected fallback"),
+            };
+        }));
+        var result = accountId is null
+            ? await client.FetchCurrentAsync(CancellationToken.None)
+            : await client.FetchCurrentAsync(accountId, CancellationToken.None);
+        Assert.True(result.IsSuccess);
+        Assert.Equal("v3", result.Snapshot!.ApiVersion);
+        Assert.Null(result.Snapshot.ModelsStatus);
+        Assert.Equal(accountId, result.Snapshot.AccountId);
+        Assert.Equal(["/v4/current", "/v3/current"], requests.Select(uri => uri.AbsolutePath));
+        Assert.All(requests, uri => Assert.Equal(
+            accountId is null ? "" : "?account=account-7", uri.Query));
+    }
+
+    [Fact]
     public async Task CurrentFallsBackToLegacyDetailsOnlyAfterAnExact404()
     {
         var paths = new List<string>();
@@ -731,7 +855,7 @@ public sealed class LoopbackStatusClientTests
             paths.Add(request.RequestUri!.AbsolutePath);
             return request.RequestUri.AbsolutePath switch
             {
-                "/v3/current" or "/v3/details" or "/v2/details" => NotFoundResponse(),
+                "/v4/current" or "/v3/current" or "/v3/details" or "/v2/details" => NotFoundResponse(),
                 "/v1/details" => JsonResponse(ValidDetailsJson(), includePublishedPair: true),
                 _ => throw new InvalidOperationException("unexpected route"),
             };
@@ -740,7 +864,7 @@ public sealed class LoopbackStatusClientTests
         var result = await client.FetchCurrentAsync(CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(["/v3/current", "/v3/details", "/v2/details", "/v1/details"], paths);
+        Assert.Equal(["/v4/current", "/v3/current", "/v3/details", "/v2/details", "/v1/details"], paths);
         Assert.Equal("v1", result.Snapshot!.ApiVersion);
     }
 
@@ -753,7 +877,7 @@ public sealed class LoopbackStatusClientTests
             paths.Add(request.RequestUri!.AbsolutePath);
             return request.RequestUri.AbsolutePath switch
             {
-                "/v3/current" or "/v3/details" or "/v2/details" => NotFoundResponse(),
+                "/v4/current" or "/v3/current" or "/v3/details" or "/v2/details" => NotFoundResponse(),
                 "/v1/details" => JsonResponse(ValidDetailsJson(), includePublishedPair: true),
                 _ => throw new InvalidOperationException("split route requested in legacy mode"),
             };
@@ -770,7 +894,7 @@ public sealed class LoopbackStatusClientTests
         Assert.True(periods.IsSuccess);
         Assert.True(page.IsSuccess);
         Assert.True(threads.IsSuccess);
-        Assert.Equal(["/v3/current", "/v3/details", "/v2/details", "/v1/details"], paths);
+        Assert.Equal(["/v4/current", "/v3/current", "/v3/details", "/v2/details", "/v1/details"], paths);
     }
 
     [Theory]
@@ -786,7 +910,7 @@ public sealed class LoopbackStatusClientTests
             paths.Add(path);
             return path switch
             {
-                "/v3/current" => JsonResponse(ValidCurrentJson(), includePublishedPair: true),
+                "/v4/current" => JsonResponse(ValidCurrentJson(), includePublishedPair: true),
                 "/v3/history/periods" when surface == "periods" => NotFoundResponse(),
                 "/v3/history" when surface == "page" => NotFoundResponse(),
                 "/v3/threads" when surface == "threads" => NotFoundResponse(),
@@ -808,7 +932,7 @@ public sealed class LoopbackStatusClientTests
         Assert.True(current.IsSuccess);
         Assert.Equal(DetailsFetchFailure.Response, failure);
         Assert.Equal(
-            ["/v3/current", surface switch
+            ["/v4/current", surface switch
             {
                 "periods" => "/v3/history/periods",
                 "page" => "/v3/history",
@@ -851,7 +975,7 @@ public sealed class LoopbackStatusClientTests
         using var client = new LoopbackStatusClient(new StubHandler(request =>
         {
             requestCount++;
-            Assert.Equal("/v3/current", request.RequestUri!.AbsolutePath);
+            Assert.Equal("/v4/current", request.RequestUri!.AbsolutePath);
             if (requestCount == 1)
             {
                 return JsonResponse(ValidCurrentJson(), includePublishedPair: true);
@@ -2069,7 +2193,7 @@ public sealed class LoopbackStatusClientTests
         "{\"api_version\":\"v3\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":13,\"input_tokens\":10,\"cached_input_tokens\":2,\"cache_write_input_tokens\":1,\"output_tokens\":3,\"estimated_cost\":{\"price_version\":\"ASTRA_USER_2026-09-05\",\"ordinary_input_dollars\":1.0,\"cached_input_dollars\":2.0,\"cache_write_input_dollars\":3.0,\"output_dollars\":4.0,\"total_dollars\":10.0}}],\"active_thread_count\":1,\"history_periods\":[{\"id\":\"253402300799\",\"start_at\":253341820740,\"end_at\":253402300740,\"reset_at\":253402300799,\"label\":\"2026/08/01 — 2026/08/08\",\"current\":true}],\"history_samples\":[{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}],\"models_complete\":true,\"model_source\":\"confirmed\"}],\"history_gaps\":[],\"threads\":[{\"id\":\"thread-1\",\"title\":\"Task\",\"parent_thread_id\":null,\"model\":\"ASTRA\",\"model_label\":\"ASTRA\",\"total_tokens\":20,\"context_usage_tokens\":10,\"context_window_tokens\":80,\"created_at\":1,\"last_user_message_at\":1,\"is_subagent\":false,\"depth\":0}]}";
 
     private static string ValidCurrentJson() =>
-        "{\"api_version\":\"v3\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":13,\"input_tokens\":10,\"cached_input_tokens\":2,\"cache_write_input_tokens\":1,\"output_tokens\":3,\"estimated_cost\":{\"price_version\":\"ASTRA_USER_2026-09-05\",\"ordinary_input_dollars\":1.0,\"cached_input_dollars\":2.0,\"cache_write_input_dollars\":3.0,\"output_dollars\":4.0,\"total_dollars\":10.0}}],\"active_thread_count\":1}";
+        "{\"api_version\":\"v4\",\"models_status\":\"complete\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":13,\"input_tokens\":10,\"cached_input_tokens\":2,\"cache_write_input_tokens\":1,\"output_tokens\":3,\"estimated_cost\":{\"price_version\":\"ASTRA_USER_2026-09-05\",\"ordinary_input_dollars\":1.0,\"cached_input_dollars\":2.0,\"cache_write_input_dollars\":3.0,\"output_dollars\":4.0,\"total_dollars\":10.0}}],\"active_thread_count\":1}";
 
     private static string ValidAccountsJson() =>
         "{\"api_version\":\"v3\",\"default_account_id\":\"account-7\",\"accounts\":[{\"id\":\"account-7\",\"is_current\":true,\"activation_at\":1789167600,\"deactivation_at\":null},{\"id\":\"account-13\",\"is_current\":false,\"activation_at\":null,\"deactivation_at\":null}]}";
