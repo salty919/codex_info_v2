@@ -305,13 +305,12 @@ public sealed class MainLayoutParityTests
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.RemainingQuotaBar");
         var quotaGrid = quota.Parent;
         Assert.NotNull(quotaGrid);
-        Assert.Equal("604,210", quotaGrid.Attribute("ColumnDefinitions")?.Value);
+        Assert.Equal("*,Auto", quotaGrid.Attribute("ColumnDefinitions")?.Value);
         Assert.Equal("14", quotaGrid.Attribute("ColumnSpacing")?.Value);
         Assert.Equal("13,5", quotaGrid.Parent?.Attribute("Padding")?.Value);
-        Assert.Contains(
-            document.Descendants().Where(element => element.Name.LocalName == "TextBlock"),
-            element => element.Attribute("Width")?.Value == "604" &&
-                element.Attribute("Text")?.Value == "{Binding RemainingPercentText}");
+        var quotaText = Assert.Single(document.Descendants(), element =>
+            element.Attribute("Text")?.Value == "{Binding RemainingPercentText}");
+        Assert.Null(quotaText.Attribute("Width"));
         Assert.Equal("0,4,0,0", quota.Attribute("Margin")?.Value);
         Assert.Equal("Top", quota.Attribute("VerticalAlignment")?.Value);
 

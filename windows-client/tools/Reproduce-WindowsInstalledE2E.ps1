@@ -85,6 +85,9 @@ try {
     $moveSmokeLog = Join-Path $OutputDirectory 'window-move-smoke.log'
     & $runner -ClientPath $ClientPath -OutputDirectory (Join-Path $OutputDirectory 'standard') -Fixture
     & $runner -ClientPath $ClientPath -OutputDirectory (Join-Path $OutputDirectory 'settings') -Fixture -SettingsTabs
+    & $runner -ClientPath $ClientPath -OutputDirectory (Join-Path $OutputDirectory 'theme-presets') -Fixture -ThemePresets
+    & $runner -ClientPath $ClientPath -OutputDirectory (Join-Path $OutputDirectory 'graph-themes') -Fixture -GraphThemes
+    & $runner -ClientPath $ClientPath -OutputDirectory (Join-Path $OutputDirectory 'calendar') -Fixture -CalendarOnly
     $moveSmokeOutput = @(& $moveSmoke -ClientPath $ClientPath -AllowPhysicalInput *>&1)
     $moveSmokeOutput | Tee-Object -FilePath $moveSmokeLog -Append
     if ($moveSmokeOutput.Count -eq 0 -or [string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS') {

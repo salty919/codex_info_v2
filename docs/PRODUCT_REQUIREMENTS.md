@@ -418,12 +418,13 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    不変で、欠測・異常・confirmed gapがない場合に限り、その保存raw vectorをidle判定に利用できる。
    掲載されないmodelを0へ補完しない。v1/v2のfixed-column rowも、保存されたmodel fieldをstrict parseした
    `legacy-unknown` raw vectorとして上記の限定idle条件だけに利用し、未掲載modelを創作しない。
-   Windowsの既知family表示では、同じreset内で既に掲載された同一model keyのtoken・ドルがともに明示0と観測済みで、
-   そのkeyの以前の正値がなく、非syntheticの`confirmed && models_complete=true`の非null model集合からそのkeyが省略された場合だけ、
+   Windowsの既知family表示では、同じreset内で既に掲載された同一model keyの当該表示metricが明示0と観測済みで、
+   そのmetricの以前の正値がなく、非syntheticの`confirmed && models_complete=true`の非null model集合からそのkeyが省略された場合だけ、
    そのmemberの表示合計への寄与を0として現在掲載されたmemberと集約し、実線と両metricのhoverへ渡す。
    全memberがこの条件で省略されたfamilyは合計0となり、後から実際のモデル版の利用が始まっても旧0 memberを欠測扱いにしない。
    raw model行・token authority・集計額・idle証拠へ0を追加せず、`U`を増やさない。初掲載前、未知family、未完全集合、
    未提供集合、既知0でないmemberの欠落、以前に正値があるmemberの消失は補完しない。明示gapと非所有区間の線種・hover制約を維持する。
+   旧family集計欄（例: `LUNA`）の明示0から同じfamilyの正確なmodel ID（例: `gpt-6-luna`）の保存実測へ切り替わる場合は、同じ表示系列の表現切替として扱う。旧0欄を独立した未取得modelとして再要求せず、現在の実測値を実線とhoverへ渡す。現在の集合が`legacy-unknown`で不完全でも、この名前の切替だけで実測を未確定扱いにしない。旧familyの当該metricに正値があった場合や、実モデルの欠落・未知価格・gapを0で補完する根拠にはしない。tokenと保存USDの確定性は独立に判定し、未知価格で記録済みtokenを破線化せず、token未提供で保存USDを欠測化しない。
 3. `G137-3`: 同一periodの累積model値は減少しない。baselineはmodelごとの直前accepted finite値とし、
    source completenessを問わずbaseline未満のraw値は計測異常として表示値へ採用せずbaselineを更新しない。
    隣接する実測点`left,middle,right`で`left <= right`かつ`middle < left || middle > right`となる
@@ -553,7 +554,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    一度掲載されたmemberの後続欠測・価格不明はunknownのままとし、未掲載をrawの0へ変換しない。
    旧familyと正確なIDの独立した保存値は既存の価格契約に従って表示上だけ合算する。
    tokens/dollars、週期間/24h/7d、hoverへ同じ表示membershipを適用し、raw token、idle・予測authority、DB/APIは変更しない。
-   familyが保持値と新しい記録値を含む場合も、描画用の利用量を古い値の水平延長へ置換しない。途中点と終端の記録済み寄与を保持し、完全性を証明できない区間は破線とする。後続の完全な観測が届いても途中の寄与を消さず、rawやidle判定を変更しない。
+   familyが保持値と新しい記録値を含む場合も、描画用の利用量を古い値の水平延長へ置換しない。途中点と終端の記録済み寄与を保持し、当該表示値に実際の欠測・補間・保持を含む区間だけを破線とする。表示名の切替や別系列の欠落だけでは実測値を破線化しない。後続の完全な観測が届いても途中の寄与を消さず、rawやidle判定を変更しない。
 
    Windowsの週期間・24時間・1週間では、各実reset期間の保存済み利用量を選択metricに連動して表示する。ドル選択は保存USD、トークン選択は保存total_tokensの全model合計をM単位（1 M = 1,000,000 tokens、100万未満は桁区切り付き整数）とする。月表示はUX正本の全モデル日別合計カレンダーとする。
    固定7日や表示窓の幅から期間を推定せず、canonicalなperiod start/endを使う。モデルの表示ON/OFFによって額を変えない。

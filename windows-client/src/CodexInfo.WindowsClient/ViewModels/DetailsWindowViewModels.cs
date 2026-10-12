@@ -313,8 +313,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             if (range == GraphTimeRange.CalendarMonth && startAt > 0 && endAt > startAt)
             {
                 var firstDate = GraphTimeWindow.LocalDate(startAt, LocalizationService.DisplayTimeZone);
-                var lastDate = GraphTimeWindow.LocalDate(endAt - 1, LocalizationService.DisplayTimeZone);
-                return $"{title} · {firstDate:yyyy/MM/dd} – {lastDate:yyyy/MM/dd}";
+                return $"{firstDate:yyyy/MM}";
             }
             return startAt > 0 && endAt > startAt
                 ? $"{title} · {FormatPeriodStart(startAt)} – {FormatPeriodStart(endAt)}"
@@ -461,10 +460,10 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     internal static IReadOnlyList<ApiHistorySample> BuildGraphSamples(ApiHistoryPeriod period, long now)
     {
         var end = EffectiveGraphEnd(period, now);
+        // Both current and historical periods own their exact published
+        // end. A 60-second cadence may start at any Unix-time phase, so
+        // validity is bounded by the accepted period rather than modulo.
         var observed = period.Samples
-            // Both current and historical periods own their exact published
-            // end. A 60-second cadence may start at any Unix-time phase, so
-            // validity is bounded by the accepted period rather than modulo.
             .Where(sample => period.ContainsHistoryMinute(sample.Timestamp))
             .OrderBy(sample => sample.Timestamp)
             .ToList();
