@@ -62,16 +62,24 @@ class WindowsCurrentContractGateTests(unittest.TestCase):
         dotnet.chmod(0o755)
 
     def run_gate(self, mode, *, full=False):
-        return subprocess.run(  # noqa: B603,S603  # nosec B603 - only two literal argv lists; test-owned cwd
-            ["/bin/bash", "scripts/windows_client_contract_gate.sh"]
-            + ([] if full else ["--current-acquisition"]),
-            cwd=self.root,
-            env={**os.environ, "PATH": str(self.root / "bin") + ":/usr/bin:/bin",
-                 "GATE_FIXTURE_MODE": mode, "TMPDIR": str(self.root)},
-            capture_output=True,
-            text=True,
+        options = {
+            "cwd": self.root,
+            "env": {**os.environ, "PATH": str(self.root / "bin") + ":/usr/bin:/bin",
+                    "GATE_FIXTURE_MODE": mode, "TMPDIR": str(self.root)},
+            "capture_output": True,
+            "text": True,
+            "timeout": 30,
+        }
+        if full:
+            return subprocess.run(  # noqa: B603  # nosec B603 - fixed test command in test-owned cwd
+                ["/bin/bash", "scripts/windows_client_contract_gate.sh"],
+                check=False,
+                **options,
+            )
+        return subprocess.run(  # noqa: B603  # nosec B603 - fixed test command in test-owned cwd
+            ["/bin/bash", "scripts/windows_client_contract_gate.sh", "--current-acquisition"],
             check=False,
-            timeout=30,
+            **options,
         )
 
     def test_all_three_consumers_are_required(self):
