@@ -2070,7 +2070,45 @@ function Get-E2EVisibleControlElements {
         [Parameter(Mandatory = $true)][System.Windows.Automation.ControlType]$ControlType
     )
 
-    return @(Get-E2EControlElements $Root $ControlType | Where-Object {
+    $elements = @(Get-E2EControlElements $Root $ControlType)
+    if ($ControlType -eq [System.Windows.Automation.ControlType]::ListItem) {
+        # Avalonia exposes TreeItem peers but no ExpandCollapsePattern on
+        # Windows. Drive the visible date header through ordinary owned input,
+        # then include only period leaves in the existing selection path.
+        foreach ($node in Get-E2EControlElements $Root ([System.Windows.Automation.ControlType]::TreeItem)) {
+            if ($node.Current.Name -notmatch '^\d{4}/\d{2}/\d{2}$' -or $node.Current.IsOffscreen) { continue }
+            $leaves = @(Get-E2EControlElements $node ([System.Windows.Automation.ControlType]::TreeItem) |
+                Where-Object { $_.Current.Name -notmatch '^\d{4}/\d{2}/\d{2}$' })
+            if ($leaves.Count -gt 0) { continue }
+            $graphHandle = Find-E2EWindow $node.Current.ProcessId 'Codex Info Graph'
+            Focus-E2EInputWindow $graphHandle
+            $rect = $node.Current.BoundingRectangle
+            $point = New-Object CodexInfoWindowsE2EWin32+POINT
+            $point.X = [int]($rect.Left + 60)
+            $point.Y = [int]($rect.Top + 16)
+            $hit = [CodexInfoWindowsE2EWin32]::WindowFromPoint($point)
+            [uint32]$owner = 0
+            [CodexInfoWindowsE2EWin32]::GetWindowThreadProcessId($hit, [ref]$owner) | Out-Null
+            Assert-E2E ($owner -eq $node.Current.ProcessId -and [CodexInfoWindowsE2EWin32]::GetAncestor($hit, 2) -eq $graphHandle) 'Another window covers the date header; no input was sent.'
+            $previous = New-Object CodexInfoWindowsE2EWin32+POINT
+            Assert-E2E ([CodexInfoWindowsE2EWin32]::GetCursorPos([ref]$previous)) 'Cannot save date-header input position.'
+            try {
+                Assert-E2E ([CodexInfoWindowsE2EWin32]::SetCursorPos($point.X, $point.Y)) 'Cannot reach date header.'
+                [CodexInfoWindowsE2EWin32]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+                [CodexInfoWindowsE2EWin32]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+            Wait-E2E -Description 'date header expands into period leaves' -TimeoutSeconds 3 -Probe {
+                $children = @(Get-E2EControlElements $node ([System.Windows.Automation.ControlType]::TreeItem) |
+                    Where-Object { $_.Current.Name -notmatch '^\d{4}/\d{2}/\d{2}$' })
+                return $children.Count -gt 0
+            } | Out-Null
+            }
+            finally { [CodexInfoWindowsE2EWin32]::SetCursorPos($previous.X, $previous.Y) | Out-Null }
+
+        }
+        $elements += @(Get-E2EControlElements $Root ([System.Windows.Automation.ControlType]::TreeItem) |
+            Where-Object { $_.Current.Name -notmatch '^\d{4}/\d{2}/\d{2}$' })
+    }
+    return @($elements | Where-Object {
         try {
             $rectangle = $_.Current.BoundingRectangle
             -not $_.Current.IsOffscreen -and $_.Current.IsEnabled -and

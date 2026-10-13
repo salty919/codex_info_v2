@@ -199,9 +199,8 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、publis
 | unknown、case-altered、末尾slash、query付きpath（methodを問わない） | any | `404` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 
 RESTのtransfer body上限は既存のOOM/DoS安全境界であるdetails `32 MiB`、health/error `4 KiB`、response header `8 KiB`を全resourceで共有する。この値を通常データ件数の妥当性判定へ使わない。historyは次の正当なrowを加えると32 MiBへ達する場合だけ、そのrowの直前でpageを完了してopaque cursorを返し、次pageへ必ず前進する。単一row自体が安全境界を超える場合だけ`resource_too_large`とし、recorder、DB、公開generationを変更しない。
-SQLiteの保持期間は過去3暦月である。一方、1回のDB取得と`details`応答が扱う履歴は観測時刻で終わる
-最長1暦月の半開区間 `(one_month_before(observed_at), observed_at]` に限定する。history samples上限は
-31日分の1分bucketに相当する`44,640`、history periods `128`、confirmed history gaps `4,096`、threads `256`である。v3 history pageのrow数は固定せず、選択期間の残件数と上記OOM境界から決まる。v1/v2のmodels上限は固定3件、v3のtop-levelおよび各history rowのmodels上限はOOM/DoS境界として`1,024`件である。
+SQLiteの保持期間は過去3暦月である。互換`/v1/details`、`/v2/details`、`/v3/details`は観測時刻で終わる直近31日のprojectionを維持し、history samples上限は`44,640`である。
+`/v3/history/periods`は同一accountの全保持期間を公開し、`/v3/history`は選択したexact periodだけを最大1,024点のpageで返す。選択期間の全pageを合わせた上限は44,640点のままとし、保持期間全体をdetailsへ詰め込まない。readerは同じread-only transactionで全保持履歴と直近detailsを投影し、retained projectionとgapも同じpublished pair・cursor prefix identityへ含める。private retained indexの容量は3×44,640点とし、period最大128件、gap最大4,096件、threads最大256件は維持する。検証失敗は`history_unavailable`として公開し、空の成功履歴へ変換しない。DBの保持・prune・canonical ID・raw値は変更しない（#646）。v1/v2のmodels上限は固定3件、v3のtop-levelおよび各history rowのmodels上限はOOM/DoS境界として1,024件である。
 
 ### 容量条件とfailure isolation
 
