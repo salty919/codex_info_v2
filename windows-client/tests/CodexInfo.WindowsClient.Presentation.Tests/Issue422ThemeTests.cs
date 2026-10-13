@@ -415,7 +415,7 @@ public sealed class Issue422ThemeTests
 
     private static string ReadGraphRoleResource(string key)
     {
-        var brush = Assert.IsType<SolidColorBrush>(ThemePalette.Brush(key));
+        var brush = Assert.IsAssignableFrom<ISolidColorBrush>(ThemePalette.Brush(key));
         return $"#{brush.Color.R:X2}{brush.Color.G:X2}{brush.Color.B:X2}";
     }
 
