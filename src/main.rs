@@ -48092,7 +48092,9 @@ mod tests {
                 );
                 let words = path.split_whitespace().collect::<Vec<_>>();
                 let stopped_y = words
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .filter_map(|pair| {
                         let x = pair[0][1..].parse::<f64>().unwrap();
                         (x > 6.0 && x < 88.0).then(|| pair[1].parse::<f64>().unwrap())
