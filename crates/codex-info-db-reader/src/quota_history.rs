@@ -17,6 +17,7 @@ pub(super) fn project(
     details: &mut PublicDetails,
     history_v2: &mut Vec<PublicHistoryObservation>,
     history_v3: &mut Vec<PublicHistoryObservationV3>,
+    history_window: HistoryWindow,
 ) -> Result<(), ReaderError> {
     let Some(current) = details.quota.as_ref() else {
         return Ok(());
@@ -27,10 +28,7 @@ pub(super) fn project(
          FROM quota_receipts WHERE observed_at > ?1 AND observed_at <= ?2 ORDER BY sequence",
     )?;
     let rows = statement.query_map(
-        params![
-            observed_at.saturating_sub(HISTORY_WINDOW_SECONDS),
-            observed_at
-        ],
+        params![history_window.cutoff(observed_at), observed_at],
         |row| {
             Ok(Receipt {
                 sequence: row.get(0)?,

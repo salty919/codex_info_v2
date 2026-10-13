@@ -7851,126 +7851,6 @@ struct GraphIdleRenderEvidence<'a> {
     untrusted_minutes: &'a BTreeSet<i64>,
 }
 
-fn graph_nearest_short_model_rate(
-    timestamp: i64,
-    search_before: bool,
-    model: &str,
-    raw_timelines: &GraphModelTimelines,
-    accepted_tokens: &GraphModelTimelines,
-    reset_at_by_minute: &BTreeMap<i64, i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> Option<f64> {
-    let raw = raw_timelines.get(model)?;
-    let accepted = accepted_tokens.get(model)?;
-    let timestamps = raw.keys().copied().collect::<Vec<_>>();
-    let endpoint = timestamps.binary_search(&timestamp).ok()?;
-    let pairs = if search_before {
-        (1..=endpoint)
-            .rev()
-            .map(|right| (right - 1, right))
-            .collect::<Vec<_>>()
-    } else {
-        (endpoint..timestamps.len().saturating_sub(1))
-            .map(|left| (left, left + 1))
-            .collect::<Vec<_>>()
-    };
-    for (left, right) in pairs {
-        let start = timestamps[left];
-        let end = timestamps[right];
-        if end - start != 60
-            || reset_at_by_minute.get(&start) != reset_at_by_minute.get(&end)
-            || reset_at_by_minute.get(&start).is_none()
-            || graph_interval_overlaps_confirmed_gap(start, end, confirmed_gaps)
-        {
-            continue;
-        }
-        let (Some(left), Some(right)) = (raw.get(&start), raw.get(&end)) else {
-            continue;
-        };
-        if !graph_model_is_lossless_idle_observation(left)
-            || !graph_model_is_lossless_idle_observation(right)
-            || !accepted
-                .get(&start)
-                .is_some_and(graph_model_is_lossless_idle_observation)
-            || !accepted
-                .get(&end)
-                .is_some_and(graph_model_is_lossless_idle_observation)
-        {
-            continue;
-        }
-        let (Some(before), Some(after)) = (left.raw_tokens, right.raw_tokens) else {
-            continue;
-        };
-        if after > before {
-            return Some((after - before) as f64 / 60.0);
-        }
-    }
-    None
-}
-
-fn graph_low_rate_long_model_change(
-    interval: (i64, i64),
-    before: &[(String, u64)],
-    after: &[(String, u64)],
-    raw_timelines: &GraphModelTimelines,
-    accepted_tokens: &GraphModelTimelines,
-    samples: &[&UsageHistorySample],
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> bool {
-    let (start, end) = interval;
-    if end <= start || before.len() != after.len() {
-        return false;
-    }
-    let reset_at_by_minute = samples
-        .iter()
-        .map(|sample| (sample.timestamp.div_euclid(60) * 60, sample.reset_at))
-        .collect::<BTreeMap<_, _>>();
-    if reset_at_by_minute.get(&start) != reset_at_by_minute.get(&end)
-        || !reset_at_by_minute.contains_key(&start)
-    {
-        return false;
-    }
-    let mut changed = false;
-    for ((before_name, before_tokens), (after_name, after_tokens)) in
-        before.iter().zip(after.iter())
-    {
-        if before_name != after_name || after_tokens < before_tokens {
-            return false;
-        }
-        if after_tokens == before_tokens {
-            continue;
-        }
-        changed = true;
-        let Some(before_rate) = graph_nearest_short_model_rate(
-            start,
-            true,
-            before_name,
-            raw_timelines,
-            accepted_tokens,
-            &reset_at_by_minute,
-            confirmed_gaps,
-        ) else {
-            return false;
-        };
-        let Some(after_rate) = graph_nearest_short_model_rate(
-            end,
-            false,
-            before_name,
-            raw_timelines,
-            accepted_tokens,
-            &reset_at_by_minute,
-            confirmed_gaps,
-        ) else {
-            return false;
-        };
-        let interval_rate = (*after_tokens - *before_tokens) as f64 / (end - start) as f64;
-        if interval_rate >= before_rate || interval_rate >= after_rate {
-            return false;
-        }
-    }
-    changed
-}
-
 fn token_idle_timestamp_intervals_with_render_evidence(
     samples: &[&UsageHistorySample],
     period_start: i64,
@@ -8148,16 +8028,7 @@ fn token_idle_timestamp_intervals_for_model(
             continue;
         };
         if end <= start
-            || (start_vector != end_vector
-                && !graph_low_rate_long_model_change(
-                    (*start, *end),
-                    start_vector,
-                    end_vector,
-                    raw_timelines,
-                    &accepted_tokens,
-                    samples,
-                    confirmed_gaps,
-                ))
+            || start_vector != end_vector
             || has_numeric_incomplete_row(*start, *end)
             || has_unavailable_incomplete_row(*start, *end)
             || !direct_models_remain_flat(*start, *end, start_vector)
@@ -50628,7 +50499,7 @@ mod tests {
     }
 
     #[test]
-    fn sep22_low_rate_interval_draws_unused_band_and_model_specific_idle() {
+    fn sep22_low_rate_interval_has_no_unused_band_and_preserves_model_specific_idle() {
         let timestamps = [0, 60, 120, 3_720, 3_780, 3_840];
         let luna_tokens = [100, 200, 200, 300, 300, 400];
         let samples = timestamps
@@ -50692,16 +50563,13 @@ mod tests {
             },
         );
         assert!(
-            graph.unused_intervals.iter().any(|interval| {
-                interval.start <= 120.0 / 3_840.0 * 100.0
-                    && interval.start + interval.width >= 3_720.0 / 3_840.0 * 100.0
-            }),
-            "the long low-rate interval needs an unused band"
+            graph.unused_intervals.is_empty(),
+            "a token increase is usage"
         );
         assert!(!graph.sol_idle.is_empty(), "SOL is unchanged throughout");
         assert!(
-            !graph.luna_inferred.is_empty(),
-            "LUNA's low-rate increase must be inferred, not solid idle"
+            !graph.luna_rising.is_empty(),
+            "LUNA's directly recorded increase remains a rising line"
         );
     }
 

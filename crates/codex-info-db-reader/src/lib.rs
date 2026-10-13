@@ -27,6 +27,37 @@ mod quota_history;
 
 const MAX_HISTORY_ROWS: usize = 31 * 24 * 60;
 const HISTORY_WINDOW_SECONDS: i64 = 31 * 24 * 60 * 60;
+const MAX_RETAINED_HISTORY_ROWS: usize = 3 * MAX_HISTORY_ROWS;
+
+#[derive(Clone, Copy)]
+enum HistoryWindow {
+    Recent,
+    Retained,
+}
+
+impl HistoryWindow {
+    fn cutoff(self, observed_at: i64) -> i64 {
+        match self {
+            Self::Recent => observed_at.saturating_sub(HISTORY_WINDOW_SECONDS),
+            Self::Retained => 0,
+        }
+    }
+    fn max_rows(self) -> usize {
+        match self {
+            Self::Recent => MAX_HISTORY_ROWS,
+            Self::Retained => MAX_RETAINED_HISTORY_ROWS,
+        }
+    }
+}
+
+/// Private retained projection for the period directory and bounded pages.
+/// Retention belongs to the writer; compatibility details stay recent.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct HistoryArchive {
+    pub periods: Vec<PublicHistoryPeriod>,
+    pub samples: Vec<PublicHistoryObservationV3>,
+    pub gaps: Vec<PublicHistoryGap>,
+}
 pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 13;
 pub const ACCOUNT_DB_SCHEMA_VERSION: i64 = 14;
 const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
@@ -63,6 +94,7 @@ pub struct DbSnapshot {
     /// v2 keeps the same nullable legacy fields while exposing source
     /// provenance and unavailable observations.
     pub history_samples_v2: Vec<PublicHistoryObservation>,
+    pub retained_history: HistoryArchive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -529,8 +561,62 @@ impl DbReader {
                     &threads,
                     &task_evidence,
                     &self.read_intervals,
-                    &authority,
+                    DetailsProjection {
+                        authority: &authority,
+                        history_window: HistoryWindow::Recent,
+                    },
                 )?;
+            let retained_history = (|| -> Result<HistoryArchive, ReaderError> {
+                let (mut retained_details, _, mut retained_v2, mut retained_v3, _) =
+                    build_details_for_intervals(
+                        &transaction,
+                        &raw,
+                        &all_history,
+                        &threads,
+                        &task_evidence,
+                        &self.read_intervals,
+                        DetailsProjection {
+                            authority: &authority,
+                            history_window: HistoryWindow::Retained,
+                        },
+                    )?;
+                if authority.quota.is_some() {
+                    quota_history::project(
+                        &transaction,
+                        &self.read_intervals,
+                        &mut retained_details,
+                        &mut retained_v2,
+                        &mut retained_v3,
+                        HistoryWindow::Retained,
+                    )?;
+                }
+                if retained_v3.len() > MAX_RETAINED_HISTORY_ROWS {
+                    return Err(ReaderError::TooManyRows(retained_v3.len()));
+                }
+                let retained_v1 = std::mem::take(&mut retained_details.history_samples);
+                retained_details.validate()?;
+                // Validate stored values against the unchanged public contract in
+                // bounded chunks, rather than broadening the details DTO limit.
+                for chunk in retained_v1.chunks(MAX_HISTORY_ROWS) {
+                    let mut bounded = retained_details.clone();
+                    bounded.history_samples = chunk.to_vec();
+                    bounded.validate()?;
+                }
+                let mut counts = BTreeMap::<i64, usize>::new();
+                for row in &retained_v3 {
+                    let count = counts.entry(row.reset_at).or_default();
+                    *count += 1;
+                    if *count > MAX_HISTORY_ROWS {
+                        return Err(ReaderError::TooManyRows(*count));
+                    }
+                }
+                Ok(HistoryArchive {
+                    periods: retained_details.history_periods,
+                    samples: retained_v3,
+                    gaps: retained_details.history_gaps,
+                })
+            })()
+            .ok();
             Ok((
                 details,
                 models_v3,
@@ -538,8 +624,10 @@ impl DbReader {
                 history_samples_v3,
                 generation,
                 current,
+                retained_history,
             ))
         })();
+        let derived_history_available = projection.is_ok();
         let (
             mut details,
             mut models_v3,
@@ -547,6 +635,7 @@ impl DbReader {
             mut history_samples_v3,
             generation,
             mut current,
+            mut retained_history,
         ) = match projection {
             Ok(value) => value,
             Err(error) => {
@@ -563,6 +652,7 @@ impl DbReader {
                     Vec::new(),
                     generation,
                     CurrentPublication::unavailable(PublicState::Error),
+                    None,
                 )
             }
         };
@@ -574,13 +664,14 @@ impl DbReader {
                     &mut details,
                     &mut history_samples_v2,
                     &mut history_samples_v3,
+                    HistoryWindow::Recent,
                 )?;
             }
             details.validate()?;
             Ok(())
         })();
         let history_available = match publication {
-            Ok(()) => true,
+            Ok(()) => derived_history_available && retained_history.is_some(),
             Err(error) => {
                 let Some(receipt) = authority.quota.as_ref() else {
                     return Err(error);
@@ -593,9 +684,11 @@ impl DbReader {
                 models_v3.clear();
                 history_samples_v2.clear();
                 history_samples_v3.clear();
+                retained_history = None;
                 false
             }
         };
+        let retained_history = retained_history.unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(generation.to_be_bytes());
         hasher.update(
@@ -606,6 +699,7 @@ impl DbReader {
                 &models_v3,
                 &history_samples_v2,
                 &history_samples_v3,
+                &retained_history,
             ))
             .map_err(|error| {
                 ReaderError::InvalidValue(format!("snapshot serialization failed: {error}"))
@@ -624,6 +718,7 @@ impl DbReader {
             models_v3,
             history_samples_v2,
             history_samples_v3,
+            retained_history,
         })
     }
 }
@@ -1319,6 +1414,11 @@ struct ProjectionAuthority {
     quota: Option<AcceptedQuota>,
 }
 
+struct DetailsProjection<'a> {
+    authority: &'a ProjectionAuthority,
+    history_window: HistoryWindow,
+}
+
 fn read_quota_acquisition_degraded(connection: &Connection) -> Result<bool, ReaderError> {
     if !table_exists(connection, "quota_acquisition_state")? {
         return Ok(false);
@@ -1385,8 +1485,12 @@ fn build_details_for_intervals(
     threads: &[PublicThread],
     task_evidence: &TaskActivityEvidence,
     intervals: &ReadIntervals,
-    authority: &ProjectionAuthority,
+    projection: DetailsProjection<'_>,
 ) -> Result<DetailsBuild, ReaderError> {
+    let DetailsProjection {
+        authority,
+        history_window,
+    } = projection;
     let history_is_canonical = authority.history_is_canonical;
     if raw.is_empty() {
         if let Some(receipt) = &authority.quota {
@@ -1432,17 +1536,39 @@ fn build_details_for_intervals(
         None => read_collection_config(connection)?,
     };
     let current_window_reset_at = latest_quota_reset_at.or(current_reset_at);
-    let cutoff = observed_at.saturating_sub(HISTORY_WINDOW_SECONDS);
+    let cutoff = history_window.cutoff(observed_at);
+    let recent = raw
+        .iter()
+        .filter(|row| row.timestamp > cutoff && row.timestamp <= observed_at)
+        .cloned()
+        .collect::<Vec<_>>();
+    if recent.len() > history_window.max_rows() {
+        return Err(ReaderError::TooManyRows(recent.len()));
+    }
     let samples = if history_is_canonical {
-        if raw.len() > MAX_HISTORY_ROWS {
-            return Err(ReaderError::TooManyRows(raw.len()));
-        }
-        raw.iter()
-            .filter(|row| row.timestamp > cutoff && row.timestamp <= observed_at)
+        recent
+            .iter()
             .map(public_sample_from_raw)
             .collect::<Vec<_>>()
     } else {
-        canonicalize_history_for_public_window(raw, current_reset_at, window_seconds)?
+        let mut samples = canonicalize_history_with_limit(
+            &recent,
+            current_reset_at,
+            window_seconds,
+            observed_at,
+            Some(history_window.max_rows()),
+        )?;
+        normalize_current_period_samples(&mut samples, current_reset_at, window_seconds);
+        if samples.is_empty() && !recent.is_empty() {
+            samples = canonicalize_history_with_limit(
+                &recent,
+                None,
+                0,
+                observed_at,
+                Some(history_window.max_rows()),
+            )?;
+        }
+        samples
     };
     let samples = authoritative_history_projection_samples(
         samples,
@@ -2709,6 +2835,12 @@ fn history_observations_v2(
     samples: &[PublicHistorySample],
     history_v3: &[PublicHistoryObservationV3],
 ) -> Vec<PublicHistoryObservation> {
+    let mut legacy_by_key = BTreeMap::new();
+    for sample in samples {
+        legacy_by_key
+            .entry((sample.reset_at, sample.timestamp))
+            .or_insert(sample);
+    }
     history_v3
         .iter()
         .map(|sample| {
@@ -2717,9 +2849,9 @@ fn history_observations_v2(
                 "reconstructed-from-session" | "unavailable"
             ))
             .then(|| {
-                samples.iter().find(|legacy| {
-                    legacy.timestamp == sample.timestamp && legacy.reset_at == sample.reset_at
-                })
+                legacy_by_key
+                    .get(&(sample.reset_at, sample.timestamp))
+                    .copied()
             })
             .flatten();
             PublicHistoryObservation {
@@ -6217,6 +6349,41 @@ mod tests {
         )
         .unwrap();
         (path, identity)
+    }
+
+    #[test]
+    fn issue646_retained_canonical_rows_do_not_exhaust_recent_history_capacity() {
+        let (path, identity) = quota_receipt_current_fixture("retained-capacity");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DELETE FROM usage_history;
+            WITH RECURSIVE minutes(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM minutes WHERE n<44999)
+            INSERT INTO usage_history SELECT 1800000000-40*86400+n*60,
+                1800000000-40*86400+(n/10080+1)*604800,90,1,0,0,n+1,0,0 FROM minutes;
+            INSERT INTO usage_history VALUES(1800000000,1800604800,99,2,0,0,50000,0,0);",
+        )
+        .unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_snapshot()
+            .unwrap();
+        assert!(
+            snapshot.history_available,
+            "retained rows outside the details window are not a details capacity error"
+        );
+        assert_eq!(snapshot.details.history_samples.len(), 32040);
+        assert_eq!(
+            snapshot.details.history_samples.last().unwrap().sol_tokens,
+            50000
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM usage_history", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            45001
+        );
+        drop(db);
+        fs::remove_file(path).unwrap();
     }
 
     fn assert_latest_receipt_quota(snapshot: &DbSnapshot) {

@@ -3,6 +3,7 @@
 
 using Avalonia;
 using Avalonia.Media;
+using Avalonia.Media.Immutable;
 using Avalonia.Styling;
 
 namespace CodexInfo.WindowsClient.Theme;
@@ -264,11 +265,11 @@ public static class ThemePalette
     {
         var result = Colors.Keys.ToDictionary(
             key => key,
-            key => (IBrush)new SolidColorBrush(Color.Parse(ResolveFor(id, key))),
+            key => (IBrush)new ImmutableSolidColorBrush(Color.Parse(ResolveFor(id, key))),
             StringComparer.OrdinalIgnoreCase);
         foreach (var roleKey in SemanticRoleColors.Keys)
         {
-            result[roleKey] = new SolidColorBrush(Color.Parse(ResolveRoleFor(id, roleKey)));
+            result[roleKey] = new ImmutableSolidColorBrush(Color.Parse(ResolveRoleFor(id, roleKey)));
         }
 
         return result;
