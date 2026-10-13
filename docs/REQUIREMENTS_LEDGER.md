@@ -4,6 +4,7 @@
 
 | ID | owner | 実装範囲 | 直接オラクル | 状態 |
 | --- | --- | --- | --- | --- |
+| HISTORY-RECOVERY-614 | PRODUCT | Session quota recovery、recorder起動、Windows Graph | exact source/hash/reset、欠落公開行のquota-only回復、atomic/idempotent、model不変、最初の実測・非所有区間説明の有限testと隔離REST/実画面 | implemented |
 | QUOTA-DURABLE-604 | DATA | Recorder quota取得原本、永続入力からのprojection・再処理、DB/REST/両UI公開 | 取得原本を通知・解釈・Session処理から独立して保持し、受理済みquotaと適用位置をatomicに確定する。現在値は取得順、期間は公式reset完全一致を正本とする。過去の未解釈原本を保全しつつ、後続の正常な公式応答を現在の取得失敗扱いにしない。最新入力の失敗と実通信・保存失敗を区別して保持する。処理・保存・再処理の失敗で入力を失わず、通常終了・SIGTERM・再起動でも保存と再処理の所有を維持する。原本保存前のSIGKILLと保存装置そのものの喪失は保証対象外。配布済み環境への反映は別途確認する | implemented |
 | LINUX-UPDATE-DIAGNOSTICS-479 | PRODUCT | installer update/rollback failure owner、既存run.sh | test_same_recorder_hash_update_and_rest_failure_preserve_running_recorder の実fixture失敗・target/stage/reasonログ・--ui stderr。実導入とDB維持はINCONCLUSIVE | implemented |
 | RUNTIME-VERSION-481 | WIRE | recorder状態公開、REST runtime metadata、共通DTO/ canonical stable・beta guard、Linux health委譲、既存state consumers | recorder_auth_state_idle_publication_has_no_account_or_generation_authority、issue_481_runtime_versions_are_available_without_an_account、Issue481RuntimeVersionsKeepSeparateProcessesAndUnavailableState、`issue467_runtime_contract_accepts_beta_diagnostics`/`issue467_runtime_contract_rejects_invalid_identity_and_status`、`issue467_native_runtime_beta_diagnostics_preserve_versions_and_mismatch`と既存native stable runtime/canonical beta healthのliteral DTO・private HTTP診断。実process/実機描画はINCONCLUSIVE | implemented |

@@ -15,6 +15,7 @@ THREAD-CONTEXT-362
 THREAD-OPEN-362
 CUM-138-04
 G137-GRAPH-01
+HISTORY-RECOVERY-614
 WIN-PARITY-DATA
 WIN-PARITY-STATE
 WIN-PARITY-OPS
@@ -387,6 +388,10 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - 上記要件と参照先仕様の間に、同じ入力へ異なる必須結果を要求する矛盾がない。
 
 ## G137 Linux / Windows 履歴グラフ同値契約
+
+`HISTORY-RECOVERY-614`: recorder 起動時の直近31日原本回復は、account partition に帰属済みの Session event と元 byte range/hash、観測時刻、保存済み exact reset が一致する quota だけを採用する。既存 quota が NULL の場合に加え、公開履歴の行自体が欠けている場合も回復する。model の証拠がない追加点は既存の unavailable durable observation として保存し、model 行や使用量0を作らない。元ファイル不在・改変、未知 reset、同じ minute の複数 reset は回復せず不明を保持する。保存は atomic・冪等とし、既存非NULL quota、model 累計、現在 quota receipt、Session checkpoint を変更しない。quota の差分から使用者・端末・model 使用量を推定しない。現在の原本が当該 account/reset に帰属しない場合の完全復元は保証しない。
+
+Windows Graph は表示範囲内の最初の実測日時と残量を表示し、初回89%などの記録を100%へ置換しない。account ownership 外の区間は当該 account を記録していない期間であり、区間内利用量は不明と説明する。範囲外の保存履歴の不存在や別利用者の使用を断定しない。破線の一般的な未確認・欠測の説明も保持する。
 
 `G137-GRAPH-01` は、同じstrict validation済み履歴resourceからLinux版とWindows版が
 同じ値、同じ線種、同じ連続区間、同じ未使用区間を表示するためのcross-platform契約である。

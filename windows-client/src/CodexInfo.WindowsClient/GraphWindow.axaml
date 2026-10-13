@@ -245,7 +245,8 @@
       <Grid Grid.Row="3" x:Name="GraphFrame">
         <Border Background="{DynamicResource Theme121C2C}" BorderBrush="Transparent" BorderThickness="1" CornerRadius="10" ClipToBounds="True">
           <Grid RowDefinitions="Auto,*">
-            <TextBlock Grid.Row="0" Classes="label" Margin="12,8,12,6" MaxWidth="560"
+            <StackPanel Grid.Row="0">
+            <TextBlock Classes="label" Margin="12,8,12,6" MaxWidth="560"
                        HorizontalAlignment="Left" VerticalAlignment="Center"
                        TextWrapping="Wrap" FontWeight="SemiBold"
                        Foreground="{DynamicResource ThemeF0A35B}"
@@ -254,6 +255,11 @@
                        IsHitTestVisible="False"
                        AutomationProperties.Name="{Binding DetailsStatusText}"
                        AutomationProperties.AutomationId="Graph.CurrentDataWarning" />
+            <TextBlock Classes="label" Margin="12,6,12,6" TextWrapping="Wrap"
+                       Text="{Binding GraphGapHintText}" IsVisible="{Binding HasLinePlot}"
+                       AutomationProperties.Name="{Binding GraphGapHintText}"
+                       AutomationProperties.AutomationId="Graph.HistoryEvidence" />
+            </StackPanel>
             <plot:GraphPlotControl Grid.Row="1" Scene="{Binding Scene}"
                                    ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}"
                                    ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}"

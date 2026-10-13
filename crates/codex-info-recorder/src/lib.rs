@@ -12059,6 +12059,63 @@ mod tests {
     }
 
     #[test]
+    fn restart_recovers_missing_session_quota_rows_without_replaying_model_usage() {
+        use rusqlite::{params, OptionalExtension};
+        let (root, database) = prepare("startup-missing-session-quota-recovery");
+        let minute = Utc::now().timestamp().div_euclid(60) * 60 - 120;
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1,latest_quota_reset_at=?1",
+                [minute + 3000],
+            )
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
+        let reset = recorder.state().unwrap().reset_at;
+        let mut event: Value = serde_json::from_str(&token(100, minute + 10)).unwrap();
+        event["payload"]["rate_limits"] = json!({"secondary": {
+            "used_percent": 12, "resets_at": reset, "window_minutes": 60
+        }});
+        fs::write(
+            root.join("sessions/one.jsonl"),
+            format!("{}{}\n", token(0, minute - 60), event),
+        )
+        .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let before = recorder.model_totals().unwrap();
+        drop(recorder);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "DELETE FROM usage_model_history WHERE timestamp=?1",
+                [minute],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM durable_state WHERE singleton>=2 AND data_generation=?1",
+                [minute],
+            )
+            .unwrap();
+        connection
+            .execute("DELETE FROM usage_history WHERE timestamp=?1", [minute])
+            .unwrap();
+        drop(connection);
+
+        let restarted =
+            Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
+        let quota: Option<f64> = Connection::open(&database).unwrap().query_row(
+            "SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2",
+            params![minute, reset], |row| row.get(0),
+        ).optional().unwrap().flatten();
+        assert_eq!(quota, Some(88.0));
+        assert_eq!(restarted.model_totals().unwrap(), before);
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn restart_recovers_session_quota_without_replaying_model_usage() {
         let (root, database) = prepare("startup-session-quota-recovery");
         let minute = Utc::now().timestamp().div_euclid(60) * 60 - 120;
