@@ -22,35 +22,41 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphSelectInteractionTests
 {
     [Fact]
-    public Task GroupedPeriodSelectionUsesPopupPaletteAfterThemeChanges() => RunOnUiThread(() =>
+    public async Task GroupedPeriodSelectionUsesPopupPaletteAfterThemeChanges()
     {
         var previousTheme = ThemePalette.CurrentId;
-        var period = new ApiHistoryPeriod("selected", 1_000, 2_000, false, "History");
-        var selector = new GraphSelect
+        // Earlier tests can create the same palette before this UI dispatcher
+        // exists even with test parallelization disabled.
+        ThemePalette.Apply("graphite-dark");
+        ThemePalette.Apply("classic-dark");
+        await RunOnUiThread(() =>
         {
-            GroupPeriodsByDate = true,
-            ItemsSource = new[] { period },
-            SelectedItem = period,
-            IsChecked = true,
-        };
-        var window = new Window { Content = selector, Width = 500, Height = 400 };
-        try
-        {
-            ThemePalette.Apply("classic-dark");
-            window.Show();
-            Invoke(selector, "OnFieldClick", new RoutedEventArgs(Button.ClickEvent));
-            var tree = selector.FindControl<TreeView>("PeriodTree");
-            Assert.NotNull(tree);
-            var group = Assert.Single(tree.ItemsSource!.Cast<PeriodDateGroup>());
-            group.IsExpanded = true;
-            Avalonia.Threading.Dispatcher.UIThread.RunJobs();
-            var parent = Assert.IsType<TreeViewItem>(tree.ContainerFromIndex(0));
-            var selected = Assert.IsType<TreeViewItem>(parent.ContainerFromIndex(0));
-            Assert.True(selected.IsSelected);
-            // Fixed popup-selected values from WINDOWS_UX_SPEC. Change themes
-            // on the same open tree to catch stale or hard-coded brushes.
-            foreach (var (theme, expected) in new[]
+            var period = new ApiHistoryPeriod("selected", 1_000, 2_000, false, "History");
+            var selector = new GraphSelect
             {
+                GroupPeriodsByDate = true,
+                ItemsSource = new[] { period },
+                SelectedItem = period,
+                IsChecked = true,
+            };
+            var window = new Window { Content = selector, Width = 500, Height = 400 };
+            try
+            {
+                ThemePalette.Apply("classic-dark");
+                window.Show();
+                Invoke(selector, "OnFieldClick", new RoutedEventArgs(Button.ClickEvent));
+                var tree = selector.FindControl<TreeView>("PeriodTree");
+                Assert.NotNull(tree);
+                var group = Assert.Single(tree.ItemsSource!.Cast<PeriodDateGroup>());
+                group.IsExpanded = true;
+                Avalonia.Threading.Dispatcher.UIThread.RunJobs();
+                var parent = Assert.IsType<TreeViewItem>(tree.ContainerFromIndex(0));
+                var selected = Assert.IsType<TreeViewItem>(parent.ContainerFromIndex(0));
+                Assert.True(selected.IsSelected);
+                // Fixed popup-selected values from WINDOWS_UX_SPEC. Change themes
+                // on the same open tree to catch stale or hard-coded brushes.
+                foreach (var (theme, expected) in new[]
+                {
                 ("classic-dark", "#244D74"), ("graphite-dark", "#344D63"), ("light", "#D9EBF8"),
                 ("paper-light", "#DAE9EE"), ("sand-light", "#DCE8DB"), ("steel-light", "#D7E5F7"),
                 ("ocean-dark", "#284B70"), ("teal-dark", "#1E5B67"), ("ember-dark", "#555147"),
@@ -58,24 +64,25 @@ public sealed class GraphSelectInteractionTests
                 ("mint-light", "#C8E8D6"), ("forest-dark", "#31533A"),
                 ("tangerine-dark", "#68462C"), ("rose-dark", "#67425B"),
             })
-            {
-                ThemePalette.Apply(theme);
-                Avalonia.Threading.Dispatcher.UIThread.RunJobs();
-                var backgrounds = selected.GetVisualDescendants().OfType<Border>()
-                    .Where(border => border.Bounds.Width > 0 && border.Bounds.Height > 0)
-                    .Select(border => (border.Background as ISolidColorBrush)?.Color)
-                    .ToArray();
-                Assert.Contains(Color.Parse(expected), backgrounds);
-                Assert.True(selector.IsOpen);
-                Assert.Same(period, selector.SelectedItem);
+                {
+                    ThemePalette.Apply(theme);
+                    Avalonia.Threading.Dispatcher.UIThread.RunJobs();
+                    var backgrounds = selected.GetVisualDescendants().OfType<Border>()
+                        .Where(border => border.Bounds.Width > 0 && border.Bounds.Height > 0)
+                        .Select(border => (border.Background as ISolidColorBrush)?.Color)
+                        .ToArray();
+                    Assert.Contains(Color.Parse(expected), backgrounds);
+                    Assert.True(selector.IsOpen);
+                    Assert.Same(period, selector.SelectedItem);
+                }
             }
-        }
-        finally
-        {
-            window.Close();
-            ThemePalette.Apply(previousTheme);
-        }
-    });
+            finally
+            {
+                window.Close();
+                ThemePalette.Apply(previousTheme);
+            }
+        });
+    }
 
     [Fact]
     public Task DateTreeInputsNeverStartGraphWindowDragging() => RunOnUiThread(() =>
