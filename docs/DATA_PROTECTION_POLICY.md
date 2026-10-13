@@ -298,7 +298,7 @@ session selectionとcache fingerprintは同じmtime/path降順vectorを使い、
 
 1. [製品要件](PRODUCT_REQUIREMENTS.md)または本書の該当箇所を更新し、要求と失敗境界を逆引きできる。
 2. 既存DB行のread-only row count/hashを変更前後で比較する。通常の3か月prune以外の減少はFAILとする。
-   DB保持は3暦月、1回の取得はその中の最長1暦月（最大44,640分点）であり、取得上限を保持期間の短縮へ読み替えない。
+   DB保持は3暦月であり、期間一覧は同じaccountの全保持期間を扱う。選択期間の取得は有限pageで最大44,640分点、互換detailsは直近31日とし、取得上限を保持期間の短縮へ読み替えない（#646）。
 3. malformed、empty、multiple writer、app-server停止、再起動、認証境界、migration/schema mismatchを検査する。
 4. 完全な変更pathと影響master IDを事前分類し、そのIDに直接紐付く既存の破壊操作scan、
    SQLite fixture、Rust testだけを共有呼出しごと1回実行する。データ保護境界を変更していない場合は

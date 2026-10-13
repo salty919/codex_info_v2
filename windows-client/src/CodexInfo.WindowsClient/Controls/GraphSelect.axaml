@@ -36,6 +36,19 @@
     <Popup x:Name="MenuPopup" IsLightDismissEnabled="True" ShouldUseOverlayLayer="True">
       <Border x:Name="PopupSurface" CornerRadius="6" BorderThickness="1"
               BorderBrush="{DynamicResource Theme405779}" Background="{DynamicResource Theme111B2C}" ClipToBounds="True">
+        <Grid>
+        <TreeView x:Name="PeriodTree" IsVisible="False"
+                  AutomationProperties.AutomationId="{Binding MenuAutomationId, ElementName=Root}"
+                  SelectionChanged="OnPeriodSelectionChanged" PointerReleased="OnPeriodPointerReleased"
+                  Background="Transparent" BorderThickness="0" Padding="0">
+          <TreeView.Styles>
+            <Style Selector="TreeViewItem">
+              <Setter Property="AutomationProperties.Name" Value="{ReflectionBinding Label}" />
+              <Setter Property="MinHeight" Value="32" />
+              <Setter Property="Padding" Value="8,0" />
+            </Style>
+          </TreeView.Styles>
+        </TreeView>
         <ListBox x:Name="MenuList" ItemsSource="{Binding ItemsSource, ElementName=Root}"
                  SelectedItem="{Binding SelectedItem, ElementName=Root, Mode=TwoWay}"
                  ItemTemplate="{Binding ItemTemplate, ElementName=Root}"
@@ -65,6 +78,7 @@
             </Style>
           </ListBox.Styles>
         </ListBox>
+        </Grid>
       </Border>
     </Popup>
   </Grid>

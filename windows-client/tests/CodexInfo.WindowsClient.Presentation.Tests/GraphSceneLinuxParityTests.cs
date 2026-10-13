@@ -10,6 +10,53 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphSceneLinuxParityTests
 {
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Issue621SlowerRecordedUsageDoesNotExtendTaskIdle(bool exactModelIds)
+    {
+        // Minutes are relative to 06:03. Actual cumulative SOL values from
+        // 10/13: the increase at 06:09 precedes the 06:09–06:24 stop.
+        var values = new Dictionary<int, ulong>
+        {
+            [0] = 847_165,
+            [1] = 1_361_486,
+            [3] = 1_943_197,
+            [5] = 2_097_645,
+            [6] = 2_411_449,
+            [22] = 2_896_985,
+        };
+        var samples = Enumerable.Range(0, 23)
+            .Where(minute => minute is not 2)
+            .Select(minute => minute is 4 or 18
+                ? new ApiHistorySample(1_000 + minute * 60, 10_000, minute == 4 ? null : 100,
+                    null, null, null, null, null, null, ApiHistorySample.UnavailableModelSource)
+                { ModelsComplete = false, TaskActiveSincePrevious = minute < 7 }
+                : new ApiHistorySample(1_000 + minute * 60, 10_000, 100,
+                    values.GetValueOrDefault(minute, 2_411_449ul), 0, 2_924_216,
+                    values.GetValueOrDefault(minute, 2_411_449ul), 0, 2_924_216,
+                    ApiHistorySample.LegacyUnknownModelSource)
+                {
+                    ModelsComplete = false,
+                    TaskActiveSincePrevious = minute < 7 || minute == 22,
+                    ModelSamples = exactModelIds ? [
+                        new ApiHistoryModelSample("gpt-6.1-sol", null, null, null, null) { TotalTokens = values.GetValueOrDefault(minute, 2_411_449ul) - 28_924 },
+                        new ApiHistoryModelSample("gpt-6-sol", null, null, null, null) { TotalTokens = 28_924 },
+                        new ApiHistoryModelSample("gpt-6-luna", null, null, null, null) { TotalTokens = 2_924_216 },
+                    ] : null,
+                })
+            .ToArray();
+        var scene = GraphScene.Create(samples, GraphMetric.Tokens, 1_000, 2_320);
+
+        Assert.Equal([new GraphUnusedInterval(1_360, 2_260)],
+            GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+        Assert.Equal(2_097_645d, scene.Sol[Array.IndexOf(samples.Select(s => s.Timestamp).ToArray(), 1_300)]);
+        Assert.Equal(2_411_449d, scene.Sol[Array.IndexOf(samples.Select(s => s.Timestamp).ToArray(), 1_360)]);
+        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        Assert.Contains(1_360d, lines.Idle.X);
+        Assert.All(lines.Idle.Y.Where(double.IsFinite), y => Assert.Equal(2_411_449d, y));
+    }
+
+    [Theory]
     [InlineData(false, true, false)]
     [InlineData(false, true, true)]
     [InlineData(false, false, false)]

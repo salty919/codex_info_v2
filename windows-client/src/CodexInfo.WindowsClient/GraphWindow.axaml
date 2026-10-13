@@ -187,6 +187,7 @@
                               HasFieldLabel="False" ValueMargin="0"
                               ValueText="{Binding SelectedPeriodValueText}"
                               ItemsSource="{Binding Periods}" SelectedItem="{Binding SelectedPeriod, Mode=TwoWay}"
+                              GroupPeriodsByDate="True"
                               MenuAutomationId="Graph.PeriodMenu" PopupWidth="620" LimitPopupToField="True" MaxVisibleItems="10"
                               IsEnabled="{Binding HasPeriods}"
                               AutomationProperties.Name="{Binding Texts.PeriodSelectorHeading}"

@@ -153,7 +153,7 @@ public partial class GraphWindow : Window
     {
         for (var current = source as Visual; current is not null && !ReferenceEquals(current, this); current = current.GetVisualParent())
         {
-            if (current is Button or ListBox or ListBoxItem or ScrollBar or Thumb or TextBox or ComboBox)
+            if (current is Button or ListBox or ListBoxItem or TreeView or TreeViewItem or ScrollBar or Thumb or TextBox or ComboBox)
             {
                 return true;
             }

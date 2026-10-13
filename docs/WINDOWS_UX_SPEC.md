@@ -481,6 +481,7 @@ component順や表示所有者を変更しない。
   model名と累積値は同じaccepted v3 rootから取得し、ASTRAを「その他」へ集約しない。
 - 期間リストはpointer pressの1回で展開し、metricスイッチは1回の操作で切替し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。7日1分bucket由来の10,080点と契約最大1暦月由来の44,640点は対象データ規模であって、通常データを拒否する任意の上限ではない。最低動作環境と承認baselineが定義されるまでは、根拠のない絶対ms値やcold maxをUX合否条件にしない。
 - 系列ON/OFFはpointer pressで状態とボタン面を先に更新する。同じ入力でplot画像も必ず変化する。物理入力、UI状態、実描画を別経路で確認する。
+- 期間リストは公開start_atを表示タイムゾーンの日付でまとめ、日付見出しを開くと全てのexact periodを個別に選べる。見出しの展開では期間を変更せず、同日の期間を統合しない。ディレクトリ更新でも選択IDと展開操作を保持し、31日より古い保存期間も同じ操作で選べる（#646）。
 - 期間リストとmetricスイッチはユーザーの選択で状態を変え、pollやlocale通知による同値候補の再公開では選択へ読み替えない。開いているリストを自動で閉じない。
 - 期間変更は`idle → loading → ready|confirmed-empty|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
   accepted same-pair history page集合のparseとpresentation projectionはUI thread外で行う。SQLite再読込やsampleの

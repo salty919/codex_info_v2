@@ -4536,7 +4536,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Low_rate_long_model_change_is_connected_and_marked_unused()
+    public void Low_rate_long_model_change_is_connected_without_unused_band()
     {
         const long start = 1_000;
         const long shortInterval = 60;
@@ -4559,11 +4559,11 @@ public sealed class GraphPlotControlTests
         Assert.Equal(
             [(start, start + shortInterval),
              (start + shortInterval, longGapStart),
+             longGap,
              (longGapEnd, longGapEnd + shortInterval)],
             SegmentPairs(lines.Rising));
-        Assert.Contains(longGap, SegmentPairs(lines.Dashed));
-        Assert.Contains(scene.IdleIntervals, interval =>
-            interval.StartAt <= longGapStart && interval.EndAt >= longGapEnd);
+        Assert.Empty(lines.Dashed.X);
+        Assert.Empty(scene.IdleIntervals);
     }
 
     [Fact]
@@ -4584,7 +4584,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Sep22_low_rate_interval_keeps_lines_connected_and_shows_unused_band()
+    public void Sep22_low_rate_interval_keeps_lines_connected_without_unused_band()
     {
         const long beforeRateStart = 1_789_965_300;
         const long beforeRateEnd = 1_789_965_360;
@@ -4695,8 +4695,9 @@ public sealed class GraphPlotControlTests
             Assert.DoesNotContain(segment, SegmentPairs(luna.Idle, luna.Flat, luna.Rising));
             Assert.DoesNotContain(segment, SegmentPairs(remaining.Idle, remaining.Solid));
         });
-        Assert.Contains(scene.IdleIntervals, interval =>
-            interval.StartAt <= gapStart && interval.EndAt >= gapEnd);
+        // The earlier exact-equal run remains unused; the later positive
+        // LUNA delta must not extend that evidence through the sparse gap.
+        Assert.Equal([new GraphIdleInterval(beforeRateEnd, gapStart, false)], scene.IdleIntervals);
 
         var shortScene = GraphScene.Create(
             [

@@ -8,7 +8,7 @@
 mod diagnostics;
 mod history;
 
-use codex_info_db_reader::{CurrentPublication, DbReader, DbSnapshot, ReaderError};
+use codex_info_db_reader::{CurrentPublication, DbReader, DbSnapshot, HistoryArchive, ReaderError};
 use codex_info_rest_contract::{
     PublicAccountV3, PublicAccountsV3, PublicDetails, PublicDetailsV2, PublicDetailsV3,
     PublicRuntimeVersions, PublicState, API_VERSION, API_VERSION_V2, API_VERSION_V3,
@@ -57,6 +57,7 @@ pub struct PublishedSnapshot {
     pub models_v3: Vec<codex_info_rest_contract::PublicModelUsageV3>,
     pub history_samples_v3: Vec<codex_info_rest_contract::PublicHistoryObservationV3>,
     pub history_samples_v2: Vec<codex_info_rest_contract::PublicHistoryObservation>,
+    pub retained_history: HistoryArchive,
     history_index: HistoryIndex,
 }
 
@@ -99,6 +100,7 @@ impl PublishedSnapshot {
             models_v3: snapshot.models_v3,
             history_samples_v3: snapshot.history_samples_v3,
             history_samples_v2: snapshot.history_samples_v2,
+            retained_history: snapshot.retained_history,
             history_index,
         }
     }
@@ -133,6 +135,7 @@ impl PublishedSnapshot {
             models_v3: Vec::new(),
             history_samples_v3: Vec::new(),
             history_samples_v2: Vec::new(),
+            retained_history: HistoryArchive::default(),
             history_index: HistoryIndex::default(),
         }
     }
@@ -1493,7 +1496,7 @@ fn serialize_route(
         }
         Route::HistoryPeriodsV3 => serialize_json(&json!({
             "api_version": API_VERSION_V3,
-            "history_periods": details.history_periods,
+            "history_periods": snapshot.retained_history.periods,
         })),
         Route::ThreadsV3 => serialize_json(&json!({
             "api_version": API_VERSION_V3,
@@ -1592,7 +1595,7 @@ fn history_selection<'a>(
         })?;
     let start = match cursor {
         Some(cursor) => indexed
-            .start_after(&snapshot.history_samples_v3, cursor)
+            .start_after(&snapshot.retained_history.samples, cursor)
             .ok_or(RouteError::StaleCursor)?,
         None => 0,
     };
@@ -1613,11 +1616,11 @@ fn serialize_history(
         .map(|&row| {
             #[cfg(test)]
             record_history_row_visit();
-            &snapshot.history_samples_v3[row]
+            &snapshot.retained_history.samples[row]
         })
         .collect::<Vec<_>>();
     let resume_cursor = if end > 0 {
-        Some(indexed.resume(&snapshot.history_samples_v3, end - 1))
+        Some(indexed.resume(&snapshot.retained_history.samples, end - 1))
     } else {
         cursor.clone()
     };
@@ -1632,7 +1635,7 @@ fn serialize_history(
         indexed
             .gaps
             .iter()
-            .map(|&row| &snapshot.details.history_gaps[row])
+            .map(|&row| &snapshot.retained_history.gaps[row])
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -1823,6 +1826,7 @@ mod tests {
             models_v3: Vec::new(),
             history_samples_v2: Vec::new(),
             history_samples_v3: Vec::new(),
+            retained_history: HistoryArchive::default(),
             history_index: HistoryIndex::default(),
         };
         let json = |route| -> serde_json::Value {
@@ -1886,6 +1890,7 @@ mod tests {
             models_v3: Vec::new(),
             history_samples_v2: Vec::new(),
             history_samples_v3: Vec::new(),
+            retained_history: HistoryArchive::default(),
             history_index: HistoryIndex::default(),
         };
         let json = |route| -> serde_json::Value {
@@ -2024,6 +2029,17 @@ mod tests {
                     reason: "recorder-stopped".to_owned(),
                 });
         }
+        let samples: Vec<_> = (0..count)
+            .map(|i| codex_info_rest_contract::PublicHistoryObservationV3 {
+                timestamp: start + i as i64 * 60,
+                reset_at: reset,
+                remaining_percent: Some(if corrected && i == 0 { 70.0 } else { 80.0 }),
+                task_active_since_previous: None,
+                models: None,
+                models_complete: false,
+                model_source: "legacy-unknown".to_owned(),
+            })
+            .collect();
         PublishedSnapshot::from_db_for_account(
             DbSnapshot {
                 generation,
@@ -2032,20 +2048,15 @@ mod tests {
                 acquisition_degraded: false,
                 history_available: true,
                 current: CurrentPublication::unavailable(details.state),
+                retained_history: HistoryArchive {
+                    periods: details.history_periods.clone(),
+                    gaps: details.history_gaps.clone(),
+                    samples: samples.clone(),
+                },
                 details,
                 models_v3: Vec::new(),
                 history_samples_v2: Vec::new(),
-                history_samples_v3: (0..count)
-                    .map(|i| codex_info_rest_contract::PublicHistoryObservationV3 {
-                        timestamp: start + i as i64 * 60,
-                        reset_at: reset,
-                        remaining_percent: Some(if corrected && i == 0 { 70.0 } else { 80.0 }),
-                        task_active_since_previous: None,
-                        models: None,
-                        models_complete: false,
-                        model_source: "legacy-unknown".to_owned(),
-                    })
-                    .collect(),
+                history_samples_v3: samples,
             },
             epoch,
         )
@@ -2130,8 +2141,14 @@ mod tests {
             models_v3: snapshot.models_v3,
             history_samples_v2: snapshot.history_samples_v2,
             history_samples_v3: snapshot.history_samples_v3,
+            retained_history: snapshot.retained_history,
         };
         edit(&mut candidate);
+        candidate.retained_history = HistoryArchive {
+            periods: candidate.details.history_periods.clone(),
+            gaps: candidate.details.history_gaps.clone(),
+            samples: candidate.history_samples_v3.clone(),
+        };
         PublishedSnapshot::from_db_for_account(candidate, storage_epoch)
     }
 
@@ -2195,6 +2212,23 @@ mod tests {
             history_test_page(&original, "unknown-period", None),
             Err(RouteError::UnknownPeriod)
         );
+    }
+
+    #[test]
+    fn history_nearby_reset_keeps_gap_in_its_exact_period() {
+        let original = history_test_fixture(10, 1, 2, false, true, "1802678400");
+        let snapshot = history_test_edit(original, 10, |candidate| {
+            let mut nearby = candidate.details.history_periods[0].clone();
+            nearby.id = "nearby-reset".into();
+            nearby.reset_at += 1;
+            nearby.start_at = candidate.history_samples_v3[0].timestamp;
+            nearby.current = false;
+            candidate.details.history_periods.push(nearby);
+        });
+        let page = history_test_page(&snapshot, "nearby-reset", None).unwrap();
+        assert!(page["history_gaps"].as_array().unwrap().is_empty());
+        let original = history_test_page(&snapshot, "1802678400", None).unwrap();
+        assert_eq!(original["history_gaps"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -2307,6 +2341,11 @@ mod tests {
                 acquisition_degraded: false,
                 history_available: true,
                 current: CurrentPublication::unavailable(details.state),
+                retained_history: HistoryArchive {
+                    periods: details.history_periods.clone(),
+                    gaps: details.history_gaps.clone(),
+                    samples: history_samples.clone(),
+                },
                 details,
                 models_v3: Vec::new(),
                 history_samples_v2: Vec::new(),
@@ -3289,6 +3328,155 @@ mod tests {
             assert!(samples.iter().all(|p| p["models"].is_null()));
         }
         server.shutdown();
+    }
+
+    #[test]
+    fn issue646_retained_history_is_paged_without_expanding_legacy_details() {
+        const NOW: i64 = 1_800_000_000;
+        const OLD: i64 = NOW - 40 * 86_400;
+        const OLD_RESET: i64 = OLD + 604_800;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("retained.sqlite3");
+        fixture(&path, 10);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DELETE FROM usage_history; DELETE FROM durable_state;
+            CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,sequence INTEGER,observed_at INTEGER,
+            reset_at INTEGER,window_seconds INTEGER,remaining_percent REAL,applied_generation TEXT);").unwrap();
+        db.execute(
+            "UPDATE collection_generation SET reset_at=?1,window_seconds=604800",
+            [NOW + 604_800],
+        )
+        .unwrap();
+        for (id, sequence, time, reset) in [
+            ("old", 1, OLD + 1099 * 60, OLD_RESET),
+            ("new", 2, NOW, NOW + 604_800),
+        ] {
+            db.execute(
+                "INSERT INTO quota_receipts VALUES(?1,?2,?3,?4,604800,90,'1')",
+                params![id, sequence, time, reset],
+            )
+            .unwrap();
+        }
+        for index in 0..1100i64 {
+            db.execute(
+                "INSERT INTO usage_history VALUES(?1,?2,90,1,0,0,?3,0,0)",
+                params![OLD + index * 60, OLD_RESET, index + 1],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO usage_history VALUES(?1,?2,90,2,0,0,10,0,0)",
+            params![NOW, NOW + 604_800],
+        )
+        .unwrap();
+        let reader = DbReader::open(&path).unwrap();
+        let initial_hash = reader.read_snapshot().unwrap().data_hash;
+        let mut server = RestServer::start(reader.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let catalog = request(
+            server.local_addr(),
+            "GET /v3/history/periods HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(catalog.starts_with("HTTP/1.1 200"), "{catalog}");
+        let value: Value = serde_json::from_str(body(&catalog)).unwrap();
+        let old_period_id = OLD_RESET.to_string();
+        assert!(value["history_periods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"].as_str() == Some(old_period_id.as_str())));
+        let mut cursor = None;
+        let mut tokens = Vec::new();
+        for _ in 0..2 {
+            let suffix = cursor
+                .as_ref()
+                .map(|c| format!("&cursor={c}"))
+                .unwrap_or_default();
+            let page = request(
+                server.local_addr(),
+                &format!("GET /v3/history?period={OLD_RESET}{suffix} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+            assert_eq!(published_pair(&page), published_pair(&catalog));
+            let page: Value = serde_json::from_str(body(&page)).unwrap();
+            let rows = page["history_samples"].as_array().unwrap();
+            assert!(rows.len() <= 1024);
+            tokens.extend(rows.iter().map(|p| {
+                p["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|model| model["model"] == "SOL")
+                    .unwrap()["total_tokens"]
+                    .as_u64()
+                    .unwrap()
+            }));
+            cursor = page["next_cursor"].as_str().map(str::to_owned);
+        }
+        assert!(cursor.is_none());
+        assert_eq!(tokens, (1..=1100u64).collect::<Vec<_>>());
+        for route in ["/v1/details", "/v2/details", "/v3/details"] {
+            let response = request(
+                server.local_addr(),
+                &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            let details: Value = serde_json::from_str(body(&response)).unwrap();
+            assert_eq!(details["history_samples"].as_array().unwrap().len(), 1);
+            assert_eq!(details["history_periods"].as_array().unwrap().len(), 1);
+        }
+        db.execute(
+            "UPDATE usage_history SET sol_tokens=999 WHERE timestamp=?1",
+            [OLD],
+        )
+        .unwrap();
+        assert_ne!(
+            initial_hash,
+            reader.read_snapshot().unwrap().data_hash,
+            "archived facts participate in the immutable pair identity"
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM usage_history", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1101
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn issue646_archive_failure_preserves_recent_details_and_models() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("archive-failure.sqlite3");
+        fixture(&path, 10);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,sequence INTEGER,
+            observed_at INTEGER,reset_at INTEGER,window_seconds INTEGER,remaining_percent REAL,applied_generation TEXT);
+            WITH RECURSIVE receipts(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM receipts WHERE n<128)
+            INSERT INTO quota_receipts SELECT printf('%064x', n+1),n+1,1800000000-40*86400+n*60,
+                1800000000-40*86400+604800+n*60,604800,90,'1' FROM receipts;
+            INSERT INTO quota_receipts VALUES('current',130,1800000000,1800000060,3600,50,'1');").unwrap();
+        // This lane needs explicit confirmed model evidence; legacy columns
+        // alone are history display values, not current model authority.
+        db.execute_batch("CREATE TABLE session_model_totals(model TEXT PRIMARY KEY,total_tokens TEXT,
+            input_tokens TEXT,cached_input_tokens TEXT,output_tokens TEXT,cache_write_input_tokens TEXT);
+            INSERT INTO session_model_totals VALUES('SOL','10','7','0','3','0');
+            CREATE TABLE usage_model_history(reset_at INTEGER,timestamp INTEGER,model TEXT,total_tokens TEXT,
+            input_tokens TEXT,cached_input_tokens TEXT,output_tokens TEXT,cache_write_input_tokens TEXT,model_set_complete INTEGER);
+            INSERT INTO usage_model_history VALUES(1800000060,1800000000,'SOL','10','7','0','3','0',1);
+            UPDATE durable_state SET snapshot_json='{\"kind\":\"codex-info-usage-observation-v1\",\"timestamp\":1800000000,\"reset_at\":1800000060,\"remaining_percent\":50.0,\"model_source\":\"confirmed\"}' WHERE singleton=2;
+        ").unwrap();
+        let snapshot = DbReader::open(&path).unwrap().read_snapshot().unwrap();
+        assert_eq!(snapshot.details.history_samples.len(), 1);
+        assert_eq!(snapshot.details.history_samples[0].sol_tokens, 10);
+        assert!(snapshot
+            .models_v3
+            .iter()
+            .any(|model| model.model == "SOL" && model.total_tokens == 10));
+        assert!(!snapshot.history_available);
+        let published = PublishedSnapshot::from_db_for_account(snapshot, 1);
+        assert!(matches!(
+            serialize_route(&published, Route::HistoryPeriodsV3, None, None, false),
+            Err(RouteError::HistoryUnavailable)
+        ));
     }
 
     #[test]

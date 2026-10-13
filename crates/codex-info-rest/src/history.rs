@@ -21,7 +21,7 @@ impl HistoryIndex {
     pub(crate) fn build(snapshot: &DbSnapshot, storage_epoch: u64) -> Self {
         let mut index = Self::default();
         let mut periods_by_reset = BTreeMap::<i64, Vec<_>>::new();
-        for period in &snapshot.details.history_periods {
+        for period in &snapshot.retained_history.periods {
             periods_by_reset
                 .entry(period.reset_at)
                 .or_default()
@@ -32,7 +32,7 @@ impl HistoryIndex {
         }
         // Preserve the reader's ordered keys and the established period filter,
         // without scanning all retained samples separately for every period.
-        for (row, sample) in snapshot.history_samples_v3.iter().enumerate() {
+        for (row, sample) in snapshot.retained_history.samples.iter().enumerate() {
             #[cfg(test)]
             crate::record_history_row_visit();
             for (_, periods) in
@@ -57,11 +57,18 @@ impl HistoryIndex {
                 }
             }
         }
-        for (row, gap) in snapshot.details.history_gaps.iter().enumerate() {
+        for (row, gap) in snapshot.retained_history.gaps.iter().enumerate() {
             for (_, periods) in
                 periods_by_reset.range(gap.reset_at..=gap.reset_at.saturating_add(60))
             {
                 for period in periods {
+                    if (gap.reset_at != period.reset_at
+                        && periods_by_reset.contains_key(&gap.reset_at))
+                        || gap.start_at < period.start_at
+                        || gap.end_at > period.end_at
+                    {
+                        continue;
+                    }
                     index
                         .periods
                         .get_mut(&period.id)
@@ -71,12 +78,12 @@ impl HistoryIndex {
                 }
             }
         }
-        for period in &snapshot.details.history_periods {
+        for period in &snapshot.retained_history.periods {
             let indexed = index.periods.get_mut(&period.id).expect("indexed period");
             let gaps = indexed
                 .gaps
                 .iter()
-                .map(|&row| &snapshot.details.history_gaps[row])
+                .map(|&row| &snapshot.retained_history.gaps[row])
                 .collect::<Vec<_>>();
             let mut hash = Sha256::new();
             hash.update(b"codex-info-rest-history-prefix-v1\n");
@@ -92,7 +99,7 @@ impl HistoryIndex {
                 #[cfg(test)]
                 crate::record_history_row_visit();
                 hash.update(
-                    serde_json::to_vec(&snapshot.history_samples_v3[row])
+                    serde_json::to_vec(&snapshot.retained_history.samples[row])
                         .expect("validated history observation is serializable"),
                 );
                 hash.update(b"\n");
