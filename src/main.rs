@@ -7574,6 +7574,7 @@ fn split_metric_line_paths_with_task_stops(
         let preserved_timestamps = context
             .idle_timestamp_intervals
             .iter()
+            .chain(task_stops.iter())
             .flat_map(|(start, end)| [*start, *end])
             .collect::<BTreeSet<_>>();
         let preserved_indices = run
@@ -48030,6 +48031,80 @@ mod tests {
         assert!(!graph.remaining_idle.is_empty());
         assert!(graph.remaining_solid.is_empty());
         assert!(graph.remaining_inferred.is_empty());
+    }
+
+    #[test]
+    fn issue621_task_stop_boundary_prevents_smoothed_usage_before_resume() {
+        // 10/13 06:08..06:26, with the model observation missing at 06:21.
+        let samples = (0..=18)
+            .map(|m| UsageHistorySample::new(m * 60, 10_000, 100.0, ModelDollarTotals::default()))
+            .collect::<Vec<_>>();
+        let refs = samples.iter().collect::<Vec<_>>();
+        let activity = (0..=18)
+            .map(|m| (m * 60, Some(m <= 1 || m >= 17)))
+            .collect();
+        let missing = BTreeSet::from([13 * 60]);
+        for origin in [
+            super::GraphModelOrigin::Direct,
+            super::GraphModelOrigin::LegacyObserved,
+        ] {
+            let timelines = BTreeMap::from([(
+                "SOL".to_owned(),
+                (0..=18)
+                    .filter(|m| *m != 13)
+                    .map(|m| {
+                        let tokens = match m {
+                            0 => 2_097_645,
+                            17 => 2_896_985,
+                            18 => 3_923_057,
+                            _ => 2_411_449,
+                        };
+                        let dollar = match m {
+                            0 => 2.206878,
+                            17 => 2.760806,
+                            18 => 3.448645,
+                            _ => 2.443581,
+                        };
+                        (
+                            m * 60,
+                            super::GraphModelPoint {
+                                dollar,
+                                tokens: tokens as f64,
+                                raw_tokens: Some(tokens),
+                                origin,
+                            },
+                        )
+                    })
+                    .collect(),
+            )]);
+            for show_tokens in [false, true] {
+                let graph = super::graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
+                    super::GraphSelectionInput { samples: &refs, period_start: 0, period_end: 1080,
+                        show_luna: false, show_terra: false, show_sol: true, show_astra: false, show_tokens,
+                        untrusted_minutes: &missing, confirmed_gaps: &[], model_timelines: &timelines },
+                    Some(&activity), Some(&missing));
+                assert_eq!(graph.unused_intervals.len(), 1);
+                assert!((graph.unused_intervals[0].start - 100.0 / 18.0).abs() < 0.001);
+                assert!((graph.unused_intervals[0].width - 1500.0 / 18.0).abs() < 0.001);
+                let path = format!(
+                    "{} {} {} {}",
+                    graph.sol_idle, graph.sol_flat, graph.sol_rising, graph.sol_inferred
+                );
+                let words = path.split_whitespace().collect::<Vec<_>>();
+                let stopped_y = words
+                    .chunks_exact(2)
+                    .filter_map(|pair| {
+                        let x = pair[0][1..].parse::<f64>().unwrap();
+                        (x > 6.0 && x < 88.0).then(|| pair[1].parse::<f64>().unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                assert!(!stopped_y.is_empty());
+                assert!(
+                    stopped_y.iter().all(|y| (*y - stopped_y[0]).abs() < 1e-9),
+                    "task stop must remain horizontal: origin={origin:?} tokens={show_tokens}"
+                );
+            }
+        }
     }
 
     #[test]
