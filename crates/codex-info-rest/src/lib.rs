@@ -1494,10 +1494,26 @@ fn serialize_route(
             }
             serialize_json(&current)
         }
-        Route::HistoryPeriodsV3 => serialize_json(&json!({
-            "api_version": API_VERSION_V3,
-            "history_periods": snapshot.retained_history.periods,
-        })),
+        Route::HistoryPeriodsV3 => {
+            // Keep the exact archive and direct history lookup intact. Only
+            // omit past selector entries with no in-bounds observations or gaps.
+            let periods = snapshot
+                .retained_history
+                .periods
+                .iter()
+                .filter(|period| {
+                    period.current
+                        || !snapshot
+                            .history_index
+                            .period(&period.id)
+                            .is_some_and(|index| index.samples.is_empty() && index.gaps.is_empty())
+                })
+                .collect::<Vec<_>>();
+            serialize_json(&json!({
+                "api_version": API_VERSION_V3,
+                "history_periods": periods,
+            }))
+        }
         Route::ThreadsV3 => serialize_json(&json!({
             "api_version": API_VERSION_V3,
             "threads": details.threads,
@@ -3326,6 +3342,146 @@ mod tests {
                 expected
             );
             assert!(samples.iter().all(|p| p["models"].is_null()));
+        }
+        server.shutdown();
+    }
+
+    #[test]
+    fn issue646_empty_period_catalog_keeps_current_observations_and_gaps() {
+        for (id, current, count, gap, model, expected) in [
+            ("past-empty", false, 0, false, None, false),
+            ("current-empty", true, 0, false, None, true),
+            ("quota-only", false, 1, false, None, true),
+            ("zero-model", false, 1, false, Some((0, true)), true),
+            ("partial-model", false, 1, false, Some((17, false)), true),
+            ("gap-only", false, 0, true, None, true),
+        ] {
+            let original = history_test_fixture(10, 1, count, false, gap, id);
+            let snapshot = history_test_edit(original, 10, |candidate| {
+                candidate.details.history_periods[0].current = current;
+                for point in &mut candidate.history_samples_v3 {
+                    point.remaining_percent = Some(100.0);
+                    point.model_source = "unavailable".into();
+                    if let Some((total_tokens, complete)) = model {
+                        point.models =
+                            Some(vec![codex_info_rest_contract::PublicHistoryModelUsageV3 {
+                                model: "gpt-6.1-sol".into(),
+                                total_tokens,
+                                input_tokens: None,
+                                cached_input_tokens: None,
+                                cache_write_input_tokens: None,
+                                output_tokens: None,
+                                total_dollars: None,
+                            }]);
+                        point.models_complete = complete;
+                        point.model_source = "confirmed".into();
+                    }
+                }
+            });
+            let body =
+                serialize_route(&snapshot, Route::HistoryPeriodsV3, None, None, false).unwrap();
+            let catalog: Value = serde_json::from_slice(&body).unwrap();
+            let periods = catalog["history_periods"].as_array().unwrap();
+            assert_eq!(!periods.is_empty(), expected, "{id}");
+            if expected {
+                assert_eq!(periods[0]["id"], id);
+            }
+            // Selection visibility never revokes the original exact ID.
+            let page = history_test_page(&snapshot, id, None).unwrap();
+            assert_eq!(page["history_samples"].as_array().unwrap().len(), count);
+            assert_eq!(
+                page["history_gaps"].as_array().unwrap().len(),
+                usize::from(gap)
+            );
+        }
+    }
+
+    #[test]
+    fn issue646_empty_period_catalog_omits_moving_reset_placeholders() {
+        // The saved incident has one raw row per reset, about 109 seconds
+        // after its window start. Each successor starts 60 seconds later,
+        // leaving no in-bounds observations in the superseded periods.
+        const START: i64 = 1_800_000_012;
+        const WINDOW: i64 = 604_800;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("moving-reset.sqlite3");
+        fixture(&path, 10);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DELETE FROM usage_history; DELETE FROM durable_state;
+             CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,
+             sequence INTEGER, observed_at INTEGER, reset_at INTEGER,
+             window_seconds INTEGER, remaining_percent REAL, applied_generation TEXT);",
+        )
+        .unwrap();
+        for minute in 0..9_i64 {
+            let start = START + minute * 60;
+            let observed = start + 109;
+            let timestamp = observed - observed.rem_euclid(60);
+            db.execute(
+                "INSERT INTO quota_receipts VALUES(?1,?2,?3,?4,?5,100,'10')",
+                params![
+                    minute.to_string(),
+                    minute + 1,
+                    observed,
+                    start + WINDOW,
+                    WINDOW
+                ],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO usage_history VALUES(?1,?2,100,0,0,0,0,0,0)",
+                params![timestamp, start + WINDOW],
+            )
+            .unwrap();
+        }
+        let current_reset = START + 8 * 60 + WINDOW;
+        db.execute(
+            "UPDATE collection_generation SET data_generation='10',reset_at=?1,window_seconds=?2",
+            params![current_reset, WINDOW],
+        )
+        .unwrap();
+        let reader = DbReader::open(&path).unwrap();
+        let before = reader.read_snapshot().unwrap();
+        assert_eq!(before.retained_history.periods.len(), 9);
+        let mut server = RestServer::start(reader.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let response = request(
+            server.local_addr(),
+            "GET /v3/history/periods HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let catalog: Value = serde_json::from_str(body(&response)).unwrap();
+        let periods = catalog["history_periods"].as_array().unwrap();
+        assert_eq!(
+            periods.len(),
+            1,
+            "only the current observed period is selectable"
+        );
+        assert_eq!(periods[0]["id"], current_reset.to_string());
+        for minute in 0..9_i64 {
+            let reset = START + minute * 60 + WINDOW;
+            let page_response = request(
+                server.local_addr(),
+                &format!("GET /v3/history?period={reset} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(page_response.starts_with("HTTP/1.1 200"), "{page_response}");
+            assert_eq!(published_pair(&page_response), published_pair(&response));
+            let page: Value = serde_json::from_str(body(&page_response)).unwrap();
+            assert_eq!(
+                page["history_samples"].as_array().unwrap().len(),
+                usize::from(minute == 8)
+            );
+            assert!(page["history_gaps"].as_array().unwrap().is_empty());
+            assert!(page["next_cursor"].is_null());
+        }
+        assert_eq!(reader.read_snapshot().unwrap().data_hash, before.data_hash);
+        for table in ["quota_receipts", "usage_history"] {
+            let count: i64 = db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 9, "{table} retains every original row");
         }
         server.shutdown();
     }

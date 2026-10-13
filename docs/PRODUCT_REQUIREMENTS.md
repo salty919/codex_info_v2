@@ -393,7 +393,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 表示geometryと色はUX owner、wireのschemaとheaderはWIRE ownerが所有するが、次の
 入力状態から表示上の事実へ至る意味とfailure isolationは本契約だけが所有する。
 
-期間一覧は同じaccountのDBに保持された全期間を公開し、31日より古い記録も個別期間の有限pageとして取得できる。互換detailsの直近31日projectionは維持する。Windowsの期間selectorは公開`start_at`を表示タイムゾーンの日付でまとめ、日付の展開後も全てのexact period IDを個別に選べる。日付見出しの操作で選択期間を変えず、periodの統合・累計加算・raw値の変更は行わない（#646）。
+期間一覧は同じaccountの保持期間から、現期間と、受理済み期間範囲内に公開観測点または欠測区間がある期間を選択対象として公開する。過去期間で両方が0件の項目は一覧から除くが、保存期間・exact ID・原本は保持し、一覧にないIDも指定した有限pageとして取得できる。利用率0%、model欠測・不完全・利用量0を除外理由にせず、観測点が1件でもあれば残す。現期間は空でも残し、後から履歴が入った期間は次のsnapshotで再掲載する。31日より古い記録も同じ条件で個別に取得できる。互換detailsの直近31日projectionは維持する。Windowsの期間selectorは公開`start_at`を表示タイムゾーンの日付でまとめ、日付の展開後も全てのexact period IDを個別に選べる。日付見出しの操作で選択期間を変えず、periodの統合・累計加算・raw値の変更は行わない（#646）。
 
 現行periodの所属は、表示時に`period_start = reset_at - window_seconds`から決める。
 `period_start <= timestamp <= reset_at`にある観測は、providerがプラン切替中に旧`reset_at`
