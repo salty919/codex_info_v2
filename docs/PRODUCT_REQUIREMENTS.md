@@ -393,7 +393,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 表示geometryと色はUX owner、wireのschemaとheaderはWIRE ownerが所有するが、次の
 入力状態から表示上の事実へ至る意味とfailure isolationは本契約だけが所有する。
 
-期間一覧は同じaccountの保持期間から、現期間と、受理済み期間範囲内に公開観測点または欠測区間がある期間を選択対象として公開する。過去期間で両方が0件の項目は一覧から除くが、保存期間・exact ID・原本は保持し、一覧にないIDも指定した有限pageとして取得できる。利用率0%、model欠測・不完全・利用量0を除外理由にせず、観測点が1件でもあれば残す。現期間は空でも残し、後から履歴が入った期間は次のsnapshotで再掲載する。31日より古い記録も同じ条件で個別に取得できる。互換detailsの直近31日projectionは維持する。Windowsの期間selectorは公開`start_at`を表示タイムゾーンの日付でまとめ、日付の展開後も全てのexact period IDを個別に選べる。日付見出しの操作で選択期間を変えず、periodの統合・累計加算・raw値の変更は行わない（#646）。
+期間の通常選択一覧は、現期間と、受理済み期間範囲内の公開modelに正の`total_tokens`がある期間を掲載する。modelが不完全または`legacy-unknown`でも正の記録は残す。quota観測だけ・欠測区間だけ・tokenが0または未取得の過去期間は通常一覧に載せないが、未使用や利用量0を確定したとは扱わない。原本・全exact ID・直接history pageを保持し、後から正のtoken記録が入れば次snapshotで再掲載する。日・週・月など任意時間窓の取得directoryは選択一覧と分離し、quota観測や欠測区間を失わない。31日より古い保存期間も同じ条件で選択でき、互換detailsの直近31日projectionは維持する。Windowsの選択一覧は公開`start_at`を表示タイムゾーンの日付でまとめ、公開されたexact IDを個別に選べる。見出しの展開で選択を変更せず、periodの統合・累計加算・raw値の変更は行わない。更新で選択項目が一覧から外れた場合は現期間へ戻す。旧serverに選択専用resourceがない場合だけ旧directoryを互換表示し、その場合は新しい掲載条件を保証しない（#646）。
 
 現行periodの所属は、表示時に`period_start = reset_at - window_seconds`から決める。
 `period_start <= timestamp <= reset_at`にある観測は、providerがプラン切替中に旧`reset_at`

@@ -17,6 +17,89 @@ public sealed class LoopbackStatusClientTests
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
     [Fact]
+    public async Task Issue646SelectablePeriodsFallBackOnlyAfterExact404()
+    {
+        foreach (var state in new[] { "ok", "404", "500", "503", "malformed", "timeout" })
+        {
+            var paths = new List<string>();
+            using var client = new LoopbackStatusClient(new StubHandler(request =>
+            {
+                var path = request.RequestUri!.AbsolutePath;
+                paths.Add(path);
+                Assert.Equal("?account=account-7", request.RequestUri.Query);
+                if (path == "/v3/history/periods")
+                {
+                    return JsonResponse(Issue646PeriodsJson("archive"), includePublishedPair: true);
+                }
+                Assert.Equal("/v3/history/periods/selectable", path);
+                return state switch
+                {
+                    "ok" => JsonResponse(Issue646PeriodsJson("selected"), includePublishedPair: true),
+                    "404" => NotFoundResponse(),
+                    "500" => new HttpResponseMessage(HttpStatusCode.InternalServerError),
+                    "503" => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable),
+                    "malformed" => JsonResponse("{}", includePublishedPair: true),
+                    _ => throw new TaskCanceledException("fixture transport timeout"),
+                };
+            }));
+            var result = await Issue646FetchSelectableAsync(client, "account-7");
+            Assert.Equal(state is "ok" or "404", result.IsSuccess);
+            Assert.Equal(state == "404" ? 2 : 1, paths.Count);
+            if (result.IsSuccess)
+            {
+                Assert.Equal(state == "404" ? "archive" : "selected", Assert.Single(result.Snapshot!.Periods).Id);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Issue646SelectablePeriodsKeepDirectoryAndAccountCachesSeparate()
+    {
+        var seen = new HashSet<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            var key = request.RequestUri!.PathAndQuery;
+            var selectable = request.RequestUri.AbsolutePath.EndsWith("/selectable", StringComparison.Ordinal);
+            if (seen.Add(key))
+            {
+                Assert.Empty(request.Headers.IfNoneMatch);
+                return JsonResponse(Issue646PeriodsJson(selectable ? "selected" : "archive"), includePublishedPair: true);
+            }
+            Assert.Equal($"\"{CanonicalPublishedPair}\"", Assert.Single(request.Headers.IfNoneMatch).Tag);
+            var response = new HttpResponseMessage(HttpStatusCode.NotModified)
+            {
+                Content = new ByteArrayContent([]),
+            };
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
+            response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+            response.Headers.TryAddWithoutValidation(PublishedPairHeader, CanonicalPublishedPair);
+            return response;
+        }));
+        for (var index = 0; index < 2; index++)
+        {
+            var selected = await Issue646FetchSelectableAsync(client, "account-7");
+            var archive = await client.FetchHistoryPeriodsAsync("account-7");
+            Assert.True(selected.IsSuccess);
+            Assert.True(archive.IsSuccess);
+            Assert.Equal("selected", Assert.Single(selected.Snapshot!.Periods).Id);
+            Assert.Equal("archive", Assert.Single(archive.Snapshot!.Periods).Id);
+        }
+        var switched = await Issue646FetchSelectableAsync(client, "account-13");
+        Assert.True(switched.IsSuccess);
+        Assert.Equal("account-13", switched.Snapshot!.AccountId);
+    }
+
+    private static Task<HistoryPeriodsFetchResult> Issue646FetchSelectableAsync(LoopbackStatusClient client, string accountId)
+    {
+        var method = typeof(LoopbackStatusClient).GetMethod("FetchSelectableHistoryPeriodsAsync", [typeof(string), typeof(CancellationToken)]);
+        Assert.NotNull(method);
+        return Assert.IsAssignableFrom<Task<HistoryPeriodsFetchResult>>(method.Invoke(client, [accountId, CancellationToken.None]));
+    }
+
+    private static string Issue646PeriodsJson(string id) =>
+        $$"""{"api_version":"v3","history_periods":[{"id":"{{id}}","start_at":1800000000,"end_at":1800000060,"reset_at":1800604800,"label":"fixture","current":true}]}""";
+
+    [Fact]
     public async Task BetaHealthAndRuntimePreserveProductAndProcessVersions()
     {
         using var health = new LoopbackStatusClient(new StubHandler(_ =>

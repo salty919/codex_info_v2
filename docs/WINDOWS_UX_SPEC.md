@@ -481,7 +481,7 @@ component順や表示所有者を変更しない。
   model名と累積値は同じaccepted v3 rootから取得し、ASTRAを「その他」へ集約しない。
 - 期間リストはpointer pressの1回で展開し、metricスイッチは1回の操作で切替し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。7日1分bucket由来の10,080点と契約最大1暦月由来の44,640点は対象データ規模であって、通常データを拒否する任意の上限ではない。最低動作環境と承認baselineが定義されるまでは、根拠のない絶対ms値やcold maxをUX合否条件にしない。
 - 系列ON/OFFはpointer pressで状態とボタン面を先に更新する。同じ入力でplot画像も必ず変化する。物理入力、UI状態、実描画を別経路で確認する。
-- 期間リストは選択用catalogの公開start_atを表示タイムゾーンの日付でまとめ、日付見出しを開くと公開された全てのexact periodを個別に選べる。過去の空項目（受理済み期間範囲内に公開観測点も欠測区間もない期間）はcatalogから除かれ、現期間・観測点・欠測区間のある期間は残る。model欠測・不完全・利用量0だけで項目を隠さない。見出しの展開では期間を変更せず、同日の期間を統合しない。ディレクトリ更新でも選択IDと展開操作を保持し、31日より古い保存期間も同じ操作で選べる（#646）。
+- 期間リストは選択専用resourceの公開start_atを表示タイムゾーンの日付でまとめ、公開されたexact IDを個別に選べる。現期間は空でも残し、過去期間は範囲内の公開modelに正のtotal_tokensがある場合に掲載する。不完全・legacy-unknownの正tokenも残す。quotaのみ・欠測区間のみ・tokenが0または未取得の過去期間は通常一覧に載せないが、未使用とは判定しない。選択とpair再整列は同じ選択用resourceを使い、日・週・月の時間窓は従来の取得directoryでquota/欠測区間を取得する。取得cacheはresourceとaccountで分離し、選択resourceのexact404だけ旧directoryへ戻る。その他の失敗は既存の失敗表示とlast-good保持を維持する。見出しの展開では期間を変更せず、同日の期間を統合しない。ディレクトリ更新でも残る選択IDと展開操作を保持し、選択IDが除外されたときは現期間へ戻す。31日より古い保存期間も同じ操作で選べる（#646）。
 - 期間リストとmetricスイッチはユーザーの選択で状態を変え、pollやlocale通知による同値候補の再公開では選択へ読み替えない。開いているリストを自動で閉じない。
 - 期間変更は`idle → loading → ready|confirmed-empty|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
   accepted same-pair history page集合のparseとpresentation projectionはUI thread外で行う。SQLite再読込やsampleの
