@@ -22,6 +22,32 @@ public sealed class GraphWindowRangeTests
         $"v1:{new string('f', 64)}");
 
     [Fact]
+    public async Task Issue646ResetSelectorUsesTokenDirectoryWhileTimeWindowKeepsQuotaHistory()
+    {
+        var current = CreatePeriod("current", FixedNow - 60, FixedNow, FixedNow + WeekSeconds, true, 0);
+        var used = CreatePeriod("used", FixedNow - 600, FixedNow - 120, FixedNow + WeekSeconds - 540, false, 28_924);
+        var quota = CreatePeriod("quota-only", FixedNow - 900, FixedNow - 660, FixedNow + WeekSeconds - 840, false, 0);
+        var client = new RangeResourceClient([current, used, quota], Pair)
+        {
+            SelectablePeriodIds = ["current", "used"],
+        };
+        using var main = CreateResourceMain(client);
+        using var graph = CreateGraph(main, () => FixedNow);
+        await EventuallyAsync(() => !graph.IsLoading && graph.SelectedPeriod is not null);
+        Assert.Equal(new[] { "current", "used" }, graph.Periods.Select(period => period.Id).ToArray());
+        graph.GoBack();
+        await EventuallyAsync(() => !graph.IsLoading && graph.SelectedPeriod?.Id == "used");
+        Assert.False(graph.CanGoBack);
+        Assert.True(graph.CanGoForward);
+        Assert.Contains(client.PageRequests, request => request.PeriodId == "used");
+        client.ClearPageRequests();
+        SetRange(graph, "Last24Hours");
+        await EventuallyAsync(() => IsViewport(graph.Scene) && !graph.IsLoading);
+        Assert.Contains(client.PageRequests, request => request.PeriodId == "quota-only");
+        Assert.Contains(ReadPeriodScenes(graph.Scene), scene => ReadNullableLong(scene, "ResetAt") == quota.ResetAt);
+    }
+
+    [Fact]
     public async Task ResetPeriodRemainsTheDefaultAndItsEndRemainsServerOwned()
     {
         var period = CreatePeriod(
@@ -1178,6 +1204,7 @@ public sealed class GraphWindowRangeTests
         }
 
         public string? FailPeriodId { get; set; }
+        public IReadOnlyList<string>? SelectablePeriodIds { get; set; }
         public bool FailPages { get; set; }
         public string? MismatchPairForPeriodId { get; set; }
         public string? DelayPeriodId { get; set; }
@@ -1234,6 +1261,22 @@ public sealed class GraphWindowRangeTests
 
         public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(CancellationToken cancellationToken = default) =>
             FetchHistoryPeriodsForAccountAsync(string.Empty);
+
+        public Task<HistoryPeriodsFetchResult> FetchSelectableHistoryPeriodsAsync(CancellationToken cancellationToken = default) =>
+            FetchSelectableHistoryPeriodsAsync(string.Empty, cancellationToken);
+
+        public async Task<HistoryPeriodsFetchResult> FetchSelectableHistoryPeriodsAsync(
+            string accountId,
+            CancellationToken cancellationToken = default)
+        {
+            var result = await FetchHistoryPeriodsForAccountAsync(accountId);
+            return result.Snapshot is { } snapshot && SelectablePeriodIds is not null
+                ? HistoryPeriodsFetchResult.Success(snapshot with
+                {
+                    Periods = snapshot.Periods.Where(period => SelectablePeriodIds.Contains(period.Id)).ToArray(),
+                })
+                : result;
+        }
 
         public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
             string accountId,

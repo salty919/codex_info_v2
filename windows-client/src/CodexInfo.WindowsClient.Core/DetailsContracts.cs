@@ -418,6 +418,9 @@ public interface ILoopbackResourceClient
     Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
         CancellationToken cancellationToken = default);
 
+    Task<HistoryPeriodsFetchResult> FetchSelectableHistoryPeriodsAsync(
+        CancellationToken cancellationToken = default) => FetchHistoryPeriodsAsync(cancellationToken);
+
     Task<HistoryPageFetchResult> FetchHistoryPageAsync(
         string periodId,
         string? cursor = null,
@@ -445,6 +448,10 @@ public interface ILoopbackAccountResourceClient
     Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
         string accountId,
         CancellationToken cancellationToken = default);
+
+    Task<HistoryPeriodsFetchResult> FetchSelectableHistoryPeriodsAsync(
+        string accountId,
+        CancellationToken cancellationToken = default) => FetchHistoryPeriodsAsync(accountId, cancellationToken);
 
     Task<HistoryPageFetchResult> FetchHistoryPageAsync(
         string accountId,

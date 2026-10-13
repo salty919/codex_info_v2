@@ -13603,6 +13603,7 @@ struct CodexInfoState {
     service_split_capable: bool,
     service_history_periods: Vec<PublicHistoryPeriod>,
     service_history_periods_pair: Option<String>,
+    service_history_periods_selectable: bool,
     service_history_samples: Vec<PublicHistoryObservationV3>,
     service_history_pair: Option<String>,
     service_history_period_id: Option<String>,
@@ -14439,6 +14440,7 @@ impl CodexInfoState {
             service_split_capable: false,
             service_history_periods: Vec::new(),
             service_history_periods_pair: None,
+            service_history_periods_selectable: false,
             service_history_samples: Vec::new(),
             service_history_pair: None,
             service_history_period_id: None,
@@ -14600,6 +14602,7 @@ impl CodexInfoState {
             service_split_capable: false,
             service_history_periods: Vec::new(),
             service_history_periods_pair: None,
+            service_history_periods_selectable: false,
             service_history_samples: Vec::new(),
             service_history_pair: None,
             service_history_period_id: None,
@@ -15204,6 +15207,7 @@ impl CodexInfoState {
         self.service_split_capable = false;
         self.service_history_periods.clear();
         self.service_history_periods_pair = None;
+        self.service_history_periods_selectable = false;
         self.service_history_samples.clear();
         self.service_history_pair = None;
         self.service_history_period_id = None;
@@ -15598,6 +15602,7 @@ impl CodexInfoState {
         self.service_split_capable = false;
         self.service_history_periods = next_history_periods;
         self.service_history_periods_pair = Some(published_pair.clone());
+        self.service_history_periods_selectable = false;
         self.service_history_samples.clear();
         self.service_history_pair = None;
         self.service_history_period_id = next_selected_period_id;
@@ -15750,6 +15755,7 @@ impl CodexInfoState {
         self.service_split_capable = false;
         self.service_history_periods = full_snapshot.history_periods.clone();
         self.service_history_periods_pair = Some(published_pair.clone());
+        self.service_history_periods_selectable = false;
         self.service_history_samples = full_snapshot.history_samples.clone();
         self.service_history_pair = Some(published_pair.clone());
         self.service_history_period_id = next_selected_period_id;
@@ -15826,6 +15832,11 @@ impl CodexInfoState {
         let pair_changed = previous_pair != Some(published_pair.as_str());
         let previous_snapshot = self.service_current_snapshot.clone();
         let previous_threads = self.active_threads.clone();
+        if !self.service_split_capable {
+            // Full-details metadata belongs to the legacy directory even
+            // when a schema transition keeps the same published data pair.
+            self.service_history_force_poll = true;
+        }
         if pair_changed {
             // The graph and thread resources are independent views, but a
             // cursor from the preceding pair may be used for the next graph
@@ -15848,6 +15859,7 @@ impl CodexInfoState {
                 self.service_history_samples.clear();
                 self.service_history_periods.clear();
                 self.service_history_periods_pair = None;
+                self.service_history_periods_selectable = false;
                 self.service_history_pair = None;
                 self.service_history_period_id = None;
                 self.service_history_pending_reset_at = None;
@@ -16546,6 +16558,7 @@ impl CodexInfoState {
         self.service_split_capable = false;
         self.service_history_periods.clear();
         self.service_history_periods_pair = None;
+        self.service_history_periods_selectable = false;
         self.service_history_samples.clear();
         self.service_history_pair = None;
         self.service_history_period_id = None;
@@ -22027,7 +22040,7 @@ type ServiceThreadsResource = (Option<u64>, Vec<PublicThread>);
 fn fetch_service_history_periods_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
-) -> Result<ServiceResourceFetch<Vec<PublicHistoryPeriod>>, String>
+) -> Result<(ServiceResourceFetch<Vec<PublicHistoryPeriod>>, bool), String>
 where
     F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
 {
@@ -22036,23 +22049,31 @@ where
             return Err("invalid history periods generation header".into());
         }
     }
-    let response = request("/v3/history/periods", prior_pair)?;
+    let mut response = request("/v3/history/periods/selectable", prior_pair)?;
+    let selectable = response.status != 404;
+    if !selectable {
+        // A cached selector response cannot validate the archive directory.
+        response = request("/v3/history/periods", None)?;
+    }
     if response.status == 304 {
         let pair = response_published_pair(&response)?;
-        if prior_pair != Some(pair.as_str()) || !response.body.is_empty() {
+        if !selectable || prior_pair != Some(pair.as_str()) || !response.body.is_empty() {
             return Err("cacheless history periods 304 or generation mismatch".into());
         }
-        return Ok(ServiceResourceFetch::NotModified { pair });
+        return Ok((ServiceResourceFetch::NotModified { pair }, selectable));
     }
     if response.status != 200 {
         return Err("history periods response is not HTTP 200".into());
     }
     let pair = response_published_pair(&response)?;
     let periods = parse_service_history_periods_document(&response.body)?;
-    Ok(ServiceResourceFetch::Fresh {
-        pair,
-        value: periods,
-    })
+    Ok((
+        ServiceResourceFetch::Fresh {
+            pair,
+            value: periods,
+        },
+        selectable,
+    ))
 }
 
 fn valid_public_account_id(value: &str) -> bool {
@@ -22959,7 +22980,9 @@ fn poll_service_graph_resources_with<F>(
     let previous_cursor = state.service_history_cursor.clone();
     let selected_account = state.service_selected_account_id.clone();
     let mut periods = state.service_history_periods.clone();
+    let mut periods_selectable = state.service_history_periods_selectable;
     let refresh_periods = force
+        || !periods_selectable
         || periods.is_empty()
         || previous_periods_pair.as_deref() != Some(current_pair.as_str());
     let reset_required = state.service_history_cursor_reset_required;
@@ -22968,13 +22991,17 @@ fn poll_service_graph_resources_with<F>(
 
     let result = (|| {
         if refresh_periods {
-            match fetch_service_history_periods_with_etag(
+            let (fetched, selectable) = fetch_service_history_periods_with_etag(
                 |route, if_none_match| {
                     let route = service_route_with_account(route, selected_account.as_deref());
                     request(&route, if_none_match)
                 },
-                previous_periods_pair.as_deref(),
-            )? {
+                previous_periods_pair
+                    .as_deref()
+                    .filter(|_| periods_selectable),
+            )?;
+            periods_selectable = selectable;
+            match fetched {
                 ServiceResourceFetch::Fresh { pair, value } => {
                     if pair != current_pair {
                         return Err("history periods generation differs from current".into());
@@ -23163,6 +23190,7 @@ fn poll_service_graph_resources_with<F>(
     })();
     match result {
         Ok(()) => {
+            state.service_history_periods_selectable = periods_selectable;
             state.service_history_force_poll = false;
             state.service_history_cursor_reset_required = false;
             state.service_history_pending_failures = 0;
@@ -25245,6 +25273,7 @@ mod tests {
             )
             .expect("graph last-good fixture is valid");
         state.service_history_force_poll = false;
+        state.service_history_periods_selectable = true;
         state
     }
 
@@ -27070,6 +27099,148 @@ mod tests {
     }
 
     #[test]
+    fn issue646_404_directory_does_not_hide_same_pair_selectable_upgrade() {
+        let pair = published_pair(26, 1);
+        let (period, samples) = split_graph_fixture();
+        let mut client = seeded_split_graph_client(&pair, &period, &samples[0], "C0");
+        client.service_history_force_poll = true;
+        let now = Instant::now();
+        let mut requests = Vec::new();
+        for upgraded in [false, true] {
+            super::poll_service_graph_resources_with(
+                &mut client,
+                now + super::SERVICE_HISTORY_POLL_INTERVAL * u32::from(upgraded),
+                false,
+                |route, prior_pair| {
+                    requests.push((route.to_owned(), prior_pair.map(str::to_owned)));
+                    Ok(super::ServiceDetailsHttpResponse {
+                        status: if !upgraded && route.ends_with("/selectable") {
+                            404
+                        } else {
+                            200
+                        },
+                        pair: Some(pair.clone()),
+                        body: split_history_periods_body(&period),
+                    })
+                },
+            );
+            assert_eq!(client.service_history_periods_selectable, upgraded);
+        }
+        assert_eq!(
+            requests,
+            vec![
+                ("/v3/history/periods/selectable".into(), Some(pair)),
+                ("/v3/history/periods".into(), None),
+                ("/v3/history/periods/selectable".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn issue646_legacy_directory_is_refetched_on_same_pair_split_transition() {
+        let source = CodexInfoState::preview("normal");
+        let legacy = source.public_details_candidates().2;
+        let selected = legacy
+            .history_periods
+            .iter()
+            .find(|period| period.current)
+            .expect("preview has a current period")
+            .clone();
+        let pair = published_pair(25, 1);
+        for previously_selectable in [false, true] {
+            let mut client = CodexInfoState::service_client();
+            client.service_history_periods_selectable = previously_selectable;
+            client
+                .apply_service_details_v3(pair.clone(), legacy.clone())
+                .expect("legacy full details is valid");
+            client.service_history_force_poll = false;
+            let mut current = legacy.clone();
+            current.history_periods.clear();
+            current.history_samples.clear();
+            current.history_gaps.clear();
+            current.threads.clear();
+            current.active_thread_count = 0;
+            current.open_session_thread_count = 0;
+            // The production poll stages schema transitions with no freshness
+            // predecessor, even when the data pair is unchanged.
+            let staged = super::stage_service_current_bundle(None, pair.clone(), current, None)
+                .unwrap()
+                .unwrap();
+            client.commit_service_current_bundle(staged);
+            let mut requests = Vec::new();
+            super::poll_service_graph_resources_with(
+                &mut client,
+                Instant::now(),
+                false,
+                |route, prior_pair| {
+                    requests.push((route.to_owned(), prior_pair.map(str::to_owned)));
+                    Ok(super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: split_history_periods_body(&selected),
+                    })
+                },
+            );
+            assert_eq!(
+                requests,
+                vec![("/v3/history/periods/selectable".into(), None)],
+                "legacy metadata must not satisfy the selector cache"
+            );
+            assert_eq!(client.service_history_periods, vec![selected.clone()]);
+            assert!(client.service_history_periods_selectable);
+        }
+    }
+
+    #[test]
+    fn issue646_selectable_linux_directory_uses_only_exact_404_fallback() {
+        let pair = published_pair(22, 1);
+        let (period, _) = split_graph_fixture();
+        let body = split_history_periods_body(&period);
+        for status in [200, 404, 500, 503] {
+            let mut paths = Vec::new();
+            let result = super::fetch_service_history_periods_with_etag(
+                |route, _| {
+                    paths.push(route.to_owned());
+                    let status = if route == "/v3/history/periods" {
+                        200
+                    } else {
+                        status
+                    };
+                    Ok(super::ServiceDetailsHttpResponse {
+                        status,
+                        pair: (status == 200).then(|| pair.clone()),
+                        body: body.clone(),
+                    })
+                },
+                None,
+            );
+            assert_eq!(paths[0], "/v3/history/periods/selectable");
+            assert_eq!(paths.len(), if status == 404 { 2 } else { 1 });
+            assert_eq!(result.is_ok(), matches!(status, 200 | 404));
+        }
+        for malformed in [false, true] {
+            let mut paths = Vec::new();
+            let result = super::fetch_service_history_periods_with_etag(
+                |route, _| {
+                    paths.push(route.to_owned());
+                    if malformed {
+                        Ok(super::ServiceDetailsHttpResponse {
+                            status: 200,
+                            pair: Some(pair.clone()),
+                            body: b"{}".to_vec(),
+                        })
+                    } else {
+                        Err("transport timeout".into())
+                    }
+                },
+                None,
+            );
+            assert!(result.is_err());
+            assert_eq!(paths, ["/v3/history/periods/selectable"]);
+        }
+    }
+
+    #[test]
     fn linux_graph_pair_change_uses_proven_cursor_and_atomically_appends() {
         let old_pair = published_pair(22, 1);
         let new_pair = published_pair(22, 2);
@@ -27089,7 +27260,7 @@ mod tests {
             true,
             |route, conditional| {
                 requests.push((route.to_owned(), conditional.map(str::to_owned)));
-                Ok(if route == "/v3/history/periods" {
+                Ok(if route == "/v3/history/periods/selectable" {
                     super::ServiceDetailsHttpResponse {
                         status: 200,
                         pair: Some(new_pair.clone()),
@@ -27109,7 +27280,10 @@ mod tests {
         assert_eq!(
             requests,
             [
-                ("/v3/history/periods".into(), Some(old_pair.clone())),
+                (
+                    "/v3/history/periods/selectable".into(),
+                    Some(old_pair.clone())
+                ),
                 (expected_page_route, Some(old_pair)),
             ]
         );
@@ -27149,7 +27323,7 @@ mod tests {
             true,
             |route, conditional| {
                 requests.push((route.to_owned(), conditional.map(str::to_owned)));
-                if route == "/v3/history/periods" {
+                if route == "/v3/history/periods/selectable" {
                     return Ok(super::ServiceDetailsHttpResponse {
                         status: 200,
                         pair: Some(new_pair.clone()),
@@ -27204,7 +27378,7 @@ mod tests {
         );
         let mut failed_page_requests = 0;
         super::poll_service_graph_resources_with(&mut failed, Instant::now(), true, |route, _| {
-            if route == "/v3/history/periods" {
+            if route == "/v3/history/periods/selectable" {
                 return Ok(super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(new_pair.clone()),
@@ -27247,7 +27421,7 @@ mod tests {
             true,
             |route, conditional| {
                 retry_requests.push((route.to_owned(), conditional.map(str::to_owned)));
-                Ok(if route == "/v3/history/periods" {
+                Ok(if route == "/v3/history/periods/selectable" {
                     super::ServiceDetailsHttpResponse {
                         status: 200,
                         pair: Some(new_pair.clone()),
@@ -27282,7 +27456,7 @@ mod tests {
             Instant::now(),
             true,
             |route, _| {
-                if route == "/v3/history/periods" {
+                if route == "/v3/history/periods/selectable" {
                     return Ok(super::ServiceDetailsHttpResponse {
                         status: 200,
                         pair: Some(new_pair.clone()),
@@ -27346,7 +27520,7 @@ mod tests {
         let duplicate_body =
             split_history_page_body(&[samples[1].clone(), samples[1].clone()], None, Some("C1"));
         super::poll_service_graph_resources_with(&mut state, Instant::now(), true, |route, _| {
-            Ok(if route == "/v3/history/periods" {
+            Ok(if route == "/v3/history/periods/selectable" {
                 super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(new_pair.clone()),
@@ -30054,7 +30228,7 @@ mod tests {
             selected_at,
             |route, conditional| {
                 requests.push((route.to_owned(), conditional.map(str::to_owned)));
-                Ok(if route == "/v3/history/periods" {
+                Ok(if route == "/v3/history/periods/selectable" {
                     super::ServiceDetailsHttpResponse {
                         status: 200,
                         pair: Some(pair.clone()),
@@ -30127,7 +30301,7 @@ mod tests {
             true,
             |route, conditional| {
                 requests.push((route.to_owned(), conditional.map(str::to_owned)));
-                if route == "/v3/history/periods" {
+                if route == "/v3/history/periods/selectable" {
                     Ok(super::ServiceDetailsHttpResponse {
                         status: 200,
                         pair: Some(pair.clone()),
@@ -30220,7 +30394,7 @@ mod tests {
         }))
         .expect("period catalog serializes");
         super::poll_service_graph_resources_with(&mut client, Instant::now(), true, |route, _| {
-            if route == "/v3/history/periods" {
+            if route == "/v3/history/periods/selectable" {
                 Ok(super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(pair.clone()),
@@ -30253,7 +30427,7 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             true,
             |route, _| {
-                Ok(if route == "/v3/history/periods" {
+                Ok(if route == "/v3/history/periods/selectable" {
                     super::ServiceDetailsHttpResponse {
                         status: 200,
                         pair: Some(pair.clone()),

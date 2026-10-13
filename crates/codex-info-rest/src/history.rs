@@ -14,6 +14,7 @@ pub(crate) struct HistoryIndex {
 pub(crate) struct PeriodIndex {
     pub(crate) samples: Vec<usize>,
     pub(crate) gaps: Vec<usize>,
+    pub(crate) has_token_usage: bool,
     fingerprints: Vec<[u8; 32]>,
 }
 
@@ -47,12 +48,11 @@ impl HistoryIndex {
                             period.end_at,
                         )
                     {
-                        index
-                            .periods
-                            .get_mut(&period.id)
-                            .expect("indexed period")
-                            .samples
-                            .push(row);
+                        let indexed = index.periods.get_mut(&period.id).expect("indexed period");
+                        indexed.samples.push(row);
+                        indexed.has_token_usage |= sample.models.as_ref().is_some_and(|models| {
+                            models.iter().any(|model| model.total_tokens > 0)
+                        });
                     }
                 }
             }
