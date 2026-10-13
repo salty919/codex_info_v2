@@ -479,6 +479,8 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    停止区間と重なる欠測bridgeは左の既知値を表示専用の1px水平線で保持し、増分は停止終了後の
    不確かな接続にのみ残す。右実測が停止終端そのものなら元値・元時刻を保ち、垂直線や架空の使用時刻を追加しない。
    この水平線は欠測の復元ではなく、DB/API/raw/hoverの値を補完しない。直接観測の線は変更しない。
+   model線のsampling同値反復を平滑化するときも、明示停止帯の開始・終了の元時刻と値を保持する。
+   再開後の増加を停止帯へ前倒しして描かない。model由来のidleが途中欠測で分断されても、この停止境界を失わない。
    以下のraw vectorによる判定は、明示停止とは独立した未使用根拠として維持する。両endpointと全interior raw rowに同じ非空model key集合が揃い、
    各rowが`model_source=confirmed && models_complete=true`または保存済みlossless token vectorを持つ`legacy-unknown`であり、
    全modelのraw `total_tokens`がexact equal、raw `remaining_percent`がfiniteかつbitwise equalで、confirmed gap、欠測、

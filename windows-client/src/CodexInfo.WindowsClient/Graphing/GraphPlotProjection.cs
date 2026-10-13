@@ -1785,6 +1785,9 @@ internal static class GraphPlotProjection
                 scene.IdleIntervals.Any(interval =>
                     interval.StartAt == timestamps[index] ||
                     interval.EndAt == timestamps[index]) ||
+                scene.TaskIdleIntervals.Any(interval =>
+                    interval.StartAt == timestamps[index] ||
+                    interval.EndAt == timestamps[index]) ||
                 (values[index] != values[index - 1] &&
                     values[index] != values[index + 1]))
             .ToArray();

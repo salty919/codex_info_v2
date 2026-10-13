@@ -10,6 +10,60 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphSceneLinuxParityTests
 {
     [Theory]
+    [InlineData(false, GraphMetric.Tokens)]
+    [InlineData(false, GraphMetric.Dollars)]
+    [InlineData(true, GraphMetric.Tokens)]
+    [InlineData(true, GraphMetric.Dollars)]
+    public void Issue621TaskStopBoundaryPreventsSmoothedUsageBeforeResume(bool exactModelIds, GraphMetric metric)
+    {
+        // Saved 10/13 samples, relative to 06:08. The SOL event after the stop
+        // is at 06:24:12, and the next minute observation is 06:25.
+        var samples = Enumerable.Range(0, 19).Select(minute =>
+        {
+            var tokens = minute switch { 0 => 2_097_645ul, 17 => 2_896_985ul, 18 => 3_923_057ul, _ => 2_411_449ul };
+            var dollars = minute switch { 0 => 2.206878, 17 => 2.760806, 18 => 3.448645, _ => 2.443581 };
+            var exactDollars = minute switch { 0 => 0.6156964, 17 => 0.752226, 18 => 0.9193188, _ => 0.676122 };
+            var missing = minute == 13; // 06:21: task stop is still known.
+            return new ApiHistorySample(1_000 + minute * 60, 10_000, 100,
+                missing ? null : dollars, missing ? null : 0, missing ? null : 0.05897728,
+                missing ? null : tokens, missing ? null : 0, missing ? null : 2_924_216ul,
+                missing ? ApiHistorySample.UnavailableModelSource : ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+                TaskActiveSincePrevious = minute <= 1 || minute >= 17,
+                ModelSamples = exactModelIds && !missing ? [
+                    new ApiHistoryModelSample("gpt-6.1-sol", null, null, null, exactDollars) { TotalTokens = tokens - 28_924 },
+                    new ApiHistoryModelSample("gpt-6-sol", null, null, null, 0.0457584) { TotalTokens = 28_924 },
+                    new ApiHistoryModelSample("gpt-6-luna", null, null, null, 0.05897728) { TotalTokens = 2_924_216 },
+                ] : null,
+            };
+        }).ToArray();
+        var scene = GraphScene.Create(samples, metric, 1_000, 2_080);
+        Assert.Equal([new GraphUnusedInterval(1_060, 1_960)],
+            GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+        var expected = metric == GraphMetric.Tokens ? 2_411_449 : exactModelIds ? 0.7218804 : 2.443581;
+        var lines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
+        var stoppedPoints = new[] { lines.Idle.Line, lines.Flat.Line, lines.Rising.Line, lines.Dashed.Line }
+            .SelectMany(line => line.X.Zip(line.Y))
+            .Where(point => point.First > 1_061 && point.First < 1_959)
+            .ToArray();
+        Assert.NotEmpty(stoppedPoints);
+        // Canonical rendering rounds normalized coordinates to two decimals.
+        // With these fixed maxima (<4M tokens / $4), that is at most 200
+        // tokens / $0.0002. The plateau itself must remain exactly horizontal.
+        var quantization = metric == GraphMetric.Tokens ? 200 : 0.0002;
+        Assert.All(stoppedPoints, point => Assert.InRange(point.Second,
+            expected - quantization, expected + quantization));
+        Assert.All(stoppedPoints, point => Assert.Equal(stoppedPoints[0].Second, point.Second, 9));
+        Assert.Equal(expected, scene.Sol[16], 9);
+        Assert.Equal(metric == GraphMetric.Tokens ? 2_896_985 : exactModelIds ? 0.7979844 : 2.760806,
+            scene.Sol[17], 9);
+        Assert.Equal(2_411_449ul, samples[16].SolTokens);
+        Assert.Null(samples[13].SolTokens);
+        Assert.Equal(2_896_985ul, samples[17].SolTokens);
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public void Issue621SlowerRecordedUsageDoesNotExtendTaskIdle(bool exactModelIds)
