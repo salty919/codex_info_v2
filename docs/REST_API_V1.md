@@ -47,7 +47,7 @@ client移行時はv4を優先し、exact 404の場合だけv3以下の既存経�
 返してもよい）。`login_id`は前後の同一
 `account/read`で確認し、owner-onlyな当該account DBへ保存した1..254 Unicode scalar、trim済み・control文字なしの
 表示専用値であり、欠落時はnullとする。AccountScopeId、partition ID、raw AccountKey、token、pathをwireへ出さない。
-`/v4/current`、`/v3/details`、`/v3/current`、`/v3/history/periods`、`/v3/history`、`/v3/threads`は
+`/v4/current`、`/v3/details`、`/v3/current`、`/v3/history/periods`、`/v3/history/periods/selectable`、`/v3/history`、`/v3/threads`は
 任意の`account=<id>`を一つだけ受理し、省略時は現accountを選ぶ。未知・重複・不正selectorは別accountへfallbackせず
 400とする。published pairとcursorはaccount IDへnamespace bindし、別accountのETag、cursor、last-goodを受理しない。
 ログアウト、account切替、またはidentity検証失敗中のselectorなしrouteは、旧accountのquota・reset・model・threadを
@@ -166,6 +166,7 @@ published generationならserverは同じpair headerとbody 0の`304`を返す�
 | `GET /v3/details` | split resource非対応client向けの任意model単一atomic rootを返す。 |
 | `GET /v3/current` | Mainに必要な状態、利用枠、model累計、active thread countだけを返す。 |
 | `GET /v3/history/periods` | Graphの期間metadataだけを返す。 |
+| `GET /v3/history/periods/selectable` | reset期間選択用に現期間と正のtoken記録がある期間のmetadataを返す。 |
 | `GET /v3/history?period=<opaque>&cursor=<opaque>` | 選択期間の履歴または`cursor`より後の差分を返す。`cursor`は初回だけ省略できる。 |
 | `GET /v3/threads` | Threads surfaceを開いたときだけthread rowsを返す。 |
 
@@ -192,6 +193,7 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、publis
 | `/v3/details` | `GET` | `200` | 同じcurrent immutable generationの任意model projection、同じ必須published pair、DB write/transaction=0 |
 | `/v3/current` | `GET` | `200` | history/period/thread rowsを含まないcurrent projection、同じ必須published pair、DB write/transaction=0 |
 | `/v3/history/periods` | `GET` | `200` | period metadata projection、同じ必須published pair、DB write/transaction=0 |
+| `/v3/history/periods/selectable` | `GET` | `200` | 選択対象period metadata projection、同じ必須published pair、DB write/transaction=0 |
 | `/v3/history?period=...&cursor=...` | `GET` | `200` | 同一pair・選択periodの有限page、DB write/transaction=0 |
 | `/v3/threads` | `GET` | `200` | thread projection、同じ必須published pair、DB write/transaction=0 |
 | v3 snapshot resource＋route/queryのcurrent pair | `GET` | `304` | body 0、同じpublished pair、route-local last-good維持、DB write/transaction=0 |
@@ -200,7 +202,8 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、publis
 
 RESTのtransfer body上限は既存のOOM/DoS安全境界であるdetails `32 MiB`、health/error `4 KiB`、response header `8 KiB`を全resourceで共有する。この値を通常データ件数の妥当性判定へ使わない。historyは次の正当なrowを加えると32 MiBへ達する場合だけ、そのrowの直前でpageを完了してopaque cursorを返し、次pageへ必ず前進する。単一row自体が安全境界を超える場合だけ`resource_too_large`とし、recorder、DB、公開generationを変更しない。
 SQLiteの保持期間は過去3暦月である。互換`/v1/details`、`/v2/details`、`/v3/details`は観測時刻で終わる直近31日のprojectionを維持し、history samples上限は`44,640`である。
-`/v3/history/periods`は同一accountの保持期間から、現期間または同じpublished snapshotの期間indexに観測点・欠測区間がある期間を公開する。過去期間で両方が0件の場合だけ一覧から除外し、model欠測・不完全・利用量0・残量100%を除外根拠にしない。archiveとindexは全exact IDを保持するため、一覧にないIDも`/v3/history`で取得でき、未知IDへ変更しない。後から観測点・欠測区間が加われば次snapshotで再掲載する。互換detailsの期間投影は変更しない。`/v3/history`は指定したexact periodだけを最大1,024点のpageで返す。選択期間の全pageを合わせた上限は44,640点のままとし、保持期間全体をdetailsへ詰め込まない。readerは同じread-only transactionで全保持履歴と直近detailsを投影し、retained projectionとgapも同じpublished pair・cursor prefix identityへ含める。private retained indexの容量は3×44,640点とし、period最大128件、gap最大4,096件、threads最大256件は維持する。検証失敗は`history_unavailable`として公開し、空の成功履歴へ変換しない。DBの保持・prune・canonical ID・raw値は変更しない（#646）。v1/v2のmodels上限は固定3件、v3のtop-levelおよび各history rowのmodels上限はOOM/DoS境界として1,024件である。
+`/v3/history/periods`は同一accountの保持期間から、現期間または同じpublished snapshotの期間indexに観測点・欠測区間がある期間を公開する取得directoryであり、任意時間窓のquota/欠測区間取得に使用する。過去期間で両方が0件の場合だけ一覧から除外し、model欠測・不完全・利用量0・残量100%を除外根拠にしない。archiveとindexは全exact IDを保持するため、一覧にないIDも`/v3/history`で取得でき、未知IDへ変更しない。後から観測点・欠測区間が加われば次snapshotで再掲載する。互換detailsの期間投影は変更しない。`/v3/history`は指定したexact periodだけを最大1,024点のpageで返す。選択期間の全pageを合わせた上限は44,640点のままとし、保持期間全体をdetailsへ詰め込まない。readerは同じread-only transactionで全保持履歴と直近detailsを投影し、retained projectionとgapも同じpublished pair・cursor prefix identityへ含める。private retained indexの容量は3×44,640点とし、period最大128件、gap最大4,096件、threads最大256件は維持する。検証失敗は`history_unavailable`として公開し、空の成功履歴へ変換しない。DBの保持・prune・canonical ID・raw値は変更しない（#646）。v1/v2のmodels上限は固定3件、v3のtop-levelおよび各history rowのmodels上限はOOM/DoS境界として1,024件である。
+`/v3/history/periods/selectable`は同じv3 body形・account query・published pairで、現期間または範囲内の公開modelに正の`total_tokens`がある期間だけを返す。model集合の完全性やsourceがconfirmedかどうかで正の記録を落とさない。quotaのみ・gapのみ・tokenが0または未取得の過去期間は選択対象にしないが、元directory・全IDの直接page・原本は変更しない。掲載は未使用判定ではない。Linux/Windowsのreset期間選択はこのresourceを使い、Windowsの任意時間窓は従来directoryを使う。二resourceのcacheを混用せず、選択resourceのexact404だけ旧directoryへ互換fallbackする。旧serverでは新掲載条件の保証外とし、timeout・5xx・不正bodyを空の成功や互換fallbackにしない（#646）。
 
 ### 容量条件とfailure isolation
 
@@ -522,7 +525,7 @@ transfer-decoded bodyは1 KiB以下とする。
 | 431 | `request_headers_too_large` | header count/field/aggregate上限超過 |
 | 500 | `internal_error` | response commit前のserialization/invariant failure |
 | 503 | `snapshot_unavailable` | publisher/DB root/stale owner/internal read timeout、またはshutdown中 |
-| 503 | `history_unavailable` | 現在quotaは読取り可能だが、履歴projectionの読取り・公開検証に失敗した場合の`/v3/history/periods`と`/v3/history` |
+| 503 | `history_unavailable` | 現在quotaは読取り可能だが、履歴projectionの読取り・公開検証に失敗した場合の`/v3/history/periods`、`/v3/history/periods/selectable`、`/v3/history` |
 
 route/publisher faultを200や`state=error`へ丸めない。valid details generation自身の`state=error`だけはschema-valid
 200 snapshotであり、server transport faultと別物である。serialization failureがheader/body commit後に起きた場合は
@@ -533,7 +536,7 @@ connectionをabortし、追加JSONやpartial-success markerを送らない。cli
 
 製品endpointはHTTP/1.1だけを受け、request targetはorigin-formのexact
 `/health`、`/v1/health`、`/v1/runtime`、`/v1/details`、`/v2/details`、`/v3/details`、`/v3/current`、
-`/v3/history/periods`、`/v3/history?period=<opaque>&cursor=<opaque>`、`/v3/threads`である。
+`/v3/history/periods`、`/v3/history/periods/selectable`、`/v3/history?period=<opaque>&cursor=<opaque>`、`/v3/threads`である。
 historyのstrict queryを除きpercent decode、path normalization、query、fragment、absolute-form、authority-form、asterisk-formを許可しない。
 
 | resource | 採用上限・規則 |

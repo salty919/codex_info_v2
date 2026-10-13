@@ -30,6 +30,7 @@ public sealed class LoopbackStatusClient :
     private static readonly string CurrentEndpoint = $"{EndpointRoot}/v3/current";
     private static readonly string CurrentV4Endpoint = $"{EndpointRoot}/v4/current";
     private static readonly string HistoryPeriodsEndpoint = $"{EndpointRoot}/v3/history/periods";
+    private static readonly string SelectableHistoryPeriodsEndpoint = $"{EndpointRoot}/v3/history/periods/selectable";
     private static readonly string HistoryEndpoint = $"{EndpointRoot}/v3/history";
     private static readonly string ThreadsEndpoint = $"{EndpointRoot}/v3/threads";
     private static readonly string DetailsV3Endpoint = $"{EndpointRoot}/v3/details";
@@ -299,6 +300,7 @@ public sealed class LoopbackStatusClient :
     private PublishedPairIdentity? _lastV3PublishedPair;
     private ApiCurrentSnapshot? _lastCurrentSnapshot;
     private ApiHistoryPeriodsSnapshot? _lastHistoryPeriodsSnapshot;
+    private ApiHistoryPeriodsSnapshot? _lastSelectableHistoryPeriodsSnapshot;
     private ApiThreadsSnapshot? _lastThreadsSnapshot;
     private bool _legacyDetailsMode;
     private ApiDetailsSnapshot? _lastLegacyDetailsSnapshot;
@@ -590,9 +592,26 @@ public sealed class LoopbackStatusClient :
         return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<HistoryPeriodsFetchResult> FetchSelectableHistoryPeriodsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (HasExplicitAccountScope())
+        {
+            return HistoryPeriodsFetchResult.FromFailure(DetailsFetchFailure.Response);
+        }
+
+        return await FetchHistoryPeriodsForAccountAsync(null, cancellationToken, selectable: true).ConfigureAwait(false);
+    }
+
+    public Task<HistoryPeriodsFetchResult> FetchSelectableHistoryPeriodsAsync(
+        string accountId,
+        CancellationToken cancellationToken = default) =>
+        FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken, selectable: true);
+
     private async Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsForAccountAsync(
         string? accountId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool selectable = false)
     {
         var accountScope = BeginAccountScope(accountId);
         if (accountId is not null && !IsSafeAccountId(accountId))
@@ -606,20 +625,26 @@ public sealed class LoopbackStatusClient :
                 ApiHistoryPeriodsSnapshot.FromDetails(cachedLegacy));
         }
 
-        var endpoint = AppendAccountQuery(HistoryPeriodsEndpoint, accountId);
+        var endpoint = AppendAccountQuery(selectable ? SelectableHistoryPeriodsEndpoint : HistoryPeriodsEndpoint, accountId);
         var result = await FetchSplitResourceAsync(
                 endpoint,
                 cacheKey: endpoint,
-                cached: GetHistoryPeriodsCache(),
+                cached: GetHistoryPeriodsCache(selectable),
                 (body, pair) => ParseHistoryPeriods(body, pair) is { } parsed
                     ? parsed with { AccountId = accountId }
                     : null,
                 static value => value.PublishedPair,
-                value => StoreHistoryPeriodsCache(value, accountScope),
-                () => EvictHistoryPeriodsCache(accountScope),
+                value => StoreHistoryPeriodsCache(value, accountScope, selectable),
+                () => EvictHistoryPeriodsCache(accountScope, selectable),
                 cancellationToken,
                 scopeIsCurrent: () => IsAccountScopeCurrent(accountId, accountScope))
             .ConfigureAwait(false);
+        if (selectable && result.NotFound)
+        {
+            // Older servers can supply their observed directory. Other
+            // failures never become a successful empty selector.
+            return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken).ConfigureAwait(false);
+        }
         return result.Value is not null
             ? HistoryPeriodsFetchResult.Success(result.Value)
             : HistoryPeriodsFetchResult.FromFailure(result.Failure ?? DetailsFetchFailure.Response);
@@ -1091,6 +1116,7 @@ public sealed class LoopbackStatusClient :
         _lastV3PublishedPair = null;
         _lastCurrentSnapshot = null;
         _lastHistoryPeriodsSnapshot = null;
+        _lastSelectableHistoryPeriodsSnapshot = null;
         _lastThreadsSnapshot = null;
         _lastLegacyDetailsSnapshot = null;
         _lastHistoryPages.Clear();
@@ -1140,6 +1166,7 @@ public sealed class LoopbackStatusClient :
             _lastLegacyDetailsSnapshot = snapshot;
             _lastCurrentSnapshot = null;
             _lastHistoryPeriodsSnapshot = null;
+            _lastSelectableHistoryPeriodsSnapshot = null;
             _lastThreadsSnapshot = null;
             _lastHistoryPages.Clear();
         }
@@ -1156,29 +1183,43 @@ public sealed class LoopbackStatusClient :
         }
     }
 
-    private ApiHistoryPeriodsSnapshot? GetHistoryPeriodsCache()
+    private ApiHistoryPeriodsSnapshot? GetHistoryPeriodsCache(bool selectable)
     {
-        lock (_v3CacheGate) return _lastHistoryPeriodsSnapshot;
+        lock (_v3CacheGate) return selectable ? _lastSelectableHistoryPeriodsSnapshot : _lastHistoryPeriodsSnapshot;
     }
 
-    private void StoreHistoryPeriodsCache(ApiHistoryPeriodsSnapshot value, long generation)
+    private void StoreHistoryPeriodsCache(ApiHistoryPeriodsSnapshot value, long generation, bool selectable)
     {
         lock (_v3CacheGate)
         {
             if (generation == _accountSelectionGeneration)
             {
-                _lastHistoryPeriodsSnapshot = value;
+                if (selectable)
+                {
+                    _lastSelectableHistoryPeriodsSnapshot = value;
+                }
+                else
+                {
+                    _lastHistoryPeriodsSnapshot = value;
+                }
             }
         }
     }
 
-    private void EvictHistoryPeriodsCache(long generation)
+    private void EvictHistoryPeriodsCache(long generation, bool selectable)
     {
         lock (_v3CacheGate)
         {
             if (generation == _accountSelectionGeneration)
             {
-                _lastHistoryPeriodsSnapshot = null;
+                if (selectable)
+                {
+                    _lastSelectableHistoryPeriodsSnapshot = null;
+                }
+                else
+                {
+                    _lastHistoryPeriodsSnapshot = null;
+                }
             }
         }
     }

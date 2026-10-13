@@ -2492,8 +2492,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             var candidateResourceSamples = resourceSamples;
             var candidateResourceGaps = resourceGaps;
             var periodsResult = accountId is not null && accountResourceClient is not null
-                ? await accountResourceClient.FetchHistoryPeriodsAsync(accountId, cancellationToken)
-                : await resourceClient.FetchHistoryPeriodsAsync(cancellationToken)
+                ? await accountResourceClient.FetchSelectableHistoryPeriodsAsync(accountId, cancellationToken)
+                : await resourceClient.FetchSelectableHistoryPeriodsAsync(cancellationToken)
                 .ConfigureAwait(false);
             if (!periodsResult.IsSuccess || periodsResult.Snapshot is not { } periodsSnapshot)
             {
@@ -2634,8 +2634,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
                     generationAlignmentAttempts++;
                     var alignedPeriodsResult = accountId is not null && accountResourceClient is not null
-                        ? await accountResourceClient.FetchHistoryPeriodsAsync(accountId, cancellationToken)
-                        : await resourceClient.FetchHistoryPeriodsAsync(cancellationToken)
+                        ? await accountResourceClient.FetchSelectableHistoryPeriodsAsync(accountId, cancellationToken)
+                        : await resourceClient.FetchSelectableHistoryPeriodsAsync(cancellationToken)
                         .ConfigureAwait(false);
                     if (!alignedPeriodsResult.IsSuccess ||
                         alignedPeriodsResult.Snapshot is not { } alignedPeriodsSnapshot ||

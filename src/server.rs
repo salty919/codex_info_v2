@@ -1277,6 +1277,7 @@ struct HistoryPeriodIndex {
     sample_end: usize,
     gap_start: usize,
     gap_end: usize,
+    has_token_usage: bool,
     sample_prefix_fingerprints: Vec<[u8; 32]>,
     head_body: Arc<HistoryHeadBodyCache>,
 }
@@ -1319,6 +1320,18 @@ fn history_period_indexes(
         .map(|(index, period)| (period.reset_at, index))
         .collect::<BTreeMap<_, _>>();
     for (sample_index, sample) in details.history_samples.iter().enumerate() {
+        if let Some(&period_index) = periods_by_reset.get(&sample.reset_at) {
+            let period = &details.history_periods[period_index];
+            indexes[period_index].has_token_usage |=
+                codex_info_rest_contract::history_minute_in_period(
+                    sample.timestamp,
+                    period.start_at,
+                    period.end_at,
+                ) && sample
+                    .models
+                    .as_ref()
+                    .is_some_and(|models| models.iter().any(|model| model.total_tokens > 0));
+        }
         let Some(period_index) = periods_by_reset
             .range(sample.reset_at..=sample.reset_at.saturating_add(60))
             .filter_map(|(_, index)| {
@@ -1843,6 +1856,7 @@ enum ApiRoute {
     DetailsV3,
     CurrentV3,
     HistoryPeriodsV3,
+    SelectableHistoryPeriodsV3,
     HistoryV3,
     ThreadsV3,
 }
@@ -2355,6 +2369,21 @@ fn snapshot_response(
             .get_or_init(|| serialize_details_v3(&current.details_v3)),
         ApiRoute::CurrentV3 => Ok(current.current_v3_body.clone()),
         ApiRoute::HistoryPeriodsV3 => Ok(current.history_periods_v3_body.clone()),
+        ApiRoute::SelectableHistoryPeriodsV3 => {
+            let periods = current
+                .details_v3
+                .history_periods
+                .iter()
+                .zip(&current.history_period_indexes)
+                .filter(|(period, index)| period.current || index.has_token_usage)
+                .map(|(period, _)| period.clone())
+                .collect::<Vec<_>>();
+            serde_json::to_vec(&HistoryPeriodsV3Response {
+                api_version: API_VERSION_V3,
+                history_periods: &periods,
+            })
+            .map_err(|_| ApiSnapshotError::Serialization)
+        }
         ApiRoute::ThreadsV3 => Ok(current.threads_v3_body.clone()),
         ApiRoute::HistoryV3 => unreachable!("history handled above"),
         ApiRoute::Health => return (503, error_body("snapshot_unavailable"), None),
@@ -2422,9 +2451,11 @@ fn handle_connection(
                     request.period.as_deref(),
                     request.cursor.as_deref(),
                 ),
-                Some(ApiRoute::HistoryPeriodsV3) => snapshot_response(
+                Some(
+                    route @ (ApiRoute::HistoryPeriodsV3 | ApiRoute::SelectableHistoryPeriodsV3),
+                ) => snapshot_response(
                     &snapshot,
-                    ApiRoute::HistoryPeriodsV3,
+                    route,
                     request.if_none_match.as_deref(),
                     request.period.as_deref(),
                     request.cursor.as_deref(),
@@ -2682,6 +2713,7 @@ fn route_supports_etag(route: Option<ApiRoute>) -> bool {
             ApiRoute::DetailsV3
                 | ApiRoute::CurrentV3
                 | ApiRoute::HistoryPeriodsV3
+                | ApiRoute::SelectableHistoryPeriodsV3
                 | ApiRoute::HistoryV3
                 | ApiRoute::ThreadsV3
         )
@@ -2771,6 +2803,7 @@ fn parse_target(target: &[u8]) -> Result<ParsedTarget, ParseFailure> {
         b"/v3/details" => Some(ApiRoute::DetailsV3),
         b"/v3/current" => Some(ApiRoute::CurrentV3),
         b"/v3/history/periods" => Some(ApiRoute::HistoryPeriodsV3),
+        b"/v3/history/periods/selectable" => Some(ApiRoute::SelectableHistoryPeriodsV3),
         b"/v3/history" => Some(ApiRoute::HistoryV3),
         b"/v3/threads" => Some(ApiRoute::ThreadsV3),
         _ => None,
@@ -2784,11 +2817,12 @@ fn parse_target(target: &[u8]) -> Result<ParsedTarget, ParseFailure> {
                 cursor,
             })
         }
-        Some(ApiRoute::CurrentV3 | ApiRoute::HistoryPeriodsV3 | ApiRoute::ThreadsV3)
-            if query.is_some() =>
-        {
-            Err(ParseFailure::BadRequest)
-        }
+        Some(
+            ApiRoute::CurrentV3
+            | ApiRoute::HistoryPeriodsV3
+            | ApiRoute::SelectableHistoryPeriodsV3
+            | ApiRoute::ThreadsV3,
+        ) if query.is_some() => Err(ParseFailure::BadRequest),
         Some(ApiRoute::Health | ApiRoute::Details | ApiRoute::DetailsV2 | ApiRoute::DetailsV3)
             if query.is_some() =>
         {
@@ -4324,6 +4358,66 @@ mod tests {
         let mut invalid = details.clone();
         invalid.history_gaps[0].end_at = period.end_at + 60;
         assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
+    }
+
+    #[test]
+    fn issue646_selectable_embedded_server_preserves_the_full_directory() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut details = history_fixture(2);
+        let current = details.history_periods[0].clone();
+        for (id, shift, tokens) in [("quota-only", 1_209_600, 0), ("token-past", 604_800, 17)] {
+            let mut period = current.clone();
+            period.id = id.into();
+            period.start_at -= shift;
+            period.end_at -= shift;
+            period.reset_at -= shift;
+            period.current = false;
+            details.history_samples.push(PublicHistorySample {
+                timestamp: period.start_at,
+                reset_at: period.reset_at,
+                remaining_percent: Some(90.0),
+                sol_dollars: 0.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: tokens,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            });
+            details.history_periods.push(period);
+        }
+        details
+            .history_samples
+            .sort_by_key(|point| (point.reset_at, point.timestamp));
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        server.publisher().publish_details(details).unwrap();
+        let all = wire_request(
+            server.local_addr(),
+            "GET /v3/history/periods HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let selected = wire_request(server.local_addr(), "GET /v3/history/periods/selectable HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        assert!(selected.starts_with("HTTP/1.1 200"), "{selected}");
+        assert_eq!(
+            published_pair_headers(&selected),
+            published_pair_headers(&all)
+        );
+        assert_eq!(body(&all)["history_periods"].as_array().unwrap().len(), 3);
+        let value = body(&selected);
+        let ids = value["history_periods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["slo-period", "token-past"]);
+        let direct = wire_request(server.local_addr(), "GET /v3/history?period=quota-only HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        assert!(direct.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            body(&direct)["history_samples"].as_array().unwrap().len(),
+            1
+        );
+        server.shutdown();
     }
 
     #[test]

@@ -851,6 +851,7 @@ enum Route {
     CurrentV3,
     CurrentV4,
     HistoryPeriodsV3,
+    SelectableHistoryPeriodsV3,
     HistoryV3,
     ThreadsV3,
 }
@@ -867,6 +868,7 @@ impl Route {
             Self::CurrentV3 => "/v3/current",
             Self::CurrentV4 => "/v4/current",
             Self::HistoryPeriodsV3 => "/v3/history/periods",
+            Self::SelectableHistoryPeriodsV3 => "/v3/history/periods/selectable",
             Self::HistoryV3 => "/v3/history",
             Self::ThreadsV3 => "/v3/threads",
         }
@@ -879,6 +881,7 @@ impl Route {
                 | Self::CurrentV3
                 | Self::CurrentV4
                 | Self::HistoryPeriodsV3
+                | Self::SelectableHistoryPeriodsV3
                 | Self::HistoryV3
                 | Self::ThreadsV3
         )
@@ -1369,6 +1372,7 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
         "/v3/current" => Some(Route::CurrentV3),
         "/v4/current" => Some(Route::CurrentV4),
         "/v3/history/periods" => Some(Route::HistoryPeriodsV3),
+        "/v3/history/periods/selectable" => Some(Route::SelectableHistoryPeriodsV3),
         "/v3/history" => Some(Route::HistoryV3),
         "/v3/threads" => Some(Route::ThreadsV3),
         _ => None,
@@ -1449,7 +1453,12 @@ fn serialize_route(
     cursor: Option<String>,
     degraded: bool,
 ) -> Result<Vec<u8>, RouteError> {
-    if !snapshot.history_available && matches!(route, Route::HistoryPeriodsV3 | Route::HistoryV3) {
+    if !snapshot.history_available
+        && matches!(
+            route,
+            Route::HistoryPeriodsV3 | Route::SelectableHistoryPeriodsV3 | Route::HistoryV3
+        )
+    {
         return Err(RouteError::HistoryUnavailable);
     }
     let details = &snapshot.details;
@@ -1507,6 +1516,26 @@ fn serialize_route(
                             .history_index
                             .period(&period.id)
                             .is_some_and(|index| index.samples.is_empty() && index.gaps.is_empty())
+                })
+                .collect::<Vec<_>>();
+            serialize_json(&json!({
+                "api_version": API_VERSION_V3,
+                "history_periods": periods,
+            }))
+        }
+        Route::SelectableHistoryPeriodsV3 => {
+            // Selection requires recorded token usage, not a claim that
+            // omitted periods were unused. The full directory and pages remain.
+            let periods = snapshot
+                .retained_history
+                .periods
+                .iter()
+                .filter(|period| {
+                    period.current
+                        || snapshot
+                            .history_index
+                            .period(&period.id)
+                            .is_some_and(|index| index.has_token_usage)
                 })
                 .collect::<Vec<_>>();
             serialize_json(&json!({
@@ -3343,6 +3372,367 @@ mod tests {
             );
             assert!(samples.iter().all(|p| p["models"].is_null()));
         }
+        server.shutdown();
+    }
+
+    #[test]
+    fn issue646_selectable_periods_require_tokens_but_preserve_the_archive() {
+        let (route, _, _, _) = parse_target("/v3/history/periods/selectable").unwrap();
+        let route = route.expect("the selectable resource must exist");
+        for (id, current, count, gap, model, expected) in [
+            ("past-empty", false, 0, false, None, false),
+            ("current-empty", true, 0, false, None, true),
+            ("quota-only", false, 1, false, None, false),
+            ("complete-zero", false, 1, false, Some((0, true)), false),
+            ("partial-zero", false, 1, false, Some((0, false)), false),
+            (
+                "partial-positive",
+                false,
+                1,
+                false,
+                Some((28_924, false)),
+                true,
+            ),
+            ("complete-positive", false, 1, false, Some((1, true)), true),
+            ("gap-only", false, 0, true, None, false),
+        ] {
+            let original = history_test_fixture(10, 1, count, false, gap, id);
+            let snapshot = history_test_edit(original, 10, |candidate| {
+                candidate.details.history_periods[0].current = current;
+                for point in &mut candidate.history_samples_v3 {
+                    point.remaining_percent = Some(90.0);
+                    point.models = model.map(|(total_tokens, _)| {
+                        vec![codex_info_rest_contract::PublicHistoryModelUsageV3 {
+                            model: "SOL".into(),
+                            total_tokens,
+                            input_tokens: None,
+                            cached_input_tokens: None,
+                            cache_write_input_tokens: None,
+                            output_tokens: None,
+                            total_dollars: None,
+                        }]
+                    });
+                    point.models_complete = model.is_some_and(|(_, complete)| complete);
+                    point.model_source = if model.is_some() {
+                        "legacy-unknown"
+                    } else {
+                        "unavailable"
+                    }
+                    .into();
+                }
+            });
+            let selected: Value = serde_json::from_slice(
+                &serialize_route(&snapshot, route, None, None, false).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                !selected["history_periods"].as_array().unwrap().is_empty(),
+                expected,
+                "{id}"
+            );
+            // This is selection eligibility, never a mutation of recorded facts.
+            let page = history_test_page(&snapshot, id, None).unwrap();
+            assert_eq!(page["history_samples"].as_array().unwrap().len(), count);
+            assert_eq!(
+                page["history_gaps"].as_array().unwrap().len(),
+                usize::from(gap)
+            );
+            let directory: Value = serde_json::from_slice(
+                &serialize_route(&snapshot, Route::HistoryPeriodsV3, None, None, false).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                !directory["history_periods"].as_array().unwrap().is_empty(),
+                current || count > 0 || gap
+            );
+            if count > 0 && !expected {
+                let updated = history_test_edit(snapshot, 11, |candidate| {
+                    candidate.history_samples_v3[0].models =
+                        Some(vec![codex_info_rest_contract::PublicHistoryModelUsageV3 {
+                            model: "SOL".into(),
+                            total_tokens: 1,
+                            input_tokens: None,
+                            cached_input_tokens: None,
+                            cache_write_input_tokens: None,
+                            output_tokens: None,
+                            total_dollars: None,
+                        }]);
+                });
+                let visible: Value = serde_json::from_slice(
+                    &serialize_route(&updated, route, None, None, false).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    visible["history_periods"][0]["id"], id,
+                    "late token evidence republishes the exact ID"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue646_selectable_keeps_one_second_apart_token_ids_exact() {
+        let (route, _, _, _) = parse_target("/v3/history/periods/selectable").unwrap();
+        let route = route.expect("the selectable resource must exist");
+        let original = history_test_fixture(10, 1, 2, false, false, "first");
+        let snapshot = history_test_edit(original, 10, |candidate| {
+            candidate.details.history_periods[0].current = false;
+            let mut second = candidate.details.history_periods[0].clone();
+            second.id = "second".into();
+            second.reset_at += 1;
+            second.start_at += 1;
+            candidate.details.history_periods.push(second);
+            candidate.history_samples_v3[1].reset_at += 1;
+            for (index, point) in candidate.history_samples_v3.iter_mut().enumerate() {
+                point.models = Some(vec![codex_info_rest_contract::PublicHistoryModelUsageV3 {
+                    model: "SOL".into(),
+                    total_tokens: (index + 1) as u64,
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    output_tokens: None,
+                    total_dollars: None,
+                }]);
+            }
+        });
+        let selected: Value =
+            serde_json::from_slice(&serialize_route(&snapshot, route, None, None, false).unwrap())
+                .unwrap();
+        let ids = selected["history_periods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["first", "second"]);
+        for (id, total) in [("first", 1), ("second", 2)] {
+            let page = history_test_page(&snapshot, id, None).unwrap();
+            assert_eq!(page["history_samples"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                page["history_samples"][0]["models"][0]["total_tokens"],
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn issue646_selectable_http_keeps_token_period_and_all_direct_pages() {
+        const START: i64 = 1_800_000_001;
+        const WINDOW: i64 = 604_800;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("token-periods.sqlite3");
+        fixture(&path, 10);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DELETE FROM usage_history; DELETE FROM durable_state;
+            CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,sequence INTEGER,
+            observed_at INTEGER,reset_at INTEGER,window_seconds INTEGER,
+            remaining_percent REAL,applied_generation TEXT);
+            CREATE TABLE usage_model_history(reset_at INTEGER,timestamp INTEGER,model TEXT,
+            total_tokens TEXT,input_tokens TEXT,cached_input_tokens TEXT,output_tokens TEXT,
+            cache_write_input_tokens TEXT,model_set_complete INTEGER);",
+        )
+        .unwrap();
+        let starts = [START, START + 128, START + 190, START + 600];
+        for (index, start) in starts.into_iter().enumerate() {
+            let observed = start + if index == 2 { 120 } else { 60 };
+            let timestamp = observed - observed.rem_euclid(60);
+            db.execute(
+                "INSERT INTO quota_receipts VALUES(?1,?2,?3,?4,?5,100,'10')",
+                params![
+                    index.to_string(),
+                    index as i64 + 1,
+                    observed,
+                    start + WINDOW,
+                    WINDOW
+                ],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO usage_history VALUES(?1,?2,100,0,0,0,?3,0,0)",
+                params![
+                    timestamp,
+                    start + WINDOW,
+                    if index == 2 { 28_924 } else { 0 }
+                ],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO usage_model_history VALUES(?1,?2,'SOL',?3,?3,'0','0','0',0)",
+                params![
+                    start + WINDOW,
+                    timestamp,
+                    if index == 2 { "28924" } else { "0" }
+                ],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "UPDATE collection_generation SET data_generation='10',reset_at=?1,window_seconds=?2",
+            params![starts[3] + WINDOW, WINDOW],
+        )
+        .unwrap();
+        // Match the live account's canonical loader. The unpartitioned legacy
+        // loader can reassign nearby reset aliases before quota projection.
+        db.pragma_update(
+            None,
+            "user_version",
+            codex_info_db_reader::HISTORY_CANONICAL_SCHEMA_VERSION,
+        )
+        .unwrap();
+        db.execute_batch("CREATE UNIQUE INDEX usage_history_canonical_timestamp_idx ON usage_history(timestamp);
+            CREATE UNIQUE INDEX usage_model_history_canonical_timestamp_model_idx ON usage_model_history(timestamp,model);
+            CREATE TABLE storage_partition(singleton INTEGER,schema_version TEXT,profile_scope_id TEXT,
+            account_scope_id TEXT,storage_epoch TEXT,partition_id TEXT);").unwrap();
+        for (name, table, operation) in [
+            (
+                "usage_history_canonical_insert_guard",
+                "usage_history",
+                "INSERT",
+            ),
+            (
+                "usage_history_canonical_update_guard",
+                "usage_history",
+                "UPDATE",
+            ),
+            (
+                "usage_model_history_canonical_insert_guard",
+                "usage_model_history",
+                "INSERT",
+            ),
+            (
+                "usage_model_history_canonical_update_guard",
+                "usage_model_history",
+                "UPDATE",
+            ),
+            (
+                "durable_history_observation_insert_guard",
+                "durable_state",
+                "INSERT",
+            ),
+            (
+                "durable_history_observation_update_guard",
+                "durable_state",
+                "UPDATE",
+            ),
+            (
+                "usage_history_sidecar_update_guard",
+                "usage_history",
+                "UPDATE",
+            ),
+            (
+                "usage_history_sidecar_delete_guard",
+                "usage_history",
+                "DELETE",
+            ),
+        ] {
+            db.execute_batch(&format!(
+                "CREATE TRIGGER {name} BEFORE {operation} ON {table} WHEN 0 BEGIN SELECT 1; END;"
+            ))
+            .unwrap();
+        }
+        let identity = codex_info_db_reader::StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 2,
+            partition_id: "33".repeat(32),
+        };
+        db.execute(
+            "INSERT INTO storage_partition VALUES(1,?1,?2,?3,'2',?4)",
+            params![
+                identity.schema_version,
+                identity.profile_scope_id,
+                identity.account_scope_id,
+                identity.partition_id
+            ],
+        )
+        .unwrap();
+        let reader = DbReader::open_partitioned(&path, &identity).unwrap();
+        let before = reader.read_snapshot().unwrap();
+        for (index, start) in starts.into_iter().enumerate() {
+            let points = before
+                .retained_history
+                .samples
+                .iter()
+                .filter(|point| point.reset_at == start + WINDOW)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                points.len(),
+                1,
+                "the canonical fixture has one in-bounds observation per exact reset"
+            );
+            assert_eq!(points[0].model_source, "legacy-unknown");
+            assert!(!points[0].models_complete);
+            assert_eq!(
+                points[0]
+                    .models
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find(|model| model.model == "SOL")
+                    .unwrap()
+                    .total_tokens,
+                if index == 2 { 28_924 } else { 0 }
+            );
+        }
+        let mut server = RestServer::start(reader.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let directory = request(
+            server.local_addr(),
+            "GET /v3/history/periods HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(directory.starts_with("HTTP/1.1 200"));
+        let all: Value = serde_json::from_str(body(&directory)).unwrap();
+        assert_eq!(all["history_periods"].as_array().unwrap().len(), 4);
+        let selected = request(
+            server.local_addr(),
+            "GET /v3/history/periods/selectable HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(selected.starts_with("HTTP/1.1 200"), "{selected}");
+        assert_eq!(published_pair(&directory), published_pair(&selected));
+        let selected: Value = serde_json::from_str(body(&selected)).unwrap();
+        let ids = selected["history_periods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                (starts[3] + WINDOW).to_string(),
+                (starts[2] + WINDOW).to_string()
+            ]
+        );
+        for (index, start) in starts.into_iter().enumerate() {
+            let reset = start + WINDOW;
+            let response = request(
+                server.local_addr(),
+                &format!("GET /v3/history?period={reset} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(response.starts_with("HTTP/1.1 200"));
+            assert_eq!(published_pair(&directory), published_pair(&response));
+            let page: Value = serde_json::from_str(body(&response)).unwrap();
+            let samples = page["history_samples"].as_array().unwrap();
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0]["models_complete"], false);
+            assert_eq!(
+                samples[0]["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|model| model["model"] == "SOL")
+                    .unwrap()["total_tokens"],
+                if index == 2 { 28_924 } else { 0 }
+            );
+        }
+        assert_eq!(reader.read_snapshot().unwrap().data_hash, before.data_hash);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM usage_history", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
         server.shutdown();
     }
 
