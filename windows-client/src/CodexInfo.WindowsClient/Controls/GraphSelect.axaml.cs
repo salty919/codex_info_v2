@@ -266,7 +266,16 @@ public sealed class PeriodDateGroup(string label) : INotifyPropertyChanged
     public bool IsExpanded
     {
         get => isExpanded;
-        set { if (isExpanded == value) return; isExpanded = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsExpanded))); }
+        set
+        {
+            if (isExpanded == value)
+            {
+                return;
+            }
+
+            isExpanded = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsExpanded)));
+        }
     }
     public event PropertyChangedEventHandler? PropertyChanged;
 }

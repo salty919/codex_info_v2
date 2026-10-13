@@ -47,6 +47,9 @@
               <Setter Property="MinHeight" Value="32" />
               <Setter Property="Padding" Value="8,0" />
             </Style>
+            <Style Selector="TreeViewItem:selected /template/ Border#PART_LayoutRoot">
+              <Setter Property="Background" Value="{DynamicResource Theme244D74}" />
+            </Style>
           </TreeView.Styles>
         </TreeView>
         <ListBox x:Name="MenuList" ItemsSource="{Binding ItemsSource, ElementName=Root}"
