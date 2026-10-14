@@ -5,13 +5,91 @@ using System.Reflection;
 using System.Globalization;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Headless;
+using Avalonia.VisualTree;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Localization;
+using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
 
 namespace CodexInfo.WindowsClient.Presentation.Tests;
 
 public sealed class MainLayoutParityTests
 {
+    [Theory]
+    [InlineData("ja")]
+    [InlineData("en")]
+    [InlineData("zh-Hans")]
+    [InlineData("ko")]
+    [InlineData("es")]
+    [InlineData("fr")]
+    [InlineData("de")]
+    [InlineData("pt")]
+    [InlineData("it")]
+    [InlineData("ru")]
+    public async Task HistoricalAccountNoticeIsFullyReadableInsideTheActivityCard(string language)
+    {
+        using var session = HeadlessUnitTestSession.StartNew(typeof(NoticeTestApplication));
+        await session.Dispatch<bool>(async () =>
+        {
+            var oldLanguage = LocalizationService.Current.LanguageCode;
+            LocalizationService.SetLanguage(language);
+            using var main = new MainWindowViewModel(new NoticeClient());
+            var snapshot = PublishedPairTestFixtures.DetailsGeneration(ApiState.Ready, 1_800_000_000, true, null, null, [], 0)
+                with
+            { AccountId = "account-1" };
+            var window = new MainWindow { DataContext = main };
+            try
+            {
+                window.Show();
+                Avalonia.Threading.Dispatcher.UIThread.RunJobs();
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                while (!main.HasDetails || main.IsStartupLoading)
+                    await Task.Delay(10, timeout.Token);
+                typeof(MainWindowViewModel).GetMethod("ApplyAccountsSnapshot", BindingFlags.Instance | BindingFlags.NonPublic)!
+                    .Invoke(main, [new ApiAccountsSnapshot(null, [new ApiAccount("account-1", false, null, null)])]);
+                main.SelectAccount("account-1");
+                typeof(MainWindowViewModel).GetMethod("ApplyDetailsGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!
+                    .Invoke(main, [snapshot]);
+                Avalonia.Threading.Dispatcher.UIThread.RunJobs();
+                window.Measure(new Size(900, 542));
+                window.Arrange(new Rect(0, 0, 900, 542));
+                var notice = Assert.Single(window.GetVisualDescendants().OfType<TextBlock>(),
+                    control => control.Text == LocalizationService.Current.HistoricalThreadsUnavailable);
+                Assert.True(notice.IsEffectivelyVisible);
+                var unbounded = new TextBlock
+                {
+                    Text = notice.Text,
+                    FontFamily = notice.FontFamily,
+                    FontSize = notice.FontSize,
+                    FontWeight = notice.FontWeight,
+                    FontStyle = notice.FontStyle,
+                    FontStretch = notice.FontStretch
+                };
+                unbounded.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                Assert.True(notice.Bounds.Width >= unbounded.DesiredSize.Width,
+                    $"Historical notice is clipped: available={notice.Bounds.Width}, text={unbounded.DesiredSize.Width}");
+            }
+            finally { window.Close(); LocalizationService.SetLanguage(oldLanguage); }
+            return true;
+        }, CancellationToken.None);
+    }
+
+    private sealed class NoticeClient : HealthyDetailsClientBase
+    {
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(DetailsFetchResult.Success(PublishedPairTestFixtures.DetailsGeneration(ApiState.Ready, 1_800_000_000, true, null, null, [], 0)));
+    }
+
+    public sealed class NoticeTestApplication
+    {
+        public static AppBuilder BuildAvaloniaApp() => AppBuilder.Configure<App>()
+            .UseSkia()
+            .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false });
+    }
+
     [Fact]
     public void MainHeaderUsesTheIssue349OrderWithoutAThreadsEntry()
     {

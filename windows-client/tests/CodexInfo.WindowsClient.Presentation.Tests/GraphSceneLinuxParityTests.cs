@@ -133,7 +133,9 @@ public sealed class GraphSceneLinuxParityTests
         foreach (var metric in new[] { GraphMetric.Tokens, GraphMetric.Dollars })
         {
             var scene = GraphScene.Create(samples, metric, 1_000, 2_680);
-            if (active != false)
+            // Both measured endpoints are authoritative. A missing-model span
+            // containing their positive token delta cannot establish inactivity.
+            if (active != false || resumed)
             {
                 Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
                 continue;

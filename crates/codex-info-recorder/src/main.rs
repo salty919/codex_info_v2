@@ -705,7 +705,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &partition.database_path,
                     &identity,
                     partition.login_id.as_deref(),
-                ) {
+                )
+                .and_then(|()| {
+                    // Inactive accounts have no later collection cycle. Apply
+                    // the same source-bound startup recovery before publishing
+                    // their retained history, using their registry ownership.
+                    Recorder::open_partitioned_for_account_with_lifecycle(
+                        RecorderConfig {
+                            sessions_root: options.sessions_root.clone(),
+                            chunk_bytes: options.chunk_bytes,
+                        },
+                        &partition.database_path,
+                        &identity,
+                        partition.activation_timestamp,
+                        None,
+                        partition
+                            .lifecycle_intervals
+                            .iter()
+                            .map(|interval| {
+                                SessionLifecycleInterval::new(interval.start_at, interval.end_at)
+                            })
+                            .collect(),
+                    )
+                    .map(drop)
+                }) {
                     eprintln!(
                         "codex-info-recorder degraded inactive account history synchronization failed: {error}"
                     );

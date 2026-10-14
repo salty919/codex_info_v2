@@ -11,6 +11,83 @@ struct Receipt {
     remaining_percent: f64,
 }
 
+/// Restore only historical origin authority. Current acquisition records and
+/// canonical minute/model values remain their separate, unchanged sources.
+pub(super) fn project_recovered_windows(
+    connection: &Connection,
+    intervals: &ReadIntervals,
+    details: &mut PublicDetails,
+    origins: &mut BTreeMap<i64, i64>,
+) -> Result<(), ReaderError> {
+    if !table_exists(connection, "session_quota_windows")?
+        || !table_exists(connection, "session_events")?
+    {
+        return Ok(());
+    }
+    let range_authority = if table_exists(connection, "session_ranges")? {
+        " OR EXISTS(SELECT 1 FROM session_ranges r WHERE r.root_identity=w.root_identity
+             AND r.relative_path=w.relative_path AND r.start_offset=w.range_start
+             AND r.end_offset=w.range_end AND r.record_sha256=w.record_sha256)"
+    } else {
+        ""
+    };
+    let mut statement = connection.prepare(&format!(
+        "SELECT w.reset_at,w.window_seconds,w.observed_at FROM session_quota_windows w
+         WHERE EXISTS(SELECT 1 FROM session_events e WHERE e.root_identity=w.root_identity
+             AND e.relative_path=w.relative_path AND e.range_start=w.range_start
+             AND e.range_end=w.range_end AND e.record_sha256=w.record_sha256
+             AND e.timestamp=w.observed_at){range_authority}",
+    ))?;
+    let mut windows = BTreeMap::<i64, BTreeSet<i64>>::new();
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (reset, seconds, observed_at) = row?;
+        let Some(start) = current_period_start_at(reset, seconds) else {
+            continue;
+        };
+        if !intervals.contains(observed_at)
+            || observed_at < start
+            || observed_at > reset
+            || details
+                .observed_at
+                .is_none_or(|cutoff| observed_at > cutoff)
+        {
+            continue;
+        }
+        windows.entry(reset).or_default().insert(start);
+    }
+    for period in &mut details.history_periods {
+        if origins.contains_key(&period.reset_at) {
+            continue;
+        }
+        let Some(starts) = windows
+            .get(&period.reset_at)
+            .filter(|values| values.len() == 1)
+        else {
+            continue;
+        };
+        let start = *starts.first().expect("one verified window");
+        // A canonical bucket may begin before the exact second of its
+        // official origin. Earlier complete minutes are a conflicting source.
+        if period.start_at.div_euclid(60) < start.div_euclid(60) || start > period.end_at {
+            continue;
+        }
+        period.start_at = start;
+        origins.insert(period.reset_at, start);
+    }
+    clip_history_periods(&mut details.history_periods, intervals);
+    assign_history_period_labels(
+        &mut details.history_periods,
+        details.quota.as_ref().map(|quota| quota.reset_at),
+    );
+    Ok(())
+}
+
 pub(super) fn project(
     connection: &Connection,
     intervals: &ReadIntervals,
@@ -18,9 +95,9 @@ pub(super) fn project(
     history_v2: &mut Vec<PublicHistoryObservation>,
     history_v3: &mut Vec<PublicHistoryObservationV3>,
     history_window: HistoryWindow,
-) -> Result<(), ReaderError> {
+) -> Result<BTreeMap<i64, i64>, ReaderError> {
     let Some(current) = details.quota.as_ref() else {
-        return Ok(());
+        return Ok(BTreeMap::new());
     };
     let observed_at = details.observed_at.unwrap_or(0);
     let mut statement = connection.prepare(
@@ -169,5 +246,22 @@ pub(super) fn project(
             .then_with(|| right.reset_at.cmp(&left.reset_at))
             .then_with(|| right.id.cmp(&left.id))
     });
-    Ok(())
+    // Keep authority separate from the observed/public bounds. A legacy
+    // first-owned sample is never evidence of a reset origin.
+    let mut origins = periods_by_receipt
+        .iter()
+        .filter_map(|(reset, (_, window))| {
+            current_period_start_at(*reset, *window).map(|start| (*reset, start))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if let Some(start) = current_period_start_at(current.reset_at, current.window_seconds) {
+        origins.insert(current.reset_at, start);
+    }
+    origins.retain(|reset, start| {
+        details
+            .history_periods
+            .iter()
+            .any(|period| period.reset_at == *reset && *start <= period.start_at)
+    });
+    Ok(origins)
 }

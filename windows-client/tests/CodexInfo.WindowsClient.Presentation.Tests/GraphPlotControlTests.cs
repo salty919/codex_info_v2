@@ -1142,6 +1142,47 @@ public sealed class GraphPlotControlTests
         Assert.Equal(81.45833333333333d, second[0], 12);
     }
 
+    [Theory]
+    [InlineData(GraphMetric.Tokens)]
+    [InlineData(GraphMetric.Dollars)]
+    public void Recorded_model_plateau_does_not_spread_later_usage_into_the_unchanged_interval(GraphMetric metric)
+    {
+        // The actual current period contains thirteen hours of recovered,
+        // unchanged cumulative tokens while quota observations are absent.
+        // A later increase belongs after the last unchanged observation.
+        var samples = new[]
+        {
+            Point(0, 100, 10, 0, 0),
+            Point(60, 97, 20, 1, 0),
+            Point(120, null, 20, 2, 0),
+            Point(48_060, null, 20, 3, 0),
+            Point(48_120, 97, 20, 4, 0),
+            Point(48_180, 96, 50, 5, 0),
+        };
+        samples = samples.Select(sample => sample with
+        {
+            ModelSource = ApiHistorySample.LegacyUnknownModelSource,
+            ModelsComplete = false,
+            TaskActiveSincePrevious = true,
+            ModelSamples =
+            [
+                new ApiHistoryModelSample("gpt-6.1-sol", null, null, null, sample.SolDollars) { TotalTokens = sample.SolTokens },
+                new ApiHistoryModelSample("gpt-6-luna", null, null, null, sample.TerraDollars) { TotalTokens = sample.TerraTokens },
+                new ApiHistoryModelSample("TERRA", null, null, null, 0) { TotalTokens = 0 },
+            ],
+        }).ToArray();
+        var scene = GraphScene.Create(samples, metric, 0, 48_180);
+        var model = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
+        var plateau = new[] { model.Idle.Line, model.Flat.Line, model.Rising.Line }
+            .SelectMany(line => line.X.Zip(line.Y))
+            .Where(point => double.IsFinite(point.First) && point.First >= 60 && point.First <= 48_120)
+            .ToArray();
+
+        Assert.NotEmpty(plateau);
+        Assert.All(plateau, point => Assert.Equal(20d, point.Second, precision: 6));
+        Assert.Equal(new[] { 10d, 20d, 20d, 20d, 20d, 50d }, scene.Sol);
+    }
+
     [Fact]
     public void Continuous_measured_run_uses_one_joined_canonical_path()
     {
@@ -1709,7 +1750,7 @@ public sealed class GraphPlotControlTests
 
         Assert.True(periodsResult.IsSuccess);
         Assert.True(pageResult.IsSuccess);
-        Assert.Equal(2, handler.RequestCount);
+        Assert.Equal(3, handler.RequestCount);
         var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
         var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
         Assert.Equal(pair, periods.PublishedPair.ToString());
@@ -1907,7 +1948,7 @@ public sealed class GraphPlotControlTests
         var pageResult = await client.FetchHistoryPageAsync(periodId, cancellationToken: CancellationToken.None);
         Assert.True(periodsResult.IsSuccess);
         Assert.True(pageResult.IsSuccess);
-        Assert.Equal(2, handler.RequestCount);
+        Assert.Equal(3, handler.RequestCount);
         var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
         var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
         Assert.Equal(periods.PublishedPair, page.PublishedPair);
@@ -2105,7 +2146,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void TokenFlatQuotaDropIsIdleWithoutFlatteningRemaining()
+    public void TokenFlatQuotaDropKeepsModelIdleWithoutAnUnusedBand()
     {
         using var document = LoadGraphEvidenceOracle();
         var fixture = document.RootElement.GetProperty("issue137_token_flat_quota_drop_v1");
@@ -2394,7 +2435,7 @@ public sealed class GraphPlotControlTests
 
         Assert.True(periodsResult.IsSuccess);
         Assert.True(pageResult.IsSuccess);
-        Assert.Equal(2, handler.RequestCount);
+        Assert.Equal(3, handler.RequestCount);
         var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
         var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
         Assert.Equal(pair, periods.PublishedPair.ToString());
@@ -3866,7 +3907,8 @@ public sealed class GraphPlotControlTests
                 ownership,
                 resetAt,
                 isVerifiedCurrentResetStart: false,
-                publishedPeriodStartAt: publishedStart);
+                publishedPeriodStartAt: publishedStart,
+                verifiedPeriodOriginAt: publishedStart);
 
         var scene = CreateScene(periodStart);
         var viewport = GraphScene.CreateViewport(viewportStart, viewportEnd, metric, [scene]);
@@ -3960,6 +4002,58 @@ public sealed class GraphPlotControlTests
         Assert.Equal(noAuthorityModel.Y, acceptedModel.Y);
     }
 
+    [Theory]
+    [InlineData(GraphMetric.Dollars)]
+    [InlineData(GraphMetric.Tokens)]
+    public void Observed_period_start_is_not_an_authority_for_zero_or_full_quota(GraphMetric metric)
+    {
+        var samples = new[] { CompleteModelSample(1_260, 89, 1, 10), CompleteModelSample(1_320, 88, 2, 20) };
+        var scene = GraphScene.Create(samples, metric, 1_200, 1_320,
+            confirmedGaps: null, hiddenModelNames: null, accountOwnershipIntervals: null,
+            resetAt: 2_000, publishedPeriodStartAt: 1_200);
+        var model = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol).Rising.Line;
+        Assert.DoesNotContain(1_200d, model.X);
+        var remaining = GraphPlotProjection.BuildCanonicalRemainingLines(scene, GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.DoesNotContain(1_200d, remaining.Solid.Line.X);
+        Assert.Equal(89d, scene.ObservedRemainingValues[0]);
+    }
+
+    [Theory]
+    [InlineData(GraphMetric.Dollars, false)]
+    [InlineData(GraphMetric.Tokens, false)]
+    [InlineData(GraphMetric.Dollars, true)]
+    [InlineData(GraphMetric.Tokens, true)]
+    public void Published_historical_model_origin_is_zero_without_fabricating_observations(GraphMetric metric, bool legacy)
+    {
+        const long start = 1_200;
+        const long first = 1_260;
+        var samples = new[]
+        {
+            CompleteModelSample(first, 95, 1, 10, legacy ? ApiHistorySample.LegacyUnknownModelSource : ApiHistorySample.ConfirmedModelSource) with { ModelsComplete = !legacy },
+            CompleteModelSample(first + 60, 94, 2, 20, legacy ? ApiHistorySample.LegacyUnknownModelSource : ApiHistorySample.ConfirmedModelSource) with { ModelsComplete = !legacy },
+        };
+        GraphScene Create(long? publishedStart, bool blocked = false) => GraphScene.Create(
+            samples, metric, start, first + 60,
+            confirmedGaps: blocked ? [new GraphConfirmedGap(start + 1, first - 1)] : null,
+            hiddenModelNames: null, accountOwnershipIntervals: null,
+            resetAt: 2_000, publishedPeriodStartAt: publishedStart,
+            verifiedPeriodOriginAt: publishedStart);
+        var scene = Create(start);
+        var line = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol).Rising.Line;
+        var origin = Array.IndexOf(line.X.ToArray(), (double)start);
+        Assert.True(origin >= 0);
+        Assert.Equal(0d, line.Y[origin]);
+        Assert.Equal([first, first + 60], scene.Timestamps.Select(value => (long)value));
+        Assert.Equal(metric == GraphMetric.Tokens ? 10d : 1d, scene.Sol[0]);
+        Assert.Equal([first, first + 60], scene.HoverObservations.Select(value => value.Timestamp));
+        Assert.DoesNotContain(0d, scene.Sol);
+        foreach (var blocked in new[] { Create(null), Create(start, blocked: true) })
+        {
+            var blockedLine = GraphPlotProjection.BuildCanonicalModelLines(blocked, blocked.Sol).Rising.Line;
+            Assert.DoesNotContain((double)start, blockedLine.X);
+        }
+    }
+
     [Fact]
     public void Verified_current_reset_baselines_do_not_cross_a_confirmed_leading_gap()
     {
@@ -3999,6 +4093,84 @@ public sealed class GraphPlotControlTests
         Assert.DoesNotContain((double)periodStart, remaining.Dashed.Line.X);
         Assert.DoesNotContain(100d, scene.ObservedRemainingValues);
         Assert.DoesNotContain(0d, scene.Sol);
+    }
+
+    [Theory]
+    [InlineData(GraphMetric.Tokens, true, 21, false)]
+    [InlineData(GraphMetric.Dollars, true, 21, false)]
+    [InlineData(GraphMetric.Tokens, true, 81, true)]
+    [InlineData(GraphMetric.Dollars, true, 81, true)]
+    [InlineData(GraphMetric.Tokens, false, 21, false)]
+    [InlineData(GraphMetric.Dollars, false, 21, false)]
+    [InlineData(GraphMetric.Tokens, false, 81, true)]
+    [InlineData(GraphMetric.Dollars, false, 81, true)]
+    public void Current_minute_remainder_does_not_predict_but_missing_minutes_remain_visible(
+        GraphMetric metric, bool current, int endOffset, bool expectMissing)
+    {
+        const long start = 1_140;
+        const long last = 1_260;
+        var period = new ApiHistoryPeriod("2000", start, last + endOffset, current, "period")
+        {
+            ResetAt = 2_000,
+            Samples = [CompleteModelSample(1_200, 95, 1, 10), CompleteModelSample(last, 94, 2, 20)],
+        };
+        var scene = GraphScene.Create(
+            GraphWindowViewModel.BuildGraphSamples(period, period.EndAt), metric, start, period.EndAt,
+            confirmedGaps: null, hiddenModelNames: null, accountOwnershipIntervals: null,
+            resetAt: period.ResetAt, isVerifiedCurrentResetStart: current,
+            publishedPeriodStartAt: start);
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Equal(expectMissing, model.Dashed.X.Count > 0);
+        Assert.Equal(expectMissing, remaining.Dashed.X.Count > 0);
+        Assert.Equal(period.EndAt, scene.PeriodEndAt);
+        Assert.Equal([1_200L, last], scene.HoverObservations.Select(value => value.Timestamp));
+        Assert.Equal([95d, 94d], scene.ObservedRemainingValues.Where(double.IsFinite));
+        if (!expectMissing)
+        {
+            Assert.Equal((double)last, model.Rising.X.Where(double.IsFinite).Max());
+            Assert.Equal((double)last, remaining.Solid.X.Where(double.IsFinite).Max());
+        }
+    }
+
+    [Theory]
+    [InlineData(GraphMetric.Tokens, true, 1, false, false)]
+    [InlineData(GraphMetric.Dollars, true, 1, false, false)]
+    [InlineData(GraphMetric.Tokens, false, 1, false, true)]
+    [InlineData(GraphMetric.Tokens, true, 2, false, true)]
+    [InlineData(GraphMetric.Tokens, true, 1, true, true)]
+    public void Pending_current_minute_does_not_infer_a_backend_gap(
+        GraphMetric metric, bool current, int elapsedMinutes, bool confirmedGap, bool expectMissing)
+    {
+        const long last = 1_260;
+        var pending = last + elapsedMinutes * 60;
+        var period = new ApiHistoryPeriod("2000", 1_140, pending + 43, current, "period")
+        {
+            ResetAt = 2_000,
+            Samples =
+            [
+                CompleteModelSample(1_200, 95, 1, 10),
+                CompleteModelSample(last, 94, 2, 20),
+                new ApiHistorySample(pending, 2_000, 94, null, null, null, null, null, null,
+                    ApiHistorySample.UnavailableModelSource),
+            ],
+        };
+        GraphConfirmedGap[] gaps = confirmedGap ? [new(last, pending)] : [];
+        var build = typeof(GraphWindowViewModel).GetMethod("BuildProjection", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var projection = build.Invoke(null, [period, metric, gaps, new HashSet<string>(), null, true])!;
+        var scene = (GraphScene)projection.GetType().GetProperty("Scene")!.GetValue(projection)!;
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        Assert.Equal(expectMissing, model.Dashed.X.Count > 0);
+        Assert.Equal(period.EndAt, scene.PeriodEndAt);
+        Assert.Equal(20UL, period.Samples[1].Models.Single(model => model.Name == "SOL").TotalTokens);
+        Assert.Null(period.Samples[^1].SolTokens);
+        if (!expectMissing)
+        {
+            Assert.Equal((double)last, model.Rising.X.Where(double.IsFinite).Max());
+            var viewport = GraphScene.CreateViewport(period.StartAt, period.EndAt, metric, [scene]);
+            Assert.Empty(GraphPlotProjection.BuildCanonicalModelLines(viewport.PeriodScenes[0], scene.Sol).Dashed.Line.X);
+            Assert.Empty(scene.IdleIntervals);
+        }
     }
 
     [Fact]
@@ -4242,6 +4414,87 @@ public sealed class GraphPlotControlTests
 
         Assert.Equal([new GraphIdleInterval(1_000, 2_800, false)], unknownScene.IdleIntervals);
         Assert.Equal([new GraphIdleInterval(1_000, 2_800, false)], activeScene.IdleIntervals);
+    }
+
+    [Theory]
+    [InlineData(GraphMetric.Tokens)]
+    [InlineData(GraphMetric.Dollars)]
+    public void Global_unused_band_cannot_cover_recorded_quota_consumption(GraphMetric metric)
+    {
+        var samples = Enumerable.Range(0, 11)
+            .Select(minute => CompleteModelSample(1_000 + minute * 60, 90 - minute, 1, 100))
+            .ToArray();
+        var scene = GraphScene.Create(samples, metric, 1_000, 1_600);
+
+        Assert.Empty(scene.IdleIntervals);
+        Assert.Equal([90d, 89d, 88d, 87d, 86d, 85d, 84d, 83d, 82d, 81d, 80d], scene.Remaining);
+        // The unchanged model still has its own flat idle line; account quota
+        // consumption is not evidence that this particular model advanced.
+        Assert.NotEmpty(GraphPlotProjection.BuildModelLines(scene, scene.Sol).Idle.X);
+    }
+
+    [Theory]
+    [InlineData(GraphMetric.Tokens)]
+    [InlineData(GraphMetric.Dollars)]
+    public void Task_stopped_band_cannot_cover_recorded_token_increases(GraphMetric metric)
+    {
+        var samples = Enumerable.Range(0, 11)
+            .Select(minute => CompleteModelSample(1_000 + minute * 60, 90, 1 + minute,
+                (ulong)(100 + minute), taskActiveSincePrevious: false))
+            .ToArray();
+        var scene = GraphScene.Create(samples, metric, 1_000, 1_600);
+
+        Assert.Empty(scene.TaskIdleIntervals);
+        Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+        Assert.Equal(metric == GraphMetric.Tokens ? 110d : 11d, scene.Sol[^1]);
+        Assert.Equal(110UL, samples[^1].ModelSamples![0].TotalTokens);
+    }
+
+    [Theory]
+    [InlineData(false, 110UL)]
+    [InlineData(false, 90UL)]
+    [InlineData(true, 100UL)]
+    public void Task_stopped_bands_exclude_changes_across_missing_observations(bool quotaChanges, ulong afterTokens)
+    {
+        var samples = Enumerable.Range(0, 31).Select(minute =>
+        {
+            var missing = minute is > 10 and < 20;
+            var sample = CompleteModelSample(1_000 + minute * 60,
+                quotaChanges && minute >= 20 ? 80 : 90, 1,
+                minute >= 20 ? afterTokens : 100, taskActiveSincePrevious: false);
+            return !missing ? sample : quotaChanges ? sample with { RemainingPercent = null } : sample with
+            {
+                ModelSamples = null,
+                ModelSource = ApiHistorySample.UnavailableModelSource,
+                ModelsComplete = false,
+            };
+        }).ToArray();
+        var scene = GraphScene.Create(samples, GraphMetric.Tokens, 1_000, 2_800);
+
+        Assert.Equal([new GraphIdleInterval(1_000, 1_600, false), new GraphIdleInterval(2_200, 2_800, false)],
+            scene.TaskIdleIntervals);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Unused_bands_do_not_cross_ownership_or_confirmed_gap_boundaries(bool confirmedGap)
+    {
+        var samples = Enumerable.Range(0, 21)
+            .Select(minute => CompleteModelSample(1_000 + minute * 60, 90, 1, 100,
+                taskActiveSincePrevious: false))
+            .ToArray();
+        var scene = GraphScene.Create(samples, GraphMetric.Tokens, 1_000, 2_200,
+            confirmedGap ? [new GraphConfirmedGap(1_500, 1_700)] : [], null,
+            confirmedGap ? null : [new GraphAccountOwnershipInterval(null, 1_500),
+                new GraphAccountOwnershipInterval(1_700, null)]);
+
+        Assert.DoesNotContain(GraphPlotProjection.BuildVisibleUnusedIntervals(scene),
+            interval => interval.StartAt < 1_700 && interval.EndAt > 1_500);
+        Assert.Equal(100d, scene.Sol[0]);
+        Assert.Equal(100d, scene.Sol[^1]);
+        Assert.Equal(90d, scene.Remaining[0]);
+        Assert.Equal(90d, scene.Remaining[^1]);
     }
 
     [Fact]
@@ -4695,9 +4948,11 @@ public sealed class GraphPlotControlTests
             Assert.DoesNotContain(segment, SegmentPairs(luna.Idle, luna.Flat, luna.Rising));
             Assert.DoesNotContain(segment, SegmentPairs(remaining.Idle, remaining.Solid));
         });
-        // The earlier exact-equal run remains unused; the later positive
-        // LUNA delta must not extend that evidence through the sparse gap.
-        Assert.Equal([new GraphIdleInterval(beforeRateEnd, gapStart, false)], scene.IdleIntervals);
+        // Equal local model totals cannot prove global inactivity: this
+        // interval has an independently recorded quota decline, 76 -> 75.
+        Assert.Equal(76d, points[1].RemainingPercent);
+        Assert.Equal(75d, points[2].RemainingPercent);
+        Assert.Empty(scene.IdleIntervals);
 
         var shortScene = GraphScene.Create(
             [
@@ -5392,6 +5647,8 @@ public sealed class GraphPlotControlTests
             RequestCount++;
             Assert.Equal(HttpMethod.Get, request.Method);
             var path = request.RequestUri?.AbsolutePath;
+            if (path == "/v4/history/periods")
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
             var body = path switch
             {
                 "/v3/history/periods" => periodsBody,

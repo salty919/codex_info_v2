@@ -852,6 +852,8 @@ enum Route {
     CurrentV4,
     HistoryPeriodsV3,
     SelectableHistoryPeriodsV3,
+    HistoryPeriodsV4,
+    SelectableHistoryPeriodsV4,
     HistoryV3,
     ThreadsV3,
 }
@@ -869,6 +871,8 @@ impl Route {
             Self::CurrentV4 => "/v4/current",
             Self::HistoryPeriodsV3 => "/v3/history/periods",
             Self::SelectableHistoryPeriodsV3 => "/v3/history/periods/selectable",
+            Self::HistoryPeriodsV4 => "/v4/history/periods",
+            Self::SelectableHistoryPeriodsV4 => "/v4/history/periods/selectable",
             Self::HistoryV3 => "/v3/history",
             Self::ThreadsV3 => "/v3/threads",
         }
@@ -882,6 +886,8 @@ impl Route {
                 | Self::CurrentV4
                 | Self::HistoryPeriodsV3
                 | Self::SelectableHistoryPeriodsV3
+                | Self::HistoryPeriodsV4
+                | Self::SelectableHistoryPeriodsV4
                 | Self::HistoryV3
                 | Self::ThreadsV3
         )
@@ -1373,6 +1379,8 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
         "/v4/current" => Some(Route::CurrentV4),
         "/v3/history/periods" => Some(Route::HistoryPeriodsV3),
         "/v3/history/periods/selectable" => Some(Route::SelectableHistoryPeriodsV3),
+        "/v4/history/periods" => Some(Route::HistoryPeriodsV4),
+        "/v4/history/periods/selectable" => Some(Route::SelectableHistoryPeriodsV4),
         "/v3/history" => Some(Route::HistoryV3),
         "/v3/threads" => Some(Route::ThreadsV3),
         _ => None,
@@ -1456,7 +1464,11 @@ fn serialize_route(
     if !snapshot.history_available
         && matches!(
             route,
-            Route::HistoryPeriodsV3 | Route::SelectableHistoryPeriodsV3 | Route::HistoryV3
+            Route::HistoryPeriodsV3
+                | Route::SelectableHistoryPeriodsV3
+                | Route::HistoryV3
+                | Route::HistoryPeriodsV4
+                | Route::SelectableHistoryPeriodsV4
         )
     {
         return Err(RouteError::HistoryUnavailable);
@@ -1502,6 +1514,27 @@ fn serialize_route(
                 current["models_status"] = json!(snapshot.current.models_status);
             }
             serialize_json(&current)
+        }
+        Route::HistoryPeriodsV4 | Route::SelectableHistoryPeriodsV4 => {
+            let old = if route == Route::HistoryPeriodsV4 {
+                Route::HistoryPeriodsV3
+            } else {
+                Route::SelectableHistoryPeriodsV3
+            };
+            let mut document: Value =
+                serde_json::from_slice(&serialize_route(snapshot, old, None, None, degraded)?)
+                    .map_err(|_| RouteError::Serialization)?;
+            document["api_version"] = json!("v4");
+            for period in document["history_periods"]
+                .as_array_mut()
+                .expect("period directory array")
+            {
+                let origin = period["reset_at"]
+                    .as_i64()
+                    .and_then(|reset| snapshot.retained_history.origins.get(&reset));
+                period["origin_at"] = json!(origin);
+            }
+            serialize_json(&document)
         }
         Route::HistoryPeriodsV3 => {
             // Keep the exact archive and direct history lookup intact. Only
@@ -2097,6 +2130,7 @@ mod tests {
                     periods: details.history_periods.clone(),
                     gaps: details.history_gaps.clone(),
                     samples: samples.clone(),
+                    origins: BTreeMap::new(),
                 },
                 details,
                 models_v3: Vec::new(),
@@ -2193,6 +2227,7 @@ mod tests {
             periods: candidate.details.history_periods.clone(),
             gaps: candidate.details.history_gaps.clone(),
             samples: candidate.history_samples_v3.clone(),
+            origins: BTreeMap::new(),
         };
         PublishedSnapshot::from_db_for_account(candidate, storage_epoch)
     }
@@ -2390,6 +2425,7 @@ mod tests {
                     periods: details.history_periods.clone(),
                     gaps: details.history_gaps.clone(),
                     samples: history_samples.clone(),
+                    origins: BTreeMap::new(),
                 },
                 details,
                 models_v3: Vec::new(),
@@ -3315,6 +3351,62 @@ mod tests {
         );
         let periods: Value = serde_json::from_str(body(&response)).unwrap();
         assert_eq!(periods["history_periods"][0]["start_at"], 1_800_000_041_i64);
+        server.shutdown();
+    }
+
+    #[test]
+    fn history_origin_v4_keeps_v3_compatible_and_unknown_origins_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("origins.sqlite3");
+        fixture(&path, 10);
+        Connection::open(&path).unwrap().execute_batch(
+            "INSERT INTO usage_history VALUES(1799900000,1799900060,89,1,2,3,10,20,30);
+             CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,sequence INTEGER,observed_at INTEGER,reset_at INTEGER,window_seconds INTEGER,remaining_percent REAL,applied_generation TEXT);
+             INSERT INTO quota_receipts VALUES('receipt',1,1800000000,1800000060,3600,50,'1');"
+        ).unwrap();
+        let mut server = RestServer::start(
+            DbReader::open(&path).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        for suffix in ["", "/selectable"] {
+            let old = request(
+                server.local_addr(),
+                &format!("GET /v3/history/periods{suffix} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(old.starts_with("HTTP/1.1 200"), "{old}");
+            let old: Value = serde_json::from_str(body(&old)).unwrap();
+            assert!(old["history_periods"].as_array().unwrap().iter().all(|p| p
+                .as_object()
+                .unwrap()
+                .len()
+                == 6));
+            let new = request(
+                server.local_addr(),
+                &format!("GET /v4/history/periods{suffix} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(new.starts_with("HTTP/1.1 200"), "{new}");
+            let new: Value = serde_json::from_str(body(&new)).unwrap();
+            assert_eq!(new["api_version"], "v4");
+            let periods = new["history_periods"].as_array().unwrap();
+            assert_eq!(periods.len(), 2);
+            assert_eq!(
+                periods
+                    .iter()
+                    .find(|p| p["reset_at"] == 1800000060_i64)
+                    .unwrap()["origin_at"],
+                1799996460_i64
+            );
+            let unknown = periods
+                .iter()
+                .find(|p| p["reset_at"] == 1799900060_i64)
+                .unwrap();
+            assert!(unknown.as_object().unwrap().contains_key("origin_at"));
+            assert!(
+                unknown["origin_at"].is_null(),
+                "first recorded sample is not reset authority"
+            );
+        }
         server.shutdown();
     }
 

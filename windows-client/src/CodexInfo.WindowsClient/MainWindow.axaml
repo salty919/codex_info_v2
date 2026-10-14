@@ -273,7 +273,7 @@
          classification counts, and the one Details entry point. -->
     <Border Grid.Row="3" Classes="section" Padding="12,5" IsVisible="{Binding ShowAuthenticatedContent}">
       <Grid ColumnDefinitions="240,*,68" ColumnSpacing="8">
-        <StackPanel Spacing="1" VerticalAlignment="Center">
+        <StackPanel Grid.ColumnSpan="3" Spacing="1" VerticalAlignment="Center">
           <TextBlock Classes="metric-label" Text="{Binding Texts.RunningThreads}" />
           <TextBlock FontSize="22"
                      FontWeight="SemiBold"

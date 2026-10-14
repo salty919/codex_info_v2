@@ -8,7 +8,10 @@ namespace CodexInfo.WindowsClient.Graphing;
 
 public sealed record GraphCalendarDay(
     string DayText, string ValueText, string StatusText, string AccessibleText,
-    bool IsInMonth, bool IsToday, bool IsFuture);
+    bool IsInMonth, bool IsToday, bool IsFuture)
+{
+    public bool IsQuiet { get; init; }
+}
 
 /// <summary>Calendar layout over the existing recorded daily attribution.</summary>
 internal static class GraphCalendarProjection
@@ -38,10 +41,11 @@ internal static class GraphCalendarProjection
             var value = "";
             string? exactTokens = null;
             var status = "";
+            rows.TryGetValue(date, out var day);
+            var contributions = day ?? [];
+            var hasRecordedUse = contributions.Any(item => item.Tokens > 0 || item.Dollars > 0);
             if (!future)
             {
-                rows.TryGetValue(date, out var day);
-                var contributions = day ?? [];
                 if (scene.Metric == GraphMetric.Tokens)
                 {
                     var known = contributions.Where(item => item.Tokens is not null).ToArray();
@@ -61,7 +65,10 @@ internal static class GraphCalendarProjection
                     contributions.Any(item => item.IsPartial) ? LocalizationService.Current.GraphRecordedPartial : "";
             }
             cells.Add(new(number.ToString(culture), value, status,
-                $"{date:yyyy/MM/dd} {exactTokens ?? value} {status}".Trim(), true, date == today, future));
+                $"{date:yyyy/MM/dd} {exactTokens ?? value} {status}".Trim(), true, date == today, future)
+            {
+                IsQuiet = !hasRecordedUse,
+            });
         }
         return cells;
     }

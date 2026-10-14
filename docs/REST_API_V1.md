@@ -194,6 +194,8 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、publis
 | `/v3/current` | `GET` | `200` | history/period/thread rowsを含まないcurrent projection、同じ必須published pair、DB write/transaction=0 |
 | `/v3/history/periods` | `GET` | `200` | period metadata projection、同じ必須published pair、DB write/transaction=0 |
 | `/v3/history/periods/selectable` | `GET` | `200` | 選択対象period metadata projection、同じ必須published pair、DB write/transaction=0 |
+| `/v4/history/periods` | `GET` | `200` | 公式起点metadata付きperiod directory、同じ必須published pair、DB write/transaction=0 |
+| `/v4/history/periods/selectable` | `GET` | `200` | 同じ公式起点metadata付き選択対象directory、DB write/transaction=0 |
 | `/v3/history?period=...&cursor=...` | `GET` | `200` | 同一pair・選択periodの有限page、DB write/transaction=0 |
 | `/v3/threads` | `GET` | `200` | thread projection、同じ必須published pair、DB write/transaction=0 |
 | v3 snapshot resource＋route/queryのcurrent pair | `GET` | `304` | body 0、同じpublished pair、route-local last-good維持、DB write/transaction=0 |
@@ -204,6 +206,10 @@ RESTのtransfer body上限は既存のOOM/DoS安全境界であるdetails `32 Mi
 SQLiteの保持期間は過去3暦月である。互換`/v1/details`、`/v2/details`、`/v3/details`は観測時刻で終わる直近31日のprojectionを維持し、history samples上限は`44,640`である。
 `/v3/history/periods`は同一accountの保持期間から、現期間または同じpublished snapshotの期間indexに観測点・欠測区間がある期間を公開する取得directoryであり、任意時間窓のquota/欠測区間取得に使用する。過去期間で両方が0件の場合だけ一覧から除外し、model欠測・不完全・利用量0・残量100%を除外根拠にしない。archiveとindexは全exact IDを保持するため、一覧にないIDも`/v3/history`で取得でき、未知IDへ変更しない。後から観測点・欠測区間が加われば次snapshotで再掲載する。互換detailsの期間投影は変更しない。`/v3/history`は指定したexact periodだけを最大1,024点のpageで返す。選択期間の全pageを合わせた上限は44,640点のままとし、保持期間全体をdetailsへ詰め込まない。readerは同じread-only transactionで全保持履歴と直近detailsを投影し、retained projectionとgapも同じpublished pair・cursor prefix identityへ含める。private retained indexの容量は3×44,640点とし、period最大128件、gap最大4,096件、threads最大256件は維持する。検証失敗は`history_unavailable`として公開し、空の成功履歴へ変換しない。DBの保持・prune・canonical ID・raw値は変更しない（#646）。v1/v2のmodels上限は固定3件、v3のtop-levelおよび各history rowのmodels上限はOOM/DoS境界として1,024件である。
 `/v3/history/periods/selectable`は同じv3 body形・account query・published pairで、現期間または範囲内の公開modelに正の`total_tokens`がある期間だけを返す。model集合の完全性やsourceがconfirmedかどうかで正の記録を落とさない。quotaのみ・gapのみ・tokenが0または未取得の過去期間は選択対象にしないが、元directory・全IDの直接page・原本は変更しない。掲載は未使用判定ではない。Linux/Windowsのreset期間選択はこのresourceを使い、Windowsの任意時間窓は従来directoryを使う。二resourceのcacheを混用せず、選択resourceのexact404だけ旧directoryへ互換fallbackする。旧serverでは新掲載条件の保証外とし、timeout・5xx・不正bodyを空の成功や互換fallbackにしない（#646）。
+
+`/v4/history/periods`と`/v4/history/periods/selectable`は、それぞれ対応するv3 directoryと同じ掲載条件・account query・published pairを持つ。top-levelは`api_version="v4"`と`history_periods`、各periodはv3の6項目に必須のnullable整数`origin_at`だけを加える。公式起点は同じread transactionのexact reset/window receipt・現在quota、または所有内の受理済みSession eventへ結び付いた検証済みの過去window証拠から得た`reset_at-window_seconds`とし、検証できない旧期間やwindowが競合する期間は`null`とする。過去window証拠は現在のquotaやmodelの期間所属を変更しない。最初の保存時刻やlegacy markerから推測しない。`origin_at <= start_at`を許し、表示開始より後、不正な時刻型・範囲、未定義fieldを拒否する。起点metadataも同じpublished pairの識別へ含める。v3の6項目body、history page、旧detailsには追加fieldを入れない。
+
+新clientはv4 directoryを先に取得し、そのresourceのexact404だけ対応するv3へfallbackする。503・timeout・不正bodyをfallbackや空の成功へ変換しない。異なるversion/選択種/accountのcacheを混用しない。v3の過去periodには公式起点の証拠がなく、現在periodの補完も同account・同published pairの現在quotaと公式windowが一致する場合だけとする。描画上の0/100%起点と未記録区間の扱いはPRODUCT ownerの`HISTORY-RECOVERY-614`に従う。
 
 ### 容量条件とfailure isolation
 
@@ -536,7 +542,7 @@ connectionをabortし、追加JSONやpartial-success markerを送らない。cli
 
 製品endpointはHTTP/1.1だけを受け、request targetはorigin-formのexact
 `/health`、`/v1/health`、`/v1/runtime`、`/v1/details`、`/v2/details`、`/v3/details`、`/v3/current`、
-`/v3/history/periods`、`/v3/history/periods/selectable`、`/v3/history?period=<opaque>&cursor=<opaque>`、`/v3/threads`である。
+`/v3/history/periods`、`/v3/history/periods/selectable`、`/v4/history/periods`、`/v4/history/periods/selectable`、`/v3/history?period=<opaque>&cursor=<opaque>`、`/v3/threads`である。
 historyのstrict queryを除きpercent decode、path normalization、query、fragment、absolute-form、authority-form、asterisk-formを許可しない。
 
 | resource | 採用上限・規則 |

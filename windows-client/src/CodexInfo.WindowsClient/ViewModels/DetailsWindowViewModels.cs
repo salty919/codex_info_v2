@@ -429,9 +429,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool HasPoints => scene.IsViewport ? scene.HasPoints : points.Count > 0;
 
-    public bool HasNoPoints => !IsLoading && !HasLoadError && !HasPoints;
+    public bool HasNoPoints => !IsMonthView && !IsLoading && !HasLoadError && !HasPoints;
 
     public bool HasBlockingLoadError => !IsLoading && HasLoadError && !HasPoints;
+
+    public bool HasRetainedLoadError => !IsLoading && HasLoadError && HasPoints;
 
     public bool HasPeriods => periods.Count > 0;
 
@@ -781,13 +783,52 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         ? Texts.GraphDollarDescription
         : Texts.GraphTokenDescription;
 
-    public string GraphGapHintText => Texts.LanguageCode switch
+    public string GraphGapHintText
     {
-        "ja" => "破線: 欠損・取得元不一致区間の参考補完（区間内は未確認）",
-        "zh-Hans" => "虚线：缺失或来源不一致区间的参考补全（区间内未确认）",
-        "ko" => "점선: 누락·출처 불일치 구간의 참고 보완(구간 내부 미확인)",
-        _ => "Dashed: reference completion across missing or source-mismatched intervals",
-    };
+        get
+        {
+            var first = Enumerable.Range(0, scene.Timestamps.Count)
+                .FirstOrDefault(index => scene.RemainingObserved[index] &&
+                    double.IsFinite(scene.ObservedRemainingValues[index]), -1);
+            var text = string.Empty;
+            if (first >= 0)
+            {
+                var time = FormatHistoryEvidenceTime((long)scene.Timestamps[first]);
+                var remaining = scene.ObservedRemainingValues[first].ToString("0.##", CultureInfo.CurrentCulture);
+                text = Texts.LanguageCode switch
+                {
+                    "ja" => $"表示範囲内の最初の記録: {time}・残り {remaining}%",
+                    "zh-Hans" => $"显示范围内首次记录：{time} · 剩余 {remaining}%",
+                    "ko" => $"표시 범위 내 첫 기록: {time} · 잔여 {remaining}%",
+                    _ => $"First recorded in this view: {time} · remaining {remaining}%",
+                };
+            }
+            if (scene.NonOwnedIntervals.Count > 0)
+            {
+                var interval = scene.NonOwnedIntervals.MaxBy(value => value.EndAt - value.StartAt);
+                var range = $"{FormatHistoryEvidenceTime(interval.StartAt)} – {FormatHistoryEvidenceTime(interval.EndAt)}";
+                text += Texts.LanguageCode switch
+                {
+                    "ja" => $"\n{range}: このアカウントを記録していない区間。区間内の利用量は不明です。",
+                    "zh-Hans" => $"\n{range}：未记录此账户，区间内的使用量未知。",
+                    "ko" => $"\n{range}: 이 계정이 기록되지 않은 구간입니다. 구간 내 사용량은 알 수 없습니다.",
+                    _ => $"\n{range}: not recorded for this account; usage within this interval is unknown.",
+                };
+            }
+            text += Texts.LanguageCode switch
+            {
+                "ja" => "\n破線: 未確認・欠測区間の参考表示。残量から利用者やモデル使用量は特定できません。",
+                "zh-Hans" => "\n虚线：未确认或缺失区间的参考显示。余额无法确定使用者或模型用量。",
+                "ko" => "\n점선: 미확인·누락 구간의 참고 표시. 잔여량으로 사용자나 모델 사용량을 알 수 없습니다.",
+                _ => "\nDashed: reference across unconfirmed or missing intervals. Remaining quota does not identify the user or model usage.",
+            };
+            return text.TrimStart('\n');
+        }
+    }
+
+    private static string FormatHistoryEvidenceTime(long timestamp) =>
+        TimeZoneInfo.ConvertTime(DateTimeOffset.FromUnixTimeSeconds(timestamp), LocalizationService.DisplayTimeZone)
+            .ToString("g", CultureInfo.CurrentCulture);
 
     public bool IsDollars => displayedMetric == GraphMetric.Dollars;
 
@@ -1101,6 +1142,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(CanGoForward));
         Notify(nameof(Points));
         Notify(nameof(Scene));
+        Notify(nameof(GraphGapHintText));
         Notify(nameof(CalendarDays));
         Notify(nameof(CalendarWeekdays));
         Notify(nameof(HasLinePlot));
@@ -2034,6 +2076,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         SetLoading(false);
         Notify(nameof(Points));
         Notify(nameof(Scene));
+        Notify(nameof(GraphGapHintText));
         Notify(nameof(CalendarDays));
         Notify(nameof(CalendarWeekdays));
         Notify(nameof(HasLinePlot));
@@ -3252,8 +3295,10 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             hiddenModelNames,
             accountOwnershipIntervals,
             period.ResetAt,
-            isVerifiedCurrentResetStart: period.Current,
-            publishedPeriodStartAt: period.StartAt);
+            isVerifiedCurrentResetStart: period.Current && period.OriginAt == period.StartAt,
+            publishedPeriodStartAt: period.StartAt,
+            verifiedPeriodOriginAt: period.OriginAt,
+            isCurrentPeriod: period.Current);
         GraphPlotProjection.PrepareGeometry(graphScene);
         return new GraphProjection(
             diagnosticSamples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
@@ -3290,6 +3335,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         SetLoading(false);
         Notify(nameof(Points));
         Notify(nameof(Scene));
+        Notify(nameof(GraphGapHintText));
         Notify(nameof(CalendarDays));
         Notify(nameof(CalendarWeekdays));
         Notify(nameof(HasLinePlot));
@@ -3410,6 +3456,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(IsLoading));
         Notify(nameof(HasNoPoints));
         Notify(nameof(HasBlockingLoadError));
+        Notify(nameof(HasRetainedLoadError));
     }
 
     private void SetLoadError(bool value)
@@ -3422,6 +3469,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(HasLoadError));
         Notify(nameof(HasNoPoints));
         Notify(nameof(HasBlockingLoadError));
+        Notify(nameof(HasRetainedLoadError));
     }
 
     private void Notify([CallerMemberName] string? propertyName = null)
@@ -3497,9 +3545,14 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool HasThreads => !main.IsSelectedAccountHistorical && threads.Count > 0;
 
-    public bool HasNoThreads => !HasThreads;
+    public bool HasNoThreads => !HasThreads &&
+        (main.IsSelectedAccountHistorical || main.HasDetails && !HasLoadError);
 
-    public bool HasLoadError => hasLoadError;
+    public bool HasLoadError => hasLoadError || main.DetailsStatusAutomationText == "error";
+
+    public bool HasPendingThreads => !HasThreads && !HasNoThreads && !HasLoadError;
+
+    public string LoadErrorText => $"{Texts.Threads}: {Texts.ApiError}";
 
     public string EmptyText => main.IsSelectedAccountHistorical
         ? Texts.HistoricalThreadsUnavailable
@@ -3567,6 +3620,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(SelectedAccountText));
             Notify(nameof(HasThreads));
             Notify(nameof(HasNoThreads));
+            Notify(nameof(HasPendingThreads));
             Notify(nameof(EmptyText));
             if (eventArgs.PropertyName == nameof(MainWindowViewModel.SelectedAccount))
             {
@@ -3581,6 +3635,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
                 Notify(nameof(TreeRootRows));
                 Notify(nameof(TreeSurfaceHeight));
                 Notify(nameof(HasLoadError));
+                Notify(nameof(HasPendingThreads));
                 if (resourceClient is null)
                 {
                     Rebuild();
@@ -3609,6 +3664,10 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             }
             Notify(nameof(DetailsStatusText));
             Notify(nameof(Texts));
+            Notify(nameof(HasLoadError));
+            Notify(nameof(HasNoThreads));
+            Notify(nameof(HasPendingThreads));
+            Notify(nameof(LoadErrorText));
         }
     }
 
@@ -3643,6 +3702,12 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             // Inactive accounts expose only a point-in-time current snapshot;
             // thread rows are intentionally not presented as live activity.
+            return;
+        }
+        if (mainGeneration is null || main.AcceptedWireOpenSessionThreadCount == 0)
+        {
+            // Main owns the accepted current/threads bundle, including an
+            // explicit zero count. Pending current is never an empty result.
             return;
         }
         if (accountResourceClient is not null && accountId is null)
@@ -3692,6 +3757,8 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 hasLoadError = true;
                 Notify(nameof(HasLoadError));
+                Notify(nameof(HasNoThreads));
+                Notify(nameof(HasPendingThreads));
                 return;
             }
 
@@ -3699,6 +3766,8 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 hasLoadError = true;
                 Notify(nameof(HasLoadError));
+                Notify(nameof(HasNoThreads));
+                Notify(nameof(HasPendingThreads));
                 return;
             }
 
@@ -3768,6 +3837,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
         Notify(nameof(HasThreads));
         Notify(nameof(HasNoThreads));
+        Notify(nameof(HasPendingThreads));
         Notify(nameof(TreeConnections));
         Notify(nameof(TreeRootRows));
         Notify(nameof(TreeSurfaceHeight));

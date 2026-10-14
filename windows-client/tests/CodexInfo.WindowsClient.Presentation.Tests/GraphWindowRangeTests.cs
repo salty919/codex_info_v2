@@ -855,7 +855,12 @@ public sealed class GraphWindowRangeTests
             GraphDailyUsageProjectionTests.Sample(start + 60, reset,
                 GraphDailyUsageProjectionTests.Model("gpt-6-sol", 1_000_000, 2.5),
                 GraphDailyUsageProjectionTests.Model("gpt-6-astra", 2_000_000, 5)));
-        using var main = await StartMainAsync([period]);
+        var oldestStart = start - 61 * DaySeconds;
+        var oldestReset = oldestStart + WeekSeconds;
+        var oldest = GraphDailyUsageProjectionTests.Period("oldest", oldestStart, oldestReset,
+            GraphDailyUsageProjectionTests.Sample(oldestStart + 60, oldestReset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", 100, 1)));
+        using var main = await StartMainAsync([period, oldest]);
         using var graph = CreateGraph(main, () => start + DaySeconds);
         graph.ShowSol = false;
         graph.SelectedTimeRange = GraphTimeRange.CalendarMonth;
@@ -868,6 +873,12 @@ public sealed class GraphWindowRangeTests
         Assert.Equal("2026/10", graph.RangeLabel);
         Assert.Contains(graph.CalendarDays, day => day.ValueText == "$7.50");
         Assert.False(graph.ShowSol);
+        graph.GoBack();
+        await EventuallyAsync(() => graph.RangeLabel == "2026/09" && !graph.IsLoading);
+        Assert.All(graph.CalendarDays.Where(day => day.IsInMonth && !day.IsFuture),
+            day => Assert.Equal("—", day.ValueText));
+        Assert.False(graph.HasNoPoints,
+            "A loaded calendar explains missing days in its cells, not as unavailable details over the calendar.");
         graph.SelectedTimeRange = GraphTimeRange.ResetPeriod;
         await EventuallyAsync(() => graph.IsPeriodView && graph.HasLinePlot);
         Assert.False(graph.ShowSol);

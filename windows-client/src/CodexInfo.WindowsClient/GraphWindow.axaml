@@ -29,6 +29,13 @@
       <Setter Property="BorderThickness" Value="1" />
       <Setter Property="CornerRadius" Value="6" />
     </Style>
+    <Style Selector="Border.calendar-day.quiet">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="{DynamicResource Theme2D3D56}" />
+    </Style>
+    <Style Selector="Border.calendar-day.quiet TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource Theme78879C}" />
+    </Style>
     <Style Selector="Border.calendar-day.today">
       <Setter Property="BorderBrush" Value="{DynamicResource ThemeE6B85C}" />
       <Setter Property="BorderThickness" Value="2" />
@@ -245,7 +252,8 @@
       <Grid Grid.Row="3" x:Name="GraphFrame">
         <Border Background="{DynamicResource Theme121C2C}" BorderBrush="Transparent" BorderThickness="1" CornerRadius="10" ClipToBounds="True">
           <Grid RowDefinitions="Auto,*">
-            <TextBlock Grid.Row="0" Classes="label" Margin="12,8,12,6" MaxWidth="560"
+            <StackPanel Grid.Row="0">
+            <TextBlock Classes="label" Margin="12,8,12,6" MaxWidth="560"
                        HorizontalAlignment="Left" VerticalAlignment="Center"
                        TextWrapping="Wrap" FontWeight="SemiBold"
                        Foreground="{DynamicResource ThemeF0A35B}"
@@ -254,6 +262,17 @@
                        IsHitTestVisible="False"
                        AutomationProperties.Name="{Binding DetailsStatusText}"
                        AutomationProperties.AutomationId="Graph.CurrentDataWarning" />
+            <TextBlock Classes="label" Margin="12,6,12,6" TextWrapping="Wrap"
+                       Foreground="{DynamicResource ThemeF0A35B}"
+                       Text="{Binding LoadErrorText}" IsVisible="{Binding HasRetainedLoadError}"
+                       IsHitTestVisible="False"
+                       AutomationProperties.Name="{Binding LoadErrorText}"
+                       AutomationProperties.AutomationId="Graph.HistoryLoadError" />
+            <TextBlock Classes="label" Margin="12,6,12,6" TextWrapping="Wrap"
+                       Text="{Binding GraphGapHintText}" IsVisible="{Binding HasLinePlot}"
+                       AutomationProperties.Name="{Binding GraphGapHintText}"
+                       AutomationProperties.AutomationId="Graph.HistoryEvidence" />
+            </StackPanel>
             <plot:GraphPlotControl Grid.Row="1" Scene="{Binding Scene}"
                                    ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}"
                                    ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}"
@@ -280,6 +299,7 @@
                   <ItemsControl.ItemTemplate>
                     <DataTemplate x:DataType="graph:GraphCalendarDay">
                       <Border Classes="calendar-day" Classes.today="{Binding IsToday}" Classes.future="{Binding IsFuture}"
+                              Classes.quiet="{Binding IsQuiet}"
                               IsVisible="{Binding IsInMonth}" Margin="3" Padding="3,6" MinHeight="64"
                               ToolTip.Tip="{Binding AccessibleText}" AutomationProperties.Name="{Binding AccessibleText}"
                               AutomationProperties.AccessibilityView="Content">
