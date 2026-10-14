@@ -24,13 +24,20 @@ pub(super) fn project_recovered_windows(
     {
         return Ok(());
     }
-    let mut statement = connection.prepare(
+    let range_authority = if table_exists(connection, "session_ranges")? {
+        " OR EXISTS(SELECT 1 FROM session_ranges r WHERE r.root_identity=w.root_identity
+             AND r.relative_path=w.relative_path AND r.start_offset=w.range_start
+             AND r.end_offset=w.range_end AND r.record_sha256=w.record_sha256)"
+    } else {
+        ""
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT w.reset_at,w.window_seconds,w.observed_at FROM session_quota_windows w
          WHERE EXISTS(SELECT 1 FROM session_events e WHERE e.root_identity=w.root_identity
              AND e.relative_path=w.relative_path AND e.range_start=w.range_start
              AND e.range_end=w.range_end AND e.record_sha256=w.record_sha256
-             AND e.timestamp=w.observed_at)",
-    )?;
+             AND e.timestamp=w.observed_at){range_authority}",
+    ))?;
     let mut windows = BTreeMap::<i64, BTreeSet<i64>>::new();
     for row in statement.query_map([], |row| {
         Ok((

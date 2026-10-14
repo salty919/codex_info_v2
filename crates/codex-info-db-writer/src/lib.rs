@@ -12672,7 +12672,10 @@ impl UsageStore {
         let mut statement=tx.prepare("SELECT w.reset_at,w.window_seconds,w.observed_at FROM session_quota_windows w
             WHERE EXISTS(SELECT 1 FROM session_events e WHERE e.root_identity=w.root_identity
                 AND e.relative_path=w.relative_path AND e.range_start=w.range_start AND e.range_end=w.range_end
-                AND e.record_sha256=w.record_sha256 AND e.timestamp=w.observed_at)")?;
+                AND e.record_sha256=w.record_sha256 AND e.timestamp=w.observed_at)
+            OR EXISTS(SELECT 1 FROM session_ranges r WHERE r.root_identity=w.root_identity
+                AND r.relative_path=w.relative_path AND r.start_offset=w.range_start AND r.end_offset=w.range_end
+                AND r.record_sha256=w.record_sha256)")?;
         for row in statement.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -12859,7 +12862,10 @@ impl UsageStore {
             }
             let mut targets = BTreeSet::new();
             let mut statement = tx.prepare(
-                "SELECT timestamp FROM usage_history WHERE reset_at=?1 ORDER BY timestamp",
+                "SELECT timestamp FROM usage_history WHERE reset_at=?1
+                 UNION SELECT data_generation FROM durable_state
+                   WHERE singleton>=2 AND json_extract(snapshot_json,'$.reset_at')=?1
+                 ORDER BY 1",
             )?;
             for row in statement.query_map([reset], |r| r.get::<_, i64>(0))? {
                 targets.insert(row?);
@@ -12981,15 +12987,12 @@ impl UsageStore {
                 let mut sample = UsageHistorySample {
                     timestamp,
                     reset_at: reset,
-                    remaining_percent: receipt
-                        .map(|r| r.3)
-                        .or_else(|| {
-                            old_sample
-                                .as_ref()
-                                .filter(|s| s.reset_at == reset)
-                                .and_then(|s| s.remaining_percent)
-                        })
-                        .or_else(|| previous.as_ref().and_then(|value| value.remaining_percent)),
+                    remaining_percent: old_sample
+                        .as_ref()
+                        .filter(|s| s.reset_at == reset)
+                        .and_then(|s| s.remaining_percent)
+                        .or_else(|| previous.as_ref().and_then(|value| value.remaining_percent))
+                        .or_else(|| receipt.map(|r| r.3)),
                     sol_dollars: 0.0,
                     terra_dollars: 0.0,
                     luna_dollars: 0.0,
@@ -15249,6 +15252,10 @@ impl UsageStore {
             if let Some(since) = canonical_events
                 .values()
                 .map(|event| event.timestamp.div_euclid(60) * 60)
+                .chain(
+                    (reset_at > 0 && window_seconds > 0)
+                        .then(|| reset_at.saturating_sub(window_seconds).div_euclid(60) * 60),
+                )
                 .min()
             {
                 let (restored, _) =
@@ -16882,6 +16889,7 @@ mod tests {
     fn retained_session_window_repairs_only_source_bound_endpoints() {
         for fault in [
             "none",
+            "range-window",
             "endpoint",
             "pointer",
             "window",
@@ -16935,6 +16943,16 @@ mod tests {
             }
             store.connection.execute("INSERT INTO session_ranges VALUES('root','session.jsonl','1','2',0,1,?1,'1',?1,?2)",params![format!("{:032x}",1_u128),"0".repeat(64)]).unwrap();
             store.connection.execute("INSERT INTO session_quota_windows VALUES(1600,600,1025,'root','session.jsonl',0,1,?1)",[if fault=="pointer" {"1".repeat(64)} else {"0".repeat(64)}]).unwrap();
+            if fault == "range-window" {
+                store.connection.execute("INSERT INTO session_ranges VALUES('root','zero.jsonl','1','3',0,1,?1,'1',?1,?2)",params![format!("{:032x}",1_u128),"0".repeat(64)]).unwrap();
+                store
+                    .connection
+                    .execute(
+                        "UPDATE session_quota_windows SET relative_path='zero.jsonl'",
+                        [],
+                    )
+                    .unwrap();
+            }
             if fault == "window" {
                 store.connection.execute("INSERT INTO session_quota_windows VALUES(1600,601,1025,'root','session.jsonl',0,1,?1)",["0".repeat(64)]).unwrap();
             }
@@ -16958,8 +16976,12 @@ mod tests {
                     &backup,
                 )
                 .unwrap();
-            assert_eq!(repaired > 0, fault == "none", "source window case={fault}");
-            if fault == "none" {
+            assert_eq!(
+                repaired > 0,
+                matches!(fault, "none" | "range-window"),
+                "source window case={fault}"
+            );
+            if matches!(fault, "none" | "range-window") {
                 for (at, total, input, cached, output) in [
                     (1020, "100", "90", "20", "10"),
                     (1080, "220", "200", "50", "20"),
@@ -17078,67 +17100,78 @@ mod tests {
 
     #[test]
     fn minute_replay_keeps_independent_durable_quota() {
-        let path = database_path("source-prefix-durable-quota");
-        let identity = partition_identity('a', 7);
-        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
-        store.connection.execute("UPDATE collection_generation SET reset_at=2000,latest_quota_reset_at=2000,window_seconds=1000",[]).unwrap();
-        store
+        for extra_receipt in [false, true] {
+            let path = database_path("source-prefix-durable-quota");
+            let identity = partition_identity('a', 7);
+            let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+            store.connection.execute("UPDATE collection_generation SET reset_at=2000,latest_quota_reset_at=2000,window_seconds=1000",[]).unwrap();
+            store
             .connection
             .execute(
                 "INSERT INTO session_model_totals VALUES('gpt-6.1-sol','170','150','50','20','0')",
                 [],
             )
             .unwrap();
-        for (index, at, total, input, cached, output) in
-            [(0, 1205, 100, 90, 30, 10), (1, 1385, 70, 60, 20, 10)]
-        {
-            store.connection.execute("INSERT INTO session_events VALUES('root','session.jsonl','1','2',?1,0,1,?2,?3,?4,'gpt-6.1-sol',?5,?6,?7,?8,'0')",params![format!("{:032x}",1_u128),"0".repeat(64),index,at,total.to_string(),input.to_string(),cached.to_string(),output.to_string()]).unwrap();
+            for (index, at, total, input, cached, output) in
+                [(0, 1205, 100, 90, 30, 10), (1, 1385, 70, 60, 20, 10)]
+            {
+                store.connection.execute("INSERT INTO session_events VALUES('root','session.jsonl','1','2',?1,0,1,?2,?3,?4,'gpt-6.1-sol',?5,?6,?7,?8,'0')",params![format!("{:032x}",1_u128),"0".repeat(64),index,at,total.to_string(),input.to_string(),cached.to_string(),output.to_string()]).unwrap();
+            }
+            let receipt_times = if extra_receipt {
+                vec![1201, 1261, 1381]
+            } else {
+                vec![1201, 1381]
+            };
+            let receipts = receipt_times
+                .into_iter()
+                .enumerate()
+                .map(|(i, observed_at)| QuotaReceipt {
+                    receipt_id: format!("{:064x}", i + 1),
+                    sequence: i as i64 + 1,
+                    observed_at,
+                    reset_at: 2000,
+                    window_seconds: 1000,
+                    remaining_percent: if observed_at == 1261 {
+                        88.0
+                    } else {
+                        90.0 - i as f64
+                    },
+                })
+                .collect::<Vec<_>>();
+            store.commit_quota_receipts(&receipts, false).unwrap();
+            let tx = store.connection.transaction().unwrap();
+            upsert_observations(
+                &tx,
+                &[UsageHistoryObservation::unavailable(1260, 2000, Some(77.0))],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            let backup =
+                UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+            assert!(
+                store
+                    .repair_session_minute_history(
+                        &[SessionLifecycleInterval::new(Some(1000), None)],
+                        &backup
+                    )
+                    .unwrap()
+                    > 0
+            );
+            let raw:Option<f64>=store.connection.query_row("SELECT remaining_percent FROM usage_history WHERE timestamp=1260 AND reset_at=2000",[],|r|r.get(0)).unwrap();
+            assert_eq!(
+                raw,
+                Some(77.0),
+                "adding a model prefix cannot erase the independent recovered quota"
+            );
+            let durable:Option<f64>=store.connection.query_row("SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE singleton>=2 AND data_generation=1260 AND json_extract(snapshot_json,'$.reset_at')=2000",[],|r|r.get(0)).unwrap();
+            assert_eq!(durable, Some(77.0));
+            assert_eq!(
+                store.latest_quota_receipt().unwrap(),
+                receipts.last().cloned()
+            );
+            drop(store);
+            remove_database(&path);
         }
-        let receipts = [1201, 1381]
-            .into_iter()
-            .enumerate()
-            .map(|(i, observed_at)| QuotaReceipt {
-                receipt_id: format!("{:064x}", i + 1),
-                sequence: i as i64 + 1,
-                observed_at,
-                reset_at: 2000,
-                window_seconds: 1000,
-                remaining_percent: 90.0 - i as f64,
-            })
-            .collect::<Vec<_>>();
-        store.commit_quota_receipts(&receipts, false).unwrap();
-        let tx = store.connection.transaction().unwrap();
-        upsert_observations(
-            &tx,
-            &[UsageHistoryObservation::unavailable(1260, 2000, Some(77.0))],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        let backup =
-            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
-        assert!(
-            store
-                .repair_session_minute_history(
-                    &[SessionLifecycleInterval::new(Some(1000), None)],
-                    &backup
-                )
-                .unwrap()
-                > 0
-        );
-        let raw:Option<f64>=store.connection.query_row("SELECT remaining_percent FROM usage_history WHERE timestamp=1260 AND reset_at=2000",[],|r|r.get(0)).unwrap();
-        assert_eq!(
-            raw,
-            Some(77.0),
-            "adding a model prefix cannot erase the independent recovered quota"
-        );
-        let durable:Option<f64>=store.connection.query_row("SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE singleton>=2 AND data_generation=1260 AND json_extract(snapshot_json,'$.reset_at')=2000",[],|r|r.get(0)).unwrap();
-        assert_eq!(durable, Some(77.0));
-        assert_eq!(
-            store.latest_quota_receipt().unwrap(),
-            receipts.last().cloned()
-        );
-        drop(store);
-        remove_database(&path);
     }
 
     #[test]

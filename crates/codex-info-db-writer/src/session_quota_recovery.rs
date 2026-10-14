@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 type SourceKey = (String, String, i64, i64, String);
 type ObservationKey = (i64, i64);
 type QuotaCandidates = BTreeMap<ObservationKey, (i64, Option<f64>)>;
+type EventSourceRanges = BTreeMap<(String, String), BTreeMap<i64, BTreeSet<(i64, i64, String)>>>;
 
 pub(super) const WINDOW_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS session_quota_windows (
@@ -124,6 +125,62 @@ pub(super) fn recover_session_quota_history_in_transaction(
     }
     drop(statement);
     let mut sources = BTreeMap::<SourceKey, BTreeMap<i64, BTreeSet<Option<i64>>>>::new();
+    let mut accepted_ranges = BTreeSet::<SourceKey>::new();
+    let mut minute_resets = BTreeMap::<i64, BTreeSet<Option<i64>>>::new();
+    let mut event_sources = EventSourceRanges::new();
+    {
+        let mut statement = tx.prepare(
+            "SELECT timestamp,reset_at FROM usage_history WHERE timestamp>=?1
+             UNION SELECT data_generation,json_extract(snapshot_json,'$.reset_at')
+             FROM durable_state WHERE singleton>=2 AND data_generation>=?1",
+        )?;
+        for row in statement.query_map([since], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        })? {
+            let (minute, reset) = row?;
+            minute_resets.entry(minute).or_default().insert(reset);
+        }
+        let mut statement = tx.prepare(
+            "SELECT root_identity,relative_path,timestamp,range_start,range_end,record_sha256
+             FROM session_events WHERE timestamp-timestamp%60>=?1",
+        )?;
+        for row in statement.query_map([since], |row| {
+            Ok((
+                (row.get(0)?, row.get(1)?),
+                row.get(2)?,
+                (row.get(3)?, row.get(4)?, row.get(5)?),
+            ))
+        })? {
+            let (path, at, range) = row?;
+            event_sources
+                .entry(path)
+                .or_default()
+                .entry(at)
+                .or_default()
+                .insert(range);
+        }
+        let mut statement = tx.prepare(
+            "SELECT root_identity,relative_path,start_offset,end_offset,record_sha256 FROM session_ranges",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })? {
+            let key: SourceKey = row?;
+            if allowed_ranges
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(&key))
+            {
+                sources.entry(key.clone()).or_default();
+                accepted_ranges.insert(key);
+            }
+        }
+    }
     {
         let mut statement = tx.prepare(
                 "SELECT e.relative_path,e.range_start,e.range_end,e.record_sha256,e.timestamp,COALESCE(h.reset_at,json_extract(d.snapshot_json,'$.reset_at')),e.root_identity
@@ -173,7 +230,11 @@ pub(super) fn recover_session_quota_history_in_transaction(
     let mut observations = BTreeMap::<ObservationKey, (i64, Option<f64>)>::new();
     let mut windows = BTreeMap::new();
     let mut relocated_paths = BTreeSet::new();
-    for ((root_identity, relative_path, start, end, expected_hash), admitted) in sources {
+    for (key, mut admitted) in sources {
+        let accepted_range = accepted_ranges.contains(&key);
+        let (root_identity, relative_path, start, end, expected_hash) = key;
+        let previous_events = event_sources.get(&(root_identity.clone(), relative_path.clone()));
+        let event_range = (start, end, expected_hash.clone());
         let Ok(path) = fs::canonicalize(root.join(&relative_path)) else {
             continue;
         };
@@ -190,6 +251,33 @@ pub(super) fn recover_session_quota_history_in_transaction(
             while reader.read_until(b'\n', &mut line)? != 0 {
                 digest.update(&line);
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) {
+                    // A token_count can report quota without changing any
+                    // counters. Its accepted bytes, rather than a fabricated
+                    // zero-usage event, bind this observation to its source.
+                    if accepted_range {
+                        if let Some(at) = value
+                            .get("timestamp")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                            .map(|at| at.timestamp())
+                            .filter(|at| {
+                                *at > 0
+                                    && at.div_euclid(60) * 60 >= since
+                                    && lifecycle_contains(&intervals, *at)
+                                    // A rewritten record already attributed to
+                                    // another range still requires the existing
+                                    // normalized-event relocation proof.
+                                    && previous_events.and_then(|events| events.get(at))
+                                        .is_none_or(|ranges| ranges.contains(&event_range))
+                            })
+                        {
+                            let authorities = minute_resets
+                                .get(&(at.div_euclid(60) * 60))
+                                .cloned()
+                                .unwrap_or_else(|| BTreeSet::from([None]));
+                            admitted.entry(at).or_default().extend(authorities);
+                        }
+                    }
                     if let Some(candidate) =
                         session_quota(&value, &admitted, &known_resets, &known_windows)
                     {
@@ -263,13 +351,9 @@ pub(super) fn recover_session_quota_history_in_transaction(
     }
     for ((reset, seconds), (at, root_identity, path, start, end, hash)) in windows {
         restored_windows += tx.execute(
-                "INSERT OR IGNORE INTO session_quota_windows
-                 SELECT ?1,?2,e.timestamp,e.root_identity,e.relative_path,e.range_start,e.range_end,e.record_sha256
-                 FROM session_events e WHERE e.relative_path=?3 AND e.range_start=?4 AND e.range_end=?5
-                   AND e.record_sha256=?6 AND e.timestamp=?7 AND e.root_identity=?8
-                 ORDER BY e.root_identity,e.file_device,e.file_inode,e.prefix_generation,e.event_index LIMIT 1",
-                params![reset,seconds,path,start,end,hash,at,root_identity],
-            )?;
+            "INSERT OR IGNORE INTO session_quota_windows VALUES (?1,?2,?7,?8,?3,?4,?5,?6)",
+            params![reset, seconds, path, start, end, hash, at, root_identity],
+        )?;
     }
     // Different exact resets in one missing minute cannot both own its
     // canonical row. Leave that minute unknown instead of choosing an ID.
@@ -282,6 +366,14 @@ pub(super) fn recover_session_quota_history_in_transaction(
             continue;
         };
         if minute_counts[&timestamp] > 1 {
+            continue;
+        }
+        let durable_remaining: Option<f64> = tx.query_row(
+            "SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state
+             WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2",
+            params![timestamp, reset_at], |row| row.get(0),
+        ).optional()?.flatten();
+        if durable_remaining.is_some() {
             continue;
         }
         let mut changed = tx.execute(
@@ -646,6 +738,79 @@ mod tests {
              VALUES('root',?1,'1','2',?2,0,?3,?4,0,?5,'SOL','1','1','0','0')",
             params![name, "a".repeat(32), body.len(), format!("{:x}", Sha256::digest(Sha256::digest(body.as_bytes()))), time],
         ).unwrap();
+    }
+
+    #[test]
+    fn zero_delta_range_quota_requires_hash_and_owned_unambiguous_authority() {
+        for fault in ["none", "hash", "unowned", "ambiguous"] {
+            let (root, mut store) = fixture();
+            add_history(&mut store, MINUTE, Some(90.0));
+            let at = MINUTE + 70;
+            let body = format!(
+                "{}\n",
+                json!({"type":"event_msg","timestamp":DateTime::from_timestamp(at,0).unwrap().to_rfc3339(),
+                "payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"cache_write_input_tokens":0}},
+                "rate_limits":{"secondary":{"used_percent":12,"resets_at":RESET,"window_minutes":10080}}}})
+            );
+            fs::write(root.join("zero.jsonl"), &body).unwrap();
+            let hash = if fault == "hash" {
+                "0".repeat(64)
+            } else {
+                format!("{:x}", Sha256::digest(Sha256::digest(body.as_bytes())))
+            };
+            store.connection.execute("INSERT INTO session_ranges VALUES('root','zero.jsonl','1','2',0,?1,?2,'1',?2,?3)",params![body.len() as i64,"a".repeat(32),hash]).unwrap();
+            if fault == "ambiguous" {
+                let tx = store.connection.transaction().unwrap();
+                upsert_observations(
+                    &tx,
+                    &[
+                        UsageHistoryObservation::unavailable(MINUTE + 60, RESET, None),
+                        UsageHistoryObservation::unavailable(MINUTE + 60, RESET + 1, None),
+                    ],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+            let intervals = [SessionLifecycleInterval::new(
+                if fault == "unowned" {
+                    Some(at + 1)
+                } else {
+                    Some(MINUTE)
+                },
+                None,
+            )];
+            let restored = store
+                .recover_session_quota_history_for_intervals(&root, MINUTE, &intervals)
+                .unwrap();
+            assert_eq!(
+                restored,
+                usize::from(fault == "none"),
+                "range-only case={fault}"
+            );
+            let remaining:Option<f64>=store.connection.query_row("SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2",params![MINUTE+60,RESET],|r|r.get(0)).optional().unwrap().flatten();
+            assert_eq!(remaining, (fault == "none").then_some(88.0));
+            assert!(store.load_session_events().unwrap().is_empty());
+            if fault == "none" {
+                assert_eq!(
+                    store
+                        .connection
+                        .query_row("SELECT observed_at FROM session_quota_windows", [], |r| r
+                            .get::<_, i64>(
+                            0
+                        ))
+                        .unwrap(),
+                    at
+                );
+                assert_eq!(
+                    store
+                        .recover_session_quota_history_for_intervals(&root, MINUTE, &intervals)
+                        .unwrap(),
+                    0
+                );
+            }
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

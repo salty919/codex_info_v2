@@ -3351,6 +3351,24 @@ impl Recorder {
             Ok(_) => {}
             Err(error) => eprintln!("recorder historical quota recovery failed: {error}"),
         }
+        if existing_database {
+            let recovered = writer.load_session_events().and_then(|events| {
+                if events.is_empty() {
+                    return Ok(0);
+                }
+                drop(events);
+                let backup =
+                    UsageStore::backup_generations_partitioned_verified(&database, identity, 3)?;
+                writer.repair_session_minute_history(&lifecycle_intervals, &backup)
+            });
+            match recovered {
+                Ok(restored) if restored > 0 => {
+                    eprintln!("recorder recovered {restored} historical model minutes");
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("recorder historical model recovery failed: {error}"),
+            }
+        }
         Ok(Self {
             config,
             writer,
@@ -3729,6 +3747,7 @@ impl Recorder {
         let mut checkpoints = Vec::new();
         let mut ranges = Vec::new();
         let mut durable_events = Vec::new();
+        let mut token_observed_at = Vec::new();
         let mut token_anchor_recoveries = Vec::new();
         let mut token_anchor_resolutions = Vec::new();
         let mut old_epoch_no_delta_proofs = Vec::<SessionPendingRange>::new();
@@ -4063,6 +4082,7 @@ impl Recorder {
             }
             if let Some(range) = result.range {
                 ranges.push(range);
+                token_observed_at.extend(result.token_observed_at);
             }
             task_events.extend(result.task_events);
             task_indexed_ranges.extend(result.task_indexed_ranges);
@@ -4124,6 +4144,19 @@ impl Recorder {
         // change an older minute's prefix; adding it to today's total would
         // shift that usage backwards. Only the changed suffix is persisted.
         let exact_history = if !period_restarted && period_available {
+            let observed_minutes = token_observed_at
+                .iter()
+                .copied()
+                .filter(|at| {
+                    *at >= window_start
+                        && *at <= timeline_end
+                        && self.lifecycle_intervals.iter().any(|interval| {
+                            interval.start_at.is_none_or(|start| *at >= start)
+                                && interval.end_at.is_none_or(|end| *at < end)
+                        })
+                })
+                .map(|at| at.div_euclid(60) * 60)
+                .collect::<BTreeSet<_>>();
             if let Some(mut first_changed) = events
                 .iter()
                 .filter(|event| event.timestamp <= timeline_end)
@@ -4133,6 +4166,7 @@ impl Recorder {
                         .iter()
                         .map(|receipt| receipt.observed_at.div_euclid(60) * 60),
                 )
+                .chain(observed_minutes.iter().copied())
                 .min()
             {
                 let quota_minute = quota
@@ -4174,6 +4208,7 @@ impl Recorder {
                         .iter()
                         .map(|receipt| receipt.observed_at.div_euclid(60) * 60),
                 );
+                recorded_minutes.extend(observed_minutes);
                 // A newly admitted quota-only minute may precede this scan's
                 // first token. Materialize its source-known prefix as well.
                 if let Some(minute) = quota_minute.filter(|minute| *minute >= first_changed) {
@@ -4671,6 +4706,7 @@ struct SourceOutcome {
     checkpoint: SessionCheckpoint,
     range: Option<SessionRange>,
     events: Vec<SessionEvent>,
+    token_observed_at: Vec<i64>,
     task_events: Vec<SessionTaskEvent>,
     task_indexed_ranges: Vec<SessionTaskIndexedRange>,
     pending: Vec<SessionPendingRange>,
@@ -5535,6 +5571,7 @@ fn scan_source(
     let mut pending_evidence = Vec::<(u64, u64, &'static str, bool)>::new();
     let mut candidate_totals = totals.clone();
     let mut candidate_events = Vec::new();
+    let mut token_observed_at = Vec::new();
     let mut candidate_task_events = Vec::new();
     // Keep every source-proven timestamped delta in the event ledger even
     // when the last quota authority cannot cover its period.  `candidate_events`
@@ -5748,6 +5785,9 @@ fn scan_source(
         }
         if timestamp < window_start || timestamp > reset_at {
             continue;
+        }
+        if timestamp > 0 {
+            token_observed_at.push(timestamp);
         }
         candidate_totals.add(&model, delta)?;
         // Session timestamps can be slightly ahead of the local cycle clock.
@@ -6031,6 +6071,7 @@ fn scan_source(
         checkpoint,
         range,
         events: durable_events,
+        token_observed_at,
         task_events,
         task_indexed_ranges: task_indexed_range.into_iter().collect(),
         pending,
@@ -10360,6 +10401,156 @@ mod tests {
     }
 
     #[test]
+    fn normal_cycle_recovers_zero_delta_source_quota() {
+        assert_zero_delta_source_quota("normal");
+    }
+
+    #[test]
+    fn restart_recovers_accepted_zero_delta_source_quota() {
+        assert_zero_delta_source_quota("restart");
+    }
+
+    #[test]
+    fn rejected_zero_delta_source_quota_rolls_back_acceptance() {
+        assert_zero_delta_source_quota("rollback");
+    }
+
+    fn assert_zero_delta_source_quota(mode: &str) {
+        use rusqlite::OptionalExtension;
+        let (root, database) = prepare(&format!("zero-delta-source-quota-{mode}"));
+        let start = Utc::now().timestamp().div_euclid(60) * 60 - 600;
+        let reset = start + 3600;
+        let source = root.join("sessions/one.jsonl");
+        fs::write(
+            &source,
+            format!(
+                "{}\n{}{}",
+                json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-6-astra"}}),
+                token(0, start + 1),
+                token(10, start + 10)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
+        recorder
+            .writer
+            .commit_quota_receipts(
+                &[codex_info_db_writer::QuotaReceipt {
+                    receipt_id: "a".repeat(64),
+                    sequence: 1,
+                    observed_at: start + 30,
+                    reset_at: reset,
+                    window_seconds: 3600,
+                    remaining_percent: 90.0,
+                }],
+                false,
+            )
+            .unwrap();
+        let quota = QuotaSnapshot {
+            observed_at: start + 30,
+            reset_at: reset,
+            window_seconds: 3600,
+            remaining_percent: Some(90.0),
+        };
+        recorder
+            .run_cycle_with_quota(Some(quota.clone()))
+            .unwrap()
+            .unwrap();
+        let before = recorder.state().unwrap();
+        let events = recorder.writer.load_session_events().unwrap();
+        let ranges = recorder.writer.load_session_ranges().unwrap();
+        let mut event: Value = serde_json::from_str(&token(10, start + 70)).unwrap();
+        event["payload"]["rate_limits"] =
+            json!({"secondary":{"used_percent":12,"resets_at":reset,"window_minutes":60}});
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{event}\n").as_bytes())
+            .unwrap();
+        let db = Connection::open(&database).unwrap();
+        if mode == "rollback" {
+            db.execute_batch(&format!("CREATE TRIGGER reject_zero_quota BEFORE UPDATE OF remaining_percent ON usage_history WHEN NEW.timestamp={} AND NEW.remaining_percent=88 BEGIN SELECT RAISE(ABORT,'zero quota rejected'); END;",start+60)).unwrap();
+            assert!(
+                recorder.run_cycle_with_quota(Some(quota)).is_err(),
+                "zero-delta quota failure cannot acknowledge its range"
+            );
+            let after = recorder.state().unwrap();
+            assert_eq!(after.data_generation, before.data_generation);
+            assert_eq!(after.checkpoints, before.checkpoints);
+            assert_eq!(after.model_totals, before.model_totals);
+            assert_eq!(recorder.writer.load_session_ranges().unwrap(), ranges);
+        } else {
+            recorder.run_cycle_with_quota(Some(quota)).unwrap().unwrap();
+            if mode == "restart" {
+                db.execute(
+                    "DELETE FROM usage_model_history WHERE timestamp=?1",
+                    [start + 60],
+                )
+                .unwrap();
+                db.execute(
+                    "DELETE FROM durable_state WHERE singleton>=2 AND data_generation=?1",
+                    [start + 60],
+                )
+                .unwrap();
+                db.execute("DELETE FROM usage_history WHERE timestamp=?1", [start + 60])
+                    .unwrap();
+                db.execute("DELETE FROM session_quota_windows", []).unwrap();
+                drop(recorder);
+                recorder = Recorder::open_partitioned(config(&root, 65536), &database, &identity())
+                    .unwrap();
+            }
+            let remaining: Option<f64> = db
+                .query_row(
+                    "SELECT remaining_percent FROM usage_history WHERE timestamp=?1",
+                    [start + 60],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+                .flatten();
+            assert_eq!(
+                remaining,
+                Some(88.0),
+                "accepted zero-delta source quota must survive {mode}"
+            );
+            let tokens:Option<String>=db.query_row("SELECT total_tokens FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6-astra'",[start+60],|r|r.get(0)).optional().unwrap();
+            assert_eq!(
+                tokens.as_deref(),
+                Some("10"),
+                "known source prefix must remain a recorded flat minute"
+            );
+            let window: (i64, i64, i64) = db
+                .query_row(
+                    "SELECT reset_at,window_seconds,observed_at FROM session_quota_windows",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(window, (reset, 3600, start + 70));
+        }
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 10);
+        assert_eq!(
+            recorder.writer.load_session_events().unwrap(),
+            events,
+            "zero counters must not create a usage event"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT remaining_percent FROM usage_history WHERE timestamp=?1",
+                [start],
+                |r| r.get::<_, f64>(0)
+            )
+            .unwrap(),
+            90.0
+        );
+        drop(db);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn normal_cycle_persists_admitted_source_quota_without_restart() {
         assert_normal_source_quota_cycle(false);
     }
@@ -13004,6 +13195,100 @@ mod tests {
             Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
         assert_eq!(quota(), Some(88.0));
         assert_eq!(restarted.model_totals().unwrap(), before);
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_repairs_source_bound_model_minutes_after_verified_backup() {
+        use rusqlite::OptionalExtension;
+
+        let (root, database) = prepare("startup-source-model-repair");
+        let start = Utc::now().timestamp().div_euclid(60) * 60 - 600;
+        let reset = start + 3600;
+        fs::write(
+            root.join("sessions/one.jsonl"),
+            format!(
+                "{}\n{}{}{}",
+                json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-6-astra"}}),
+                token(0, start + 1),
+                token(10, start + 10),
+                token(20, start + 130)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
+        recorder
+            .writer
+            .commit_quota_receipts(
+                &[codex_info_db_writer::QuotaReceipt {
+                    receipt_id: "a".repeat(64),
+                    sequence: 1,
+                    observed_at: start + 30,
+                    reset_at: reset,
+                    window_seconds: 3600,
+                    remaining_percent: 90.0,
+                }],
+                false,
+            )
+            .unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: start + 30,
+                reset_at: reset,
+                window_seconds: 3600,
+                remaining_percent: Some(90.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let before = recorder.state().unwrap();
+        let events = recorder.writer.load_session_events().unwrap();
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 20);
+        drop(recorder);
+        let db = Connection::open(&database).unwrap();
+        assert_eq!(db.query_row("SELECT total_tokens FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6-astra'",[start],|r|r.get::<_,String>(0)).unwrap(),"10");
+        db.execute(
+            "DELETE FROM usage_model_history WHERE timestamp=?1",
+            [start],
+        )
+        .unwrap();
+        drop(db);
+
+        let restarted =
+            Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
+        let db = Connection::open(&database).unwrap();
+        let restored: Option<String> = db.query_row("SELECT total_tokens FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6-astra'",[start],|r|r.get(0)).optional().unwrap();
+        assert_eq!(
+            restored.as_deref(),
+            Some("10"),
+            "restart must materialize the verified source prefix, not only expose a repair API"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT remaining_percent FROM usage_history WHERE timestamp=?1",
+                [start],
+                |r| r.get::<_, Option<f64>>(0)
+            )
+            .unwrap(),
+            Some(90.0)
+        );
+        assert_eq!(restarted.state().unwrap().model_totals, before.model_totals);
+        assert_eq!(restarted.writer.load_session_events().unwrap(), events);
+        let backup = Connection::open(root.join("usage_history.sqlite3.bak.1")).unwrap();
+        assert_eq!(
+            backup
+                .query_row(
+                    "SELECT count(*) FROM usage_model_history WHERE timestamp=?1",
+                    [start],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "backup must preserve the original missing sidecar before repair"
+        );
+        drop(backup);
+        drop(db);
         drop(restarted);
         fs::remove_dir_all(root).unwrap();
     }

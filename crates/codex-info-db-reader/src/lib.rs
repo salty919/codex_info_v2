@@ -6365,6 +6365,44 @@ mod tests {
     }
 
     #[test]
+    fn recovered_quota_window_accepts_a_verified_zero_event_range() {
+        for (matches, conflict, expected) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            let (path, identity) = quota_receipt_current_fixture("zero-event-quota-window");
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("PRAGMA user_version=15;
+                INSERT INTO usage_history VALUES(1799900040,1799950000,90,1,0,0,100,0,0);
+                CREATE TABLE session_events(root_identity TEXT,relative_path TEXT,range_start INTEGER,range_end INTEGER,record_sha256 TEXT,timestamp INTEGER);
+                CREATE TABLE session_ranges(root_identity TEXT,relative_path TEXT,start_offset INTEGER,end_offset INTEGER,record_sha256 TEXT);
+                INSERT INTO session_ranges VALUES('root','zero.jsonl',0,100,'proof');
+                CREATE TABLE session_quota_windows(reset_at INTEGER,window_seconds INTEGER,observed_at INTEGER,root_identity TEXT,relative_path TEXT,range_start INTEGER,range_end INTEGER,record_sha256 TEXT,PRIMARY KEY(reset_at,window_seconds));").unwrap();
+            db.execute("INSERT INTO session_quota_windows VALUES(1799950000,86400,1799900050,'root','zero.jsonl',0,100,?1)",[if matches {"proof"} else {"different"}]).unwrap();
+            if conflict {
+                db.execute("INSERT INTO session_quota_windows VALUES(1799950000,604800,1799900050,'root','zero.jsonl',0,100,'proof')",[]).unwrap();
+            }
+            drop(db);
+            let snapshot = DbReader::open_partitioned(&path, &identity)
+                .unwrap()
+                .read_snapshot()
+                .unwrap();
+            assert_latest_receipt_quota(&snapshot);
+            assert_eq!(
+                snapshot
+                    .retained_history
+                    .origins
+                    .get(&1_799_950_000)
+                    .copied(),
+                expected.then_some(1_799_863_600),
+                "range matches={matches}, conflict={conflict}"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn recovered_quota_window_requires_an_owned_event_and_one_official_window() {
         for (event_matches, conflicting, expected) in [
             (true, false, true),

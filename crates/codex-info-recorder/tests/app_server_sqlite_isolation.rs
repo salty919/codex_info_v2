@@ -456,6 +456,185 @@ fn run_quota_replay(fixture: &QuotaJournalFixture) -> String {
     fs::read_to_string(root.join("replay.log")).unwrap()
 }
 
+#[test]
+fn real_startup_recovers_inactive_account_source_history() {
+    use codex_info_account_locator::{
+        ensure_partition_with_activation, mark_partition_initialized,
+    };
+    use codex_info_db_writer::{QuotaReceipt, StoragePartitionIdentity, UsageStore};
+    use codex_info_recorder::{QuotaSnapshot, Recorder, RecorderConfig};
+    use rusqlite::{params, OptionalExtension};
+    let _environment = ENVIRONMENT_LOCK.lock().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let data = root.path().join("data");
+    let sessions = root.path().join("custom-sessions");
+    for path in [&home, &data, &sessions] {
+        private_directory(path);
+    }
+    let auth = home.join("auth.json");
+    fs::write(&auth, br#"{"tokens":{"account_id":"old-account"}}"#).unwrap();
+    fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+    let start = chrono::Utc::now().timestamp().div_euclid(60) * 60 - 600;
+    let reset = start + 3600;
+    let old = ensure_partition_with_activation(&home, &data, Some(start)).unwrap();
+    let identity = StoragePartitionIdentity {
+        schema_version: "codex-info-account-db-v1".into(),
+        profile_scope_id: old.profile_scope_id.clone(),
+        account_scope_id: old.account_scope_id.clone(),
+        storage_epoch: old.storage_epoch,
+        partition_id: old.partition_id.clone(),
+    };
+    let mut body = format!(
+        "{}\n",
+        json!({"type":"turn_context","payload":{"model":"gpt-6-astra"}})
+    );
+    for (total, at, with_quota) in [
+        (0, start + 1, false),
+        (10, start + 10, false),
+        (20, start + 70, false),
+        (20, start + 130, true),
+    ] {
+        let mut record = json!({"type":"event_msg","timestamp":chrono::DateTime::from_timestamp(at,0).unwrap().to_rfc3339(),
+            "payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":total,"input_tokens":total,"cached_input_tokens":0,"output_tokens":0,"cache_write_input_tokens":0}}}});
+        if with_quota {
+            record["payload"]["rate_limits"] =
+                json!({"secondary":{"used_percent":12,"resets_at":reset,"window_minutes":60}});
+        }
+        body.push_str(&format!("{record}\n"));
+    }
+    fs::write(sessions.join("old.jsonl"), body).unwrap();
+    let mut recorder = Recorder::open_partitioned(
+        RecorderConfig {
+            sessions_root: sessions.clone(),
+            chunk_bytes: 65536,
+        },
+        &old.database_path,
+        &identity,
+    )
+    .unwrap();
+    recorder
+        .run_cycle_with_quota(Some(QuotaSnapshot {
+            observed_at: start + 30,
+            reset_at: reset,
+            window_seconds: 3600,
+            remaining_percent: Some(90.0),
+        }))
+        .unwrap()
+        .unwrap();
+    drop(recorder);
+    let mut writer = UsageStore::open_partitioned(&old.database_path, &identity).unwrap();
+    writer
+        .commit_quota_receipts(
+            &[QuotaReceipt {
+                receipt_id: "a".repeat(64),
+                sequence: 1,
+                observed_at: start + 30,
+                reset_at: reset,
+                window_seconds: 3600,
+                remaining_percent: 90.0,
+            }],
+            false,
+        )
+        .unwrap();
+    let events = writer.load_session_events().unwrap();
+    let checkpoints = writer.load_session_collection_state().unwrap().checkpoints;
+    drop(writer);
+    mark_partition_initialized(&data, &old).unwrap();
+    let db = Connection::open(&old.database_path).unwrap();
+    db.execute(
+        "DELETE FROM usage_model_history WHERE timestamp=?1",
+        [start],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM usage_model_history WHERE timestamp=?1",
+        [start + 120],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM durable_state WHERE singleton>=2 AND data_generation=?1",
+        [start + 120],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM usage_history WHERE timestamp=?1",
+        [start + 120],
+    )
+    .unwrap();
+    db.execute("DELETE FROM session_quota_windows", []).unwrap();
+    drop(db);
+    fs::write(&auth, br#"{"tokens":{"account_id":"current-account"}}"#).unwrap();
+    let current = ensure_partition_with_activation(&home, &data, Some(start + 180)).unwrap();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
+            .args(["--once", "--sessions-root"])
+            .arg(&sessions)
+            .env("CODEX_HOME", &home)
+            .env("CODEX_INFO_DATA_DIR", &data)
+            .env(
+                "CODEX_INFO_CODEX_BIN",
+                root.path().join("absent-app-server"),
+            )
+            .env_remove("CODEX_INFO_RECORDER_DB")
+            .env_remove("CODEX_INFO_ACCOUNT_DB")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(root.path().join("startup.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "real recorder startup did not terminate"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "{}",
+        fs::read_to_string(root.path().join("startup.log")).unwrap()
+    );
+    assert!(
+        current.database_path.is_file(),
+        "main must initialize authenticated account B"
+    );
+    let db = Connection::open(&old.database_path).unwrap();
+    let tokens:Option<String>=db.query_row("SELECT total_tokens FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6-astra'",[start],|r|r.get(0)).optional().unwrap();
+    assert_eq!(
+        tokens.as_deref(),
+        Some("10"),
+        "main must restore inactive account A's source prefix"
+    );
+    let quota: Option<f64> = db
+        .query_row(
+            "SELECT remaining_percent FROM usage_history WHERE timestamp=?1 AND reset_at=?2",
+            params![start + 120, reset],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten();
+    assert_eq!(quota, Some(88.0));
+    drop(db);
+    let writer = UsageStore::open_read_only_partitioned(&old.database_path, &identity).unwrap();
+    assert_eq!(writer.load_session_events().unwrap(), events);
+    assert_eq!(
+        writer.load_session_collection_state().unwrap().checkpoints,
+        checkpoints
+    );
+    assert_eq!(
+        writer.load_session_collection_state().unwrap().model_totals[0].total_tokens,
+        20
+    );
+    assert!(old.database_path.with_extension("sqlite3.bak.1").is_file());
+}
+
 fn accepted_quota_receipts(database: &Path) -> Vec<(String, i64, f64)> {
     let db =
         Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
