@@ -432,6 +432,42 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task OpenThreadsIndependentFailurePreservesAcceptedRowsAndRecovers()
+    {
+        var current = CurrentSnapshot(activeThreadCount: 1);
+        var sol = ThreadDetails("gpt-5.6-sol", "same-thread");
+        var accepted = ThreadsFetchResult.Success(new ApiThreadsSnapshot([sol], current.PublishedPair));
+        var client = new SequencedSplitClient([current],
+            [accepted, ThreadsFetchResult.FromFailure(DetailsFetchFailure.Transport), accepted]);
+        using var main = new MainWindowViewModel(client);
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
+        using var threads = new ThreadsWindowViewModel(main, action => action());
+        await EventuallyAsync(() => threads.HasLoadError);
+        Assert.Equal(sol.Id, Assert.Single(threads.Threads).Id);
+        Assert.False(threads.HasNoThreads);
+
+        var refresh = typeof(ThreadsWindowViewModel).GetMethod("RefreshSplitResourceAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(refresh);
+        await Assert.IsAssignableFrom<Task>(refresh.Invoke(threads, [CancellationToken.None]));
+        Assert.False(threads.HasLoadError);
+        Assert.Equal(sol.Id, Assert.Single(threads.Threads).Id);
+    }
+
+    [Fact]
+    public async Task OpenThreadsAcceptedEmptyNeedsNoIndependentRequest()
+    {
+        using var main = new MainWindowViewModel(new SingleCurrentClient(CurrentSnapshot(activeThreadCount: 0)));
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
+        using var threads = new ThreadsWindowViewModel(main, action => action());
+        Assert.True(threads.HasNoThreads);
+        Assert.False(threads.HasLoadError);
+        Assert.Empty(threads.Threads);
+    }
+
+    [Fact]
     public async Task OpenThreadsClearsOnMainAcceptedZeroWithoutFetchingThreads()
     {
         var first = CurrentSnapshot(activeThreadCount: 1);
@@ -1007,10 +1043,12 @@ public sealed class MainWindowViewModelTests
             Assert.Same(item.row, viewModel.QuotaSegments[item.index]));
     }
 
-    [Fact]
-    public async Task InactiveAccountShowsItsRecordedPointWithoutLiveCountdownOrThreads()
+    [Theory]
+    [InlineData(ApiState.Ready)]
+    [InlineData(ApiState.Error)]
+    public async Task InactiveAccountShowsItsRecordedPointWithoutLiveCountdownOrThreads(ApiState historicalState)
     {
-        var client = new AccountScopedClient();
+        var client = new AccountScopedClient(historicalState: historicalState);
         using var viewModel = new MainWindowViewModel(client);
 
         viewModel.Start();
@@ -1028,7 +1066,12 @@ public sealed class MainWindowViewModelTests
 
         Assert.True(viewModel.IsSelectedAccountHistorical);
         Assert.Equal(LocalizationService.Current.Ready, viewModel.StatusTitle);
-        Assert.Equal("過去の記録を表示しています", viewModel.StatusDetail);
+        Assert.Equal(historicalState == ApiState.Error
+            ? "過去の記録を表示しています。記録終了時は取得エラーでした。"
+            : "過去の記録を表示しています", viewModel.StatusDetail);
+        Assert.Equal(historicalState, viewModel.DetailsSnapshot!.State);
+        Assert.Equal("ready", viewModel.DetailsStatusAutomationText);
+        Assert.False(viewModel.IsRetryVisible);
         Assert.Equal($"最終記録 {observedLocal}", viewModel.LastReceivedText);
         Assert.Equal("記録終了時の期間", viewModel.QuotaWindowText);
         Assert.Equal("$42.00", viewModel.Models.Single().InputDollarsText);
@@ -1039,7 +1082,12 @@ public sealed class MainWindowViewModelTests
             .ToString("g", CultureInfo.CurrentCulture);
         Assert.Equal(resetLocal, viewModel.ResetAtText);
         Assert.Equal(viewModel.ResetAtText, viewModel.QuotaRemainingText);
-        Assert.Equal(0, viewModel.QuotaRemainingPeriodValue);
+        // The record has 600 seconds left in its official 604800-second
+        // window. This is time remaining at the recorded observation, not
+        // its unrelated 73% quota and not today's clock.
+        Assert.Equal(100.0 / 1008, viewModel.QuotaRemainingPeriodValue, 8);
+        Assert.Equal(1.0 / 144, viewModel.QuotaSegments[0].Fill, 8);
+        Assert.All(viewModel.QuotaSegments.Skip(1), segment => Assert.Equal(0, segment.Fill));
         Assert.False(viewModel.HasLiveThreadSummary);
         Assert.False(viewModel.HasActiveThreads);
         Assert.False(viewModel.HasNoActiveThreads);
@@ -1051,6 +1099,7 @@ public sealed class MainWindowViewModelTests
         using var threads = new ThreadsWindowViewModel(viewModel, action => action());
         await Task.Delay(20);
         Assert.Empty(threads.Threads);
+        Assert.Equal("過去アカウントのスレッド情報は表示できません", threads.EmptyText);
         Assert.Equal(LocalizationService.Current.HistoricalThreadsUnavailable, threads.EmptyText);
         Assert.DoesNotContain("account-13", client.ThreadAccountIds);
     }
@@ -3168,9 +3217,12 @@ public sealed class MainWindowViewModelTests
             true,
             "2026/09/12 — 2026/09/12");
 
-        public AccountScopedClient(bool blockFirstCurrent = false)
+        private readonly ApiState historicalState;
+
+        public AccountScopedClient(bool blockFirstCurrent = false, ApiState historicalState = ApiState.Ready)
         {
             this.blockFirstCurrent = blockFirstCurrent;
+            this.historicalState = historicalState;
         }
 
         public Task FirstCurrentStarted => firstCurrentStarted.Task;
@@ -3300,7 +3352,7 @@ public sealed class MainWindowViewModelTests
 
             var result = CurrentFetchResult.Success(
                 new ApiCurrentSnapshot(
-                    ApiState.Ready,
+                    historical ? historicalState : ApiState.Ready,
                     historical ? 1_700_000_000 : 1_800_000_600,
                     true,
                     "Pro",

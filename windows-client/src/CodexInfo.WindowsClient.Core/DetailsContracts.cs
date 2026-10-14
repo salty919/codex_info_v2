@@ -144,6 +144,8 @@ public sealed record ApiHistoryPeriod(
     // boundary from the wire contract instead of parsing the ID or guessing
     // from the graph end.
     public long ResetAt { get; init; } = EndAt;
+    // Null for legacy directories without exact reset-window authority.
+    public long? OriginAt { get; init; }
 
     // History timestamps identify minutes, while period boundaries retain seconds.
     public bool ContainsHistoryMinute(long timestamp) =>

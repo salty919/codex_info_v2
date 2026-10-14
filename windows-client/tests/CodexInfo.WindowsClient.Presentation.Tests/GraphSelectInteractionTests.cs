@@ -101,6 +101,7 @@ public sealed class GraphSelectInteractionTests
     {
         var previousZone = LocalizationService.DisplayTimeZone.Id;
         LocalizationService.SetTimeZone("UTC");
+        Window? window = null;
         try
         {
             var first = new ApiHistoryPeriod("reset-a", DateTimeOffset.Parse("2026-10-13T00:30:00Z").ToUnixTimeSeconds(), 1_900_000_000, false, "05:45");
@@ -111,7 +112,7 @@ public sealed class GraphSelectInteractionTests
             var grouped = typeof(GraphSelect).GetProperty("GroupPeriodsByDate");
             Assert.NotNull(grouped);
             grouped.SetValue(selector, true);
-            var window = new Window { Content = selector };
+            window = new Window { Content = selector };
             window.Show();
             Invoke(selector, "OnFieldClick", new RoutedEventArgs(Button.ClickEvent));
             var tree = selector.FindControl<TreeView>("PeriodTree");
@@ -147,9 +148,8 @@ public sealed class GraphSelectInteractionTests
             tree.SelectedItem = second;
             Assert.Same(second, selector.SelectedItem);
             Assert.False(selector.IsOpen);
-            window.Close();
         }
-        finally { LocalizationService.SetTimeZone(previousZone); }
+        finally { window?.Close(); LocalizationService.SetTimeZone(previousZone); }
     });
 
     [Fact]
@@ -165,25 +165,28 @@ public sealed class GraphSelectInteractionTests
             IsChecked = true,
         };
         var window = new Window { Content = selector };
-        window.Show();
-        var list = selector.FindControl<ListBox>("MenuList");
-        Assert.NotNull(list);
-        Assert.Same(periods, list.ItemsSource);
-        Assert.Same(past, list.SelectedItem);
-        Invoke(selector, "OnFieldClick", new RoutedEventArgs(Button.ClickEvent));
-        Assert.True(selector.IsOpen);
+        try
+        {
+            window.Show();
+            var list = selector.FindControl<ListBox>("MenuList");
+            Assert.NotNull(list);
+            Assert.Same(periods, list.ItemsSource);
+            Assert.Same(past, list.SelectedItem);
+            Invoke(selector, "OnFieldClick", new RoutedEventArgs(Button.ClickEvent));
+            Assert.True(selector.IsOpen);
 
-        var refreshed = past with { Label = "Updated history" };
-        periods.Clear();
-        periods.Add(current);
-        periods.Add(refreshed);
-        selector.SelectedItem = refreshed;
+            var refreshed = past with { Label = "Updated history" };
+            periods.Clear();
+            periods.Add(current);
+            periods.Add(refreshed);
+            selector.SelectedItem = refreshed;
 
-        Assert.Same(refreshed, list.SelectedItem);
-        Assert.True(selector.IsOpen);
-        Assert.True(selector.IsChecked);
-        selector.Close();
-        window.Close();
+            Assert.Same(refreshed, list.SelectedItem);
+            Assert.True(selector.IsOpen);
+            Assert.True(selector.IsChecked);
+            selector.Close();
+        }
+        finally { window.Close(); }
     });
 
     [Theory]
@@ -240,6 +243,7 @@ public sealed class GraphSelectInteractionTests
         public TestApplication() => Styles.Add(new FluentTheme());
 
         public static AppBuilder BuildAvaloniaApp() => AppBuilder.Configure<TestApplication>()
-            .UseHeadless(new AvaloniaHeadlessPlatformOptions());
+            .UseSkia()
+            .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false });
     }
 }

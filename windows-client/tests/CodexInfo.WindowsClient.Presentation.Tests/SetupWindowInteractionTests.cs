@@ -22,7 +22,7 @@ public sealed class SetupWindowInteractionTests
     public async Task AuthenticationButtonStartsOnceWithoutCompletingSetup(bool launchSucceeds)
     {
         using var session = HeadlessUnitTestSession.StartNew(typeof(TestApplication));
-        await session.Dispatch(async () =>
+        await session.Dispatch<bool>(async () =>
         {
             var calls = 0;
             var oldLanguage = LocalizationService.Current.LanguageCode;
@@ -67,6 +67,7 @@ public sealed class SetupWindowInteractionTests
                 window.Close();
                 LocalizationService.SetLanguage(oldLanguage);
             }
+            return true;
         }, CancellationToken.None);
     }
 
@@ -90,6 +91,7 @@ public sealed class SetupWindowInteractionTests
     public sealed class TestApplication
     {
         public static AppBuilder BuildAvaloniaApp() => AppBuilder.Configure<App>()
-            .UseHeadless(new AvaloniaHeadlessPlatformOptions());
+            .UseSkia()
+            .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false });
     }
 }

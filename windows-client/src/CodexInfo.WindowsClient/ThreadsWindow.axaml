@@ -44,7 +44,14 @@
   </Window.Styles>
   <Grid Margin="20" RowDefinitions="30,384" RowSpacing="6">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"><PathIcon Classes="heading-icon" Data="{StaticResource IconThreads}" /><TextBlock Classes="window-title" Text="{Binding Texts.RunningThreads}" /></StackPanel>
+      <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+        <PathIcon Classes="heading-icon" Data="{StaticResource IconThreads}" />
+        <TextBlock Classes="window-title" Text="{Binding Texts.RunningThreads}" />
+        <TextBlock Classes="label" Margin="12,0,0,0" MaxWidth="420" VerticalAlignment="Center"
+                   Text="{Binding LoadErrorText}" TextWrapping="Wrap"
+                   Foreground="{DynamicResource ThemeF0A35B}" IsVisible="{Binding HasLoadError}"
+                   AutomationProperties.AutomationId="Threads.LoadError" />
+      </StackPanel>
       <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
         <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Threads.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
         <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Threads.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
@@ -56,6 +63,9 @@
                   HorizontalScrollBarVisibility="Disabled"
                   VerticalScrollBarVisibility="Auto">
       <Grid Width="860" Height="{Binding TreeSurfaceHeight}" VerticalAlignment="Top">
+        <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Top"
+                   IsVisible="{Binding HasPendingThreads}" Text="{Binding Texts.UnavailableDetails}"
+                   AutomationProperties.AutomationId="Threads.Pending" />
         <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Top" IsVisible="{Binding HasNoThreads}" Text="{Binding EmptyText}" />
         <ItemsControl Width="860" IsVisible="{Binding HasThreads}" ItemsSource="{Binding Threads}">
           <ItemsControl.ItemTemplate>

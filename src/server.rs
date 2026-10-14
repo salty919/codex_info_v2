@@ -97,6 +97,9 @@ pub struct PublicDetailedModelUsage {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicHistoryPeriod {
+    /// Internal v4 authority. Legacy v1-v3 serialization stays six fields.
+    #[serde(skip)]
+    pub origin_at: Option<i64>,
     pub id: String,
     pub start_at: i64,
     pub end_at: i64,
@@ -3357,6 +3360,7 @@ mod tests {
             }],
             active_thread_count: 1,
             history_periods: vec![PublicHistoryPeriod {
+                origin_at: None,
                 id: "1780400000".into(),
                 start_at,
                 end_at,
@@ -3408,6 +3412,7 @@ mod tests {
             monthly: false,
         });
         details.history_periods = vec![PublicHistoryPeriod {
+            origin_at: None,
             id: "slo-period".into(),
             start_at: start,
             end_at: end,
@@ -4152,6 +4157,7 @@ mod tests {
         let mut invalid = detailed_fixture();
         invalid.history_samples.clear();
         invalid.history_periods.push(PublicHistoryPeriod {
+            origin_at: None,
             id: "duplicate-reset".into(),
             start_at: 1_779_395_200,
             end_at: 1_780_000_020,

@@ -151,14 +151,19 @@ public sealed class GraphViewportRenderingTests
     [Fact]
     public void ResetBoundaryHasNoModelConnectorOrIdleBridge()
     {
-        var second = Scene(
+        // An unused tail requires both a flat model counter and flat quota.
+        // The ordinary Scene fixture decreases quota at every point.
+        static GraphScene FlatQuotaScene(long start, long end, params (long Timestamp, double Sol)[] points) =>
+            GraphScene.Create(points.Select(point => Sample(point.Timestamp, end, point.Sol, taskActiveSincePrevious: false)).ToArray(),
+                GraphMetric.Dollars, start, end);
+        var second = FlatQuotaScene(
             5_000,
             6_200,
             (5_000, 1),
             (5_300, 3),
             (5_600, 5),
             (6_200, 5));
-        var firstWithIdleTail = Scene(
+        var firstWithIdleTail = FlatQuotaScene(
             1_000,
             2_200,
             (1_000, 10),

@@ -483,8 +483,32 @@ public sealed record UiText(
     public string MainThread => LanguageCode switch { "ja" => "メイン", "zh-Hans" => "主线程", "ko" => "메인", "es" => "Principal", "fr" => "Principal", "de" => "Haupt", "pt" => "Principal", "it" => "Principale", "ru" => "Основной", _ => "Main" };
     public string SubThread => LanguageCode switch { "ja" => "サブ", "zh-Hans" => "子线程", "ko" => "하위", "es" => "Sub", "fr" => "Secondaire", "de" => "Untergeordnet", "pt" => "Sub", "it" => "Secondario", "ru" => "Подчинённый", _ => "Sub" };
     public string Context => LanguageCode switch { "ja" => "コンテキスト", "zh-Hans" => "上下文", "ko" => "컨텍스트", "es" => "Contexto", "fr" => "Contexte", "de" => "Kontext", "pt" => "Contexto", "it" => "Contesto", "ru" => "Контекст", _ => "Context" };
-    public string ThreadNameUnset => "未設定";
-    public string ContextUnobserved => "未観測";
+    public string ThreadNameUnset => LanguageCode switch
+    {
+        "ja" => "未設定",
+        "zh-Hans" => "未设置",
+        "ko" => "설정되지 않음",
+        "es" => "Sin definir",
+        "fr" => "Non défini",
+        "de" => "Nicht festgelegt",
+        "pt" => "Não definido",
+        "it" => "Non impostato",
+        "ru" => "Не задано",
+        _ => "Unset",
+    };
+    public string ContextUnobserved => LanguageCode switch
+    {
+        "ja" => "未観測",
+        "zh-Hans" => "未观测",
+        "ko" => "관측되지 않음",
+        "es" => "No observado",
+        "fr" => "Non observé",
+        "de" => "Nicht beobachtet",
+        "pt" => "Não observado",
+        "it" => "Non osservato",
+        "ru" => "Не наблюдалось",
+        _ => "Unobserved",
+    };
     public string Depth => LanguageCode switch { "ja" => "深さ", "zh-Hans" => "深度", "ko" => "깊이", "es" => "Profundidad", "fr" => "Profondeur", "de" => "Tiefe", "pt" => "Profundidade", "it" => "Profondità", "ru" => "Глубина", _ => "Depth" };
     public string Elapsed => LanguageCode switch { "ja" => "経過", "zh-Hans" => "已过", "ko" => "경과", "es" => "Transcurrido", "fr" => "Écoulé", "de" => "Vergangen", "pt" => "Decorrido", "it" => "Trascorso", "ru" => "Прошло", _ => "Elapsed" };
     public string Instruction => LanguageCode switch { "ja" => "指示", "zh-Hans" => "指令", "ko" => "지시", "es" => "Instrucción", "fr" => "Instruction", "de" => "Anweisung", "pt" => "Instrução", "it" => "Istruzione", "ru" => "Инструкция", _ => "Instruction" };
@@ -576,7 +600,33 @@ public sealed record UiText(
     public string HistoricalLastRecordedPrefix => LanguageCode switch { "ja" => "最終記録", "zh-Hans" => "最后记录", "ko" => "최종 기록", "es" => "Último registro", "fr" => "Dernier enregistrement", "de" => "Letzte Aufzeichnung", "pt" => "Último registro", "it" => "Ultima registrazione", "ru" => "Последняя запись", _ => "Last recorded" };
     public string HistoricalQuotaPeriod => LanguageCode switch { "ja" => "記録終了時の期間", "zh-Hans" => "记录结束时的周期", "ko" => "기록 종료 시점의 기간", "es" => "Período al finalizar el registro", "fr" => "Période à la fin de l’enregistrement", "de" => "Zeitraum am Ende der Aufzeichnung", "pt" => "Período no fim do registro", "it" => "Periodo alla fine della registrazione", "ru" => "Период на конец записи", _ => "Recorded ending period" };
     public string HistoricalAccountDetail => LanguageCode switch { "ja" => "過去の記録を表示しています", "zh-Hans" => "正在显示历史记录", "ko" => "과거 기록을 표시하고 있습니다", "es" => "Se muestra un registro histórico", "fr" => "Un enregistrement historique est affiché", "de" => "Eine historische Aufzeichnung wird angezeigt", "pt" => "Um registro histórico está sendo exibido", "it" => "È visualizzata una registrazione storica", "ru" => "Показана историческая запись", _ => "A historical record is displayed" };
-    public string HistoricalThreadsUnavailable => LanguageCode switch { "ja" => "記録された実行スレッドはありません", "zh-Hans" => "没有记录的运行线程", "ko" => "기록된 실행 중 스레드가 없습니다", "es" => "No hay hilos en ejecución registrados", "fr" => "Aucun thread en cours enregistré", "de" => "Keine laufenden Threads aufgezeichnet", "pt" => "Não há threads em execução registrados", "it" => "Nessun thread in esecuzione registrato", "ru" => "Нет записанных выполняющихся потоков", _ => "No running threads were recorded" };
+
+    public string HistoricalAccountErrorDetail => LanguageCode switch
+    {
+        "ja" => "過去の記録を表示しています。記録終了時は取得エラーでした。",
+        "zh-Hans" => "正在显示历史记录。记录结束时发生了获取错误。",
+        "ko" => "과거 기록을 표시하고 있습니다. 기록 종료 시 데이터를 가져오지 못했습니다.",
+        "es" => "Se muestra un registro histórico. La recopilación terminó con un error.",
+        "fr" => "Un enregistrement historique est affiché. La collecte s’est terminée par une erreur.",
+        "de" => "Eine historische Aufzeichnung wird angezeigt. Die Erfassung endete mit einem Fehler.",
+        "pt" => "Um registro histórico está sendo exibido. A coleta terminou com um erro.",
+        "it" => "È visualizzata una registrazione storica. La raccolta è terminata con un errore.",
+        "ru" => "Показана историческая запись. Сбор данных завершился с ошибкой.",
+        _ => "A historical record is displayed. Collection ended with an error."
+    };
+    public string HistoricalThreadsUnavailable => LanguageCode switch
+    {
+        "ja" => "過去アカウントのスレッド情報は表示できません",
+        "zh-Hans" => "无法显示历史账户的线程信息",
+        "ko" => "이전 계정의 스레드 정보는 표시할 수 없습니다",
+        "es" => "No se puede mostrar la información de hilos de una cuenta histórica",
+        "fr" => "Les informations des threads d’un compte historique ne sont pas disponibles",
+        "de" => "Thread-Informationen eines historischen Kontos sind nicht verfügbar",
+        "pt" => "As informações de threads de uma conta histórica não estão disponíveis",
+        "it" => "Le informazioni sui thread di un account storico non sono disponibili",
+        "ru" => "Информация о потоках исторической учётной записи недоступна",
+        _ => "Thread information is unavailable for a historical account"
+    };
     public string SignedInAccountSuffix => LanguageCode switch { "ja" => "［ログイン中］", "zh-Hans" => "［已登录］", "ko" => " [로그인 중]", "es" => " [sesión activa]", "fr" => " [connecté]", "de" => " [angemeldet]", "pt" => " [sessão ativa]", "it" => " [accesso]", "ru" => " [выполнен вход]", _ => " [signed in]" };
     public string HistoricalAccountSuffix => LanguageCode switch { "ja" => "［履歴］", "zh-Hans" => "［历史］", "ko" => " [기록]", "es" => " [historial]", "fr" => " [historique]", "de" => " [Verlauf]", "pt" => " [histórico]", "it" => " [cronologia]", "ru" => " [история]", _ => " [history]" };
     public string CurrentPeriodSuffix => LanguageCode switch { "ja" => "（現在）", "zh-Hans" => "（当前）", "ko" => " (현재)", "es" => " (actual)", "fr" => " (actuelle)", "de" => " (aktuell)", "pt" => " (atual)", "it" => " (corrente)", "ru" => " (текущий)", _ => " (current)" };

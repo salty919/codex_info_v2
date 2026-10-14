@@ -17,6 +17,40 @@ public sealed class LoopbackStatusClientTests
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
     [Fact]
+    public async Task Issue614HistoryOriginUsesVersionedAuthorityAndExact404Fallback()
+    {
+        foreach (var state in new[] { "known", "earlier", "unknown", "404", "503", "invalid" })
+        {
+            var paths = new List<string>();
+            using var client = new LoopbackStatusClient(new StubHandler(request =>
+            {
+                var path = request.RequestUri!.AbsolutePath;
+                paths.Add(path);
+                if (path == "/v3/history/periods")
+                    return JsonResponse(Issue646PeriodsJson("period"), includePublishedPair: true);
+                Assert.Equal("/v4/history/periods", path);
+                if (state == "404") return NotFoundResponse();
+                if (state == "503") return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+                var origin = state == "unknown" ? "null" : state == "invalid" ? "1800000001" : state == "earlier" ? "1799999940" : "1800000000";
+                var json = Issue646PeriodsJson("period").Replace("\"v3\"", "\"v4\"", StringComparison.Ordinal)
+                    .Replace("\"current\":true", $"\"current\":true,\"origin_at\":{origin}", StringComparison.Ordinal);
+                return JsonResponse(json, includePublishedPair: true);
+            }, versionedPeriods: true));
+            var result = await client.FetchHistoryPeriodsAsync("account-7");
+            Assert.Equal("/v4/history/periods", paths[0]);
+            Assert.Equal(state is "known" or "earlier" or "unknown" or "404", result.IsSuccess);
+            Assert.Equal(state == "404" ? 2 : 1, paths.Count);
+            if (result.IsSuccess)
+            {
+                var period = Assert.Single(result.Snapshot!.Periods);
+                var property = typeof(ApiHistoryPeriod).GetProperty("OriginAt");
+                Assert.NotNull(property);
+                Assert.Equal(state == "known" ? (long?)1800000000 : state == "earlier" ? 1799999940 : null, property.GetValue(period));
+            }
+        }
+    }
+
+    [Fact]
     public async Task Issue646SelectablePeriodsFallBackOnlyAfterExact404()
     {
         foreach (var state in new[] { "ok", "404", "500", "503", "malformed", "timeout" })
@@ -2284,7 +2318,7 @@ public sealed class LoopbackStatusClientTests
     private static string ValidHistoryPageJson() =>
         $"{{\"api_version\":\"v3\",\"history_samples\":[{{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"models\":[{{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}}],\"models_complete\":true,\"model_source\":\"confirmed\"}}],\"history_gaps\":[],\"next_cursor\":null,\"resume_cursor\":\"resume-opaque\"}}";
 
-    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler
+    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder, bool versionedPeriods = false) : HttpMessageHandler
     {
         public HttpRequestMessage? LastRequest { get; private set; }
 
@@ -2293,6 +2327,10 @@ public sealed class LoopbackStatusClientTests
             CancellationToken cancellationToken)
         {
             LastRequest = request;
+            // Existing fixtures describe a v3 server. Model its absent v4
+            // routes explicitly; the origin test exercises the v4 responder.
+            if (!versionedPeriods && request.RequestUri!.AbsolutePath.StartsWith("/v4/history/periods", StringComparison.Ordinal))
+                return Task.FromResult(NotFoundResponse());
             return Task.FromResult(responder(request));
         }
     }

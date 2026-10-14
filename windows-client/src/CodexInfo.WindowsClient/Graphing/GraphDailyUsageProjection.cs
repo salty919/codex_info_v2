@@ -86,12 +86,13 @@ internal static class GraphDailyUsageProjection
         double? priorDollars = null;
         ulong? lastKnownTokens = null;
         double? lastKnownDollars = null;
-        long? priorTimestamp = null;
-        var startDate = GraphTimeWindow.LocalDate(period.StartAt, displayTimeZone);
+        long? priorTokenTimestamp = null;
+        long? priorDollarTimestamp = null;
         foreach (var sample in samples)
         {
             var models = Models(sample).Where(model => model.Name == name).ToArray();
-            var authoritative = sample.ModelSource == ApiHistorySample.ConfirmedModelSource && sample.ModelsComplete &&
+            var authoritative = (sample.ModelSource == ApiHistorySample.ConfirmedModelSource && sample.ModelsComplete ||
+                sample.ModelSource == ApiHistorySample.LegacyUnknownModelSource) &&
                 models.Length == 1 && OwnsSpan(sample.Timestamp, sample.Timestamp, ownershipIntervals);
             var model = authoritative ? models[0] : null;
             var tokens = model?.TotalTokens;
@@ -116,13 +117,19 @@ internal static class GraphDailyUsageProjection
                 foreach (var affected in days.Values) affected.Dollars = null;
             }
 
-            var sameDay = priorTimestamp is { } previous && GraphTimeWindow.LocalDate(previous, displayTimeZone) == date &&
+            var sameTokenDay = priorTokenTimestamp is { } previousToken && GraphTimeWindow.LocalDate(previousToken, displayTimeZone) == date &&
+                OwnsSpan(previousToken, sample.Timestamp, ownershipIntervals) &&
+                !CrossesGap(previousToken, sample.Timestamp, period.ResetAt, gaps);
+            var sameDollarDay = priorDollarTimestamp is { } previous && GraphTimeWindow.LocalDate(previous, displayTimeZone) == date &&
                 OwnsSpan(previous, sample.Timestamp, ownershipIntervals) &&
                 !CrossesGap(previous, sample.Timestamp, period.ResetAt, gaps);
-            var initialDay = date == startDate && OwnsSpan(period.StartAt, sample.Timestamp, ownershipIntervals);
+            var initialDay = period.OriginAt is { } origin && origin <= sample.Timestamp &&
+                date == GraphTimeWindow.LocalDate(origin, displayTimeZone) &&
+                OwnsSpan(origin, sample.Timestamp, ownershipIntervals) &&
+                !CrossesGap(origin, sample.Timestamp, period.ResetAt, gaps);
             if (sample.Timestamp <= endAt && tokens is { } tokenValue && !tokenCorrection)
             {
-                if (sameDay && priorTokens is { } tokenBaseline)
+                if (sameTokenDay && priorTokens is { } tokenBaseline)
                 {
                     day.Tokens = checked((day.Tokens ?? 0) + (tokenValue - tokenBaseline));
                 }
@@ -133,7 +140,7 @@ internal static class GraphDailyUsageProjection
             }
             if (sample.Timestamp <= endAt && dollars is { } dollarValue && !dollarCorrection)
             {
-                if (sameDay && priorDollars is { } dollarBaseline)
+                if (sameDollarDay && priorDollars is { } dollarBaseline)
                 {
                     day.Dollars = (day.Dollars ?? 0) + (dollarValue - dollarBaseline);
                 }
@@ -143,11 +150,16 @@ internal static class GraphDailyUsageProjection
                 }
             }
 
-            priorTokens = tokens;
-            priorDollars = dollars;
-            priorTimestamp = sample.Timestamp;
-            if (tokens is not null) lastKnownTokens = tokens;
-            if (dollars is not null) lastKnownDollars = dollars;
+            if (tokens is not null)
+            {
+                priorTokens = lastKnownTokens = tokens;
+                priorTokenTimestamp = sample.Timestamp;
+            }
+            if (dollars is not null)
+            {
+                priorDollars = lastKnownDollars = dollars;
+                priorDollarTimestamp = sample.Timestamp;
+            }
         }
         return days;
     }

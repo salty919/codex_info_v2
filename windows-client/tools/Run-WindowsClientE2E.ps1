@@ -1245,6 +1245,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
     private static string accountsBody;
     private static string currentBody;
     private static string periodsBody;
+    private static string periodsV4Body;
     private static string currentHistoryBody;
     private static string pastHistoryBody;
     private static string oldestHistoryBody;
@@ -1275,7 +1276,8 @@ public static class CodexInfoWindowsE2EFixtureServer {
         string threads,
         string pair,
         string version,
-        int port) {
+        int port,
+        string periodsV4 = null) {
         if (running) return false;
         try {
             detailsBody = details;
@@ -1287,6 +1289,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
             EmptyThreads = false;
             PartialCurrentV4Requests = 0;
             periodsBody = periods;
+            periodsV4Body = periodsV4;
             currentHistoryBody = currentHistory;
             pastHistoryBody = pastHistory;
             oldestHistoryBody = "{\"api_version\":\"v3\",\"history_samples\":[],\"history_gaps\":[],\"next_cursor\":null,\"resume_cursor\":null}";
@@ -1452,6 +1455,15 @@ public static class CodexInfoWindowsE2EFixtureServer {
                             "\"$1\":0");
                     }
                     includePublishedPair = code == 200;
+                }
+                else if (parts[1] == "/v4/history/periods?account=account-7" &&
+                    !String.IsNullOrEmpty(periodsV4Body)) {
+                    Interlocked.Increment(ref periodsRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = periodsV4Body;
+                    includePublishedPair = true;
                 }
                 else if (parts[1] == "/v3/history/periods?account=account-7") {
                     Interlocked.Increment(ref periodsRequests);
@@ -3585,6 +3597,12 @@ function New-E2EFixtureDocuments {
     # Theme mode needs a genuinely ready status for the UX-spec ready-color
     # oracle. The normal fixture retains its original reset-warning timing.
     $currentReset = if ($ThemePresets) { $now + 172800 } else { $now + 7200 }
+    if ($CalendarOnly) {
+        # Calendar records the initial cumulative usage on its verified origin
+        # day. Keep the official four-hour window and the recording start distinct.
+        $currentOrigin = $currentStart - ($currentStart % 3600)
+        $currentReset = $currentOrigin + 14400
+    }
     $pastStart = $now - 360
     $pastReset = $now - 180
     # The current graph contract admits an unused band only after 10 minutes
@@ -3647,6 +3665,12 @@ function New-E2EFixtureDocuments {
     $periods = @"
 {"api_version":"v3","history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$v3PastStart,"end_at":$v3PastReset,"reset_at":$v3PastReset,"label":"Past period","current":false}]}
 "@
+    $periodsV4 = ''
+    if ($CalendarOnly) {
+        $periodsV4 = @"
+{"api_version":"v4","history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true,"origin_at":$currentOrigin},{"id":"e2e-past","start_at":$v3PastStart,"end_at":$v3PastReset,"reset_at":$v3PastReset,"label":"Past period","current":false,"origin_at":$v3PastStart}]}
+"@.Trim()
+    }
     $currentHistory = @"
 {"api_version":"v3","history_samples":[{"timestamp":$currentStart,"reset_at":$currentReset,"remaining_percent":92.0,"models":[{"model":"SOL","total_tokens":100,"input_tokens":70,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":30,"total_dollars":0.25},{"model":"TERRA","total_tokens":200,"input_tokens":140,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":60,"total_dollars":0.50},{"model":"LUNA","total_tokens":300,"input_tokens":210,"cached_input_tokens":60,"cache_write_input_tokens":0,"output_tokens":90,"total_dollars":0.75}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":null},{"timestamp":$now,"reset_at":$currentReset,"remaining_percent":72.0,"models":[{"model":"SOL","total_tokens":1200,"input_tokens":800,"cached_input_tokens":200,"cache_write_input_tokens":0,"output_tokens":400,"total_dollars":1.20},{"model":"TERRA","total_tokens":2400,"input_tokens":1600,"cached_input_tokens":500,"cache_write_input_tokens":0,"output_tokens":800,"total_dollars":2.40},{"model":"LUNA","total_tokens":3600,"input_tokens":2500,"cached_input_tokens":700,"cache_write_input_tokens":0,"output_tokens":1100,"total_dollars":3.60}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":true}],"history_gaps":[],"next_cursor":null,"resume_cursor":"e2e-current-resume"}
 "@
@@ -3682,6 +3706,7 @@ function New-E2EFixtureDocuments {
         Accounts = $accounts.Trim()
         Current = $current.Trim()
         Periods = $periods.Trim()
+        PeriodsV4 = $periodsV4
         CurrentHistory = $currentHistory.Trim()
         PastHistory = $pastHistory.Trim()
         CurrentHistoryDelta = $currentHistoryDelta
@@ -3922,7 +3947,8 @@ function Enter-E2EFixture {
         $documents.Threads,
         $documents.PublishedPair,
         $script:e2eProductVersion,
-        0)) 'Could not bind the fixture to an ephemeral loopback port.'
+        0,
+        $documents.PeriodsV4)) 'Could not bind the fixture to an ephemeral loopback port.'
     $script:e2eFixturePort = [CodexInfoWindowsE2EFixtureServer]::BoundPort()
     Assert-E2E ($script:e2eFixturePort -ge 1 -and $script:e2eFixturePort -le 65535) 'Fixture did not report a valid bound port.'
     $script:e2eFixtureRunning = $true
@@ -6767,7 +6793,8 @@ try {
             Assert-E2E ($flattenedFixtureRows.IndexOf($contextCase.Usage, [StringComparison]::Ordinal) -ge 0) `
                 "Threads context usage/limit missing: $($contextCase.Id)"
         }
-        $missingContextText = ([string][char]0x672A) + [char]0x89B3 + [char]0x6E2C
+        # The fixture uses English settings; missing values follow that locale.
+        $missingContextText = 'Context Unobserved'
         Assert-E2E ($flattenedFixtureRows.IndexOf($missingContextText, [StringComparison]::Ordinal) -ge 0) `
             "Missing context must be rendered as $($missingContextText)."
         Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Context [0-9]+(?:\.[0-9]+)?%$').Count -eq 3) `

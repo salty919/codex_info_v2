@@ -872,7 +872,7 @@ internal static class GraphPlotProjection
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
         if (baselineMode is GraphRemainingBaselineMode.PeriodStartAtFullQuota &&
-            (scene.IsVerifiedCurrentResetStart || scene.PublishedPeriodStarts.Contains(scene.PeriodStartAt)) &&
+            scene.HasVerifiedPeriodOrigin &&
             anchors.Length > 0 &&
             scene.RemainingObserved[anchors[0]] &&
             scene.Timestamps[anchors[0]] > scene.PeriodStartAt &&
@@ -977,6 +977,7 @@ internal static class GraphPlotProjection
 
         var previous = anchors.LastOrDefault(-1);
         if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous] &&
+            !IsObservationMinuteRemainder(scene, scene.Timestamps[previous]) &&
             !scene.OverlapsNonOwnedInterval(scene.Timestamps[previous], scene.PeriodEndAt))
         {
             // The remote source may stop while the current period continues.
@@ -1188,13 +1189,13 @@ internal static class GraphPlotProjection
         var modelName = scene.ModelSeries
             .FirstOrDefault(pair => ReferenceEquals(pair.Value, values))
             .Key;
-        var firstAnchorIsDirect = firstAnchor >= 0 &&
+        var firstAnchorIsRecorded = firstAnchor >= 0 &&
             modelName is not null &&
-            scene.ModelReliability.TryGetValue(modelName, out var modelReliability) &&
-            firstAnchor < modelReliability.Count &&
-            modelReliability[firstAnchor];
-        if (scene.IsVerifiedCurrentResetStart &&
-            firstAnchorIsDirect &&
+            ((scene.ModelReliability.TryGetValue(modelName, out var modelReliability) &&
+              firstAnchor < modelReliability.Count && modelReliability[firstAnchor]) ||
+             scene.HasRecordedModelContribution(values, firstAnchor));
+        if (scene.HasVerifiedPeriodOrigin &&
+            firstAnchorIsRecorded &&
             scene.Timestamps[firstAnchor] > scene.PeriodStartAt &&
             !scene.HasModelHardBreakBetween(
                 values,
@@ -1203,7 +1204,7 @@ internal static class GraphPlotProjection
             !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[firstAnchor]))
         {
             // The zero origin is a presentation boundary supported by both
-            // the verified current period and this series' direct first
+            // the verified published period and this series' recorded first
             // anchor. It never becomes a model sample or hover observation.
             var (baselineX, baselineY) = values[firstAnchor] == 0
                 ? (flatX, flatY)
@@ -1219,6 +1220,10 @@ internal static class GraphPlotProjection
 
         var previous = anchors.LastOrDefault(-1);
         if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous] &&
+            !IsObservationMinuteRemainder(scene, scene.Timestamps[previous]) &&
+            !(scene.IsCurrentPeriod &&
+                scene.PeriodEndAt / 60 == (long)scene.Timestamps[previous] / 60 + 1 &&
+                !scene.HasModelHardBreakBetween(values, scene.Timestamps[previous], scene.PeriodEndAt)) &&
             !scene.OverlapsNonOwnedInterval(scene.Timestamps[previous], scene.PeriodEndAt))
         {
             if (!AppendStoppedBridge(scene, scene.Timestamps[previous], values[previous],
@@ -1238,6 +1243,12 @@ internal static class GraphPlotProjection
             new GraphLineProjection(risingX, risingY),
             new GraphLineProjection(dashedX, dashedY));
     }
+
+    // A period ending inside its latest observed minute has no missing
+    // minute yet. Stop the line at the observation; retain the published axis
+    // endpoint without inventing a value or a prediction for those seconds.
+    private static bool IsObservationMinuteRemainder(GraphScene scene, double observedAt) =>
+        scene.PeriodEndAt / 60 == (long)observedAt / 60;
 
     // Only missing-data bridges use this projection. Measured anchors and hover data stay intact.
     private static bool AppendStoppedBridge(
@@ -1848,7 +1859,9 @@ internal static class GraphPlotProjection
             var timestamps = indices.Select(index => scene.Timestamps[index]).ToArray();
             var runValues = indices.Select(index => values[index]).ToArray();
             var preservedIndices = run
-                .SelectMany((interval, index) => interval.Style is ProjectionStyle.Dashed
+                // A recorded unchanged cumulative interval must stay flat.
+                // Removing its endpoints moves later usage into earlier time.
+                .SelectMany((interval, index) => interval.Style is ProjectionStyle.Dashed or ProjectionStyle.Flat
                     ? new[] { index, index + 1 }
                     : Array.Empty<int>())
                 .ToHashSet();

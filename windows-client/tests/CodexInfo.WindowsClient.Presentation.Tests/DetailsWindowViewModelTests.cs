@@ -179,7 +179,7 @@ public sealed class DetailsWindowViewModelTests
     [Fact]
     public void JapaneseDurationsOmitZeroUnitsAndUseExplicitElapsedFallback()
     {
-        var text = LocalizationService.Current;
+        var text = Assert.Single(LocalizationService.Languages, text => text.LanguageCode == "ja");
 
         Assert.Equal("残り 2日 3時間 4分", text.FormatRemaining(2, 3, 4));
         Assert.Equal("残り 2日", text.FormatRemaining(2, 0, 0));

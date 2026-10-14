@@ -589,13 +589,13 @@
       "dollar_series":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[1.0,1.0,1.0,1.0,1.0]},
       "remaining_input":[90.0,90.0,89.0,89.0,88.0],
       "remaining_effective":[90.0,90.0,89.0,89.0,88.0],
-      "idle_intervals":[[0,1200]],
+      "idle_intervals":[],
       "model_segments":{
         "LUNA":{"idle":[[0,300],[300,600],[600,900],[900,1200]],"flat":[],"rising":[],"dashed":[]},
         "SOL":{"idle":[[0,300],[300,600],[600,900],[900,1200]],"flat":[],"rising":[],"dashed":[]}
       },
       "model_line_values":{"tokens":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[100.0,100.0,100.0,100.0,100.0]},"dollars":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[1.0,1.0,1.0,1.0,1.0]}},
-      "remaining_segments":{"idle":[[0,300],[600,900]],"solid":[[300,600],[900,1200]],"dashed":[]},
+      "remaining_segments":{"idle":[],"solid":[[0,300],[300,600],[600,900],[900,1200]],"dashed":[]},
       "line_widths":{"model_idle":1.0,"remaining_idle":1.0,"remaining_solid":3.0},
       "latest_labels":{"SOL":"$1.00","remaining":"88%"}
     }
