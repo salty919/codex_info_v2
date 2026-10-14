@@ -447,6 +447,14 @@ public sealed class DetailsPresentationCoverageTests
         Assert.Same(initialScene, graph.Scene);
         Assert.Equal(1, graph.Points[^1].SolValue);
 
+        // History failure must stay visible independently of a retained plot.
+        var graphMarkup = XDocument.Parse(LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "GraphWindow.axaml"));
+        Assert.Contains(graphMarkup.Descendants(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            (string?)element.Attribute("IsVisible") == "{Binding HasRetainedLoadError}" &&
+            (string?)element.Attribute("Text") == "{Binding LoadErrorText}");
+
         // reset-required sends no C0 on the next cycle. A complete head root
         // replaces the scene and clears reset-required with the new C1.
         await RefreshGraphResourceAsync(graph, period.Id);
@@ -832,7 +840,7 @@ public sealed class DetailsPresentationCoverageTests
         const long start = 1_800_000_000;
         const long firstObservation = start + 60;
         const long end = start + 3_600;
-        var period = CreateSingleAstraPeriod("current", start, end, current: true, firstObservation, 95, 257, 42.5);
+        var period = CreateSingleAstraPeriod("current", start, end, current: true, firstObservation, 95, 257, 42.5) with { OriginAt = start };
         var details = CreateDetails([period], Array.Empty<ApiThreadDetails>()) with
         {
             Quota = new ApiQuota(95, end, end - start, false),
@@ -873,7 +881,7 @@ public sealed class DetailsPresentationCoverageTests
         const long start = 1_805_000_000;
         const long firstObservation = start + 60;
         const long end = start + 3_600;
-        var period = CreateSingleAstraPeriod("current-zero", start, end, current: true, firstObservation, 100, 0, 0);
+        var period = CreateSingleAstraPeriod("current-zero", start, end, current: true, firstObservation, 100, 0, 0) with { OriginAt = start };
         var details = CreateDetails([period], Array.Empty<ApiThreadDetails>()) with
         {
             Quota = new ApiQuota(100, end, end - start, false),
@@ -908,7 +916,7 @@ public sealed class DetailsPresentationCoverageTests
         const long start = 1_810_000_000;
         const long firstObservation = start + 300;
         const long end = start + 3_600;
-        var period = CreateSingleAstraPeriod("late-current", start, end, current: true, firstObservation, 95, 257, 42.5);
+        var period = CreateSingleAstraPeriod("late-current", start, end, current: true, firstObservation, 95, 257, 42.5) with { OriginAt = start };
         var details = CreateDetails([period], Array.Empty<ApiThreadDetails>()) with
         {
             Quota = new ApiQuota(95, end, end - start, false),
@@ -936,12 +944,12 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
-    public async Task GraphWindow_PublishedHistoricalPeriodHasQuotaBaselineWithoutModelBackfill()
+    public async Task GraphWindow_PublishedHistoricalPeriodHasQuotaAndZeroModelBaselinesWithoutRawBackfill()
     {
         const long start = 1_820_000_000;
         const long firstObservation = start + 300;
         const long end = start + 3_600;
-        var period = CreateSingleAstraPeriod("historical", start, end, current: false, firstObservation, 95, 257, 42.5);
+        var period = CreateSingleAstraPeriod("historical", start, end, current: false, firstObservation, 95, 257, 42.5) with { OriginAt = start };
         var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
         var pair = PublishedPairIdentity.Create($"v1:{new string('3', 64)}");
         var resourceClient = new CountingHistoryResourceClient(details, period, pair);
@@ -959,7 +967,13 @@ public sealed class DetailsPresentationCoverageTests
         Assert.Equal(100d, quota.Y[0]);
         Assert.InRange(quota.X[^1], firstObservation - 4d, firstObservation + 4d);
         Assert.Equal(95d, quota.Y[^1], precision: 8);
-        Assert.DoesNotContain((double)start, geometry.ModelLines[GraphSeries.Astra].Rising.Line.X);
+        var model = geometry.ModelLines[GraphSeries.Astra].Rising.Line;
+        var modelOrigin = Array.IndexOf(model.X.ToArray(), (double)start);
+        Assert.True(modelOrigin >= 0);
+        Assert.Equal(0d, model.Y[modelOrigin]);
+        Assert.Equal(GraphMetric.Tokens, graph.Scene.Metric);
+        Assert.Equal(257d, graph.Scene.Astra[0]);
+        Assert.DoesNotContain(0d, graph.Scene.Astra);
         Assert.DoesNotContain((double)start, geometry.RemainingLines.Dashed.Line.X);
         Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
         Assert.Equal(95d, graph.Scene.ObservedRemainingValues[0]);
@@ -975,7 +989,7 @@ public sealed class DetailsPresentationCoverageTests
         const long firstObservation = start + 300;
         const long viewportStart = start + 60;
         const long end = start + 3_600;
-        var period = CreateSingleAstraPeriod("current-window", start, end, current: true, firstObservation, 95, 257, 42.5);
+        var period = CreateSingleAstraPeriod("current-window", start, end, current: true, firstObservation, 95, 257, 42.5) with { OriginAt = start };
         var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
         var pair = PublishedPairIdentity.Create($"v1:{new string('4', 64)}");
         var resourceClient = new CountingHistoryResourceClient(details, period, pair);
@@ -1046,6 +1060,63 @@ public sealed class DetailsPresentationCoverageTests
         Assert.Equal(samples[0].Timestamp, graph.Points[0].Timestamp);
         Assert.Equal(period.EndAt, graph.Points[^1].Timestamp);
         Assert.Null(graph.Points[^1].RemainingPercent);
+    }
+
+    [Fact]
+    public async Task ThreadsWindow_UnknownAndFailedAcquisitionCannotClaimEmpty()
+    {
+        using var main = new MainWindowViewModel(new StaticCombinedClient(
+            DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport)));
+        using var threads = new ThreadsWindowViewModel(main);
+
+        Assert.False(main.HasDetails);
+        Assert.False(threads.HasThreads);
+        Assert.False(threads.HasNoThreads);
+
+        main.Start();
+        await EventuallyAsync(() => main.DetailsStatusAutomationText == "error");
+        Assert.False(threads.HasNoThreads);
+        Assert.True(threads.HasLoadError);
+
+        var markup = XDocument.Parse(LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "ThreadsWindow.axaml"));
+        Assert.Contains(markup.Descendants(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            (string?)element.Attribute("IsVisible") == "{Binding HasLoadError}");
+        Assert.Contains(markup.Descendants(), element =>
+            element.Name.LocalName == "TextBlock" &&
+            (string?)element.Attribute("IsVisible") == "{Binding HasPendingThreads}");
+    }
+
+    [Fact]
+    public async Task ThreadsWindow_RetainedRowsExposeMainAcquisitionFailureAndRecover()
+    {
+        var row = new ApiThreadDetails("source-thread", "source title", null, "SOL", "SOL",
+            null, null, null, 1, 1, false, 0, false)
+        {
+            ActivityStatus = ApiThreadActivityStatus.Running,
+        };
+        var ready = CreateDetails([], [row]);
+        var client = new SequenceCombinedClient(
+            DetailsFetchResult.Success(ready),
+            DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport),
+            DetailsFetchResult.Success(ready with { ObservedAt = ready.ObservedAt + 1 }));
+        using var main = new MainWindowViewModel(client);
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
+        using var threads = new ThreadsWindowViewModel(main);
+        Assert.Equal(row.Id, Assert.Single(threads.Threads).Id);
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsStatusAutomationText == "error");
+        Assert.True(threads.HasLoadError);
+        Assert.False(threads.HasNoThreads);
+        Assert.Equal(row.Id, Assert.Single(threads.Threads).Id);
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot?.ObservedAt == ready.ObservedAt + 1);
+        Assert.False(threads.HasLoadError);
+        Assert.Equal(row.Id, Assert.Single(threads.Threads).Id);
     }
 
     [Fact]

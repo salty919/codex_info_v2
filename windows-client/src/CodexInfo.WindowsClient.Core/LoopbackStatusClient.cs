@@ -31,6 +31,8 @@ public sealed class LoopbackStatusClient :
     private static readonly string CurrentV4Endpoint = $"{EndpointRoot}/v4/current";
     private static readonly string HistoryPeriodsEndpoint = $"{EndpointRoot}/v3/history/periods";
     private static readonly string SelectableHistoryPeriodsEndpoint = $"{EndpointRoot}/v3/history/periods/selectable";
+    private static readonly string HistoryPeriodsV4Endpoint = $"{EndpointRoot}/v4/history/periods";
+    private static readonly string SelectableHistoryPeriodsV4Endpoint = $"{EndpointRoot}/v4/history/periods/selectable";
     private static readonly string HistoryEndpoint = $"{EndpointRoot}/v3/history";
     private static readonly string ThreadsEndpoint = $"{EndpointRoot}/v3/threads";
     private static readonly string DetailsV3Endpoint = $"{EndpointRoot}/v3/details";
@@ -611,7 +613,8 @@ public sealed class LoopbackStatusClient :
     private async Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsForAccountAsync(
         string? accountId,
         CancellationToken cancellationToken,
-        bool selectable = false)
+        bool selectable = false,
+        bool legacyVersion = false)
     {
         var accountScope = BeginAccountScope(accountId);
         if (accountId is not null && !IsSafeAccountId(accountId))
@@ -625,25 +628,50 @@ public sealed class LoopbackStatusClient :
                 ApiHistoryPeriodsSnapshot.FromDetails(cachedLegacy));
         }
 
-        var endpoint = AppendAccountQuery(selectable ? SelectableHistoryPeriodsEndpoint : HistoryPeriodsEndpoint, accountId);
+        var endpoint = AppendAccountQuery(legacyVersion
+            ? selectable ? SelectableHistoryPeriodsEndpoint : HistoryPeriodsEndpoint
+            : selectable ? SelectableHistoryPeriodsV4Endpoint : HistoryPeriodsV4Endpoint, accountId);
+        var version = legacyVersion ? "v3" : "v4";
+        var cached = GetHistoryPeriodsCache(selectable);
         var result = await FetchSplitResourceAsync(
                 endpoint,
                 cacheKey: endpoint,
-                cached: GetHistoryPeriodsCache(selectable),
-                (body, pair) => ParseHistoryPeriods(body, pair) is { } parsed
-                    ? parsed with { AccountId = accountId }
-                    : null,
+                cached: cached?.ApiVersion == version ? cached : null,
+                (body, pair) =>
+                {
+                    if (ParseHistoryPeriods(body, pair, version) is not { } parsed) return null;
+                    if (legacyVersion && GetCurrentCache() is { } current &&
+                        current.PublishedPair == pair && current.AccountId == accountId && current.Quota is { } quota &&
+                        quota.WindowSeconds > 0 && quota.ResetAt > quota.WindowSeconds)
+                    {
+                        parsed = parsed with
+                        {
+                            Periods = parsed.Periods.Select(period =>
+                            period.Current && period.ResetAt == quota.ResetAt && quota.ResetAt - quota.WindowSeconds <= period.StartAt
+                                ? period with { OriginAt = quota.ResetAt - quota.WindowSeconds } : period).ToArray()
+                        };
+                    }
+                    return parsed with { AccountId = accountId };
+                },
                 static value => value.PublishedPair,
                 value => StoreHistoryPeriodsCache(value, accountScope, selectable),
-                () => EvictHistoryPeriodsCache(accountScope, selectable),
+                () =>
+                {
+                    if (GetHistoryPeriodsCache(selectable)?.ApiVersion == version)
+                        EvictHistoryPeriodsCache(accountScope, selectable);
+                },
                 cancellationToken,
                 scopeIsCurrent: () => IsAccountScopeCurrent(accountId, accountScope))
             .ConfigureAwait(false);
+        if (!legacyVersion && result.NotFound)
+        {
+            return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken, selectable, legacyVersion: true).ConfigureAwait(false);
+        }
         if (selectable && result.NotFound)
         {
             // Older servers can supply their observed directory. Other
             // failures never become a successful empty selector.
-            return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken).ConfigureAwait(false);
+            return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken, legacyVersion: true).ConfigureAwait(false);
         }
         return result.Value is not null
             ? HistoryPeriodsFetchResult.Success(result.Value)
@@ -2061,7 +2089,8 @@ public sealed class LoopbackStatusClient :
 
     private static ApiHistoryPeriodsSnapshot? ParseHistoryPeriods(
         byte[] body,
-        PublishedPairIdentity publishedPair)
+        PublishedPairIdentity publishedPair,
+        string version = "v3")
     {
         try
         {
@@ -2076,8 +2105,8 @@ public sealed class LoopbackStatusClient :
             var root = document.RootElement;
             if (!HasExactlyProperties(root, HistoryPeriodsTopLevelProperties, 2) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
-                apiVersion != "v3" ||
-                !TryGetHistoryPeriods(root, observedAt: null, out var periods, requireCurrentObserved: false))
+                apiVersion != version ||
+                !TryGetHistoryPeriods(root, observedAt: null, out var periods, requireCurrentObserved: false, hasOrigin: version == "v4"))
             {
                 return null;
             }
@@ -2617,7 +2646,8 @@ public sealed class LoopbackStatusClient :
         JsonElement parent,
         long? observedAt,
         out List<ApiHistoryPeriod> periods,
-        bool requireCurrentObserved = true)
+        bool requireCurrentObserved = true,
+        bool hasOrigin = false)
     {
         periods = new List<ApiHistoryPeriod>();
         if (!parent.TryGetProperty("history_periods", out var property) ||
@@ -2633,7 +2663,8 @@ public sealed class LoopbackStatusClient :
         ApiHistoryPeriod? previous = null;
         foreach (var period in property.EnumerateArray())
         {
-            if (!HasExactlyProperties(period, HistoryPeriodProperties, 6) ||
+            var fields = hasOrigin ? new HashSet<string>(HistoryPeriodProperties, StringComparer.Ordinal) { "origin_at" } : HistoryPeriodProperties;
+            if (!HasExactlyProperties(period, fields, hasOrigin ? 7 : 6) ||
                 !TryGetBoundedString(period, "id", 1, 512, out var id) ||
                 !periodIds.Add(id) ||
                 !TryGetUnixSeconds(period, "start_at", out var startAt) ||
@@ -2648,6 +2679,14 @@ public sealed class LoopbackStatusClient :
                 return false;
             }
 
+            long? originAt = null;
+            if (hasOrigin && period.GetProperty("origin_at").ValueKind != JsonValueKind.Null)
+            {
+                if (!TryGetUnixSeconds(period, "origin_at", out var origin) || origin > startAt)
+                    return false;
+                originAt = origin;
+            }
+
             var candidate = new ApiHistoryPeriod(
                 id,
                 startAt,
@@ -2656,6 +2695,7 @@ public sealed class LoopbackStatusClient :
                 label)
             {
                 ResetAt = resetAt,
+                OriginAt = originAt,
             };
             if (previous is not null &&
                 (candidate.StartAt > previous.StartAt ||

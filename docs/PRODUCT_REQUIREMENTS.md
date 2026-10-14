@@ -92,7 +92,7 @@ REST/DBの公開応答に含めるモデル数値は、同じmodel keyを持つ�
 | `I18N` | `docs/LOCALIZATION.md` | locale、固定文言、時刻、font |
 | `SECURITY` | `SECURITY.md` | trust boundary、秘密、入力検証、残余risk |
 
-利用枠の取得原本保存・再処理の契約はDATA owner `QUOTA-DURABLE-604`へ委譲する。公式応答を解釈・期間判定・Session集計より先に保存し、後段の失敗による原本消失を防ぐ。
+利用枠の取得原本保存・再処理の契約はDATA owner `QUOTA-DURABLE-604`へ委譲する。公式応答を解釈・期間判定・Session集計より先に保存し、後段の失敗による原本消失を防ぐ。過去Session原本に残る公式windowも、同DATA ownerのsource検証とaccount所有区間を満たす場合は期間起点として復元する。最初の保存時刻から推測せず、現在quota・元のmodel値・receiptの取得順を変えない。
 
 通常の期間利用枠では、公式応答が長さとリセット日時を示した窓のうち、最も長い窓を表示・記録対象にする。これは短期枠より週枠を表示するための製品側の選択であり、公式APIがprimary/secondaryの優先順位を保証するという意味ではない。同じ長さなら後のリセット日時、両者も同じならprimaryを選ぶ。公式型が許すnullの期間長・リセット日時を持つ窓は選択対象外とし、別の完全に報告された窓を拒否する理由にしない。選択できる窓がない場合は期間や残量を推測せず、取得原本を保持して解釈不能として扱う。
 
@@ -389,7 +389,19 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 
 ## G137 Linux / Windows 履歴グラフ同値契約
 
-`HISTORY-RECOVERY-614`: recorder 起動時の直近31日原本回復は、account partition に帰属済みの Session event と元 byte range/hash、観測時刻、保存済み exact reset が一致する quota だけを採用する。既存 quota が NULL の場合に加え、公開履歴の行自体が欠けている場合も回復する。model の証拠がない追加点は既存の unavailable durable observation として保存し、model 行や使用量0を作らない。元ファイル不在・改変、未知 reset、同じ minute の複数 reset は回復せず不明を保持する。保存は atomic・冪等とし、既存非NULL quota、model 累計、現在 quota receipt、Session checkpoint を変更しない。quota の差分から使用者・端末・model 使用量を推定しない。現在の原本が当該 account/reset に帰属しない場合の完全復元は保証しない。
+`HISTORY-RECOVERY-614`: recorder 起動時の保持対象3か月の原本回復は、account partition に帰属済みの Session event と元 byte range/hash、観測時刻、保存済み exact reset が一致する quota だけを採用する。原本のbyte位置が変わった場合は、同じroot/pathで別途受理済みのrangeのhashを検証し、正規化済みeventの時刻・exact model・5 token成分が全て一致する原本recordだけを採用できる。時刻やファイル名だけで同一eventと推定せず、未受理rangeやhash不一致を救済しない。原本が報告する正の期間長のうち最長窓を対象とし、保存済み公式 window がある場合はその期間長とも一致させる。期間長欠落・矛盾を10080分などの固定値で補わない。既存 quota が NULL の場合に加え、公開履歴の行自体が欠けている場合も回復する。model の証拠がない追加点は既存の unavailable durable observation として保存し、model 行や使用量0を作らない。検証可能な原本rangeがない、未知 reset、同じ minute の複数 reset は回復せず不明を保持する。保存は atomic・冪等とし、既存非NULL quota、model 累計、現在 quota receipt、Session checkpoint を変更しない。quota の差分から使用者・端末・model 使用量を推定しない。現在の原本が当該 account/reset に帰属しない場合の完全復元は保証しない。
+
+通常cycleでも、新たに受理するSession rangeのhashと所有区間を確認し、その範囲の既知reset/windowに属するquotaをmodel履歴・range・checkpointと同じtransactionで保存する。既存非NULL quotaと現在receiptを上書きせず、quota保存が失敗したcycleはmodelだけを公開・受領済みにしない。通常cycleで過去range全件の再読取りや位置変更後の原本探索を行わず、起動時の原本復旧と処理範囲を区別する。durable JSONの数値表記は、同じSQLite connectionとSerdeの双方で元のbinary64へ一致することを確認し、保存金額や厳密照合guardを丸め差のために変更しない。
+
+model累計の復元はquota回復から独立した操作とする。検証済みpartition backupとaccount lifecycleを前提に、公式reset/window内の帰属済みSession eventの5成分合計が現在の保存合計と一致する場合だけ、既存minute・公式quota観測minute・原本event minuteの累計を各minuteの既知原本prefixから再構成する。閉じた期間では、同じexact reset/windowの保存済み最新source frame、または最後のlossless canonical model観測の5成分が当該期間の全帰属済みSession event合計と一致し、原本rangeの全identity・hashと公式receiptの受信順で期間境界を検証できる場合だけ同じ復元を行う。旧offset退役後もこの既知成分の根拠を失わない。最初の原本event minuteから既存記録終端までのeventがないminuteも、同じ全原本合計の一致を前提に既知累計prefixを復元できる。quotaを観測していないminuteの残量はNULLのまま保持する。元event・receipt・checkpoint・現在合計を変更せず、保存済み価格の根拠を保持し、原本の既知成分からmodel集合の完備を推定しない。別期間のrowは同じminuteの公式receiptが完全一致する場合だけ置換できる。置換範囲を全て再構成できた旧派生offsetだけを同じtransactionで退役し、別期間の補正を保持する。再実行で値・世代を変えない。
+
+通常の後着eventも同じ原本prefixの意味で既存minuteの変更suffixへ反映する。後続のquota-only minuteを古い累計のまま残さず、同じ公式reset/windowの派生offsetがあればその先頭まで再構成範囲を広げる。writerは同じwrite transactionのsource合計・各minute prefix・全既存minuteと補正pointの被覆を検証してから旧投影と派生offsetを置換する。新しいquotaを持つminuteへ旧quotaを混ぜない。正規化で検証済みminuteが消える場合はtransaction全体を拒否し、原本・旧投影・補正・checkpointを保持する。通常cycleで原本全文再scanやbackupを追加しない。
+
+Sessionのminute集計終端を最新quota receiptの観測時刻で打ち切らない。scan中にminuteが進んだ場合も、受理したeventをその記録minuteへ保存する。quotaのminuteへ付けるmodel値は、そのminute末尾までの検証済み原本prefixを使い、後のminuteの使用量を古いreceipt時刻へ加算しない。複数receiptがscan間に届いた場合も、同じexact window・所有区間内の未記録minuteを全て対象とし、各minute固有の残量と確認済みprefixを同じtransactionで反映する。新しいtokenがないcycleでも確認済みprefixを保持し、sourceの裏付けがない初期minuteや別exact periodの既存minuteを0や別期間の値へ置換しない。変更suffixより前の保存minuteを古いquotaの再利用で書き換えず、quota未観測のsource-only minuteは残量NULLのまま保持する。
+
+minute復元でも価格の意味を混在させない。`usage_history`のSOL/TERRA/LUNA固定列は通常記録と同じ凍結された互換料金で既知prefixを評価し、exact model IDの料金や版を合算して上書きしない。モデルsidecarは保存済みのexact-ID料金・価格版を独立して保持する。
+
+公式起点は同じ読取りsnapshotのexact reset/windowに一致するreceiptまたは現在quotaから検証し、最初の保存rowやlegacy補正を公式起点へ昇格しない。versioned period directoryの`origin_at`は表示開始より前も許すが、表示開始と公式起点が一致し、最初の採用観測まで非所有区間・確定gap・矛盾を跨がない場合だけ、描画上のmodel 0・残量100%へ接続する。これらの起点はraw/history/hoverへ追加しない。最後の直接観測と表示末尾が同じcanonical minuteに属する場合は、現在・過去periodとも末尾の端数秒を欠測の破線にしない。別minuteの欠測は保持する。
 
 Windows Graph は表示範囲内の最初の実測日時と残量を表示し、初回89%などの記録を100%へ置換しない。account ownership 外の区間は当該 account を記録していない期間であり、区間内利用量は不明と説明する。範囲外の保存履歴の不存在や別利用者の使用を断定しない。破線の一般的な未確認・欠測の説明も保持する。
 
@@ -400,11 +412,11 @@ Windows Graph は表示範囲内の最初の実測日時と残量を表示し、
 
 期間の通常選択一覧は、現期間と、受理済み期間範囲内の公開modelに正の`total_tokens`がある期間を掲載する。modelが不完全または`legacy-unknown`でも正の記録は残す。quota観測だけ・欠測区間だけ・tokenが0または未取得の過去期間は通常一覧に載せないが、未使用や利用量0を確定したとは扱わない。原本・全exact ID・直接history pageを保持し、後から正のtoken記録が入れば次snapshotで再掲載する。日・週・月など任意時間窓の取得directoryは選択一覧と分離し、quota観測や欠測区間を失わない。31日より古い保存期間も同じ条件で選択でき、互換detailsの直近31日projectionは維持する。Windowsの選択一覧は公開`start_at`を表示タイムゾーンの日付でまとめ、公開されたexact IDを個別に選べる。見出しの展開で選択を変更せず、periodの統合・累計加算・raw値の変更は行わない。更新で選択項目が一覧から外れた場合は現期間へ戻す。旧serverに選択専用resourceがない場合だけ旧directoryを互換表示し、その場合は新しい掲載条件を保証しない（#646）。
 
-現行periodの所属は、表示時に`period_start = reset_at - window_seconds`から決める。
-`period_start <= timestamp <= reset_at`にある観測は、providerがプラン切替中に旧`reset_at`
-aliasを返していても現行periodへcanonicalizeする。rawのsource reset/timestampはprovenanceとして保持し、
-同一minuteの相反値は値を合成せず除外する。現行period外およびcompleted periodは従来のcanonical
-reset authorityを使い、account lifecycleや外部利用を推測してmodel数値を付け替えない。
+現行periodの表示範囲は公式`reset_at - window_seconds`から検証する。
+period所属とmodel sidecar結合は公開されたexact `reset_at`を正本とし、同じ時間窓にあるという理由で
+別の公式periodの観測を現行periodへ付け替えない。rawのsource reset/timestampはprovenanceとして保持し、
+旧混合履歴の正規化はDATA ownerの`HISTORY-CANONICAL-134`、現在quotaは`QUOTA-DURABLE-604`に従う。
+account lifecycleや外部利用を推測してmodel数値を付け替えない。
 現行periodの先頭から最初のlocally-owned model observationまでに保存されたfiniteな`remaining_percent`も、providerから
 直接取得したraw quota観測として元時刻・元値のまま履歴へ保持する。Session/model ownershipを確認できないrowは
 `model_source=unavailable`、model数値なしで公開するが、そのmetadataだけでraw Remainingを欠損または予測へ降格させない。
@@ -463,8 +475,8 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    idle bandと同じX範囲の1px水平実線へ分離する。exact 60秒の1 sampling slotだけが`unavailable`で、その前後が
    same reset、同一model集合、全modelのraw token exact equal、raw Remaining bitwise equalかつgapなしなら、
    そのrowだけをread-time表示入力から除外して前後を3px実線で結ぶ。この限定補完はDB、history、API rawを変更せず、
-   当該rowを直接観測または新anchorへ昇格させない。それ以外の明示欠測は1px破線とする。raw値は元時刻・元値の証拠として保持する一方、未使用と確定できない
-   sampling由来の同値反復は表示geometryの必須通過点にせず、有効変化点間を単調かつovershootしないPCHIP
+   当該rowを直接観測または新anchorへ昇格させない。それ以外の明示欠測は1px破線とする。raw値は元時刻・元値の証拠として保持し、
+   modelの同値区間は両端時刻・値を通る水平線を維持する。利用が増えた隣接観測間だけを単調かつovershootしないPCHIP
    （Fritsch–Carlson）で滑らかにつなぐ。当該modelの明示的欠測、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を1pxの
    破線で連続補完する。補間・holdはUI presentation-onlyで、API/DBへ書き戻さず、直接観測または集計・idleの
    根拠へ昇格させない。
@@ -472,7 +484,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    completedか、local clockがどこかによって置換しない。accepted値が1点以上ある系列はperiod内の最初の
    accepted pointからperiod endまで空白区間を作らず、同一X座標のsegmentを作らない。最初のaccepted point
    より前は創作せず、accepted値が0点のmodelは線・右端labelを、全modelが0点なら未使用帯も作らない。
-   最終accepted point後は長さを問わずperiod endまで細い破線holdとする。破線は予測表示であり、それ単独では
+   最終accepted point後はperiod endまで細い破線holdとする。ただし公開終端と最終実測が同じcanonical minute内の場合は、現在・過去periodとも次minuteの欠測ではないため実測点で線を終える。公開終端・横軸は保持し、その端数秒へ実線や予測値を作らない。後続minuteの欠測はこの例外に含めない。破線は予測表示であり、それ単独では
    未使用の証拠にしない。
    model集合変更は、未掲載または新規model自身の線と未使用判定にだけ反映し、Remainingの形状・線種には反映しない。
    集合変更区間でも共通modelのaccepted値は実線を維持し、raw Remainingの両endpointがacceptedなら
@@ -484,7 +496,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    停止区間と重なる欠測bridgeは左の既知値を表示専用の1px水平線で保持し、増分は停止終了後の
    不確かな接続にのみ残す。右実測が停止終端そのものなら元値・元時刻を保ち、垂直線や架空の使用時刻を追加しない。
    この水平線は欠測の復元ではなく、DB/API/raw/hoverの値を補完しない。直接観測の線は変更しない。
-   model線のsampling同値反復を平滑化するときも、明示停止帯の開始・終了の元時刻と値を保持する。
+   model線は記録済み累計が同値の区間の両端時刻・値を保持し、後続の利用増加を同値区間へ前倒ししない。明示停止帯の開始・終了の元時刻と値も保持する。
    再開後の増加を停止帯へ前倒しして描かない。model由来のidleが途中欠測で分断されても、この停止境界を失わない。
    以下のraw vectorによる判定は、明示停止とは独立した未使用根拠として維持する。両endpointと全interior raw rowに同じ非空model key集合が揃い、
    各rowが`model_source=confirmed && models_complete=true`または保存済みlossless token vectorを持つ`legacy-unknown`であり、
@@ -508,6 +520,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    使用の証拠にはせず、上記のexact equalなDirect値による判定を変更しない。Remainingがraw-nullまたは予測値の区間は、
    finite raw Remainingがないためidle候補にできない。
    lifecycle unknownだけでは他の完全な証拠をidleへ昇格しない。
+   task停止の証拠があっても、同じ区間に保存済みtoken増減または利用枠の変化がある場合は、その区間を未使用帯に含めない。model単独の水平線はそのmodelのtoken同値で判定し、別modelや利用枠の変化を混同しない。
    これらは当該局所区間だけを除外し、前後の独立した候補まで棄却しない。
 6. `G137-6`: non-nullでfiniteな0..100のRemainingをraw観測として元時刻に保持し、繰返しrawを
    証拠として変更しない。隣接するfinite実測点`left,middle,right`で`left >= right`かつ
@@ -530,7 +543,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    表示専用の`(period_start,100%)`から最初のaccepted raw Remainingまでを1px破線で結ぶ。
    Windowsでは、同一published pairとして検証済みのperiods/historyのcanonical `start_at`を
    明示的にgeometryへ渡し、現期間・過去期間とも確認済みの期間開始から最初のaccepted raw Remainingまで100%起点の実線で結ぶ。
-   model系列の0起点は`Current=true`の現期間だけとし、値が確認できた系列の最初の実測値へ実線で結ぶ。最初の実測が95%や正のtoken値でもよく、
+   model系列の0起点も確認済み開始を持つ現期間・過去期間へ適用し、値が確認できた系列の最初の保存観測値へ実線で結ぶ。`legacy-unknown`でも当該系列の保存値がある場合は対象とし、欠測値を0へ置換しない。最初の実測が95%や正のtoken値でもよく、
    0または100%の実測検出を開始条件にしない。これらはリセット時の表示専用起点であり、観測値ではない。
    DB/API、raw/effective anchor、hoverの実観測列に追加せず、最初のraw以降のgeometryにも混入させない。
    Windowsの開始authority不明の期間には開始補助線を作らず、24時間/7日間viewportの左端をreset開始と解釈しない。
@@ -548,7 +561,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
 7. `G137-7`: G137-6で定めるWindows現期間の表示専用起点を除き、model線はaccepted raw同士のexact値の増加と、10分未満またはsession-level idleではない不変区間を同じ3px実線とし、
    確定idleに含まれる不変区間だけをbandと同じX範囲の1px水平実線へ分離する。timestamp差だけでは破線化しない。raw列を
    変更せず、ドル表示では同じmodelのraw tokenが不変なrunを左端ドル値へ水平補正してから同じ線種規則を適用する。
-   未使用と確定できないsampling同値反復は折れ点から外して有効変化点間を単調PCHIPで滑らかにつなぐ。途中に
+   記録済みmodel累計の同値区間は元の両端を通る水平線とし、利用が増えた隣接観測間だけを単調PCHIPで滑らかにつなぐ。途中に
    当該modelのunknown rowがあるnearest-finite接続、限定補完条件を満たさないraw-null補間点の両側、
    monotonic hold、bounded/terminal hold、synthetic tailは1px破線とする。raw quota同値のcontiguous区間は
    model availabilityと独立した実測実線である。raw-nullの`Interpolated`だけを欠測破線とする。model線は当該modelの当該表示metric anomaly、Remaining線はRemaining
@@ -644,7 +657,7 @@ Remainingの配分または線種へ波及させず、直接観測anchor間は3p
 
 Windowsのみ、既定のreset週期間、固定24時間／7日間、表示timezoneの暦月を選べる。固定時間窓に重なる各resetは同一account/published pairで全履歴を完全受理した別系列として投影し、表示窓が週の途中から始まってもそのresetの利用相当額を表示する。線は表示窓の左端で切り出し、観測終端から現在までを実測で埋めない。固定時間窓とreset期間の縦軸は既存の累計の意味を維持する。Windowsの常時右端値ラベルと専用余白は、近い実観測時刻の日時・全表示系列の値を示すホバー表示へ置き換える。操作とgeometryの詳細は`docs/WINDOWS_UX_SPEC.md` §4.2を正本とする（#554、#600）。
 
-`G137-GRAPH-01`のWindows月表示は、その日単独の使用量を表示timezoneの`[当日0時, 翌日0時)`へ投影する。当日は現在時刻までとし、取得済みraw履歴の同一account・canonical reset期間・modelについて、両端が同一ローカル日内にあるDirectのauthoritative累積観測差だけを加算する。canonical期間開始と初回観測が同一ローカル日の場合だけ初回累積をその日へ帰属できる。日跨ぎ差分を按分せず、snapshotを総和せず、欠測・未提供・未知価格を0へ補完しない。算出可能な部分は日合計の確定値とせず「記録分」、算出不能は「未計測」とする。同じcanonical期間・model・metricの累積が下がった場合、補正を過去の特定日へ配分できないため、それまでの当該配賦を無効化する。補正値を以後のbaselineとし、以後の同日内の差分だけを記録分へ加算する。負値の0 clamp、旧最大値の保持、DB・raw・API・価格計算の変更を行わない。
+`G137-GRAPH-01`のWindows月表示は、その日単独の使用量を表示timezoneの`[当日0時, 翌日0時)`へ投影する。当日は現在時刻までとし、取得済みraw履歴の同一account・canonical reset期間・modelについて、両端が同一ローカル日内にあるDirectのauthoritative累積観測差を加算する。保存済み`legacy-unknown`の同じmodel keyの有限・非負の値も、月カレンダーの「記録分」へ表示上加算できる。model集合の完備・確定した日合計へ昇格せず、unknown・unavailable・reconstructed値や補間を採用しない。両端が採用済みで同じ日・所有区間・期間にあり確定gapを跨がない場合、途中のunavailable観測だけで既知累計のbaselineを捨てない。途中欠測の値自体を補完せず、前後の既知累計差を記録分へ加算する。公式windowから確認済みのcanonical期間開始（origin_at）と初回観測が同一ローカル日であり、間に所有区間外・確定gapがない場合だけ、初回累積をその日へ帰属できる。origin_at不明時のstart_atは記録開始であり、初回累積の配賦根拠にしない。日跨ぎ差分を按分せず、snapshotを総和せず、欠測・未提供・未知価格を0へ補完しない。算出可能な部分は日合計の確定値とせず「記録分」、算出不能は「未計測」とする。同じcanonical期間・model・metricの累積が下がった場合、補正を過去の特定日へ配分できないため、それまでの当該配賦を無効化する。補正値を以後のbaselineとし、以後の同日内の差分だけを記録分へ加算する。負値の0 clamp、旧最大値の保持、DB・raw・API・価格計算の変更を行わない。
 
 一般のグラフgeometry、操作、色と線幅はUX ownerの`CUM-138-06`が
 `docs/WINDOWS_UX_SPEC.md`で所有する。Issue #137で確定したcross-platformの値・線種・連続区間・

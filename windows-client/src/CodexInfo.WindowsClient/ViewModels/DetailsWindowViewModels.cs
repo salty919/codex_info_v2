@@ -429,9 +429,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool HasPoints => scene.IsViewport ? scene.HasPoints : points.Count > 0;
 
-    public bool HasNoPoints => !IsLoading && !HasLoadError && !HasPoints;
+    public bool HasNoPoints => !IsMonthView && !IsLoading && !HasLoadError && !HasPoints;
 
     public bool HasBlockingLoadError => !IsLoading && HasLoadError && !HasPoints;
+
+    public bool HasRetainedLoadError => !IsLoading && HasLoadError && HasPoints;
 
     public bool HasPeriods => periods.Count > 0;
 
@@ -3293,8 +3295,10 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             hiddenModelNames,
             accountOwnershipIntervals,
             period.ResetAt,
-            isVerifiedCurrentResetStart: period.Current,
-            publishedPeriodStartAt: period.StartAt);
+            isVerifiedCurrentResetStart: period.Current && period.OriginAt == period.StartAt,
+            publishedPeriodStartAt: period.StartAt,
+            verifiedPeriodOriginAt: period.OriginAt,
+            isCurrentPeriod: period.Current);
         GraphPlotProjection.PrepareGeometry(graphScene);
         return new GraphProjection(
             diagnosticSamples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
@@ -3452,6 +3456,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(IsLoading));
         Notify(nameof(HasNoPoints));
         Notify(nameof(HasBlockingLoadError));
+        Notify(nameof(HasRetainedLoadError));
     }
 
     private void SetLoadError(bool value)
@@ -3464,6 +3469,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(HasLoadError));
         Notify(nameof(HasNoPoints));
         Notify(nameof(HasBlockingLoadError));
+        Notify(nameof(HasRetainedLoadError));
     }
 
     private void Notify([CallerMemberName] string? propertyName = null)
@@ -3539,9 +3545,14 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool HasThreads => !main.IsSelectedAccountHistorical && threads.Count > 0;
 
-    public bool HasNoThreads => !HasThreads;
+    public bool HasNoThreads => !HasThreads &&
+        (main.IsSelectedAccountHistorical || main.HasDetails && !HasLoadError);
 
-    public bool HasLoadError => hasLoadError;
+    public bool HasLoadError => hasLoadError || main.DetailsStatusAutomationText == "error";
+
+    public bool HasPendingThreads => !HasThreads && !HasNoThreads && !HasLoadError;
+
+    public string LoadErrorText => $"{Texts.Threads}: {Texts.ApiError}";
 
     public string EmptyText => main.IsSelectedAccountHistorical
         ? Texts.HistoricalThreadsUnavailable
@@ -3609,6 +3620,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(SelectedAccountText));
             Notify(nameof(HasThreads));
             Notify(nameof(HasNoThreads));
+            Notify(nameof(HasPendingThreads));
             Notify(nameof(EmptyText));
             if (eventArgs.PropertyName == nameof(MainWindowViewModel.SelectedAccount))
             {
@@ -3623,6 +3635,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
                 Notify(nameof(TreeRootRows));
                 Notify(nameof(TreeSurfaceHeight));
                 Notify(nameof(HasLoadError));
+                Notify(nameof(HasPendingThreads));
                 if (resourceClient is null)
                 {
                     Rebuild();
@@ -3651,6 +3664,10 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             }
             Notify(nameof(DetailsStatusText));
             Notify(nameof(Texts));
+            Notify(nameof(HasLoadError));
+            Notify(nameof(HasNoThreads));
+            Notify(nameof(HasPendingThreads));
+            Notify(nameof(LoadErrorText));
         }
     }
 
@@ -3685,6 +3702,12 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             // Inactive accounts expose only a point-in-time current snapshot;
             // thread rows are intentionally not presented as live activity.
+            return;
+        }
+        if (mainGeneration is null || main.AcceptedWireOpenSessionThreadCount == 0)
+        {
+            // Main owns the accepted current/threads bundle, including an
+            // explicit zero count. Pending current is never an empty result.
             return;
         }
         if (accountResourceClient is not null && accountId is null)
@@ -3734,6 +3757,8 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 hasLoadError = true;
                 Notify(nameof(HasLoadError));
+                Notify(nameof(HasNoThreads));
+                Notify(nameof(HasPendingThreads));
                 return;
             }
 
@@ -3741,6 +3766,8 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 hasLoadError = true;
                 Notify(nameof(HasLoadError));
+                Notify(nameof(HasNoThreads));
+                Notify(nameof(HasPendingThreads));
                 return;
             }
 
@@ -3810,6 +3837,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
         Notify(nameof(HasThreads));
         Notify(nameof(HasNoThreads));
+        Notify(nameof(HasPendingThreads));
         Notify(nameof(TreeConnections));
         Notify(nameof(TreeRootRows));
         Notify(nameof(TreeSurfaceHeight));

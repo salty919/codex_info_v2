@@ -433,13 +433,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// inactive account. A missing or unscoped document is never treated as a
     /// historical record by inference.
     /// </summary>
-    private bool IsHistoricalDetails =>
+    private bool IsHistoricalDetails => detailsSnapshot is { } snapshot && IsHistoricalSnapshot(snapshot);
+
+    private bool IsHistoricalSnapshot(ApiDetailsSnapshot snapshot) =>
         selectedAccount is { IsCurrent: false, Id: var accountId } &&
-        detailsSnapshot is { State: ApiState.Ready, Authenticated: true, AccountId: var snapshotAccountId } &&
+        snapshot is { State: ApiState.Ready or ApiState.Error, Authenticated: true, AccountId: var snapshotAccountId } &&
         snapshotAccountId == accountId;
 
     private bool HasCurrentDataApiError =>
-        HasDetails && detailsSnapshot?.State == ApiState.Error;
+        HasDetails && !IsHistoricalDetails && detailsSnapshot?.State == ApiState.Error;
 
     public ApiDetailsSnapshot? DetailsSnapshot => HasDetails ? detailsSnapshot : null;
 
@@ -517,15 +519,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             : FormatRemainingDuration(quota.ResetAt)
         : Texts.UnavailableValue;
 
-    public double QuotaRemainingPeriodValue => detailsSnapshot?.Quota is { } quota
-        ? IsHistoricalDetails
-            ? 0
-            : Math.Clamp(
-                (quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) * 100.0 /
-                Math.Max(1, quota.WindowSeconds),
-                0,
-                100)
-        : 0;
+    public double QuotaRemainingPeriodValue => QuotaRemainingPeriodFraction * 100;
+
+    private double QuotaRemainingPeriodFraction => detailsSnapshot?.Quota is { } quota
+        && (!IsHistoricalDetails || detailsSnapshot.ObservedAt.HasValue)
+            ? Math.Clamp((quota.ResetAt - (IsHistoricalDetails
+                    ? detailsSnapshot.ObservedAt!.Value
+                    : DateTimeOffset.UtcNow.ToUnixTimeSeconds())) /
+                (double)Math.Max(1, quota.WindowSeconds), 0, 1)
+            : 0;
 
     // CORE publishes the current quota-window bounds once in History. Windows
     // consumes that StartAt directly; ResetAtText remains the quota deadline.
@@ -618,7 +620,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             if (IsHistoricalDetails && detailsFailure is null)
             {
-                return Texts.HistoricalAccountDetail;
+                return detailsSnapshot?.State == ApiState.Error
+                    ? Texts.HistoricalAccountErrorDetail
+                    : Texts.HistoricalAccountDetail;
             }
 
             var detail = Texts.StatusDetailFor(
@@ -1633,9 +1637,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         // or property notification.  The commit itself is synchronous so an
         // observer can never see core from one details generation with history,
         // models, or threads from another.
-        var historical = selectedAccount is { IsCurrent: false, Id: var accountId } &&
-            validatedDetails is { State: ApiState.Ready, Authenticated: true } &&
-            validatedDetails.AccountId == accountId;
+        var historical = IsHistoricalSnapshot(validatedDetails);
         acceptedWireOpenSessionThreadCount = validatedDetails.OpenSessionThreadCount;
         acceptedWireActiveThreadCount = validatedDetails.ActiveThreadCount;
         if ((validatedDetails.ApiVersion is "v3" or "v4") && !historical)
@@ -1657,7 +1659,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 ? DateTimeOffset.FromUnixTimeSeconds(observedAt)
                 : null
             : DateTimeOffset.Now;
-        hasConnectionFailure = validatedDetails.State == ApiState.Error;
+        hasConnectionFailure = !historical && validatedDetails.State == ApiState.Error;
         authLaunchFailed = false;
         authLaunchSucceeded = false;
         presentationState = historical
@@ -1859,12 +1861,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void RebuildQuotaSegments()
     {
-        var fraction = detailsSnapshot?.Quota is { } quota
-            ? IsHistoricalDetails
-                ? Math.Clamp(quota.RemainingPercent / 100.0, 0, 1)
-                : Math.Clamp((quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) /
-                             (double)Math.Max(1, quota.WindowSeconds), 0, 1)
-            : 0;
+        var fraction = QuotaRemainingPeriodFraction;
         var fills = Enumerable.Range(0, 7)
             .Select(index => Math.Clamp(fraction * 7 - index, 0, 1))
             .ToArray();

@@ -125,13 +125,15 @@ public sealed class GraphScene
         IReadOnlyList<GraphObservedSample>? hoverObservations = null,
         bool isVerifiedCurrentResetStart = false,
         GraphPeriodCostSummary periodCost = default,
-        IReadOnlyList<GraphIdleInterval>? taskIdleIntervals = null)
+        IReadOnlyList<GraphIdleInterval>? taskIdleIntervals = null,
+        long? verifiedPeriodOriginAt = null)
     {
         TaskIdleIntervals = taskIdleIntervals ?? [];
         PeriodStartAt = periodStartAt;
         PeriodEndAt = periodEndAt;
         ResetAt = resetAt;
         IsVerifiedCurrentResetStart = isVerifiedCurrentResetStart;
+        HasVerifiedPeriodOrigin = isVerifiedCurrentResetStart || verifiedPeriodOriginAt == periodStartAt;
         PeriodCost = periodCost;
         Metric = metric;
         Timestamps = timestamps;
@@ -184,6 +186,8 @@ public sealed class GraphScene
     /// the authoritative current quota window.
     /// </summary>
     internal bool IsVerifiedCurrentResetStart { get; }
+    internal bool IsCurrentPeriod { get; private init; }
+    internal bool HasVerifiedPeriodOrigin { get; }
 
     public GraphMetric Metric { get; }
 
@@ -413,6 +417,12 @@ public sealed class GraphScene
 
         var hasVisiblePoints = GraphPlotProjection.HasVisibleViewportPoints(children, startAt, endAt);
         var visibleModelMaximum = GraphPlotProjection.CalculateViewportModelMaximum(children, startAt, endAt);
+        var nonOwnedIntervals = children.SelectMany(scene => scene.NonOwnedIntervals)
+            .Where(interval => interval.StartAt < endAt && interval.EndAt > startAt)
+            .Select(interval => new GraphUnusedInterval(Math.Max(startAt, interval.StartAt), Math.Min(endAt, interval.EndAt)))
+            .Distinct()
+            .OrderBy(interval => interval.StartAt)
+            .ToArray();
         var acceptedPeriodStarts = publishedPeriodStarts ??
             children.SelectMany(scene => scene.PublishedPeriodStarts).ToArray();
         return new GraphScene(
@@ -438,7 +448,7 @@ public sealed class GraphScene
             visible.Select(point => point.Scene.RemainingInterpolated[point.Index]).ToArray(),
             visible.Select(point => point.Scene.RemainingOrigins[point.Index]).ToArray(),
             [],
-            [],
+            nonOwnedIntervals,
             new Dictionary<string, IReadOnlySet<long>>(StringComparer.Ordinal),
             new HashSet<long>(),
             new HashSet<long>(),
@@ -495,7 +505,9 @@ public sealed class GraphScene
         IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals,
         long? resetAt,
         bool isVerifiedCurrentResetStart = false,
-        long? publishedPeriodStartAt = null)
+        long? publishedPeriodStartAt = null,
+        long? verifiedPeriodOriginAt = null,
+        bool isCurrentPeriod = false)
     {
         ArgumentNullException.ThrowIfNull(samples);
         if (samples.Count == 0)
@@ -525,7 +537,9 @@ public sealed class GraphScene
             (PublishedModels(sample).Any() ||
              sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
              sample.ModelsComplete && sample.ModelSamples is { Count: 0 }));
-        var taskIdleIntervals = BuildTaskIdleIntervals(samples, start, end, nonOwnedIntervals);
+        var idleBoundaries = normalizedGaps.Concat(nonOwnedIntervals
+            .Select(interval => new GraphConfirmedGap(interval.StartAt, interval.EndAt))).ToArray();
+        var taskIdleIntervals = BuildTaskIdleIntervals(samples, start, end, idleBoundaries);
         samples = WithoutRecoverableSamplingJitter(samples, normalizedGaps);
         var allModelNames = samples
             .SelectMany(PublishedModels)
@@ -554,7 +568,7 @@ public sealed class GraphScene
             samples,
             start,
             end,
-            normalizedGaps,
+            idleBoundaries,
             tokenProjection);
         var modelIdleIntervals = allModelNames.ToDictionary(
             name => name,
@@ -709,10 +723,12 @@ public sealed class GraphScene
                 eligibleMissingTokenZeros),
             isVerifiedCurrentResetStart: isVerifiedCurrentResetStart,
             periodCost: periodCost,
-            taskIdleIntervals: taskIdleIntervals)
+            taskIdleIntervals: taskIdleIntervals,
+            verifiedPeriodOriginAt: verifiedPeriodOriginAt)
         {
             RecordedPeriodTokens = BuildRecordedPeriodTokens(latestCostObservation, firstModelPublications.Count),
             ModelMemberLineReliability = rawDisplayProjection.LineReliability,
+            IsCurrentPeriod = isCurrentPeriod,
         };
     }
 
@@ -1781,9 +1797,11 @@ public sealed class GraphScene
     /// </summary>
     private static IReadOnlyList<GraphIdleInterval> BuildTaskIdleIntervals(
         IReadOnlyList<ApiHistorySample> samples, long start, long end,
-        IReadOnlyList<GraphUnusedInterval> nonOwned)
+        IReadOnlyList<GraphConfirmedGap> boundaries)
     {
         var intervals = new List<GraphIdleInterval>();
+        var changes = RecordedUsageChanges(samples);
+        var changeIndex = 0;
         for (var index = 1; index < samples.Count; index++)
         {
             var left = samples[index - 1];
@@ -1793,12 +1811,46 @@ public sealed class GraphScene
                 continue;
             var from = Math.Max(start, left.Timestamp);
             var to = Math.Min(end, right.Timestamp);
-            if (to > from && !nonOwned.Any(gap => gap.StartAt < to && gap.EndAt > from))
+            while (changeIndex < changes.Count && changes[changeIndex].EndAt <= from) changeIndex++;
+            var hasChange = changeIndex < changes.Count && changes[changeIndex].StartAt < to;
+            if (to > from && !hasChange && !boundaries.Any(gap => gap.StartAt < to && gap.EndAt > from))
                 intervals.Add(new GraphIdleInterval(from, to, false));
         }
         return MergeIdleIntervals(intervals)
             .Where(interval => interval.EndAt - interval.StartAt >= SustainedUnusedMinimumSeconds)
             .ToArray();
+    }
+
+    private static IReadOnlyList<GraphIdleInterval> RecordedUsageChanges(IReadOnlyList<ApiHistorySample> samples)
+    {
+        var changes = new List<GraphIdleInterval>();
+        var models = new Dictionary<string, (long Timestamp, ulong Tokens)>(StringComparer.Ordinal);
+        (long Timestamp, double Value)? quota = null;
+        long? reset = null;
+        foreach (var sample in samples)
+        {
+            if (sample.IsSyntheticTail) continue;
+            if (sample.ResetAt != reset)
+            {
+                models.Clear();
+                quota = null;
+                reset = sample.ResetAt;
+            }
+            if (sample.RemainingPercent is { } remaining && double.IsFinite(remaining) && remaining is >= 0 and <= 100)
+            {
+                if (quota is { } previous && !RemainingBitsEqual(previous.Value, remaining))
+                    changes.Add(new GraphIdleInterval(previous.Timestamp, sample.Timestamp, false));
+                quota = (sample.Timestamp, remaining);
+            }
+            foreach (var model in PublishedModels(sample))
+            {
+                if (model.TotalTokens is not { } tokens) continue;
+                if (models.TryGetValue(model.Name, out var previous) && previous.Tokens != tokens)
+                    changes.Add(new GraphIdleInterval(previous.Timestamp, sample.Timestamp, false));
+                models[model.Name] = (sample.Timestamp, tokens);
+            }
+        }
+        return MergeIdleIntervals(changes);
     }
 
     private static IReadOnlyList<GraphIdleInterval> MergeIdleIntervals(IEnumerable<GraphIdleInterval> intervals)
@@ -1848,6 +1900,7 @@ public sealed class GraphScene
             if (right.Timestamp <= left.Timestamp ||
                 left.ResetAt != right.ResetAt ||
                 !TokenVectorsEqual(before.Vector, after.Vector) ||
+                modelName is null && !SameRecordedRemaining(left, right) ||
                 HasConfirmedGapBetween(
                     confirmedGaps,
                     left.Timestamp,
@@ -1923,6 +1976,7 @@ public sealed class GraphScene
                 continue;
             }
             if (sample.ResetAt != resetAt ||
+                modelName is null && !SameRecordedRemaining(samples[before], sample) ||
                 !TryGetIdleModelVector(sample, modelName, out var vector) ||
                 !AcceptedIdleVectorAt(index, vector, tokenProjection) ||
                 !TokenVectorsEqual(baseline, vector))
@@ -1933,6 +1987,11 @@ public sealed class GraphScene
 
         return false;
     }
+
+    private static bool SameRecordedRemaining(ApiHistorySample left, ApiHistorySample right) =>
+        left.RemainingPercent is { } before && right.RemainingPercent is { } after &&
+        double.IsFinite(before) && before is >= 0 and <= 100 &&
+        double.IsFinite(after) && after is >= 0 and <= 100 && RemainingBitsEqual(before, after);
 
     private static bool AcceptedIdleVectorAt(
         int index,

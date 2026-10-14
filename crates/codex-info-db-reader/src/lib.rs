@@ -57,9 +57,11 @@ pub struct HistoryArchive {
     pub periods: Vec<PublicHistoryPeriod>,
     pub samples: Vec<PublicHistoryObservationV3>,
     pub gaps: Vec<PublicHistoryGap>,
+    /// Exact quota authority; absence means the historical origin is unknown.
+    pub origins: BTreeMap<i64, i64>,
 }
 pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 13;
-pub const ACCOUNT_DB_SCHEMA_VERSION: i64 = 14;
+pub const ACCOUNT_DB_SCHEMA_VERSION: i64 = 15;
 const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
 const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
@@ -580,8 +582,9 @@ impl DbReader {
                             history_window: HistoryWindow::Retained,
                         },
                     )?;
+                let mut origins = BTreeMap::new();
                 if authority.quota.is_some() {
-                    quota_history::project(
+                    origins = quota_history::project(
                         &transaction,
                         &self.read_intervals,
                         &mut retained_details,
@@ -590,6 +593,12 @@ impl DbReader {
                         HistoryWindow::Retained,
                     )?;
                 }
+                quota_history::project_recovered_windows(
+                    &transaction,
+                    &self.read_intervals,
+                    &mut retained_details,
+                    &mut origins,
+                )?;
                 if retained_v3.len() > MAX_RETAINED_HISTORY_ROWS {
                     return Err(ReaderError::TooManyRows(retained_v3.len()));
                 }
@@ -614,6 +623,7 @@ impl DbReader {
                     periods: retained_details.history_periods,
                     samples: retained_v3,
                     gaps: retained_details.history_gaps,
+                    origins,
                 })
             })()
             .ok();
@@ -2538,20 +2548,23 @@ fn assign_task_activity_for_intervals(
                 intervals.interval_containing(previous) == current_interval
             });
             let interval_start = if same_interval {
-                previous_timestamp.unwrap_or(period.start_at)
+                previous_timestamp
+                    .unwrap_or(period.start_at)
+                    .saturating_add(60)
             } else {
                 current_interval
                     .and_then(|interval| interval.start_at)
                     .unwrap_or(period.start_at)
             };
-            let active =
-                task_active_in_interval(&activity, interval_start.min(timestamp), timestamp);
-            let verified_idle = !active
-                && task_interval_is_verified_idle(
-                    &activity,
-                    interval_start.min(timestamp),
-                    timestamp,
-                );
+            // History timestamps name a minute bucket. Token events later in
+            // that same minute are included in its cumulative model value, so
+            // lifecycle evidence must cover the same seconds rather than end
+            // at the bucket's first second.
+            let interval_end = timestamp.saturating_add(59).min(period.end_at);
+            let interval_start = interval_start.min(interval_end);
+            let active = task_active_in_interval(&activity, interval_start, interval_end);
+            let verified_idle =
+                !active && task_interval_is_verified_idle(&activity, interval_start, interval_end);
             history
                 .get_mut(&key)
                 .expect("task activity key collected from history")
@@ -6352,6 +6365,56 @@ mod tests {
     }
 
     #[test]
+    fn recovered_quota_window_requires_an_owned_event_and_one_official_window() {
+        for (event_matches, conflicting, expected) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            let (path, identity) = quota_receipt_current_fixture("recovered-quota-window");
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "PRAGMA user_version=15;
+                 INSERT INTO usage_history VALUES(1799900040,1799950000,90,1,0,0,100,0,0);
+                 CREATE TABLE session_events(root_identity TEXT,relative_path TEXT,range_start INTEGER,
+                    range_end INTEGER,record_sha256 TEXT,timestamp INTEGER);
+                 INSERT INTO session_events VALUES('root','source.jsonl',0,100,'proof',1799900050);
+                 CREATE TABLE session_quota_windows(reset_at INTEGER,window_seconds INTEGER,
+                    observed_at INTEGER,root_identity TEXT,relative_path TEXT,range_start INTEGER,
+                    range_end INTEGER,record_sha256 TEXT,PRIMARY KEY(reset_at,window_seconds));",
+            ).unwrap();
+            db.execute("INSERT INTO session_quota_windows VALUES(1799950000,86400,1799900050,'root','source.jsonl',0,100,?1)",
+                [if event_matches {"proof"} else {"different"}]).unwrap();
+            if conflicting {
+                db.execute("INSERT INTO session_quota_windows VALUES(1799950000,604800,1799900050,'root','source.jsonl',0,100,'proof')", []).unwrap();
+            }
+            assert_eq!(
+                db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                15,
+                "recovered source-window fixture must use its owning schema version"
+            );
+            drop(db);
+            let snapshot = DbReader::open_partitioned(&path, &identity)
+                .unwrap()
+                .read_snapshot()
+                .unwrap();
+            assert_latest_receipt_quota(&snapshot);
+            assert!(snapshot.history_available);
+            assert_eq!(
+                snapshot
+                    .retained_history
+                    .origins
+                    .get(&1_799_950_000)
+                    .copied(),
+                expected.then_some(1_799_863_600),
+                "event={event_matches}, conflict={conflicting}"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn issue646_retained_canonical_rows_do_not_exhaust_recent_history_capacity() {
         let (path, identity) = quota_receipt_current_fixture("retained-capacity");
         let db = Connection::open(&path).unwrap();
@@ -9151,6 +9214,78 @@ mod tests {
     }
 
     #[test]
+    fn task_activity_includes_events_inside_the_model_minute_bucket() {
+        let start = 1_800_000_000;
+        let reset_at = start + 600;
+        let mut history = [start, start + 60, start + 120]
+            .into_iter()
+            .map(|timestamp| {
+                (
+                    (reset_at, timestamp),
+                    PublicHistoryObservationV3 {
+                        timestamp,
+                        reset_at,
+                        remaining_percent: Some(90.0),
+                        task_active_since_previous: None,
+                        models: None,
+                        models_complete: false,
+                        model_source: "unavailable".to_owned(),
+                    },
+                )
+            })
+            .collect();
+        let source = TaskSourceKey {
+            root_identity: "source".into(),
+            relative_path: "task.jsonl".into(),
+            file_device: "1".into(),
+            file_inode: "1".into(),
+        };
+        let evidence = TaskActivityEvidence {
+            complete: true,
+            transitions: BTreeMap::from([(
+                source.clone(),
+                vec![
+                    TaskTransition {
+                        timestamp: start + 86,
+                        event_index: 0,
+                        running: true,
+                    },
+                    TaskTransition {
+                        timestamp: start + 112,
+                        event_index: 1,
+                        running: false,
+                    },
+                ],
+            )]),
+            source_observed_through: BTreeMap::from([(source.clone(), start + 180)]),
+            source_complete: BTreeMap::from([(source, true)]),
+        };
+        let period = PublicHistoryPeriod {
+            id: reset_at.to_string(),
+            start_at: start,
+            end_at: start + 180,
+            reset_at,
+            label: "minute bucket".into(),
+            current: true,
+        };
+        assign_task_activity(&mut history, &[period], &evidence);
+        assert_eq!(
+            history[&(reset_at, start)].task_active_since_previous,
+            Some(false)
+        );
+        assert_eq!(
+            history[&(reset_at, start + 60)].task_active_since_previous,
+            Some(true),
+            "the :86 start and :100 token event both belong to the :60 model bucket"
+        );
+        assert_eq!(
+            history[&(reset_at, start + 120)].task_active_since_previous,
+            Some(false),
+            "a task finished in the previous bucket must not spill into the next one"
+        );
+    }
+
+    #[test]
     fn task_activity_unions_sources_but_bounds_an_unclosed_task_to_observed_evidence() {
         let reset_at = 1_800_000_600;
         let period = PublicHistoryPeriod {
@@ -9224,7 +9359,7 @@ mod tests {
 
         assert_eq!(
             history[&(reset_at, 1_800_000_000)].task_active_since_previous,
-            None
+            Some(true)
         );
         assert_eq!(
             history[&(reset_at, 1_800_000_060)].task_active_since_previous,
@@ -9232,7 +9367,7 @@ mod tests {
         );
         assert_eq!(
             history[&(reset_at, 1_800_000_120)].task_active_since_previous,
-            Some(true)
+            None
         );
         assert_eq!(
             history[&(reset_at, 1_800_000_180)].task_active_since_previous,
@@ -9312,7 +9447,7 @@ mod tests {
             }));
         assert_eq!(
             history[&(reset_at, 1_800_000_060)].task_active_since_previous,
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             history[&(reset_at, 1_800_000_120)].task_active_since_previous,
@@ -9320,7 +9455,7 @@ mod tests {
         );
         assert_eq!(
             history[&(reset_at, 1_800_000_180)].task_active_since_previous,
-            Some(false)
+            Some(true)
         );
         assert_eq!(
             history[&(reset_at, 1_800_000_240)].task_active_since_previous,
@@ -9408,8 +9543,15 @@ mod tests {
             [1_800_000_000, 1_800_000_060, 1_800_000_120, 1_800_000_240,]
         );
         assert_eq!(
-            history[&(reset_at, 1_800_000_120)].task_active_since_previous,
+            history[&(reset_at, 1_800_000_060)].task_active_since_previous,
             Some(true)
+        );
+        // The stop at second 70 belongs to the 60..119 model bucket.
+        // The next bucket cannot inherit that earlier positive activity;
+        // incomplete global coverage still cannot certify inactivity.
+        assert_eq!(
+            history[&(reset_at, 1_800_000_120)].task_active_since_previous,
+            None
         );
         assert_eq!(
             history[&(reset_at, 1_800_000_240)].task_active_since_previous,
@@ -9605,7 +9747,8 @@ mod tests {
         assign_task_activity(&mut history, &[period], &evidence);
         assert_eq!(
             history[&(reset_at, 1_800_000_000)].task_active_since_previous,
-            None
+            Some(true),
+            "the indexed start at second 10 is positive evidence in the first model minute"
         );
         assert_eq!(
             history[&(reset_at, 1_800_000_060)].task_active_since_previous,
@@ -9617,8 +9760,8 @@ mod tests {
         );
         assert_eq!(
             history[&(reset_at, 1_800_000_180)].task_active_since_previous,
-            Some(true),
-            "an exact indexed start remains positive evidence even when later source coverage is incomplete"
+            None,
+            "the indexed start at second 130 cannot certify activity after its last observed second 150"
         );
     }
 

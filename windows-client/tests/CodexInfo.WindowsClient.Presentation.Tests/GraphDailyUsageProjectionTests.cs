@@ -14,6 +14,26 @@ public sealed class GraphDailyUsageProjectionTests
     private static readonly long Day = Unix("2026-10-01T00:00:00Z");
     private const long SecondsPerDay = 86_400;
 
+    [Theory]
+    [InlineData(null, 40UL, 0.4)]
+    [InlineData(-86_400L, 40UL, 0.4)]
+    [InlineData(0L, 140UL, 1.4)]
+    public void InitialCumulativeUsageNeedsAVerifiedOriginOnThatLocalDate(
+        long? originOffset, ulong expectedTokens, double expectedDollars)
+    {
+        var reset = Day + 7 * SecondsPerDay;
+        var period = Period("recording-start", Day + 60, reset,
+            Sample(Day + 60, reset, Model("gpt-6-sol", 100, 1)),
+            Sample(Day + 120, reset, Model("gpt-6-sol", 140, 1.4))) with
+        {
+            OriginAt = originOffset is { } offset ? Day + offset : null,
+        };
+        var scene = DailyScene(Day, Day + SecondsPerDay, GraphMetric.Tokens, period);
+
+        Assert.Equal(expectedTokens, Value<ulong?>(Row(scene, Day, "SOL"), "Tokens"));
+        Assert.Equal(expectedDollars, Value<double?>(Row(scene, Day, "SOL"), "Dollars")!.Value, precision: 10);
+    }
+
     [Fact]
     public void DailyBarsUseStandaloneDeltasWithinEachLocalDate()
     {
@@ -65,6 +85,63 @@ public sealed class GraphDailyUsageProjectionTests
         var lateScene = DailyScene(Day, Day + SecondsPerDay, GraphMetric.Tokens, late);
         Assert.Equal(10UL, Value<ulong?>(Row(lateScene, Day, "SOL"), "Tokens"));
         Assert.Equal(1d, Value<double?>(Row(lateScene, Day, "SOL"), "Dollars"));
+    }
+
+    [Fact]
+    public void SavedLegacyValuesRemainRecordedPartialDailyUsageWithoutPromotingCompleteness()
+    {
+        var reset = Day + 7 * SecondsPerDay;
+        ApiHistorySample Saved(long at, ulong tokens, double dollars) =>
+            Sample(at, reset, Model("gpt-6.1-sol", tokens, dollars)) with
+            {
+                ModelSource = ApiHistorySample.LegacyUnknownModelSource,
+                ModelsComplete = false,
+            };
+        var period = Period("saved", Day, reset,
+            Saved(Day + 60, 100, 1),
+            Saved(Day + 120, 140, 1.4),
+            Saved(Day + SecondsPerDay, 180, 1.8),
+            Saved(Day + SecondsPerDay + 60, 200, 2));
+        var scene = DailyScene(Day, Day + 2 * SecondsPerDay, GraphMetric.Tokens, period);
+        Assert.Equal(140UL, Value<ulong?>(Row(scene, Day, "SOL"), "Tokens"));
+        Assert.Equal(20UL, Value<ulong?>(Row(scene, Day + SecondsPerDay, "SOL"), "Tokens"));
+        Assert.Equal(1.4, Value<double?>(Row(scene, Day, "SOL"), "Dollars")!.Value, precision: 10);
+        Assert.Equal(0.2, Value<double?>(Row(scene, Day + SecondsPerDay, "SOL"), "Dollars")!.Value, precision: 10);
+        Assert.True(Value<bool>(Row(scene, Day, "SOL"), "IsPartial"));
+        Assert.All(period.Samples, sample => Assert.False(sample.ModelsComplete));
+
+        var unavailable = period with
+        {
+            Samples = period.Samples.Select(sample => sample with
+            {
+                ModelSource = ApiHistorySample.UnavailableModelSource,
+            }).ToArray(),
+        };
+        var missing = DailyScene(Day, Day + SecondsPerDay, GraphMetric.Tokens, unavailable);
+        Assert.Null(Value<ulong?>(Row(missing, Day, "SOL"), "Tokens"));
+        Assert.Null(Value<double?>(Row(missing, Day, "SOL"), "Dollars"));
+    }
+
+    [Fact]
+    public void DailyRecordedUsageUsesKnownCumulativeEndpointsAcrossAnUnavailableInteriorMinute()
+    {
+        var reset = Day + 7 * SecondsPerDay;
+        ApiHistorySample Missing(long at) => new(at, reset, null, null, null, null, null, null, null,
+            ApiHistorySample.UnavailableModelSource)
+        { ModelsComplete = false };
+        var period = Period("interior", Day - SecondsPerDay, reset,
+            Sample(Day + 32 * 60, reset, Model("gpt-6.1-sol", 46_748_363, 1)),
+            Missing(Day + 33 * 60),
+            Sample(Day + 34 * 60, reset, Model("gpt-6.1-sol", 47_251_607, 2)),
+            Sample(Day + 69 * 60, reset, Model("gpt-6.1-sol", 54_895_046, 3)),
+            Missing(Day + 70 * 60),
+            Sample(Day + 71 * 60, reset, Model("gpt-6.1-sol", 55_212_115, 4)));
+        var scene = DailyScene(Day, Day + SecondsPerDay, GraphMetric.Tokens, period);
+        Assert.Equal(8_463_752UL, Value<ulong?>(Row(scene, Day, "SOL"), "Tokens"));
+        Assert.Equal(3d, Value<double?>(Row(scene, Day, "SOL"), "Dollars"));
+        Assert.True(Value<bool>(Row(scene, Day, "SOL"), "IsPartial"));
+        Assert.Null(period.Samples[1].ModelSamples);
+        Assert.Null(period.Samples[4].ModelSamples);
     }
 
     [Fact]
@@ -125,7 +202,7 @@ public sealed class GraphDailyUsageProjectionTests
     }
 
     internal static ApiHistoryPeriod Period(string id, long start, long reset, params ApiHistorySample[] samples) =>
-        new(id, start, reset, false, id) { ResetAt = reset, Samples = samples };
+        new(id, start, reset, false, id) { ResetAt = reset, OriginAt = start, Samples = samples };
 
     internal static ApiHistorySample Sample(long timestamp, long reset, params ApiHistoryModelSample[] models) =>
         new(timestamp, reset, null, null, null, null, null, null, null) { ModelSamples = models, ModelsComplete = true };

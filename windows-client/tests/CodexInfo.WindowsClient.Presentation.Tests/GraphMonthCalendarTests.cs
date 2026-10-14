@@ -12,6 +12,32 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphMonthCalendarTests
 {
     [Theory]
+    [InlineData(GraphMetric.Tokens)]
+    [InlineData(GraphMetric.Dollars)]
+    public void DaysWithoutRecordedUseAreQuietWithoutCallingMissingDataUnused(GraphMetric metric)
+    {
+        var start = DateTimeOffset.Parse("2026-10-01T00:00:00Z").ToUnixTimeSeconds();
+        var reset = start + 604_800;
+        var period = GraphDailyUsageProjectionTests.Period("quiet", start, reset,
+            GraphDailyUsageProjectionTests.Sample(start + 60, reset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", 100, 1)),
+            GraphDailyUsageProjectionTests.Sample(start + 86_400, reset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", 100, 1)),
+            GraphDailyUsageProjectionTests.Sample(start + 86_460, reset,
+                GraphDailyUsageProjectionTests.Model("gpt-6-sol", 100, 1)));
+        var scene = GraphDailyUsageProjectionTests.DailyScene(start, start + 4 * 86_400, metric, period);
+        var days = Days(scene, start + 3 * 86_400);
+        var quiet = days[4].GetType().GetProperty("IsQuiet");
+        Assert.NotNull(quiet);
+        Assert.Equal(false, quiet.GetValue(days[4]));
+        Assert.Equal(true, quiet.GetValue(days[5]));
+        Assert.Equal(true, quiet.GetValue(days[6]));
+        Assert.NotEqual("—", Property<string>(days[5], "ValueText"));
+        Assert.Equal("—", Property<string>(days[6], "ValueText"));
+        Assert.NotEqual(Property<string>(days[5], "StatusText"), Property<string>(days[6], "StatusText"));
+    }
+
+    [Theory]
     [InlineData(GraphMetric.Tokens, "3 M")]
     [InlineData(GraphMetric.Dollars, "$7.50")]
     public void MonthHasSevenColumnCalendarAndDailyAllModelTotals(GraphMetric metric, string expected)

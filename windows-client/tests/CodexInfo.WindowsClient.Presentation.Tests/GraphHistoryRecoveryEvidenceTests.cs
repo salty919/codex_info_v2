@@ -41,6 +41,26 @@ public sealed class GraphHistoryRecoveryEvidenceTests : IDisposable
     }
 
     [Theory]
+    [InlineData(1_000, 4_000, 1_060, 4_000)]
+    [InlineData(2_000, 3_000, 2_000, 3_000)]
+    public void TimeWindowKeepsClippedUnrecordedAccountIntervals(long start, long end, long expectedStart, long expectedEnd)
+    {
+        using var main = new MainWindowViewModel(new UnusedClient());
+        using var graph = new GraphWindowViewModel(main);
+        var child = GraphScene.Create([Sample(1_000, 89), Sample(4_000, 67)],
+            GraphMetric.Tokens, 1_000, 4_000,
+            confirmedGaps: null, hiddenModelNames: null,
+            accountOwnershipIntervals: [new(1_000, 1_060), new(4_000, null)]);
+        var viewport = GraphScene.CreateViewport(start, end, GraphMetric.Tokens, [child]);
+        SetScene(graph, viewport);
+        var interval = Assert.Single(viewport.NonOwnedIntervals);
+        Assert.Equal(expectedStart, interval.StartAt);
+        Assert.Equal(expectedEnd, interval.EndAt);
+        Assert.Contains("not recorded for this account", graph.GraphGapHintText);
+        Assert.Contains("unknown", graph.GraphGapHintText);
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public void MissingQuotaKeepsUncertaintyExplanationWithoutInventingFirstValue(bool nonOwned)

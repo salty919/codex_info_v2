@@ -6767,7 +6767,8 @@ try {
             Assert-E2E ($flattenedFixtureRows.IndexOf($contextCase.Usage, [StringComparison]::Ordinal) -ge 0) `
                 "Threads context usage/limit missing: $($contextCase.Id)"
         }
-        $missingContextText = ([string][char]0x672A) + [char]0x89B3 + [char]0x6E2C
+        # The fixture uses English settings; missing values follow that locale.
+        $missingContextText = 'Context Unobserved'
         Assert-E2E ($flattenedFixtureRows.IndexOf($missingContextText, [StringComparison]::Ordinal) -ge 0) `
             "Missing context must be rendered as $($missingContextText)."
         Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Context [0-9]+(?:\.[0-9]+)?%$').Count -eq 3) `

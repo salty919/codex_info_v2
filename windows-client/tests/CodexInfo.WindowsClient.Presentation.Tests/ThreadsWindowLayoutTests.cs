@@ -17,6 +17,28 @@ public sealed class ThreadsWindowLayoutTests
 {
     private static readonly XNamespace Avalonia = "https://github.com/avaloniaui";
 
+    [Theory]
+    [InlineData("ja", "未設定", "未観測")]
+    [InlineData("en", "Unset", "Unobserved")]
+    public void MissingThreadValuesUseTheSelectedLanguage(string language, string unset, string unobserved)
+    {
+        var previous = LocalizationService.Current.LanguageCode;
+        try
+        {
+            LocalizationService.SetLanguage(language);
+            var texts = LocalizationService.Current;
+            var thread = new ApiThreadDetails("unknown", "", null, "SOL", "SOL",
+                null, null, null, null, null, false, 0, false);
+            Assert.Equal(unset, InvokeFormatter("FormatThreadTitle", texts, thread));
+            Assert.Equal($"{texts.Context} {unobserved}", InvokeFormatter("FormatContextUsage", texts, thread));
+            Assert.DoesNotContain("0%", InvokeFormatter("FormatContextUsage", texts, thread));
+        }
+        finally
+        {
+            LocalizationService.SetLanguage(previous);
+        }
+    }
+
     [Fact]
     public void ThreadsInformationRowsUseTheIssue362Contract()
     {

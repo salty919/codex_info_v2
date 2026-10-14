@@ -9,6 +9,21 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphWindowSelectorParityTests
 {
     [Fact]
+    public void QuietCalendarDaysUseSubduedCellsAndReadableValues()
+    {
+        var graph = XDocument.Parse(Load("GraphWindow.axaml"));
+        var cell = graph.Descendants().Single(element =>
+            element.Name.LocalName == "Border" && element.Attribute("Classes")?.Value == "calendar-day");
+        Assert.Equal("{Binding IsQuiet}", cell.Attribute("Classes.quiet")?.Value);
+        var style = Assert.Single(graph.Descendants(), element =>
+            element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "Border.calendar-day.quiet");
+        Assert.Contains(style.Elements(), element => element.Attribute("Property")?.Value == "Background" &&
+            element.Attribute("Value")?.Value == "Transparent");
+        Assert.Contains(graph.Descendants(), element => element.Name.LocalName == "Style" &&
+            element.Attribute("Selector")?.Value == "Border.calendar-day.quiet TextBlock");
+    }
+
+    [Fact]
     public void GraphTimeWindowsExposeModesAndBoundedNavigation()
     {
         var graph = XDocument.Parse(Load("GraphWindow.axaml"));
@@ -89,7 +104,7 @@ public sealed class GraphWindowSelectorParityTests
     }
 
     [Fact]
-    public void GraphCurrentDataWarningHasDedicatedNonBlockingRowAbovePlot()
+    public void GraphWarningAndHistoryEvidenceHaveNonBlockingHeaderAbovePlot()
     {
         var graph = XDocument.Parse(Load("GraphWindow.axaml"));
         var warning = Assert.Single(graph.Descendants(), element =>
@@ -101,7 +116,27 @@ public sealed class GraphWindowSelectorParityTests
         Assert.Equal("{Binding DetailsStatusText}", warning.Attribute("AutomationProperties.Name")?.Value);
         Assert.Equal("False", warning.Attribute("IsHitTestVisible")?.Value);
         Assert.Equal("Left", warning.Attribute("HorizontalAlignment")?.Value);
-        Assert.Equal("0", warning.Attribute("Grid.Row")?.Value);
+        var evidence = Assert.Single(graph.Descendants(), element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.HistoryEvidence");
+        Assert.Equal("TextBlock", evidence.Name.LocalName);
+        Assert.Equal("{Binding GraphGapHintText}", evidence.Attribute("Text")?.Value);
+        Assert.Equal("{Binding GraphGapHintText}", evidence.Attribute("AutomationProperties.Name")?.Value);
+        Assert.Equal("{Binding HasLinePlot}", evidence.Attribute("IsVisible")?.Value);
+        Assert.Equal("Wrap", evidence.Attribute("TextWrapping")?.Value);
+
+        var header = warning.Parent;
+        Assert.NotNull(header);
+        Assert.Equal("StackPanel", header.Name.LocalName);
+        Assert.Equal("Vertical", header.Attribute("Orientation")?.Value ?? "Vertical");
+        Assert.Equal("0", header.Attribute("Grid.Row")?.Value);
+        Assert.Same(header, evidence.Parent);
+        var historyError = graph.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.HistoryLoadError");
+        Assert.Equal("{Binding HasRetainedLoadError}", historyError.Attribute("IsVisible")?.Value);
+        Assert.Equal("{Binding LoadErrorText}", historyError.Attribute("Text")?.Value);
+        Assert.Equal("Wrap", historyError.Attribute("TextWrapping")?.Value);
+        Assert.Same(header, historyError.Parent);
+        Assert.Equal(new[] { warning, historyError, evidence }, header.Elements().ToArray());
 
         var frame = graph.Descendants().Single(element =>
             element.Attribute(XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml"))?.Value == "GraphFrame");
@@ -111,8 +146,8 @@ public sealed class GraphWindowSelectorParityTests
         var plot = graph.Descendants().Single(element => element.Name.LocalName == "GraphPlotControl");
         Assert.Equal("{Binding HasLinePlot}", plot.Attribute("IsVisible")?.Value);
         Assert.Equal("1", plot.Attribute("Grid.Row")?.Value);
-        Assert.Same(warning.Parent, plot.Parent);
-        Assert.Equal("Auto,*", warning.Parent?.Attribute("RowDefinitions")?.Value);
+        Assert.Same(header.Parent, plot.Parent);
+        Assert.Equal("Auto,*", header.Parent?.Attribute("RowDefinitions")?.Value);
         Assert.Contains(graph.Descendants(), element =>
             element.Name.LocalName == "TextBlock" &&
             element.Attribute("IsVisible")?.Value == "{Binding HasBlockingLoadError}");
