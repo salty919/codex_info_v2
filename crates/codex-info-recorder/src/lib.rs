@@ -6786,6 +6786,7 @@ impl Recorder {
         let mut candidate_token_anchor_recoveries = durable_token_anchor_recoveries.clone();
         candidate_token_anchor_recoveries.extend(token_anchor_recoveries.iter().cloned());
         let candidate_model_totals_complete = !current_cycle_unresolved
+            && !totals.values.contains_key(UNATTRIBUTED_MODEL)
             && durable_pending
                 .iter()
                 .filter(|pending| pending.complete)
@@ -9377,9 +9378,11 @@ fn legacy_pending_no_delta_proof(
         && strict_prior.fully_attributed_from_zero
         && prior_snapshot.valid()
         && prior_snapshot.is_zero();
-    let unknown_zero_baseline =
-        !strict_prior.token_baseline_known && prior_snapshot.valid() && prior_snapshot.is_zero();
-    if !known_zero_anchor && !unknown_zero_baseline {
+    // Unknown legacy components are not a zero snapshot. The exact source
+    // proof below establishes its own first raw baseline and requires every
+    // following counter in the range to remain identical.
+    let unknown_baseline = !strict_prior.token_baseline_known;
+    if !known_zero_anchor && !unknown_baseline {
         return LegacyNoDeltaProofAttempt {
             proven_pending: None,
             bytes_read: 0,
@@ -10639,10 +10642,9 @@ fn scan_source_with_reader<R: BufRead>(
                 model_context: legacy_model_proof.clone(),
             });
         }
-        if source_admission
-            .as_ref()
-            .is_none_or(|admission| admission.stream != UsageStream::LegacyCounter)
-        {
+        if source_admission.as_ref().is_none_or(|admission| {
+            admission.stream == UsageStream::ResponseRecord || !admission.responses.is_empty()
+        }) {
             model_context.start_interval();
             if delta.has_usage() && !had_response_before_counter {
                 unresolved = true;
@@ -10660,6 +10662,11 @@ fn scan_source_with_reader<R: BufRead>(
             continue;
         }
         let qualified_model = model_context.interval_model().map(str::to_owned);
+        if qualified_model.is_none() && delta.has_usage() {
+            // The exact counter delta remains recorded in the explicit
+            // UNATTRIBUTED bucket; only model-set completeness is unknown.
+            fully_attributed = false;
+        }
         let model = ModelTotals::usage_model(qualified_model.as_deref());
         model_context.start_interval();
         let timed_event = (timestamp > 0 && delta.has_usage()).then(|| TimedModelUsage {
@@ -10738,6 +10745,18 @@ fn scan_source_with_reader<R: BufRead>(
         }
     }
     let end_offset = unresolved_start.unwrap_or(physical_offset);
+    // An account boundary advances only the physical cursor. Retain the exact
+    // bytes read at that boundary so the next cycle can reconstruct parser
+    // state without treating any pre-boundary counter as new consumption.
+    let boundary_digest = if baseline_existing && admitted_start > 0 {
+        Some(sha256_open_file_range(
+            &mut metadata_file,
+            0,
+            admitted_start,
+        )?)
+    } else {
+        None
+    };
     let after_file = metadata_file.metadata()?;
     let after_path = fs::symlink_metadata(&source.path)?;
     if after_path.file_type().is_symlink()
@@ -10821,34 +10840,39 @@ fn scan_source_with_reader<R: BufRead>(
         previous_output: previous.output,
         previous_cache_write_input: previous.cache_write_input,
     };
-    let range = (end_offset > admitted_start).then(|| SessionRange {
+    let range = (end_offset > admitted_start || boundary_digest.is_some()).then(|| SessionRange {
         root_identity: checkpoint.root_identity.clone(),
         relative_path: checkpoint.relative_path.clone(),
         file_device: checkpoint.file_device,
         file_inode: checkpoint.file_inode,
-        start_offset: admitted_start,
+        start_offset: if boundary_digest.is_some() {
+            0
+        } else {
+            admitted_start
+        },
         end_offset,
         collector_epoch,
         cycle_seq,
         prefix_generation: checkpoint.prefix_generation,
-        record_sha256: accepted_digest.expect("accepted range has a digest"),
+        record_sha256: boundary_digest
+            .or(accepted_digest)
+            .expect("accepted range has a digest"),
     });
-    let task_indexed_range =
-        range
-            .as_ref()
-            .filter(|_| !unresolved)
-            .map(|range| SessionTaskIndexedRange {
-                root_identity: range.root_identity.clone(),
-                relative_path: range.relative_path.clone(),
-                file_device: range.file_device,
-                file_inode: range.file_inode,
-                start_offset: range.start_offset,
-                end_offset: range.end_offset,
-                collector_epoch: range.collector_epoch,
-                cycle_seq: range.cycle_seq,
-                prefix_generation: range.prefix_generation,
-                record_sha256: range.record_sha256.clone(),
-            });
+    let task_indexed_range = range
+        .as_ref()
+        .filter(|_| !unresolved && !baseline_existing)
+        .map(|range| SessionTaskIndexedRange {
+            root_identity: range.root_identity.clone(),
+            relative_path: range.relative_path.clone(),
+            file_device: range.file_device,
+            file_inode: range.file_inode,
+            start_offset: range.start_offset,
+            end_offset: range.end_offset,
+            collector_epoch: range.collector_epoch,
+            cycle_seq: range.cycle_seq,
+            prefix_generation: range.prefix_generation,
+            record_sha256: range.record_sha256.clone(),
+        });
     let task_events = task_indexed_range
         .as_ref()
         .map(|indexed| {
@@ -12116,17 +12140,21 @@ mod tests {
             )
             .unwrap();
         let start_at = reset_at - window_seconds;
+        let metadata_record = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\",\"session_id\":\"thread\"}}\n";
         let original = if old_baseline_unknown {
-            "{\"type\":\"session_meta\"}\n".to_owned()
+            metadata_record.to_owned()
         } else {
-            token(0, start_at + 1)
+            format!(
+                "{metadata_record}{}",
+                token_with_cache_write_input(0, 0, start_at + 1)
+            )
         };
         fs::write(&source, original).unwrap();
         let stable_source = root.join("sessions/two.jsonl");
         fs::write(
             &stable_source,
             format!(
-                "{}\n{}{}",
+                "{metadata_record}{}\n{}{}",
                 json!({
                         "type": "event_msg",
                         "timestamp": DateTime::<Utc>::from_timestamp(start_at + 1, 0)
@@ -12134,8 +12162,8 @@ mod tests {
                             .to_rfc3339(),
                         "payload": {"type": "turn_context", "model": "gpt-6-astra"},
                 }),
-                token(10, start_at + 2),
-                token(15, start_at + 3)
+                token_with_cache_write_input(0, 0, start_at + 2),
+                token_with_cache_write_input(5, 0, start_at + 3)
             ),
         )
         .unwrap();
@@ -12163,7 +12191,7 @@ mod tests {
             .unwrap();
         if old_baseline_unknown {
             assert!(!old_checkpoint.token_baseline_known);
-            assert_eq!(old_checkpoint.previous_total, Some(0));
+            assert_eq!(old_checkpoint.previous_total, None);
         } else {
             assert!(old_checkpoint.token_baseline_known);
             assert!(old_checkpoint.fully_attributed_from_zero);
@@ -12180,13 +12208,15 @@ mod tests {
         }
         drop(recorder);
 
-        replace_source_file_with_new_inode(&source, current_bytes);
+        let mut current_source = metadata_record.as_bytes().to_vec();
+        current_source.extend_from_slice(current_bytes.as_ref());
+        replace_source_file_with_new_inode(&source, current_source);
         let transition = "aa".repeat(32);
         let mut recorder = Recorder::open_partitioned_for_account(
             config(&root, chunk_bytes),
             &database,
             &identity(),
-            None,
+            Some(start_at),
             Some(&transition),
         )
         .unwrap();
@@ -12198,6 +12228,19 @@ mod tests {
                 remaining_percent: Some(90.0),
             }))
             .unwrap()
+            .unwrap();
+        // This fixture models an already parsed legacy boundary, with one
+        // retained old-format marker. Hydrate the parser from the actual bytes
+        // before installing that old marker; do not manufacture model facts.
+        recorder.config.chunk_bytes = chunk_bytes.max(4096);
+        recorder.run_cycle().unwrap().unwrap();
+        recorder.config.chunk_bytes = chunk_bytes;
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "DELETE FROM session_pending_ranges WHERE relative_path='one.jsonl'",
+                [],
+            )
             .unwrap();
         let state = recorder.state().unwrap();
         let current_checkpoint = state
@@ -12263,18 +12306,50 @@ mod tests {
     }
 
     fn latest_model_set_complete(database: &Path) -> i64 {
-        Connection::open(database)
+        let reader = UsageStore::open_read_only_partitioned(database, &identity()).unwrap();
+        let observation = reader
+            .load_recent_observations(Utc::now() + chrono::Duration::days(1))
             .unwrap()
-            .query_row(
-                "SELECT model_set_complete FROM usage_model_history
-                 ORDER BY reset_at DESC, timestamp DESC, model DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
+            .into_iter()
+            .max_by_key(|row| (row.reset_at, row.timestamp))
+            .unwrap();
+        i64::from(observation.model_totals_complete)
+    }
+
+    fn anchor_pending_ranges(recorder: &Recorder) -> Vec<SessionPendingRange> {
+        recorder
+            .writer
+            .load_session_pending_ranges()
             .unwrap()
+            .into_iter()
+            .filter(|pending| pending.reason == "checkpoint-token-anchor-missing")
+            .collect()
+    }
+
+    fn assert_pending_reasons(recorder: &Recorder, expected: &[(&str, usize)]) {
+        let mut actual = BTreeMap::<String, usize>::new();
+        for pending in recorder.writer.load_session_pending_ranges().unwrap() {
+            *actual.entry(pending.reason).or_default() += 1;
+        }
+        let expected = expected
+            .iter()
+            .map(|(reason, count)| (reason.to_string(), *count))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            actual, expected,
+            "all retained unknown evidence must be explained"
+        );
     }
 
     fn downgrade_canonical_history_to_v9(connection: &Connection) {
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM session_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "this schema fixture must not discard recorded events"
+        );
         connection
             .execute_batch(
                 "DROP TRIGGER usage_history_canonical_insert_guard;
@@ -12285,8 +12360,26 @@ mod tests {
                  DROP TRIGGER durable_history_observation_update_guard;
                  DROP TRIGGER usage_history_sidecar_update_guard;
                  DROP TRIGGER usage_history_sidecar_delete_guard;
-                 DROP INDEX usage_history_canonical_timestamp_idx;
-                 DROP INDEX usage_model_history_canonical_timestamp_model_idx;
+                 DROP INDEX usage_history_canonical_period_timestamp_idx;
+                 DROP INDEX usage_model_history_canonical_period_timestamp_model_idx;
+                 ALTER TABLE session_checkpoints DROP COLUMN source_admission;
+                 ALTER TABLE session_checkpoints DROP COLUMN last_model_interval;
+                 ALTER TABLE session_checkpoints DROP COLUMN last_model_context_kind;
+                 DROP TABLE session_events;
+                 CREATE TABLE session_events (
+                    root_identity TEXT NOT NULL, relative_path TEXT NOT NULL,
+                    file_device TEXT NOT NULL, file_inode TEXT NOT NULL,
+                    prefix_generation TEXT NOT NULL,
+                    range_start INTEGER NOT NULL CHECK(range_start>=0),
+                    range_end INTEGER NOT NULL CHECK(range_end>range_start),
+                    record_sha256 TEXT NOT NULL, event_index INTEGER NOT NULL,
+                    timestamp INTEGER NOT NULL, model TEXT NOT NULL,
+                    total_tokens TEXT NOT NULL, input_tokens TEXT NOT NULL,
+                    cached_input_tokens TEXT NOT NULL, output_tokens TEXT NOT NULL,
+                    cache_write_input_tokens TEXT,
+                    PRIMARY KEY(root_identity,relative_path,file_device,file_inode,prefix_generation,
+                        range_start,range_end,record_sha256,event_index)
+                 ) WITHOUT ROWID;
                  DROP TABLE session_quota_windows;
                  PRAGMA user_version = 9;",
             )
@@ -12305,6 +12398,25 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(auth, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn unattributed_event_total(recorder: &Recorder) -> u64 {
+        let state = recorder.state().unwrap();
+        let period_start = (state.reset_at > 0 && state.window_seconds > 0)
+            .then(|| state.reset_at.saturating_sub(state.window_seconds));
+        recorder
+            .writer
+            .load_session_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.model == UNATTRIBUTED_MODEL)
+            .filter(|event| {
+                period_start.is_none_or(|start| {
+                    event.timestamp >= start && event.timestamp <= state.reset_at
+                })
+            })
+            .map(|event| event.total_tokens)
+            .sum()
     }
 
     pub(crate) fn token(total: u64, timestamp: i64) -> String {
@@ -13059,10 +13171,7 @@ mod tests {
             .write_all(token(15, now + 1).as_bytes())
             .unwrap();
         assert_eq!(recorder.run_cycle().unwrap().unwrap().generation, 2);
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
+        assert_eq!(unattributed_event_total(&recorder), 5);
         assert_eq!(recorder.run_cycle().unwrap().unwrap().generation, 3);
         let _ = fs::remove_dir_all(root);
     }
@@ -14061,7 +14170,11 @@ mod tests {
     fn new_zero_event_range_is_indexed_without_inventing_lifecycle_state() {
         let (root, database) = prepare("task-zero-event");
         let source = root.join("sessions/one.jsonl");
-        fs::write(&source, "{\"type\":\"session_meta\"}\n").unwrap();
+        fs::write(
+            &source,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\",\"session_id\":\"root-session\"}}\n",
+        )
+        .unwrap();
 
         let mut recorder =
             Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
@@ -14445,10 +14558,7 @@ mod tests {
         let report = recorder.run_cycle().unwrap().unwrap();
 
         assert_eq!(report.generation, 2);
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            10
-        );
+        assert_eq!(unattributed_event_total(&recorder), 10);
         let future_samples: i64 = Connection::open(&database)
             .unwrap()
             .query_row(
@@ -19205,37 +19315,31 @@ mod tests {
         let mut recorder =
             Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
         let first = recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(first.pending_ranges, 1);
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
+        assert_eq!(first.pending_ranges, 3);
+        assert_eq!(unattributed_event_total(&recorder), 5);
         assert!(!recorder.state().unwrap().checkpoints[0].fully_attributed_from_zero);
-        let pending: (i64, String, i64) = Connection::open(&database)
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*), reason, complete FROM session_pending_ranges",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(pending, (1, "malformed-json-record".to_owned(), 1));
+        assert!(recorder.model_totals().unwrap().is_empty());
+        assert_pending_reasons(
+            &recorder,
+            &[
+                ("malformed-json-record", 1),
+                ("initial-counter-prefix-unknown", 1),
+                ("model-interval-unqualified", 1),
+            ],
+        );
         assert_eq!(recorder.generation().unwrap(), 1);
         let heartbeat = recorder.run_cycle().unwrap().unwrap();
         assert_eq!(heartbeat.accepted_ranges, 0);
         assert_eq!(heartbeat.generation, 2);
         assert_eq!(recorder.generation().unwrap(), 2);
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
+        assert_eq!(unattributed_event_total(&recorder), 5);
         let pending_count: i64 = Connection::open(&database)
             .unwrap()
             .query_row("SELECT COUNT(*) FROM session_pending_ranges", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(pending_count, 1);
+        assert_eq!(pending_count, 3);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -19728,7 +19832,7 @@ mod tests {
             .unwrap();
         recorder.run_cycle_with_quota(None).unwrap().unwrap();
         assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&recorder),
             10,
             "both deltas belong to the still-current old window before the new quota arrives"
         );
@@ -19762,7 +19866,7 @@ mod tests {
         assert_eq!(rolled_state.reset_at, NEW_RESET_AT);
         assert_eq!(rolled_state.latest_quota_reset_at, NEW_RESET_AT);
         assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&recorder),
             5,
             "only the delta timestamped inside the externally defined new window is included"
         );
@@ -19789,7 +19893,7 @@ mod tests {
             Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
         restarted.run_cycle().unwrap().unwrap();
         assert_eq!(
-            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&restarted),
             5,
             "restarting and replaying the unchanged source must not duplicate its post-window delta"
         );
@@ -19866,7 +19970,7 @@ mod tests {
             .recover_session_quota_history(&root.join("sessions"), minute)
             .unwrap();
         drop(writer);
-        let recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+        let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
             config(&root, 4096),
             &database,
             &identity(),
@@ -19875,6 +19979,16 @@ mod tests {
             vec![SessionLifecycleInterval::new(Some(minute + 60), None)],
         )
         .unwrap();
+        // Initialization has no permission to perform an unbounded source
+        // scan. Execute the existing recovery owner with its recorded fence.
+        recorder
+            .writer
+            .recover_session_quota_history_for_intervals(
+                &root.join("sessions"),
+                minute,
+                &recorder.lifecycle_intervals,
+            )
+            .unwrap();
         let db = Connection::open(&database).unwrap();
         let at: i64 = db
             .query_row(
@@ -19904,7 +20018,7 @@ mod tests {
             &source,
             format!(
                 "{}\n{}{}",
-                json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-6-astra"}}),
+                json!({"type":"event_msg","timestamp":DateTime::<Utc>::from_timestamp(start,0).unwrap().to_rfc3339(),"payload":{"type":"turn_context","model":"gpt-6-astra"}}),
                 token(0, start + 1),
                 token(10, start + 10)
             ),
@@ -20003,7 +20117,7 @@ mod tests {
             &source,
             format!(
                 "{}\n{}{}",
-                json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-6-astra"}}),
+                json!({"type":"event_msg","timestamp":DateTime::<Utc>::from_timestamp(start,0).unwrap().to_rfc3339(),"payload":{"type":"turn_context","model":"gpt-6-astra"}}),
                 token(0, start + 1),
                 token(10, start + 10)
             ),
@@ -20111,8 +20225,9 @@ mod tests {
         fs::write(
             &source,
             format!(
-                "{}\n{}{}",
-                json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-6-astra"}}),
+                "{}\n{}\n{}{}",
+                json!({"type":"session_meta","payload":{"id":"thread","session_id":"thread"}}),
+                json!({"type":"event_msg","timestamp":DateTime::<Utc>::from_timestamp(start,0).unwrap().to_rfc3339(),"payload":{"type":"turn_context","model":"gpt-6-astra"}}),
                 token(0, start + 1),
                 token(10, start + 10)
             ),
@@ -20134,6 +20249,17 @@ mod tests {
                 false,
             )
             .unwrap();
+        stage_fixture_official_quota(
+            &mut recorder,
+            &codex_info_db_writer::QuotaReceipt {
+                receipt_id: "a".repeat(64),
+                sequence: 1,
+                observed_at: start + 30,
+                reset_at: reset,
+                window_seconds: 3600,
+                remaining_percent: 90.0,
+            },
+        );
         let quota = QuotaSnapshot {
             observed_at: start + 30,
             reset_at: reset,
@@ -20158,7 +20284,7 @@ mod tests {
             .unwrap();
         let db = Connection::open(&database).unwrap();
         if mode == "rollback" {
-            db.execute_batch(&format!("CREATE TRIGGER reject_zero_quota BEFORE UPDATE OF remaining_percent ON usage_history WHEN NEW.timestamp={} AND NEW.remaining_percent=88 BEGIN SELECT RAISE(ABORT,'zero quota rejected'); END;",start+60)).unwrap();
+            db.execute_batch("CREATE TRIGGER reject_zero_quota BEFORE INSERT ON session_quota_windows BEGIN SELECT RAISE(ABORT,'zero quota source metadata rejected'); END;").unwrap();
             assert!(
                 recorder.run_cycle_with_quota(Some(quota)).is_err(),
                 "zero-delta quota failure cannot acknowledge its range"
@@ -20185,8 +20311,24 @@ mod tests {
                     .unwrap();
                 db.execute("DELETE FROM session_quota_windows", []).unwrap();
                 drop(recorder);
-                recorder = Recorder::open_partitioned(config(&root, 65536), &database, &identity())
+                recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+                    config(&root, 65536),
+                    &database,
+                    &identity(),
+                    None,
+                    None,
+                    vec![SessionLifecycleInterval::new(Some(start - 1), None)],
+                )
+                .unwrap();
+                recorder
+                    .writer
+                    .recover_session_quota_history_for_intervals(
+                        &root.join("sessions"),
+                        start - 1,
+                        &recorder.lifecycle_intervals,
+                    )
                     .unwrap();
+                recorder.repair_historical_sources_guarded(|| true).unwrap();
             }
             let remaining: Option<f64> = db
                 .query_row(
@@ -20199,15 +20341,18 @@ mod tests {
                 .flatten();
             assert_eq!(
                 remaining,
-                Some(88.0),
-                "accepted zero-delta source quota must survive {mode}"
+                None,
+                "cached Session quota is not an official remaining-percent observation after {mode}"
             );
             let tokens:Option<String>=db.query_row("SELECT total_tokens FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6-astra'",[start+60],|r|r.get(0)).optional().unwrap();
             assert_eq!(
                 tokens.as_deref(),
-                Some("10"),
-                "known source prefix must remain a recorded flat minute"
+                if mode == "restart" { None } else { Some("10") },
+                "raw repair cannot fabricate a missing legacy-period observation"
             );
+            if mode == "restart" {
+                assert_recorded_model_prefixes(&database, "gpt-6-astra", &[(start + 10, 10, 10)]);
+            }
             let window: (i64, i64, i64) = db
                 .query_row(
                     "SELECT reset_at,window_seconds,observed_at FROM session_quota_windows",
@@ -20386,7 +20531,7 @@ mod tests {
         let reset = start + 3_600;
         let header = format!(
             "{}\n",
-            json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-6-astra"}})
+            json!({"type":"event_msg","timestamp":DateTime::<Utc>::from_timestamp(start,0).unwrap().to_rfc3339(),"payload":{"type":"turn_context","model":"gpt-6-astra"}})
         );
         fs::write(
             root.join("sessions/one.jsonl"),
@@ -20673,7 +20818,15 @@ mod tests {
         let observed_at = Utc::now().timestamp();
         let window_seconds = 7 * 24 * 60 * 60;
         let canonical_reset_at = observed_at + window_seconds;
-        fs::write(&source, token(10, observed_at)).unwrap();
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), observed_at),
+                token(10, observed_at)
+            ),
+        )
+        .unwrap();
         let mut recorder =
             Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
 
@@ -20761,7 +20914,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(reset_count, 2);
+        assert_eq!(
+            reset_count, 3,
+            "each distinct official reset remains a separate exact key"
+        );
         drop(recorder);
         let reopened =
             Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
@@ -20786,12 +20942,13 @@ mod tests {
         let mut recorder =
             Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        fs::write(&second_source, token(20, now + 1)).unwrap();
+        fs::write(
+            &second_source,
+            format!("{}{}", token(0, now), token(20, now + 1)),
+        )
+        .unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            20
-        );
+        assert_eq!(unattributed_event_total(&recorder), 20);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -20859,7 +21016,11 @@ mod tests {
         fs::create_dir_all(&sessions).unwrap();
         let path = sessions.join("one.jsonl");
         let now = Utc::now().timestamp();
-        let first = token(10, now);
+        let first = format!(
+            "{}{}",
+            issue604_context_record("turn_context", json!("gpt-6.1-sol"), now),
+            token(10, now)
+        );
         fs::write(&path, &first).unwrap();
 
         let root_metadata = fs::metadata(&sessions).unwrap();
@@ -20869,43 +21030,35 @@ mod tests {
             fs::metadata(&path).unwrap(),
         );
         let collector_epoch = 7;
-        let prefix_sha256 = sha256_file_range(&path, 0, first.len() as u64).unwrap();
-        let checkpoint = SessionCheckpoint {
-            root_identity: recorded.root_identity.clone(),
-            relative_path: recorded.relative_path.clone(),
-            file_device: recorded.file_device,
-            file_inode: recorded.file_inode,
-            committed_offset: first.len() as u64,
-            discard_until_lf: false,
+        let source = Source { path, recorded };
+        let checkpoint = scan_source(
+            &source,
+            None,
+            false,
+            false,
             collector_epoch,
-            cycle_seq: 1,
-            prefix_generation: prefix_generation(collector_epoch, &recorded, &prefix_sha256),
-            prefix_sha256,
-            fully_attributed_from_zero: true,
-            token_baseline_known: true,
-            history_base_pending: false,
-            last_model: None,
-            last_model_context_kind: None,
-            last_model_interval: None,
-            source_admission: None,
-            last_task_running: None,
-            context_usage_tokens: None,
-            context_window_tokens: None,
-            previous_total: Some(10),
-            previous_input: Some(10),
-            previous_cached_input: None,
-            previous_output: None,
-            previous_cache_write_input: None,
-        };
+            1,
+            now + 60,
+            now - 60,
+            4096,
+            None,
+            None,
+            None,
+            None,
+            &mut ModelTotals::default(),
+            &mut Vec::new(),
+        )
+        .unwrap()
+        .unwrap()
+        .checkpoint;
         let second = token(15, now + 1);
         fs::OpenOptions::new()
             .append(true)
-            .open(&path)
+            .open(&source.path)
             .unwrap()
             .write_all(second.as_bytes())
             .unwrap();
 
-        let source = Source { path, recorded };
         let mut totals = ModelTotals::default();
         let mut events = Vec::new();
         let outcome = scan_source(
@@ -20948,25 +21101,19 @@ mod tests {
         let mut recorder =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
-        );
+        assert_eq!(unattributed_event_total(&recorder), 70);
         fs::write(
             &source,
             format!("{}{}", token(100, now + 20), token(105, now + 21)),
         )
         .unwrap();
         let replacement_report = recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
-        );
-        assert_eq!(replacement_report.pending_ranges, 1);
+        assert_eq!(unattributed_event_total(&recorder), 70);
+        assert_eq!(replacement_report.pending_ranges, 9);
         let diagnostic: (String, i64) = Connection::open(&database)
             .unwrap()
             .query_row(
-                "SELECT reason, complete FROM session_pending_ranges",
+                "SELECT reason, complete FROM session_pending_ranges WHERE reason='checkpoint-token-anchor-missing'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -20976,12 +21123,17 @@ mod tests {
             ("checkpoint-token-anchor-missing".to_owned(), 1)
         );
 
-        let repeated = recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(repeated.pending_ranges, 1);
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
+        assert_pending_reasons(
+            &recorder,
+            &[
+                ("initial-counter-prefix-unknown", 1),
+                ("model-interval-unqualified", 7),
+                ("checkpoint-token-anchor-missing", 1),
+            ],
         );
+        let repeated = recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(repeated.pending_ranges, 9);
+        assert_eq!(unattributed_event_total(&recorder), 70);
         assert_eq!(
             recorder
                 .writer
@@ -21019,16 +21171,18 @@ mod tests {
             fs::write(&source, replacement).unwrap();
             let report = recorder.run_cycle().unwrap().unwrap();
 
-            assert_eq!(
-                recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-                recovered_total
+            assert_eq!(unattributed_event_total(&recorder), recovered_total);
+            assert_eq!(report.pending_ranges, 9);
+            assert_pending_reasons(
+                &recorder,
+                &[
+                    ("initial-counter-prefix-unknown", 1),
+                    ("model-interval-unqualified", 7),
+                    ("checkpoint-token-anchor-missing", 1),
+                ],
             );
-            assert_eq!(report.pending_ranges, 1);
             recorder.run_cycle().unwrap().unwrap();
-            assert_eq!(
-                recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-                recovered_total
-            );
+            assert_eq!(unattributed_event_total(&recorder), recovered_total);
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -21061,10 +21215,7 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
-        );
+        assert_eq!(unattributed_event_total(&recorder), 70);
 
         replace_source_file_with_new_inode(
             &source,
@@ -21075,9 +21226,9 @@ mod tests {
             ),
         );
         let unresolved = recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(unresolved.pending_ranges, 1);
+        assert_eq!(unresolved.pending_ranges, 9);
         assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&recorder),
             70,
             "an unmatched replacement prefix must not be credited"
         );
@@ -21086,9 +21237,9 @@ mod tests {
         let mut restarted =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         let still_unresolved = restarted.run_cycle().unwrap().unwrap();
-        assert_eq!(still_unresolved.pending_ranges, 1);
+        assert_eq!(still_unresolved.pending_ranges, 9);
         assert_eq!(
-            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&restarted),
             70,
             "restart must retain the original unresolved anchor without crediting the prefix"
         );
@@ -21107,9 +21258,9 @@ mod tests {
             .write_all(token_with_cache_write_input(80, 1, now + 20).as_bytes())
             .unwrap();
         let wrong_cache_write = restarted.run_cycle().unwrap().unwrap();
-        assert_eq!(wrong_cache_write.pending_ranges, 1);
+        assert_eq!(wrong_cache_write.pending_ranges, 9);
         assert_eq!(
-            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&restarted),
             70,
             "an equal token total with a different cache-write counter is not the saved anchor"
         );
@@ -21138,23 +21289,21 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(recovered.pending_ranges, 0);
-        assert_eq!(
-            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            74
+        assert_eq!(recovered.pending_ranges, 10);
+        assert!(anchor_pending_ranges(&restarted).is_empty());
+        assert_pending_reasons(
+            &restarted,
+            &[
+                ("initial-counter-prefix-unknown", 1),
+                ("model-interval-unqualified", 9),
+            ],
         );
-        let recovered_observation_complete: i64 = Connection::open(&database)
-            .unwrap()
-            .query_row(
-                "SELECT model_set_complete FROM usage_model_history
-                 ORDER BY timestamp DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        assert!(restarted.model_totals().unwrap().is_empty());
+        assert_eq!(unattributed_event_total(&restarted), 74);
+        let recovered_observation_complete = latest_model_set_complete(&database);
         assert_eq!(
-            recovered_observation_complete, 1,
-            "resolving the last pending anchor must publish the new observation as complete"
+            recovered_observation_complete, 0,
+            "anchor recovery does not invent the absent model context"
         );
         let recovered_event_count: i64 = Connection::open(&database)
             .unwrap()
@@ -21171,7 +21320,7 @@ mod tests {
         let mut replay =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         replay.run_cycle().unwrap().unwrap();
-        assert_eq!(replay.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 74);
+        assert_eq!(unattributed_event_total(&replay), 74);
         let replayed_event_count: i64 = Connection::open(&database)
             .unwrap()
             .query_row(
@@ -21215,7 +21364,10 @@ mod tests {
             .unwrap();
         assert_eq!(old_checkpoint.previous_total, Some(80));
         assert!(old_checkpoint.token_baseline_known);
-        assert!(old_checkpoint.fully_attributed_from_zero);
+        assert!(
+            !old_checkpoint.fully_attributed_from_zero,
+            "the source has no model context"
+        );
 
         replace_source_file_with_new_inode(
             &source,
@@ -21225,8 +21377,8 @@ mod tests {
                 token_with_cache_write_input(95, 1, now + 11)
             ),
         );
-        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 1);
-        let original_pending = recorder.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 9);
+        let original_pending = anchor_pending_ranges(&recorder);
         assert_eq!(original_pending.len(), 1);
         assert_eq!(
             original_pending[0].reason,
@@ -21343,23 +21495,41 @@ mod tests {
         for _ in 0..12 {
             let report = restarted.run_cycle().unwrap().unwrap();
             final_report = Some(report.clone());
-            if report.pending_ranges == 0 {
+            if restarted
+                .writer
+                .load_session_token_anchor_recoveries()
+                .unwrap()
+                .is_empty()
+                && restarted
+                    .state()
+                    .unwrap()
+                    .checkpoints
+                    .iter()
+                    .any(|checkpoint| {
+                        checkpoint.file_inode == original_pending[0].file_inode
+                            && checkpoint.committed_offset == fs::metadata(&source).unwrap().len()
+                    })
+            {
                 break;
             }
         }
-        assert_eq!(final_report.unwrap().pending_ranges, 0);
+        assert_eq!(final_report.unwrap().pending_ranges, 10);
         assert!(restarted
             .writer
             .load_session_token_anchor_recoveries()
             .unwrap()
             .is_empty());
-        assert!(restarted
-            .writer
-            .load_session_pending_ranges()
-            .unwrap()
-            .is_empty());
+        assert!(anchor_pending_ranges(&restarted).is_empty());
+        assert_pending_reasons(
+            &restarted,
+            &[
+                ("initial-counter-prefix-unknown", 1),
+                ("model-interval-unqualified", 9),
+            ],
+        );
+        assert!(restarted.model_totals().unwrap().is_empty());
         assert_eq!(
-            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&restarted),
             75,
             "only the two deltas after the exact strict-prior vector are admitted"
         );
@@ -21378,7 +21548,7 @@ mod tests {
         let mut replay =
             Recorder::open_partitioned(config(&root, 128), &database, &identity()).unwrap();
         replay.run_cycle().unwrap().unwrap();
-        assert_eq!(replay.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 75);
+        assert_eq!(unattributed_event_total(&replay), 75);
         let replayed_event_count: i64 = Connection::open(&database)
             .unwrap()
             .query_row(
@@ -21421,10 +21591,7 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
-        );
+        assert_eq!(unattributed_event_total(&recorder), 70);
 
         replace_source_file_with_new_inode(
             &source,
@@ -21441,13 +21608,10 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .pending_ranges,
-            1
+            9
         );
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
-        );
-        let pending_before = recorder.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(unattributed_event_total(&recorder), 70);
+        let pending_before = anchor_pending_ranges(&recorder);
         let checkpoint_before = recorder
             .state()
             .unwrap()
@@ -21505,15 +21669,23 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(retained.pending_ranges, 1);
-        assert_eq!(legacy.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 70);
+        assert_eq!(retained.pending_ranges, 9);
+        assert_eq!(unattributed_event_total(&legacy), 70);
         assert!(legacy
             .writer
             .load_session_token_anchor_recoveries()
             .unwrap()
             .is_empty());
-        let pending = legacy.writer.load_session_pending_ranges().unwrap();
+        let pending = anchor_pending_ranges(&legacy);
         assert_eq!(pending.len(), 1);
+        assert_pending_reasons(
+            &legacy,
+            &[
+                ("initial-counter-prefix-unknown", 1),
+                ("model-interval-unqualified", 7),
+                ("checkpoint-token-anchor-missing", 1),
+            ],
+        );
         assert_eq!(pending[0].reason, "checkpoint-token-anchor-missing");
         let checkpoint_after = legacy
             .state()
@@ -21536,15 +21708,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(credited_late_event, 0);
-        let latest_model_set_complete: i64 = Connection::open(&database)
-            .unwrap()
-            .query_row(
-                "SELECT model_set_complete FROM usage_model_history
-                 ORDER BY timestamp DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let latest_model_set_complete = latest_model_set_complete(&database);
         assert_eq!(
             latest_model_set_complete, 0,
             "a legacy pending range without its original anchor remains incomplete"
@@ -21573,14 +21737,11 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
-        );
+        assert_eq!(unattributed_event_total(&recorder), 70);
 
         replace_source_file_with_new_inode(&source, token(90, now + 10));
-        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 1);
-        let original_pending = recorder.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 9);
+        let original_pending = anchor_pending_ranges(&recorder);
         assert_eq!(original_pending.len(), 1);
         let expected_hash = original_pending[0].record_sha256.clone();
         let mut changed = fs::read(&source).unwrap();
@@ -21612,8 +21773,8 @@ mod tests {
         let mut legacy =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         let retained = legacy.run_cycle().unwrap().unwrap();
-        assert_eq!(retained.pending_ranges, 2);
-        assert_eq!(legacy.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 70);
+        assert_eq!(retained.pending_ranges, 10);
+        assert_eq!(unattributed_event_total(&legacy), 70);
         assert!(legacy
             .writer
             .load_session_token_anchor_recoveries()
@@ -21628,6 +21789,15 @@ mod tests {
             1
         );
         assert!(retained_pending.contains(&original_pending[0]));
+        assert_pending_reasons(
+            &legacy,
+            &[
+                ("initial-counter-prefix-unknown", 1),
+                ("model-interval-unqualified", 7),
+                ("checkpoint-token-anchor-missing", 1),
+                ("source-changed-during-scan", 1),
+            ],
+        );
         assert!(retained_pending.iter().any(|pending| {
             pending.reason == "source-changed-during-scan" && !pending.complete
         }));
@@ -21655,18 +21825,15 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
-        );
+        assert_eq!(unattributed_event_total(&recorder), 70);
 
         let legacy_prefix = format!(
-            "{{\"type\":\"session_meta\",\"padding\":\"{}\"}}\n",
-            "x".repeat(256)
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":"thread","session_id":"thread"},"padding":"x".repeat(256)})
         );
         replace_source_file_with_new_inode(&source, legacy_prefix);
-        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 1);
-        let original_pending = recorder.writer.load_session_pending_ranges().unwrap();
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 9);
+        let original_pending = anchor_pending_ranges(&recorder);
         assert_eq!(original_pending.len(), 1);
         let current_inode = original_pending[0].file_inode;
         let old_checkpoint = recorder
@@ -21752,8 +21919,8 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(first_chunk.pending_ranges, 1);
-        assert_eq!(legacy.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 70);
+        assert_eq!(first_chunk.pending_ranges, 9);
+        assert_eq!(unattributed_event_total(&legacy), 70);
         let checkpoint = legacy
             .state()
             .unwrap()
@@ -21761,9 +21928,26 @@ mod tests {
             .into_iter()
             .find(|checkpoint| checkpoint.file_inode == current_inode)
             .unwrap();
-        assert_eq!(checkpoint.previous_total, Some(0));
+        assert_eq!(
+            checkpoint.previous_total, None,
+            "unknown is not a zero observation"
+        );
         assert!(!checkpoint.token_baseline_known);
-        let backlog = legacy.writer.load_session_pending_ranges().unwrap();
+        assert_pending_reasons(
+            &legacy,
+            &[
+                ("initial-counter-prefix-unknown", 1),
+                ("model-interval-unqualified", 7),
+                ("cycle-budget-backlog", 1),
+            ],
+        );
+        let backlog = legacy
+            .writer
+            .load_session_pending_ranges()
+            .unwrap()
+            .into_iter()
+            .filter(|pending| pending.reason == "cycle-budget-backlog")
+            .collect::<Vec<_>>();
         assert_eq!(backlog.len(), 1);
         assert_eq!(backlog[0].reason, "cycle-budget-backlog");
         assert!(!backlog[0].complete);
@@ -21777,15 +21961,7 @@ mod tests {
             .load_session_token_anchor_recoveries()
             .unwrap()
             .is_empty());
-        let incomplete: i64 = Connection::open(&database)
-            .unwrap()
-            .query_row(
-                "SELECT model_set_complete FROM usage_model_history
-                 ORDER BY timestamp DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let incomplete = latest_model_set_complete(&database);
         assert_eq!(incomplete, 0, "the unread source suffix stays incomplete");
 
         drop(legacy);
@@ -21802,24 +21978,20 @@ mod tests {
                 }))
                 .unwrap()
                 .unwrap();
-            let complete: i64 = Connection::open(&database)
-                .unwrap()
-                .query_row(
-                    "SELECT model_set_complete FROM usage_model_history
-                     ORDER BY timestamp DESC LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
+            let complete = latest_model_set_complete(&database);
             if complete == 1 {
                 break;
             }
         }
-        assert!(replay
-            .writer
-            .load_session_pending_ranges()
-            .unwrap()
-            .is_empty());
+        assert!(anchor_pending_ranges(&replay).is_empty());
+        assert_pending_reasons(
+            &replay,
+            &[
+                ("initial-counter-prefix-unknown", 2),
+                ("model-interval-unqualified", 8),
+            ],
+        );
+        assert!(replay.model_totals().unwrap().is_empty());
         let delta = Connection::open(&database)
             .unwrap()
             .query_row(
@@ -21833,7 +22005,7 @@ mod tests {
             delta, 10,
             "the first recovered counter is baseline, not usage"
         );
-        assert_eq!(replay.model_totals().unwrap()[UNATTRIBUTED_MODEL].total, 80);
+        assert_eq!(unattributed_event_total(&replay), 80);
         let event_count: i64 = Connection::open(&database)
             .unwrap()
             .query_row(
@@ -21844,16 +22016,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event_count, 1);
-        let complete: i64 = Connection::open(&database)
-            .unwrap()
-            .query_row(
-                "SELECT model_set_complete FROM usage_model_history
-                 ORDER BY timestamp DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(complete, 1);
+        let complete = latest_model_set_complete(&database);
+        assert_eq!(complete, 0, "the original model remains unknown");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -21865,7 +22029,11 @@ mod tests {
             (
                 "old-epoch-known-zero-no-delta",
                 false,
-                format!("{}{}", token(0, now + 10), token(0, now + 11)),
+                format!(
+                    "{}{}",
+                    token_with_cache_write_input(0, 0, now + 10),
+                    token_with_cache_write_input(0, 0, now + 11)
+                ),
                 40,
                 43,
             ),
@@ -21965,15 +22133,29 @@ mod tests {
                 }))
                 .unwrap()
                 .unwrap();
-            assert_eq!(appended.pending_ranges, 1);
-            assert_eq!(latest_model_set_complete(&fixture.database), 1);
+            assert_eq!(appended.pending_ranges, 3);
+            assert_eq!(latest_model_set_complete(&fixture.database), 0);
+            let appended_pending = fixture
+                .recorder
+                .writer
+                .load_session_pending_ranges()
+                .unwrap();
+            let mut reasons = appended_pending
+                .iter()
+                .map(|pending| pending.reason.as_str())
+                .collect::<Vec<_>>();
+            reasons.sort_unstable();
             assert_eq!(
-                fixture
-                    .recorder
-                    .model_totals()
-                    .unwrap()
-                    .get(UNATTRIBUTED_MODEL)
-                    .map_or(0, |counter| counter.total),
+                reasons,
+                vec![
+                    "checkpoint-token-anchor-missing",
+                    "initial-counter-prefix-unknown",
+                    "model-interval-unqualified",
+                ],
+                "a positive first counter and absent model context remain independently unknown"
+            );
+            assert_eq!(
+                unattributed_event_total(&fixture.recorder),
                 3,
                 "the new epoch's first appended counter remains a baseline; only its next delta counts"
             );
@@ -22006,21 +22188,17 @@ mod tests {
                 }))
                 .unwrap()
                 .unwrap();
-            assert_eq!(restart.pending_ranges, 1);
-            assert_eq!(latest_model_set_complete(&fixture.database), 1);
+            assert_eq!(restart.pending_ranges, 3);
+            assert_eq!(latest_model_set_complete(&fixture.database), 0);
             assert_eq!(
-                restarted
-                    .model_totals()
-                    .unwrap()
-                    .get(UNATTRIBUTED_MODEL)
-                    .map_or(0, |counter| counter.total),
+                unattributed_event_total(&restarted),
                 3,
                 "restart does not double-credit the accepted post-boundary delta"
             );
             assert_eq!(
                 restarted.writer.load_session_pending_ranges().unwrap(),
-                vec![retained_marker],
-                "the original old-epoch marker remains durable after restart"
+                appended_pending,
+                "restart retains the old marker and both explicit unknown intervals"
             );
             let event_count: i64 = Connection::open(&fixture.database)
                 .unwrap()
@@ -22045,7 +22223,7 @@ mod tests {
     #[test]
     fn checkpoint_token_anchor_old_epoch_uncollected_suffix_stays_incomplete() {
         let now = Utc::now().timestamp();
-        let zero = token(0, now + 10);
+        let zero = token_with_cache_write_input(0, 0, now + 10);
         let positive = token(5, now + 11);
         let mut fixture = seed_old_epoch_pending_fixture(
             "old-epoch-uncollected-suffix",
@@ -22054,7 +22232,7 @@ mod tests {
             4096,
         );
         let mut pending = fixture.pending.clone();
-        pending.end_offset = zero.len() as u64;
+        pending.end_offset = fixture.current_checkpoint.committed_offset - positive.len() as u64;
         pending.record_sha256 =
             sha256_file_range(&fixture.source, pending.start_offset, pending.end_offset).unwrap();
         let changed = Connection::open(&fixture.database)
@@ -22079,6 +22257,34 @@ mod tests {
             .unwrap();
         assert_eq!(changed, 1);
         fixture.pending = pending.clone();
+        // This legacy fixture intentionally lacks accepted bytes for its
+        // suffix. Retain only the exact hashed prefix in the current epoch.
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute(
+                "DELETE FROM session_ranges WHERE relative_path='one.jsonl' AND file_inode=?1",
+                [pending.file_inode.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_ranges(root_identity,relative_path,file_device,file_inode,
+             start_offset,end_offset,collector_epoch,cycle_seq,prefix_generation,record_sha256)
+             VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?9)",
+                rusqlite::params![
+                    &pending.root_identity,
+                    &pending.relative_path,
+                    pending.file_device.to_string(),
+                    pending.file_inode.to_string(),
+                    pending.end_offset as i64,
+                    format!("{:032x}", fixture.current_checkpoint.collector_epoch),
+                    fixture.current_checkpoint.cycle_seq.to_string(),
+                    format!("{:032x}", fixture.current_checkpoint.prefix_generation),
+                    &pending.record_sha256
+                ],
+            )
+            .unwrap();
+        drop(connection);
         let persisted_ranges = fixture.recorder.writer.load_session_ranges().unwrap();
         assert!(
             !persisted_ranges.iter().any(|range| {
@@ -22294,10 +22500,7 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            initial.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            10
-        );
+        assert_eq!(unattributed_event_total(&initial), 10);
         drop(initial);
 
         fs::OpenOptions::new()
@@ -22326,15 +22529,7 @@ mod tests {
             .unwrap();
         let observed_end = fs::metadata(&source).unwrap().len();
         assert!(checkpoint.committed_offset < observed_end);
-        let latest_model_set_complete: i64 = Connection::open(&database)
-            .unwrap()
-            .query_row(
-                "SELECT model_set_complete FROM usage_model_history
-                 ORDER BY timestamp DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let latest_model_set_complete = latest_model_set_complete(&database);
         assert_eq!(
             latest_model_set_complete, 0,
             "a source cursor before the inventoried end cannot publish a complete model set"
@@ -22371,10 +22566,7 @@ mod tests {
         let mut recorder =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            75
-        );
+        assert_eq!(unattributed_event_total(&recorder), 75);
 
         fs::write(
             &replaced_source,
@@ -22388,9 +22580,17 @@ mod tests {
             .write_all(token(20, now + 12).as_bytes())
             .unwrap();
         let report = recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(report.pending_ranges, 1);
+        assert_eq!(report.pending_ranges, 12);
+        assert_pending_reasons(
+            &recorder,
+            &[
+                ("initial-counter-prefix-unknown", 2),
+                ("model-interval-unqualified", 9),
+                ("checkpoint-token-anchor-missing", 1),
+            ],
+        );
         assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&recorder),
             80,
             "only the other source's verified five-token delta may advance"
         );
@@ -22422,7 +22622,7 @@ mod tests {
         let (root, database) = prepare("checkpoint-anchor-legacy-zero-token-free");
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
-        fs::write(&source, token(0, now)).unwrap();
+        fs::write(&source, token_with_cache_write_input(0, 0, now)).unwrap();
         let mut recorder =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         recorder
@@ -22453,7 +22653,9 @@ mod tests {
             0
         );
 
-        replace_source_file_with_new_inode(&source, "{\"type\":\"session_meta\"}\n");
+        replace_source_file_with_new_inode(&source, format!("{}{}",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\",\"session_id\":\"thread\"}}\n",
+            token_with_cache_write_input(0, 0, now + 2)));
         let partial = recorder
             .run_cycle_with_quota(Some(QuotaSnapshot {
                 observed_at: now + 2,
@@ -22503,19 +22705,17 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(recovered.pending_ranges, 0);
-        assert!(restarted
-            .writer
-            .load_session_pending_ranges()
-            .unwrap()
-            .is_empty());
+        assert_eq!(recovered.pending_ranges, 1);
+        assert!(anchor_pending_ranges(&restarted).is_empty());
+        assert_pending_reasons(&restarted, &[("model-interval-unqualified", 1)]);
+        assert!(restarted.model_totals().unwrap().is_empty());
         assert!(restarted
             .writer
             .load_session_token_anchor_recoveries()
             .unwrap()
             .is_empty());
         assert_eq!(
-            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&restarted),
             3,
             "the verified source-start zero anchor allows only later usage"
         );
@@ -22529,16 +22729,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recovered_delta, 3);
-        let complete: i64 = Connection::open(&database)
-            .unwrap()
-            .query_row(
-                "SELECT model_set_complete FROM usage_model_history
-                 ORDER BY timestamp DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(complete, 1);
+        let complete = latest_model_set_complete(&database);
+        assert_eq!(
+            complete, 0,
+            "a raw zero anchor does not supply a model context"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -22572,21 +22767,15 @@ mod tests {
             }))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
-        );
+        assert_eq!(unattributed_event_total(&recorder), 70);
 
         fs::write(
             &source,
             format!("{}{}", token(90, now + 16), token(95, now + 17)),
         )
         .unwrap();
-        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 1);
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            70
-        );
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 9);
+        assert_eq!(unattributed_event_total(&recorder), 70);
 
         let next_reset = previous_reset + window_seconds;
         fs::OpenOptions::new()
@@ -22605,9 +22794,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recorder.state().unwrap().reset_at, next_reset);
-        assert_eq!(recovered.pending_ranges, 0);
+        assert_eq!(recovered.pending_ranges, 8);
+        assert!(anchor_pending_ranges(&recorder).is_empty());
+        assert_pending_reasons(
+            &recorder,
+            &[
+                ("initial-counter-prefix-unknown", 1),
+                ("model-interval-unqualified", 7),
+            ],
+        );
         assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unattributed_event_total(&recorder),
             2,
             "the verified post-anchor delta belongs to the new weekly period"
         );
@@ -22626,10 +22823,7 @@ mod tests {
         let mut recorder =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
+        assert_eq!(unattributed_event_total(&recorder), 5);
         let original_inode = fs::metadata(&source).unwrap().ino();
         fs::write(&replacement, format!("{committed}{}", token(20, now + 2))).unwrap();
         fs::rename(&replacement, &source).unwrap();
@@ -22637,10 +22831,7 @@ mod tests {
 
         recorder.run_cycle().unwrap().unwrap();
 
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            10
-        );
+        assert_eq!(unattributed_event_total(&recorder), 10);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -22798,9 +22989,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            remaining,
-            Some(88.0),
-            "recoverable retained history cannot be excluded by a one-month startup cutoff"
+            remaining, None,
+            "cached Session quota remains unknown rather than becoming an official observation"
         );
         assert!(recorder.model_totals().unwrap().is_empty());
         drop(db);
@@ -22859,7 +23049,7 @@ mod tests {
             "SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2",
             params![minute, reset], |row| row.get(0),
         ).optional().unwrap().flatten();
-        assert_eq!(quota, Some(88.0));
+        assert_eq!(quota, None);
         assert_eq!(restarted.model_totals().unwrap(), before);
         drop(restarted);
         fs::remove_dir_all(root).unwrap();
@@ -22867,6 +23057,7 @@ mod tests {
 
     #[test]
     fn restart_recovers_session_quota_without_replaying_model_usage() {
+        use rusqlite::OptionalExtension;
         let (root, database) = prepare("startup-session-quota-recovery");
         let minute = Utc::now().timestamp().div_euclid(60) * 60 - 120;
         Connection::open(&database)
@@ -22898,7 +23089,9 @@ mod tests {
                     [minute],
                     |row| row.get::<_, Option<f64>>(0),
                 )
+                .optional()
                 .unwrap()
+                .flatten()
         };
         // Simulate the missing quota left by an older recorder. Normal cycles
         // now persist the source value before acknowledging the model batch.
@@ -22915,7 +23108,7 @@ mod tests {
         drop(recorder);
         let restarted =
             Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
-        assert_eq!(quota(), Some(88.0));
+        assert_eq!(quota(), None);
         assert_eq!(restarted.model_totals().unwrap(), before);
         drop(restarted);
         fs::remove_dir_all(root).unwrap();
@@ -22931,8 +23124,9 @@ mod tests {
         fs::write(
             root.join("sessions/one.jsonl"),
             format!(
-                "{}\n{}{}{}",
-                json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-6-astra"}}),
+                "{}\n{}\n{}{}{}",
+                json!({"type":"session_meta","payload":{"id":"thread","session_id":"thread"}}),
+                json!({"type":"event_msg","timestamp":DateTime::<Utc>::from_timestamp(start,0).unwrap().to_rfc3339(),"payload":{"type":"turn_context","model":"gpt-6-astra"}}),
                 token(0, start + 1),
                 token(10, start + 10),
                 token(20, start + 130)
@@ -22955,6 +23149,17 @@ mod tests {
                 false,
             )
             .unwrap();
+        stage_fixture_official_quota(
+            &mut recorder,
+            &codex_info_db_writer::QuotaReceipt {
+                receipt_id: "a".repeat(64),
+                sequence: 1,
+                observed_at: start + 30,
+                reset_at: reset,
+                window_seconds: 3600,
+                remaining_percent: 90.0,
+            },
+        );
         recorder
             .run_cycle_with_quota(Some(QuotaSnapshot {
                 observed_at: start + 30,
@@ -22977,14 +23182,24 @@ mod tests {
         .unwrap();
         drop(db);
 
-        let restarted =
-            Recorder::open_partitioned(config(&root, 65536), &database, &identity()).unwrap();
+        let mut restarted = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 65536),
+            &database,
+            &identity(),
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(Some(start - 1), None)],
+        )
+        .unwrap();
+        restarted
+            .repair_historical_sources_guarded(|| true)
+            .unwrap();
         let db = Connection::open(&database).unwrap();
         let restored: Option<String> = db.query_row("SELECT total_tokens FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6-astra'",[start],|r|r.get(0)).optional().unwrap();
         assert_eq!(
             restored.as_deref(),
-            Some("10"),
-            "restart must materialize the verified source prefix, not only expose a repair API"
+            None,
+            "recorded facts cannot fill a legacy sidecar without period proof"
         );
         assert_eq!(
             db.query_row(
@@ -22994,6 +23209,11 @@ mod tests {
             )
             .unwrap(),
             Some(90.0)
+        );
+        assert_recorded_model_prefixes(
+            &database,
+            "gpt-6-astra",
+            &[(start + 10, 10, 10), (start + 130, 10, 20)],
         );
         assert_eq!(restarted.state().unwrap().model_totals, before.model_totals);
         assert_eq!(restarted.writer.load_session_events().unwrap(), events);
@@ -23064,10 +23284,7 @@ mod tests {
             .write_all(b"\n")
             .unwrap();
         assert_eq!(recorder.run_cycle().unwrap().unwrap().generation, 2);
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
+        assert_eq!(unattributed_event_total(&recorder), 5);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -23082,8 +23299,9 @@ mod tests {
                 .to_rfc3339();
             format!("{}\n", json!({"type":kind,"timestamp":time,"model":model}))
         };
+        let metadata = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\",\"session_id\":\"thread\"}}\n";
         let existing = format!(
-            "{}{}{}{}",
+            "{metadata}{}{}{}{}",
             context("thread_context", "gpt-5.6-sol", now - 3),
             task_event("task_started", now - 2),
             token(10, now - 1),
@@ -23135,6 +23353,14 @@ mod tests {
                 .as_bytes(),
             )
             .unwrap();
+        // One bounded phase restores parser qualification at the boundary;
+        // the following phase admits only the appended counters.
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0].committed_offset,
+            existing_bytes
+        );
+        assert!(recorder.model_totals().unwrap().is_empty());
         recorder.run_cycle().unwrap().unwrap();
         assert_eq!(recorder.model_totals().unwrap()["gpt-5.6-sol"].total, 5);
         assert!(!recorder
@@ -23162,18 +23388,92 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn exact_unattributed_boundary_events_are_repaired_once_from_unchanged_source() {
-        let (root, database) = prepare("account-boundary-model-repair");
+    fn assert_recorded_model_prefixes(database: &Path, model: &str, expected: &[(i64, u64, u64)]) {
+        let connection = Connection::open(database).unwrap();
+        let mut query = connection.prepare(
+            "SELECT timestamp,tokens_json,eligible FROM recorded_usage_facts WHERE model=?1 ORDER BY timestamp"
+        ).unwrap();
+        let facts = query
+            .query_map([model], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), expected.len());
+        for ((timestamp, json, eligible), (at, delta, _)) in facts.iter().zip(expected) {
+            assert_eq!((*timestamp, *eligible), (*at, 1));
+            let tokens: Value = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                tokens,
+                json!({"total":delta,"input":delta,"cached_input":0,
+                "cache_write_input":null,"output":0})
+            );
+        }
+        let mut query = connection.prepare(
+            "SELECT timestamp,prefix_json FROM recorded_usage_prefixes WHERE model=?1 ORDER BY timestamp"
+        ).unwrap();
+        let prefixes = query
+            .query_map([model], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(prefixes.len(), expected.len());
+        for (index, ((timestamp, json), (at, _, total))) in
+            prefixes.iter().zip(expected).enumerate()
+        {
+            assert_eq!(*timestamp, *at);
+            let prefix: Value = serde_json::from_str(json).unwrap();
+            assert_eq!(prefix["total"], total.to_string());
+            assert_eq!(prefix["input"]["known_sum"], total.to_string());
+            assert_eq!(prefix["event_count"], (index + 1) as u64);
+            assert_eq!(
+                prefix["cache_write_input"]["unknown_count"],
+                (index + 1) as u64,
+                "unknown cache-write components must survive repair"
+            );
+        }
+    }
+
+    fn stage_fixture_official_quota(
+        recorder: &mut Recorder,
+        receipt: &codex_info_db_writer::QuotaReceipt,
+    ) {
+        recorder
+            .writer
+            .stage_official_quota_inputs(&[
+                codex_info_db_writer::period_evidence::OfficialQuotaInput {
+                    input_id: receipt.receipt_id.clone(),
+                    account_scope: identity().account_scope_id,
+                    sequence: u64::try_from(receipt.sequence).unwrap(),
+                    observed_at: receipt.observed_at,
+                    content_sha256: "b".repeat(64),
+                    reset_at: Some(receipt.reset_at),
+                    window_seconds: Some(receipt.window_seconds),
+                    reason: None,
+                },
+            ])
+            .unwrap();
+    }
+
+    fn legacy_unattributed_boundary_fixture(name: &str) -> (PathBuf, PathBuf, i64) {
+        let (root, database) = prepare(name);
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
         fs::write(
             &source,
             format!(
-                "{}\n{}{}",
-                json!({"type":"thread_context","model":"gpt-5.6-sol"}),
+                "{}\n{}{}{}",
+                json!({"type":"session_meta","payload":{"id":"thread","session_id":"thread"}}),
+                issue604_context_record("thread_context", json!("gpt-5.6-sol"), now - 3),
                 token(10, now - 1),
-                token(15, now)
+                token(15, now),
             ),
         )
         .unwrap();
@@ -23185,35 +23485,89 @@ mod tests {
         )
         .unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        drop(recorder);
-
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute("UPDATE session_checkpoints SET last_model=NULL", [])
-            .unwrap();
-        drop(connection);
         fs::OpenOptions::new()
             .append(true)
             .open(&source)
             .unwrap()
             .write_all(format!("{}{}", token(20, now + 1), token(25, now + 2)).as_bytes())
             .unwrap();
-
-        let mut old_behavior =
-            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
-        old_behavior.run_cycle().unwrap().unwrap();
+        recorder.run_cycle().unwrap().unwrap(); // accepted-prefix qualification
+        recorder.run_cycle().unwrap().unwrap(); // appended owned interval
+        assert_eq!(recorder.model_totals().unwrap()["gpt-5.6-sol"].total, 5);
+        let state = recorder.state().unwrap();
+        let receipt = codex_info_db_writer::QuotaReceipt {
+            receipt_id: "a".repeat(64),
+            sequence: 1,
+            observed_at: now + 3,
+            reset_at: state.reset_at,
+            window_seconds: state.window_seconds,
+            remaining_percent: 90.0,
+        };
+        recorder
+            .writer
+            .commit_quota_receipts(std::slice::from_ref(&receipt), false)
+            .unwrap();
+        stage_fixture_official_quota(&mut recorder, &receipt);
+        drop(recorder);
+        // Model the old format explicitly. The modern parser cannot reproduce
+        // an old attribution bug by omitting a valid context from its input.
+        let db = Connection::open(&database).unwrap();
         assert_eq!(
-            old_behavior.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
+            db.execute(
+                "UPDATE session_events SET model='UNATTRIBUTED',
+            admission_json=NULL,reset_at=NULL,window_seconds=NULL WHERE model='gpt-5.6-sol'",
+                []
+            )
+            .unwrap(),
+            1
         );
-        drop(old_behavior);
+        assert_eq!(
+            db.execute(
+                "UPDATE session_model_totals SET model='UNATTRIBUTED'
+            WHERE model='gpt-5.6-sol'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        db.execute(
+            "UPDATE session_checkpoints SET last_model=NULL,
+            last_model_context_kind=NULL,last_model_interval=NULL,source_admission=NULL",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        (root, database, now)
+    }
 
-        let repaired =
-            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+    #[test]
+    fn exact_unattributed_boundary_events_are_repaired_once_from_unchanged_source() {
+        let (root, database, now) =
+            legacy_unattributed_boundary_fixture("account-boundary-model-repair");
+        let old = Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        assert_eq!(unattributed_event_total(&old), 5);
+        drop(old);
+        let mut repaired = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 4096),
+            &database,
+            &identity(),
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(Some(now + 1), None)],
+        )
+        .unwrap();
+        repaired.repair_historical_sources_guarded(|| true).unwrap();
         let repaired_generation = repaired.generation().unwrap();
         let totals = repaired.model_totals().unwrap();
-        assert_eq!(totals["gpt-5.6-sol"].total, 5);
-        assert!(!totals.contains_key(UNATTRIBUTED_MODEL));
+        assert!(
+            !totals.contains_key("gpt-5.6-sol"),
+            "raw model repair alone cannot attribute a legacy period aggregate"
+        );
+        assert_eq!(
+            totals[UNATTRIBUTED_MODEL].total, 5,
+            "preserve the saved legacy aggregate without inventing period membership"
+        );
+        assert_recorded_model_prefixes(&database, "gpt-5.6-sol", &[(now + 2, 5, 5)]);
         assert!(repaired
             .writer
             .load_session_events()
@@ -23225,56 +23579,18 @@ mod tests {
         let reopened =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         assert_eq!(reopened.generation().unwrap(), repaired_generation);
-        assert_eq!(reopened.model_totals().unwrap()["gpt-5.6-sol"].total, 5);
+        assert_eq!(
+            reopened.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            5
+        );
+        assert_recorded_model_prefixes(&database, "gpt-5.6-sol", &[(now + 2, 5, 5)]);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn historical_unattributed_events_do_not_reenter_rebased_current_totals() {
-        let (root, database) = prepare("historical-model-repair-after-rebase");
-        let source = root.join("sessions/one.jsonl");
-        let now = Utc::now().timestamp();
-        fs::write(
-            &source,
-            format!(
-                "{}\n{}{}",
-                json!({"type":"thread_context","model":"gpt-5.6-sol"}),
-                token(10, now - 1),
-                token(15, now)
-            ),
-        )
-        .unwrap();
-        let mut recorder = Recorder::open_partitioned_with_activation(
-            config(&root, 4096),
-            &database,
-            &identity(),
-            Some(now),
-        )
-        .unwrap();
-        recorder.run_cycle().unwrap().unwrap();
-        drop(recorder);
-
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute("UPDATE session_checkpoints SET last_model=NULL", [])
-            .unwrap();
-        drop(connection);
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&source)
-            .unwrap()
-            .write_all(format!("{}{}", token(20, now + 1), token(25, now + 2)).as_bytes())
-            .unwrap();
-
-        let mut old_behavior =
-            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
-        old_behavior.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            old_behavior.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
-        drop(old_behavior);
-
+        let (root, database, now) =
+            legacy_unattributed_boundary_fixture("historical-model-repair-after-rebase");
         // A different current aggregate cannot be mapped back to the proven
         // event subset. It is preserved without making recorder startup fail.
         let connection = Connection::open(&database).unwrap();
@@ -23292,7 +23608,14 @@ mod tests {
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         let unchanged_generation = unchanged.generation().unwrap();
         assert_eq!(
-            unchanged.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            unchanged
+                .state()
+                .unwrap()
+                .model_totals
+                .iter()
+                .find(|total| total.model == UNATTRIBUTED_MODEL)
+                .unwrap()
+                .total_tokens,
             6
         );
         assert!(unchanged
@@ -23315,11 +23638,20 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let repaired =
-            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        let mut repaired = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 4096),
+            &database,
+            &identity(),
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(Some(now + 1), None)],
+        )
+        .unwrap();
+        repaired.repair_historical_sources_guarded(|| true).unwrap();
         let repaired_generation = repaired.generation().unwrap();
         assert!(repaired_generation > unchanged_generation);
         assert_eq!(repaired.model_totals().unwrap()["gpt-5.6-sol"].total, 6);
+        assert_recorded_model_prefixes(&database, "gpt-5.6-sol", &[(now + 2, 5, 5)]);
         assert!(repaired
             .writer
             .load_session_events()
@@ -23340,11 +23672,11 @@ mod tests {
         let (root, database) = prepare("returning-account-boundary");
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
-        fs::write(&source, format!("{}{}", token(10, now), token(15, now + 1))).unwrap();
+        fs::write(&source, format!("{}{}{}", "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\",\"session_id\":\"thread\"}}\n", token(10, now), token(15, now + 1))).unwrap();
         let mut first =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         first.run_cycle().unwrap().unwrap();
-        let initial_total = first.model_totals().unwrap()[UNATTRIBUTED_MODEL].total;
+        let initial_total = unattributed_event_total(&first);
         let original_epoch = first.state().unwrap().collector_epoch.unwrap();
         drop(first);
 
@@ -23370,10 +23702,7 @@ mod tests {
             first_boundary_state.checkpoints[0].committed_offset,
             fs::metadata(&source).unwrap().len()
         );
-        assert_eq!(
-            returned.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            initial_total
-        );
+        assert_eq!(unattributed_event_total(&returned), initial_total);
         drop(returned);
 
         fs::OpenOptions::new()
@@ -23392,9 +23721,13 @@ mod tests {
         .unwrap();
         crash_restart.run_cycle().unwrap().unwrap();
         assert_eq!(
-            crash_restart.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            initial_total + 5
+            crash_restart.state().unwrap().checkpoints[0].committed_offset,
+            first_boundary_state.checkpoints[0].committed_offset,
+            "qualification phase must not consume the new owner's append"
         );
+        assert_eq!(unattributed_event_total(&crash_restart), initial_total);
+        crash_restart.run_cycle().unwrap().unwrap();
+        assert_eq!(unattributed_event_total(&crash_restart), initial_total + 5);
         drop(crash_restart);
 
         fs::OpenOptions::new()
@@ -23413,10 +23746,7 @@ mod tests {
         )
         .unwrap();
         returned_again.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            returned_again.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            initial_total + 5
-        );
+        assert_eq!(unattributed_event_total(&returned_again), initial_total + 5);
         assert_eq!(
             returned_again.state().unwrap().checkpoints[0].committed_offset,
             fs::metadata(&source).unwrap().len()
@@ -23680,10 +24010,7 @@ mod tests {
             Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
         assert_eq!(restarted.run_cycle().unwrap().unwrap().generation, 3);
         assert_eq!(restarted.generation().unwrap(), 3);
-        assert_eq!(
-            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
+        assert_eq!(unattributed_event_total(&restarted), 5);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -23883,10 +24210,7 @@ mod tests {
             before
         );
         assert_eq!(recorder.run_cycle().unwrap().unwrap().generation, 2);
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
+        assert_eq!(unattributed_event_total(&recorder), 5);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -23952,10 +24276,7 @@ mod tests {
                 .committed_offset,
             old_cursor
         );
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            10
-        );
+        assert_eq!(unattributed_event_total(&recorder), 10);
         assert_eq!(
             recorder.writer.latest_quota_receipt().unwrap(),
             Some(receipt.clone())
@@ -23964,17 +24285,11 @@ mod tests {
             .run_cycle_with_stored_quota_guarded(|| true)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            15
-        );
+        assert_eq!(unattributed_event_total(&recorder), 15);
         recorder
             .run_cycle_with_stored_quota_guarded(|| true)
             .unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            15
-        );
+        assert_eq!(unattributed_event_total(&recorder), 15);
         assert_eq!(
             recorder.writer.latest_quota_receipt().unwrap(),
             Some(receipt)
@@ -24207,10 +24522,7 @@ mod tests {
             .run_cycle()
             .expect("reader snapshot must not block a Session commit")
             .unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
+        assert_eq!(unattributed_event_total(&recorder), 5);
         assert_eq!(
             count(),
             0,
@@ -24222,10 +24534,7 @@ mod tests {
         let mut restarted =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         restarted.run_cycle().unwrap();
-        assert_eq!(
-            restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
+        assert_eq!(unattributed_event_total(&restarted), 5);
         assert_eq!(
             count(),
             1,
