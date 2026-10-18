@@ -11162,7 +11162,10 @@ impl UsageStore {
         // busy timeout prevents a transient writer collision from discarding
         // an otherwise valid batch.
         connection.busy_timeout(Duration::from_secs(2))?;
-        let transaction = connection.transaction()?;
+        // Serialize concurrent instance initialization before running schema DDL.
+        // A deferred transaction lets multiple openers hold read locks and then
+        // fail while upgrading to a writer, even with a busy timeout configured.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(period_evidence::SCHEMA)?;
         transaction.execute_batch(source_qualification_repair::SCHEMA)?;
@@ -27414,19 +27417,21 @@ mod tests {
         let left_path = path.clone();
         let left_barrier = Arc::clone(&barrier);
         let left = std::thread::spawn(move || {
-            let store = UsageStore::open(left_path).unwrap();
+            let store = UsageStore::open(left_path);
             left_barrier.wait();
-            store.upsert_sample(&first).unwrap();
+            store.and_then(|store| store.upsert_sample(&first))
         });
         let right_path = path.clone();
         let right_barrier = Arc::clone(&barrier);
         let right = std::thread::spawn(move || {
-            let store = UsageStore::open(right_path).unwrap();
+            let store = UsageStore::open(right_path);
             right_barrier.wait();
-            store.upsert_sample(&second).unwrap();
+            store.and_then(|store| store.upsert_sample(&second))
         });
-        left.join().unwrap();
-        right.join().unwrap();
+        let left_result = left.join().unwrap();
+        let right_result = right.join().unwrap();
+        left_result.unwrap();
+        right_result.unwrap();
         let rows = UsageStore::open(&path).unwrap().load_all().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], expected_second);
