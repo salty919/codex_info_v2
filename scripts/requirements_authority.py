@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Validate the requirement-owner registry and requirements ledger.
 
 The validator intentionally performs only local, finite markdown/schema checks.
@@ -10,10 +9,10 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
-from pathlib import Path
 import re
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 
@@ -37,7 +36,7 @@ MASTER_IDS_MARKER_RE = re.compile(
 
 REGISTRY_HEADER = ("owner ID", "唯一のowner", "所有する契約境界")
 LEDGER_HEADER = ("ID", "owner", "実装範囲", "直接オラクル", "状態")
-VALID_STATUSES = frozenset({"implemented", "verified"})
+VALID_STATUSES = frozenset({"in-progress", "implemented", "verified"})
 UNBOUNDED_ORACLE_PATTERNS = (
     re.compile(
         r"(?:全て|すべて|全)(?:の)?\s*(?:graph|unit|tests?|suites?)\b",

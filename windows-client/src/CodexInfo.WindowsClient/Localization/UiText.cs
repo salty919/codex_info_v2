@@ -159,6 +159,20 @@ public sealed record UiText(
 
     public string GraphUnmeasured => LanguageCode == "ja" ? "未計測" : "Unmeasured";
 
+    public string Back => LanguageCode switch
+    {
+        "ja" => "戻る",
+        "zh-Hans" => "返回",
+        "ko" => "뒤로",
+        "es" => "Atrás",
+        "fr" => "Retour",
+        "de" => "Zurück",
+        "pt" => "Voltar",
+        "it" => "Indietro",
+        "ru" => "Назад",
+        _ => "Back",
+    };
+
     public string GraphPreviousRange => LanguageCode switch
     {
         "ja" => "前の範囲",

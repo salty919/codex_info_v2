@@ -23,7 +23,7 @@ namespace CodexInfo.WindowsClient.Controls;
 /// framework-independent Graphing layer; this control only applies theme,
 /// axes, visibility, and pointer feedback.
 /// </summary>
-public sealed class GraphPlotControl : Control
+public sealed partial class GraphPlotControl : Control
 {
     internal const string RemainingColorHex = "#56b2f5";
     internal const string SolColorHex = "#a88cf5";
@@ -240,6 +240,11 @@ public sealed class GraphPlotControl : Control
         }
 
         var axes = BuildAxesForCurrentWidth(scene);
+        if (scene.IsRecordedScope)
+        {
+            PopulateRecordedPlot(presentation, axes);
+            return;
+        }
         AddPlotGrid(presentation, scene, axes);
         var idleIntervals = scene.IsViewport
             ? GraphPlotProjection.BuildViewportUnusedIntervals(scene)
@@ -370,7 +375,7 @@ public sealed class GraphPlotControl : Control
             {
                 return GraphPlotProjection.BuildAxes(
                     scene,
-                    LocalizationService.DisplayTimeZone,
+                    scene.RecordedDisplayTimeZone ?? LocalizationService.DisplayTimeZone,
                     CultureInfo.CurrentCulture,
                     currentDataAreaWidth);
             }
@@ -378,7 +383,7 @@ public sealed class GraphPlotControl : Control
 
         return GraphPlotProjection.BuildAxes(
             scene,
-            LocalizationService.DisplayTimeZone,
+            scene.RecordedDisplayTimeZone ?? LocalizationService.DisplayTimeZone,
             CultureInfo.CurrentCulture);
     }
 
@@ -515,7 +520,7 @@ public sealed class GraphPlotControl : Control
         var rightAxis = presentation.Plot.Axes.Right;
         rightAxis.TickGenerator = new NumericManual(
             axes.RemainingValues.ToArray(),
-            axes.RemainingLabels.Select(_ => string.Empty).ToArray());
+            scene.IsRecordedScope ? axes.RemainingLabels.ToArray() : axes.RemainingLabels.Select(_ => string.Empty).ToArray());
         using var tickTypeface = SkiaSharp.SKTypeface.FromFamilyName(PlotFontFamily);
         using var tickFont = new SkiaSharp.SKFont(tickTypeface, presentation.Plot.Axes.Bottom.TickLabelStyle.FontSize);
         var finalDateLabelHalfWidth = Math.Ceiling(tickFont.MeasureText(axes.BottomLabels[^1]) / 2d + 1d);
@@ -524,7 +529,12 @@ public sealed class GraphPlotControl : Control
         // The right axis remains attached to Remaining's percent scale. Its
         // invisible panel supplies only the measured outside room required by
         // the centered final timestamp tick; it has no duplicate labels/frame.
-        ((ScottPlot.AxisPanels.AxisBase)rightAxis).Color(PlotColor);
+        ((ScottPlot.AxisPanels.AxisBase)rightAxis).Color(scene.IsRecordedScope ? MutedColor : PlotColor);
+        if (scene.IsRecordedScope)
+        {
+            rightAxis.Label.Text = "%";
+            presentation.Plot.Axes.Left.Label.Text = scene.Metric == GraphMetric.Tokens ? "tokens" : "USD";
+        }
     }
 
     private static void ApplyTopDateAxis(PlotPresentation presentation, GraphAxisProjection axes)
@@ -685,7 +695,7 @@ public sealed class GraphPlotControl : Control
         }
         var axes = GraphPlotProjection.BuildAxes(
             scene,
-            LocalizationService.DisplayTimeZone,
+            scene.RecordedDisplayTimeZone ?? LocalizationService.DisplayTimeZone,
             CultureInfo.CurrentCulture,
             currentDataAreaWidth);
         lock (presentation.Plot.Sync)
@@ -743,7 +753,7 @@ public sealed class GraphPlotControl : Control
         hoverMetric = current.Scene.Metric;
         hoverVisibleSeries.Clear();
         hoverVisibleSeries.UnionWith(visibleSeries);
-        hoverTip = CreateHoverTip(snapshot, current.Scene.Metric);
+        hoverTip = CreateHoverTip(snapshot, current.Scene.Metric, current.Scene.RecordedDisplayTimeZone);
         ToolTip.SetTip(this, hoverTip);
         ToolTip.SetIsOpen(this, true);
     }
@@ -768,12 +778,12 @@ public sealed class GraphPlotControl : Control
         _ => false,
     });
 
-    private static StackPanel CreateHoverTip(GraphHoverSnapshot snapshot, GraphMetric metric)
+    private static StackPanel CreateHoverTip(GraphHoverSnapshot snapshot, GraphMetric metric, TimeZoneInfo? zone = null)
     {
         var culture = CultureInfo.CurrentCulture;
         var displayedTimestamp = TimeZoneInfo.ConvertTime(
                 DateTimeOffset.FromUnixTimeSeconds(snapshot.Timestamp),
-                LocalizationService.DisplayTimeZone)
+                zone ?? LocalizationService.DisplayTimeZone)
             .ToString("yyyy/MM/dd HH:mm:ss zzz", culture);
         var panel = new StackPanel
         {
@@ -782,6 +792,7 @@ public sealed class GraphPlotControl : Control
         };
         panel.SetValue(Avalonia.Automation.AutomationProperties.AutomationIdProperty, "Graph.Hover");
         AddHoverRow(panel, "Graph.Hover.Timestamp", displayedTimestamp);
+        foreach (var detail in snapshot.Details) AddHoverRow(panel, "Graph.Hover.RecordedDetail", detail);
         foreach (var row in snapshot.Rows)
         {
             var name = row.Series switch

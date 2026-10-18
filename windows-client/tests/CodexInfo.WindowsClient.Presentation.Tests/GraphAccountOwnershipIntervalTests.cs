@@ -10,6 +10,31 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphAccountOwnershipIntervalTests
 {
     [Fact]
+    public void EmptyOwnershipMarkersDoNotChangeOwnedCoverage()
+    {
+        var samples = new[]
+        {
+            new ApiHistorySample(100, 400, 100, null, null, null, null, null, null, ApiHistorySample.ConfirmedModelSource),
+            new ApiHistorySample(299, 400, 90, null, null, null, null, null, null, ApiHistorySample.ConfirmedModelSource),
+        };
+        var scene = GraphScene.Create(samples, GraphMetric.Tokens, 100, 300, confirmedGaps: null, hiddenModelNames: null,
+            accountOwnershipIntervals:
+            [
+                new GraphAccountOwnershipInterval(100, 300),
+                new GraphAccountOwnershipInterval(150, 150),
+                new GraphAccountOwnershipInterval(253_402_300_799, 253_402_300_799),
+            ]);
+        Assert.Empty(scene.NonOwnedIntervals);
+
+        var empty = GraphScene.Create(samples, GraphMetric.Tokens, 100, 300, confirmedGaps: null, hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(150, 150)]);
+        var gap = Assert.Single(empty.NonOwnedIntervals);
+        Assert.Equal(100, gap.StartAt);
+        Assert.Equal(300, gap.EndAt);
+        Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(empty));
+    }
+
+    [Fact]
     public void LoggedOutOwnershipGapDoesNotBecomeVisibleUnusedIntervalInTokensGraphDespiteEndpointDelta()
     {
         const long firstTimestamp = 1_789_967_100;

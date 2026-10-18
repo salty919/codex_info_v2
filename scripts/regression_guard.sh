@@ -86,7 +86,7 @@ case "$1" in
             graph_collision_preview_matches_the_historical_singleton_oracle
             graph_correction_fixture_holds_regressions_without_a_vertical_drop
             graph_oracle_distinguishes_unconfirmed_regression_from_confirmed_correction
-            graph_oracle_preserves_raw_quota_increase_but_displays_monotonic_hold
+            graph_oracle_preserves_raw_quota_increase_as_measured
             history_stale_cursor_response_requires_exact_bounded_error_envelope
             linux_graph_pair_change_uses_proven_cursor_and_atomically_appends
             linux_graph_exact_stale_cursor_retries_head_once_and_preserves_reset_state

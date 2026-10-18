@@ -23,4 +23,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["rt", "signal"] }
 
 [dev-dependencies]
+codex-info-db-reader = { path = "../codex-info-db-reader" }
 tempfile = "3.27.0"

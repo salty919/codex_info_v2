@@ -5,7 +5,7 @@ use codex_info_recorder::{
     probe_codex_authentication_state, ActiveThreadPollResult, CodexAuthenticationState,
     QuotaPoller, ThreadPoller,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -69,7 +69,20 @@ impl QuotaJournalFixture {
         )
         .unwrap();
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
-        codex_info_account_locator::ensure_partition(&home, &data).unwrap();
+        let reserved = codex_info_account_locator::ensure_partition(&home, &data).unwrap();
+        if resident_interval.is_none() {
+            // The library-only poller runs inside a previously confirmed
+            // account. The resident branch exercises real startup instead.
+            let at = chrono::Utc::now().timestamp();
+            codex_info_account_locator::admit_partition(
+                &home,
+                &data,
+                &reserved,
+                codex_info_account_locator::AccountConfirmation::InitialRpc { began_at: at },
+                || Some(at),
+            )
+            .unwrap();
+        }
         let journal = data.join("history/quota");
         private_directory(&journal);
         let database = journal.join("observations.sqlite3");
@@ -458,13 +471,76 @@ fn run_quota_replay(fixture: &QuotaJournalFixture) -> String {
 
 #[test]
 fn real_startup_recovers_inactive_account_source_history() {
+    assert_inactive_original_repair(false, false, false, false, None);
+}
+
+#[test]
+fn issue604_historical_repairs_source_disproved_numbers_and_model() {
+    assert_inactive_original_repair(true, false, false, false, None);
+}
+
+#[test]
+fn issue604_current_repairs_source_disproved_numbers_at_the_original_cursor() {
+    assert_inactive_original_repair(true, true, false, false, None);
+}
+
+#[test]
+fn issue604_historical_repairs_initial_baseline_regression_and_double_add() {
+    assert_inactive_original_repair(true, false, true, false, None);
+}
+
+#[test]
+fn issue604_historical_reads_old_bytes_through_an_independently_accepted_container() {
+    assert_inactive_original_repair(false, false, false, true, None);
+}
+
+#[test]
+fn issue604_current_reads_old_bytes_through_an_independently_accepted_container() {
+    assert_inactive_original_repair(false, true, false, true, None);
+}
+
+#[test]
+fn issue604_source_equivalence_identical_prefix_alias_reaches_startup_and_recorded_index_once() {
+    assert_inactive_original_repair(false, false, false, false, Some("identical-prefix-alias"));
+}
+
+#[test]
+fn issue604_source_equivalence_event_bijection_reaches_startup_and_recorded_index_once() {
+    assert_inactive_original_repair(false, false, false, false, Some("event-bijection"));
+}
+
+fn assert_inactive_original_repair(
+    disproved_numbers: bool,
+    selected_account: bool,
+    stream_boundaries: bool,
+    accepted_container: bool,
+    equivalence: Option<&str>,
+) {
     use codex_info_account_locator::{
-        ensure_partition_with_activation, mark_partition_initialized,
+        admit_partition, mark_partition_initialized, reserve_partition_at, AccountConfirmation,
     };
+    use std::io::Write;
+    fn confirmed_fixture(
+        home: &Path,
+        data: &Path,
+        at: i64,
+    ) -> codex_info_account_locator::AccountPartition {
+        let partition = reserve_partition_at(home, data, at).unwrap();
+        admit_partition(
+            home,
+            data,
+            &partition,
+            AccountConfirmation::InitialRpc { began_at: at },
+            || Some(at),
+        )
+        .unwrap()
+    }
     use codex_info_db_writer::{QuotaReceipt, StoragePartitionIdentity, UsageStore};
     use codex_info_recorder::{QuotaSnapshot, Recorder, RecorderConfig};
     use rusqlite::{params, OptionalExtension};
-    let _environment = ENVIRONMENT_LOCK.lock().unwrap();
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let data = root.path().join("data");
@@ -477,7 +553,7 @@ fn real_startup_recovers_inactive_account_source_history() {
     fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
     let start = chrono::Utc::now().timestamp().div_euclid(60) * 60 - 600;
     let reset = start + 3600;
-    let old = ensure_partition_with_activation(&home, &data, Some(start)).unwrap();
+    let old = confirmed_fixture(&home, &data, start);
     let identity = StoragePartitionIdentity {
         schema_version: "codex-info-account-db-v1".into(),
         profile_scope_id: old.profile_scope_id.clone(),
@@ -486,17 +562,42 @@ fn real_startup_recovers_inactive_account_source_history() {
         partition_id: old.partition_id.clone(),
     };
     let mut body = format!(
-        "{}\n",
-        json!({"type":"turn_context","payload":{"model":"gpt-6-astra"}})
+        "{}\n{}\n",
+        json!({"type":"session_meta","payload":{"id":"old-session","session_id":"old-session"}}),
+        json!({"type":"turn_context","timestamp":chrono::DateTime::from_timestamp(start,0).unwrap().to_rfc3339(),"payload":{"model":"gpt-6-astra"}})
     );
-    for (total, at, with_quota) in [
-        (0, start + 1, false),
-        (10, start + 10, false),
-        (20, start + 70, false),
-        (20, start + 130, true),
-    ] {
+    let points = if equivalence.is_some() {
+        vec![
+            (0, start + 1, false),
+            (10, start + 10, false),
+            (15, start + 70, false),
+            (15, start + 130, true),
+        ]
+    } else if stream_boundaries {
+        vec![
+            (10, start + 1, false),
+            (20, start + 10, false),
+            (5, start + 40, false),
+            (25, start + 70, false),
+            (25, start + 130, true),
+        ]
+    } else {
+        vec![
+            (0, start + 1, false),
+            (10, start + 10, false),
+            (20, start + 70, false),
+            (20, start + 130, true),
+        ]
+    };
+    for (total, at, with_quota) in points {
         let mut record = json!({"type":"event_msg","timestamp":chrono::DateTime::from_timestamp(at,0).unwrap().to_rfc3339(),
             "payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":total,"input_tokens":total,"cached_input_tokens":0,"output_tokens":0,"cache_write_input_tokens":0}}}});
+        if equivalence.is_some() {
+            record["payload"]["info"]["total_token_usage"]
+                .as_object_mut()
+                .unwrap()
+                .remove("cache_write_input_tokens");
+        }
         if with_quota {
             record["payload"]["rate_limits"] =
                 json!({"secondary":{"used_percent":12,"resets_at":reset,"window_minutes":60}});
@@ -524,87 +625,801 @@ fn real_startup_recovers_inactive_account_source_history() {
         .unwrap();
     drop(recorder);
     let mut writer = UsageStore::open_partitioned(&old.database_path, &identity).unwrap();
+    let receipts = [
+        (1_i64, start + 1, 90.0),
+        (2, start + 30, 90.0),
+        (3, start + 130, 88.0),
+    ]
+    .map(|(sequence, observed_at, remaining_percent)| QuotaReceipt {
+        receipt_id: format!("{sequence:064x}"),
+        sequence,
+        observed_at,
+        reset_at: reset,
+        window_seconds: 3600,
+        remaining_percent,
+    });
+    writer.commit_quota_receipts(&receipts, false).unwrap();
     writer
-        .commit_quota_receipts(
-            &[QuotaReceipt {
-                receipt_id: "a".repeat(64),
-                sequence: 1,
-                observed_at: start + 30,
-                reset_at: reset,
-                window_seconds: 3600,
-                remaining_percent: 90.0,
-            }],
-            false,
+        .stage_official_quota_inputs(
+            &receipts
+                .iter()
+                .map(
+                    |receipt| codex_info_db_writer::period_evidence::OfficialQuotaInput {
+                        input_id: receipt.receipt_id.clone(),
+                        account_scope: identity.account_scope_id.clone(),
+                        sequence: u64::try_from(receipt.sequence).unwrap(),
+                        observed_at: receipt.observed_at,
+                        content_sha256: "f".repeat(64),
+                        reset_at: Some(reset),
+                        window_seconds: Some(3600),
+                        reason: None,
+                    },
+                )
+                .collect::<Vec<_>>(),
         )
         .unwrap();
-    let events = writer.load_session_events().unwrap();
-    let checkpoints = writer.load_session_collection_state().unwrap().checkpoints;
+    let expected_events = writer.load_session_events().unwrap();
+    let original_state = writer.load_session_collection_state().unwrap();
+    let mut checkpoints = original_state.checkpoints.clone();
+    for checkpoint in &mut checkpoints {
+        checkpoint.source_admission = None;
+        checkpoint.last_model_context_kind = None;
+        checkpoint.last_model_interval = None;
+    }
+    let expected_checkpoints = checkpoints.clone();
     drop(writer);
     mark_partition_initialized(&data, &old).unwrap();
     let db = Connection::open(&old.database_path).unwrap();
-    db.execute(
-        "DELETE FROM usage_model_history WHERE timestamp=?1",
-        [start],
-    )
-    .unwrap();
-    db.execute(
-        "DELETE FROM usage_model_history WHERE timestamp=?1",
-        [start + 120],
-    )
-    .unwrap();
-    db.execute(
-        "DELETE FROM durable_state WHERE singleton>=2 AND data_generation=?1",
-        [start + 120],
-    )
-    .unwrap();
-    db.execute(
-        "DELETE FROM usage_history WHERE timestamp=?1",
-        [start + 120],
-    )
-    .unwrap();
-    db.execute("DELETE FROM session_quota_windows", []).unwrap();
-    drop(db);
-    fs::write(&auth, br#"{"tokens":{"account_id":"current-account"}}"#).unwrap();
-    let current = ensure_partition_with_activation(&home, &data, Some(start + 180)).unwrap();
-    let mut child = ChildGuard(
-        Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
-            .args(["--once", "--sessions-root"])
-            .arg(&sessions)
-            .env("CODEX_HOME", &home)
-            .env("CODEX_INFO_DATA_DIR", &data)
-            .env(
-                "CODEX_INFO_CODEX_BIN",
-                root.path().join("absent-app-server"),
+    db.execute("UPDATE session_checkpoints SET source_admission=NULL,last_model_context_kind=NULL,last_model_interval=NULL", []).unwrap();
+    if disproved_numbers {
+        db.execute(
+            "UPDATE session_events SET total_tokens='42',input_tokens='42',model='gpt-6-luna'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE session_checkpoints SET previous_total='999',previous_input='999'",
+            [],
+        )
+        .unwrap();
+        db.execute("UPDATE session_model_totals SET model='gpt-6-luna',total_tokens='84',input_tokens='84'",[]).unwrap();
+        for checkpoint in &mut checkpoints {
+            checkpoint.previous_total = Some(999);
+            checkpoint.previous_input = Some(999);
+        }
+    }
+    if stream_boundaries {
+        for (index, at, total) in [
+            (100, start + 1, 10),
+            (101, start + 40, 5),
+            (102, start + 130, 25),
+        ] {
+            db.execute("INSERT INTO session_events SELECT root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,?1,?2,model,?3,?3,cached_input_tokens,output_tokens,cache_write_input_tokens,NULL,NULL,NULL FROM session_events LIMIT 1",params![index,at,total.to_string()]).unwrap();
+        }
+    }
+    if let Some(mode) = equivalence {
+        db.execute("UPDATE usage_model_history SET total_dollars=?1,price_version='preserved-fixture-price'", [0.123_456_789_012_345_66_f64]).unwrap();
+        use sha2::{Digest, Sha256};
+        // These are independent saved prefixes, not a boolean qualification.
+        // The production startup must reread every hash and rebuild proof.
+        let generation = format!("{:032x}", checkpoints[0].prefix_generation.wrapping_add(1));
+        let new_identity = if mode == "event-bijection" {
+            let path = sessions.join("old.jsonl");
+            let original = fs::read(&path).unwrap();
+            let replacement = sessions.join("accepted.tmp");
+            let mut bytes = b"{\"type\":\"ignored_fixture_record\"}\n".to_vec();
+            bytes.extend(original);
+            fs::write(&replacement, &bytes).unwrap();
+            let metadata = fs::metadata(&replacement).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+            Some((
+                metadata.dev(),
+                metadata.ino(),
+                bytes.len(),
+                format!("{:x}", Sha256::digest(Sha256::digest(&bytes))),
+            ))
+        } else {
+            None
+        };
+        for table in ["session_checkpoints", "session_ranges", "session_events"] {
+            if new_identity.is_some() && table == "session_events" {
+                continue;
+            }
+            let query = db
+                .prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+                .unwrap();
+            let columns = query
+                .column_names()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>();
+            drop(query);
+            let select = columns
+                .iter()
+                .map(|column| {
+                    if column == "prefix_generation" {
+                        return format!("'{generation}'");
+                    }
+                    if let Some((device, inode, end, hash)) = &new_identity {
+                        match column.as_str() {
+                            "file_device" => return format!("'{device}'"),
+                            "file_inode" => return format!("'{inode}'"),
+                            "committed_offset" | "end_offset" => return end.to_string(),
+                            "record_sha256" | "prefix_sha256" => return format!("'{hash}'"),
+                            _ => {}
+                        }
+                    }
+                    column.clone()
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(
+                &format!("INSERT INTO {table} SELECT {select} FROM {table}"),
+                [],
             )
-            .env_remove("CODEX_INFO_RECORDER_DB")
-            .env_remove("CODEX_INFO_ACCOUNT_DB")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(File::create(root.path().join("startup.log")).unwrap())
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let status = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            break status;
+            .unwrap();
+        }
+    }
+    let container_inode = if accepted_container {
+        let path = sessions.join("old.jsonl");
+        let replacement = sessions.join("accepted.tmp");
+        fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+        let metadata = fs::metadata(&replacement).unwrap();
+        assert_ne!(metadata.ino(), checkpoints[0].file_inode);
+        fs::rename(replacement, path).unwrap();
+        // This is a distinct previously accepted physical source. Both sets
+        // of stored range hashes must be checked against the same full bytes.
+        db.execute("INSERT INTO session_ranges SELECT root_identity,relative_path,?1,?2,start_offset,end_offset,collector_epoch,cycle_seq,prefix_generation,record_sha256 FROM session_ranges",
+            params![metadata.dev().to_string(),metadata.ino().to_string()]).unwrap();
+        Some(metadata.ino())
+    } else {
+        None
+    };
+    let raw_writer = UsageStore::open_read_only_partitioned(&old.database_path, &identity).unwrap();
+    let events = raw_writer.load_session_events().unwrap();
+    drop(raw_writer);
+    if equivalence.is_none() {
+        db.execute(
+            "DELETE FROM usage_model_history WHERE timestamp=?1",
+            [start],
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM usage_model_history WHERE timestamp=?1",
+            [start + 120],
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM durable_state WHERE singleton>=2 AND data_generation=?1",
+            [start + 120],
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM usage_history WHERE timestamp=?1",
+            [start + 120],
+        )
+        .unwrap();
+        db.execute("DELETE FROM session_quota_windows", []).unwrap();
+    }
+    drop(db);
+    // This belongs to the old account's time interval, but was never part of
+    // its accepted prefix. Historical repair must stop at the saved N.
+    if !selected_account && equivalence.is_none() {
+        fs::OpenOptions::new().append(true).open(sessions.join("old.jsonl")).unwrap()
+        .write_all(format!("{}\n",json!({"type":"event_msg","timestamp":chrono::DateTime::from_timestamp(start+140,0).unwrap().to_rfc3339(),
+            "payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":999,"input_tokens":999,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0}}}})).as_bytes()).unwrap();
+    }
+    let current = if selected_account {
+        old.clone()
+    } else {
+        fs::write(&auth, br#"{"tokens":{"account_id":"current-account"}}"#).unwrap();
+        confirmed_fixture(&home, &data, start + 180)
+    };
+    let run = || {
+        let mut child = ChildGuard(
+            Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
+                .args(["--once", "--sessions-root"])
+                .arg(&sessions)
+                .env("CODEX_HOME", &home)
+                .env("CODEX_INFO_DATA_DIR", &data)
+                .env(
+                    "CODEX_INFO_CODEX_BIN",
+                    root.path().join("absent-app-server"),
+                )
+                .env_remove("CODEX_INFO_RECORDER_DB")
+                .env_remove("CODEX_INFO_ACCOUNT_DB")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(File::create(root.path().join("startup.log")).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real recorder startup did not terminate"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            status.success(),
+            "{}",
+            fs::read_to_string(root.path().join("startup.log")).unwrap()
+        );
+    };
+    if let Some(mode) = equivalence {
+        let snapshot = || {
+            let db = Connection::open(&old.database_path).unwrap();
+            let mut q = db
+                .prepare("SELECT * FROM session_checkpoints ORDER BY prefix_generation,file_inode")
+                .unwrap();
+            let count = q.column_count();
+            let checkpoints = q
+                .query_map([], |r| {
+                    (0..count)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let price: Vec<_> = db.prepare("SELECT reset_at,timestamp,model,total_dollars,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens FROM usage_model_history ORDER BY reset_at,timestamp,model").unwrap().query_map([], |r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<f64>>(3)?.map(f64::to_bits),(4..9).map(|column|r.get::<_,Option<String>>(column)).collect::<rusqlite::Result<Vec<_>>>()?))).unwrap().map(Result::unwrap).collect();
+            let fixed:Vec<_>=db.prepare("SELECT timestamp,reset_at,sol_tokens,terra_tokens,luna_tokens,sol_dollars,terra_dollars,luna_dollars FROM usage_history ORDER BY reset_at,timestamp").unwrap().query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<i64>>(3)?,r.get::<_,Option<i64>>(4)?,r.get::<_,Option<f64>>(5)?.map(f64::to_bits),r.get::<_,Option<f64>>(6)?.map(f64::to_bits),r.get::<_,Option<f64>>(7)?.map(f64::to_bits)))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            let durable: Vec<(String,String)> = db.prepare("SELECT data_hash,snapshot_json FROM durable_state WHERE singleton>=2 AND json_extract(snapshot_json,'$.kind')='codex-info-usage-observation-v1' ORDER BY data_hash").unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            (checkpoints, price, fixed, durable)
+        };
+        let original = snapshot();
+        let original_raw = codex_info_db_writer::read_session_event_facts(
+            &Connection::open(&old.database_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(original.0.len(), 2);
+        assert!(original
+            .1
+            .iter()
+            .all(|p| p.3 == Some(0.123_456_789_012_345_66_f64.to_bits())));
+        // A missing whole-prefix hash and None-versus-zero are distinct
+        // refusal cases. Neither may be repaired by retaining only a subset.
+        let rejected = Connection::open(&old.database_path).unwrap();
+        let ranges = UsageStore::open_read_only_partitioned(&old.database_path, &identity)
+            .unwrap()
+            .load_session_ranges()
+            .unwrap();
+        if mode == "identical-prefix-alias" {
+            rejected.execute("UPDATE session_ranges SET record_sha256=?1 WHERE prefix_generation=(SELECT max(prefix_generation) FROM session_ranges)",["ab".repeat(32)]).unwrap();
+        } else {
+            rejected.execute("UPDATE session_events SET cache_write_input_tokens='0' WHERE event_index=(SELECT min(event_index) FROM session_events)",[]).unwrap();
+        }
+        drop(rejected);
+        run();
+        let unchanged = snapshot();
+        assert_eq!(unchanged.0, original.0);
+        for saved in &original.1 {
+            assert!(
+                unchanged.1.contains(saved),
+                "incomplete prefix/None-versus-zero proof must preserve the last saved values"
+            );
+        }
+        for saved in &original.2 {
+            assert!(
+                unchanged.2.contains(saved),
+                "incomplete prefix/None-versus-zero proof must preserve the last saved values"
+            );
+        }
+        let rejected = Connection::open(&old.database_path).unwrap();
+        assert_eq!(
+            rejected
+                .query_row("SELECT count(*) FROM source_prefix_repairs", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        for range in &ranges {
+            rejected.execute("UPDATE session_ranges SET record_sha256=?1 WHERE prefix_generation=?2 AND file_inode=?3 AND start_offset=?4",params![range.record_sha256,format!("{:032x}",range.prefix_generation),range.file_inode.to_string(),range.start_offset]).unwrap();
+        }
+        if mode == "event-bijection" {
+            rejected
+                .execute(
+                    "UPDATE session_events SET cache_write_input_tokens=NULL",
+                    [],
+                )
+                .unwrap();
+            rejected.execute("INSERT INTO session_events SELECT root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,999,timestamp+500,model,'77','77',cached_input_tokens,output_tokens,cache_write_input_tokens,NULL,NULL,NULL FROM session_events LIMIT 1",[]).unwrap();
+            drop(rejected);
+            run();
+            let rejected = Connection::open(&old.database_path).unwrap();
+            assert_eq!(rejected.query_row("SELECT count(*) FROM source_prefix_repairs",[],|r|r.get::<_,i64>(0)).unwrap(),0,"bijection must include the entire old event inventory, including unmatched suffixes");
+            rejected
+                .execute("DELETE FROM session_events WHERE event_index=999", [])
+                .unwrap();
+        } else {
+            drop(rejected);
+        }
+        let rejected = Connection::open(&old.database_path).unwrap();
+        rejected.execute_batch("CREATE TRIGGER reject_equivalence BEFORE INSERT ON source_prefix_repairs BEGIN SELECT RAISE(ABORT,'equivalence rollback fixture'); END;").unwrap();
+        drop(rejected);
+        run();
+        let unchanged = snapshot();
+        assert_eq!(unchanged.0, original.0);
+        for saved in &original.1 {
+            assert!(
+                unchanged.1.contains(saved),
+                "failed sealed transaction must retain checkpoint and price bits"
+            );
+        }
+        for saved in &original.2 {
+            assert!(
+                unchanged.2.contains(saved),
+                "failed sealed transaction must retain checkpoint and price bits"
+            );
+        }
+        let rejected = Connection::open(&old.database_path).unwrap();
+        assert_eq!(
+            rejected
+                .query_row("SELECT count(*) FROM source_prefix_repairs", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        rejected
+            .execute_batch("DROP TRIGGER reject_equivalence")
+            .unwrap();
+        // Keep the same legal legacy producer shape, including the original
+        // quota, USD, Luna values and optional source timestamp at each key.
+        for timestamp in [start, start + 60] {
+            let mut sample = rejected.query_row(
+                "SELECT timestamp,reset_at,remaining_percent,sol_dollars,terra_dollars,luna_dollars,sol_tokens,terra_tokens,luna_tokens FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                params![reset,timestamp],
+                |row| Ok(codex_info_db_writer::UsageHistorySample {
+                    timestamp: row.get(0)?, reset_at: row.get(1)?, remaining_percent: row.get(2)?,
+                    sol_dollars: row.get(3)?, terra_dollars: row.get(4)?, luna_dollars: row.get(5)?,
+                    sol_tokens: row.get(6)?, terra_tokens: row.get(7)?, luna_tokens: row.get(8)?,
+                }),
+            ).unwrap();
+            sample.sol_tokens = 66_123_101;
+            sample.terra_tokens = 3_763_895;
+            let observation =
+                codex_info_db_writer::UsageHistoryObservation::legacy_unknown(&sample);
+            let (singleton, previous): (i64,String) = rejected.query_row(
+                "SELECT singleton,snapshot_json FROM durable_state WHERE singleton>=2 AND json_extract(snapshot_json,'$.kind')='codex-info-usage-observation-v1' AND json_extract(snapshot_json,'$.reset_at')=?1 AND json_extract(snapshot_json,'$.timestamp')=?2",
+                params![reset,timestamp], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).unwrap();
+            let previous: Value = serde_json::from_str(&previous).unwrap();
+            let mut saved = json!({
+                "kind":"codex-info-usage-observation-v1",
+                "timestamp":observation.timestamp,"reset_at":observation.reset_at,
+                "remaining_percent":observation.remaining_percent,
+                "sol_dollars":observation.sol_dollars,"terra_dollars":observation.terra_dollars,"luna_dollars":observation.luna_dollars,
+                "sol_tokens":observation.sol_tokens,"terra_tokens":observation.terra_tokens,"luna_tokens":observation.luna_tokens,
+                "model_source":observation.model_source.as_str(),
+            });
+            if let Some(source_timestamp) = previous.get("source_timestamp") {
+                saved["source_timestamp"] = source_timestamp.clone();
+            }
+            assert_eq!(rejected.execute(
+                "UPDATE usage_history SET sol_tokens=?1,terra_tokens=?2 WHERE reset_at=?3 AND timestamp=?4",
+                params![sample.sol_tokens,sample.terra_tokens,reset,timestamp],
+            ).unwrap(),1);
+            assert_eq!(rejected.execute(
+                "UPDATE usage_model_history SET total_tokens='30',input_tokens='30',cached_input_tokens='0',output_tokens='0',cache_write_input_tokens=NULL,model_set_complete=0 WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6-astra'",
+                params![reset,timestamp],
+            ).unwrap(),1);
+            assert_eq!(rejected.execute(
+                "UPDATE durable_state SET snapshot_json=?1 WHERE singleton=?2 AND json_extract(snapshot_json,'$.reset_at')=?3 AND json_extract(snapshot_json,'$.timestamp')=?4",
+                params![saved.to_string(),singleton,reset,timestamp],
+            ).unwrap(),1);
+        }
+        let original = snapshot();
+        drop(
+            UsageStore::open_read_only_partitioned(&old.database_path, &identity)
+                .expect("coherent saved legacy fixture retains the strict observation schema"),
+        );
+
+        drop(rejected);
+        run();
+        let db = Connection::open(&old.database_path).unwrap();
+        let values = db.prepare("SELECT tokens_json FROM recorded_usage_facts WHERE eligible=1 ORDER BY timestamp,fact_id").unwrap().query_map([], |r|r.get::<_,String>(0)).unwrap().map(|r|serde_json::from_str::<Value>(&r.unwrap()).unwrap()).collect::<Vec<_>>();
+        let total = values
+            .iter()
+            .map(|v| v["total"].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(
+            total,
+            15,
+            "{mode}: qualified T10+T5 must reach the recorded index exactly once: {}",
+            fs::read_to_string(root.path().join("startup.log")).unwrap()
+        );
+        assert_eq!(values.len(), 2);
+        assert!(
+            values.iter().all(|v| v["cache_write_input"].is_null()),
+            "unknown W must remain unknown"
+        );
+        let reader_identity = codex_info_db_reader::StoragePartitionIdentity {
+            schema_version: identity.schema_version.clone(),
+            profile_scope_id: identity.profile_scope_id.clone(),
+            account_scope_id: identity.account_scope_id.clone(),
+            storage_epoch: identity.storage_epoch,
+            partition_id: identity.partition_id.clone(),
+        };
+        let intervals = codex_info_db_reader::ReadIntervals::new(vec![
+            codex_info_db_reader::ReadInterval::new(Some(start), Some(start + 180)).unwrap(),
+        ])
+        .unwrap();
+        let public = codex_info_db_reader::DbReader::open_partitioned_with_intervals(
+            &old.database_path,
+            &reader_identity,
+            intervals,
+        )
+        .unwrap()
+        .read_snapshot()
+        .unwrap();
+        let archive = public
+            .recordings
+            .as_deref()
+            .expect("production reader admits repaired recorded usage");
+        let saved = archive
+            .observations
+            .iter()
+            .filter(|observation| {
+                observation.storage_kind == "source-event"
+                    && [start + 10, start + 70].contains(&observation.timestamp)
+                    && observation
+                        .models
+                        .iter()
+                        .any(|model| model.stored_model_key == "gpt-6-astra")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !saved.is_empty(),
+            "repaired raw source observations remain visible"
+        );
+        for observation in saved {
+            assert!(!observation.observation_id.is_empty());
+            assert!(
+                !observation
+                    .unresolved_reasons
+                    .iter()
+                    .any(|reason| reason == "source-recovery-pending"),
+                "{mode}: the independently proved raw observation is recovered: {:?}",
+                observation.unresolved_reasons
+            );
+            let model = observation
+                .models
+                .iter()
+                .find(|model| model.stored_model_key == "gpt-6-astra")
+                .unwrap();
+            assert_eq!(
+                model.total_tokens,
+                Some(if observation.timestamp == start + 10 {
+                    10
+                } else {
+                    5
+                })
+            );
+            assert_eq!(
+                model.cache_write_input_tokens, None,
+                "saved unknown W remains unknown after classification repair"
+            );
+        }
+        let raw_count: i64 = db
+            .query_row("SELECT count(*) FROM session_events", [], |r| r.get(0))
+            .unwrap();
+        assert!(raw_count >= 2, "old raw keys must remain present");
+        let payload:Option<String>=db.query_row("SELECT payload_json FROM source_prefix_repairs WHERE json_extract(payload_json,'$.mode')=?1",[mode],|r|r.get(0)).optional().unwrap();
+        assert!(payload.is_some(), "{mode}: startup must commit the full-prefix proof and old-to-canonical pointer relation");
+        let payload: Value = serde_json::from_str(&payload.unwrap()).unwrap();
+        assert_eq!(payload["version"], 2);
+        assert_eq!(
+            payload["mappings"].as_array().unwrap().len(),
+            if mode == "identical-prefix-alias" {
+                4
+            } else {
+                2
+            }
+        );
+        let before: (String,String)=db.query_row("SELECT fact_revision,(SELECT group_concat(prefix_json,'|') FROM recorded_usage_prefixes) FROM recorded_usage_state",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        drop(db);
+        let restored = snapshot();
+        assert_eq!(
+            restored.0, original.0,
+            "repair must retain both complete checkpoints"
+        );
+        for saved in &original.1 {
+            assert!(
+                restored.1.contains(saved),
+                "original key, saved numeric and USD REAL bits must remain exact: {saved:?}"
+            );
+        }
+        for saved in &original.2 {
+            assert!(
+                restored.2.contains(saved),
+                "past fixed legacy observation must remain exact: {saved:?}"
+            );
+        }
+        for saved in &original.3 {
+            assert!(
+                restored.3.contains(saved),
+                "past durable observation must remain exact: {saved:?}"
+            );
+        }
+        let raw = codex_info_db_writer::read_session_event_facts(
+            &Connection::open(&old.database_path).unwrap(),
+        )
+        .unwrap();
+        for saved in &original_raw {
+            let restored = raw
+                .iter()
+                .find(|fact| fact.source == saved.source)
+                .expect("every original nine-field key remains stored");
+            assert_eq!(
+                (&restored.tokens, &restored.model, restored.timestamp),
+                (&saved.tokens, &saved.model, saved.timestamp)
+            );
+            if mode == "event-bijection" {
+                assert_eq!(
+                    restored.admission, saved.admission,
+                    "new-source admission cannot be written onto the old physical key"
+                );
+            }
         }
         assert!(
-            Instant::now() < deadline,
-            "real recorder startup did not terminate"
+            payload
+                .to_string()
+                .contains(&format!("{:016x}", 0.123_456_789_012_345_66_f64.to_bits())),
+            "immutable provenance retains original USD REAL bits"
         );
-        thread::sleep(Duration::from_millis(20));
-    };
-    assert!(
-        status.success(),
-        "{}",
-        fs::read_to_string(root.path().join("startup.log")).unwrap()
+        let fixed_reader =
+            UsageStore::open_read_only_partitioned(&old.database_path, &identity).unwrap();
+        assert_eq!(
+            fixed_reader
+                .load_session_events()
+                .unwrap()
+                .iter()
+                .map(|event| event.total_tokens)
+                .sum::<u64>(),
+            15
+        );
+        let retired = payload["mappings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mapping| mapping["original"] != mapping["canonical"])
+            .unwrap()["original"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let mutation = Connection::open(&old.database_path).unwrap();
+        let predicate="root_identity=?1 AND relative_path=?2 AND file_device=?3 AND file_inode=?4 AND prefix_generation=?5 AND range_start=?6 AND range_end=?7 AND record_sha256=?8 AND event_index=?9";
+        let previous: (String, Option<String>) = mutation
+            .query_row(
+                &format!("SELECT total_tokens,input_tokens FROM session_events WHERE {predicate}"),
+                rusqlite::params_from_iter(&retired),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        mutation.execute(&format!("UPDATE session_events SET total_tokens='99',input_tokens='99' WHERE {predicate}"),rusqlite::params_from_iter(&retired)).unwrap();
+        assert!(
+            fixed_reader.load_session_events().is_err(),
+            "a new batch cannot reuse a proof after its retired raw inventory changes"
+        );
+        let mut restore = retired;
+        restore.push(previous.0);
+        restore.push(previous.1.unwrap());
+        mutation
+            .execute(
+                &format!(
+                    "UPDATE session_events SET total_tokens=?10,input_tokens=?11 WHERE {predicate}"
+                ),
+                rusqlite::params_from_iter(&restore),
+            )
+            .unwrap();
+        assert_eq!(
+            fixed_reader
+                .load_session_events()
+                .unwrap()
+                .iter()
+                .map(|event| event.total_tokens)
+                .sum::<u64>(),
+            15,
+            "failed batch scope drops its cache before a restored new batch"
+        );
+        drop(mutation);
+        drop(fixed_reader);
+        run();
+        let db = Connection::open(&old.database_path).unwrap();
+        let after:(String,String)=db.query_row("SELECT fact_revision,(SELECT group_concat(prefix_json,'|') FROM recorded_usage_prefixes) FROM recorded_usage_state",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(
+            after, before,
+            "same accepted proof replay must be SQL no-op for facts/prefixes"
+        );
+        let restored = snapshot();
+        assert_eq!(restored.0, original.0);
+        for saved in &original.1 {
+            assert!(restored.1.contains(saved));
+        }
+        for saved in &original.3 {
+            assert!(
+                restored.3.contains(saved),
+                "noop retains the same durable observation"
+            );
+        }
+        drop(db);
+        // Reactivate A through the real account/main path. The ordinary cycle
+        // must consume the same canonical view as historical reconstruction.
+        fs::write(&auth, br#"{"tokens":{"account_id":"old-account"}}"#).unwrap();
+        let reactivated = confirmed_fixture(&home, &data, start + 200);
+        assert_eq!(reactivated.database_path, old.database_path);
+        run();
+        let db = Connection::open(&old.database_path).unwrap();
+        let normal:(String,String)=db.query_row("SELECT fact_revision,(SELECT group_concat(prefix_json,'|') FROM recorded_usage_prefixes) FROM recorded_usage_state",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(
+            normal,
+            before,
+            "normal cycle must not recount either side of the proof: {}",
+            fs::read_to_string(root.path().join("startup.log")).unwrap()
+        );
+        let total: String = db
+            .query_row(
+                "SELECT total_tokens FROM session_model_totals WHERE model='gpt-6-astra'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total, "15",
+            "normal model totals must use exactly the same canonical event stream"
+        );
+        let restored = snapshot();
+        assert_eq!(
+            restored.0.len(),
+            2,
+            "normal collection must retain both proof-referenced checkpoints"
+        );
+        for saved in &original.1 {
+            assert!(
+                restored.1.contains(saved),
+                "normal current repair cannot rewrite a past saved model observation"
+            );
+        }
+        for saved in &original.2 {
+            assert!(
+                restored.2.contains(saved),
+                "normal current repair cannot rewrite a past fixed legacy observation"
+            );
+        }
+        for saved in &original.3 {
+            assert!(
+                restored.3.contains(saved),
+                "normal collection retains the same durable observation"
+            );
+        }
+        return;
+    }
+    if let Some(inode) = container_inode {
+        let ranges = UsageStore::open_read_only_partitioned(&old.database_path, &identity)
+            .unwrap()
+            .load_session_ranges()
+            .unwrap();
+        for fault in [
+            "container-range-missing",
+            "container-hash-wrong",
+            "original-hash-wrong",
+        ] {
+            let db = Connection::open(&old.database_path).unwrap();
+            match fault {
+                "container-range-missing" => {
+                    db.execute(
+                        "DELETE FROM session_ranges WHERE file_inode=?1",
+                        [inode.to_string()],
+                    )
+                    .unwrap();
+                }
+                "container-hash-wrong" => {
+                    db.execute(
+                        "UPDATE session_ranges SET record_sha256=?1 WHERE file_inode=?2",
+                        params!["ab".repeat(32), inode.to_string()],
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    db.execute(
+                        "UPDATE session_ranges SET record_sha256=?1 WHERE file_inode=?2",
+                        params!["cd".repeat(32), checkpoints[0].file_inode.to_string()],
+                    )
+                    .unwrap();
+                }
+            }
+            drop(db);
+            run();
+            let db = Connection::open(&old.database_path).unwrap();
+            let qualified: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM session_events WHERE admission_json IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                qualified, 0,
+                "both independent sets of accepted evidence are required: {fault}"
+            );
+            assert_eq!(
+                UsageStore::open_read_only_partitioned(&old.database_path, &identity)
+                    .unwrap()
+                    .load_session_events()
+                    .unwrap(),
+                events,
+                "failed byte proof must retain the old event values: {fault}"
+            );
+            db.execute("DELETE FROM session_ranges", []).unwrap();
+            for range in &ranges {
+                db.execute(
+                    "INSERT INTO session_ranges VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    params![
+                        range.root_identity,
+                        range.relative_path,
+                        range.file_device.to_string(),
+                        range.file_inode.to_string(),
+                        range.start_offset,
+                        range.end_offset,
+                        format!("{:032x}", range.collector_epoch),
+                        range.cycle_seq.to_string(),
+                        format!("{:032x}", range.prefix_generation),
+                        range.record_sha256
+                    ],
+                )
+                .unwrap();
+            }
+        }
+    }
+    let failed = Connection::open(&old.database_path).unwrap();
+    failed.execute_batch("CREATE TRIGGER reject_parser_repair BEFORE INSERT ON source_prefix_repairs BEGIN SELECT RAISE(ABORT,'sealed parser test rejection'); END;").unwrap();
+    drop(failed);
+    run();
+    let failed = Connection::open(&old.database_path).unwrap();
+    let untouched: (i64,i64,i64) = failed.query_row("SELECT (SELECT count(*) FROM session_events WHERE admission_json IS NOT NULL),(SELECT count(*) FROM session_checkpoints WHERE source_admission IS NOT NULL),(SELECT count(*) FROM source_prefix_repairs)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!(
+        untouched,
+        (0, 0, 0),
+        "failed parser repair cannot publish qualification or provenance"
     );
+    let failed_writer =
+        UsageStore::open_read_only_partitioned(&old.database_path, &identity).unwrap();
+    let mut failed_checkpoints = failed_writer
+        .load_session_collection_state()
+        .unwrap()
+        .checkpoints;
+    if selected_account {
+        for checkpoint in &mut failed_checkpoints {
+            checkpoint.cycle_seq = checkpoints[0].cycle_seq;
+        }
+    }
+    assert_eq!(failed_checkpoints, checkpoints);
+    assert_eq!(failed_writer.load_session_events().unwrap(), events);
+    drop(failed_writer);
+    failed
+        .execute_batch("DROP TRIGGER reject_parser_repair")
+        .unwrap();
+    drop(failed);
+    run();
     assert!(
         current.database_path.is_file(),
         "main must initialize authenticated account B"
     );
     let db = Connection::open(&old.database_path).unwrap();
+    let qualified: i64 = db.query_row("SELECT COUNT(*) FROM session_events WHERE reset_at=?1 AND window_seconds=3600 AND admission_json IS NOT NULL",[reset],|row|row.get(0)).unwrap();
+    assert_eq!(
+        qualified,
+        2,
+        "account must recover the accepted original events against its own official timeline: {}",
+        fs::read_to_string(root.path().join("startup.log")).unwrap()
+    );
     let tokens:Option<String>=db.query_row("SELECT total_tokens FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6-astra'",[start],|r|r.get(0)).optional().unwrap();
     assert_eq!(
         tokens.as_deref(),
@@ -623,16 +1438,2126 @@ fn real_startup_recovers_inactive_account_source_history() {
     assert_eq!(quota, Some(88.0));
     drop(db);
     let writer = UsageStore::open_read_only_partitioned(&old.database_path, &identity).unwrap();
-    assert_eq!(writer.load_session_events().unwrap(), events);
+    let mut restored_events = writer.load_session_events().unwrap();
+    if disproved_numbers {
+        let raw = Connection::open(&old.database_path).unwrap();
+        let facts = codex_info_db_writer::read_session_event_facts(&raw).unwrap();
+        for (restored, expected) in restored_events.iter_mut().zip(&expected_events) {
+            let fact = facts
+                .iter()
+                .find(|fact| fact.source.event_index == restored.event_index)
+                .unwrap();
+            let proof = match &fact.admission.as_ref().unwrap().numeric {
+                codex_info_db_writer::event_admission::NumericEventProof::LegacyCounter(proof) => {
+                    proof
+                }
+                _ => panic!("expected a source counter proof"),
+            };
+            assert_eq!(
+                restored.event_index, proof.after.pointer.start,
+                "replacement key names the exact raw record"
+            );
+            restored.event_index = expected.event_index;
+        }
+    }
+    assert_eq!(restored_events, expected_events);
+    let mut repaired_checkpoints = writer.load_session_collection_state().unwrap().checkpoints;
+    for checkpoint in &mut repaired_checkpoints {
+        assert!(
+            checkpoint
+                .source_admission
+                .as_ref()
+                .and_then(|state| state.account_binding.as_ref())
+                .is_some(),
+            "legacy parser qualification must recover from the accepted original prefix"
+        );
+        assert!(checkpoint.last_model_context_kind.is_some());
+        assert!(checkpoint.last_model_interval.is_some());
+        checkpoint.source_admission = None;
+        checkpoint.last_model_context_kind = None;
+        checkpoint.last_model_interval = None;
+        if selected_account {
+            checkpoint.cycle_seq = expected_checkpoints[0].cycle_seq;
+        }
+    }
     assert_eq!(
-        writer.load_session_collection_state().unwrap().checkpoints,
-        checkpoints
+        repaired_checkpoints, expected_checkpoints,
+        "repair must keep the same cursor and the raw state proven at that position"
     );
     assert_eq!(
         writer.load_session_collection_state().unwrap().model_totals[0].total_tokens,
-        20
+        if stream_boundaries { 15 } else { 20 }
     );
+    let repaired_state = writer.load_session_collection_state().unwrap();
+    assert_eq!(
+        repaired_state.collector_epoch,
+        original_state.collector_epoch
+    );
+    if selected_account {
+        assert!(repaired_state.cycle_seq > original_state.cycle_seq);
+    } else {
+        assert_eq!(
+            repaired_state.cycle_seq, original_state.cycle_seq,
+            "historical repair is not a Session collection cycle"
+        );
+    }
+    assert_eq!(
+        writer.latest_quota_receipt().unwrap(),
+        Some(receipts[2].clone())
+    );
+    let proof = Connection::open(&old.database_path).unwrap();
+    let payload: String = proof
+        .query_row(
+            "SELECT payload_json FROM source_prefix_repairs",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert!(payload["original_parser"]["source_admission"].is_null());
+    assert!(payload["original_parser"]["last_model_context_kind"].is_null());
+    assert!(payload["original_parser"]["last_model_interval"].is_null());
+    if let Some(inode) = container_inode {
+        assert_eq!(payload["read_container"]["file_inode"], inode);
+        assert_eq!(
+            payload["read_container"]["accepted_end"],
+            checkpoints[0].committed_offset
+        );
+        assert!(!payload["read_container"]["ranges"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            payload["checkpoint"]["file_inode"], checkpoints[0].file_inode,
+            "the reading container must not replace the old physical identity"
+        );
+    }
+    if disproved_numbers {
+        assert_eq!(payload["original_raw"]["total"], 999);
+        assert_eq!(
+            payload["qualified_raw"]["total"],
+            if stream_boundaries { 25 } else { 20 }
+        );
+        assert!(payload["original"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|fact| fact["tokens"]["total"] == 42));
+        assert_eq!(payload["original"][0]["model"], "gpt-6-luna");
+        assert_eq!(
+            payload["numeric_replay"]["records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            if stream_boundaries { 5 } else { 4 }
+        );
+    }
+    if stream_boundaries {
+        let records = payload["numeric_replay"]["records"].as_array().unwrap();
+        assert_eq!(records[0]["raw"]["total"], 10);
+        assert_eq!(records[0]["outcome"], "account-counter-baseline");
+        assert_eq!(records[2]["before"]["total"], 20);
+        assert_eq!(records[2]["raw"]["total"], 5);
+        assert_eq!(
+            records[2]["outcome"],
+            "raw-counter-regression-or-invalid-delta"
+        );
+        assert_eq!(records[3]["before"]["total"], 20);
+        assert_eq!(records[3]["raw"]["total"], 25);
+        let rows = Connection::open(&old.database_path).unwrap();
+        let complete: i64 = rows
+            .query_row(
+                "SELECT max(model_set_complete) FROM usage_model_history WHERE reset_at=?1",
+                [reset],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            complete, 0,
+            "a positive initial baseline cannot become full coverage"
+        );
+    }
+    assert_eq!(
+        payload["checkpoint"]["accepted_end"].as_u64(),
+        Some(checkpoints[0].committed_offset)
+    );
+    assert_eq!(
+        payload["qualified_parser"]["source_admission"]["account_binding"]["partition"]
+            ["account_scope_id"],
+        identity.account_scope_id
+    );
+    drop(proof);
+    let fixed_generation = repaired_state.data_generation;
+    drop(writer);
+    run();
+    let writer = UsageStore::open_read_only_partitioned(&old.database_path, &identity).unwrap();
+    if !selected_account {
+        assert_eq!(
+            writer
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            fixed_generation,
+            "same accepted prefix after restart is a no-op"
+        );
+    } else {
+        assert_eq!(writer.load_session_events().unwrap().len(), 2);
+    }
     assert!(old.database_path.with_extension("sqlite3.bak.1").is_file());
+}
+
+#[test]
+fn issue604_startup_requires_initial_account_confirmation_before_database() {
+    fn run(root: &Path, mode: &str) -> (bool, String) {
+        let log = root.join(format!("startup-{mode}.log"));
+        let mut child = ChildGuard(
+            Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
+                .args(["--once", "--interval-secs", "1"])
+                .env("CODEX_HOME", root.join("home"))
+                .env("CODEX_INFO_DATA_DIR", root.join("data"))
+                .env("CODEX_INFO_CODEX_BIN", root.join("server.py"))
+                .env("CODEX_INFO_ACCOUNT_ACTIVATION_UNIX", "1")
+                .env("CONFIRMATION_MODE", mode)
+                .env("CONFIRMATION_ROOT", root)
+                .env_remove("CODEX_INFO_RECORDER_DB")
+                .env_remove("CODEX_INFO_ACCOUNT_DB")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(File::create(&log).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "confirmation fixture did not terminate: {mode}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        (status.success(), fs::read_to_string(log).unwrap())
+    }
+    fn setup(root: &Path) {
+        private_directory(&root.join("home"));
+        private_directory(&root.join("home/sessions"));
+        private_directory(&root.join("data"));
+        fs::write(
+            root.join("home/auth.json"),
+            br#"{"tokens":{"account_id":"confirmation-fixture-A"}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(
+            root.join("home/auth.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::write(root.join("server.py"), r#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+root = pathlib.Path(os.environ['CONFIRMATION_ROOT'])
+mode = os.environ['CONFIRMATION_MODE']
+reads = 0
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    if 'id' not in message:
+        continue
+    result = {}
+    error = None
+    if method == 'account/read':
+        reads += 1
+        if not (root / 'initial-confirmation.done').exists() and list((root / 'data/history/accounts').glob('**/usage_history.sqlite3')):
+            (root / 'premature-database').touch()
+        if mode == 'error':
+            error = {'code': -32000, 'message': 'fixture account read unavailable'}
+        else:
+            if mode == 'raw-switch' and reads == 1:
+                auth = root / 'home/auth.json'
+                auth.write_text('{"tokens":{"account_id":"confirmation-fixture-B"}}')
+                auth.chmod(0o600)
+            if mode == 'lease-replace' and reads == 1:
+                temporary = root / 'data/history/replacement-lease'
+                temporary.write_text('{}')
+                temporary.chmod(0o600)
+                temporary.replace(root / 'data/history/usage_record_daemon.lock')
+            email = 'fixture@example.test' if mode != 'account-mismatch' or reads == 1 else 'other@example.test'
+            result = {'account': {'type': 'chatgpt', 'email': email, 'planType': 'pro'}, 'requiresOpenaiAuth': True}
+            if reads == 2 and mode == 'success':
+                (root / 'initial-confirmation.done').touch()
+    elif method == 'account/rateLimits/read':
+        result = {'rateLimits': {'primary': {'usedPercent': 0, 'resetsAt': int(time.time()) + 604800, 'windowDurationMins': 10080}}}
+    response = {'id': message['id'], 'error': error} if error else {'id': message['id'], 'result': result}
+    print(json.dumps(response), flush=True)
+"#).unwrap();
+        fs::set_permissions(root.join("server.py"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut failures = Vec::new();
+    for mode in ["error", "account-mismatch", "raw-switch", "lease-replace"] {
+        let root = tempfile::tempdir().unwrap();
+        setup(root.path());
+        let (success, log) = run(root.path(), mode);
+        let registry: Value = serde_json::from_slice(
+            &fs::read(root.path().join("data/history/account_profile_v1.json")).unwrap(),
+        )
+        .unwrap();
+        let entries: Vec<_> = registry["accounts"].as_object().unwrap().values().collect();
+        let unconfirmed = entries.iter().all(|entry| {
+            entry["canonical_confirmation"].is_null()
+                && entry["lifecycle_intervals"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+                && entry["state"] == "allocated"
+        });
+        let any_db = entries.iter().any(|entry| {
+            root.path()
+                .join("data/history/accounts/v1")
+                .join(
+                    registry["accounts"]
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .find(|(_, value)| *value == *entry)
+                        .unwrap()
+                        .0,
+                )
+                .join(format!(
+                    "epoch-{}",
+                    entry["storage_epoch"].as_u64().unwrap()
+                ))
+                .join("usage_history.sqlite3")
+                .exists()
+        });
+        failures.push((
+            mode,
+            !success && unconfirmed && !any_db && !root.path().join("premature-database").exists(),
+            log,
+        ));
+    }
+    let root = tempfile::tempdir().unwrap();
+    setup(root.path());
+    let began = chrono::Utc::now().timestamp();
+    let (success, log) = run(root.path(), "success");
+    let ended = chrono::Utc::now().timestamp();
+    let read_registry = || -> Value {
+        serde_json::from_slice(
+            &fs::read(root.path().join("data/history/account_profile_v1.json")).unwrap(),
+        )
+        .unwrap()
+    };
+    let registry = read_registry();
+    let (scope, entry) = registry["accounts"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap();
+    let proof = entry["canonical_confirmation"].clone();
+    let interval = entry["lifecycle_intervals"].clone();
+    let valid = success
+        && entry["state"] == "initialized"
+        && proof["rule_version"] == 1
+        && proof["profile_scope_id"] == registry["profile_scope_id"]
+        && proof["account_scope_id"] == scope.as_str()
+        && proof["storage_epoch"] == entry["storage_epoch"]
+        && proof["began_at"]
+            .as_i64()
+            .is_some_and(|t| t >= began && t <= ended)
+        && proof["ended_at"]
+            .as_i64()
+            .is_some_and(|t| t >= proof["began_at"].as_i64().unwrap_or(i64::MAX) && t <= ended)
+        && interval.as_array().is_some_and(|v| {
+            v.len() == 1 && v[0]["start_at"] == proof["began_at"] && v[0]["end_at"].is_null()
+        })
+        && !root.path().join("premature-database").exists();
+    let (resumed, resume_log) = run(root.path(), "error");
+    let after = read_registry();
+    let stable = resumed
+        && after["accounts"][scope]["canonical_confirmation"] == proof
+        && after["accounts"][scope]["lifecycle_intervals"] == interval
+        && after["next_storage_epoch"] == 2;
+    for (mode, qualified, log) in failures {
+        assert!(
+            qualified,
+            "initial confirmation failure leaked storage/ownership: {mode}\n{log}"
+        );
+    }
+    assert!(
+        valid,
+        "successful initial confirmation was not committed before DB initialization\n{log}"
+    );
+    assert!(
+        stable,
+        "saved confirmation did not permit RPC-independent restart\n{resume_log}"
+    );
+}
+
+#[test]
+fn issue604_collector_binds_sources_before_checkpoint_and_usage() {
+    verify_bound_source_event_collection(false, false, false, false, false, false, false);
+}
+
+#[test]
+fn issue604_collector_recovers_original_event_qualification_from_accepted_prefix() {
+    verify_bound_source_event_collection(true, false, false, false, false, false, false);
+}
+
+#[test]
+fn issue604_collector_retires_only_the_original_counter_matched_to_a_response() {
+    verify_bound_source_event_collection(false, true, false, false, false, false, false);
+}
+
+#[test]
+fn issue604_collector_requalifies_only_the_matching_saved_legacy_family_key() {
+    verify_bound_source_event_collection(false, false, true, false, false, false, false);
+}
+
+#[test]
+fn issue604_qualified_live_append_progresses_before_old_parser_reconstruction() {
+    verify_bound_source_event_collection(false, false, false, true, false, false, false);
+}
+
+#[test]
+fn issue604_qualified_live_append_does_not_spend_its_budget_requalifying_old_events() {
+    verify_bound_source_event_collection(false, false, false, false, true, false, false);
+}
+
+#[test]
+fn issue604_exact_period_history_includes_prior_owned_intervals_after_reactivation() {
+    verify_bound_source_event_collection(false, false, false, false, false, true, false);
+}
+
+#[test]
+fn issue604_response_before_rpc_binding_stays_pending_without_blocking_the_source() {
+    verify_bound_source_event_collection(false, false, false, false, false, false, true);
+}
+
+#[test]
+fn issue604_numerical_replay_keeps_an_already_qualified_legacy_family_key() {
+    verify_bound_source_event_collection(true, false, true, false, false, false, false);
+}
+
+#[test]
+fn issue604_numerical_replay_does_not_alias_different_exact_models_of_one_family() {
+    verify_bound_source_event_collection(true, true, true, false, false, false, false);
+}
+
+#[test]
+fn issue604_numerical_replay_qualifies_the_original_unattributed_model() {
+    verify_bound_source_event_collection(true, false, true, false, false, false, true);
+}
+
+fn verify_bound_source_event_collection(
+    restore_original: bool,
+    retire_counter: bool,
+    legacy_family: bool,
+    live_before_reconstruction: bool,
+    live_before_original_repair: bool,
+    reactivated: bool,
+    prior_rpc_response: bool,
+) {
+    fn counter(total: u64, at: i64) -> String {
+        let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp(at, 0)
+            .unwrap()
+            .to_rfc3339();
+        format!(
+            "{}\n",
+            json!({"type":"event_msg","timestamp":timestamp,
+            "payload":{"type":"token_count","info":{"total_token_usage":{
+                "total_tokens":total,"input_tokens":total,"cached_input_tokens":0,"output_tokens":0
+            }}}})
+        )
+    }
+    fn setup() -> (tempfile::TempDir, String) {
+        let root = match env::var_os("CODEX_INFO_TEST_EXPORT_BINDING_FIXTURE") {
+            Some(export) => tempfile::tempdir_in(PathBuf::from(export).parent().unwrap()).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let home = root.path().join("home");
+        private_directory(&home);
+        private_directory(&home.join("sessions"));
+        private_directory(&root.path().join("data"));
+        let auth = home.join("auth.json");
+        fs::write(&auth, br#"{"tokens":{"account_id":"binding-fixture-A"}}"#).unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        let old = chrono::Utc::now().timestamp() - 30;
+        let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp(old, 0)
+            .unwrap()
+            .to_rfc3339();
+        let original = format!(
+            "{}\n{}\n{}",
+            json!({"type":"session_meta","timestamp":timestamp,
+                "payload":{"id":"binding-thread","session_id":"binding-session"}}),
+            json!({"type":"turn_context","timestamp":timestamp,
+                "payload":{"model":"gpt-6.1-sol","turn_id":"turn","root_turn_id":"root-turn"}}),
+            counter(15, old)
+        );
+        let source = home.join("sessions/one.jsonl");
+        fs::write(&source, &original).unwrap();
+        let item = json!({
+            "cliVersion":"0.147.0", "createdAt":old, "updatedAt":old,
+            "cwd":root.path(), "ephemeral":false, "id":"binding-thread",
+            "modelProvider":"openai", "preview":"fixture", "name":"fixture",
+            "sessionId":"binding-session", "source":"cli",
+            "status":{"type":"idle"}, "turns":[], "path":source
+        });
+        assert!(codex_info::thread_contract::validate_thread_item(&item).is_ok());
+        fs::write(root.path().join("thread.json"), item.to_string()).unwrap();
+        fs::write(
+            root.path().join("reset-at"),
+            (chrono::Utc::now().timestamp() + 604800).to_string(),
+        )
+        .unwrap();
+        fs::write(root.path().join("server.py"), r#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+root = pathlib.Path(os.environ['BINDING_FIXTURE_ROOT'])
+mode = os.environ['BINDING_FIXTURE_MODE']
+thread_seen = False
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req:
+        continue
+    method = req.get('method')
+    result, error = {}, None
+    if mode == 'offline' and method != 'initialize':
+        error = {'code':-32000,'message':'fixture RPC unavailable'}
+    elif method == 'account/read':
+        email = 'other@example.invalid' if thread_seen and mode == 'account-mismatch' else 'fixture@example.invalid'
+        result = {'requiresOpenaiAuth':False,'account':{'type':'chatgpt','email':email,'planType':'pro'}}
+    elif method == 'thread/read':
+        thread_seen = True
+        with (root / 'thread-reads').open('a') as calls:
+            calls.write('thread/read\n')
+        item = json.loads((root / 'thread.json').read_text())
+        if mode == 'thread-error':
+            error = {'code':-32000,'message':'fixture thread unavailable'}
+        if mode == 'id-mismatch':
+            item['id'] = 'another-thread'
+        if mode == 'path-mismatch':
+            item['path'] = str(root / 'missing.jsonl')
+        if mode == 'raw-switch':
+            auth = root / 'home/auth.json'
+            auth.write_text('{"tokens":{"account_id":"binding-fixture-B"}}')
+            auth.chmod(0o600)
+        result = {'thread':item}
+    elif method == 'account/rateLimits/read':
+        used = 0
+        if mode == 'repair-live':
+            state = root / 'repair-percent'
+            used = int(state.read_text()) + 1 if state.exists() else 1
+            state.write_text(str(used))
+        result = {'rateLimits':{'primary':{'usedPercent':used,'resetsAt':int((root / 'reset-at').read_text()),'windowDurationMins':10080}}}
+    response = {'id':req['id'],'error':error} if error else {'id':req['id'],'result':result}
+    print(json.dumps(response), flush=True)
+"#).unwrap();
+        fs::set_permissions(
+            root.path().join("server.py"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        (root, original)
+    }
+    fn run(root: &Path, mode: &str, label: &str, bounded_repair: bool) -> (bool, String) {
+        let log = root.join(format!("binding-{label}.log"));
+        let args = if bounded_repair {
+            vec!["--interval-secs", "1", "--chunk-bytes", "700"]
+        } else if label == "live-before-repair" {
+            vec!["--once", "--interval-secs", "1", "--chunk-bytes", "700"]
+        } else {
+            vec!["--once", "--interval-secs", "1"]
+        };
+        let mut child = ChildGuard(
+            Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
+                .args(args)
+                .env("CODEX_HOME", root.join("home"))
+                .env("CODEX_INFO_DATA_DIR", root.join("data"))
+                .env("CODEX_INFO_CODEX_BIN", root.join("server.py"))
+                .env("BINDING_FIXTURE_ROOT", root)
+                .env("BINDING_FIXTURE_MODE", mode)
+                .env_remove("CODEX_INFO_RECORDER_DB")
+                .env_remove("CODEX_INFO_ACCOUNT_DB")
+                .stdin(if bounded_repair {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                })
+                .stdout(Stdio::null())
+                .stderr(File::create(&log).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        eprintln!(
+            "issue604_fixture label={label} recorder_pid={} source_bytes={}",
+            child.0.id(),
+            fs::metadata(root.join("home/sessions/one.jsonl"))
+                .unwrap()
+                .len()
+        );
+        if bounded_repair {
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let mut failed_at = None;
+            let mut released = false;
+            loop {
+                let (db, _) = database(root);
+                if mode == "repair-live" {
+                    let receipts: i64 = db
+                        .query_row("SELECT count(*) FROM quota_receipts", [], |r| r.get(0))
+                        .unwrap();
+                    let text = fs::read_to_string(&log).unwrap();
+                    if failed_at.is_none() && text.contains("forced pending qualification rollback")
+                    {
+                        let revision: i64 = db
+                            .query_row(
+                                "SELECT max(revision) FROM official_period_inputs",
+                                [],
+                                |r| r.get(0),
+                            )
+                            .unwrap();
+                        failed_at = Some((receipts, revision));
+                    }
+                    if let Some((count, revision)) =
+                        failed_at.filter(|(count, _)| receipts >= count + 2)
+                    {
+                        if !released {
+                            let writable = Connection::open(db.path().unwrap()).unwrap();
+                            writable
+                                .execute_batch("DROP TRIGGER reject_pending_qualification")
+                                .unwrap();
+                            fs::write(root.join("pending-repair-input.json"),json!({"failure_receipts":count,"released_receipts":receipts,"fixed_revision":revision}).to_string()).unwrap();
+                            released = true;
+                        }
+                    }
+                    assert!(
+                        !released || !text.contains("source qualification repair input changed"),
+                        "fresh quota poisoned fixed pending repair: {text}"
+                    );
+                }
+                let qualified: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM session_events WHERE admission_json IS NOT NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                if qualified == 4 {
+                    break;
+                }
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "bounded repair owner exited: {}",
+                    fs::read_to_string(&log).unwrap()
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "bounded full-prefix replay did not complete: {}",
+                    fs::read_to_string(&log).unwrap()
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(Command::new("kill")
+                .args(["-TERM", "--", &child.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success());
+        }
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "source fixture did not terminate: {label}\n{}",
+                fs::read_to_string(&log).unwrap()
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        (status.success(), fs::read_to_string(log).unwrap())
+    }
+    fn database(root: &Path) -> (Connection, Value) {
+        let registry: Value = serde_json::from_slice(
+            &fs::read(root.join("data/history/account_profile_v1.json")).unwrap(),
+        )
+        .unwrap();
+        let (scope, entry) = registry["accounts"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap();
+        let path = root
+            .join("data/history/accounts/v1")
+            .join(scope)
+            .join(format!(
+                "epoch-{}",
+                entry["storage_epoch"].as_u64().unwrap()
+            ))
+            .join("usage_history.sqlite3");
+        let db =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.execute_batch("PRAGMA query_only=ON").unwrap();
+        (db, entry["canonical_confirmation"].clone())
+    }
+    fn checkpoint_state(db: &Connection) -> (i64, String, Value) {
+        let (offset, generation, state): (i64, String, String) = db.query_row(
+            "SELECT committed_offset,prefix_generation,source_admission FROM session_checkpoints",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        (offset, generation, serde_json::from_str(&state).unwrap())
+    }
+    fn ledger(db: &Connection) -> Vec<(String, String)> {
+        db.prepare("SELECT model,total_tokens FROM session_events ORDER BY timestamp,event_index")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    for mode in [
+        "thread-error",
+        "id-mismatch",
+        "path-mismatch",
+        "account-mismatch",
+        "raw-switch",
+    ] {
+        let (root, _) = setup();
+        let observed_begin = chrono::Utc::now().timestamp();
+        let (_, log) = run(root.path(), mode, mode, false);
+        let observed_end = chrono::Utc::now().timestamp();
+        let (db, _) = database(root.path());
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "unconfirmed source advanced a checkpoint: {mode}\n{log}"
+        );
+        assert!(ledger(&db).is_empty());
+        assert_eq!(
+            fs::read_to_string(root.path().join("thread-reads"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let registry: Value = serde_json::from_slice(
+            &fs::read(root.path().join("data/history/account_profile_v1.json")).unwrap(),
+        )
+        .unwrap();
+        let entry = registry["accounts"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let end = &entry["lifecycle_intervals"][0]["end_at"];
+        if mode == "raw-switch" {
+            assert!(end.as_i64().is_some_and(|end| end >= observed_begin && end <= observed_end),
+                "a detected raw loss must close old ownership before exit, without waiting for restart");
+        } else {
+            assert!(
+                end.is_null(),
+                "RPC-only failure cannot close local ownership: {mode}"
+            );
+        }
+    }
+    let (root, mut original) = setup();
+    if reactivated {
+        let reset: i64 = fs::read_to_string(root.path().join("reset-at"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        fs::write(root.path().join("reset-at"), (reset - 3600).to_string()).unwrap();
+    }
+    if live_before_original_repair {
+        let end = original.find('\n').unwrap();
+        let mut metadata: Value = serde_json::from_str(&original[..end]).unwrap();
+        metadata["irrelevant_padding"] = json!("x".repeat(1400));
+        original = format!("{metadata}{}", &original[end..]);
+        fs::write(root.path().join("home/sessions/one.jsonl"), &original).unwrap();
+    }
+    let began = chrono::Utc::now().timestamp();
+    let (success, log) = run(root.path(), "success", "success", false);
+    assert!(success, "source binding startup failed\n{log}");
+    let ended = chrono::Utc::now().timestamp();
+    let (db, canonical) = database(root.path());
+    let (offset, generation, state) = checkpoint_state(&db);
+    let binding = state["account_binding"].clone();
+    assert_eq!(offset, original.len() as i64);
+    assert_eq!(binding["version"], 1);
+    assert_eq!(binding["prefix_end"], original.len() as u64);
+    assert_eq!(binding["prefix_generation"], generation);
+    assert_eq!(
+        binding["metadata"],
+        json!({"thread_id":"binding-thread","session_id":"binding-session"})
+    );
+    let source = root.path().join("home/sessions/one.jsonl");
+    let metadata = fs::metadata(&source).unwrap();
+    assert_eq!(binding["file_device"], metadata.dev());
+    assert_eq!(binding["file_inode"], metadata.ino());
+    assert_eq!(binding["relative_path"], "one.jsonl");
+    let partition: (String, String, String, String) = db.query_row(
+        "SELECT profile_scope_id,account_scope_id,storage_epoch,partition_id FROM storage_partition",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).unwrap();
+    assert_eq!(
+        binding["partition"],
+        json!({"schema_version":"codex-info-account-db-v1",
+        "profile_scope_id":partition.0,"account_scope_id":partition.1,
+        "storage_epoch":partition.2.parse::<u64>().unwrap(),"partition_id":partition.3})
+    );
+    let proof = &binding["proof"];
+    assert_eq!(proof["kind"], "rpc");
+    let proof_begin = proof["began_at"].as_i64().unwrap();
+    let proof_end = proof["ended_at"].as_i64().unwrap();
+    assert!(proof_begin >= began && proof_end >= proof_begin && proof_end <= ended);
+    assert!(proof["process"]["pid"].as_i64().unwrap() > 0);
+    assert!(
+        ledger(&db).is_empty(),
+        "the initial cumulative 15 is not account consumption"
+    );
+    let initial_history_tokens: Option<i64> = db
+        .query_row(
+            "SELECT sol_tokens FROM usage_history ORDER BY timestamp DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        initial_history_tokens, None,
+        "an unproved initial source baseline cannot publish a confirmed empty period"
+    );
+    drop(db);
+
+    // A second real acquisition occurs after the RPC source binding. Both
+    // counter endpoints are at this accepted receipt's point, with no clock
+    // interpolation or fabricated acquisition observation.
+    let (success, log) = run(root.path(), "success", "period-evidence", false);
+    assert!(success, "official evidence startup failed\n{log}");
+    let (db, _) = database(root.path());
+    let now: i64 = db
+        .query_row(
+            "SELECT observed_at FROM quota_receipts ORDER BY sequence DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(now >= proof_begin);
+    let expected_reset: i64 = fs::read_to_string(root.path().join("reset-at"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    drop(db);
+    let appended = format!("{}{}", counter(20, now), counter(25, now));
+    fs::write(&source, format!("{original}{appended}")).unwrap();
+    if live_before_reconstruction || live_before_original_repair {
+        use sha2::{Digest, Sha256};
+        let (db, _) = database(root.path());
+        let next: String = db
+            .query_row("SELECT cycle_seq FROM collection_generation", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // Startup's owner commit and the collection each advance the cycle.
+        // Put the legacy source first in the existing rotating order.
+        let backlog_name = if (next.parse::<u64>().unwrap() + 2) % 2 == 0 {
+            "aaa.jsonl"
+        } else {
+            "zzz.jsonl"
+        };
+        let backlog = format!("{original}{}", counter(15, now - 30).repeat(20));
+        assert!(backlog.len() > 1400 && appended.len() < 700);
+        let path = root.path().join("home/sessions").join(backlog_name);
+        fs::write(&path, &backlog).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let writable = Connection::open(db.path().unwrap()).unwrap();
+        writable.execute("INSERT INTO session_checkpoints SELECT root_identity,?1,?2,?3,?4,discard_until_lf,collector_epoch,cycle_seq,prefix_generation,prefix_sha256,fully_attributed_from_zero,token_baseline_known,last_model,previous_total,previous_input,previous_cached_input,previous_output,last_task_running,previous_cache_write_input,history_base_pending,context_usage_tokens,context_window_tokens,NULL,NULL,NULL FROM session_checkpoints WHERE relative_path='one.jsonl'",
+            rusqlite::params![backlog_name,metadata.dev().to_string(),metadata.ino().to_string(),backlog.len() as i64]).unwrap();
+        let hash = format!("{:x}", Sha256::digest(Sha256::digest(backlog.as_bytes())));
+        writable.execute("INSERT INTO session_ranges SELECT root_identity,?1,?2,?3,0,?4,collector_epoch,cycle_seq,prefix_generation,?5 FROM session_checkpoints WHERE relative_path=?1",
+            rusqlite::params![backlog_name,metadata.dev().to_string(),metadata.ino().to_string(),backlog.len() as i64,hash]).unwrap();
+        if live_before_original_repair {
+            assert!(original.len() > 1400);
+            writable.execute("INSERT INTO session_events SELECT root_identity,relative_path,file_device,file_inode,prefix_generation,start_offset,end_offset,record_sha256,0,?1,'gpt-6-luna','9','9','0','0','0',NULL,NULL,NULL FROM session_ranges WHERE relative_path='one.jsonl' LIMIT 1",[now-30]).unwrap();
+        }
+        drop(writable);
+        drop(db);
+        let (success, log) = run(root.path(), "offline", "live-before-repair", false);
+        assert!(success, "{log}");
+        let (db, _) = database(root.path());
+        let expected = if live_before_original_repair {
+            vec![
+                ("gpt-6-luna".to_owned(), "9".to_owned()),
+                ("gpt-6.1-sol".to_owned(), "5".to_owned()),
+            ]
+        } else {
+            vec![("gpt-6.1-sol".to_owned(), "5".to_owned())]
+        };
+        assert_eq!(ledger(&db),expected,"an already qualified append must progress in one bounded cycle while old reconstruction remains pending: {log}");
+        let live_end: i64 = db
+            .query_row(
+                "SELECT committed_offset FROM session_checkpoints WHERE relative_path='one.jsonl'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_end, (original.len() + appended.len()) as i64);
+        if live_before_original_repair {
+            assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM session_pending_ranges WHERE relative_path='one.jsonl' AND reason='source-original-qualification-unresolved')",[],|r|r.get::<_,bool>(0)).unwrap(),"deferred old numerical qualification remains explicit, not confirmed/zero");
+        }
+        let old: Option<String> = db
+            .query_row(
+                "SELECT source_admission FROM session_checkpoints WHERE relative_path=?1",
+                [backlog_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            old.is_none(),
+            "a partly replayed old source cannot publish complete parser qualification"
+        );
+        return;
+    }
+    let (resumed, log) = run(root.path(), "offline", "resume", false);
+    assert!(
+        resumed,
+        "saved source binding must survive RPC failure\n{log}"
+    );
+    let (db, after_canonical) = database(root.path());
+    let saved = checkpoint_state(&db);
+    assert_eq!(saved.0, (original.len() + appended.len()) as i64);
+    assert_eq!(saved.2["account_binding"], binding);
+    assert_eq!(after_canonical, canonical);
+    assert_eq!(ledger(&db), [("gpt-6.1-sol".to_owned(), "5".to_owned())]);
+    let (event_reset, event_window, admission): (Option<i64>, Option<i64>, Option<String>) = db
+        .query_row(
+            "SELECT reset_at,window_seconds,admission_json FROM session_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let admission: Value = serde_json::from_str(
+        &admission.expect("accepted source consumption must retain its original qualification"),
+    )
+    .unwrap();
+    assert_eq!(admission["version"], 1);
+    assert_eq!(admission["source_binding"], binding);
+    assert_eq!(admission["verified_prefix_end"], saved.0 as u64);
+    let registry: Value = serde_json::from_slice(
+        &fs::read(root.path().join("data/history/account_profile_v1.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = registry["accounts"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(admission["ownership"], entry["lifecycle_intervals"][0]);
+    let numeric = &admission["numeric"];
+    assert_eq!(numeric["kind"], "legacy-counter");
+    use sha2::{Digest, Sha256};
+    let before = counter(20, now);
+    let after = counter(25, now);
+    for (name, start, bytes, total) in [
+        ("before", original.len(), before.as_bytes(), 20),
+        ("after", original.len() + before.len(), after.as_bytes(), 25),
+    ] {
+        assert_eq!(
+            numeric[name],
+            json!({
+                "pointer":{"start":start,"end":start+bytes.len(),
+                    "sha256":format!("{:x}",Sha256::digest(bytes)),"timestamp":now},
+                "total":total,"input":total,"cached_input":0,"cache_write_input":null,"output":0
+            })
+        );
+    }
+    let context_start = original.find('\n').unwrap() + 1;
+    let context_end = context_start + original[context_start..].find('\n').unwrap() + 1;
+    assert_eq!(
+        numeric["model_context"],
+        json!({
+            "pointer":{"start":context_start,"end":context_end,
+                "sha256":format!("{:x}",Sha256::digest(&original.as_bytes()[context_start..context_end]))},
+        "kind":"turn","interval":"none"
+        })
+    );
+    assert_eq!(
+        event_reset,
+        Some(expected_reset),
+        "an accepted original event at a qualified official observation point must be attributed"
+    );
+    assert_eq!(event_window, Some(604800));
+    assert!(!admission["period"].is_null());
+    assert!(admission["period"]["lower_at"].as_i64().unwrap() <= now);
+    assert!(admission["period"]["upper_at"].as_i64().unwrap() >= now);
+    if restore_original && legacy_family {
+        use codex_info_db_writer::{SessionLifecycleInterval, StoragePartitionIdentity};
+        use codex_info_recorder::{AccountEpochProof, Recorder, RecorderConfig};
+        let identity: StoragePartitionIdentity =
+            serde_json::from_value(binding["partition"].clone()).unwrap();
+        let mut family = admission.clone();
+        let mut numeric = family["numeric"].clone();
+        numeric.as_object_mut().unwrap().remove("kind");
+        if prior_rpc_response {
+            family["numeric"]["model_context"] = Value::Null;
+            family["period"] = Value::Null;
+        } else {
+            family["numeric"] = json!({"kind":"legacy-family-counter","proof":numeric,"exact_model":if retire_counter { "gpt-5.6-sol" } else { "gpt-6.1-sol" }});
+        }
+        let pointer_start = admission["numeric"]["after"]["pointer"]["start"]
+            .as_u64()
+            .unwrap();
+        let path = db.path().unwrap().to_owned();
+        drop(db);
+        let writable = Connection::open(&path).unwrap();
+        writable
+            .execute(
+                "UPDATE session_events SET model=?3,event_index=?1,admission_json=?2,reset_at=?4,window_seconds=?5",
+                rusqlite::params![pointer_start, family.to_string(), if prior_rpc_response { "UNATTRIBUTED" } else { "SOL" }, (!prior_rpc_response).then_some(expected_reset), (!prior_rpc_response).then_some(604800)],
+            )
+            .unwrap();
+        // An unqualified initial baseline makes the original-prefix repair
+        // necessary; it is not a second confirmed use of this response.
+        writable.execute("INSERT INTO session_events SELECT root_identity,relative_path,file_device,file_inode,prefix_generation,0,?1,?2,999,timestamp,'gpt-6.1-sol','15','15','0','0',NULL,NULL,NULL,NULL FROM session_events LIMIT 1",rusqlite::params![original.len(),format!("{:x}",Sha256::digest(Sha256::digest(original.as_bytes())))]).unwrap();
+        writable
+            .execute(
+                "UPDATE session_checkpoints SET previous_total='24',previous_input='24'",
+                [],
+            )
+            .unwrap();
+        let saved = codex_info_db_writer::read_session_event_facts(&writable)
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.admission.is_some())
+            .unwrap();
+        drop(writable);
+        let owners = entry["lifecycle_intervals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|interval| {
+                SessionLifecycleInterval::new(
+                    interval["start_at"].as_i64(),
+                    interval["end_at"].as_i64(),
+                )
+            })
+            .collect();
+        let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+            RecorderConfig {
+                sessions_root: root.path().join("home/sessions"),
+                chunk_bytes: 65536,
+            },
+            &path,
+            &identity,
+            entry["activation_timestamp"].as_i64(),
+            None,
+            owners,
+        )
+        .unwrap();
+        let epoch = AccountEpochProof::capture(&root.path().join("home")).unwrap();
+        let collected = recorder.run_account_cycle_with_stored_quota_guarded(
+            &root.path().join("home"),
+            &epoch,
+            || true,
+        );
+        if retire_counter {
+            let error = collected.expect_err(
+                "a different exact model in the same family is not the qualified original",
+            );
+            assert!(error
+                .to_string()
+                .contains("qualification repair cannot replace numeric/source facts"));
+            let (db, _) = database(root.path());
+            let facts = codex_info_db_writer::read_session_event_facts(&db).unwrap();
+            assert_eq!(
+                facts.iter().find(|fact| fact.source == saved.source),
+                Some(&saved)
+            );
+            assert_eq!(facts.len(), 2);
+            assert_eq!(
+                recorder.state().unwrap().checkpoints[0].previous_total,
+                Some(24)
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM source_prefix_repairs", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+                0
+            );
+            return;
+        }
+        collected.expect("raw checkpoint repair must preserve qualified labels and recover only missing original model context");
+        let (db, _) = database(root.path());
+        let facts = codex_info_db_writer::read_session_event_facts(&db).unwrap();
+        let retained = facts
+            .iter()
+            .find(|fact| fact.source == saved.source)
+            .expect("the saved family pointer must survive");
+        assert_eq!(
+            retained.model,
+            if prior_rpc_response {
+                "gpt-6.1-sol"
+            } else {
+                "SOL"
+            }
+        );
+        assert_eq!(retained.tokens, saved.tokens);
+        if prior_rpc_response {
+            assert_eq!(retained.period.unwrap().reset_at, expected_reset);
+            use codex_info_db_writer::event_admission::NumericEventProof;
+            let (NumericEventProof::LegacyCounter(before), NumericEventProof::LegacyCounter(after)) = (
+                &saved.admission.as_ref().unwrap().numeric,
+                &retained.admission.as_ref().unwrap().numeric,
+            ) else {
+                panic!("original counter proof must survive model qualification")
+            };
+            assert_eq!(before.before, after.before);
+            assert_eq!(before.after, after.after);
+            assert!(before.model_context.is_none());
+            assert!(after.model_context.is_some());
+            let provenance: String = db.query_row("SELECT payload_json FROM source_prefix_repairs WHERE json_extract(payload_json,'$.original[0].model')='UNATTRIBUTED' OR json_extract(payload_json,'$.original[1].model')='UNATTRIBUTED'", [], |row| row.get(0)).unwrap();
+            let provenance: Value = serde_json::from_str(&provenance).unwrap();
+            let originals = provenance["original"].as_array().unwrap();
+            let original = originals
+                .iter()
+                .find(|fact| fact["model"] == "UNATTRIBUTED")
+                .unwrap();
+            assert_eq!(original["tokens"]["total"], 5);
+            assert_eq!(original["source"]["event_index"], pointer_start);
+            assert_eq!(original["admission"], family);
+        } else {
+            assert_eq!(
+                retained.admission.as_ref().unwrap().numeric,
+                saved.admission.as_ref().unwrap().numeric
+            );
+        }
+        assert_eq!(
+            facts.iter().filter(|fact| fact.admission.is_some()).count(),
+            1
+        );
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0].previous_total,
+            Some(25)
+        );
+        return;
+    }
+    if prior_rpc_response {
+        // This source existed during the account's ownership, before this
+        // physical source acquired its first RPC account binding.
+        let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0)
+            .unwrap()
+            .to_rfc3339();
+        let usage = json!({"total_tokens":7,"input_tokens":5,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":1});
+        let bytes = format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"binding-thread","session_id":"binding-session"}}),
+            json!({"type":"turn_context","timestamp":timestamp,"payload":{"model":"gpt-6.1-sol","turn_id":"turn","root_turn_id":"root-turn"}}),
+            json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"thread_id":"binding-thread","session_id":"binding-session","root_turn_id":"root-turn","turn_id":"turn","response_id":"older-root","usage":usage,"turn_token_usage":usage,"thread_token_usage":usage}}),
+            json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{"total_token_usage":usage,"last_token_usage":usage}}}),
+        );
+        let other = root.path().join("home/sessions/two.jsonl");
+        fs::write(&other, &bytes).unwrap();
+        let mut item: Value =
+            serde_json::from_slice(&fs::read(root.path().join("thread.json")).unwrap()).unwrap();
+        item["path"] = json!(other);
+        fs::write(root.path().join("thread.json"), item.to_string()).unwrap();
+        while chrono::Utc::now().timestamp() <= now {
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(db);
+        let (success, log) = run(root.path(), "success", "prior-rpc-response", false);
+        assert!(success, "{log}");
+        let (db, _) = database(root.path());
+        let stored: Option<(i64,String)> = db.query_row("SELECT committed_offset,source_admission FROM session_checkpoints WHERE relative_path='two.jsonl'",[], |r|Ok((r.get(0)?,r.get(1)?))).optional().unwrap();
+        assert!(
+            stored.is_some(),
+            "an unqualified historical response must not abort the source transaction: {log}"
+        );
+        let (end, state) = stored.unwrap();
+        assert_eq!(end, bytes.len() as i64);
+        let state: Value = serde_json::from_str(&state).unwrap();
+        assert!(
+            state["account_binding"]["proof"]["began_at"]
+                .as_i64()
+                .unwrap()
+                > now
+        );
+        assert_eq!(state["responses"].as_array().unwrap().len(), 1);
+        assert_eq!(state["responses"][0]["pointer"]["timestamp"], now);
+        assert_eq!(ledger(&db), [("gpt-6.1-sol".to_owned(), "5".to_owned())]);
+        assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM session_pending_ranges WHERE relative_path='two.jsonl' AND reason='response-source-qualification-unresolved')", [], |r|r.get::<_,bool>(0)).unwrap());
+        return;
+    }
+    if reactivated {
+        use codex_info_db_writer::{
+            period_evidence::OfficialQuotaInput, SessionLifecycleInterval,
+            StoragePartitionIdentity, UsageStore,
+        };
+        use codex_info_recorder::{AccountEpochProof, Recorder, RecorderConfig};
+        let identity: StoragePartitionIdentity =
+            serde_json::from_value(binding["partition"].clone()).unwrap();
+        let next_start = now + 2;
+        let owners = vec![
+            SessionLifecycleInterval::new(
+                Some(admission["ownership"]["start_at"].as_i64().unwrap()),
+                Some(now + 1),
+            ),
+            SessionLifecycleInterval::new(Some(next_start), None),
+        ];
+        let path = db.path().unwrap().to_owned();
+        drop(db);
+        while chrono::Utc::now().timestamp() < next_start {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let mut store = UsageStore::open_partitioned(&path, &identity).unwrap();
+        // A migrated raw aggregate may include unassigned/other-period usage.
+        // It is retained evidence, not the prefix of this exact period.
+        Connection::open(&path).unwrap().execute(
+            "INSERT INTO session_model_totals(model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('gpt-6-luna','70','70','0','0','0')", []
+        ).unwrap();
+        store
+            .stage_official_quota_inputs(&[OfficialQuotaInput {
+                input_id: "e".repeat(64),
+                account_scope: identity.account_scope_id.clone(),
+                sequence: 900000,
+                observed_at: next_start,
+                content_sha256: "f".repeat(64),
+                reset_at: Some(expected_reset),
+                window_seconds: Some(604800),
+                reason: None,
+            }])
+            .unwrap();
+        // Advance the independent observation clock across a minute; no
+        // source timestamp or source byte is rewritten by this observation.
+        store
+            .commit_quota_receipts(
+                &[codex_info_db_writer::QuotaReceipt {
+                    receipt_id: "d".repeat(64),
+                    sequence: 900001,
+                    observed_at: next_start + 120,
+                    reset_at: expected_reset,
+                    window_seconds: 604800,
+                    remaining_percent: 80.0,
+                }],
+                false,
+            )
+            .unwrap();
+        // Retain a legacy offset whose earlier prefix is not covered by the
+        // qualified source set. New collection must not guess or delete it.
+        let saved_generation = store
+            .load_session_collection_state()
+            .unwrap()
+            .data_generation;
+        let raw = Connection::open(&path).unwrap();
+        let range: Vec<String> = raw.query_row("SELECT root_identity,relative_path,file_device,file_inode,CAST(start_offset AS TEXT),CAST(end_offset AS TEXT),collector_epoch,cycle_seq,prefix_generation,record_sha256 FROM session_ranges WHERE relative_path='one.jsonl' ORDER BY end_offset DESC LIMIT 1", [], |row|(0..10).map(|index|row.get(index)).collect()).unwrap();
+        let offset_end = (next_start + 59).div_euclid(60) * 60 + 60;
+        let models = json!([["gpt-6.1-sol", 5, 5, 0, 0, null]]);
+        let payload = serde_json::to_string(&json!([
+            identity.partition_id,
+            expected_reset,
+            604800,
+            saved_generation - 1,
+            offset_end,
+            [],
+            [range],
+            [[
+                (now - 120).div_euclid(60) * 60,
+                models,
+                [0.000025, 0.0, 0.0]
+            ]],
+            models,
+            [0.000025, 0.0, 0.0]
+        ]))
+        .unwrap();
+        let offset_id = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        raw.execute(
+            "INSERT INTO session_timeline_recoveries VALUES(?1,?2,?3)",
+            rusqlite::params![offset_id, payload, saved_generation.to_string()],
+        )
+        .unwrap();
+        let original_minute: i64 = raw.query_row("SELECT timestamp FROM usage_history WHERE sol_tokens=5 ORDER BY timestamp DESC LIMIT 1", [], |row|row.get(0)).unwrap();
+        let preserved_row = |db: &Connection| -> Vec<rusqlite::types::Value> {
+            db.query_row(
+                "SELECT * FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                rusqlite::params![expected_reset, original_minute],
+                |row| {
+                    (0..9)
+                        .map(|index| {
+                            row.get::<_, rusqlite::types::Value>(index)
+                                .map(|value| match value {
+                                    rusqlite::types::Value::Real(value) => {
+                                        rusqlite::types::Value::Text(format!(
+                                            "REAL:{:016x}",
+                                            value.to_bits()
+                                        ))
+                                    }
+                                    other => other,
+                                })
+                        })
+                        .collect()
+                },
+            )
+            .unwrap()
+        };
+        let original_row = preserved_row(&raw);
+        let observation_values = |db: &Connection| -> String {
+            db.query_row("SELECT json_remove(snapshot_json,'$.model_source','$.empty_model_set_complete') FROM durable_state WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2", rusqlite::params![original_minute,expected_reset], |row|row.get(0)).unwrap()
+        };
+        let original_observation_values = observation_values(&raw);
+        drop(store);
+        let bytes = format!(
+            "{original}{appended}{}{}",
+            counter(25, next_start),
+            counter(30, next_start)
+        );
+        fs::write(&source, &bytes).unwrap();
+        let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+            RecorderConfig {
+                sessions_root: root.path().join("home/sessions"),
+                chunk_bytes: 65536,
+            },
+            &path,
+            &identity,
+            Some(next_start),
+            None,
+            owners,
+        )
+        .unwrap();
+        let epoch = AccountEpochProof::capture(&root.path().join("home")).unwrap();
+        recorder
+            .run_account_cycle_with_stored_quota_guarded(&root.path().join("home"), &epoch, || true)
+            .expect("the exact-period prefix includes both independently owned intervals");
+        let state = recorder.state().unwrap();
+        assert_eq!(state.model_totals[0].total_tokens, 10);
+        assert_eq!(state.checkpoints[0].committed_offset, bytes.len() as u64);
+        let (db, _) = database(root.path());
+        let latest: String = db.query_row("SELECT total_tokens FROM usage_model_history WHERE reset_at=?1 AND model='gpt-6.1-sol' ORDER BY timestamp DESC LIMIT 1", [expected_reset], |r|r.get(0)).unwrap();
+        assert_eq!(
+            latest, "10",
+            "old and current owned interval facts form one exact period"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT payload_json FROM session_timeline_recoveries WHERE recovery_id=?1",
+                [&offset_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            payload
+        );
+        assert_eq!(preserved_row(&db), original_row);
+        assert_eq!(observation_values(&db), original_observation_values);
+        assert_eq!(db.query_row("SELECT json_extract(snapshot_json,'$.model_source') FROM durable_state WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2", rusqlite::params![original_minute,expected_reset], |row|row.get::<_,String>(0)).unwrap(), "legacy-unknown");
+        assert_eq!(db.query_row("SELECT model_set_complete FROM usage_model_history WHERE reset_at=?1 AND model='gpt-6.1-sol' ORDER BY timestamp DESC LIMIT 1", [expected_reset], |row|row.get::<_,i64>(0)).unwrap(), 0);
+        assert_eq!(
+            ledger(&db),
+            vec![("gpt-6.1-sol".to_owned(), "5".to_owned()); 2]
+        );
+        return;
+    }
+    let writable = Connection::open(db.path().unwrap()).unwrap();
+    writable.execute_batch(
+        "CREATE TRIGGER reject_event_admission_insert BEFORE INSERT ON session_events
+         WHEN NEW.admission_json IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture admission write'); END;
+         CREATE TRIGGER reject_event_admission_update BEFORE UPDATE OF admission_json ON session_events
+         BEGIN SELECT RAISE(ABORT,'fixture admission write'); END;",
+    ).unwrap();
+    drop(db);
+
+    let more = counter(30, now);
+    fs::write(&source, format!("{original}{appended}{more}")).unwrap();
+    let (_, failed_log) = run(root.path(), "offline", "admission-rollback", false);
+    assert!(
+        failed_log.contains("fixture admission write"),
+        "{failed_log}"
+    );
+    let (db, _) = database(root.path());
+    assert_eq!(
+        checkpoint_state(&db),
+        saved,
+        "qualification and cursor must commit together"
+    );
+    assert_eq!(ledger(&db), [("gpt-6.1-sol".to_owned(), "5".to_owned())]);
+    writable.execute_batch("DROP TRIGGER reject_event_admission_insert; DROP TRIGGER reject_event_admission_update;").unwrap();
+    drop(writable);
+    drop(db);
+    let (recovered, recovered_log) = run(root.path(), "offline", "admission-retry", false);
+    assert!(recovered, "{recovered_log}");
+    let (db, _) = database(root.path());
+    let saved = checkpoint_state(&db);
+    assert_eq!(
+        saved.0,
+        (original.len() + appended.len() + more.len()) as i64
+    );
+    assert_eq!(
+        ledger(&db),
+        vec![("gpt-6.1-sol".to_owned(), "5".to_owned()); 2]
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM session_events WHERE admission_json IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    let compatibility_dollars: Option<f64> = db
+        .query_row(
+            "SELECT sol_dollars FROM usage_history ORDER BY timestamp DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(compatibility_dollars.map(f64::to_bits),Some(0x3f0a36e2eb1c432d),"ten qualified SOL input tokens use the frozen compatibility tariff and operation order independently of exact-model prices");
+    drop(db);
+
+    // The next source point has no official observation on its right. Keep
+    // its valid numeric event, but do not extrapolate the last receipt into a
+    // period or let the current-period accumulator count it by timestamp.
+    let unassigned = counter(35, now + 1);
+    fs::write(&source, format!("{original}{appended}{more}{unassigned}")).unwrap();
+    let (success, log) = run(root.path(), "offline", "unassigned-current", false);
+    assert!(success, "{log}");
+    let (db, _) = database(root.path());
+    let saved = checkpoint_state(&db);
+    assert_eq!(
+        ledger(&db),
+        vec![("gpt-6.1-sol".to_owned(), "5".to_owned()); 3]
+    );
+    let unassigned_period: Option<i64> = db
+        .query_row(
+            "SELECT reset_at FROM session_events ORDER BY timestamp DESC,event_index DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unassigned_period, None);
+    let current_tokens: String = db
+        .query_row(
+            "SELECT total_tokens FROM session_model_totals WHERE model='gpt-6.1-sol'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        current_tokens, "10",
+        "an unassigned event cannot enter the current period by its timestamp"
+    );
+    drop(db);
+
+    let response = |total: u64, cumulative: u64| {
+        let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0)
+            .unwrap()
+            .to_rfc3339();
+        let usage = json!({"total_tokens":total,"input_tokens":total-2,"cached_input_tokens":1,
+            "cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":1});
+        format!(
+            "{}\n{}\n",
+            json!({"type":"token_usage_record","timestamp":timestamp,
+            "payload":{"thread_id":"binding-thread","session_id":"binding-session",
+                "root_turn_id":"root-turn","turn_id":"turn","response_id":"normal-response",
+                "usage":usage,"turn_token_usage":usage,"thread_token_usage":usage}}),
+            json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{
+                "total_token_usage":{"total_tokens":cumulative,"input_tokens":cumulative-2,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2},
+                "last_token_usage":usage}}})
+        )
+    };
+    let root_response = response(7, 42);
+    let (root_record, closing_counter) = root_response.split_once('\n').unwrap();
+    let open_source = format!("{original}{appended}{more}{unassigned}{root_record}\n");
+    fs::write(&source, &open_source).unwrap();
+    let (success, log) = run(root.path(), "offline", "open-response", false);
+    assert!(success, "{log}");
+    let (db, _) = database(root.path());
+    assert_eq!(db.query_row("SELECT count(*) FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='response-record'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM session_pending_ranges WHERE reason='response-qualification-pending')",[],|r|r.get::<_,bool>(0)).unwrap());
+    let pending_state = checkpoint_state(&db);
+    assert_eq!(pending_state.0, open_source.len() as i64);
+    drop(db);
+    assert!(!closing_counter.is_empty());
+    let mut accepted_source = format!("{original}{appended}{more}{unassigned}{root_response}");
+    fs::write(&source, &accepted_source).unwrap();
+    let (success, log) = run(root.path(), "offline", "canonical-response", false);
+    assert!(success, "{log}");
+    let (db, _) = database(root.path());
+    let response_rows:i64=db.query_row("SELECT count(*) FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='response-record'",[],|r|r.get(0)).unwrap();
+    assert_eq!(
+        response_rows, 1,
+        "a classified qualified root must reach the canonical event ledger"
+    );
+    let root_values:(String,Option<i64>,i64,String)=db.query_row("SELECT total_tokens,reset_at,timestamp,admission_json FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='response-record'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(root_values.0, "7");
+    assert_eq!(root_values.1, Some(expected_reset));
+    assert_eq!(root_values.2, now);
+    let response_admission: Value = serde_json::from_str(&root_values.3).unwrap();
+    assert_eq!(
+        response_admission["numeric"]["candidate"]["record"]["usage"],
+        json!({"total":7,"input":5,"cached_input":1,"cache_write_input":0,"output":2,"reasoning_output":1})
+    );
+    let first_root_admission = root_values.3;
+    let after_root = checkpoint_state(&db);
+    assert!(after_root.0 > saved.0);
+    drop(db);
+    // Same ordered 5-ID key, timestamp and all six usage components is one
+    // response even at another source byte position and after restart.
+    accepted_source.push_str(&response(7, 49));
+    fs::write(&source, &accepted_source).unwrap();
+    let (success, log) = run(root.path(), "offline", "response-replay", false);
+    assert!(success, "{log}");
+    let (db, _) = database(root.path());
+    assert_eq!(db.query_row("SELECT count(*) FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='response-record'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(
+        db.query_row(
+            "SELECT total_tokens FROM session_model_totals WHERE model='gpt-6.1-sol'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "17"
+    );
+    assert_eq!(db.query_row("SELECT admission_json FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='response-record'",[],|r|r.get::<_,String>(0)).unwrap(),first_root_admission);
+    drop(db);
+    // A differing usage for that same key is retained as a conflict and may
+    // not replace the original seven-token event or add another consumption.
+    accepted_source.push_str(&response(8, 57));
+    fs::write(&source, &accepted_source).unwrap();
+    let (success, log) = run(root.path(), "offline", "response-conflict", false);
+    assert!(success, "{log}");
+    let (db, _) = database(root.path());
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM session_events", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT total_tokens FROM session_model_totals WHERE model='gpt-6.1-sol'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "17"
+    );
+    assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM session_pending_ranges WHERE reason='response-record-conflict')",[],|r|r.get::<_,bool>(0)).unwrap(),
+        "conflict candidate state={} log={log} reasons={:?}",checkpoint_state(&db).2,
+        db.prepare("SELECT reason FROM session_pending_ranges").unwrap().query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap());
+    let saved = checkpoint_state(&db);
+    let saved_ledger = ledger(&db);
+    drop(db);
+
+    let changed = accepted_source.replacen("\"total_tokens\":15", "\"total_tokens\":16", 1);
+    assert_ne!(changed, accepted_source);
+    assert_eq!(changed.len(), accepted_source.len());
+    fs::write(&source, format!("{changed}{}", counter(40, now + 1))).unwrap();
+    let (_, _) = run(root.path(), "offline", "changed-prefix", false);
+    let (db, _) = database(root.path());
+    assert_eq!(
+        checkpoint_state(&db),
+        saved,
+        "changed accepted bytes cannot advance the old source"
+    );
+    assert_eq!(ledger(&db), saved_ledger);
+    let accepted_database_path = db.path().unwrap().to_owned();
+    drop(db);
+    if restore_original {
+        fs::write(&source, &accepted_source).unwrap();
+        let writable = Connection::open(&accepted_database_path).unwrap();
+        let before_source: (String,String) = writable.query_row("SELECT admission_json,record_sha256 FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='legacy-counter' ORDER BY timestamp,event_index LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(writable.execute("UPDATE session_events SET reset_at=NULL,window_seconds=NULL,admission_json=NULL WHERE admission_json=?1",[&before_source.0]).unwrap(),1);
+        writable.execute_batch("CREATE TRIGGER reject_pending_qualification BEFORE UPDATE OF admission_json ON session_events WHEN OLD.admission_json IS NULL AND NEW.admission_json IS NOT NULL BEGIN SELECT RAISE(ABORT,'forced pending qualification rollback'); END;").unwrap();
+        drop(writable);
+        let (success, log) = run(root.path(), "repair-live", "restore-original-event", true);
+        assert!(success, "{log}");
+        let (db, _) = database(root.path());
+        assert_eq!(db.query_row("SELECT count(*) FROM session_events WHERE admission_json IS NOT NULL",[],|r|r.get::<_,i64>(0)).unwrap(),4,"a matching accepted original must recover its numeric/source qualification before period projection");
+        let restored: (i64,i64,String,String) = db.query_row("SELECT reset_at,window_seconds,admission_json,record_sha256 FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='legacy-counter' ORDER BY timestamp,event_index LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        let restored_admission: Value = serde_json::from_str(&restored.2).unwrap();
+        let original_admission: Value = serde_json::from_str(&before_source.0).unwrap();
+        assert_eq!(restored.0, expected_reset);
+        assert_eq!(restored.1, 604800);
+        assert_eq!(restored.3, before_source.1);
+        assert_eq!(restored_admission["numeric"], original_admission["numeric"]);
+        let pending: Value = serde_json::from_slice(
+            &fs::read(root.path().join("pending-repair-input.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            pending["released_receipts"].as_i64().unwrap()
+                >= pending["failure_receipts"].as_i64().unwrap() + 2
+        );
+        let snapshot_generation = restored_admission["period"]["evidence_generation"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        let fixed_revision:i64=db.query_row("SELECT json_extract(payload_json,'$.input_revision') FROM period_evidence_snapshots WHERE generation=?1",[snapshot_generation],|r|r.get(0)).unwrap();
+        assert_eq!(
+            fixed_revision,
+            pending["fixed_revision"].as_i64().unwrap(),
+            "new quota cannot alter a fixed pending evidence snapshot"
+        );
+        let newest_revision: i64 = db
+            .query_row(
+                "SELECT max(revision) FROM official_period_inputs",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(newest_revision > fixed_revision);
+        let newest_remaining: f64 = db
+            .query_row(
+                "SELECT remaining_percent FROM quota_receipts ORDER BY sequence DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (latest_sequence,latest_at,latest_reset,latest_window):(i64,i64,i64,i64)=db.query_row("SELECT sequence,observed_at,reset_at,window_seconds FROM quota_receipts ORDER BY sequence DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert!(latest_sequence >= pending["released_receipts"].as_i64().unwrap());
+        assert_eq!(latest_reset, expected_reset);
+        assert_eq!(latest_window, 604800);
+        let remaining_values=db.prepare("SELECT remaining_percent FROM quota_receipts WHERE remaining_percent<100 ORDER BY sequence").unwrap().query_map([],|r|r.get::<_,f64>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(remaining_values.len() >= 3);
+        for (index, remaining) in remaining_values.iter().enumerate() {
+            assert_eq!(*remaining, 99.0 - index as f64);
+        }
+        assert_eq!(remaining_values.last(), Some(&newest_remaining));
+        let registry: Value = serde_json::from_slice(
+            &fs::read(root.path().join("data/history/account_profile_v1.json")).unwrap(),
+        )
+        .unwrap();
+        let account = registry["accounts"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let intervals = codex_info_db_reader::ReadIntervals::new(
+            account["lifecycle_intervals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|interval| {
+                    codex_info_db_reader::ReadInterval::new(
+                        interval["start_at"].as_i64(),
+                        interval["end_at"].as_i64(),
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        let identity = codex_info_db_reader::StoragePartitionIdentity {
+            schema_version: binding["partition"]["schema_version"]
+                .as_str()
+                .unwrap()
+                .into(),
+            profile_scope_id: binding["partition"]["profile_scope_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+            account_scope_id: binding["partition"]["account_scope_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+            storage_epoch: binding["partition"]["storage_epoch"].as_u64().unwrap(),
+            partition_id: binding["partition"]["partition_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        };
+        let public = codex_info_db_reader::DbReader::open_partitioned_with_intervals(
+            &accepted_database_path,
+            &identity,
+            intervals,
+        )
+        .unwrap()
+        .read_snapshot()
+        .unwrap();
+        let quota = public
+            .details
+            .quota
+            .as_ref()
+            .expect("independent current quota remains public");
+        assert_eq!(
+            (
+                quota.reset_at,
+                quota.window_seconds,
+                quota.remaining_percent.to_bits()
+            ),
+            (latest_reset, latest_window, newest_remaining.to_bits())
+        );
+        assert_eq!(public.details.observed_at, Some(latest_at));
+        assert!(public.history_available);
+        let minute = latest_at.div_euclid(60) * 60;
+        let point = public
+            .history_samples_v3
+            .iter()
+            .find(|point| point.reset_at == latest_reset && point.timestamp == minute)
+            .expect("history projects the exact receipt key independently");
+        assert_eq!(
+            point.remaining_percent.map(f64::to_bits),
+            Some(newest_remaining.to_bits())
+        );
+        // The SQL usage observation remains the fixed pending model batch.
+        // Public quota history is owned by receipts, without a second write.
+        let original_model_at:i64=db.query_row("SELECT json_extract(snapshot_json,'$.source_timestamp') FROM durable_state WHERE singleton>=2 AND json_extract(snapshot_json,'$.reset_at')=?1 ORDER BY data_generation DESC LIMIT 1",[expected_reset],|r|r.get::<_,Option<i64>>(0).map(|value|value.expect("qualified model preserves original observation time"))).unwrap();
+        assert!(original_model_at <= latest_at);
+
+        assert_eq!(
+            ledger(&db),
+            saved_ledger,
+            "qualification recovery preserves every original numeric/source row"
+        );
+        assert_eq!(
+            checkpoint_state(&db).0,
+            saved.0,
+            "recovery cannot advance the accepted source prefix"
+        );
+        drop(db);
+    }
+    if legacy_family {
+        fs::write(&source, &accepted_source).unwrap();
+        let writable = Connection::open(&accepted_database_path).unwrap();
+        let old_sha:String=writable.query_row("SELECT record_sha256 FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='legacy-counter' ORDER BY timestamp,event_index LIMIT 1",[],|r|r.get(0)).unwrap();
+        assert_eq!(writable.execute("UPDATE session_events SET model='SOL',reset_at=NULL,window_seconds=NULL,admission_json=NULL WHERE record_sha256=?1",[&old_sha]).unwrap(),1);
+        writable.execute_batch("UPDATE session_checkpoints SET source_admission=json_remove(source_admission,'$.account_binding')").unwrap();
+        let cp = checkpoint_state(&writable);
+        drop(writable);
+        let (success, log) = run(root.path(), "offline", "requalify-old-family", false);
+        assert!(success, "{log}");
+        let (db, _) = database(root.path());
+        let restored:(String,Option<i64>,Option<String>)=db.query_row("SELECT total_tokens,reset_at,admission_json FROM session_events WHERE record_sha256=?1 AND model='SOL'",[&old_sha],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(
+            (restored.0, restored.1),
+            ("5".into(), Some(expected_reset)),
+            "the original family key must qualify only through its exact raw model: {log}"
+        );
+        let proof: Value = serde_json::from_str(restored.2.as_ref().unwrap()).unwrap();
+        assert_eq!(proof["numeric"]["exact_model"], "gpt-6.1-sol");
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM session_events", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT sum(CAST(total_tokens AS INTEGER)) FROM session_model_totals",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            17
+        );
+        assert_eq!(checkpoint_state(&db).0, cp.0);
+        drop(db);
+        let writable = Connection::open(&accepted_database_path).unwrap();
+        let incompatible_sha:String=writable.query_row("SELECT record_sha256 FROM session_events WHERE model='gpt-6.1-sol' AND json_extract(admission_json,'$.numeric.kind')='legacy-counter' ORDER BY timestamp,event_index LIMIT 1",[],|r|r.get(0)).unwrap();
+        assert_eq!(writable.execute("UPDATE session_events SET model='TERRA',reset_at=NULL,window_seconds=NULL,admission_json=NULL WHERE record_sha256=?1",[&incompatible_sha]).unwrap(),1);
+        let original_ledger = ledger(&writable);
+        drop(writable);
+        let (success, log) = run(root.path(), "offline", "refuse-other-family", false);
+        assert!(success, "{log}");
+        let (db, _) = database(root.path());
+        assert_eq!(ledger(&db), original_ledger);
+        assert!(db.query_row("SELECT admission_json IS NULL AND reset_at IS NULL FROM session_events WHERE record_sha256=?1 AND model='TERRA'",[&incompatible_sha],|r|r.get::<_,bool>(0)).unwrap());
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM source_prefix_repairs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(db);
+    }
+    if retire_counter {
+        fs::write(&source, &accepted_source).unwrap();
+        let root_at = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0)
+            .unwrap()
+            .to_rfc3339();
+        let counter_at = chrono::DateTime::<chrono::Utc>::from_timestamp(now + 1, 0)
+            .unwrap()
+            .to_rfc3339();
+        let usage = json!({"total_tokens":11,"input_tokens":9,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":1});
+        accepted_source.push_str(&format!("{}\n{}\n",
+            json!({"type":"token_usage_record","timestamp":root_at,"payload":{"thread_id":"binding-thread","session_id":"binding-session","root_turn_id":"root-turn","turn_id":"turn","response_id":"retired-response","usage":usage,"turn_token_usage":usage,"thread_token_usage":usage}}),
+            json!({"type":"event_msg","timestamp":counter_at,"payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":68,"input_tokens":66,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2},"last_token_usage":usage}}})
+        ));
+        fs::write(&source, &accepted_source).unwrap();
+        let (success, log) = run(root.path(), "offline", "new-root-before-old-counter", false);
+        assert!(success, "{log}");
+        let writable = Connection::open(&accepted_database_path).unwrap();
+        let original_sha:String=writable.query_row("SELECT record_sha256 FROM session_events WHERE json_extract(admission_json,'$.numeric.candidate.record.ids.response_id')='retired-response'",[],|r|r.get(0)).unwrap();
+        // Simulate the old counter-only representation in the same accepted
+        // source range. Its numbers describe cumulative delta 57 -> 68,
+        // whereas the immutable root records I9/C1/O2 and the earlier time.
+        assert_eq!(writable.execute("UPDATE session_events SET model='SOL',event_index=0,timestamp=?1,input_tokens='11',cached_input_tokens='0',output_tokens='0',cache_write_input_tokens=NULL,reset_at=NULL,window_seconds=NULL,admission_json=NULL WHERE json_extract(admission_json,'$.numeric.candidate.record.ids.response_id')='retired-response'",[now+1]).unwrap(),1);
+        let prefix_before = checkpoint_state(&writable);
+        let ledger_before = ledger(&writable);
+        let snapshots_before: i64 = writable
+            .query_row("SELECT count(*) FROM period_evidence_snapshots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        writable.execute_batch("CREATE TRIGGER reject_counter_retirement BEFORE DELETE ON session_events WHEN OLD.total_tokens='11' AND OLD.admission_json IS NULL BEGIN SELECT RAISE(ABORT,'forced original retirement rollback'); END;").unwrap();
+        drop(writable);
+        let (_, failed_log) = run(root.path(), "offline", "rollback-original-counter", false);
+        assert!(
+            failed_log.contains("forced original retirement rollback"),
+            "{failed_log}"
+        );
+        let writable = Connection::open(&accepted_database_path).unwrap();
+        assert_eq!(checkpoint_state(&writable), prefix_before);
+        assert_eq!(ledger(&writable), ledger_before);
+        assert_eq!(
+            writable
+                .query_row("SELECT count(*) FROM source_prefix_repairs", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            writable
+                .query_row("SELECT count(*) FROM period_evidence_snapshots", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+            snapshots_before
+        );
+        writable
+            .execute_batch("DROP TRIGGER reject_counter_retirement")
+            .unwrap();
+        drop(writable);
+        let (success, log) = run(root.path(), "offline", "replace-original-counter", false);
+        assert!(success, "{log}");
+        let (db, _) = database(root.path());
+        let restored:(i64,String,String,String,String,String,Option<i64>,String)=db.query_row("SELECT timestamp,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,reset_at,record_sha256 FROM session_events WHERE json_extract(admission_json,'$.numeric.candidate.record.ids.response_id')='retired-response'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional().unwrap().unwrap_or((0,String::new(),String::new(),String::new(),String::new(),String::new(),None,String::new()));
+        assert_eq!(
+            restored,
+            (
+                now,
+                "11".into(),
+                "9".into(),
+                "1".into(),
+                "2".into(),
+                "0".into(),
+                Some(expected_reset),
+                original_sha
+            ),
+            "a proven old counter is retired in favor of the original response once: {log}"
+        );
+        assert_eq!(db.query_row("SELECT model FROM session_events WHERE json_extract(admission_json,'$.numeric.candidate.record.ids.response_id')='retired-response'",[],|r|r.get::<_,String>(0)).unwrap(),"SOL","retirement preserves an existing family key");
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM session_events", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT CAST(sum(CAST(total_tokens AS INTEGER)) AS TEXT) FROM session_model_totals",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "28"
+        );
+        assert_eq!(checkpoint_state(&db).0, prefix_before.0);
+        assert_eq!(checkpoint_state(&db).1, prefix_before.1);
+        let (provenance, id, sha): (String, String, String) = db
+            .query_row(
+                "SELECT payload_json,repair_id,payload_sha256 FROM source_prefix_repairs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(id, sha);
+        assert_eq!(id, format!("{:x}", Sha256::digest(provenance.as_bytes())));
+        let proof: Value = serde_json::from_str(&provenance).unwrap();
+        let retired = &proof["retirements"][0];
+        assert_eq!(retired["original"]["timestamp"], now + 1);
+        assert_eq!(retired["original"]["source"]["event_index"], 0);
+        assert_eq!(
+            retired["original"]["tokens"],
+            json!({"total":11,"input":11,"cached_input":0,"cache_write_input":null,"output":0})
+        );
+        assert_eq!(retired["replacement"]["timestamp"], now);
+        assert_eq!(
+            retired["replacement"]["admission"]["numeric"]["candidate"]["counter_association"]
+                ["state"],
+            "matched"
+        );
+        assert!(PathBuf::from(format!("{accepted_database_path}.bak.1")).is_file());
+        let before_replay = ledger(&db);
+        drop(db);
+        let (success, log) = run(root.path(), "offline", "replay-retired-counter", false);
+        assert!(success, "{log}");
+        let (db, _) = database(root.path());
+        assert_eq!(ledger(&db), before_replay);
+        assert_eq!(
+            db.query_row("SELECT payload_json FROM source_prefix_repairs", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            provenance
+        );
+        drop(db);
+        // A differing reasoning component in the FIRST counter is enough
+        // to refuse association. A later all-six match cannot rescue it.
+        let usage = json!({"total_tokens":13,"input_tokens":11,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":1});
+        let unmatched = json!({"total_tokens":13,"input_tokens":11,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0});
+        accepted_source.push_str(&format!("{}\n{}\n{}\n",
+            json!({"type":"token_usage_record","timestamp":root_at,"payload":{"thread_id":"binding-thread","session_id":"binding-session","root_turn_id":"root-turn","turn_id":"turn","response_id":"unmatched-response","usage":usage,"turn_token_usage":usage,"thread_token_usage":usage}}),
+            json!({"type":"event_msg","timestamp":counter_at,"payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":81,"input_tokens":79,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2},"last_token_usage":unmatched}}}),
+            json!({"type":"event_msg","timestamp":counter_at,"payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":94,"input_tokens":92,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":2},"last_token_usage":usage}}})
+        ));
+        fs::write(&source, &accepted_source).unwrap();
+        let (success, log) = run(root.path(), "offline", "unmatched-root", false);
+        assert!(success, "{log}");
+        let writable = Connection::open(&accepted_database_path).unwrap();
+        assert_eq!(writable.execute("UPDATE session_events SET event_index=0,timestamp=?1,input_tokens='13',cached_input_tokens='0',output_tokens='0',cache_write_input_tokens=NULL,reset_at=NULL,window_seconds=NULL,admission_json=NULL WHERE json_extract(admission_json,'$.numeric.candidate.record.ids.response_id')='unmatched-response'",[now+1]).unwrap(),1);
+        let unmatched_prefix = checkpoint_state(&writable);
+        let unmatched_ledger = ledger(&writable);
+        drop(writable);
+        let (success, log) = run(root.path(), "offline", "do-not-search-later-counter", false);
+        assert!(success, "{log}");
+        let (db, _) = database(root.path());
+        assert_eq!(ledger(&db), unmatched_ledger);
+        assert_eq!(checkpoint_state(&db).0, unmatched_prefix.0);
+        assert_eq!(db.query_row("SELECT count(*) FROM session_events WHERE admission_json IS NULL AND total_tokens='13' AND input_tokens='13' AND cache_write_input_tokens IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM source_prefix_repairs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(db);
+    }
+    if let Some(export) = env::var_os("CODEX_INFO_TEST_EXPORT_BINDING_FIXTURE") {
+        // A fake-account process fixture is retained only for the explicit
+        // recorder-owner -> REST integration probe. Restore its accepted
+        // original before handing it to that probe.
+        fs::write(&source, &accepted_source).unwrap();
+        let destination = PathBuf::from(export);
+        assert!(!destination.exists(), "fixture export destination exists");
+        let original_root = root.keep();
+        fs::write(&destination, original_root.to_str().unwrap()).unwrap();
+        eprintln!(
+            "issue604 binding fixture retained at {} (locator {})",
+            original_root.display(),
+            destination.display()
+        );
+    }
+}
+
+#[test]
+fn issue604_collector_reuses_only_owned_accepted_prefix_for_historical_binding() {
+    use codex_info_account_locator::{
+        admit_partition, mark_partition_initialized, reserve_partition_at, AccountConfirmation,
+    };
+    use codex_info_db_writer::StoragePartitionIdentity;
+    use codex_info_recorder::{Recorder, RecorderConfig};
+    use sha2::{Digest, Sha256};
+
+    for owned in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let data = root.path().join("data");
+        private_directory(&home);
+        private_directory(&home.join("sessions"));
+        private_directory(&data);
+        let auth = home.join("auth.json");
+        fs::write(
+            &auth,
+            br#"{"tokens":{"account_id":"historical-binding-fixture"}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let observed = now - 30;
+        let start = if owned { now - 3600 } else { now };
+        let reserved = reserve_partition_at(&home, &data, start).unwrap();
+        let partition = admit_partition(
+            &home,
+            &data,
+            &reserved,
+            AccountConfirmation::InitialRpc { began_at: start },
+            || Some(start),
+        )
+        .unwrap();
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: partition.profile_scope_id.clone(),
+            account_scope_id: partition.account_scope_id.clone(),
+            storage_epoch: partition.storage_epoch,
+            partition_id: partition.partition_id.clone(),
+        };
+        let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp(observed, 0)
+            .unwrap()
+            .to_rfc3339();
+        let counter = |total: u64, at: i64| {
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp(at, 0)
+                .unwrap()
+                .to_rfc3339();
+            format!(
+                "{}\n",
+                json!({"type":"event_msg","timestamp":at,
+                "payload":{"type":"token_count","info":{"total_token_usage":{
+                    "total_tokens":total,"input_tokens":total,"cached_input_tokens":0,"output_tokens":0
+                }}}})
+            )
+        };
+        let metadata = format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","timestamp":timestamp,
+                "payload":{"id":"historical-thread","session_id":"historical-session"}}),
+            json!({"type":"turn_context","timestamp":timestamp,
+                "payload":{"model":"gpt-6.1-sol","turn_id":"turn","root_turn_id":"root-turn"}})
+        );
+        let first = counter(15, observed);
+        let original = format!("{metadata}{first}");
+        let source = home.join("sessions/one.jsonl");
+        fs::write(&source, &original).unwrap();
+        // This fixture represents an original accepted CP, not a new runtime
+        // authentication claim. The real owner below must revalidate it.
+        let mut seed = Recorder::open_partitioned(
+            RecorderConfig {
+                sessions_root: home.join("sessions"),
+                chunk_bytes: 65536,
+            },
+            &partition.database_path,
+            &identity,
+        )
+        .unwrap();
+        seed.run_cycle().unwrap().unwrap();
+        let before = seed.state().unwrap().checkpoints.remove(0);
+        assert_eq!(before.committed_offset, original.len() as u64);
+        assert!(before
+            .source_admission
+            .as_ref()
+            .unwrap()
+            .account_binding
+            .is_none());
+        drop(seed);
+        mark_partition_initialized(&data, &partition).unwrap();
+        let appended_at = chrono::Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{original}{}{}",
+                counter(20, appended_at),
+                counter(25, appended_at)
+            ),
+        )
+        .unwrap();
+        let server = root.path().join("offline.py");
+        fs::write(&server, r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req:
+        continue
+    response = {'id':req['id'],'result':{}} if req.get('method') == 'initialize' else {'id':req['id'],'error':{'code':-32000,'message':'fixture RPC unavailable'}}
+    print(json.dumps(response), flush=True)
+"#).unwrap();
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).unwrap();
+        let log = root.path().join("historical.log");
+        let mut child = ChildGuard(
+            Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
+                .args(["--once", "--interval-secs", "1"])
+                .env("CODEX_HOME", &home)
+                .env("CODEX_INFO_DATA_DIR", &data)
+                .env("CODEX_INFO_CODEX_BIN", &server)
+                .env_remove("CODEX_INFO_RECORDER_DB")
+                .env_remove("CODEX_INFO_ACCOUNT_DB")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(File::create(&log).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "historical binding fixture did not terminate"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            status.success(),
+            "saved canonical account could not restart\n{}",
+            fs::read_to_string(log).unwrap()
+        );
+        let db = Connection::open_with_flags(
+            &partition.database_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.execute_batch("PRAGMA query_only=ON").unwrap();
+        let (offset,generation,state): (i64,String,String) = db.query_row(
+            "SELECT committed_offset,prefix_generation,source_admission FROM session_checkpoints",
+            [],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        let state: Value = serde_json::from_str(&state).unwrap();
+        let amounts: Vec<String> = db
+            .prepare("SELECT total_tokens FROM session_events ORDER BY timestamp,event_index")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        if owned {
+            let binding = &state["account_binding"];
+            assert_eq!(
+                binding["proof"]["kind"], "accepted-prefix",
+                "an original owned point needs its saved qualification, not current RPC"
+            );
+            assert_eq!(binding["prefix_end"], original.len() as u64);
+            assert_eq!(
+                binding["prefix_generation"],
+                format!("{:032x}", before.prefix_generation)
+            );
+            assert_eq!(
+                binding["proof"]["anchor"],
+                json!({
+                    "start":metadata.len(),"end":original.len(),
+                    "sha256":format!("{:x}",Sha256::digest(first.as_bytes())),"timestamp":observed
+                })
+            );
+            assert_eq!(
+                amounts,
+                ["5", "5"],
+                "the accepted owned 15 remains a comparison baseline"
+            );
+            assert_eq!(offset, fs::metadata(&source).unwrap().len() as i64);
+            assert_eq!(generation, format!("{:032x}", before.prefix_generation));
+        } else {
+            assert_eq!(
+                offset, before.committed_offset as i64,
+                "an unowned legacy point plus failed initial RPC cannot advance source ownership"
+            );
+            let original_state: Value =
+                serde_json::from_str(&before.source_admission.unwrap().to_storage().unwrap())
+                    .unwrap();
+            assert_eq!(state, original_state);
+            assert!(
+                amounts.is_empty(),
+                "current authentication cannot assign the old point"
+            );
+        }
+    }
 }
 
 fn accepted_quota_receipts(database: &Path) -> Vec<(String, i64, f64)> {
@@ -1229,7 +4154,9 @@ fn fake_app_server_launch_count(calls: &Path, client: &str) -> usize {
 fn poll_result_kind(result: &ActiveThreadPollResult) -> &'static str {
     match result {
         ActiveThreadPollResult::Empty { .. } => "empty",
-        ActiveThreadPollResult::Failed(_) | ActiveThreadPollResult::CheckpointMismatch => "failed",
+        ActiveThreadPollResult::Failed(_) | ActiveThreadPollResult::CheckpointMismatch { .. } => {
+            "failed"
+        }
         ActiveThreadPollResult::Snapshot { .. } => "snapshot",
     }
 }
@@ -1474,13 +4401,16 @@ fn checkpoint(sessions: &Path, session: &Path, committed_offset: u64) -> Session
         token_baseline_known: true,
         history_base_pending: false,
         last_model: Some("gpt-5.6-sol".to_owned()),
+        last_model_context_kind: None,
+        last_model_interval: None,
+        source_admission: None,
         last_task_running: Some(true),
         context_usage_tokens: None,
         context_window_tokens: None,
-        previous_total: 42,
-        previous_input: 40,
-        previous_cached_input: 0,
-        previous_output: 2,
+        previous_total: Some(42),
+        previous_input: Some(40),
+        previous_cached_input: Some(0),
+        previous_output: Some(2),
         previous_cache_write_input: Some(0),
     }
 }
@@ -1597,7 +4527,7 @@ fn stopped_parent_and_descendants_are_absent_after_real_thread_read_cycle() {
         ActiveThreadPollResult::Failed(error) => {
             panic!("FIXTURE_NOT_ADMITTED: thread/read cycle failed: {error}")
         }
-        ActiveThreadPollResult::CheckpointMismatch => {
+        ActiveThreadPollResult::CheckpointMismatch { .. } => {
             panic!("FIXTURE_NOT_ADMITTED: active session checkpoint mismatch")
         }
         ActiveThreadPollResult::Empty { .. } => {

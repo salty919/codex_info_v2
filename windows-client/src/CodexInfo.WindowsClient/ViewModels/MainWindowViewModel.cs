@@ -22,7 +22,7 @@ namespace CodexInfo.WindowsClient.ViewModels;
 /// Presents one validated details generation. HTTP, JSON, and schema failures
 /// are classified by the Core client before reaching this UI.
 /// </summary>
-public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
+public sealed partial class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 {
     private const int MaxSplitGenerationAlignmentAttempts = 2;
     private const string OtherModelIdentity = "Other";
@@ -397,7 +397,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// model breakdown use the same accepted rows. Legacy details retain their
     /// running-only scalar contract.
     /// </summary>
-    public ulong ActiveThreadCount => detailsSnapshot is { ApiVersion: "v3" or "v4" } v3
+    public ulong ActiveThreadCount => detailsSnapshot is { ApiVersion: "v3" or "v4" or "v5" } v3
         ? (ulong)v3.Threads.Count
         : detailsSnapshot?.ActiveThreadCount ?? 0;
 
@@ -535,6 +535,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         get
         {
+            if (detailsSnapshot is { ApiVersion: "v5" } recorded)
+                return RecordedUsageText.Scope(recorded.UsageScope);
             var period = detailsSnapshot?.History.FirstOrDefault(candidate => candidate.Current)
                 ?? detailsSnapshot?.History.FirstOrDefault();
             return period is null
@@ -543,10 +545,13 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    public string ModelUsageUnavailableText => $"{Texts.ModelUsage}: {Texts.UnavailableValue}";
+    public string ModelUsageUnavailableText => detailsSnapshot is { ApiVersion: "v5" } recorded
+        ? recorded.UsageScope?.Coverage == ApiRecordedCoverage.Complete ? RecordedUsageText.RecordedZero : RecordedUsageText.NoRecord
+        : $"{Texts.ModelUsage}: {Texts.UnavailableValue}";
 
     public string EstimatedCostText => detailsSnapshot switch
     {
+        { ApiVersion: "v5" } snapshot => RecordedCostText(snapshot.RecordedModels),
         { ApiVersion: "v3" or "v4" } snapshot => FormatV3EstimatedCost(snapshot.Models),
         { } snapshot => snapshot.EstimatedCostLabel,
         _ => Texts.EstimatedUnavailable,
@@ -620,18 +625,19 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             if (IsHistoricalDetails && detailsFailure is null)
             {
-                return detailsSnapshot?.State == ApiState.Error
+                var historical = detailsSnapshot?.State == ApiState.Error
                     ? Texts.HistoricalAccountErrorDetail
                     : Texts.HistoricalAccountDetail;
+                return DescribeRecordedQuality(historical);
             }
 
             var detail = Texts.StatusDetailFor(
                 presentationState.ToString(),
                 authLaunchFailed,
                 detailsSnapshot is not null);
-            return IsRetryVisible && lastReceivedAt is not null
+            return DescribeRecordedQuality(IsRetryVisible && lastReceivedAt is not null
                 ? $"{detail} {LastReceivedText}"
-                : detail;
+                : detail);
         }
     }
 
@@ -1036,6 +1042,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(EstimatedCostText));
             Notify(nameof(ModelUsageUnavailableText));
             Notify(nameof(ModelUsagePeriodText));
+            Notify(nameof(ModelUsageHeading));
+            Notify(nameof(QuotaHeading));
+            Notify(nameof(QuotaResetHeading));
         }
     }
 
@@ -1640,7 +1649,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         var historical = IsHistoricalSnapshot(validatedDetails);
         acceptedWireOpenSessionThreadCount = validatedDetails.OpenSessionThreadCount;
         acceptedWireActiveThreadCount = validatedDetails.ActiveThreadCount;
-        if ((validatedDetails.ApiVersion is "v3" or "v4") && !historical)
+        if ((validatedDetails.ApiVersion is "v3" or "v4" or "v5") && !historical)
         {
             var visibleThreads = WithoutStoppedParentSubtrees(validatedDetails.Threads);
             validatedDetails = validatedDetails with
@@ -1681,7 +1690,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         else
         {
-            ReplaceModels(validatedDetails.Models);
+            if (validatedDetails.ApiVersion == "v5") ReplaceRecordedModels(validatedDetails.RecordedModels);
+            else ReplaceModels(validatedDetails.Models);
         }
         RebuildQuotaSegments();
 
@@ -1690,6 +1700,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(DetailsStatusText));
         Notify(nameof(DetailsStatusAutomationText));
         Notify(nameof(ModelUsagePeriodText));
+        Notify(nameof(ModelUsageHeading));
+        Notify(nameof(QuotaHeading));
+        Notify(nameof(QuotaResetHeading));
         Notify(nameof(EstimatedCostText));
         NotifyGenerationProperties(quotaAlreadyRebuilt: true);
         authCommand.RaiseCanExecuteChanged();
@@ -1756,6 +1769,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             ApiVersion = current.ApiVersion,
             ModelsStatus = current.ModelsStatus,
+            UsageScope = current.UsageScope,
+            RecordedModels = current.RecordedModels,
             OpenSessionThreadCount = historical ? 0 : current.OpenSessionThreadCount,
             PublishedPair = current.PublishedPair,
             AccountId = current.AccountId,
@@ -2142,7 +2157,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private string FormatThreadModelCount(string model, int generated)
     {
-        if (generated == 0 || detailsSnapshot is not { ApiVersion: "v3" or "v4" } snapshot)
+        if (generated == 0 || detailsSnapshot is not { ApiVersion: "v3" or "v4" or "v5" } snapshot)
         {
             return generated.ToString(CultureInfo.CurrentCulture);
         }

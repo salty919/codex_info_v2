@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use chrono::{DateTime, Months, Utc};
+pub use codex_info_db_reader::TokenFacts;
 use codex_info_db_reader::{
     canonicalize_history_for_storage_with_sources, RawSample as CanonicalRawSample,
     ACCOUNT_DB_SCHEMA_VERSION, HISTORY_CANONICAL_SCHEMA_VERSION,
@@ -136,6 +137,18 @@ CREATE TABLE session_checkpoints (
     history_base_pending INTEGER NOT NULL DEFAULT 0 CHECK (history_base_pending IN (0, 1)),
     context_usage_tokens TEXT,
     context_window_tokens TEXT,
+    last_model_context_kind TEXT CHECK (
+        last_model_context_kind IS NULL
+        OR (last_model_context_kind = 'none' AND last_model IS NULL)
+        OR (last_model_context_kind IN ('initial-settings', 'turn') AND last_model IS NOT NULL)
+        OR last_model_context_kind = 'unknown'
+    ),
+    last_model_interval TEXT CHECK (
+        last_model_interval IS NULL
+        OR last_model_interval IN ('none', 'mixed', 'unknown')
+        OR (substr(last_model_interval, 1, 6) = 'model:' AND length(last_model_interval) > 6)
+    ),
+    source_admission TEXT,
     PRIMARY KEY (
         root_identity,
         relative_path,
@@ -241,6 +254,17 @@ CREATE TABLE session_events (
     cached_input_tokens TEXT NOT NULL,
     output_tokens TEXT NOT NULL,
     cache_write_input_tokens TEXT,
+    reset_at INTEGER,
+    window_seconds INTEGER,
+    admission_json TEXT,
+    CHECK (
+        (reset_at IS NULL AND window_seconds IS NULL)
+        OR (reset_at IS NOT NULL AND window_seconds IS NOT NULL
+            AND reset_at BETWEEN 1 AND 253402300799
+            AND window_seconds > 0 AND reset_at-window_seconds >= 1
+            AND admission_json IS NOT NULL)
+    ),
+    CHECK (admission_json IS NULL OR json_valid(admission_json)),
     PRIMARY KEY (
         root_identity,
         relative_path,
@@ -426,10 +450,10 @@ CREATE TABLE active_thread_snapshot (
 "#;
 
 const HISTORY_CANONICAL_CONSTRAINTS: &str = r#"
-CREATE UNIQUE INDEX usage_history_canonical_timestamp_idx
-    ON usage_history (timestamp);
-CREATE UNIQUE INDEX usage_model_history_canonical_timestamp_model_idx
-    ON usage_model_history (timestamp, model);
+CREATE UNIQUE INDEX usage_history_canonical_period_timestamp_idx
+    ON usage_history (reset_at, timestamp);
+CREATE UNIQUE INDEX usage_model_history_canonical_period_timestamp_model_idx
+    ON usage_model_history (reset_at, timestamp, model);
 
 CREATE TRIGGER usage_history_canonical_insert_guard
 BEFORE INSERT ON usage_history
@@ -440,15 +464,15 @@ WHEN typeof(NEW.timestamp) <> 'integer'
       typeof(NEW.remaining_percent) NOT IN ('integer', 'real')
       OR NEW.remaining_percent < 0.0 OR NEW.remaining_percent > 100.0
   ))
-  OR typeof(NEW.sol_dollars) NOT IN ('integer', 'real')
-  OR typeof(NEW.terra_dollars) NOT IN ('integer', 'real')
-  OR typeof(NEW.luna_dollars) NOT IN ('integer', 'real')
+  OR (NEW.sol_dollars IS NOT NULL AND typeof(NEW.sol_dollars) NOT IN ('integer', 'real'))
+  OR (NEW.terra_dollars IS NOT NULL AND typeof(NEW.terra_dollars) NOT IN ('integer', 'real'))
+  OR (NEW.luna_dollars IS NOT NULL AND typeof(NEW.luna_dollars) NOT IN ('integer', 'real'))
   OR NEW.sol_dollars < 0.0 OR NEW.sol_dollars >= 1e999
   OR NEW.terra_dollars < 0.0 OR NEW.terra_dollars >= 1e999
   OR NEW.luna_dollars < 0.0 OR NEW.luna_dollars >= 1e999
-  OR typeof(NEW.sol_tokens) <> 'integer' OR NEW.sol_tokens < 0
-  OR typeof(NEW.terra_tokens) <> 'integer' OR NEW.terra_tokens < 0
-  OR typeof(NEW.luna_tokens) <> 'integer' OR NEW.luna_tokens < 0
+  OR (NEW.sol_tokens IS NOT NULL AND (typeof(NEW.sol_tokens) <> 'integer' OR NEW.sol_tokens < 0))
+  OR (NEW.terra_tokens IS NOT NULL AND (typeof(NEW.terra_tokens) <> 'integer' OR NEW.terra_tokens < 0))
+  OR (NEW.luna_tokens IS NOT NULL AND (typeof(NEW.luna_tokens) <> 'integer' OR NEW.luna_tokens < 0))
 BEGIN
     SELECT RAISE(ABORT, 'invalid canonical usage history row');
 END;
@@ -462,15 +486,15 @@ WHEN typeof(NEW.timestamp) <> 'integer'
       typeof(NEW.remaining_percent) NOT IN ('integer', 'real')
       OR NEW.remaining_percent < 0.0 OR NEW.remaining_percent > 100.0
   ))
-  OR typeof(NEW.sol_dollars) NOT IN ('integer', 'real')
-  OR typeof(NEW.terra_dollars) NOT IN ('integer', 'real')
-  OR typeof(NEW.luna_dollars) NOT IN ('integer', 'real')
+  OR (NEW.sol_dollars IS NOT NULL AND typeof(NEW.sol_dollars) NOT IN ('integer', 'real'))
+  OR (NEW.terra_dollars IS NOT NULL AND typeof(NEW.terra_dollars) NOT IN ('integer', 'real'))
+  OR (NEW.luna_dollars IS NOT NULL AND typeof(NEW.luna_dollars) NOT IN ('integer', 'real'))
   OR NEW.sol_dollars < 0.0 OR NEW.sol_dollars >= 1e999
   OR NEW.terra_dollars < 0.0 OR NEW.terra_dollars >= 1e999
   OR NEW.luna_dollars < 0.0 OR NEW.luna_dollars >= 1e999
-  OR typeof(NEW.sol_tokens) <> 'integer' OR NEW.sol_tokens < 0
-  OR typeof(NEW.terra_tokens) <> 'integer' OR NEW.terra_tokens < 0
-  OR typeof(NEW.luna_tokens) <> 'integer' OR NEW.luna_tokens < 0
+  OR (NEW.sol_tokens IS NOT NULL AND (typeof(NEW.sol_tokens) <> 'integer' OR NEW.sol_tokens < 0))
+  OR (NEW.terra_tokens IS NOT NULL AND (typeof(NEW.terra_tokens) <> 'integer' OR NEW.terra_tokens < 0))
+  OR (NEW.luna_tokens IS NOT NULL AND (typeof(NEW.luna_tokens) <> 'integer' OR NEW.luna_tokens < 0))
 BEGIN
     SELECT RAISE(ABORT, 'invalid canonical usage history row');
 END;
@@ -540,6 +564,7 @@ WHEN NEW.singleton >= 2 AND CASE
                 OR EXISTS (
                     SELECT 1 FROM usage_history AS history
                      WHERE history.timestamp=NEW.data_generation
+                       AND history.reset_at=json_extract(NEW.snapshot_json, '$.reset_at')
                 )
             )
         )
@@ -593,6 +618,7 @@ WHEN NEW.singleton >= 2 AND CASE
                 OR EXISTS (
                     SELECT 1 FROM usage_history AS history
                      WHERE history.timestamp=NEW.data_generation
+                       AND history.reset_at=json_extract(NEW.snapshot_json, '$.reset_at')
                 )
             )
         )
@@ -660,9 +686,25 @@ const DURABLE_STATE_OBSERVATION_MIN_SINGLETON: i64 = 2;
 const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
 const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
 pub const MAX_SESSION_MODEL_BYTES: usize = 512;
+pub use codex_info_db_reader::model_names;
+pub mod event_admission;
+pub mod period_attribution;
+pub mod period_evidence;
 mod quota_receipts;
+mod recorded_usage;
 mod session_quota_recovery;
+pub mod source_admission;
+mod source_events;
+mod source_qualification_repair;
 pub use quota_receipts::QuotaReceipt;
+pub use source_events::{
+    read_session_event_facts, same_response, LosslessSessionEvent, SessionEventSource,
+};
+pub use source_qualification_repair::{
+    AcceptedSourceReadContainer, CanonicalSourceSnapshot, PreparedSourceQualificationRepair,
+    PreparedSourceRepairInputs, SourceCounterRetirement, SourceEquivalenceMode,
+    SourceEquivalencePrefix, SourceNumericalReplay,
+};
 const LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION: i64 = 10;
 const MODEL_PRICING_PREVIOUS_SCHEMA_VERSION: i64 = 11;
 const SESSION_TOKEN_ANCHOR_PREVIOUS_SCHEMA_VERSION: i64 = 12;
@@ -1081,8 +1123,6 @@ impl UsageHistoryObservation {
         }
         let values = [self.sol_dollars, self.terra_dollars, self.luna_dollars];
         let tokens = [self.sol_tokens, self.terra_tokens, self.luna_tokens];
-        let all_values = values.iter().all(Option::is_some);
-        let all_tokens = tokens.iter().all(Option::is_some);
         let any_values = values.iter().any(Option::is_some);
         let any_tokens = tokens.iter().any(Option::is_some);
         match self.model_source {
@@ -1091,13 +1131,9 @@ impl UsageHistoryObservation {
                     "unavailable observation contains model values".into(),
                 ));
             }
-            ModelSource::Confirmed
-            | ModelSource::ReconstructedFromSession
-            | ModelSource::LegacyUnknown
-                if !all_values || !all_tokens =>
-            {
+            ModelSource::LegacyUnknown if self.model_totals_complete => {
                 return Err(UsageStoreError::InvalidImport(
-                    "confirmed observation has a partial model vector".into(),
+                    "legacy observation cannot establish a complete model set".into(),
                 ));
             }
             _ => {}
@@ -1180,7 +1216,8 @@ pub struct DurableRecord {
 /// Durable identity that must match the one and only partition row in a
 /// physical account database. All values are opaque lower-hex identifiers;
 /// no raw account identifier is accepted by this layer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoragePartitionIdentity {
     pub schema_version: String,
     pub profile_scope_id: String,
@@ -1211,6 +1248,68 @@ impl StoragePartitionIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionModelContextKind {
+    None,
+    InitialSettings,
+    Turn,
+    Unknown,
+}
+
+impl SessionModelContextKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::InitialSettings => "initial-settings",
+            Self::Turn => "turn",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "initial-settings" => Some(Self::InitialSettings),
+            "turn" => Some(Self::Turn),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// Model contexts adopted since the last accepted raw counter. This is
+/// independent of the context currently in effect at the end of the prefix.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionModelInterval {
+    None,
+    Model(String),
+    Mixed,
+    Unknown,
+}
+
+impl SessionModelInterval {
+    pub fn to_storage(&self) -> String {
+        match self {
+            Self::None => "none".into(),
+            Self::Model(model) => format!("model:{model}"),
+            Self::Mixed => "mixed".into(),
+            Self::Unknown => "unknown".into(),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "mixed" => Some(Self::Mixed),
+            "unknown" => Some(Self::Unknown),
+            _ => value
+                .strip_prefix("model:")
+                .filter(|model| model_names::normalize_model_name(model) == Some(model))
+                .map(|model| Self::Model(model.to_owned())),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionCheckpoint {
     pub root_identity: String,
@@ -1227,13 +1326,16 @@ pub struct SessionCheckpoint {
     pub token_baseline_known: bool,
     pub history_base_pending: bool,
     pub last_model: Option<String>,
+    pub last_model_context_kind: Option<SessionModelContextKind>,
+    pub last_model_interval: Option<SessionModelInterval>,
+    pub source_admission: Option<source_admission::SourceAdmission>,
     pub last_task_running: Option<bool>,
     pub context_usage_tokens: Option<u64>,
     pub context_window_tokens: Option<u64>,
-    pub previous_total: u64,
-    pub previous_input: u64,
-    pub previous_cached_input: u64,
-    pub previous_output: u64,
+    pub previous_total: Option<u64>,
+    pub previous_input: Option<u64>,
+    pub previous_cached_input: Option<u64>,
+    pub previous_output: Option<u64>,
     pub previous_cache_write_input: Option<u64>,
 }
 
@@ -1249,6 +1351,40 @@ pub struct SessionRange {
     pub cycle_seq: u64,
     pub prefix_generation: u128,
     pub record_sha256: String,
+}
+
+impl SessionRange {
+    fn from_sql_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let start_offset = row.get::<_, i64>(4)?;
+        let end_offset = row.get::<_, i64>(5)?;
+        let collector_epoch = row.get::<_, String>(6)?;
+        let cycle_seq = row.get::<_, String>(7)?;
+        let prefix_generation = row.get::<_, String>(8)?;
+        Ok(Self {
+            root_identity: row.get(0)?,
+            relative_path: row.get(1)?,
+            file_device: row
+                .get::<_, String>(2)?
+                .parse()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            file_inode: row
+                .get::<_, String>(3)?
+                .parse()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            start_offset: u64::try_from(start_offset).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            end_offset: u64::try_from(end_offset).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            collector_epoch: u128::from_str_radix(&collector_epoch, 16)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            cycle_seq: cycle_seq
+                .parse()
+                .ok()
+                .filter(|value: &u64| value.to_string() == cycle_seq)
+                .ok_or(rusqlite::Error::InvalidQuery)?,
+            prefix_generation: u128::from_str_radix(&prefix_generation, 16)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            record_sha256: row.get(9)?,
+        })
+    }
 }
 
 /// A verified source span whose task lifecycle records have been inspected.
@@ -1295,6 +1431,14 @@ pub struct SessionTaskEvidence {
 
 type SessionTaskIndexedRangeKey = (String, String, u64, u64, u128, u64, u64, String);
 type SessionTaskEventKey = (String, String, u64, u64, u128, u64, u64, String, u64);
+type StoredSessionEventValues = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 type SessionEventReplayGroupKey = (
     String,
     String,
@@ -1303,9 +1447,9 @@ type SessionEventReplayGroupKey = (
     i64,
     String,
     u64,
-    u64,
-    u64,
-    u64,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
     Option<u64>,
 );
 
@@ -1347,9 +1491,9 @@ pub struct SessionTokenAnchor {
     pub cycle_seq: u64,
     pub fully_attributed_from_zero: bool,
     pub total_tokens: u64,
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub cache_write_input_tokens: Option<u64>,
 }
 
@@ -1379,9 +1523,9 @@ pub struct SessionTokenAnchorResolution {
     pub matched_start_offset: u64,
     pub matched_end_offset: u64,
     pub total_tokens: u64,
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub cache_write_input_tokens: Option<u64>,
     pub accepted_range: SessionRange,
 }
@@ -1405,9 +1549,9 @@ pub struct SessionEvent {
     pub timestamp: i64,
     pub model: String,
     pub total_tokens: u64,
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub cache_write_input_tokens: Option<u64>,
 }
 
@@ -1423,10 +1567,39 @@ pub struct SessionEventReattribution {
 pub struct SessionModelTotal {
     pub model: String,
     pub total_tokens: u64,
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub cache_write_input_tokens: Option<u64>,
+}
+
+impl SessionModelTotal {
+    pub fn tokens(&self) -> TokenFacts {
+        TokenFacts {
+            total: self.total_tokens,
+            input: self.input_tokens,
+            cached_input: self.cached_input_tokens,
+            cache_write_input: self.cache_write_input_tokens,
+            output: self.output_tokens,
+        }
+    }
+
+    fn replace_tokens(&mut self, tokens: TokenFacts) {
+        self.total_tokens = tokens.total;
+        self.input_tokens = tokens.input;
+        self.cached_input_tokens = tokens.cached_input;
+        self.cache_write_input_tokens = tokens.cache_write_input;
+        self.output_tokens = tokens.output;
+    }
+
+    fn pricing_usage(&self) -> Option<Usage> {
+        Some(Usage {
+            input_tokens: self.input_tokens?,
+            cached_input_tokens: self.cached_input_tokens?,
+            cache_write_input_tokens: self.cache_write_input_tokens,
+            output_tokens: self.output_tokens?,
+        })
+    }
 }
 
 /// One account-owned half-open Unix-second interval.  The registry is the
@@ -1666,6 +1839,10 @@ pub struct SessionTaskEvidenceInput<'a> {
 }
 
 struct CollectionEvidence<'a> {
+    source_repairs: &'a [PreparedSourceQualificationRepair],
+    response_replays: &'a [LosslessSessionEvent],
+    period_attribution: Option<&'a period_evidence::PreparedPeriodAttribution>,
+    qualified_events: Option<&'a [LosslessSessionEvent]>,
     source_quota: Option<(&'a Path, &'a [SessionLifecycleInterval])>,
     exact_history_span: Option<(i64, i64)>,
     cumulative_recovery: Option<&'a SessionCumulativeRecovery>,
@@ -1685,6 +1862,14 @@ pub struct SessionSourceCommitEvidence<'a> {
     pub exact_history_span: Option<(i64, i64)>,
     pub sessions_root: &'a Path,
     pub lifecycle_intervals: &'a [SessionLifecycleInterval],
+}
+
+/// One fixed usage candidate's numeric qualifications and response replays.
+pub struct SessionEventCommitEvidence<'a> {
+    pub source_repairs: &'a [PreparedSourceQualificationRepair],
+    pub events: &'a [LosslessSessionEvent],
+    pub period_attribution: Option<&'a period_evidence::PreparedPeriodAttribution>,
+    pub response_replays: &'a [LosslessSessionEvent],
 }
 
 pub struct SessionCollectionCommitResult {
@@ -1719,7 +1904,7 @@ pub struct MigrationReport {
     pub preserved_backup: std::path::PathBuf,
 }
 
-/// Opaque proof that `.bak.1` was created and read back for one exact account
+/// Opaque proof that a separate backup was read back for one exact account
 /// partition before canonical history replacement. Only this module can
 /// construct the proof; the migration rechecks its raw fingerprint while
 /// holding the SQLite write transaction.
@@ -1958,6 +2143,12 @@ fn canonical_u64_text(value: &str, field: &'static str) -> Result<u64> {
         )));
     }
     Ok(parsed)
+}
+
+fn canonical_optional_u64_text(value: Option<&str>, field: &'static str) -> Result<Option<u64>> {
+    value
+        .map(|text| canonical_u64_text(text, field))
+        .transpose()
 }
 
 fn canonical_u128_hex(value: &str, field: &'static str) -> Result<u128> {
@@ -2211,12 +2402,41 @@ fn validate_session_checkpoint(checkpoint: &SessionCheckpoint) -> Result<()> {
             .last_model
             .as_deref()
             .is_some_and(|model| !valid_session_model(model))
-        || checkpoint.previous_cached_input > checkpoint.previous_input
-        || checkpoint.previous_cache_write_input.is_some_and(|writes| {
-            checkpoint
-                .previous_cached_input
-                .checked_add(writes)
-                .is_none_or(|cached| cached > checkpoint.previous_input)
+        || match checkpoint.last_model_context_kind {
+            Some(SessionModelContextKind::None) => checkpoint.last_model.is_some(),
+            Some(SessionModelContextKind::InitialSettings | SessionModelContextKind::Turn) => {
+                checkpoint
+                    .last_model
+                    .as_deref()
+                    .is_none_or(|model| model_names::normalize_model_name(model) != Some(model))
+            }
+            Some(SessionModelContextKind::Unknown) | None => false,
+        }
+        || matches!(&checkpoint.last_model_interval,
+            Some(SessionModelInterval::Model(model)) if model_names::normalize_model_name(model) != Some(model)
+                || checkpoint.last_model.as_deref() != Some(model)
+                || !matches!(checkpoint.last_model_context_kind,
+                    Some(SessionModelContextKind::InitialSettings | SessionModelContextKind::Turn)))
+        || (checkpoint.token_baseline_known && checkpoint.previous_total.is_none())
+        || checkpoint
+            .source_admission
+            .as_ref()
+            .is_some_and(|state| !state.valid(checkpoint.committed_offset))
+        || checkpoint
+            .source_admission
+            .as_ref()
+            .and_then(|state| state.account_binding.as_ref())
+            .is_some_and(|binding| !binding.matches_checkpoint(checkpoint))
+        || checkpoint.previous_total.is_some_and(|total| {
+            (TokenFacts {
+                total,
+                input: checkpoint.previous_input,
+                cached_input: checkpoint.previous_cached_input,
+                cache_write_input: checkpoint.previous_cache_write_input,
+                output: checkpoint.previous_output,
+            })
+            .validate_raw_counter()
+            .is_err()
         })
     {
         return Err(UsageStoreError::InvalidImport(
@@ -2224,6 +2444,31 @@ fn validate_session_checkpoint(checkpoint: &SessionCheckpoint) -> Result<()> {
         ));
     }
     validate_sha256(&checkpoint.prefix_sha256, "session checkpoint prefix")?;
+    Ok(())
+}
+
+fn validate_source_binding_partitions<'a>(
+    connection: &Connection,
+    checkpoints: impl IntoIterator<Item = &'a SessionCheckpoint>,
+) -> Result<()> {
+    let mut partition = None;
+    for binding in checkpoints.into_iter().filter_map(|checkpoint| {
+        checkpoint
+            .source_admission
+            .as_ref()
+            .and_then(|state| state.account_binding.as_ref())
+    }) {
+        if let Some(expected) = partition {
+            if expected != &binding.partition {
+                return Err(UsageStoreError::InvalidImport(
+                    "source account binding partition mismatch".into(),
+                ));
+            }
+        } else {
+            validate_storage_partition_identity(connection, &binding.partition)?;
+            partition = Some(&binding.partition);
+        }
+    }
     Ok(())
 }
 
@@ -2335,7 +2580,14 @@ pub fn session_token_anchor_recovery_id(
     }
 
     let mut hasher = Sha256::new();
-    hasher.update(b"codex-info-session-token-anchor-recovery-v1\0");
+    let partial = anchor.input_tokens.is_none()
+        || anchor.cached_input_tokens.is_none()
+        || anchor.output_tokens.is_none();
+    hasher.update(if partial {
+        b"codex-info-session-token-anchor-recovery-v2\0"
+    } else {
+        b"codex-info-session-token-anchor-recovery-v1\0"
+    });
     for value in [
         pending.root_identity.as_str(),
         pending.relative_path.as_str(),
@@ -2368,11 +2620,19 @@ pub fn session_token_anchor_recovery_id(
         anchor.committed_offset,
         anchor.cycle_seq,
         anchor.total_tokens,
+    ] {
+        hasher.update(value.to_be_bytes());
+    }
+    for value in [
         anchor.input_tokens,
         anchor.cached_input_tokens,
         anchor.output_tokens,
     ] {
-        hasher.update(value.to_be_bytes());
+        if partial {
+            update_optional_u64(&mut hasher, value);
+        } else {
+            hasher.update(value.expect("complete v1 anchor").to_be_bytes());
+        }
     }
     hasher.update(anchor.prefix_generation.to_be_bytes());
     hasher.update(anchor.collector_epoch.to_be_bytes());
@@ -2387,13 +2647,15 @@ fn validate_session_token_anchor(anchor: &SessionTokenAnchor) -> Result<()> {
         || anchor.collector_epoch == 0
         || anchor.cycle_seq == 0
         || anchor.prefix_generation == 0
-        || anchor.cached_input_tokens > anchor.input_tokens
-        || anchor.cache_write_input_tokens.is_some_and(|writes| {
-            anchor
-                .cached_input_tokens
-                .checked_add(writes)
-                .is_none_or(|total| total > anchor.input_tokens)
+        || (TokenFacts {
+            total: anchor.total_tokens,
+            input: anchor.input_tokens,
+            cached_input: anchor.cached_input_tokens,
+            cache_write_input: anchor.cache_write_input_tokens,
+            output: anchor.output_tokens,
         })
+        .validate_raw_counter()
+        .is_err()
     {
         return Err(UsageStoreError::InvalidImport(
             "session token anchor is invalid".into(),
@@ -2434,7 +2696,7 @@ fn encode_session_token_anchor_recovery(recovery: &SessionTokenAnchorRecovery) -
     let pending = &recovery.pending;
     let anchor = &recovery.anchor;
     let value = serde_json::json!({
-        "version": 1,
+        "version": if anchor.input_tokens.is_some() && anchor.cached_input_tokens.is_some() && anchor.output_tokens.is_some() { 1 } else { 2 },
         "recovery_id": recovery.recovery_id,
         "pending": {
             "root_identity": pending.root_identity,
@@ -2463,9 +2725,9 @@ fn encode_session_token_anchor_recovery(recovery: &SessionTokenAnchorRecovery) -
             "cycle_seq": anchor.cycle_seq.to_string(),
             "fully_attributed_from_zero": anchor.fully_attributed_from_zero,
             "total_tokens": anchor.total_tokens.to_string(),
-            "input_tokens": anchor.input_tokens.to_string(),
-            "cached_input_tokens": anchor.cached_input_tokens.to_string(),
-            "output_tokens": anchor.output_tokens.to_string(),
+            "input_tokens": anchor.input_tokens.map(|value| value.to_string()),
+            "cached_input_tokens": anchor.cached_input_tokens.map(|value| value.to_string()),
+            "output_tokens": anchor.output_tokens.map(|value| value.to_string()),
             "cache_write_input_tokens": anchor.cache_write_input_tokens.map(|value| value.to_string()),
         },
         "current": {
@@ -2590,7 +2852,8 @@ fn decode_session_token_anchor_recovery(
             "session token anchor payload is malformed: {error}"
         ))
     })?;
-    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    if !matches!(version, Some(1 | 2))
         || string(
             value.as_object().ok_or_else(|| {
                 UsageStoreError::InvalidImport("session token anchor payload is malformed".into())
@@ -2631,11 +2894,19 @@ fn decode_session_token_anchor_recovery(
         cycle_seq: decimal(anchor_value, "cycle_seq")?,
         fully_attributed_from_zero: boolean(anchor_value, "fully_attributed_from_zero")?,
         total_tokens: decimal(anchor_value, "total_tokens")?,
-        input_tokens: decimal(anchor_value, "input_tokens")?,
-        cached_input_tokens: decimal(anchor_value, "cached_input_tokens")?,
-        output_tokens: decimal(anchor_value, "output_tokens")?,
+        input_tokens: optional_decimal(anchor_value, "input_tokens")?,
+        cached_input_tokens: optional_decimal(anchor_value, "cached_input_tokens")?,
+        output_tokens: optional_decimal(anchor_value, "output_tokens")?,
         cache_write_input_tokens: optional_decimal(anchor_value, "cache_write_input_tokens")?,
     };
+    let complete = anchor.input_tokens.is_some()
+        && anchor.cached_input_tokens.is_some()
+        && anchor.output_tokens.is_some();
+    if (version == Some(1)) != complete {
+        return Err(UsageStoreError::InvalidImport(
+            "token anchor version and knownness mismatch".into(),
+        ));
+    }
     let current_value = object(&value, "current")?;
     let recovery = SessionTokenAnchorRecovery {
         recovery_id: recovery_id.to_owned(),
@@ -2662,25 +2933,17 @@ fn validate_session_event(event: &SessionEvent) -> Result<()> {
         || event.event_index > i64::MAX as u64
         || event.prefix_generation == 0
         || event.timestamp <= 0
+        || event.timestamp > MAX_PUBLIC_UNIX_SECONDS
         || !valid_session_model(&event.model)
-        || event.cached_input_tokens > event.input_tokens
-        || event.cache_write_input_tokens.is_some_and(|writes| {
-            event
-                .cached_input_tokens
-                .checked_add(writes)
-                .is_none_or(|total| total > event.input_tokens)
+        || (TokenFacts {
+            total: event.total_tokens,
+            input: event.input_tokens,
+            cached_input: event.cached_input_tokens,
+            cache_write_input: event.cache_write_input_tokens,
+            output: event.output_tokens,
         })
-        || [
-            event.total_tokens,
-            event.input_tokens,
-            event.cached_input_tokens,
-            event.output_tokens,
-        ]
-        .into_iter()
-        .any(|value| value > i64::MAX as u64)
-        || event
-            .cache_write_input_tokens
-            .is_some_and(|value| value > i64::MAX as u64)
+        .validate_fact()
+        .is_err()
     {
         return Err(UsageStoreError::InvalidImport(
             "session event is invalid".into(),
@@ -2693,15 +2956,7 @@ fn validate_session_event(event: &SessionEvent) -> Result<()> {
 fn canonicalize_model_totals(totals: &[SessionModelTotal]) -> Result<Vec<SessionModelTotal>> {
     let mut canonical = BTreeMap::new();
     for total in totals {
-        if !valid_session_model(&total.model)
-            || total.cached_input_tokens > total.input_tokens
-            || total.cache_write_input_tokens.is_some_and(|writes| {
-                total
-                    .cached_input_tokens
-                    .checked_add(writes)
-                    .is_none_or(|cached| cached > total.input_tokens)
-            })
-        {
+        if !valid_session_model(&total.model) || total.tokens().validate_fact().is_err() {
             return Err(UsageStoreError::InvalidImport(
                 "session model total is invalid".into(),
             ));
@@ -2722,41 +2977,20 @@ fn checked_add_model_total(
     target: &mut SessionModelTotal,
     source: &SessionModelTotal,
 ) -> Result<()> {
-    target.total_tokens = target
-        .total_tokens
-        .checked_add(source.total_tokens)
-        .ok_or(UsageStoreError::GenerationOverflow)?;
-    target.input_tokens = target
-        .input_tokens
-        .checked_add(source.input_tokens)
-        .ok_or(UsageStoreError::GenerationOverflow)?;
-    target.cached_input_tokens = target
-        .cached_input_tokens
-        .checked_add(source.cached_input_tokens)
-        .ok_or(UsageStoreError::GenerationOverflow)?;
-    target.output_tokens = target
-        .output_tokens
-        .checked_add(source.output_tokens)
-        .ok_or(UsageStoreError::GenerationOverflow)?;
-    target.cache_write_input_tokens = match (
-        target.cache_write_input_tokens,
-        source.cache_write_input_tokens,
-    ) {
-        (Some(left), Some(right)) => Some(
-            left.checked_add(right)
-                .ok_or(UsageStoreError::GenerationOverflow)?,
-        ),
-        _ => None,
-    };
+    let tokens = target
+        .tokens()
+        .checked_sum(source.tokens())
+        .map_err(|_| UsageStoreError::InvalidImport("session model total sum is invalid".into()))?;
+    target.replace_tokens(tokens);
     Ok(())
 }
 
 fn model_total_dominates(left: &SessionModelTotal, right: &SessionModelTotal) -> bool {
     left.model == right.model
         && left.total_tokens >= right.total_tokens
-        && left.input_tokens >= right.input_tokens
-        && left.cached_input_tokens >= right.cached_input_tokens
-        && left.output_tokens >= right.output_tokens
+        && optional_counter_dominates(left.input_tokens, right.input_tokens, false)
+        && optional_counter_dominates(left.cached_input_tokens, right.cached_input_tokens, false)
+        && optional_counter_dominates(left.output_tokens, right.output_tokens, false)
         && match (
             left.cache_write_input_tokens,
             right.cache_write_input_tokens,
@@ -2767,19 +3001,36 @@ fn model_total_dominates(left: &SessionModelTotal, right: &SessionModelTotal) ->
         }
 }
 
+fn optional_counter_dominates(
+    left: Option<u64>,
+    right: Option<u64>,
+    may_lose_knowledge: bool,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left >= right,
+        (None, None) => true,
+        (None, Some(_)) => may_lose_knowledge,
+        (Some(_), None) => false,
+    }
+}
+
 fn model_total_reset_is_proven(baseline: &SessionModelTotal, observed: &SessionModelTotal) -> bool {
     if baseline.model != observed.model {
         return false;
     }
     let known_components = [
-        (baseline.total_tokens, observed.total_tokens),
+        (Some(baseline.total_tokens), Some(observed.total_tokens)),
         (baseline.input_tokens, observed.input_tokens),
         (baseline.cached_input_tokens, observed.cached_input_tokens),
         (baseline.output_tokens, observed.output_tokens),
     ];
     if known_components
         .into_iter()
-        .any(|(before, after)| before > 0 && after >= before)
+        .any(|(before, after)| match (before, after) {
+            (Some(before), Some(after)) => before > 0 && after >= before,
+            (None, None) => false,
+            _ => true,
+        })
     {
         return false;
     }
@@ -2794,9 +3045,12 @@ fn model_total_reset_is_proven(baseline: &SessionModelTotal, observed: &SessionM
 }
 
 fn cumulative_model_totals_are_complete(totals: &[SessionModelTotal]) -> bool {
-    totals
-        .iter()
-        .all(|total| total.cache_write_input_tokens.is_some())
+    totals.iter().all(|total| {
+        total.input_tokens.is_some()
+            && total.cached_input_tokens.is_some()
+            && total.output_tokens.is_some()
+            && total.cache_write_input_tokens.is_some()
+    })
 }
 
 fn model_totals_dominate(left: &[SessionModelTotal], right: &[SessionModelTotal]) -> bool {
@@ -2822,9 +3076,13 @@ fn timeline_model_totals_dominate(left: &[SessionModelTotal], right: &[SessionMo
     right.iter().all(|required| {
         left.get(required.model.as_str()).is_some_and(|candidate| {
             candidate.total_tokens >= required.total_tokens
-                && candidate.input_tokens >= required.input_tokens
-                && candidate.cached_input_tokens >= required.cached_input_tokens
-                && candidate.output_tokens >= required.output_tokens
+                && optional_counter_dominates(candidate.input_tokens, required.input_tokens, true)
+                && optional_counter_dominates(
+                    candidate.cached_input_tokens,
+                    required.cached_input_tokens,
+                    true,
+                )
+                && optional_counter_dominates(candidate.output_tokens, required.output_tokens, true)
                 && match (
                     candidate.cache_write_input_tokens,
                     required.cache_write_input_tokens,
@@ -3099,24 +3357,12 @@ fn checked_add_model_totals(
             .or_insert_with(|| SessionModelTotal {
                 model: offset.model.clone(),
                 total_tokens: 0,
-                input_tokens: 0,
-                cached_input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: Some(0),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
             });
-        total.total_tokens = total.total_tokens.checked_add(offset.total_tokens)?;
-        total.input_tokens = total.input_tokens.checked_add(offset.input_tokens)?;
-        total.cached_input_tokens = total
-            .cached_input_tokens
-            .checked_add(offset.cached_input_tokens)?;
-        total.output_tokens = total.output_tokens.checked_add(offset.output_tokens)?;
-        total.cache_write_input_tokens = match (
-            total.cache_write_input_tokens,
-            offset.cache_write_input_tokens,
-        ) {
-            (Some(left), Some(right)) => Some(left.checked_add(right)?),
-            _ => None,
-        };
+        total.replace_tokens(total.tokens().checked_sum(offset.tokens()).ok()?);
     }
     canonicalize_model_totals(&combined.into_values().collect::<Vec<_>>()).ok()
 }
@@ -3136,36 +3382,37 @@ fn canonical_lifecycle_intervals(
             interval.end_at.unwrap_or(i64::MAX),
         )
     });
-    for (index, interval) in canonical.iter().enumerate() {
-        if interval.start_at.is_some_and(|value| value <= 0)
-            || interval.end_at.is_some_and(|value| value <= 0)
-            || interval.start_at.is_none() && index != 0
-            || interval.end_at.is_none() && index + 1 != canonical.len()
-            || matches!((interval.start_at, interval.end_at), (Some(start), Some(end)) if start >= end)
+    for interval in &canonical {
+        if interval
+            .start_at
+            .is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+            || interval
+                .end_at
+                .is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+            || matches!((interval.start_at, interval.end_at), (Some(start), Some(end)) if start > end)
         {
             return Err(UsageStoreError::InvalidImport(
                 "account lifecycle interval is invalid".into(),
             ));
         }
     }
-    let mut merged: Vec<SessionLifecycleInterval> = Vec::new();
-    for interval in canonical {
-        if let Some(previous) = merged.last_mut() {
-            let previous_end = previous.end_at.unwrap_or(i64::MAX);
+    let mut previous_end = None;
+    for interval in &canonical {
+        if matches!((interval.start_at, interval.end_at), (Some(start), Some(end)) if start == end)
+        {
+            continue;
+        }
+        if let Some(previous_end) = previous_end {
             let next_start = interval.start_at.unwrap_or(i64::MIN);
             if next_start < previous_end {
                 return Err(UsageStoreError::InvalidImport(
                     "account lifecycle intervals overlap".into(),
                 ));
             }
-            if next_start == previous_end {
-                previous.end_at = interval.end_at;
-                continue;
-            }
         }
-        merged.push(interval);
+        previous_end = Some(interval.end_at.unwrap_or(i64::MAX));
     }
-    Ok(merged)
+    Ok(canonical)
 }
 
 fn lifecycle_contains(intervals: &[SessionLifecycleInterval], timestamp: i64) -> bool {
@@ -3254,6 +3501,33 @@ fn sum_session_events<'a>(
     Ok(totals)
 }
 
+fn mark_retained_history_models_unknown(
+    tx: &rusqlite::Transaction<'_>,
+    reset: i64,
+    before: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE usage_model_history SET model_set_complete=0
+         WHERE reset_at=?1 AND timestamp<?2 AND model_set_complete<>0",
+        params![reset, before],
+    )?;
+    // Modify only quality metadata in the saved JSON. Rebuilding it from a
+    // parsed observation could change price decimals or receipt provenance.
+    tx.execute(
+        "UPDATE durable_state SET snapshot_json=
+            CASE WHEN json_type(snapshot_json,'$.empty_model_set_complete') IS NULL
+            THEN json_set(snapshot_json,'$.model_source','legacy-unknown')
+            ELSE json_set(snapshot_json,'$.model_source','legacy-unknown',
+                          '$.empty_model_set_complete',json('false')) END
+         WHERE singleton>=2 AND json_extract(snapshot_json,'$.reset_at')=?1
+           AND data_generation<?2
+           AND (json_extract(snapshot_json,'$.model_source')<>'legacy-unknown'
+                OR json_extract(snapshot_json,'$.empty_model_set_complete')=1)",
+        params![reset, before],
+    )?;
+    Ok(())
+}
+
 type SessionEventSourceKey = (String, String, u64, u64, u128, u64, u64, String, u64);
 
 /// Replace projections only after the complete admitted source and every
@@ -3295,9 +3569,9 @@ fn prepare_exact_session_history(
         .collect::<Vec<_>>();
     let positive = |total: &&SessionModelTotal| {
         total.total_tokens > 0
-            || total.input_tokens > 0
-            || total.cached_input_tokens > 0
-            || total.output_tokens > 0
+            || total.input_tokens.is_some_and(|value| value > 0)
+            || total.cached_input_tokens.is_some_and(|value| value > 0)
+            || total.output_tokens.is_some_and(|value| value > 0)
             || total
                 .cache_write_input_tokens
                 .is_some_and(|value| value > 0)
@@ -3370,19 +3644,14 @@ fn prepare_exact_session_history(
             ));
         }
         // Existing quota is an independent observation, not a source-derived zero.
-        let previous: Option<(i64, Option<f64>)> = tx
+        let previous: Option<Option<f64>> = tx
             .query_row(
-                "SELECT reset_at,remaining_percent FROM usage_history WHERE timestamp=?1",
-                [minute],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT remaining_percent FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                params![reset, minute],
+                |row| row.get(0),
             )
             .optional()?;
-        if let Some((owner, remaining)) = previous {
-            if owner != reset {
-                return Err(UsageStoreError::InvalidImport(
-                    "exact history minute belongs to another period".into(),
-                ));
-            }
+        if let Some(remaining) = previous {
             if sample.remaining_percent.is_none() && !incoming_quota_minutes.contains(&minute) {
                 sample.remaining_percent = remaining;
                 observation.remaining_percent = remaining;
@@ -3406,6 +3675,12 @@ fn prepare_exact_session_history(
     for (recovery, _, _) in recoveries.iter().filter(|(recovery, _, _)| {
         recovery.canonical_reset_at == reset && recovery.window_seconds == window
     }) {
+        // This transaction changes only a later suffix. Retaining the exact
+        // old payload is not retirement and grants no authority to its range.
+        if recovery.projection_end_exclusive <= since {
+            mark_retained_history_models_unknown(tx, reset, recovery.projection_end_exclusive)?;
+            continue;
+        }
         if recovery.points[0].timestamp < since
             || recovery.projection_end_exclusive > until.saturating_add(1)
             || recovery
@@ -3424,12 +3699,13 @@ fn prepare_exact_session_history(
     }
     for minute in replaced {
         tx.execute(
-            "DELETE FROM usage_model_history WHERE timestamp=?1",
-            [minute],
+            "DELETE FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2",
+            params![reset, minute],
         )?;
         tx.execute(
-            "DELETE FROM durable_state WHERE singleton>=2 AND data_generation=?1",
-            [minute],
+            "DELETE FROM durable_state WHERE singleton>=2 AND data_generation=?1
+             AND json_extract(snapshot_json,'$.reset_at')=?2",
+            params![minute, reset],
         )?;
         tx.execute(
             "DELETE FROM usage_history WHERE timestamp=?1 AND reset_at=?2",
@@ -3441,9 +3717,9 @@ fn prepare_exact_session_history(
 
 fn event_has_usage(event: &SessionEvent) -> bool {
     event.total_tokens > 0
-        || event.input_tokens > 0
-        || event.cached_input_tokens > 0
-        || event.output_tokens > 0
+        || event.input_tokens.is_some_and(|value| value > 0)
+        || event.cached_input_tokens.is_some_and(|value| value > 0)
+        || event.output_tokens.is_some_and(|value| value > 0)
         || event
             .cache_write_input_tokens
             .is_some_and(|value| value > 0)
@@ -3462,118 +3738,51 @@ fn session_totals_history_tokens(totals: &[SessionModelTotal]) -> (u64, u64, u64
     tokens
 }
 
+#[cfg(test)]
 fn load_raw_session_events_from_connection(connection: &Connection) -> Result<Vec<SessionEvent>> {
-    let mut statement = connection.prepare(
-        "SELECT root_identity, relative_path, file_device, file_inode,
-                prefix_generation, range_start, range_end, record_sha256,
-                event_index, timestamp, model, total_tokens, input_tokens,
-                cached_input_tokens, output_tokens, cache_write_input_tokens
-         FROM session_events
-         ORDER BY timestamp, root_identity, relative_path, range_start, event_index",
-    )?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok(SessionEvent {
-                root_identity: row.get(0)?,
-                relative_path: row.get(1)?,
-                file_device: row
-                    .get::<_, String>(2)?
-                    .parse()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                file_inode: row
-                    .get::<_, String>(3)?
-                    .parse()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                prefix_generation: u128::from_str_radix(&row.get::<_, String>(4)?, 16)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                range_start: u64::try_from(row.get::<_, i64>(5)?)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                range_end: u64::try_from(row.get::<_, i64>(6)?)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                record_sha256: row.get(7)?,
-                event_index: u64::try_from(row.get::<_, i64>(8)?)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                timestamp: row.get(9)?,
-                model: row.get(10)?,
-                total_tokens: row
-                    .get::<_, String>(11)?
-                    .parse()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                input_tokens: row
-                    .get::<_, String>(12)?
-                    .parse()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                cached_input_tokens: row
-                    .get::<_, String>(13)?
-                    .parse()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                output_tokens: row
-                    .get::<_, String>(14)?
-                    .parse()
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                cache_write_input_tokens: row
-                    .get::<_, Option<String>>(15)?
-                    .map(|value| value.parse().map_err(|_| rusqlite::Error::InvalidQuery))
-                    .transpose()?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for event in &rows {
-        validate_session_event(event)?;
-    }
-    Ok(rows)
+    read_session_event_facts(connection)?
+        .into_iter()
+        .map(SessionEvent::try_from)
+        .collect()
 }
 
-/// Returns whether two session rows prove the same physical token record.
-///
-/// An exact primary-key replay is idempotent.  A different prefix lineage is
-/// also a replay only when the immutable source identity, token payload, and
-/// overlapping byte ranges all agree.  Equal timestamps alone are not enough:
-/// two independent source records may legitimately have the same timestamp.
+/// Family compatibility is only an ambiguity/recovery candidate test. It is
+/// never sufficient to discard a normal event or change its exact model key.
 fn session_event_models_replay_compatible(existing: &str, candidate: &str) -> bool {
     if existing == candidate {
         return true;
     }
     let is_legacy_family_key = |model: &str| matches!(model, "SOL" | "TERRA" | "LUNA" | "ASTRA");
-    if is_legacy_family_key(existing) {
-        return family(candidate).is_some_and(|candidate_family| candidate_family == existing);
-    }
-    if is_legacy_family_key(candidate) {
-        return family(existing).is_some_and(|existing_family| existing_family == candidate);
-    }
-    false
+    (is_legacy_family_key(existing) && family(candidate) == Some(existing))
+        || (is_legacy_family_key(candidate) && family(existing) == Some(candidate))
 }
 
+/// Exact saved-key/value replay only. Cross-generation identity requires the
+/// sealed full-prefix repair; overlapping ranges cannot establish it here.
 pub fn session_event_is_replay(existing: &SessionEvent, candidate: &SessionEvent) -> bool {
-    let same_payload = existing.timestamp == candidate.timestamp
+    existing == candidate
+}
+
+/// Potential duplicate evidence which ordinary collection must retain for
+/// full-prefix reconciliation. This does not grant replay or deletion rights.
+pub fn session_event_has_ambiguous_lineage(
+    existing: &SessionEvent,
+    candidate: &SessionEvent,
+) -> bool {
+    existing.prefix_generation != candidate.prefix_generation
+        && existing.root_identity == candidate.root_identity
+        && existing.relative_path == candidate.relative_path
+        && existing.file_device == candidate.file_device
+        && existing.file_inode == candidate.file_inode
+        && existing.timestamp == candidate.timestamp
         && session_event_models_replay_compatible(&existing.model, &candidate.model)
         && existing.total_tokens == candidate.total_tokens
         && existing.input_tokens == candidate.input_tokens
         && existing.cached_input_tokens == candidate.cached_input_tokens
         && existing.output_tokens == candidate.output_tokens
-        && existing.cache_write_input_tokens == candidate.cache_write_input_tokens;
-    if !same_payload
-        || existing.root_identity != candidate.root_identity
-        || existing.relative_path != candidate.relative_path
-        || existing.file_device != candidate.file_device
-        || existing.file_inode != candidate.file_inode
-    {
-        return false;
-    }
-    let same_primary_key = existing.prefix_generation == candidate.prefix_generation
-        && existing.range_start == candidate.range_start
-        && existing.range_end == candidate.range_end
-        && existing.record_sha256 == candidate.record_sha256
-        && existing.event_index == candidate.event_index;
-    same_primary_key
-        || (existing.prefix_generation != candidate.prefix_generation
-            && existing.range_start < candidate.range_end
-            && candidate.range_start < existing.range_end)
-}
-
-fn session_event_is_cross_prefix_replay(existing: &SessionEvent, candidate: &SessionEvent) -> bool {
-    existing.prefix_generation != candidate.prefix_generation
-        && session_event_is_replay(existing, candidate)
+        && existing.cache_write_input_tokens == candidate.cache_write_input_tokens
+        && existing.range_start < candidate.range_end
+        && candidate.range_start < existing.range_end
 }
 
 fn session_event_primary_key(
@@ -3608,20 +3817,10 @@ fn session_event_replay_group_key(event: &SessionEvent) -> SessionEventReplayGro
     )
 }
 
-/// Collapse replayed records from overlapping physical source ranges. A new
-/// prefix generation can rescan bytes that an older generation already
-/// committed (for example after an account transition). The event key
-/// deliberately ignores only lineage fields; two equal token records are
-/// collapsed only when their source identities and byte ranges overlap, which
-/// proves they came from the same physical bytes rather than two independent
-/// sessions. The repair path removes the discarded raw rows after a verified
-/// backup; ambiguous records are never guessed away.
+/// Keep every distinct saved record. Only byte-for-byte exact key/value
+/// repeats in an in-memory input are idempotent; a reader never repairs raw
+/// rows or promotes an overlapping generation to proved physical identity.
 fn canonicalize_session_events(events: Vec<SessionEvent>) -> (Vec<SessionEvent>, bool) {
-    // Equal payloads are the only rows which can be replays. Partitioning by
-    // immutable source identity and payload avoids comparing every event with
-    // every other event when a real database contains tens of thousands of
-    // records. Within one group, an end-offset index tracks only ranges that
-    // are still capable of overlapping the next sorted range.
     let mut groups = BTreeMap::<SessionEventReplayGroupKey, Vec<SessionEvent>>::new();
     for event in events {
         groups
@@ -3629,64 +3828,16 @@ fn canonicalize_session_events(events: Vec<SessionEvent>) -> (Vec<SessionEvent>,
             .or_default()
             .push(event);
     }
-
-    let mut canonical = Vec::with_capacity(groups.values().map(Vec::len).sum());
+    let mut canonical = Vec::new();
     let mut deduplicated = false;
-    for mut group in groups.into_values() {
-        group.sort_by_key(|event| {
-            (
-                event.range_start,
-                event.range_end,
-                event.prefix_generation,
-                event.record_sha256.clone(),
-                event.event_index,
-            )
-        });
-        let mut active_by_end = BTreeMap::<u64, Vec<u128>>::new();
-        let mut active_by_prefix = BTreeMap::<u128, usize>::new();
-        let mut active_total = 0_usize;
-        let mut seen_primary_keys = BTreeSet::new();
+    for group in groups.into_values() {
+        let mut seen = BTreeSet::new();
         for event in group {
-            // All stored offsets are bounded by SQLite's signed integer range,
-            // so adding one cannot overflow here.
-            let future = if event.range_start == u64::MAX {
-                BTreeMap::new()
-            } else {
-                active_by_end.split_off(&(event.range_start + 1))
-            };
-            for prefixes in std::mem::replace(&mut active_by_end, future).into_values() {
-                active_total = active_total.saturating_sub(prefixes.len());
-                for prefix in prefixes {
-                    let remove_prefix = if let Some(count) = active_by_prefix.get_mut(&prefix) {
-                        *count = count.saturating_sub(1);
-                        *count == 0
-                    } else {
-                        false
-                    };
-                    if remove_prefix {
-                        active_by_prefix.remove(&prefix);
-                    }
-                }
-            }
-
-            let primary_key = session_event_primary_key(&event);
-            let same_primary_key = !seen_primary_keys.insert(primary_key);
-            let same_prefix_active = active_by_prefix
-                .get(&event.prefix_generation)
-                .copied()
-                .unwrap_or(0);
-            let has_other_prefix_overlap = active_total > same_prefix_active;
-            if same_primary_key || has_other_prefix_overlap {
+            if !seen.insert(session_event_primary_key(&event)) {
                 deduplicated = true;
-                continue;
+            } else {
+                canonical.push(event);
             }
-            active_by_end
-                .entry(event.range_end)
-                .or_default()
-                .push(event.prefix_generation);
-            *active_by_prefix.entry(event.prefix_generation).or_default() += 1;
-            active_total += 1;
-            canonical.push(event);
         }
     }
     canonical.sort_by_key(|event| {
@@ -3702,8 +3853,12 @@ fn canonicalize_session_events(events: Vec<SessionEvent>) -> (Vec<SessionEvent>,
 }
 
 fn load_session_events_from_connection(connection: &Connection) -> Result<Vec<SessionEvent>> {
-    let (events, _) =
-        canonicalize_session_events(load_raw_session_events_from_connection(connection)?);
+    let (events, _) = canonicalize_session_events(
+        source_events::read_matching(connection, "", [])?
+            .into_iter()
+            .map(SessionEvent::try_from)
+            .collect::<Result<Vec<_>>>()?,
+    );
     Ok(events)
 }
 
@@ -3764,7 +3919,14 @@ pub fn reconcile_rejected_generation_model_totals(
     Ok(Some(canonicalize_model_totals(&reconciled)?))
 }
 
-type CumulativeModelPayload = (String, u64, u64, u64, u64, Option<u64>);
+type CumulativeModelPayload = (
+    String,
+    u64,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+);
 type CumulativeDollarPayload = (f64, f64, f64);
 type TimelineRangePayload = (
     String,
@@ -3941,9 +4103,9 @@ fn validate_timeline_recovery_content(
         || final_offset_model_totals.is_empty()
         || !final_offset_model_totals.iter().any(|total| {
             total.total_tokens > 0
-                || total.input_tokens > 0
-                || total.cached_input_tokens > 0
-                || total.output_tokens > 0
+                || total.input_tokens.is_some_and(|value| value > 0)
+                || total.cached_input_tokens.is_some_and(|value| value > 0)
+                || total.output_tokens.is_some_and(|value| value > 0)
                 || total
                     .cache_write_input_tokens
                     .is_some_and(|value| value > 0)
@@ -4027,9 +4189,9 @@ fn validate_timeline_recovery_content(
             || totals != point.offset_model_totals
             || !totals.iter().any(|total| {
                 total.total_tokens > 0
-                    || total.input_tokens > 0
-                    || total.cached_input_tokens > 0
-                    || total.output_tokens > 0
+                    || total.input_tokens.is_some_and(|value| value > 0)
+                    || total.cached_input_tokens.is_some_and(|value| value > 0)
+                    || total.output_tokens.is_some_and(|value| value > 0)
                     || total
                         .cache_write_input_tokens
                         .is_some_and(|value| value > 0)
@@ -4249,9 +4411,9 @@ fn validate_cumulative_recovery(
         || !cumulative_model_totals_are_complete(&current)
         || !offset.iter().any(|total| {
             total.total_tokens > 0
-                || total.input_tokens > 0
-                || total.cached_input_tokens > 0
-                || total.output_tokens > 0
+                || total.input_tokens.is_some_and(|value| value > 0)
+                || total.cached_input_tokens.is_some_and(|value| value > 0)
+                || total.output_tokens.is_some_and(|value| value > 0)
                 || total
                     .cache_write_input_tokens
                     .is_some_and(|value| value > 0)
@@ -4318,9 +4480,9 @@ fn cumulative_recovery_point_from_storage(
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
         ))
     })?;
@@ -4330,9 +4492,15 @@ fn cumulative_recovery_point_from_storage(
         model_totals.push(SessionModelTotal {
             model,
             total_tokens: canonical_u64_text(&total, "recovery evidence total")?,
-            input_tokens: canonical_u64_text(&input, "recovery evidence input")?,
-            cached_input_tokens: canonical_u64_text(&cached, "recovery evidence cached input")?,
-            output_tokens: canonical_u64_text(&output, "recovery evidence output")?,
+            input_tokens: canonical_optional_u64_text(input.as_deref(), "recovery evidence input")?,
+            cached_input_tokens: canonical_optional_u64_text(
+                cached.as_deref(),
+                "recovery evidence cached input",
+            )?,
+            output_tokens: canonical_optional_u64_text(
+                output.as_deref(),
+                "recovery evidence output",
+            )?,
             cache_write_input_tokens: cache_write
                 .as_deref()
                 .map(|value| canonical_u64_text(value, "recovery evidence cache write"))
@@ -4515,9 +4683,9 @@ fn session_model_totals_from_connection(connection: &Connection) -> Result<Vec<S
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
         ))
     })?;
@@ -4527,9 +4695,15 @@ fn session_model_totals_from_connection(connection: &Connection) -> Result<Vec<S
         totals.push(SessionModelTotal {
             model,
             total_tokens: canonical_u64_text(&total, "current recovery total")?,
-            input_tokens: canonical_u64_text(&input, "current recovery input")?,
-            cached_input_tokens: canonical_u64_text(&cached, "current recovery cached input")?,
-            output_tokens: canonical_u64_text(&output, "current recovery output")?,
+            input_tokens: canonical_optional_u64_text(input.as_deref(), "current recovery input")?,
+            cached_input_tokens: canonical_optional_u64_text(
+                cached.as_deref(),
+                "current recovery cached input",
+            )?,
+            output_tokens: canonical_optional_u64_text(
+                output.as_deref(),
+                "current recovery output",
+            )?,
             cache_write_input_tokens: cache_write
                 .as_deref()
                 .map(|value| canonical_u64_text(value, "current recovery cache write"))
@@ -5407,25 +5581,20 @@ fn canonicalize_samples_with_sources(
     samples: &[UsageHistorySample],
     preserve_existing: bool,
     preserve_existing_before: Option<i64>,
-    admitted_period: Option<(i64, i64)>,
+    qualified_prefix: bool,
 ) -> Result<CanonicalizedSamples> {
+    let canonical_scope = source_qualification_repair::CanonicalSourceScope::begin(transaction)?;
     let canonical_storage = canonical_history_constraints_present(transaction)?;
     let incoming = if canonical_storage {
-        // Recorder has already accepted the official period. Legacy import
-        // canonicalization must not alias it back to the previous DB period.
-        let (current_reset_at, window_seconds): (i64, i64) = match admitted_period {
-            Some(period) => period,
-            None => transaction.query_row(
-                "SELECT reset_at, window_seconds FROM collection_generation WHERE singleton=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?,
-        };
-        let raw = samples
-            .iter()
-            .map(|sample| {
-                sample.validate()?;
-                Ok(CanonicalRawSample {
+        // These are admitted exact period keys. Legacy alias recovery is a
+        // separate migration; a stale collection setting cannot relabel them.
+        let mut raw_by_period = BTreeMap::<i64, Vec<CanonicalRawSample>>::new();
+        for sample in samples {
+            sample.validate()?;
+            raw_by_period
+                .entry(sample.reset_at)
+                .or_default()
+                .push(CanonicalRawSample {
                     timestamp: sample.timestamp,
                     reset_at: sample.reset_at,
                     remaining_percent: sample.remaining_percent,
@@ -5435,19 +5604,18 @@ fn canonicalize_samples_with_sources(
                     sol_tokens: sample.sol_tokens,
                     terra_tokens: sample.terra_tokens,
                     luna_tokens: sample.luna_tokens,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let canonical = canonicalize_history_for_storage_with_sources(
-            &raw,
-            (current_reset_at > 0).then_some(current_reset_at),
-            window_seconds.max(0),
-        )
-        .map_err(|error| {
-            UsageStoreError::InvalidImport(format!(
-                "incoming history canonicalization failed: {error}"
-            ))
-        })?;
+                });
+        }
+        let mut canonical = Vec::new();
+        for raw in raw_by_period.into_values() {
+            canonical.extend(
+                canonicalize_history_for_storage_with_sources(&raw, None, 0).map_err(|error| {
+                    UsageStoreError::InvalidImport(format!(
+                        "incoming history canonicalization failed: {error}"
+                    ))
+                })?,
+            );
+        }
         canonical
             .into_iter()
             .map(|canonical| {
@@ -5485,68 +5653,60 @@ fn canonicalize_samples_with_sources(
             .collect::<Result<Vec<_>>>()?
     };
 
-    let query = if canonical_storage {
-        "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
-                terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
-         FROM usage_history WHERE timestamp = ?1"
-    } else {
-        "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
-                terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
-         FROM usage_history WHERE reset_at = ?1 AND timestamp = ?2"
-    };
+    let query = "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
+                        terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                 FROM usage_history WHERE reset_at = ?1 AND timestamp = ?2";
     let mut existing_statement = transaction.prepare(query)?;
     let mut canonical = Vec::with_capacity(incoming.len());
     let mut source_to_canonical = BTreeMap::new();
-    for (mut incoming, source_key) in incoming {
+    for (incoming, source_key) in incoming {
         let decode = |row: &rusqlite::Row<'_>| {
             let sample = valid_sample_from_row(row)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            sample.ok_or(rusqlite::Error::InvalidQuery)
+            Ok(sample)
         };
-        let existing = if canonical_storage {
-            existing_statement
-                .query_row([incoming.timestamp], decode)
-                .optional()?
-        } else {
-            existing_statement
-                .query_row(params![incoming.reset_at, incoming.timestamp], decode)
-                .optional()?
-        };
-        let replaces_period = existing.as_ref().is_some_and(|existing| {
-            admitted_period.is_some_and(|(reset_at, _)| incoming.reset_at == reset_at)
-                && existing.reset_at != incoming.reset_at
-        });
-        if let Some(existing) = existing.as_ref().filter(|_| !replaces_period) {
-            // The canonical timestamp already owns its one durable period
-            // key. An incoming reset alias cannot create or rename that row.
-            incoming.reset_at = existing.reset_at;
+        let existing = existing_statement
+            .query_row(params![incoming.reset_at, incoming.timestamp], decode)
+            .optional()?;
+        if existing == Some(None) && !qualified_prefix {
+            return Err(UsageStoreError::InvalidImport(
+                "partial stored history requires qualified event-prefix reconstruction".into(),
+            ));
         }
-        let selected = match existing {
+        let existing = existing.flatten();
+        let mut selected = match existing {
             Some(existing)
                 if preserve_existing
+                    || canonical_scope
+                        .preserves_observation(incoming.reset_at, incoming.timestamp)
                     || preserve_existing_before
                         .is_some_and(|cutoff| incoming.timestamp < cutoff) =>
             {
                 existing
             }
-            // A minute contains one canonical sample. On an official reset,
-            // replace that minute with the new period's independently rebuilt
-            // vector; never carry the previous period's larger totals into it.
-            Some(_) if replaces_period => incoming,
             Some(existing) => reconcile_existing_sample(existing, incoming)?,
             None => incoming,
         };
+        if let Some(remaining) = quota_receipts::remaining_for_exact_minute(
+            transaction,
+            selected.reset_at,
+            selected.timestamp,
+        )? {
+            selected.remaining_percent = Some(remaining);
+        }
         source_to_canonical.insert(source_key, (selected.reset_at, selected.timestamp));
         canonical.push(selected);
     }
 
     if canonical_storage {
-        let mut timestamps = BTreeSet::new();
+        let mut keys = BTreeSet::new();
         for sample in &canonical {
             sample.validate()?;
-            if sample.timestamp.rem_euclid(60) != 0 || !timestamps.insert(sample.timestamp) {
+            if sample.timestamp.rem_euclid(60) != 0
+                || !keys.insert((sample.reset_at, sample.timestamp))
+            {
                 return Err(UsageStoreError::InvalidImport(
-                    "incoming canonical timestamp is not globally unique".into(),
+                    "incoming canonical period/minute key is not unique".into(),
                 ));
             }
         }
@@ -5569,7 +5729,7 @@ fn canonicalize_samples(
         samples,
         preserve_existing,
         preserve_existing_before,
-        None,
+        false,
     )
     .map(|canonical| canonical.rows)
 }
@@ -5580,36 +5740,18 @@ fn upsert_canonical_samples(
     preserve_existing: bool,
     preserve_existing_before: Option<i64>,
 ) -> Result<()> {
+    let canonical_scope = source_qualification_repair::CanonicalSourceScope::begin(transaction)?;
     let mut insert_if_absent = transaction.prepare(INSERT_SAMPLE_IF_ABSENT)?;
     let mut upsert = transaction.prepare(UPSERT_SAMPLE)?;
-    let canonical_storage = canonical_history_constraints_present(transaction)?;
     for sample in samples {
-        let preserved = preserve_existing
-            || preserve_existing_before.is_some_and(|cutoff| sample.timestamp < cutoff);
-        if canonical_storage && !preserved {
-            let replaces_period: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM usage_history WHERE timestamp=?1 AND reset_at<>?2)",
-                params![sample.timestamp, sample.reset_at],
-                |row| row.get(0),
-            )?;
-            if replaces_period {
-                // Replace only this derived minute and its dependent sidecars
-                // inside the same transaction. Session source events stay intact.
-                transaction.execute(
-                    "DELETE FROM usage_model_history WHERE timestamp=?1",
-                    [sample.timestamp],
-                )?;
-                transaction.execute(
-                    "DELETE FROM durable_state WHERE singleton>=?1 AND data_generation=?2",
-                    params![DURABLE_STATE_OBSERVATION_MIN_SINGLETON, sample.timestamp],
-                )?;
-                transaction.execute(
-                    "DELETE FROM usage_history WHERE timestamp=?1",
-                    [sample.timestamp],
-                )?;
-            }
-        }
+        let remaining = quota_receipts::remaining_for_exact_minute(
+            transaction,
+            sample.reset_at,
+            sample.timestamp,
+        )?
+        .or(sample.remaining_percent);
         let statement = if preserve_existing
+            || canonical_scope.preserves_observation(sample.reset_at, sample.timestamp)
             || preserve_existing_before.is_some_and(|cutoff| sample.timestamp < cutoff)
         {
             &mut insert_if_absent
@@ -5619,7 +5761,7 @@ fn upsert_canonical_samples(
         statement.execute(params![
             sample.timestamp,
             sample.reset_at,
-            sample.remaining_percent,
+            remaining,
             sample.sol_dollars,
             sample.terra_dollars,
             sample.luna_dollars,
@@ -5896,9 +6038,9 @@ fn resolve_session_token_anchor_recoveries(
             && resolution.accepted_range.end_offset > 0
             && recovery.anchor.fully_attributed_from_zero
             && recovery.anchor.total_tokens == 0
-            && recovery.anchor.input_tokens == 0
-            && recovery.anchor.cached_input_tokens == 0
-            && recovery.anchor.output_tokens == 0
+            && recovery.anchor.input_tokens == Some(0)
+            && recovery.anchor.cached_input_tokens == Some(0)
+            && recovery.anchor.output_tokens == Some(0)
             && recovery
                 .anchor
                 .cache_write_input_tokens
@@ -6044,6 +6186,175 @@ fn upsert_session_token_anchor_recoveries(
     Ok(())
 }
 
+fn upsert_session_event_qualifications(
+    transaction: &rusqlite::Transaction<'_>,
+    events: &[LosslessSessionEvent],
+    replay: bool,
+    phase: &str,
+    prepared: Option<&period_evidence::PreparedPeriodAttribution>,
+) -> Result<()> {
+    let _canonical_scope = source_qualification_repair::CanonicalSourceScope::begin(transaction)?;
+    for event in events {
+        let admission = event.admission.as_ref().ok_or_else(|| {
+            UsageStoreError::InvalidImport("qualified event has no admission".into())
+        })?;
+        validate_storage_partition_identity(transaction, &admission.source_binding.partition)?;
+        let source = &event.source;
+        let read = || -> Result<(Option<i64>, Option<i64>, Option<String>)> {
+            Ok(transaction.query_row(
+                "SELECT reset_at,window_seconds,admission_json FROM session_events
+                 WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+                   AND file_inode=?4 AND prefix_generation=?5 AND range_start=?6
+                   AND range_end=?7 AND record_sha256=?8 AND event_index=?9",
+                params![
+                    &source.root_identity,
+                    &source.relative_path,
+                    source.file_device.to_string(),
+                    source.file_inode.to_string(),
+                    format!("{:032x}", source.prefix_generation),
+                    source.range_start as i64,
+                    source.range_end as i64,
+                    &source.record_sha256,
+                    source.event_index as i64
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        };
+        let stored = read()?;
+        let reset = event.period.map(|period| period.reset_at);
+        let window = event.period.map(|period| period.window_seconds);
+        let stored_admission = stored
+            .2
+            .as_deref()
+            .map(serde_json::from_str::<event_admission::EventAdmission>)
+            .transpose()
+            .map_err(|_| UsageStoreError::InvalidImport("invalid stored event admission".into()))?;
+        if stored.0 == reset && stored.1 == window && stored_admission.as_ref() == Some(admission) {
+            recorded_usage::observe(transaction, event)?;
+            continue;
+        }
+        if let Some(prepared) = prepared {
+            let saved = LosslessSessionEvent {
+                period: stored.0.zip(stored.1).map(|(reset_at, window_seconds)| {
+                    event_admission::SessionEventPeriod {
+                        reset_at,
+                        window_seconds,
+                    }
+                }),
+                admission: stored_admission.clone(),
+                ..event.clone()
+            };
+            if prepared.is_reassignment_of(&saved, event)? {
+                recorded_usage::observe(transaction, event)?;
+                continue;
+            }
+        }
+        // An acknowledgement replay cannot silently change an already
+        // committed generation. Requalification has its own evidence owner.
+        if replay || stored.0.is_some() || stored.1.is_some() || stored.2.is_some() {
+            let changes = match (&stored_admission, &event.admission) {
+                (Some(before), Some(after)) => format!(
+                    "binding={},prefix={},ownership={},numeric={},period={}",
+                    before.source_binding != after.source_binding,
+                    before.verified_prefix_end != after.verified_prefix_end,
+                    before.ownership != after.ownership,
+                    before.numeric != after.numeric,
+                    before.period != after.period,
+                ),
+                _ => "presence".to_owned(),
+            };
+            return Err(UsageStoreError::InvalidImport(format!(
+                "event qualification conflicts with the committed batch: context={phase} replay={replay} reset_changed={} window_changed={} admission_changed=[{changes}]",
+                stored.0 != reset, stored.1 != window,
+            )));
+        }
+        let encoded = serde_json::to_string(admission)
+            .map_err(|error| UsageStoreError::InvalidImport(error.to_string()))?;
+        let changed = transaction.execute(
+            "UPDATE session_events SET reset_at=?10,window_seconds=?11,admission_json=?12
+             WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+               AND file_inode=?4 AND prefix_generation=?5 AND range_start=?6
+               AND range_end=?7 AND record_sha256=?8 AND event_index=?9",
+            params![
+                &source.root_identity,
+                &source.relative_path,
+                source.file_device.to_string(),
+                source.file_inode.to_string(),
+                format!("{:032x}", source.prefix_generation),
+                source.range_start as i64,
+                source.range_end as i64,
+                &source.record_sha256,
+                source.event_index as i64,
+                reset,
+                window,
+                &encoded
+            ],
+        )?;
+        if changed != 1 || read()? != (reset, window, Some(encoded)) {
+            return Err(UsageStoreError::InvalidImport(
+                "event qualification read-back failed".into(),
+            ));
+        }
+        clear_response_pending(transaction, event)?;
+        recorded_usage::observe(transaction, event)?;
+    }
+    Ok(())
+}
+
+fn clear_response_pending(
+    tx: &rusqlite::Transaction<'_>,
+    event: &LosslessSessionEvent,
+) -> Result<()> {
+    if let Some(event_admission::EventAdmission {
+        numeric: event_admission::NumericEventProof::ResponseRecord { candidate, .. },
+        ..
+    }) = event.admission.as_ref()
+    {
+        tx.execute("DELETE FROM session_pending_ranges WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3 AND file_inode=?4 AND prefix_generation=?5 AND start_offset=?6 AND end_offset=?7 AND reason='response-qualification-pending'",
+            params![event.source.root_identity,event.source.relative_path,event.source.file_device.to_string(),event.source.file_inode.to_string(),format!("{:032x}",event.source.prefix_generation),candidate.pointer.start,candidate.pointer.end])?;
+    }
+    Ok(())
+}
+
+fn resolve_response_replays(
+    tx: &rusqlite::Transaction<'_>,
+    replays: &[LosslessSessionEvent],
+    checkpoints: &BTreeMap<(String, String, u64, u64, u128), SessionCheckpoint>,
+) -> Result<()> {
+    for replay in replays {
+        let _ = SessionEvent::try_from(replay.clone())?;
+        let admission = replay.admission.as_ref().ok_or_else(|| {
+            UsageStoreError::InvalidImport("response replay has no qualification".into())
+        })?;
+        validate_storage_partition_identity(tx, &admission.source_binding.partition)?;
+        let event_admission::NumericEventProof::ResponseRecord { candidate, .. } =
+            &admission.numeric
+        else {
+            return Err(UsageStoreError::InvalidImport(
+                "response replay has no root proof".into(),
+            ));
+        };
+        if !checkpoints.values().any(|checkpoint| {
+            admission.source_binding.matches_checkpoint(checkpoint)
+                && admission.verified_prefix_end == checkpoint.committed_offset
+        }) {
+            return Err(UsageStoreError::InvalidImport(
+                "response replay has no current source checkpoint".into(),
+            ));
+        }
+        let existing = source_events::response_by_key(tx, &candidate.key)?.ok_or_else(|| {
+            UsageStoreError::InvalidImport("response replay has no canonical event".into())
+        })?;
+        if !same_response(&existing, replay) {
+            return Err(UsageStoreError::InvalidImport(
+                "response replay conflicts with canonical usage".into(),
+            ));
+        }
+        clear_response_pending(tx, replay)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::type_complexity)]
 fn upsert_session_events(
     transaction: &rusqlite::Transaction<'_>,
@@ -6072,9 +6383,9 @@ fn upsert_session_events(
             event.timestamp,
             &event.model,
             event.total_tokens.to_string(),
-            event.input_tokens.to_string(),
-            event.cached_input_tokens.to_string(),
-            event.output_tokens.to_string(),
+            event.input_tokens.map(|value| value.to_string()),
+            event.cached_input_tokens.map(|value| value.to_string()),
+            event.output_tokens.map(|value| value.to_string()),
             event
                 .cache_write_input_tokens
                 .map(|value| value.to_string()),
@@ -6131,17 +6442,26 @@ fn upsert_session_events(
                             .parse()
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         input_tokens: row
-                            .get::<_, String>(12)?
-                            .parse()
-                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                            .get::<_, Option<String>>(12)?
+                            .map(|text| {
+                                canonical_u64_text(&text, "event input_tokens")
+                                    .map_err(|_| rusqlite::Error::InvalidQuery)
+                            })
+                            .transpose()?,
                         cached_input_tokens: row
-                            .get::<_, String>(13)?
-                            .parse()
-                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                            .get::<_, Option<String>>(13)?
+                            .map(|text| {
+                                canonical_u64_text(&text, "event cached_input_tokens")
+                                    .map_err(|_| rusqlite::Error::InvalidQuery)
+                            })
+                            .transpose()?,
                         output_tokens: row
-                            .get::<_, String>(14)?
-                            .parse()
-                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                            .get::<_, Option<String>>(14)?
+                            .map(|text| {
+                                canonical_u64_text(&text, "event output_tokens")
+                                    .map_err(|_| rusqlite::Error::InvalidQuery)
+                            })
+                            .transpose()?,
                         cache_write_input_tokens: row
                             .get::<_, Option<String>>(15)?
                             .map(|value| value.parse().map_err(|_| rusqlite::Error::InvalidQuery))
@@ -6432,11 +6752,8 @@ fn canonicalize_observations_with_sources(
     canonical_samples: &[UsageHistorySample],
     source_to_canonical: &BTreeMap<(i64, i64), (i64, i64)>,
 ) -> Result<CanonicalizedObservations> {
+    let canonical_scope = source_qualification_repair::CanonicalSourceScope::begin(transaction)?;
     let canonical_storage = canonical_history_constraints_present(transaction)?;
-    let samples_by_timestamp = canonical_samples
-        .iter()
-        .map(|sample| (sample.timestamp, sample))
-        .collect::<BTreeMap<_, _>>();
     let canonical_samples = canonical_samples
         .iter()
         .map(|sample| ((sample.reset_at, sample.timestamp), sample))
@@ -6470,6 +6787,16 @@ fn canonicalize_observations_with_sources(
         source_timestamps.insert(key, source_timestamp);
     }
     for (key, observation) in canonical.iter_mut() {
+        if canonical_scope.preserves_observation(key.0, key.1) {
+            let previous: Option<(i64,String,String)> = transaction.query_row(
+                "SELECT data_generation,data_hash,snapshot_json FROM durable_state WHERE singleton>=2 AND data_hash=?1",
+                [observation_data_hash(key.0,key.1)], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).optional()?;
+            if let Some((at, hash, json)) = previous {
+                *observation = observation_from_sql(at, hash, json)?;
+                continue;
+            }
+        }
         match observation.model_source {
             ModelSource::Confirmed
             | ModelSource::ReconstructedFromSession
@@ -6522,9 +6849,7 @@ fn canonicalize_observations_with_sources(
                 observation.luna_tokens = Some(sample.luna_tokens);
             }
             ModelSource::Unavailable => {
-                if canonical_samples.contains_key(key)
-                    || (canonical_storage && samples_by_timestamp.contains_key(&key.1))
-                {
+                if canonical_samples.contains_key(key) {
                     return Err(UsageStoreError::InvalidImport(
                         "unavailable observation conflicts with usage_history vector".into(),
                     ));
@@ -6571,6 +6896,7 @@ fn upsert_observations_with_sources(
     if observations.is_empty() {
         return Ok(Vec::new());
     }
+    let canonical_scope = source_qualification_repair::CanonicalSourceScope::begin(transaction)?;
     let mut next_singleton: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(singleton), 1) FROM durable_state",
         [],
@@ -6583,11 +6909,19 @@ fn upsert_observations_with_sources(
     }
     let mut persisted = BTreeMap::new();
     for observation in observations {
+        let mut observation = observation.clone();
+        if let Some(remaining) = quota_receipts::remaining_for_exact_minute(
+            transaction,
+            observation.reset_at,
+            observation.timestamp,
+        )? {
+            observation.remaining_percent = Some(remaining);
+        }
         let source_timestamp = source_timestamps
             .get(&(observation.reset_at, observation.timestamp))
             .copied();
         let snapshot_json =
-            observation_json_with_source_timestamp(transaction, observation, source_timestamp)?;
+            observation_json_with_source_timestamp(transaction, &observation, source_timestamp)?;
         let data_hash = observation_data_hash(observation.reset_at, observation.timestamp);
         let existing: Option<(i64, i64, String)> = transaction
             .query_row(
@@ -6618,6 +6952,10 @@ fn upsert_observations_with_sources(
             continue;
         };
         let existing = observation_from_sql(data_generation, data_hash.clone(), existing_json)?;
+        if canonical_scope.preserves_observation(observation.reset_at, observation.timestamp) {
+            persisted.insert((existing.reset_at, existing.timestamp), existing);
+            continue;
+        }
         let source_rank = |source: ModelSource| match source {
             ModelSource::Unavailable => 0,
             ModelSource::LegacyUnknown => 1,
@@ -6672,7 +7010,9 @@ fn upsert_observation_model_totals_with_saved_legacy_dollars(
     preserve_existing_before: Option<i64>,
     saved_legacy_dollars: Option<&BTreeMap<i64, SavedLegacyFamilyDollars>>,
 ) -> Result<()> {
-    let mut delete = transaction.prepare("DELETE FROM usage_model_history WHERE timestamp = ?1")?;
+    let canonical_scope = source_qualification_repair::CanonicalSourceScope::begin(transaction)?;
+    let mut delete = transaction
+        .prepare("DELETE FROM usage_model_history WHERE reset_at = ?1 AND timestamp = ?2 AND model NOT IN (SELECT value FROM json_each(?3))")?;
     let mut insert = transaction.prepare(
         "INSERT INTO usage_model_history (
             reset_at, timestamp, model, total_tokens, input_tokens,
@@ -6691,9 +7031,9 @@ fn upsert_observation_model_totals_with_saved_legacy_dollars(
             let exists: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM usage_model_history
-                    WHERE timestamp = ?1
+                    WHERE reset_at = ?1 AND timestamp = ?2
                 )",
-                [observation.timestamp],
+                params![observation.reset_at, observation.timestamp],
                 |row| row.get(0),
             )?;
             if exists {
@@ -6705,9 +7045,21 @@ fn upsert_observation_model_totals_with_saved_legacy_dollars(
                 continue;
             }
         }
-        let saved_prices = load_saved_model_prices(transaction, observation.timestamp)?;
-        delete.execute([observation.timestamp])?;
+        let saved_prices =
+            load_saved_model_prices(transaction, observation.reset_at, observation.timestamp)?;
+        let protected =
+            canonical_scope.preserved_models(observation.reset_at, observation.timestamp);
+        let protected_json = serde_json::to_string(&protected)
+            .map_err(|_| UsageStoreError::InvalidImport("invalid preserved model keys".into()))?;
+        delete.execute(params![
+            observation.reset_at,
+            observation.timestamp,
+            protected_json
+        ])?;
         for total in model_totals {
+            if protected.contains(&total.model) {
+                continue;
+            }
             let saved_fixed_dollars = family(&total.model)
                 .filter(|model_family| *model_family == total.model)
                 .and_then(|model_family| {
@@ -6726,9 +7078,9 @@ fn upsert_observation_model_totals_with_saved_legacy_dollars(
                 observation.timestamp,
                 &total.model,
                 total.total_tokens.to_string(),
-                total.input_tokens.to_string(),
-                total.cached_input_tokens.to_string(),
-                total.output_tokens.to_string(),
+                total.input_tokens.map(|value| value.to_string()),
+                total.cached_input_tokens.map(|value| value.to_string()),
+                total.output_tokens.map(|value| value.to_string()),
                 total
                     .cache_write_input_tokens
                     .map(|value| value.to_string()),
@@ -6744,9 +7096,9 @@ fn upsert_observation_model_totals_with_saved_legacy_dollars(
 #[derive(Clone, Debug)]
 struct SavedModelPrice {
     total_tokens: String,
-    input_tokens: String,
-    cached_input_tokens: String,
-    output_tokens: String,
+    input_tokens: Option<String>,
+    cached_input_tokens: Option<String>,
+    output_tokens: Option<String>,
     cache_write_input_tokens: Option<String>,
     total_dollars: Option<f64>,
     price_version: Option<String>,
@@ -6784,7 +7136,7 @@ fn load_saved_legacy_family_dollars(
 ) -> Result<BTreeMap<i64, SavedLegacyFamilyDollars>> {
     let mut saved = BTreeMap::new();
     for sample in samples {
-        let values: Option<(f64, f64, f64)> = connection
+        let values: Option<(Option<f64>, Option<f64>, Option<f64>)> = connection
             .query_row(
                 "SELECT sol_dollars, terra_dollars, luna_dollars
                  FROM usage_history WHERE timestamp=?1 AND reset_at=?2",
@@ -6792,7 +7144,7 @@ fn load_saved_legacy_family_dollars(
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((sol, terra, luna)) = values else {
+        let Some((Some(sol), Some(terra), Some(luna))) = values else {
             continue;
         };
         let mut families_with_exact_models = BTreeSet::new();
@@ -6825,14 +7177,15 @@ fn load_saved_legacy_family_dollars(
 
 fn load_saved_model_prices(
     connection: &Connection,
+    reset_at: i64,
     timestamp: i64,
 ) -> Result<BTreeMap<String, SavedModelPrice>> {
     let mut statement = connection.prepare(
         "SELECT model, total_tokens, input_tokens, cached_input_tokens,
                 output_tokens, cache_write_input_tokens, total_dollars, price_version
-         FROM usage_model_history WHERE timestamp=?1",
+         FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2",
     )?;
-    let rows = statement.query_map([timestamp], |row| {
+    let rows = statement.query_map(params![reset_at, timestamp], |row| {
         Ok((
             row.get::<_, String>(0)?,
             SavedModelPrice {
@@ -6882,9 +7235,10 @@ fn model_history_price_with_legacy_fallback(
     let legacy_family = family(&total.model).filter(|model_family| *model_family == total.model);
     if let Some(saved) = saved {
         let same_usage = saved.total_tokens == total.total_tokens.to_string()
-            && saved.input_tokens == total.input_tokens.to_string()
-            && saved.cached_input_tokens == total.cached_input_tokens.to_string()
-            && saved.output_tokens == total.output_tokens.to_string()
+            && saved.input_tokens == total.input_tokens.map(|value| value.to_string())
+            && saved.cached_input_tokens
+                == total.cached_input_tokens.map(|value| value.to_string())
+            && saved.output_tokens == total.output_tokens.map(|value| value.to_string())
             && saved.cache_write_input_tokens
                 == total
                     .cache_write_input_tokens
@@ -6910,11 +7264,11 @@ fn model_history_price_with_legacy_fallback(
             return (None, None);
         }
     }
-    let usage = Usage {
-        input_tokens: total.input_tokens,
-        cached_input_tokens: total.cached_input_tokens,
-        cache_write_input_tokens: total.cache_write_input_tokens,
-        output_tokens: total.output_tokens,
+    if legacy_family.is_none() && saved.is_some_and(|price| price.price_version.is_none()) {
+        return (None, None);
+    }
+    let Some(usage) = total.pricing_usage() else {
+        return (None, saved.and_then(|price| price.price_version.clone()));
     };
     let cost = if let Some(model_family) = legacy_family {
         // The frozen SOL/TERRA/LUNA family projections historically priced
@@ -6936,7 +7290,7 @@ fn model_history_price_with_legacy_fallback(
     };
     cost.filter(|cost| cost.total_dollars.is_finite() && cost.total_dollars >= 0.0)
         .map(|cost| (Some(cost.total_dollars), Some(cost.price_version)))
-        .unwrap_or((None, None))
+        .unwrap_or_else(|| (None, saved.and_then(|price| price.price_version.clone())))
 }
 
 fn numeric_sqlite_value(value: Value) -> Option<f64> {
@@ -7112,6 +7466,10 @@ fn load_valid_samples_from_table(
 }
 
 fn legacy_raw_evidence(connection: &Connection) -> Result<(usize, String)> {
+    let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version >= 16 {
+        validate_nullable_canonical_history_storage(connection)?;
+    }
     let mut statement = connection.prepare(
         "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
                 terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
@@ -7122,7 +7480,7 @@ fn legacy_raw_evidence(connection: &Connection) -> Result<(usize, String)> {
     digest.update(b"codex-info-legacy-usage-history-sqlite-values-v1\0");
     let mut row_count = 0_usize;
     while let Some(row) = rows.next()? {
-        if canonicalizable_legacy_sample_from_row(row)?.is_none() {
+        if version < 16 && canonicalizable_legacy_sample_from_row(row)?.is_none() {
             return Err(UsageStoreError::InvalidImport(
                 "usage_history contains an invalid raw row".into(),
             ));
@@ -7158,6 +7516,10 @@ fn legacy_raw_evidence(connection: &Connection) -> Result<(usize, String)> {
 }
 
 const HISTORY_CANONICAL_INDEX_NAMES: [&str; 2] = [
+    "usage_history_canonical_period_timestamp_idx",
+    "usage_model_history_canonical_period_timestamp_model_idx",
+];
+const LEGACY_HISTORY_CANONICAL_INDEX_NAMES: [&str; 2] = [
     "usage_history_canonical_timestamp_idx",
     "usage_model_history_canonical_timestamp_model_idx",
 ];
@@ -7205,12 +7567,158 @@ fn named_schema_object_count(connection: &Connection, kind: &str, names: &[&str]
 }
 
 fn canonical_history_constraints_present(connection: &Connection) -> Result<bool> {
-    Ok(
-        named_schema_object_count(connection, "index", &HISTORY_CANONICAL_INDEX_NAMES)?
-            == HISTORY_CANONICAL_INDEX_NAMES.len()
-            && named_schema_object_count(connection, "trigger", &HISTORY_CANONICAL_TRIGGER_NAMES)?
-                == HISTORY_CANONICAL_TRIGGER_NAMES.len(),
-    )
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let indexes = if version >= 16 {
+        &HISTORY_CANONICAL_INDEX_NAMES
+    } else {
+        &LEGACY_HISTORY_CANONICAL_INDEX_NAMES
+    };
+    let present = named_schema_object_count(connection, "index", indexes)? == indexes.len()
+        && named_schema_object_count(connection, "trigger", &HISTORY_CANONICAL_TRIGGER_NAMES)?
+            == HISTORY_CANONICAL_TRIGGER_NAMES.len();
+    if present && version >= 16 {
+        codex_info_db_reader::validate_canonical_history_tables(connection)
+            .map_err(|error| UsageStoreError::InvalidImport(error.to_string()))?;
+    }
+    Ok(present)
+}
+
+/// Changes storage constraints only. Call within the verified migration (or
+/// first, still-empty partition creation) transaction, before installing guards.
+fn migrate_nullable_history_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    const TABLES: &[(&str, &[&str])] = &[
+        (
+            "usage_history",
+            &[
+                "sol_dollars",
+                "terra_dollars",
+                "luna_dollars",
+                "sol_tokens",
+                "terra_tokens",
+                "luna_tokens",
+            ],
+        ),
+        (
+            "usage_model_history",
+            &[
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "cache_write_input_tokens",
+            ],
+        ),
+        (
+            "session_model_totals",
+            &[
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "cache_write_input_tokens",
+            ],
+        ),
+        (
+            "session_events",
+            &[
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "cache_write_input_tokens",
+            ],
+        ),
+        (
+            "session_checkpoints",
+            &[
+                "previous_total",
+                "previous_input",
+                "previous_cached_input",
+                "previous_output",
+                "previous_cache_write_input",
+            ],
+        ),
+    ];
+    // Preserve every other existing index/trigger. Capture SQL before ALTER can
+    // rename its references; reinstall only after all original names exist.
+    let mut statement = transaction.prepare(
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema
+         WHERE type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name",
+    )?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut restore = Vec::new();
+    for (kind, name, table, sql) in objects {
+        let target_table = TABLES.iter().any(|(target, _)| *target == table);
+        let replaced = HISTORY_CANONICAL_TRIGGER_NAMES.contains(&name.as_str())
+            || HISTORY_CANONICAL_INDEX_NAMES.contains(&name.as_str())
+            || LEGACY_HISTORY_CANONICAL_INDEX_NAMES.contains(&name.as_str());
+        if kind == "trigger" || (kind == "index" && target_table) {
+            let quoted = name.replace('"', "\"\"");
+            transaction.execute_batch(&format!("DROP {kind} \"{quoted}\";"))?;
+            if !replaced {
+                restore.push(sql);
+            }
+        }
+    }
+    for (table, nullable) in TABLES {
+        let prefix = if *table == "usage_history" {
+            format!("CREATE TABLE IF NOT EXISTS {table} (")
+        } else {
+            format!("CREATE TABLE {table} (")
+        };
+        let schema = if *table == "usage_history" {
+            SCHEMA
+        } else {
+            PARTITION_SCHEMA
+        };
+        let source = schema.find(&prefix).ok_or_else(|| {
+            UsageStoreError::InvalidImport("nullable table definition is missing".into())
+        })?;
+        let end = schema[source..].find(';').ok_or_else(|| {
+            UsageStoreError::InvalidImport("nullable table definition is incomplete".into())
+        })? + source;
+        let mut definition = schema[source..=end].to_owned();
+        for column in *nullable {
+            for (old, new) in [
+                (
+                    format!("{column} INTEGER NOT NULL DEFAULT 0"),
+                    format!("{column} INTEGER"),
+                ),
+                (format!("{column} REAL NOT NULL"), format!("{column} REAL")),
+                (format!("{column} TEXT NOT NULL"), format!("{column} TEXT")),
+            ] {
+                definition = definition.replace(&old, &new);
+            }
+        }
+        let mut statement =
+            transaction.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
+        let columns = statement
+            .query_map([table], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let columns = columns
+            .iter()
+            .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let previous = format!("{table}_schema_migration_input");
+        transaction.execute_batch(&format!(
+            "ALTER TABLE {table} RENAME TO {previous};\n{definition}\n\
+             INSERT INTO {table} ({columns}) SELECT {columns} FROM {previous};\n\
+             DROP TABLE {previous};"
+        ))?;
+    }
+    for sql in restore {
+        transaction.execute_batch(&sql)?;
+    }
+    Ok(())
 }
 
 fn load_history_model_groups(connection: &Connection) -> Result<Vec<HistoryModelGroup>> {
@@ -7244,12 +7752,18 @@ fn load_history_model_groups(connection: &Connection) -> Result<Vec<HistoryModel
         let total = SessionModelTotal {
             model: row.get(2)?,
             total_tokens: canonical_u64_text(&row.get::<_, String>(3)?, "history total")?,
-            input_tokens: canonical_u64_text(&row.get::<_, String>(4)?, "history input")?,
-            cached_input_tokens: canonical_u64_text(
-                &row.get::<_, String>(5)?,
+            input_tokens: canonical_optional_u64_text(
+                row.get::<_, Option<String>>(4)?.as_deref(),
+                "history input",
+            )?,
+            cached_input_tokens: canonical_optional_u64_text(
+                row.get::<_, Option<String>>(5)?.as_deref(),
                 "history cached input",
             )?,
-            output_tokens: canonical_u64_text(&row.get::<_, String>(6)?, "history output")?,
+            output_tokens: canonical_optional_u64_text(
+                row.get::<_, Option<String>>(6)?.as_deref(),
+                "history output",
+            )?,
             cache_write_input_tokens: cache_write
                 .as_deref()
                 .map(|value| canonical_u64_text(value, "history cache write"))
@@ -7299,6 +7813,10 @@ fn validate_canonical_history_storage(connection: &Connection) -> Result<()> {
             "canonical history constraint set is incomplete".into(),
         ));
     }
+    let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version >= 16 {
+        return validate_nullable_canonical_history_storage(connection);
+    }
     let invalid: i64 = connection.query_row(
         "SELECT COUNT(*) FROM usage_history
          WHERE typeof(timestamp) <> 'integer' OR timestamp <= 0 OR timestamp % 60 <> 0
@@ -7344,10 +7862,9 @@ fn validate_canonical_history_storage(connection: &Connection) -> Result<()> {
     while let Some(row) = rows.next()? {
         let observation = observation_from_sql(row.get(0)?, row.get(1)?, row.get(2)?)?;
         if observation.model_source == ModelSource::Unavailable {
-            if samples
-                .iter()
-                .any(|sample| sample.timestamp == observation.timestamp)
-            {
+            if samples.iter().any(|sample| {
+                sample.timestamp == observation.timestamp && sample.reset_at == observation.reset_at
+            }) {
                 return Err(UsageStoreError::InvalidImport(
                     "unavailable durable observation conflicts with canonical usage".into(),
                 ));
@@ -7395,11 +7912,79 @@ fn validate_canonical_history_storage(connection: &Connection) -> Result<()> {
             .filter_map(|(field, matches)| (!matches).then_some(field))
             .collect::<Vec<_>>()
             .join(",");
+            return Err(UsageStoreError::InvalidImport(format!(
+                "durable history observation differs from canonical usage at timestamp={} reset_at={} fields={mismatched_fields}",
+                observation.timestamp, observation.reset_at
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_nullable_canonical_history_storage(connection: &Connection) -> Result<()> {
+    let mut statement=connection.prepare("SELECT timestamp,reset_at,remaining_percent,sol_dollars,terra_dollars,luna_dollars,sol_tokens,terra_tokens,luna_tokens FROM usage_history")?;
+    let mut rows = statement.query([])?;
+    let mut samples = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let timestamp: i64 = row.get(0)?;
+        let reset: i64 = row.get(1)?;
+        let dollars = [row.get::<_, Option<f64>>(3)?, row.get(4)?, row.get(5)?];
+        let tokens = [row.get::<_, Option<i64>>(6)?, row.get(7)?, row.get(8)?];
+        let remaining: Option<f64> = row.get(2)?;
+        if !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&timestamp)
+            || timestamp % 60 != 0
+            || !(timestamp..=MAX_PUBLIC_UNIX_SECONDS).contains(&reset)
+            || remaining.is_some_and(|v| !v.is_finite() || !(0.0..=100.0).contains(&v))
+            || dollars
+                .into_iter()
+                .flatten()
+                .any(|v| !v.is_finite() || v < 0.0)
+            || tokens.into_iter().flatten().any(|v| v < 0)
+        {
             return Err(UsageStoreError::InvalidImport(
-                format!(
-                    "durable history observation differs from canonical usage at timestamp={} reset_at={} fields={mismatched_fields}",
-                    observation.timestamp, observation.reset_at
-                ),
+                "canonical nullable history contains invalid rows".into(),
+            ));
+        }
+        samples.insert((reset, timestamp), (remaining, dollars, tokens));
+    }
+    for group in load_history_model_groups(connection)? {
+        if !samples.contains_key(&(group.reset_at, group.timestamp)) {
+            return Err(UsageStoreError::InvalidImport(
+                "history model row has no canonical usage parent".into(),
+            ));
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT data_generation,data_hash,snapshot_json FROM durable_state WHERE singleton>=2",
+    )?;
+    for value in statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
+        let (at, hash, json) = value?;
+        let observation = observation_from_sql(at, hash, json)?;
+        let raw = samples.get(&(observation.reset_at, observation.timestamp));
+        if observation.model_source == ModelSource::Unavailable {
+            if raw.is_some() {
+                return Err(UsageStoreError::InvalidImport(
+                    "unavailable observation conflicts with canonical history".into(),
+                ));
+            }
+            continue;
+        }
+        let expected = (
+            observation.remaining_percent,
+            [
+                observation.sol_dollars,
+                observation.terra_dollars,
+                observation.luna_dollars,
+            ],
+            [
+                observation.sol_tokens.map(|v| v as i64),
+                observation.terra_tokens.map(|v| v as i64),
+                observation.luna_tokens.map(|v| v as i64),
+            ],
+        );
+        if raw != Some(&expected) {
+            return Err(UsageStoreError::InvalidImport(
+                "durable nullable history differs from canonical usage".into(),
             ));
         }
     }
@@ -7596,7 +8181,7 @@ fn rewrite_canonical_history(
     for group in canonical_models {
         saved_prices_by_source.insert(
             (group.source_timestamp, group.source_reset_at),
-            load_saved_model_prices(transaction, group.source_timestamp)?,
+            load_saved_model_prices(transaction, group.source_reset_at, group.source_timestamp)?,
         );
     }
     transaction.execute("DELETE FROM usage_model_history", [])?;
@@ -7651,9 +8236,9 @@ fn rewrite_canonical_history(
                     group.timestamp,
                     &total.model,
                     total.total_tokens.to_string(),
-                    total.input_tokens.to_string(),
-                    total.cached_input_tokens.to_string(),
-                    total.output_tokens.to_string(),
+                    total.input_tokens.map(|value| value.to_string()),
+                    total.cached_input_tokens.map(|value| value.to_string()),
+                    total.output_tokens.map(|value| value.to_string()),
                     total
                         .cache_write_input_tokens
                         .map(|value| value.to_string()),
@@ -8090,7 +8675,9 @@ fn validate_observation_json(snapshot_json: &str) -> Result<serde_json::Value> {
             let Some(value) = object.get(name) else {
                 return false;
             };
-            if is_integer {
+            if value.is_null() && empty_model_set_complete.as_bool() == Some(false) {
+                true
+            } else if is_integer {
                 value.as_u64() == Some(0)
             } else {
                 value.as_f64() == Some(0.0)
@@ -8316,6 +8903,7 @@ pub fn group_reset_periods(samples: &[UsageHistorySample]) -> Vec<ResetPeriod> {
 /// Persistent SQLite storage for minute-level usage samples.
 pub struct UsageStore {
     connection: Connection,
+    period_evidence_cache: std::cell::RefCell<period_evidence::EvidenceCache>,
 }
 
 fn validate_partition_file(path: &Path) -> Result<()> {
@@ -8475,6 +9063,9 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                 ("history_base_pending", "INTEGER", 0),
                 ("context_usage_tokens", "TEXT", 0),
                 ("context_window_tokens", "TEXT", 0),
+                ("last_model_context_kind", "TEXT", 0),
+                ("last_model_interval", "TEXT", 0),
+                ("source_admission", "TEXT", 0),
             ],
         ),
         (
@@ -8533,6 +9124,9 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                 ("cached_input_tokens", "TEXT", 0),
                 ("output_tokens", "TEXT", 0),
                 ("cache_write_input_tokens", "TEXT", 0),
+                ("reset_at", "INTEGER", 0),
+                ("window_seconds", "INTEGER", 0),
+                ("admission_json", "TEXT", 0),
             ],
         ),
         (
@@ -8665,6 +9259,36 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     let mut actual_tables = table_statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    // The attribution owner adds this complete auxiliary bundle without
+    // rewriting the existing versioned numeric ledger. Partial/malformed
+    // bundles and arbitrary extra tables remain schema errors.
+    let period_tables = [
+        "official_period_inputs",
+        "period_evidence_snapshots",
+        "period_evidence_head",
+    ];
+    if period_tables
+        .iter()
+        .any(|table| actual_tables.contains(*table))
+    {
+        period_evidence::validate_schema(connection)?;
+        for table in period_tables {
+            actual_tables.remove(table);
+        }
+    }
+    if recorded_usage::TABLES
+        .iter()
+        .any(|table| actual_tables.contains(*table))
+    {
+        recorded_usage::validate_schema(connection)?;
+        for table in recorded_usage::TABLES {
+            actual_tables.remove(table);
+        }
+    }
+    if actual_tables.contains("source_prefix_repairs") {
+        source_qualification_repair::validate_schema(connection)?;
+        actual_tables.remove("source_prefix_repairs");
+    }
     let mut expected_tables = TABLES
         .iter()
         .map(|(table, _)| (*table).to_owned())
@@ -8676,7 +9300,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     // Old partitions may lack it; their existing history is already canonical.
     let receipt_table_present = actual_tables.contains("quota_receipts");
     let quota_health_present = actual_tables.contains("quota_acquisition_state");
-    if schema_version < ACCOUNT_DB_SCHEMA_VERSION {
+    if schema_version < 15 {
         expected_tables.remove("quota_receipts");
         expected_tables.remove("quota_acquisition_state");
         actual_tables.remove("quota_receipts");
@@ -8768,7 +9392,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         }
         if ((*table == "quota_receipts" && !receipt_table_present)
             || (*table == "quota_acquisition_state" && !quota_health_present))
-            && schema_version < ACCOUNT_DB_SCHEMA_VERSION
+            && schema_version < 15
         {
             continue;
         }
@@ -8820,7 +9444,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                         || actual.as_slice() == &expected[..19]
                         || actual.as_slice() == &expected[..20]
                 }
-                1..=ACCOUNT_DB_SCHEMA_VERSION => {
+                1..=15 => {
                     actual.as_slice() == &expected[..19] || actual.as_slice() == &expected[..20]
                 }
                 _ => false,
@@ -8828,6 +9452,14 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         let legacy_storage_partition_login_id = *table == "storage_partition"
             && schema_version < 9
             && actual.len() + 1 == expected.len()
+            && actual == expected[..actual.len()];
+        let legacy_model_context_kind = *table == "session_checkpoints"
+            && schema_version < 16
+            && actual.len() + 3 == expected.len()
+            && actual == expected[..actual.len()];
+        let legacy_event_qualification = *table == "session_events"
+            && schema_version < 16
+            && actual.len() + 3 == expected.len()
             && actual == expected[..actual.len()];
         let legacy_usage_model_pricing_columns = *table == "usage_model_history"
             && schema_version < HISTORY_CANONICAL_SCHEMA_VERSION
@@ -8840,7 +9472,9 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         let legacy_active_thread_snapshot_columns = *table == "active_thread_snapshot"
             && schema_version < 7
             && actual == legacy_active_thread_snapshot_columns();
-        if actual != expected
+        let current_shape = actual == expected
+            && !(matches!(*table, "session_checkpoints" | "session_events") && schema_version < 16);
+        if !current_shape
             && !(allow_unversioned_legacy
                 && ((*table == "recorder_gap_ledger"
                     && actual == legacy_recorder_gap_ledger_columns())
@@ -8848,6 +9482,8 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                     || legacy_cache_write_columns
                     || legacy_storage_partition_login_id))
             && !legacy_session_checkpoint_shape
+            && !legacy_model_context_kind
+            && !legacy_event_qualification
             && !legacy_active_thread_snapshot_columns
             && !legacy_storage_partition_login_id
             && !legacy_usage_model_pricing_columns
@@ -8857,6 +9493,34 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             return Err(UsageStoreError::InvalidImport(format!(
                 "account partition {table} schema mismatch"
             )));
+        }
+        if *table == "session_checkpoints" && schema_version >= 16 {
+            let nullable_without_default: bool = connection.query_row(
+                "SELECT count(*)=3 AND min(\"notnull\"=0 AND dflt_value IS NULL)
+                 FROM pragma_table_info('session_checkpoints')
+                 WHERE name IN ('last_model_context_kind','last_model_interval','source_admission')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !nullable_without_default {
+                return Err(UsageStoreError::InvalidImport(
+                    "checkpoint model context kind must preserve legacy unknown state".into(),
+                ));
+            }
+        }
+        if *table == "session_events" && schema_version >= 16 {
+            let nullable_without_default: bool = connection.query_row(
+                "SELECT count(*)=3 AND min(\"notnull\"=0 AND dflt_value IS NULL)
+                 FROM pragma_table_info('session_events')
+                 WHERE name IN ('reset_at','window_seconds','admission_json')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !nullable_without_default {
+                return Err(UsageStoreError::InvalidImport(
+                    "event qualification must preserve legacy unknown state".into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -9111,6 +9775,17 @@ fn ensure_session_event_schema(transaction: &rusqlite::Transaction<'_>) -> Resul
             cached_input_tokens TEXT NOT NULL,
             output_tokens TEXT NOT NULL,
             cache_write_input_tokens TEXT,
+            reset_at INTEGER,
+            window_seconds INTEGER,
+            admission_json TEXT,
+            CHECK (
+                (reset_at IS NULL AND window_seconds IS NULL)
+                OR (reset_at IS NOT NULL AND window_seconds IS NOT NULL
+                    AND reset_at BETWEEN 1 AND 253402300799
+                    AND window_seconds > 0 AND reset_at-window_seconds >= 1
+                    AND admission_json IS NOT NULL)
+            ),
+            CHECK (admission_json IS NULL OR json_valid(admission_json)),
             PRIMARY KEY (
                 root_identity,
                 relative_path,
@@ -9125,6 +9800,22 @@ fn ensure_session_event_schema(transaction: &rusqlite::Transaction<'_>) -> Resul
         ) WITHOUT ROWID;
         "#,
     )?;
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS session_events_observation_time ON session_events(timestamp);",
+    )?;
+    // Legacy migrations add the qualification columns below, before creating
+    // the exact-period index on their initialized v16 representation.
+    let has_period: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_events') WHERE name='reset_at')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_period {
+        transaction.execute_batch("CREATE INDEX IF NOT EXISTS session_events_official_period ON session_events(reset_at,window_seconds,timestamp);
+         CREATE UNIQUE INDEX IF NOT EXISTS session_events_response_identity
+         ON session_events(json_extract(admission_json,'$.numeric.candidate.key'))
+         WHERE json_extract(admission_json,'$.numeric.kind')='response-record';")?;
+    }
     Ok(())
 }
 
@@ -9813,6 +10504,10 @@ impl UsageStore {
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(PARTITION_SCHEMA)?;
         transaction.execute_batch(quota_receipts::SCHEMA)?;
+        transaction.execute_batch(period_evidence::SCHEMA)?;
+        transaction.execute_batch(source_qualification_repair::SCHEMA)?;
+        transaction.execute_batch(source_qualification_repair::CANDIDATE_INDEX_SCHEMA)?;
+        transaction.execute_batch(recorded_usage::SCHEMA)?;
         transaction.execute_batch(session_quota_recovery::WINDOW_SCHEMA)?;
         quota_receipts::ensure_health_schema(&transaction)?;
         ensure_collection_generation_live_quota_schema(&transaction, false)?;
@@ -9829,8 +10524,9 @@ impl UsageStore {
         ensure_session_event_schema(&transaction)?;
         ensure_session_task_event_schema(&transaction)?;
         ensure_active_thread_snapshot_schema(&transaction)?;
-        ensure_canonical_history_constraints(&transaction)?;
+        migrate_nullable_history_schema(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
+        ensure_canonical_history_constraints(&transaction)?;
         transaction.execute(
             "INSERT INTO storage_partition (
                 singleton, schema_version, profile_scope_id, account_scope_id,
@@ -9848,7 +10544,10 @@ impl UsageStore {
         Self::ensure_recent_history_covering_index(&transaction)?;
         validate_storage_partition(&transaction, identity)?;
         transaction.commit()?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            period_evidence_cache: Default::default(),
+        })
     }
 
     /// Opens an initialized account partition only after its durable identity
@@ -10218,6 +10917,66 @@ impl UsageStore {
         })
     }
 
+    /// Verifies a separately preserved SQLite backup without creating or
+    /// rotating any backup generation. Migration remains a separate action.
+    pub fn verify_preserved_partition_backup(
+        path: &Path,
+        preserved: &Path,
+        identity: &StoragePartitionIdentity,
+    ) -> Result<VerifiedPartitionBackup> {
+        if !path.is_absolute() || !preserved.is_absolute() {
+            return Err(UsageStoreError::InvalidImport(
+                "preserved partition backup paths must be absolute".into(),
+            ));
+        }
+        validate_partition_file(path)?;
+        validate_partition_file(preserved)?;
+        if fs::canonicalize(path)? == fs::canonicalize(preserved)? {
+            return Err(UsageStoreError::InvalidImport(
+                "preserved partition backup must be a separate file".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let source = fs::metadata(path)?;
+            let backup = fs::metadata(preserved)?;
+            if (source.dev(), source.ino()) == (backup.dev(), backup.ino()) {
+                return Err(UsageStoreError::InvalidImport(
+                    "preserved partition backup aliases the source file".into(),
+                ));
+            }
+        }
+        let source = Self::open_read_only_partitioned(path, identity)?;
+        let backup = Self::open_read_only_partitioned(preserved, identity)?;
+        source
+            .connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN;")?;
+        backup
+            .connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN;")?;
+        backup.verify_integrity()?;
+        if account_db_schema_version(&source.connection)?
+            != account_db_schema_version(&backup.connection)?
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "preserved partition backup schema differs from source".into(),
+            ));
+        }
+        let (raw_rows, raw_fingerprint) = legacy_raw_evidence(&backup.connection)?;
+        if legacy_raw_evidence(&source.connection)? != (raw_rows, raw_fingerprint.clone()) {
+            return Err(UsageStoreError::InvalidImport(
+                "partition changed after its preserved backup".into(),
+            ));
+        }
+        Ok(VerifiedPartitionBackup {
+            database: path.to_owned(),
+            partition_id: identity.partition_id.clone(),
+            raw_rows,
+            raw_fingerprint,
+        })
+    }
+
     /// Returns true only when this exact partition already has the current,
     /// internally consistent single-table canonical history. A legacy schema
     /// is a normal `false`; malformed or mismatched partitions remain errors.
@@ -10285,6 +11044,9 @@ impl UsageStore {
         }
         ensure_collection_generation_live_quota_schema(&transaction, true)?;
         transaction.execute_batch(quota_receipts::SCHEMA)?;
+        transaction.execute_batch(period_evidence::SCHEMA)?;
+        transaction.execute_batch(source_qualification_repair::SCHEMA)?;
+        transaction.execute_batch(recorded_usage::SCHEMA)?;
         transaction.execute_batch(session_quota_recovery::WINDOW_SCHEMA)?;
         quota_receipts::ensure_health_schema(&transaction)?;
         if version == LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION
@@ -10292,14 +11054,15 @@ impl UsageStore {
             || version == SESSION_TOKEN_ANCHOR_PREVIOUS_SCHEMA_VERSION
             || version == HISTORY_CANONICAL_SCHEMA_VERSION
             || version == 14
+            || version == 15
         {
-            // Versions 10 through 14 already have canonical single-table
-            // history. Add only the columns/tables introduced by the selected
-            // versions; rewriting accepted history would change no authority.
+            // Canonical inputs preserve their accepted keys and values. Only
+            // metadata and nullable/exact-period constraints change here.
             ensure_usage_model_history_schema(&transaction)?;
             ensure_session_token_anchor_recovery_schema(&transaction)?;
+            migrate_nullable_history_schema(&transaction)?;
             stamp_current_account_db_schema(&transaction)?;
-            validate_canonical_history_storage(&transaction)?;
+            ensure_canonical_history_constraints(&transaction)?;
             validate_storage_partition(&transaction, identity)?;
             transaction.commit()?;
             let read_back = Self::open_read_only_partitioned(path, identity)?;
@@ -10337,8 +11100,9 @@ impl UsageStore {
             &canonical_models,
             &canonical_observations,
         )?;
-        ensure_canonical_history_constraints(&transaction)?;
+        migrate_nullable_history_schema(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
+        ensure_canonical_history_constraints(&transaction)?;
         validate_storage_partition(&transaction, identity)?;
         transaction.commit()?;
 
@@ -10400,6 +11164,10 @@ impl UsageStore {
         connection.busy_timeout(Duration::from_secs(2))?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(SCHEMA)?;
+        transaction.execute_batch(period_evidence::SCHEMA)?;
+        transaction.execute_batch(source_qualification_repair::SCHEMA)?;
+        transaction.execute_batch(source_qualification_repair::CANDIDATE_INDEX_SCHEMA)?;
+        transaction.execute_batch(recorded_usage::SCHEMA)?;
         ensure_durable_state_schema(&transaction)?;
         quota_receipts::ensure_health_schema(&transaction)?;
         // A database must already have the current schema. Older formats are
@@ -10419,7 +11187,10 @@ impl UsageStore {
         validate_recorded_sessions_schema(&transaction)?;
         Self::ensure_recent_history_covering_index(&transaction)?;
         transaction.commit()?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            period_evidence_cache: Default::default(),
+        })
     }
 
     /// Opens an existing current-schema database without creating files,
@@ -10453,7 +11224,10 @@ impl UsageStore {
                 ));
             }
         }
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            period_evidence_cache: Default::default(),
+        })
     }
 
     /// Keeps the bounded recent-history read covered even for databases that
@@ -10974,12 +11748,18 @@ impl UsageStore {
                 entry.0.push(SessionModelTotal {
                     model: row.get(2)?,
                     total_tokens: canonical_u64_text(&row.get::<_, String>(3)?, "history total")?,
-                    input_tokens: canonical_u64_text(&row.get::<_, String>(4)?, "history input")?,
-                    cached_input_tokens: canonical_u64_text(
-                        &row.get::<_, String>(5)?,
+                    input_tokens: canonical_optional_u64_text(
+                        row.get::<_, Option<String>>(4)?.as_deref(),
+                        "history input",
+                    )?,
+                    cached_input_tokens: canonical_optional_u64_text(
+                        row.get::<_, Option<String>>(5)?.as_deref(),
                         "history cached input",
                     )?,
-                    output_tokens: canonical_u64_text(&row.get::<_, String>(6)?, "history output")?,
+                    output_tokens: canonical_optional_u64_text(
+                        row.get::<_, Option<String>>(6)?.as_deref(),
+                        "history output",
+                    )?,
                     cache_write_input_tokens: cache_write
                         .as_deref()
                         .map(|value| canonical_u64_text(value, "history cache write"))
@@ -11614,7 +12394,7 @@ impl UsageStore {
                     token_baseline_known, {history_base_column}, last_model,
                     {task_running_column}, {context_usage_column},
                     {context_window_column}, previous_total, previous_input,
-                    previous_cached_input, previous_output, {cache_write_column}
+                    previous_cached_input, previous_output, {cache_write_column}, {model_context_kind_column}, {model_interval_column}, {source_admission_column}
              FROM session_checkpoints
              ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation",
             history_base_column = if session_checkpoint_history_base_column_present(&transaction)? {
@@ -11622,6 +12402,21 @@ impl UsageStore {
             } else {
                 "0"
             },
+            model_context_kind_column = if cache_write_column_present(
+                &transaction,
+                "session_checkpoints",
+                "last_model_context_kind"
+            )? {
+                "last_model_context_kind"
+            } else {
+                "NULL"
+            },
+            model_interval_column = if cache_write_column_present(
+                &transaction, "session_checkpoints", "last_model_interval"
+            )? { "last_model_interval" } else { "NULL" },
+            source_admission_column = if cache_write_column_present(
+                &transaction, "session_checkpoints", "source_admission"
+            )? { "source_admission" } else { "NULL" },
             cache_write_column = if cache_write_column_present(
                 &transaction,
                 "session_checkpoints",
@@ -11683,6 +12478,31 @@ impl UsageStore {
                     token_baseline_known: row.get::<_, i64>(11)? == 1,
                     history_base_pending: row.get::<_, i64>(12)? == 1,
                     last_model: row.get(13)?,
+                    last_model_context_kind: row
+                        .get::<_, Option<String>>(22)?
+                        .as_deref()
+                        .map(|value| {
+                            SessionModelContextKind::parse(value)
+                                .ok_or(rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
+                    last_model_interval: row
+                        .get::<_, Option<String>>(23)?
+                        .as_deref()
+                        .map(|value| {
+                            SessionModelInterval::parse(value).ok_or(rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
+                    source_admission: row
+                        .get::<_, Option<String>>(24)?
+                        .map(|value| {
+                            source_admission::SourceAdmission::from_storage(
+                                &value,
+                                committed_offset as u64,
+                            )
+                            .ok_or(rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                     last_task_running: match row.get::<_, Option<i64>>(14)? {
                         None => None,
                         Some(0) => Some(false),
@@ -11692,21 +12512,33 @@ impl UsageStore {
                     context_usage_tokens,
                     context_window_tokens,
                     previous_total: row
-                        .get::<_, String>(17)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        .get::<_, Option<String>>(17)?
+                        .map(|text| {
+                            canonical_u64_text(&text, "checkpoint previous_total")
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                     previous_input: row
-                        .get::<_, String>(18)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        .get::<_, Option<String>>(18)?
+                        .map(|text| {
+                            canonical_u64_text(&text, "checkpoint previous_input")
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                     previous_cached_input: row
-                        .get::<_, String>(19)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        .get::<_, Option<String>>(19)?
+                        .map(|text| {
+                            canonical_u64_text(&text, "checkpoint previous_cached_input")
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                     previous_output: row
-                        .get::<_, String>(20)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        .get::<_, Option<String>>(20)?
+                        .map(|text| {
+                            canonical_u64_text(&text, "checkpoint previous_output")
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                     previous_cache_write_input: row
                         .get::<_, Option<String>>(21)?
                         .map(|text| {
@@ -11721,6 +12553,7 @@ impl UsageStore {
         for checkpoint in &checkpoints {
             validate_session_checkpoint(checkpoint)?;
         }
+        validate_source_binding_partitions(&transaction, &checkpoints)?;
 
         let model_totals = {
             let write_column = if cache_write_column_present(
@@ -11751,17 +12584,26 @@ impl UsageStore {
                         .parse()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     input_tokens: row
-                        .get::<_, String>(2)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        .get::<_, Option<String>>(2)?
+                        .map(|text| {
+                            canonical_u64_text(&text, "model input_tokens")
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                     cached_input_tokens: row
-                        .get::<_, String>(3)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        .get::<_, Option<String>>(3)?
+                        .map(|text| {
+                            canonical_u64_text(&text, "model cached_input_tokens")
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                     output_tokens: row
-                        .get::<_, String>(4)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        .get::<_, Option<String>>(4)?
+                        .map(|text| {
+                            canonical_u64_text(&text, "model output_tokens")
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -11928,39 +12770,48 @@ impl UsageStore {
                       prefix_generation, start_offset, end_offset, record_sha256",
         )?;
         let rows = statement
-            .query_map([], |row| {
-                let start_offset = row.get::<_, i64>(4)?;
-                let end_offset = row.get::<_, i64>(5)?;
-                let collector_epoch = row.get::<_, String>(6)?;
-                let cycle_seq = row.get::<_, String>(7)?;
-                let prefix_generation = row.get::<_, String>(8)?;
-                Ok(SessionRange {
-                    root_identity: row.get(0)?,
-                    relative_path: row.get(1)?,
-                    file_device: row
-                        .get::<_, String>(2)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    file_inode: row
-                        .get::<_, String>(3)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    start_offset: u64::try_from(start_offset)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    end_offset: u64::try_from(end_offset)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    collector_epoch: u128::from_str_radix(&collector_epoch, 16)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    cycle_seq: cycle_seq
-                        .parse()
-                        .ok()
-                        .filter(|value: &u64| value.to_string() == cycle_seq)
-                        .ok_or(rusqlite::Error::InvalidQuery)?,
-                    prefix_generation: u128::from_str_radix(&prefix_generation, 16)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    record_sha256: row.get(9)?,
-                })
-            })?
+            .query_map([], SessionRange::from_sql_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for range in &rows {
+            validate_session_range(range)?;
+        }
+        Ok(rows)
+    }
+
+    /// Load only the accepted ranges needed to verify one saved parser prefix.
+    /// A crossing range is retained so its original complete hash is checked.
+    pub fn load_session_ranges_for_checkpoint(
+        &self,
+        checkpoint: &SessionCheckpoint,
+    ) -> Result<Vec<SessionRange>> {
+        validate_session_checkpoint(checkpoint)?;
+        validate_source_binding_partitions(&self.connection, std::iter::once(checkpoint))?;
+        let mut statement = self.connection.prepare(
+            "SELECT root_identity, relative_path, file_device, file_inode,
+                    start_offset, end_offset, collector_epoch, cycle_seq,
+                    prefix_generation, record_sha256
+             FROM session_ranges
+             WHERE root_identity=?1 AND relative_path=?2
+               AND file_device=?3 AND file_inode=?4 AND prefix_generation=?5
+               AND start_offset<?6
+             ORDER BY start_offset, end_offset, record_sha256",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    checkpoint.root_identity,
+                    checkpoint.relative_path,
+                    checkpoint.file_device.to_string(),
+                    checkpoint.file_inode.to_string(),
+                    format!("{:032x}", checkpoint.prefix_generation),
+                    i64::try_from(checkpoint.committed_offset).map_err(|_| {
+                        UsageStoreError::InvalidImport(
+                            "checkpoint offset exceeds SQLite range".into(),
+                        )
+                    })?,
+                ],
+                SessionRange::from_sql_row,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for range in &rows {
             validate_session_range(range)?;
@@ -12005,7 +12856,7 @@ impl UsageStore {
         }
         for event in events {
             validate_session_event(event)?;
-            let stored: Option<(String, String, String, String, String, Option<String>)> = self
+            let stored: Option<StoredSessionEventValues> = self
                 .connection
                 .query_row(
                     "SELECT model, total_tokens, input_tokens, cached_input_tokens,
@@ -12041,9 +12892,9 @@ impl UsageStore {
             let expected = Some((
                 event.model.clone(),
                 event.total_tokens.to_string(),
-                event.input_tokens.to_string(),
-                event.cached_input_tokens.to_string(),
-                event.output_tokens.to_string(),
+                event.input_tokens.map(|value| value.to_string()),
+                event.cached_input_tokens.map(|value| value.to_string()),
+                event.output_tokens.map(|value| value.to_string()),
                 event
                     .cache_write_input_tokens
                     .map(|value| value.to_string()),
@@ -12187,6 +13038,8 @@ impl UsageStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let _canonical_scope =
+            source_qualification_repair::CanonicalSourceScope::begin(&transaction)?;
         let partition_id: String = transaction.query_row(
             "SELECT partition_id FROM storage_partition WHERE singleton=1",
             [],
@@ -12216,7 +13069,14 @@ impl UsageStore {
         let period_start = reset_at
             .checked_sub(window_seconds)
             .ok_or(UsageStoreError::GenerationOverflow)?;
-        let raw_events = load_raw_session_events_from_connection(&transaction)?;
+        let raw_events = source_events::read_matching(
+            &transaction,
+            "WHERE reset_at=?1 AND window_seconds=?2 AND admission_json IS NOT NULL",
+            params![reset_at, window_seconds],
+        )?
+        .into_iter()
+        .map(SessionEvent::try_from)
+        .collect::<Result<Vec<_>>>()?;
         let (events, duplicate_lineage) = canonicalize_session_events(raw_events.clone());
         let canonical_event_keys = events
             .iter()
@@ -12336,7 +13196,7 @@ impl UsageStore {
         for (sample, _) in &history {
             saved_prices_by_timestamp.insert(
                 sample.timestamp,
-                load_saved_model_prices(&transaction, sample.timestamp)?,
+                load_saved_model_prices(&transaction, sample.reset_at, sample.timestamp)?,
             );
         }
 
@@ -12400,9 +13260,9 @@ impl UsageStore {
                         sample.timestamp,
                         &total.model,
                         total.total_tokens.to_string(),
-                        total.input_tokens.to_string(),
-                        total.cached_input_tokens.to_string(),
-                        total.output_tokens.to_string(),
+                        total.input_tokens.map(|value| value.to_string()),
+                        total.cached_input_tokens.map(|value| value.to_string()),
+                        total.output_tokens.map(|value| value.to_string()),
                         total
                             .cache_write_input_tokens
                             .map(|value| value.to_string()),
@@ -12444,9 +13304,9 @@ impl UsageStore {
             insert.execute(params![
                 &total.model,
                 total.total_tokens.to_string(),
-                total.input_tokens.to_string(),
-                total.cached_input_tokens.to_string(),
-                total.output_tokens.to_string(),
+                total.input_tokens.map(|value| value.to_string()),
+                total.cached_input_tokens.map(|value| value.to_string()),
+                total.output_tokens.map(|value| value.to_string()),
                 total
                     .cache_write_input_tokens
                     .map(|value| value.to_string()),
@@ -12474,6 +13334,7 @@ impl UsageStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let _canonical_scope = source_qualification_repair::CanonicalSourceScope::begin(&tx)?;
         let partition: String = tx.query_row(
             "SELECT partition_id FROM storage_partition WHERE singleton=1",
             [],
@@ -12493,6 +13354,7 @@ impl UsageStore {
             return Ok(0);
         }
         let all_events = load_session_events_from_connection(&tx)?;
+        let qualified_facts = source_events::read_matching(&tx, "", [])?;
         let recoveries = load_session_timeline_recoveries_from_connection(&tx)?;
         let mut candidates = vec![(
             reset,
@@ -12604,7 +13466,7 @@ impl UsageStore {
                 if mixed {
                     continue;
                 }
-                let saved = load_saved_model_prices(&tx, at)?;
+                let saved = load_saved_model_prices(&tx, id, at)?;
                 if saved.is_empty() {
                     continue;
                 }
@@ -12617,16 +13479,16 @@ impl UsageStore {
                                 &value.total_tokens,
                                 "saved endpoint total",
                             )?,
-                            input_tokens: canonical_u64_text(
-                                &value.input_tokens,
+                            input_tokens: canonical_optional_u64_text(
+                                value.input_tokens.as_deref(),
                                 "saved endpoint input",
                             )?,
-                            cached_input_tokens: canonical_u64_text(
-                                &value.cached_input_tokens,
+                            cached_input_tokens: canonical_optional_u64_text(
+                                value.cached_input_tokens.as_deref(),
                                 "saved endpoint cached",
                             )?,
-                            output_tokens: canonical_u64_text(
-                                &value.output_tokens,
+                            output_tokens: canonical_optional_u64_text(
+                                value.output_tokens.as_deref(),
                                 "saved endpoint output",
                             )?,
                             cache_write_input_tokens: value
@@ -12745,7 +13607,7 @@ impl UsageStore {
             if mixed {
                 continue;
             }
-            let saved = load_saved_model_prices(&tx, last)?;
+            let saved = load_saved_model_prices(&tx, id, last)?;
             if saved.is_empty() {
                 continue;
             }
@@ -12758,16 +13620,16 @@ impl UsageStore {
                             &value.total_tokens,
                             "source endpoint total",
                         )?,
-                        input_tokens: canonical_u64_text(
-                            &value.input_tokens,
+                        input_tokens: canonical_optional_u64_text(
+                            value.input_tokens.as_deref(),
                             "source endpoint input",
                         )?,
-                        cached_input_tokens: canonical_u64_text(
-                            &value.cached_input_tokens,
+                        cached_input_tokens: canonical_optional_u64_text(
+                            value.cached_input_tokens.as_deref(),
                             "source endpoint cached",
                         )?,
-                        output_tokens: canonical_u64_text(
-                            &value.output_tokens,
+                        output_tokens: canonical_optional_u64_text(
+                            value.output_tokens.as_deref(),
                             "source endpoint output",
                         )?,
                         cache_write_input_tokens: value
@@ -12814,15 +13676,21 @@ impl UsageStore {
             let start = reset
                 .checked_sub(window)
                 .ok_or(UsageStoreError::GenerationOverflow)?;
-            let events = all_events
+            let exact_events = qualified_facts
                 .iter()
-                .filter(|e| {
-                    e.timestamp >= start
-                        && e.timestamp < end
-                        && lifecycle_contains(&intervals, e.timestamp)
+                .filter(|fact| {
+                    fact.admission.is_some()
+                        && fact.period.is_some_and(|period| {
+                            period.reset_at == reset && period.window_seconds == window
+                        })
+                        && fact.timestamp >= start
+                        && fact.timestamp < end
+                        && lifecycle_contains(&intervals, fact.timestamp)
                 })
                 .cloned()
-                .collect::<Vec<_>>();
+                .map(SessionEvent::try_from)
+                .collect::<Result<Vec<_>>>()?;
+            let (events, _) = canonicalize_session_events(exact_events);
             if events.is_empty() || sum_session_events(events.iter())? != totals {
                 continue;
             }
@@ -12848,7 +13716,7 @@ impl UsageStore {
                 ))
             })? {
                 let (at, id, seconds, remaining) = row?;
-                if at >= start && at < end {
+                if at >= start && at < end && id == reset && seconds == window {
                     receipts.insert(at.div_euclid(60) * 60, (at, id, seconds, remaining));
                 }
             }
@@ -12924,16 +13792,9 @@ impl UsageStore {
                     continue;
                 }
                 let old_sample = tx.query_row(
-                "SELECT timestamp,reset_at,remaining_percent,sol_dollars,terra_dollars,luna_dollars,sol_tokens,terra_tokens,luna_tokens FROM usage_history WHERE timestamp=?1",
-                [timestamp], |r| valid_sample_from_row(r).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e))))
+                "SELECT timestamp,reset_at,remaining_percent,sol_dollars,terra_dollars,luna_dollars,sol_tokens,terra_tokens,luna_tokens FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                params![reset,timestamp], |r| valid_sample_from_row(r).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e))))
                 .optional()?.flatten();
-                if old_sample
-                    .as_ref()
-                    .is_some_and(|sample| sample.reset_at != reset)
-                    && receipt.is_none()
-                {
-                    continue;
-                }
                 let previous: Option<(i64,String,String)> = tx.query_row(
                 "SELECT data_generation,data_hash,snapshot_json FROM durable_state WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2 LIMIT 1",
                 params![timestamp,reset], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
@@ -12945,7 +13806,7 @@ impl UsageStore {
                 let mut previous = previous
                     .map(|(at, hash, json)| observation_from_sql(at, hash, json))
                     .transpose()?;
-                let saved_prices = load_saved_model_prices(&tx, timestamp)?;
+                let saved_prices = load_saved_model_prices(&tx, reset, timestamp)?;
                 // Durable JSON stores the family fields. Generic components and
                 // completeness have their own canonical model sidecar table.
                 if let Some(previous) = previous.as_mut() {
@@ -12958,16 +13819,16 @@ impl UsageStore {
                                     &saved.total_tokens,
                                     "history total",
                                 )?,
-                                input_tokens: canonical_u64_text(
-                                    &saved.input_tokens,
+                                input_tokens: canonical_optional_u64_text(
+                                    saved.input_tokens.as_deref(),
                                     "history input",
                                 )?,
-                                cached_input_tokens: canonical_u64_text(
-                                    &saved.cached_input_tokens,
+                                cached_input_tokens: canonical_optional_u64_text(
+                                    saved.cached_input_tokens.as_deref(),
                                     "history cached input",
                                 )?,
-                                output_tokens: canonical_u64_text(
-                                    &saved.output_tokens,
+                                output_tokens: canonical_optional_u64_text(
+                                    saved.output_tokens.as_deref(),
                                     "history output",
                                 )?,
                                 cache_write_input_tokens: saved
@@ -12978,7 +13839,7 @@ impl UsageStore {
                             });
                         }
                         previous.model_totals = Some(models);
-                        let complete: i64=tx.query_row("SELECT MIN(model_set_complete) FROM usage_model_history WHERE timestamp=?1",[timestamp],|r|r.get(0))?;
+                        let complete: i64=tx.query_row("SELECT MIN(model_set_complete) FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2",params![reset,timestamp],|r|r.get(0))?;
                         previous.model_totals_complete = complete == 1;
                     }
                 }
@@ -13017,15 +13878,9 @@ impl UsageStore {
                     // and their saved revisions belong only to the model sidecar.
                     let dollars = family(&total.model)
                         .and_then(|model_family| {
-                            estimate_legacy(
-                                model_family,
-                                Usage {
-                                    input_tokens: total.input_tokens,
-                                    cached_input_tokens: total.cached_input_tokens,
-                                    cache_write_input_tokens: Some(0),
-                                    output_tokens: total.output_tokens,
-                                },
-                            )
+                            let mut usage = total.pricing_usage()?;
+                            usage.cache_write_input_tokens = Some(0);
+                            estimate_legacy(model_family, usage)
                         })
                         .map_or(0.0, |cost| cost.total_dollars);
                     match family(&total.model) {
@@ -13045,12 +13900,13 @@ impl UsageStore {
                     continue;
                 }
                 tx.execute(
-                    "DELETE FROM usage_model_history WHERE timestamp=?1",
-                    [timestamp],
+                    "DELETE FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2",
+                    params![reset, timestamp],
                 )?;
                 tx.execute(
-                    "DELETE FROM durable_state WHERE singleton>=2 AND data_generation=?1",
-                    [timestamp],
+                    "DELETE FROM durable_state WHERE singleton>=2 AND data_generation=?1
+                     AND json_extract(snapshot_json,'$.reset_at')=?2",
+                    params![timestamp, reset],
                 )?;
                 upsert_canonical_samples(&tx, std::slice::from_ref(&sample), false, None)?;
                 upsert_observation_model_totals(
@@ -13061,7 +13917,7 @@ impl UsageStore {
                 )?;
                 // Preserve historical pricing authority while changing token input.
                 for (model, (dollars, version)) in prices {
-                    tx.execute("UPDATE usage_model_history SET total_dollars=?1,price_version=?2 WHERE timestamp=?3 AND model=?4",params![dollars,version,timestamp,model])?;
+                    tx.execute("UPDATE usage_model_history SET total_dollars=?1,price_version=?2 WHERE timestamp=?3 AND model=?4 AND reset_at=?5",params![dollars,version,timestamp,model,reset])?;
                 }
                 let source_timestamps = source_timestamp
                     .map(|at| BTreeMap::from([((reset, timestamp), at)]))
@@ -13113,7 +13969,8 @@ impl UsageStore {
     }
 
     /// Accepted observations that do not yet have a canonical history minute.
-    /// A raw minute owned by another exact period must never be reassigned.
+    /// A raw minute owned by another exact period does not materialize this
+    /// receipt and must never be reassigned.
     pub fn unmaterialized_quota_receipts(
         &self,
         reset_at: i64,
@@ -13125,7 +13982,8 @@ impl UsageStore {
             "SELECT receipt_id,sequence,observed_at,reset_at,window_seconds,remaining_percent
              FROM quota_receipts q
              WHERE q.reset_at=?1 AND q.window_seconds=?2 AND q.observed_at>=?3 AND q.observed_at<=?4
-               AND NOT EXISTS(SELECT 1 FROM usage_history h WHERE h.timestamp=(q.observed_at/60)*60)
+               AND NOT EXISTS(SELECT 1 FROM usage_history h
+                   WHERE h.reset_at=q.reset_at AND h.timestamp=(q.observed_at/60)*60)
              ORDER BY sequence",
         )?;
         let rows = statement.query_map(params![reset_at, window_seconds, since, until], |r| {
@@ -13157,11 +14015,106 @@ impl UsageStore {
             .min())
     }
 
+    /// Old offsets reserve their covered history until a full-prefix repair
+    /// reconstructs it. Independent current appends can publish after it.
+    pub fn timeline_history_end(&self, reset_at: i64, window_seconds: i64) -> Result<Option<i64>> {
+        Ok(self
+            .load_session_timeline_recoveries()?
+            .into_iter()
+            .filter(|(recovery, _, _)| {
+                recovery.canonical_reset_at == reset_at && recovery.window_seconds == window_seconds
+            })
+            .map(|(recovery, _, _)| recovery.projection_end_exclusive)
+            .max())
+    }
+
     /// Read source-proven token deltas independently of quota period
     /// materialization. This bounded projection is used only during an
     /// accepted period boundary to reconstruct the current window.
     pub fn load_session_events(&self) -> Result<Vec<SessionEvent>> {
         load_session_events_from_connection(&self.connection)
+    }
+
+    pub fn response_event(&self, key: &str) -> Result<Option<LosslessSessionEvent>> {
+        source_events::response_by_key(&self.connection, key)
+    }
+
+    /// One canonical batch for an exact accepted physical prefix. This does
+    /// not qualify raw rows or read unrelated source event payloads.
+    pub fn canonical_events_for_checkpoint(
+        &self,
+        checkpoint: &SessionCheckpoint,
+    ) -> Result<Vec<LosslessSessionEvent>> {
+        let _scope = source_qualification_repair::CanonicalSourceScope::begin(&self.connection)?;
+        source_events::read_matching(
+            &self.connection,
+            "WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3 AND file_inode=?4
+               AND prefix_generation=?5 AND range_end<=?6",
+            params![
+                checkpoint.root_identity,
+                checkpoint.relative_path,
+                checkpoint.file_device.to_string(),
+                checkpoint.file_inode.to_string(),
+                format!("{:032x}", checkpoint.prefix_generation),
+                checkpoint.committed_offset,
+            ],
+        )
+    }
+
+    pub fn source_range_for_pointer(
+        &self,
+        checkpoint: &SessionCheckpoint,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<SessionRange>> {
+        let mut statement=self.connection.prepare("SELECT start_offset,end_offset,collector_epoch,cycle_seq,record_sha256 FROM session_ranges WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3 AND file_inode=?4 AND prefix_generation=?5 AND start_offset<=?6 AND end_offset>=?7 ORDER BY start_offset DESC LIMIT 2")?;
+        let values = statement
+            .query_map(
+                params![
+                    checkpoint.root_identity,
+                    checkpoint.relative_path,
+                    checkpoint.file_device.to_string(),
+                    checkpoint.file_inode.to_string(),
+                    format!("{:032x}", checkpoint.prefix_generation),
+                    start,
+                    end
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, u64>(0)?,
+                        r.get::<_, u64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if values.len() > 1 {
+            return Err(UsageStoreError::InvalidImport(
+                "response root has overlapping accepted ranges".into(),
+            ));
+        }
+        values
+            .into_iter()
+            .next()
+            .map(|(start_offset, end_offset, epoch, cycle, record_sha256)| {
+                let range = SessionRange {
+                    root_identity: checkpoint.root_identity.clone(),
+                    relative_path: checkpoint.relative_path.clone(),
+                    file_device: checkpoint.file_device,
+                    file_inode: checkpoint.file_inode,
+                    prefix_generation: checkpoint.prefix_generation,
+                    start_offset,
+                    end_offset,
+                    collector_epoch: canonical_u128_hex(&epoch, "response source epoch")?,
+                    cycle_seq: canonical_u64_text(&cycle, "response source cycle")?,
+                    record_sha256,
+                };
+                validate_session_range(&range)?;
+                Ok(range)
+            })
+            .transpose()
     }
 
     /// Replace only an exact set of unattributed events after the recorder has
@@ -13190,9 +14143,9 @@ impl UsageStore {
         let mut unattributed = SessionModelTotal {
             model: "UNATTRIBUTED".to_owned(),
             total_tokens: 0,
-            input_tokens: 0,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         };
         for correction in corrections {
@@ -13230,9 +14183,9 @@ impl UsageStore {
                 .or_insert_with(|| SessionModelTotal {
                     model: correction.corrected_model.clone(),
                     total_tokens: 0,
-                    input_tokens: 0,
-                    cached_input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens: Some(0),
+                    cached_input_tokens: Some(0),
+                    output_tokens: Some(0),
                     cache_write_input_tokens: Some(0),
                 });
             checked_add_model_total(target, &delta)?;
@@ -13287,9 +14240,9 @@ impl UsageStore {
                     event.timestamp,
                     &event.model,
                     event.total_tokens.to_string(),
-                    event.input_tokens.to_string(),
-                    event.cached_input_tokens.to_string(),
-                    event.output_tokens.to_string(),
+                    event.input_tokens.map(|value| value.to_string()),
+                    event.cached_input_tokens.map(|value| value.to_string()),
+                    event.output_tokens.map(|value| value.to_string()),
                     event
                         .cache_write_input_tokens
                         .map(|value| value.to_string()),
@@ -13315,9 +14268,9 @@ impl UsageStore {
                         .or_insert_with(|| SessionModelTotal {
                             model: correction.model.clone(),
                             total_tokens: 0,
-                            input_tokens: 0,
-                            cached_input_tokens: 0,
-                            output_tokens: 0,
+                            input_tokens: Some(0),
+                            cached_input_tokens: Some(0),
+                            output_tokens: Some(0),
                             cache_write_input_tokens: Some(0),
                         });
                 checked_add_model_total(target, &correction)?;
@@ -13336,9 +14289,9 @@ impl UsageStore {
                 insert.execute(params![
                     total.model,
                     total.total_tokens.to_string(),
-                    total.input_tokens.to_string(),
-                    total.cached_input_tokens.to_string(),
-                    total.output_tokens.to_string(),
+                    total.input_tokens.map(|value| value.to_string()),
+                    total.cached_input_tokens.map(|value| value.to_string()),
+                    total.output_tokens.map(|value| value.to_string()),
                     total
                         .cache_write_input_tokens
                         .map(|value| value.to_string()),
@@ -13972,6 +14925,10 @@ impl UsageStore {
             &observations,
             None,
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: None,
@@ -14000,6 +14957,10 @@ impl UsageStore {
             observations,
             None,
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: None,
@@ -14029,6 +14990,10 @@ impl UsageStore {
             observations,
             None,
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: Some(recovery),
@@ -14057,6 +15022,10 @@ impl UsageStore {
             observations,
             None,
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: None,
@@ -14086,6 +15055,10 @@ impl UsageStore {
             observations,
             None,
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: None,
@@ -14114,6 +15087,10 @@ impl UsageStore {
             observations,
             None,
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: None,
@@ -14144,6 +15121,10 @@ impl UsageStore {
             observations,
             None,
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: None,
@@ -14172,6 +15153,10 @@ impl UsageStore {
             observations,
             None,
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: None,
@@ -14202,6 +15187,10 @@ impl UsageStore {
             observations,
             Some(latest_quota_reset_at),
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: None,
@@ -14230,6 +15219,10 @@ impl UsageStore {
             observations,
             Some(latest_quota_reset_at),
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: Some(span),
                 cumulative_recovery: None,
@@ -14257,6 +15250,10 @@ impl UsageStore {
             observations,
             Some(latest_quota_reset_at),
             CollectionEvidence {
+                source_repairs: &[],
+                qualified_events: None,
+                response_replays: &[],
+                period_attribution: None,
                 source_quota: None,
                 exact_history_span: None,
                 cumulative_recovery: None,
@@ -14279,6 +15276,42 @@ impl UsageStore {
         latest_quota_reset_at: i64,
         evidence: SessionSourceCommitEvidence<'_>,
     ) -> Result<SessionCollectionCommitResult> {
+        self.commit_session_source_collection(
+            commit,
+            observations,
+            latest_quota_reset_at,
+            evidence,
+            None,
+        )
+    }
+
+    /// Preserve verified original numeric facts in the same usage transaction.
+    /// Period assignment is supplied only by its independent evidence owner.
+    pub fn commit_session_collection_with_source_event_facts(
+        &mut self,
+        commit: SessionCollectionCommit<'_>,
+        observations: &[UsageHistoryObservation],
+        latest_quota_reset_at: i64,
+        evidence: SessionSourceCommitEvidence<'_>,
+        qualifications: SessionEventCommitEvidence<'_>,
+    ) -> Result<SessionCollectionCommitResult> {
+        self.commit_session_source_collection(
+            commit,
+            observations,
+            latest_quota_reset_at,
+            evidence,
+            Some(qualifications),
+        )
+    }
+
+    fn commit_session_source_collection(
+        &mut self,
+        commit: SessionCollectionCommit<'_>,
+        observations: &[UsageHistoryObservation],
+        latest_quota_reset_at: i64,
+        evidence: SessionSourceCommitEvidence<'_>,
+        qualifications: Option<SessionEventCommitEvidence<'_>>,
+    ) -> Result<SessionCollectionCommitResult> {
         if evidence.timeline_recovery.is_some() && evidence.exact_history_span.is_some() {
             return Err(UsageStoreError::InvalidImport(
                 "incompatible source history evidence".into(),
@@ -14289,6 +15322,16 @@ impl UsageStore {
             observations,
             Some(latest_quota_reset_at),
             CollectionEvidence {
+                source_repairs: qualifications
+                    .as_ref()
+                    .map_or(&[], |value| value.source_repairs),
+                qualified_events: qualifications.as_ref().map(|value| value.events),
+                period_attribution: qualifications
+                    .as_ref()
+                    .and_then(|value| value.period_attribution),
+                response_replays: qualifications
+                    .as_ref()
+                    .map_or(&[], |value| value.response_replays),
                 source_quota: Some((evidence.sessions_root, evidence.lifecycle_intervals)),
                 exact_history_span: evidence.exact_history_span,
                 cumulative_recovery: None,
@@ -14311,6 +15354,10 @@ impl UsageStore {
         evidence: CollectionEvidence<'_>,
     ) -> Result<SessionCollectionCommitResult> {
         let CollectionEvidence {
+            source_repairs,
+            qualified_events,
+            period_attribution,
+            response_replays,
             source_quota,
             exact_history_span,
             cumulative_recovery,
@@ -14333,7 +15380,6 @@ impl UsageStore {
             model_totals,
             recorded_sessions,
         } = commit;
-        let admitted_period = latest_quota_reset_at.map(|_| (reset_at, window_seconds));
         let latest_quota_reset_at = latest_quota_reset_at.unwrap_or(reset_at);
         if reset_at < 0
             || latest_quota_reset_at < 0
@@ -14377,6 +15423,7 @@ impl UsageStore {
                 ));
             }
         }
+        validate_source_binding_partitions(&self.connection, canonical_checkpoints.values())?;
         let mut canonical_ranges = BTreeMap::new();
         for range in ranges {
             validate_session_range(range)?;
@@ -14552,7 +15599,38 @@ impl UsageStore {
                     && range.end_offset == event.range_end
                     && range.record_sha256 == event.record_sha256
             });
-            if !matching_range {
+            let saved_response = qualified_events.unwrap_or(&[]).iter().any(|fact| {
+                matches!(
+                    fact.admission.as_ref().map(|admission| &admission.numeric),
+                    Some(event_admission::NumericEventProof::ResponseRecord { .. })
+                ) && SessionEvent::try_from(fact.clone()).is_ok_and(|raw| &raw == event)
+            });
+            let saved_range = if saved_response && !matching_range {
+                let source = canonical_checkpoints
+                    .values()
+                    .find(|checkpoint| {
+                        checkpoint.root_identity == event.root_identity
+                            && checkpoint.relative_path == event.relative_path
+                            && checkpoint.file_device == event.file_device
+                            && checkpoint.file_inode == event.file_inode
+                            && checkpoint.prefix_generation == event.prefix_generation
+                    })
+                    .ok_or_else(|| {
+                        UsageStoreError::InvalidImport(
+                            "response has no current source checkpoint".into(),
+                        )
+                    })?
+                    .clone();
+                self.source_range_for_pointer(&source, event.range_start, event.range_end)?
+                    .is_some_and(|range| {
+                        range.start_offset == event.range_start
+                            && range.end_offset == event.range_end
+                            && range.record_sha256 == event.record_sha256
+                    })
+            } else {
+                false
+            };
+            if !matching_range && !saved_range {
                 return Err(UsageStoreError::InvalidImport(
                     "session event has no committed source range".into(),
                 ));
@@ -14571,6 +15649,43 @@ impl UsageStore {
             if canonical_events.insert(key, event.clone()).is_some() {
                 return Err(UsageStoreError::InvalidImport(
                     "duplicate session event".into(),
+                ));
+            }
+        }
+        let mut qualified_keys = BTreeSet::new();
+        for fact in qualified_events.unwrap_or(&[]) {
+            if matches!(
+                fact.admission.as_ref().map(|admission| &admission.numeric),
+                Some(
+                    event_admission::NumericEventProof::LegacyFamilyCounter { .. }
+                        | event_admission::NumericEventProof::ResponseRecord {
+                            legacy_family_exact_model: Some(_),
+                            ..
+                        }
+                )
+            ) {
+                return Err(UsageStoreError::InvalidImport(
+                    "legacy family qualification requires a sealed existing-prefix repair".into(),
+                ));
+            }
+            let raw = SessionEvent::try_from(fact.clone())?;
+            let key = (
+                raw.root_identity.clone(),
+                raw.relative_path.clone(),
+                raw.file_device,
+                raw.file_inode,
+                raw.prefix_generation,
+                raw.range_start,
+                raw.range_end,
+                raw.record_sha256.clone(),
+                raw.event_index,
+            );
+            if fact.admission.is_none()
+                || canonical_events.get(&key) != Some(&raw)
+                || !qualified_keys.insert(key)
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "qualified event does not match the source batch".into(),
                 ));
             }
         }
@@ -14615,6 +15730,57 @@ impl UsageStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let _canonical_scope =
+            source_qualification_repair::CanonicalSourceScope::begin(&transaction)?;
+        let mut attribution_changes = if let Some(prepared) = period_attribution {
+            period_evidence::commit_snapshot(&transaction, prepared)?;
+            for fact in qualified_events.unwrap_or(&[]) {
+                let mut expected = fact.clone();
+                prepared.assign(&mut expected)?;
+                if &expected != fact {
+                    return Err(UsageStoreError::InvalidImport(
+                        "event does not match the fixed period evidence".into(),
+                    ));
+                }
+            }
+            let mut changes =
+                source_qualification_repair::apply(&transaction, source_repairs, Some(prepared))?;
+            for (period, since) in period_evidence::apply_reassignments(&transaction, prepared)? {
+                changes
+                    .entry(period)
+                    .and_modify(|value| *value = (*value).min(since))
+                    .or_insert(since);
+            }
+            changes
+        } else {
+            BTreeMap::new()
+        };
+        if !source_repairs.is_empty() && period_attribution.is_none() {
+            return Err(UsageStoreError::InvalidImport(
+                "source repair has no fixed official evidence".into(),
+            ));
+        }
+        if period_attribution.is_some() {
+            for fact in qualified_events.unwrap_or(&[]) {
+                if let Some(period) = fact.period {
+                    attribution_changes
+                        .entry((period.reset_at, period.window_seconds))
+                        .and_modify(|since| *since = (*since).min(fact.timestamp))
+                        .or_insert(fact.timestamp);
+                } else if reset_at > 0
+                    && window_seconds > 0
+                    && fact.timestamp >= reset_at - window_seconds
+                    && fact.timestamp < reset_at
+                {
+                    attribution_changes
+                        .entry((reset_at, window_seconds))
+                        .and_modify(|since| *since = (*since).min(fact.timestamp))
+                        .or_insert(fact.timestamp);
+                }
+            }
+        }
+        let original_projection_prices =
+            period_evidence::capture_projection_prices(&transaction, &attribution_changes)?;
         let stored_timeline_recoveries =
             load_session_timeline_recoveries_from_connection(&transaction)?;
         let preserve_existing_before = stored_timeline_recoveries
@@ -14632,11 +15798,11 @@ impl UsageStore {
             )
             .max();
 
-        let existing_events = load_raw_session_events_from_connection(&transaction)?;
+        let existing_events = load_session_events_from_connection(&transaction)?;
         if canonical_events.values().any(|candidate| {
             existing_events
                 .iter()
-                .any(|existing| session_event_is_cross_prefix_replay(existing, candidate))
+                .any(|existing| session_event_has_ambiguous_lineage(existing, candidate))
         }) {
             return Err(UsageStoreError::InvalidImport(
                 "session event overlaps an existing prefix lineage replay".into(),
@@ -14646,12 +15812,44 @@ impl UsageStore {
         if incoming.iter().enumerate().any(|(index, candidate)| {
             incoming[index + 1..]
                 .iter()
-                .any(|other| session_event_is_cross_prefix_replay(candidate, other))
+                .any(|other| session_event_has_ambiguous_lineage(candidate, other))
         }) {
             return Err(UsageStoreError::InvalidImport(
                 "session batch contains overlapping prefix lineage replays".into(),
             ));
         }
+        let exact_saved = if period_attribution.is_some() && exact_history_span.is_some() {
+            Some(
+                source_events::read_matching(
+                    &transaction,
+                    "WHERE reset_at=?1 AND window_seconds=?2",
+                    params![reset_at, window_seconds],
+                )?
+                .into_iter()
+                .map(SessionEvent::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+        let exact_incoming = if period_attribution.is_some() && exact_history_span.is_some() {
+            Some(
+                qualified_events
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|fact| {
+                        fact.period.is_some_and(|period| {
+                            period.reset_at == reset_at && period.window_seconds == window_seconds
+                        })
+                    })
+                    .cloned()
+                    .map(SessionEvent::try_from)
+                    .map(|event| event.map(|event| (session_event_primary_key(&event), event)))
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            )
+        } else {
+            None
+        };
         let exact_projection = exact_history_span
             .map(|span| {
                 prepare_exact_session_history(
@@ -14662,8 +15860,8 @@ impl UsageStore {
                     samples,
                     observations,
                     &model_totals,
-                    &existing_events,
-                    &canonical_events,
+                    exact_saved.as_deref().unwrap_or(&existing_events),
+                    exact_incoming.as_ref().unwrap_or(&canonical_events),
                     &stored_timeline_recoveries,
                 )
             })
@@ -14684,7 +15882,7 @@ impl UsageStore {
             &adjusted_samples,
             cumulative_recovery.is_some(),
             preserve_existing_before,
-            admitted_period,
+            period_attribution.is_some(),
         )?;
         let mut canonical_samples = canonical_projection.rows;
         if exact_history_span.is_some() {
@@ -14968,8 +16166,17 @@ impl UsageStore {
                     &pending_token_anchor_recoveries,
                 )?;
                 upsert_session_events(&transaction, &canonical_events)?;
+                upsert_session_event_qualifications(
+                    &transaction,
+                    qualified_events.unwrap_or(&[]),
+                    true,
+                    "ack",
+                    period_attribution,
+                )?;
+                resolve_response_replays(&transaction, response_replays, &canonical_checkpoints)?;
                 upsert_session_task_indexed_ranges(&transaction, &canonical_task_indexed_ranges)?;
                 upsert_session_task_events(&transaction, &canonical_task_events)?;
+                recorded_usage::finish(&transaction)?;
                 transaction.commit()?;
                 return Ok(SessionCollectionCommitResult {
                     data_generation: current_data_generation,
@@ -15045,11 +16252,14 @@ impl UsageStore {
         // append evidence; superseded cursor lineages only make every later
         // collection read and rewrite stale rows.
         {
+            let retained = _canonical_scope.checkpoint_references_json()?;
             let mut statement = transaction.prepare(
                 "DELETE FROM session_checkpoints
                  WHERE root_identity = ?1 AND relative_path = ?2
                    AND file_device = ?3 AND file_inode = ?4
-                   AND prefix_generation <> ?5",
+                   AND prefix_generation <> ?5
+                   AND (root_identity,relative_path,file_device,file_inode,prefix_generation)
+                       NOT IN (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),json_extract(value,'$[2]'),json_extract(value,'$[3]'),json_extract(value,'$[4]') FROM json_each(?6))",
             )?;
             for checkpoint in canonical_checkpoints.values() {
                 statement.execute(params![
@@ -15058,6 +16268,7 @@ impl UsageStore {
                     checkpoint.file_device.to_string(),
                     checkpoint.file_inode.to_string(),
                     format!("{:032x}", checkpoint.prefix_generation),
+                    retained,
                 ])?;
             }
         }
@@ -15123,6 +16334,14 @@ impl UsageStore {
         )?;
         upsert_session_token_anchor_recoveries(&transaction, &pending_token_anchor_recoveries)?;
         upsert_session_events(&transaction, &canonical_events)?;
+        upsert_session_event_qualifications(
+            &transaction,
+            qualified_events.unwrap_or(&[]),
+            false,
+            "usage",
+            period_attribution,
+        )?;
+        resolve_response_replays(&transaction, response_replays, &canonical_checkpoints)?;
         upsert_session_task_indexed_ranges(&transaction, &canonical_task_indexed_ranges)?;
         upsert_session_task_events(&transaction, &canonical_task_events)?;
         {
@@ -15134,10 +16353,10 @@ impl UsageStore {
                     token_baseline_known, history_base_pending, last_model,
                     last_task_running, context_usage_tokens, context_window_tokens,
                     previous_total, previous_input, previous_cached_input,
-                    previous_output, previous_cache_write_input
+                    previous_output, previous_cache_write_input, last_model_context_kind, last_model_interval, source_admission
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
                  )
                  ON CONFLICT (
                     root_identity, relative_path, file_device, file_inode, prefix_generation
@@ -15158,7 +16377,10 @@ impl UsageStore {
                     previous_input = excluded.previous_input,
                     previous_cached_input = excluded.previous_cached_input,
                     previous_output = excluded.previous_output,
-                    previous_cache_write_input = excluded.previous_cache_write_input",
+                    previous_cache_write_input = excluded.previous_cache_write_input,
+                    last_model_context_kind = excluded.last_model_context_kind,
+                    last_model_interval = excluded.last_model_interval,
+                    source_admission = excluded.source_admission",
             )?;
             for checkpoint in canonical_checkpoints.values() {
                 statement.execute(params![
@@ -15183,13 +16405,30 @@ impl UsageStore {
                     checkpoint
                         .context_window_tokens
                         .map(|value| value.to_string()),
-                    checkpoint.previous_total.to_string(),
-                    checkpoint.previous_input.to_string(),
-                    checkpoint.previous_cached_input.to_string(),
-                    checkpoint.previous_output.to_string(),
+                    checkpoint.previous_total.map(|value| value.to_string()),
+                    checkpoint.previous_input.map(|value| value.to_string()),
+                    checkpoint
+                        .previous_cached_input
+                        .map(|value| value.to_string()),
+                    checkpoint.previous_output.map(|value| value.to_string()),
                     checkpoint
                         .previous_cache_write_input
                         .map(|value| value.to_string()),
+                    checkpoint
+                        .last_model_context_kind
+                        .map(SessionModelContextKind::as_str),
+                    checkpoint
+                        .last_model_interval
+                        .as_ref()
+                        .map(SessionModelInterval::to_storage),
+                    checkpoint
+                        .source_admission
+                        .as_ref()
+                        .map(source_admission::SourceAdmission::to_storage)
+                        .transpose()
+                        .map_err(|_| UsageStoreError::InvalidImport(
+                            "source admission cannot be encoded".into()
+                        ))?,
                 ])?;
             }
         }
@@ -15224,9 +16463,9 @@ impl UsageStore {
                 statement.execute(params![
                     &total.model,
                     total.total_tokens.to_string(),
-                    total.input_tokens.to_string(),
-                    total.cached_input_tokens.to_string(),
-                    total.output_tokens.to_string(),
+                    total.input_tokens.map(|value| value.to_string()),
+                    total.cached_input_tokens.map(|value| value.to_string()),
+                    total.output_tokens.map(|value| value.to_string()),
                     total
                         .cache_write_input_tokens
                         .map(|value| value.to_string()),
@@ -15249,6 +16488,41 @@ impl UsageStore {
             ],
         )?;
         if let Some((root, intervals)) = source_quota {
+            let mut metadata_ranges = ranges.to_vec();
+            for repair in source_repairs {
+                let cp = repair.checkpoint();
+                let mut query=transaction.prepare("SELECT start_offset,end_offset,record_sha256 FROM session_ranges WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3 AND file_inode=?4 AND prefix_generation=?5 ORDER BY start_offset")?;
+                for row in query.query_map(
+                    params![
+                        cp.root_identity,
+                        cp.relative_path,
+                        cp.file_device.to_string(),
+                        cp.file_inode.to_string(),
+                        format!("{:032x}", cp.prefix_generation)
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )? {
+                    let (start, end, hash) = row?;
+                    metadata_ranges.push(SessionRange {
+                        root_identity: cp.root_identity.clone(),
+                        relative_path: cp.relative_path.clone(),
+                        file_device: cp.file_device,
+                        file_inode: cp.file_inode,
+                        prefix_generation: cp.prefix_generation,
+                        start_offset: start,
+                        end_offset: end,
+                        record_sha256: hash,
+                        collector_epoch: cp.collector_epoch,
+                        cycle_seq: cp.cycle_seq,
+                    });
+                }
+            }
             if let Some(since) = canonical_events
                 .values()
                 .map(|event| event.timestamp.div_euclid(60) * 60)
@@ -15264,7 +16538,7 @@ impl UsageStore {
                         root,
                         since,
                         intervals,
-                        Some(ranges),
+                        Some(&metadata_ranges),
                     )?;
                 if restored > 0 {
                     for sample in &mut canonical_samples {
@@ -15280,6 +16554,23 @@ impl UsageStore {
                 }
             }
         }
+        if period_attribution.is_some() {
+            for sample in canonical_samples
+                .iter()
+                .filter(|sample| sample.reset_at == reset_at && reset_at > 0 && window_seconds > 0)
+            {
+                attribution_changes
+                    .entry((reset_at, window_seconds))
+                    .and_modify(|since| *since = (*since).min(sample.timestamp))
+                    .or_insert(sample.timestamp);
+            }
+        }
+        period_evidence::reproject_periods(
+            &transaction,
+            &attribution_changes,
+            &original_projection_prices,
+        )?;
+        recorded_usage::finish(&transaction)?;
         transaction.commit()?;
         Ok(SessionCollectionCommitResult {
             data_generation: next,
@@ -15359,49 +16650,7 @@ impl UsageStore {
             ));
         }
 
-        let current = {
-            let mut statement = transaction.prepare(
-                "SELECT model, total_tokens, input_tokens, cached_input_tokens, output_tokens, cache_write_input_tokens
-                 FROM session_model_totals ORDER BY model",
-            )?;
-            let rows = statement.query_map([], |row| {
-                let total_tokens = row.get::<_, String>(1)?;
-                let input_tokens = row.get::<_, String>(2)?;
-                let cached_input_tokens = row.get::<_, String>(3)?;
-                let output_tokens = row.get::<_, String>(4)?;
-                Ok(SessionModelTotal {
-                    model: row.get(0)?,
-                    cache_write_input_tokens: row
-                        .get::<_, Option<String>>(5)?
-                        .map(|text| {
-                            text.parse::<u64>()
-                                .map_err(|_| rusqlite::Error::InvalidQuery)
-                        })
-                        .transpose()?,
-                    total_tokens: total_tokens
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|value| value.to_string() == total_tokens)
-                        .ok_or(rusqlite::Error::InvalidQuery)?,
-                    input_tokens: input_tokens
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|value| value.to_string() == input_tokens)
-                        .ok_or(rusqlite::Error::InvalidQuery)?,
-                    cached_input_tokens: cached_input_tokens
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|value| value.to_string() == cached_input_tokens)
-                        .ok_or(rusqlite::Error::InvalidQuery)?,
-                    output_tokens: output_tokens
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|value| value.to_string() == output_tokens)
-                        .ok_or(rusqlite::Error::InvalidQuery)?,
-                })
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let current = session_model_totals_from_transaction(&transaction)?;
         let mut combined = canonicalize_model_totals(&current)?
             .into_iter()
             .map(|total| (total.model.clone(), total))
@@ -15412,37 +16661,12 @@ impl UsageStore {
                 .or_insert_with(|| SessionModelTotal {
                     model: offset.model.clone(),
                     total_tokens: 0,
-                    input_tokens: 0,
-                    cached_input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens: Some(0),
+                    cached_input_tokens: Some(0),
+                    output_tokens: Some(0),
                     cache_write_input_tokens: Some(0),
                 });
-            total.cache_write_input_tokens = match (
-                total.cache_write_input_tokens,
-                offset.cache_write_input_tokens,
-            ) {
-                (Some(left), Some(right)) => Some(
-                    left.checked_add(right)
-                        .ok_or(UsageStoreError::GenerationOverflow)?,
-                ),
-                _ => None,
-            };
-            total.total_tokens = total
-                .total_tokens
-                .checked_add(offset.total_tokens)
-                .ok_or(UsageStoreError::GenerationOverflow)?;
-            total.input_tokens = total
-                .input_tokens
-                .checked_add(offset.input_tokens)
-                .ok_or(UsageStoreError::GenerationOverflow)?;
-            total.cached_input_tokens = total
-                .cached_input_tokens
-                .checked_add(offset.cached_input_tokens)
-                .ok_or(UsageStoreError::GenerationOverflow)?;
-            total.output_tokens = total
-                .output_tokens
-                .checked_add(offset.output_tokens)
-                .ok_or(UsageStoreError::GenerationOverflow)?;
+            checked_add_model_total(total, offset)?;
         }
         let combined = canonicalize_model_totals(&combined.into_values().collect::<Vec<_>>())?;
         transaction.execute("DELETE FROM session_model_totals", [])?;
@@ -15456,9 +16680,9 @@ impl UsageStore {
                 statement.execute(params![
                     &total.model,
                     total.total_tokens.to_string(),
-                    total.input_tokens.to_string(),
-                    total.cached_input_tokens.to_string(),
-                    total.output_tokens.to_string(),
+                    total.input_tokens.map(|value| value.to_string()),
+                    total.cached_input_tokens.map(|value| value.to_string()),
+                    total.output_tokens.map(|value| value.to_string()),
                     total
                         .cache_write_input_tokens
                         .map(|value| value.to_string()),
@@ -16135,12 +17359,7 @@ mod tests {
                     Some(1_791_691_140),
                     Some(10.0),
                 ),
-                QuotaCandidate::new(
-                    1_792_295_861,
-                    WINDOW,
-                    Some(100.0),
-                    1_791_692_640,
-                ),
+                QuotaCandidate::new(1_792_295_861, WINDOW, Some(100.0), 1_791_692_640,),
             ),
             QuotaTransition::Boundary,
             "the official quota reset must replace a stale local period when its window began 79 seconds before the last stored observation"
@@ -16349,6 +17568,7 @@ mod tests {
         store.commit_active_thread_snapshot(&snapshot).unwrap();
         drop(store);
         let connection = Connection::open(&path).unwrap();
+        downgrade_qualification_fixture(&connection);
         connection
             .execute_batch(
                 "ALTER TABLE active_thread_snapshot RENAME TO active_thread_snapshot_old;
@@ -16421,8 +17641,3863 @@ mod tests {
         }
     }
 
+    pub(crate) fn downgrade_event_qualification_fixture(connection: &Connection) {
+        let qualified: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_events') WHERE name='admission_json')",
+            [], |row| row.get(0),
+        ).unwrap();
+        if !qualified {
+            return;
+        }
+        let assigned: i64 = connection.query_row(
+            "SELECT count(*) FROM session_events WHERE reset_at IS NOT NULL OR window_seconds IS NOT NULL OR admission_json IS NOT NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            assigned, 0,
+            "an old-schema fixture cannot discard qualified event data"
+        );
+        connection
+            .execute_batch(
+                "CREATE TABLE session_events_legacy_fixture (
+                root_identity TEXT NOT NULL, relative_path TEXT NOT NULL,
+                file_device TEXT NOT NULL, file_inode TEXT NOT NULL,
+                prefix_generation TEXT NOT NULL,
+                range_start INTEGER NOT NULL CHECK(range_start>=0),
+                range_end INTEGER NOT NULL CHECK(range_end>range_start),
+                record_sha256 TEXT NOT NULL, event_index INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL, model TEXT NOT NULL,
+                total_tokens TEXT NOT NULL, input_tokens TEXT NOT NULL,
+                cached_input_tokens TEXT NOT NULL, output_tokens TEXT NOT NULL,
+                cache_write_input_tokens TEXT,
+                PRIMARY KEY(root_identity,relative_path,file_device,file_inode,prefix_generation,
+                    range_start,range_end,record_sha256,event_index)
+            ) WITHOUT ROWID;
+            INSERT INTO session_events_legacy_fixture SELECT root_identity,relative_path,
+                file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,
+                event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,
+                output_tokens,cache_write_input_tokens FROM session_events;
+            DROP TABLE session_events;
+            ALTER TABLE session_events_legacy_fixture RENAME TO session_events;",
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn downgrade_qualification_fixture(connection: &Connection) {
+        downgrade_event_qualification_fixture(connection);
+        for column in [
+            "source_admission",
+            "last_model_interval",
+            "last_model_context_kind",
+        ] {
+            let present: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_checkpoints') WHERE name=?1)",
+                [column], |row| row.get(0),
+            ).unwrap();
+            if present {
+                connection
+                    .execute_batch(&format!(
+                        "ALTER TABLE session_checkpoints DROP COLUMN {column}"
+                    ))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn issue604_unavailable_new_period_keeps_another_periods_same_minute_model() {
+        const AT: i64 = 1_791_871_200;
+        const FIRST: i64 = AT + 600;
+        const SECOND: i64 = AT + 601;
+        let path = database_path("issue604-exact-period-unavailable");
+        let mut store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        let sample = UsageHistorySample {
+            timestamp: AT,
+            reset_at: FIRST,
+            remaining_percent: Some(90.0),
+            sol_dollars: 0.00005,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 10,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        store.upsert_sample(&sample).unwrap();
+        let previous = UsageHistoryObservation::confirmed_with_models(
+            &sample,
+            vec![SessionModelTotal {
+                model: "gpt-6.1-sol".into(),
+                total_tokens: 10,
+                input_tokens: Some(10),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
+                cache_write_input_tokens: Some(0),
+            }],
+        );
+        let unavailable = UsageHistoryObservation::unavailable(AT, SECOND, Some(100.0));
+        let tx = store.connection.transaction().unwrap();
+        upsert_observations(&tx, std::slice::from_ref(&previous)).unwrap();
+        upsert_observation_model_totals(&tx, &[previous], false, None).unwrap();
+        let admitted = canonicalize_observations(
+            &tx,
+            std::slice::from_ref(&unavailable),
+            std::slice::from_ref(&sample),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(admitted, [unavailable]);
+        upsert_observations(&tx, &admitted).unwrap();
+        tx.commit().unwrap();
+        validate_canonical_history_storage(&store.connection).unwrap();
+        let models: Vec<(i64, String)> = store.connection
+            .prepare("SELECT reset_at,total_tokens FROM usage_model_history WHERE timestamp=?1 ORDER BY reset_at")
+            .unwrap().query_map([AT], |row| Ok((row.get(0)?,row.get(1)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(models, [(FIRST, "10".to_owned())]);
+        let observations: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM durable_state WHERE singleton>=2 AND data_generation=?1",
+                [AT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 2);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_same_minute_replay_preserves_each_periods_saved_price() {
+        const AT: i64 = 1_791_871_200;
+        const FIRST: i64 = AT + 600;
+        const SECOND: i64 = AT + 601;
+        let path = database_path("issue604-exact-period-price");
+        let mut store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        for (reset, dollars) in [(FIRST, 1.25), (SECOND, 2.5)] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO usage_history VALUES(?1,?2,90.0,0.00005,0.0,0.0,10,0,0)",
+                    params![AT, reset],
+                )
+                .unwrap();
+            // Already recorded prices with unknown historical revisions are
+            // preserved inputs; equal usage does not join different periods.
+            store.connection.execute(
+                "INSERT INTO usage_model_history VALUES(?1,?2,'gpt-6.1-sol','10','10','0','0','0',1,?3,NULL)",
+                params![reset, AT, dollars],
+            ).unwrap();
+        }
+        let sample = UsageHistorySample {
+            timestamp: AT,
+            reset_at: FIRST,
+            remaining_percent: Some(90.0),
+            sol_dollars: 0.00005,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 10,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let observation = UsageHistoryObservation::confirmed_with_models(
+            &sample,
+            vec![SessionModelTotal {
+                model: "gpt-6.1-sol".into(),
+                total_tokens: 10,
+                input_tokens: Some(10),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
+                cache_write_input_tokens: Some(0),
+            }],
+        );
+        let tx = store.connection.transaction().unwrap();
+        upsert_observation_model_totals(&tx, &[observation], false, None).unwrap();
+        tx.commit().unwrap();
+        let prices: Vec<(i64, f64)> = store.connection
+            .prepare("SELECT reset_at,total_dollars FROM usage_model_history WHERE timestamp=?1 ORDER BY reset_at")
+            .unwrap().query_map([AT], |row| Ok((row.get(0)?,row.get(1)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(prices, [(FIRST, 1.25), (SECOND, 2.5)]);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_event_admission_schema_preserves_unknown_old_events() {
+        let path = database_path("issue604-event-admission-schema");
+        let store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        let columns: Vec<(String, String, bool, Option<String>)> = store.connection
+            .prepare("SELECT name,type,\"notnull\",dflt_value FROM pragma_table_info('session_events') WHERE name IN ('reset_at','window_seconds','admission_json') ORDER BY cid")
+            .unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(
+            columns,
+            [
+                ("reset_at".into(), "INTEGER".into(), false, None),
+                ("window_seconds".into(), "INTEGER".into(), false, None),
+                ("admission_json".into(), "TEXT".into(), false, None),
+            ],
+            "event qualification must have an explicit unknown state"
+        );
+        store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','one.jsonl','1','2',?1,0,100,?2,0,1791871200,'gpt-6.1-sol','10',NULL,'0','2',NULL)", params![format!("{:032x}",1_u128),"0".repeat(64)]).unwrap();
+        let stored: (Option<i64>,Option<i64>,Option<String>,String,Option<String>) = store.connection.query_row("SELECT reset_at,window_seconds,admission_json,total_tokens,input_tokens FROM session_events", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(stored, (None, None, None, "10".into(), None));
+        for sql in [
+            "UPDATE session_events SET reset_at=1791871800",
+            "UPDATE session_events SET window_seconds=600",
+            "UPDATE session_events SET reset_at=1791871800,window_seconds=0",
+            "UPDATE session_events SET reset_at=1791871800,window_seconds=1791871800",
+            "UPDATE session_events SET reset_at=1791871800,window_seconds=600",
+            "UPDATE session_events SET admission_json='broken'",
+        ] {
+            assert!(
+                store.connection.execute(sql, []).is_err(),
+                "invalid period or unproved qualification accepted: {sql}"
+            );
+        }
+        assert_eq!(
+            read_session_event_facts(&store.connection).unwrap()[0]
+                .tokens
+                .total,
+            10
+        );
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_closing_an_owned_interval_reassigns_without_changing_numeric_source() {
+        verify_period_owner_closing(8);
+        verify_period_owner_closing(20);
+    }
+
+    fn verify_period_owner_closing(close_after: i64) {
+        use crate::period_evidence::OfficialQuotaInput;
+        const AT: i64 = 1_791_871_200;
+        let path = database_path("issue604-period-owner-closing");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let input = |seq: u64, at| OfficialQuotaInput {
+            input_id: format!("{seq:064x}"),
+            account_scope: identity.account_scope_id.clone(),
+            sequence: seq,
+            observed_at: at,
+            content_sha256: format!("{seq:064x}"),
+            reset_at: Some(AT + 100),
+            window_seconds: Some(200),
+            reason: None,
+        };
+        store
+            .stage_official_quota_inputs(&[input(1, AT + 2), input(2, AT + 10)])
+            .unwrap();
+        let witness = |start, end, at, total| {
+            serde_json::json!({
+                "pointer":{"start":start,"end":end,"sha256":"22".repeat(32),"timestamp":at},
+                "total":total,"input":total,"cached_input":0,"cache_write_input":0,"output":0
+            })
+        };
+        let admission = serde_json::json!({
+            "version":1,"source_binding":issue604_source_binding_json()["account_binding"],
+            "verified_prefix_end":100,"ownership":{"start_at":AT,"end_at":null},
+            "numeric":{"kind":"legacy-counter","before":witness(10,20,AT+2,10),
+                "after":witness(20,30,AT+3,15),
+                "model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},"kind":"turn","interval":"none"}},
+            "period":null
+        });
+        store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20','one.jsonl','10','42',?1,0,100,?2,0,?3,'gpt-6.1-sol','5','5','0','0','0',?4)",
+            params![format!("{:032x}",0x5678_u128),"00".repeat(32),AT+3,admission.to_string()]).unwrap();
+        let open = [SessionLifecycleInterval::new(Some(AT), None)];
+        let first = store.prepare_period_attribution(&identity, &open).unwrap();
+        let tx = store.connection.transaction().unwrap();
+        period_evidence::commit_snapshot(&tx, &first).unwrap();
+        period_evidence::apply_reassignments(&tx, &first).unwrap();
+        tx.commit().unwrap();
+        let original = read_session_event_facts(&store.connection)
+            .unwrap()
+            .remove(0);
+        assert_eq!(original.period.unwrap().reset_at, AT + 100);
+        let old_bytes: String = store
+            .connection
+            .query_row(
+                "SELECT payload_json FROM period_evidence_snapshots WHERE generation=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // The earlier closure removes the second official observation; the
+        // later closure keeps the same timeline but still fixes ownership.
+        let closed = [SessionLifecycleInterval::new(
+            Some(AT),
+            Some(AT + close_after),
+        )];
+        let next = store
+            .prepare_period_attribution(&identity, &closed)
+            .expect("closing an existing owner must permit exact-period reassignment");
+        {
+            let tx = store.connection.transaction().unwrap();
+            period_evidence::commit_snapshot(&tx, &next).unwrap();
+            period_evidence::apply_reassignments(&tx, &next).unwrap();
+        }
+        assert_eq!(
+            read_session_event_facts(&store.connection)
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&original)
+        );
+        let tx = store.connection.transaction().unwrap();
+        period_evidence::commit_snapshot(&tx, &next).unwrap();
+        period_evidence::apply_reassignments(&tx, &next).unwrap();
+        tx.commit().unwrap();
+        let saved = read_session_event_facts(&store.connection)
+            .unwrap()
+            .remove(0);
+        assert_eq!(saved.source, original.source);
+        assert_eq!(saved.tokens, original.tokens);
+        assert_eq!(saved.timestamp, original.timestamp);
+        assert_eq!(saved.model, original.model);
+        assert_eq!(
+            saved.period,
+            (close_after > 10).then_some(original.period.unwrap())
+        );
+        assert_eq!(
+            saved.admission.as_ref().unwrap().ownership.end_at,
+            Some(AT + close_after)
+        );
+        let snapshot: serde_json::Value = serde_json::from_str(
+            &store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT payload_json FROM period_evidence_snapshots WHERE generation=2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot["previous"][0]["admission"]["ownership"]["end_at"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT payload_json FROM period_evidence_snapshots WHERE generation=1",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            old_bytes
+        );
+        let widened = store.prepare_period_attribution(&identity, &open);
+        assert!(
+            widened.is_err(),
+            "a closed source ownership cannot silently widen"
+        );
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_extending_official_run_only_assigns_the_newly_supported_events() {
+        use crate::period_evidence::OfficialQuotaInput;
+        const AT: i64 = 1_791_871_200;
+        let path = database_path("issue604-period-run-extension");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let input = |sequence: u64, at, reset| OfficialQuotaInput {
+            input_id: format!("{sequence:064x}"),
+            account_scope: identity.account_scope_id.clone(),
+            sequence,
+            observed_at: at,
+            content_sha256: format!("{sequence:064x}"),
+            reset_at: reset,
+            window_seconds: reset.map(|_| 200),
+            reason: reset.is_none().then(|| "unknown-window".into()),
+        };
+        store
+            .stage_official_quota_inputs(&[
+                input(1, AT + 2, Some(AT + 100)),
+                input(3, AT + 10, Some(AT + 100)),
+            ])
+            .unwrap();
+        let witness = |start, end, at, total| {
+            serde_json::json!({
+                "pointer":{"start":start,"end":end,"sha256":"22".repeat(32),"timestamp":at},
+                "total":total,"input":total,"cached_input":0,"cache_write_input":0,"output":0
+            })
+        };
+        for (index, at, start, before) in [(0, AT + 3, 10, 10), (1, AT + 15, 30, 15)] {
+            let admission = serde_json::json!({"version":1,"source_binding":issue604_source_binding_json()["account_binding"],
+                "verified_prefix_end":100,"ownership":{"start_at":AT,"end_at":null},"period":null,
+                "numeric":{"kind":"legacy-counter","before":witness(start,start+10,at-1,before),
+                    "after":witness(start+10,start+20,at,before+5),
+                    "model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},"kind":"turn","interval":"none"}}});
+            store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20','one.jsonl','10','42',?1,0,100,?2,?3,?4,'gpt-6.1-sol','5','5','0','0','0',?5)",params![format!("{:032x}",0x5678_u128),"00".repeat(32),index,at,admission.to_string()]).unwrap();
+        }
+        let intervals = [SessionLifecycleInterval::new(Some(AT), None)];
+        let first = store
+            .prepare_period_attribution(&identity, &intervals)
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        period_evidence::commit_snapshot(&tx, &first).unwrap();
+        period_evidence::apply_reassignments(&tx, &first).unwrap();
+        tx.commit().unwrap();
+        let original = read_session_event_facts(&store.connection).unwrap();
+        assert!(original[0].period.is_some());
+        assert_eq!(original[1].period, None);
+        store.connection.execute_batch("CREATE TRIGGER forbid_unchanged_period_proof BEFORE UPDATE OF admission_json ON session_events WHEN OLD.event_index=0 BEGIN SELECT RAISE(ABORT,'old sufficient proof must stay immutable'); END;").unwrap();
+        store
+            .stage_official_quota_inputs(&[input(4, AT + 20, Some(AT + 100))])
+            .unwrap();
+        let next = store
+            .prepare_period_attribution(&identity, &intervals)
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        period_evidence::commit_snapshot(&tx, &next).unwrap();
+        period_evidence::apply_reassignments(&tx, &next)
+            .expect("extending a run must not rewrite its already sufficient old proof");
+        tx.commit().unwrap();
+        let saved = read_session_event_facts(&store.connection).unwrap();
+        assert_eq!(saved[0], original[0]);
+        assert_eq!(saved[1].period.unwrap().reset_at, AT + 100);
+        assert_eq!(saved[1].tokens, original[1].tokens);
+        let previous_count:i64=store.connection.query_row("SELECT json_array_length(payload_json,'$.previous') FROM period_evidence_snapshots WHERE generation=2",[],|row|row.get(0)).unwrap();
+        assert_eq!(
+            previous_count, 1,
+            "only the newly supported numeric event changes qualification"
+        );
+        store
+            .stage_official_quota_inputs(&[input(2, AT + 8, None)])
+            .unwrap();
+        let barrier = store
+            .prepare_period_attribution(&identity, &intervals)
+            .unwrap();
+        {
+            let tx = store.connection.transaction().unwrap();
+            period_evidence::commit_snapshot(&tx, &barrier).unwrap();
+            assert!(
+                period_evidence::apply_reassignments(&tx, &barrier).is_err(),
+                "a barrier must revisit the old affected span and roll back on failure"
+            );
+        }
+        assert_eq!(read_session_event_facts(&store.connection).unwrap(), saved);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER forbid_unchanged_period_proof")
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        period_evidence::commit_snapshot(&tx, &barrier).unwrap();
+        period_evidence::apply_reassignments(&tx, &barrier).unwrap();
+        tx.commit().unwrap();
+        let changed = read_session_event_facts(&store.connection).unwrap();
+        assert_eq!(changed[0].period, None);
+        assert_eq!(changed[1].period, saved[1].period);
+        assert_eq!(
+            changed[1]
+                .admission
+                .as_ref()
+                .unwrap()
+                .period
+                .as_ref()
+                .unwrap()
+                .lower_at,
+            AT + 10
+        );
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_official_evidence_reassigns_saved_events_and_both_period_prefixes_atomically() {
+        verify_official_evidence_saved_prices(false, false, false, false, false, false);
+    }
+
+    #[test]
+    fn issue604_official_evidence_preserves_saved_price_bits_for_unchanged_prefix() {
+        verify_official_evidence_saved_prices(true, false, false, false, false, false);
+    }
+
+    #[test]
+    fn issue604_official_evidence_price_qualification_keeps_unknown_revisions_unknown() {
+        let total = SessionModelTotal {
+            model: "gpt-6.1-sol".into(),
+            total_tokens: 5,
+            input_tokens: Some(5),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+        };
+        let mut saved = SavedModelPrice {
+            total_tokens: "5".into(),
+            input_tokens: Some("5".into()),
+            cached_input_tokens: Some("0".into()),
+            output_tokens: Some("0".into()),
+            cache_write_input_tokens: Some("0".into()),
+            total_dollars: Some(f64::from_bits(0x3ee4f8b588e368f2)),
+            price_version: Some("unavailable-original-revision".into()),
+        };
+        let unchanged = model_history_price(&total, 1791871200, Some(&saved));
+        assert_eq!(
+            unchanged.0.map(f64::to_bits),
+            saved.total_dollars.map(f64::to_bits)
+        );
+        assert_eq!(unchanged.1, saved.price_version);
+        saved.total_dollars = None;
+        saved.price_version = None;
+        assert_eq!(
+            model_history_price(&total, 1791871200, Some(&saved)),
+            (None, None),
+            "an existing unchanged prefix retains its saved missing price"
+        );
+        saved.total_tokens = "4".into();
+        saved.input_tokens = Some("4".into());
+        assert_eq!(
+            model_history_price(&total, 1791871200, Some(&saved)),
+            (None, None),
+            "a changed prefix without an observed revision cannot use the current catalog"
+        );
+        saved.price_version = Some("unavailable-original-revision".into());
+        assert_eq!(
+            model_history_price(&total, 1791871200, Some(&saved)),
+            (None, saved.price_version.clone()),
+            "an unavailable original revision remains recorded, with an unknown corrected price"
+        );
+    }
+
+    #[test]
+    fn issue604_partial_source_repair_preserves_unverified_saved_prefix_values() {
+        verify_official_evidence_saved_prices(true, true, false, false, false, false);
+    }
+
+    #[test]
+    fn issue604_partial_source_repair_preserves_unknown_family_cells_and_old_known_values() {
+        verify_official_evidence_saved_prices(true, true, true, false, false, false);
+    }
+
+    #[test]
+    fn issue604_qualified_partial_usage_enriches_a_quota_only_unknown_observation() {
+        verify_official_evidence_saved_prices(true, true, false, true, false, false);
+    }
+
+    #[test]
+    fn issue604_normal_replay_preserves_original_admission_when_official_support_expands() {
+        verify_official_evidence_saved_prices(true, false, false, false, true, false);
+    }
+
+    #[test]
+    fn issue604_qualification_conflict_diagnostic_exposes_only_static_changes() {
+        verify_official_evidence_saved_prices(true, false, false, false, true, true);
+    }
+
+    fn verify_official_evidence_saved_prices(
+        unchanged_prefix: bool,
+        unqualified_peer: bool,
+        partial_fixed: bool,
+        quota_only: bool,
+        replay_same_event: bool,
+        diagnostic_only: bool,
+    ) {
+        use crate::period_evidence::OfficialQuotaInput;
+        const AT: i64 = 1_791_871_200;
+        // Independent catalog oracle at AT: five ordinary input tokens at
+        // $2 per million are $0.00001; incomplete source coverage does not
+        // change this exact model's known token components or price revision.
+        const FIVE_INPUT_DOLLARS: f64 = 0.00001;
+        const PRICE_REVISION: &str = "1791430564-183968cc652f6276";
+        let path = database_path("issue604-official-reassignment");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let intervals = [SessionLifecycleInterval::new(Some(AT), None)];
+        let input = |seq: u64, at, reset| OfficialQuotaInput {
+            input_id: format!("{seq:064x}"),
+            account_scope: identity.account_scope_id.clone(),
+            sequence: seq,
+            observed_at: at,
+            content_sha256: format!("{seq:064x}"),
+            reset_at: Some(reset),
+            window_seconds: Some(200),
+            reason: None,
+        };
+        store
+            .stage_official_quota_inputs(&[input(1, AT + 2, AT + 100), input(3, AT + 10, AT + 100)])
+            .unwrap();
+        let witness = |start, end, at, total| {
+            serde_json::json!({
+                "pointer":{"start":start,"end":end,"sha256":"22".repeat(32),"timestamp":at},
+                "total":total,"input":total,"cached_input":0,"cache_write_input":0,"output":0
+            })
+        };
+        let qualification = serde_json::json!({
+            "version":1,"source_binding":issue604_source_binding_json()["account_binding"],
+            "verified_prefix_end":100,"ownership":{"start_at":AT,"end_at":null},
+            "numeric":{"kind":"legacy-counter","before":witness(10,20,AT+2,10),
+                "after":witness(20,30,AT+3,15),
+                "model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},"kind":"turn","interval":"none"}},
+            "period":null
+        });
+        store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20','one.jsonl','10','42',?1,0,100,?2,0,?3,'gpt-6.1-sol','5','5','0','0','0',?4)",
+            params![format!("{:032x}",0x5678_u128),"00".repeat(32),AT+3,Option::<String>::None]).unwrap();
+        if unqualified_peer {
+            store.connection.execute("INSERT INTO session_events SELECT root_identity,'peer.jsonl',file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,0,timestamp,model,'9','9',cached_input_tokens,output_tokens,cache_write_input_tokens,NULL,NULL,NULL FROM session_events LIMIT 1",[]).unwrap();
+        }
+        let first = store
+            .prepare_period_attribution(&identity, &intervals)
+            .unwrap();
+        let mut event = read_session_event_facts(&store.connection)
+            .unwrap()
+            .remove(0);
+        event.admission = Some(serde_json::from_value(qualification).unwrap());
+        first.assign(&mut event).unwrap();
+        assert_eq!(event.period.unwrap().reset_at, AT + 100);
+        let tx = store.connection.transaction().unwrap();
+        period_evidence::commit_snapshot(&tx, &first).unwrap();
+        upsert_session_event_qualifications(&tx, &[event], false, "fixture", None).unwrap();
+        tx.commit().unwrap();
+        let minute = AT.div_euclid(60) * 60;
+        if quota_only {
+            store.connection.execute("INSERT INTO usage_history(timestamp,reset_at,remaining_percent) VALUES(?1,?2,90)",params![minute,AT+100]).unwrap();
+            let before = read_session_event_facts(&store.connection).unwrap();
+            let tx = store.connection.transaction().unwrap();
+            let mut unknown = UsageHistoryObservation::unavailable(minute, AT + 100, Some(90.0));
+            unknown.model_source = ModelSource::LegacyUnknown;
+            upsert_observations(&tx, &[unknown]).unwrap();
+            let periods = BTreeMap::from([((AT + 100, 200), AT + 3)]);
+            let original = period_evidence::capture_projection_prices(&tx, &periods).unwrap();
+            period_evidence::reproject_periods(&tx, &periods, &original).unwrap();
+            tx.commit().unwrap();
+            let model: Option<(String, i64, Option<f64>, Option<String>)> = store
+                .connection
+                .query_row(
+                    "SELECT total_tokens,model_set_complete,total_dollars,price_version FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6.1-sol'",
+                    params![AT + 100, minute],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(
+                model,
+                Some((
+                    "5".into(),
+                    0,
+                    Some(FIVE_INPUT_DOLLARS),
+                    Some(PRICE_REVISION.into())
+                )),
+                "the qualified model uses its observation-time price while the unverified peer keeps coverage incomplete"
+            );
+            let fixed:(Option<i64>,Option<i64>,Option<i64>,Option<f64>)=store.connection.query_row("SELECT sol_tokens,terra_tokens,luna_tokens,remaining_percent FROM usage_history WHERE reset_at=?1 AND timestamp=?2",params![AT+100,minute],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert_eq!(fixed, (Some(5), None, None, Some(90.0)));
+            assert_eq!(
+                read_session_event_facts(&store.connection).unwrap(),
+                before,
+                "the unknown peer's saved raw9 and original qualified5 remain unchanged"
+            );
+            drop(store);
+            remove_database(&path);
+            return;
+        }
+        let old = UsageHistorySample {
+            timestamp: minute,
+            reset_at: AT + 100,
+            remaining_percent: Some(90.0),
+            sol_dollars: 0.00001,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: if unqualified_peer { 14 } else { 5 },
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        store.upsert_sample(&old).unwrap();
+        let total = SessionModelTotal {
+            model: "gpt-6.1-sol".into(),
+            total_tokens: if unqualified_peer { 14 } else { 5 },
+            input_tokens: Some(if unqualified_peer { 14 } else { 5 }),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+        };
+        let tx = store.connection.transaction().unwrap();
+        let mut observation =
+            UsageHistoryObservation::confirmed_with_models(&old, vec![total.clone()]);
+        if partial_fixed {
+            observation.terra_tokens = None;
+            observation.terra_dollars = None;
+            observation.luna_tokens = None;
+            observation.luna_dollars = None;
+            tx.execute("UPDATE usage_history SET terra_tokens=NULL,terra_dollars=NULL,luna_tokens=NULL,luna_dollars=NULL WHERE reset_at=?1 AND timestamp=?2",params![AT+100,minute]).unwrap();
+        }
+        upsert_observations(&tx, std::slice::from_ref(&observation)).unwrap();
+        upsert_observation_model_totals(&tx, &[observation], false, None).unwrap();
+        tx.commit().unwrap();
+        let original = read_session_event_facts(&store.connection).unwrap();
+        let saved_snapshot: (i64, String, String) = store
+            .connection
+            .query_row(
+                "SELECT generation,sha256,payload_json FROM period_evidence_snapshots",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+
+        // DATA's fixed example: recovered sequence 2 occupies its ORIGINAL
+        // position, and the same event at its point changes exact period.
+        let target_reset = if unchanged_prefix { AT + 100 } else { AT + 101 };
+        store
+            .stage_official_quota_inputs(&[if unchanged_prefix {
+                input(4, AT + 11, target_reset)
+            } else {
+                input(2, AT + 3, target_reset)
+            }])
+            .unwrap();
+        let prepared = store
+            .prepare_period_attribution(&identity, &intervals)
+            .unwrap();
+        let root = path.parent().unwrap().join("sessions");
+        fs::create_dir(&root).unwrap();
+        let samples = if unchanged_prefix {
+            vec![]
+        } else {
+            vec![UsageHistorySample {
+                reset_at: target_reset,
+                ..old.clone()
+            }]
+        };
+        let observations = samples
+            .iter()
+            .map(|sample| {
+                UsageHistoryObservation::confirmed_with_models(sample, vec![total.clone()])
+            })
+            .collect::<Vec<_>>();
+        let saved_fact = read_session_event_facts(&store.connection).unwrap()[0].clone();
+        let mut replayed = Vec::new();
+        if replay_same_event {
+            let mut fact = saved_fact.clone();
+            prepared.assign(&mut fact).unwrap();
+            assert_eq!(fact.period, saved_fact.period);
+            assert_ne!(fact.admission, saved_fact.admission);
+            assert_eq!(fact.tokens, saved_fact.tokens);
+            replayed.push(fact);
+        }
+        if diagnostic_only {
+            let before_state = store.load_session_collection_state().unwrap();
+            let tx = store.connection.transaction().unwrap();
+            let error = upsert_session_event_qualifications(&tx, &replayed, false, "usage", None)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                UsageStoreError::InvalidImport(ref message)
+                    if message == "event qualification conflicts with the committed batch: context=usage replay=false reset_changed=false window_changed=false admission_changed=[binding=false,prefix=false,ownership=false,numeric=false,period=true]"
+            ));
+            tx.rollback().unwrap();
+            assert_eq!(store.load_session_collection_state().unwrap(), before_state);
+            assert_eq!(
+                read_session_event_facts(&store.connection).unwrap(),
+                original
+            );
+            let after_snapshot: (i64, String, String) = store
+                .connection
+                .query_row(
+                    "SELECT generation,sha256,payload_json FROM period_evidence_snapshots",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(after_snapshot, saved_snapshot);
+            for (context, replay) in [("usage", false), ("ack", true), ("source-repair", false)] {
+                let tx = store.connection.transaction().unwrap();
+                upsert_session_event_qualifications(
+                    &tx,
+                    &replayed,
+                    replay,
+                    context,
+                    Some(&prepared),
+                )
+                .expect("the same immutable source fact retains its original admission");
+                tx.commit().unwrap();
+                assert_eq!(
+                    read_session_event_facts(&store.connection).unwrap(),
+                    original
+                );
+                assert_eq!(store.load_session_collection_state().unwrap(), before_state);
+            }
+            for change_numeric in [false, true] {
+                let mut conflicting = replayed.clone();
+                let admission = conflicting[0].admission.as_mut().unwrap();
+                if change_numeric {
+                    let event_admission::NumericEventProof::LegacyCounter(proof) =
+                        &mut admission.numeric
+                    else {
+                        panic!("counter fixture")
+                    };
+                    proof.model_context.as_mut().unwrap().pointer.sha256 = "ff".repeat(32);
+                } else {
+                    admission.period.as_mut().unwrap().lower_at += 1;
+                }
+                let tx = store.connection.transaction().unwrap();
+                assert!(upsert_session_event_qualifications(
+                    &tx,
+                    &conflicting,
+                    false,
+                    "usage",
+                    Some(&prepared),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("event qualification conflicts with the committed batch"));
+                tx.rollback().unwrap();
+                assert_eq!(
+                    read_session_event_facts(&store.connection).unwrap(),
+                    original
+                );
+                assert_eq!(store.load_session_collection_state().unwrap(), before_state);
+            }
+            drop(store);
+            remove_database(&path);
+            return;
+        }
+        let raw_replayed = replayed
+            .iter()
+            .cloned()
+            .map(SessionEvent::try_from)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let commit = |store: &mut UsageStore, cycle| {
+            let ranges = raw_replayed
+                .iter()
+                .map(|event| SessionRange {
+                    root_identity: event.root_identity.clone(),
+                    relative_path: event.relative_path.clone(),
+                    file_device: event.file_device,
+                    file_inode: event.file_inode,
+                    start_offset: event.range_start,
+                    end_offset: event.range_end,
+                    collector_epoch: 1,
+                    cycle_seq: cycle,
+                    prefix_generation: event.prefix_generation,
+                    record_sha256: event.record_sha256.clone(),
+                })
+                .collect::<Vec<_>>();
+            store.commit_session_collection_with_source_event_facts(
+                SessionCollectionCommit {
+                    reset_at: target_reset,
+                    window_seconds: 200,
+                    collector_epoch: 1,
+                    cycle_seq: cycle,
+                    samples: &samples,
+                    checkpoints: &[],
+                    ranges: &ranges,
+                    model_totals: std::slice::from_ref(&total),
+                    recorded_sessions: &[],
+                },
+                &observations,
+                target_reset,
+                SessionSourceCommitEvidence {
+                    task: SessionTaskEvidenceInput {
+                        events: &raw_replayed,
+                        pending_ranges: &[],
+                        token_anchor_recoveries: &[],
+                        token_anchor_resolutions: &[],
+                        task_events: &[],
+                        task_indexed_ranges: &[],
+                    },
+                    timeline_recovery: None,
+                    exact_history_span: None,
+                    sessions_root: &root,
+                    lifecycle_intervals: &intervals,
+                },
+                SessionEventCommitEvidence {
+                    source_repairs: &[],
+                    events: &replayed,
+                    period_attribution: Some(&prepared),
+                    response_replays: &[],
+                },
+            )
+        };
+        if unchanged_prefix {
+            commit(&mut store, 1).unwrap();
+            if replay_same_event {
+                let committed = store.load_session_collection_state().unwrap();
+                assert_eq!(
+                    read_session_event_facts(&store.connection).unwrap(),
+                    vec![saved_fact.clone()]
+                );
+                commit(&mut store, 1)
+                    .expect("same-batch acknowledgement must keep the same original admission");
+                assert_eq!(store.load_session_collection_state().unwrap(), committed);
+                assert_eq!(
+                    read_session_event_facts(&store.connection).unwrap(),
+                    vec![saved_fact]
+                );
+            }
+            let stored: f64 = store
+                .connection
+                .query_row(
+                    "SELECT sol_dollars FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                    params![AT + 100, minute],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stored.to_bits(),
+                old.sol_dollars.to_bits(),
+                "a changed supporting time span cannot reprice an unchanged qualified prefix"
+            );
+            if unqualified_peer {
+                let saved:(String,Option<f64>)=store.connection.query_row("SELECT total_tokens,total_dollars FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6.1-sol'",params![AT+100,minute],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+                assert_eq!(saved.0,"14","a partial proof cannot overwrite another source's unverified known contribution");
+                let complete:i64=store.connection.query_row("SELECT model_set_complete FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2",params![AT+100,minute],|row|row.get(0)).unwrap();
+                assert_eq!(
+                    complete, 0,
+                    "retained old values do not become verified full coverage"
+                );
+                if partial_fixed {
+                    let cells:(Option<i64>,Option<f64>,Option<i64>,Option<f64>)=store.connection.query_row("SELECT terra_tokens,terra_dollars,luna_tokens,luna_dollars FROM usage_history WHERE reset_at=?1 AND timestamp=?2",params![AT+100,minute],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+                    assert_eq!(
+                        cells,
+                        (None, None, None, None),
+                        "another source's partial proof cannot manufacture missing family cells"
+                    );
+                    let source:String=store.connection.query_row("SELECT json_extract(snapshot_json,'$.model_source') FROM durable_state WHERE data_hash=?1",[observation_data_hash(AT+100,minute)],|row|row.get(0)).unwrap();
+                    assert_eq!(source, "legacy-unknown");
+                }
+            }
+            drop(store);
+            remove_database(&path);
+            return;
+        }
+        store.connection.execute_batch("CREATE TRIGGER reject_period_reassignment BEFORE UPDATE OF reset_at ON session_events WHEN OLD.reset_at IS NOT NEW.reset_at BEGIN SELECT RAISE(ABORT,'fixture period reassignment'); END;").unwrap();
+        let failed = commit(&mut store, 1);
+        assert!(failed.as_ref().is_err_and(|error|error.to_string().contains("fixture period reassignment")),
+            "a changed evidence set must update the EXISTING event inside the usage transaction: {:?}", failed.as_ref().err());
+        assert_eq!(
+            read_session_event_facts(&store.connection).unwrap(),
+            original
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM period_evidence_snapshots", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_period_reassignment")
+            .unwrap();
+        commit(&mut store, 1).unwrap();
+        let facts = read_session_event_facts(&store.connection).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].period.unwrap().reset_at, AT + 101);
+        assert_eq!(facts[0].tokens, original[0].tokens);
+        assert_eq!(facts[0].source, original[0].source);
+        let old_tokens: Option<i64> = store
+            .connection
+            .query_row(
+                "SELECT sol_tokens FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                params![AT + 100, minute],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_tokens, None,
+            "losing every qualified event is unknown, not confirmed zero"
+        );
+        let new_tokens: i64 = store
+            .connection
+            .query_row(
+                "SELECT sol_tokens FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                params![AT + 101, minute],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_tokens, 5);
+        let new_price:(Option<f64>,Option<String>)=store.connection.query_row("SELECT total_dollars,price_version FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6.1-sol'",params![AT+101,minute],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(
+            new_price,
+            (Some(FIVE_INPUT_DOLLARS), Some(PRICE_REVISION.into())),
+            "a newly qualified target prefix uses the revision observed before its original observation, without moving the other period's saved price"
+        );
+        assert_eq!(store.connection.query_row("SELECT generation,sha256,payload_json FROM period_evidence_snapshots WHERE generation=1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap(),saved_snapshot);
+        drop(store);
+        let reopened = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(
+            read_session_event_facts(&reopened.connection).unwrap(),
+            facts
+        );
+        drop(reopened);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_candidate_index_excludes_v1_sqlite_payload_scans() {
+        const INDEX_NAME: &str = "source_prefix_repairs_v2_candidates";
+        const V1: &str = r#"{"body":"canonical old","version":1}"#;
+        const V1_ID: &str = "db8e4d541ce5cdbed94ee921df2c7e8a3246f309d5fd967a32e6cd50d2253709";
+        const V2: &str =
+            r#"{"mappings":[],"mode":"event-bijection","original":[],"prefixes":[],"version":2}"#;
+        const V2_ID: &str = "80447b5384329e8bba38c474edfee8217af35d66bbb8b06c7ec406fac4d516ae";
+        const NONCANONICAL: &str = r#" { "version" : 1, "body" : "preserve fallback" } "#;
+        const NONCANONICAL_ID: &str =
+            "7329064e67d29fa7ad9fa62a28314e0bb3462b40aed4fe67dd08608e386ef72a";
+        const INSERTED: &str = r#"{"body":"new candidate","mappings":[],"mode":"event-bijection","original":[],"prefixes":[],"version":2}"#;
+        const INSERTED_ID: &str =
+            "5e2206f9b64206170d621b2534efc2cef5baab501af4d1edfd369205640058ba";
+        let index_sql = |connection: &Connection| -> Option<String> {
+            connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name=?1 AND type='index'",
+                    [INDEX_NAME],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap()
+        };
+        let schema_version = |connection: &Connection| -> i64 {
+            connection
+                .query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let proof_rows = |connection: &Connection| {
+            connection.prepare("SELECT repair_id,payload_json,payload_sha256 FROM source_prefix_repairs ORDER BY repair_id").unwrap()
+                .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let candidates = |connection: &Connection| -> std::collections::BTreeSet<String> {
+            connection
+                .prepare(codex_info_db_reader::SOURCE_REPAIR_V2_CANDIDATE_QUERY)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let query_plan = |connection: &Connection| {
+            connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    codex_info_db_reader::SOURCE_REPAIR_V2_CANDIDATE_QUERY
+                ))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let expected = [V2_ID, NONCANONICAL_ID]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        let path = database_path("issue604-candidate-index");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let created_index = index_sql(&store.connection).is_some();
+        let original_account_schema = account_db_schema_version(&store.connection).unwrap();
+        // These rows exercise selection and preservation only, never proof
+        // qualification or numeric admission.
+        for (id, payload) in [(V1_ID, V1), (V2_ID, V2), (NONCANONICAL_ID, NONCANONICAL)] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO source_prefix_repairs VALUES(?1,?2,?1)",
+                    params![id, payload],
+                )
+                .unwrap();
+        }
+        let original_rows = proof_rows(&store.connection);
+        assert_eq!(original_rows.len(), 3);
+        assert_eq!(candidates(&store.connection), expected);
+        let created_plan = query_plan(&store.connection);
+        let created_plan_uses_index = created_plan
+            .iter()
+            .any(|detail| detail.contains(INDEX_NAME));
+        {
+            let tx = store.connection.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO source_prefix_repairs VALUES(?1,?2,?1)",
+                params![INSERTED_ID, INSERTED],
+            )
+            .unwrap();
+            let mut expected_tx = expected.clone();
+            expected_tx.insert(INSERTED_ID.to_owned());
+            assert_eq!(candidates(&tx), expected_tx);
+            // Changed metadata is observed only inside this transaction and
+            // rolled back; no updated payload is admitted as a proof.
+            tx.execute(
+                "UPDATE source_prefix_repairs SET payload_json=?1 WHERE repair_id=?2",
+                params![V2, V1_ID],
+            )
+            .unwrap();
+            expected_tx.insert(V1_ID.to_owned());
+            assert_eq!(candidates(&tx), expected_tx);
+            tx.execute(
+                "UPDATE source_prefix_repairs SET payload_json=?1 WHERE repair_id=?2",
+                params![V1, V2_ID],
+            )
+            .unwrap();
+            expected_tx.remove(V2_ID);
+            assert_eq!(candidates(&tx), expected_tx);
+            tx.execute(
+                "DELETE FROM source_prefix_repairs WHERE repair_id=?1",
+                [NONCANONICAL_ID],
+            )
+            .unwrap();
+            expected_tx.remove(NONCANONICAL_ID);
+            assert_eq!(candidates(&tx), expected_tx);
+            tx.rollback().unwrap();
+        }
+        assert_eq!(proof_rows(&store.connection), original_rows);
+        assert_eq!(candidates(&store.connection), expected);
+        // A current-schema legacy fixture lacks only this derived index.
+        store
+            .connection
+            .execute_batch("DROP INDEX IF EXISTS source_prefix_repairs_v2_candidates")
+            .unwrap();
+        assert!(index_sql(&store.connection).is_none());
+        let legacy_schema_version = schema_version(&store.connection);
+        drop(store);
+        let readonly = UsageStore::open_read_only_partitioned(&path, &identity).unwrap();
+        assert!(
+            index_sql(&readonly.connection).is_none(),
+            "readonly open adds no index"
+        );
+        assert_eq!(schema_version(&readonly.connection), legacy_schema_version);
+        assert_eq!(proof_rows(&readonly.connection), original_rows);
+        assert_eq!(candidates(&readonly.connection), expected);
+        drop(readonly);
+
+        let writer = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let introduced_index = index_sql(&writer.connection);
+        let introduced_schema_version = schema_version(&writer.connection);
+        let introduced_once =
+            introduced_index.is_some() && introduced_schema_version == legacy_schema_version + 1;
+        let introduced_plan = query_plan(&writer.connection);
+        let introduced_plan_uses_index = introduced_plan
+            .iter()
+            .any(|detail| detail.contains(INDEX_NAME));
+        assert_eq!(proof_rows(&writer.connection), original_rows);
+        assert_eq!(candidates(&writer.connection), expected);
+        assert_eq!(
+            account_db_schema_version(&writer.connection).unwrap(),
+            original_account_schema
+        );
+        drop(writer);
+        let writer = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(
+            index_sql(&writer.connection),
+            introduced_index,
+            "reopen preserves the existing index"
+        );
+        assert_eq!(
+            schema_version(&writer.connection),
+            introduced_schema_version,
+            "reopen does not recreate schema"
+        );
+        assert_eq!(proof_rows(&writer.connection), original_rows);
+        writer.connection.execute_batch("DROP INDEX IF EXISTS source_prefix_repairs_v2_candidates;
+            CREATE INDEX source_prefix_repairs_v2_candidates ON source_prefix_repairs(repair_id) WHERE repair_id='literal-unrelated-predicate'").unwrap();
+        let existing_sql = index_sql(&writer.connection);
+        let existing_schema_version = schema_version(&writer.connection);
+        assert!(existing_sql.is_some());
+        drop(writer);
+        let writer = UsageStore::open_partitioned(&path, &identity)
+            .expect("an existing differently defined optional index is not authority");
+        assert_eq!(index_sql(&writer.connection), existing_sql);
+        assert_eq!(schema_version(&writer.connection), existing_schema_version);
+        assert_eq!(proof_rows(&writer.connection), original_rows);
+        assert_eq!(
+            candidates(&writer.connection),
+            expected,
+            "the shared predicate retains candidate meaning"
+        );
+        assert_eq!(
+            account_db_schema_version(&writer.connection).unwrap(),
+            original_account_schema
+        );
+        drop(writer);
+        remove_database(&path);
+        assert!(
+            created_index,
+            "normal writer creation supplies the candidate index"
+        );
+        assert!(
+            created_plan_uses_index,
+            "shared query uses candidate index: {created_plan:?}"
+        );
+        assert!(
+            introduced_once,
+            "normal writer open introduces a missing index once"
+        );
+        assert!(
+            introduced_plan_uses_index,
+            "legacy writer open uses candidate index: {introduced_plan:?}"
+        );
+    }
+
+    #[test]
+    fn issue604_unrelated_proof_catalog_does_not_block_noop_projections() {
+        const AT: i64 = 1_791_871_200;
+        let path = database_path("issue604-unrelated-proof-catalog");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let witness = |start, end, at, total| {
+            serde_json::json!({
+                "pointer":{"start":start,"end":end,"sha256":"22".repeat(32),"timestamp":at},
+                "total":total,"input":total,"cached_input":0,"cache_write_input":0,"output":0
+            })
+        };
+        for index in 0..2 {
+            let at = AT + 3 + index;
+            let admission = serde_json::json!({
+                "version":1,"source_binding":issue604_source_binding_json()["account_binding"],
+                "verified_prefix_end":100,"ownership":{"start_at":AT,"end_at":null},
+                "numeric":{"kind":"legacy-counter",
+                    "before":witness(10,20,at-1,10+index*5),
+                    "after":witness(20,30,at,15+index*5),
+                    "model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},"kind":"turn","interval":"none"}},
+                "period":null
+            });
+            store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20','one.jsonl','10','42',?1,0,100,?2,?3,?4,'gpt-6.1-sol','5','5','0','0','0',?5)",
+                params![format!("{:032x}",0x5678_u128),"00".repeat(32),index,at,admission.to_string()]).unwrap();
+        }
+        let cp = checkpoint(&recorded_source("one.jsonl", 42), 100);
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: AT + 100,
+                window_seconds: 200,
+                collector_epoch: cp.collector_epoch,
+                cycle_seq: cp.cycle_seq,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&cp),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        let prefix_rows = |connection: &Connection| {
+            connection.prepare("SELECT model,timestamp,prefix_json,prefix_sha256 FROM recorded_usage_prefixes ORDER BY model,timestamp").unwrap()
+                .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let before_prefix = prefix_rows(&store.connection);
+        assert_eq!(before_prefix.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&before_prefix[1].2).unwrap()["total"],
+            "10"
+        );
+        let initialized: bool = store
+            .connection
+            .query_row(
+                "SELECT initialized FROM recorded_usage_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(initialized);
+        let intervals = [SessionLifecycleInterval::new(Some(AT), None)];
+        let prepared = store
+            .prepare_period_attribution(&identity, &intervals)
+            .unwrap();
+        {
+            let tx = store.connection.transaction().unwrap();
+            period_evidence::commit_snapshot(&tx, &prepared).unwrap();
+            tx.commit().unwrap();
+        }
+        let head = |connection: &Connection| -> (i64, String, i64) {
+            connection.query_row("SELECT generation,sha256,input_revision FROM period_evidence_head WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
+        };
+        let before_head = head(&store.connection);
+        // This exact-hash row is deliberately invalid and grants no source
+        // authority. The three no-op consumers do not use its qualification.
+        store.connection.execute("INSERT INTO source_prefix_repairs VALUES(?1,?2,?1)",
+            params!["572c8a571ec0578d4c3f678fc3f053aa8e690f5d25d20e0b942ea5e897ddeccf", r#"{"mappings":[],"mode":"invalid-unrelated","original":[],"prefixes":[],"version":2}"#]).unwrap();
+        let mut outcomes = Vec::new();
+        let unchanged_prepare = match store.prepare_period_attribution(&identity, &intervals) {
+            Ok(next) => {
+                let tx = store.connection.transaction().unwrap();
+                let committed = period_evidence::commit_snapshot(&tx, &next).is_ok();
+                if committed {
+                    tx.commit().unwrap();
+                } else {
+                    drop(tx);
+                }
+                committed && head(&store.connection) == before_head
+            }
+            Err(_) => false,
+        };
+        outcomes.push(("unchanged-period-reference", unchanged_prepare));
+        let finish_ok = {
+            let tx = store.connection.transaction().unwrap();
+            let success = recorded_usage::finish(&tx).is_ok();
+            if success {
+                tx.commit().unwrap();
+            }
+            success
+        };
+        outcomes.push((
+            "initialized-prefix-ten",
+            finish_ok && prefix_rows(&store.connection) == before_prefix,
+        ));
+        let empty_ok = {
+            let tx = store.connection.transaction().unwrap();
+            let success = upsert_observations_with_sources(&tx, &[], &BTreeMap::new())
+                .is_ok_and(|observations| observations.is_empty());
+            if success {
+                tx.commit().unwrap();
+            }
+            success
+        };
+        outcomes.push(("empty-observations", empty_ok));
+        outcomes.push((
+            "required-canonical-proof-rejected",
+            source_events::read_matching(&store.connection, "WHERE 1=1", []).is_err(),
+        ));
+        assert_eq!(prefix_rows(&store.connection), before_prefix);
+        assert_eq!(head(&store.connection), before_head);
+        drop(store);
+        remove_database(&path);
+        assert!(
+            outcomes.iter().all(|(_, success)| *success),
+            "no-op projections do not consume unrelated proof authority: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn issue604_recorded_facts_commit_without_provider_period_identity() {
+        const AT: i64 = 1_791_871_200;
+        let path = database_path("issue604-recorded-facts-independent-period");
+        let mut store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        let witness = |start, end, at, total| {
+            serde_json::json!({
+                "pointer":{"start":start,"end":end,"sha256":"22".repeat(32),"timestamp":at},
+                "total":total,"input":total,"cached_input":0,"cache_write_input":0,"output":0
+            })
+        };
+        for index in 0..2 {
+            let at = AT + 3 + index;
+            let admission = serde_json::json!({
+                "version":1,"source_binding":issue604_source_binding_json()["account_binding"],
+                "verified_prefix_end":100,"ownership":{"start_at":AT,"end_at":null},
+                "numeric":{"kind":"legacy-counter",
+                    "before":witness(10,20,at-1,10+index*5),
+                    "after":witness(20,30,at,15+index*5),
+                    "model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},"kind":"turn","interval":"none"}},
+                "period":null
+            });
+            store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20','one.jsonl','10','42',?1,0,100,?2,?3,?4,'gpt-6.1-sol','5','5','0','0','0',?5)",
+                params![format!("{:032x}",0x5678_u128),"00".repeat(32),index,at,admission.to_string()]).unwrap();
+        }
+        let cp = checkpoint(&recorded_source("one.jsonl", 42), 100);
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: AT + 100,
+                window_seconds: 200,
+                collector_epoch: cp.collector_epoch,
+                cycle_seq: cp.cycle_seq,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&cp),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        let tables:i64=store.connection.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('recorded_usage_facts','recorded_usage_prefixes','recorded_usage_state')",[],|r|r.get(0)).unwrap();
+        assert_eq!(tables,3,"normal collection must materialize qualified recorded facts independently of reset ownership");
+        let totals:(i64,i64)=store.connection.query_row("SELECT count(*),sum(CAST(json_extract(tokens_json,'$.total') AS INTEGER)) FROM recorded_usage_facts WHERE eligible=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(totals, (2, 10));
+        let prefix: String = store
+            .connection
+            .query_row(
+                "SELECT prefix_json FROM recorded_usage_prefixes ORDER BY timestamp DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&prefix).unwrap()["total"],
+            "10"
+        );
+        let unassigned:i64=store.connection.query_row("SELECT count(*) FROM session_events WHERE reset_at IS NULL AND window_seconds IS NULL",[],|r|r.get(0)).unwrap();
+        assert_eq!(
+            unassigned, 2,
+            "derived recording must not invent provider period qualification"
+        );
+        let reader = codex_info_db_reader::DbReader::open(&path).unwrap();
+        let snapshot = reader.read_snapshot().unwrap();
+        let archive = snapshot
+            .recordings
+            .expect("same-transaction reader must admit recorded prefix");
+        let models = archive.models(AT, AT + 100).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].total_tokens, 10);
+        assert_eq!(models[0].input_tokens, Some(10));
+        assert_eq!(models[0].estimated_cost, None);
+        assert_eq!(
+            archive
+                .samples(AT, AT + 100)
+                .unwrap()
+                .iter()
+                .map(|v| v.models[0].total_tokens)
+                .collect::<Vec<_>>(),
+            [5, 10]
+        );
+        store.connection.execute_batch("CREATE TRIGGER recorded_facts_noop BEFORE UPDATE ON recorded_usage_facts BEGIN SELECT RAISE(ABORT,'unchanged recorded fact rewritten'); END; CREATE TRIGGER recorded_prefix_noop BEFORE UPDATE ON recorded_usage_prefixes BEGIN SELECT RAISE(ABORT,'unchanged recorded prefix rewritten'); END; CREATE TRIGGER recorded_head_noop BEFORE UPDATE ON recorded_usage_state BEGIN SELECT RAISE(ABORT,'unchanged recorded head rewritten'); END;").unwrap();
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: AT + 100,
+                window_seconds: 200,
+                collector_epoch: cp.collector_epoch,
+                cycle_seq: cp.cycle_seq,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&cp),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .expect("ack must leave the recorded index byte-for-byte unchanged");
+        fn materialized(connection: &Connection) -> Vec<Vec<Vec<Value>>> {
+            recorded_usage::TABLES
+                .iter()
+                .map(|table| {
+                    let mut query = connection
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+                        .unwrap();
+                    let width = query.column_count();
+                    query
+                        .query_map([], |row| {
+                            (0..width)
+                                .map(|index| row.get(index))
+                                .collect::<rusqlite::Result<Vec<Value>>>()
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                })
+                .collect()
+        }
+        let original_materialized = materialized(&store.connection);
+        UsageStore::backup_generations_partitioned_verified(&path, &partition_identity('a', 7), 1)
+            .unwrap();
+        let backup_path = path.with_extension("sqlite3.bak.1");
+        let backup =
+            UsageStore::open_read_only_partitioned(&backup_path, &partition_identity('a', 7))
+                .unwrap();
+        assert_eq!(
+            materialized(&backup.connection),
+            original_materialized,
+            "verified SQLite copy must retain all auxiliary values"
+        );
+        drop(backup);
+        drop(store);
+        let mut reopened =
+            UsageStore::open_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        assert_eq!(
+            materialized(&reopened.connection),
+            original_materialized,
+            "reopen must retain immutable index/prefix/head bytes"
+        );
+        // The original two qualified facts stay stored without a provider
+        // period; official evidence assigns them only in this prepared view.
+        let raw_before = read_session_event_facts(&reopened.connection).unwrap();
+        assert_eq!(raw_before.len(), 2);
+        assert!(raw_before.iter().all(|event| event.period.is_none()));
+        reopened
+            .stage_official_quota_inputs(&[
+                period_evidence::OfficialQuotaInput {
+                    input_id: "11".repeat(32),
+                    account_scope: "a".repeat(64),
+                    sequence: 1,
+                    observed_at: AT + 2,
+                    content_sha256: "31".repeat(32),
+                    reset_at: Some(AT + 100),
+                    window_seconds: Some(200),
+                    reason: None,
+                },
+                period_evidence::OfficialQuotaInput {
+                    input_id: "22".repeat(32),
+                    account_scope: "a".repeat(64),
+                    sequence: 2,
+                    observed_at: AT + 10,
+                    content_sha256: "32".repeat(32),
+                    reset_at: Some(AT + 100),
+                    window_seconds: Some(200),
+                    reason: None,
+                },
+            ])
+            .unwrap();
+        let prepared = reopened
+            .prepare_period_attribution(
+                &partition_identity('a', 7),
+                &[SessionLifecycleInterval::new(Some(AT), None)],
+            )
+            .unwrap();
+        let expected_period = Some(event_admission::SessionEventPeriod {
+            reset_at: AT + 100,
+            window_seconds: 200,
+        });
+        assert_eq!(
+            [AT + 3, AT + 4].map(|at| prepared.candidate_period_at(at)),
+            [expected_period, expected_period]
+        );
+        let already_assigned: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT count(*) FROM session_events WHERE reset_at=?1 AND window_seconds=?2",
+                params![AT + 100, 200],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            already_assigned, 0,
+            "both returned facts must use previous-point lookups"
+        );
+        source_qualification_repair::CanonicalSourceScope::reset_test_snapshot_load_count();
+        let (events, incomplete) = reopened
+            .session_events_for_prepared_period(&prepared, AT + 100, 200)
+            .expect("valid prepared evidence reads both qualified points");
+        let snapshot_loads =
+            source_qualification_repair::CanonicalSourceScope::test_snapshot_load_count();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            [AT + 3, AT + 4]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (
+                    event.total_tokens,
+                    event.input_tokens,
+                    event.cached_input_tokens,
+                    event.cache_write_input_tokens,
+                    event.output_tokens
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (5, Some(5), Some(0), Some(0), Some(0)),
+                (5, Some(5), Some(0), Some(0), Some(0))
+            ]
+        );
+        assert_eq!(
+            events.iter().map(|event| event.total_tokens).sum::<u64>(),
+            10
+        );
+        assert!(!incomplete);
+        assert_eq!(
+            read_session_event_facts(&reopened.connection).unwrap(),
+            raw_before,
+            "prepared assignment must not mutate the stored unknown-period facts"
+        );
+        assert_eq!(
+            snapshot_loads, 1,
+            "two previous-point lookups share one validated snapshot"
+        );
+        drop(reopened);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_source_equivalence_bijection_preserves_known_response_identity_and_reasoning() {
+        const AT: i64 = 1_791_871_200;
+        let path = database_path("issue604-source-equivalence-known-response");
+        let store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        let binding = issue604_source_binding_json();
+        let pointer = |start, end, at| serde_json::json!({"start":start,"end":end,"timestamp":at,"sha256":"22".repeat(32)});
+        let ids = source_admission::ResponseIds {
+            thread_id: "binding-thread".into(),
+            session_id: "binding-session".into(),
+            root_turn_id: "root-turn".into(),
+            turn_id: "turn".into(),
+            response_id: "old-response".into(),
+        };
+        let usage = serde_json::json!({"total":5,"input":4,"cached_input":1,"cache_write_input":0,"output":1,"reasoning_output":1});
+        let admission = serde_json::json!({"version":1,"source_binding":binding["account_binding"],"verified_prefix_end":100,"ownership":{"start_at":AT,"end_at":null},"period":null,"numeric":{"kind":"response-record","candidate":{"key":ids.key(),"record":{"ids":ids,"usage":usage,"turn_usage":usage,"thread_usage":usage},"pointer":pointer(20,30,AT+3),"session_scope_qualified":true,"root_context":{"model":"gpt-6.1-sol","context":{"turn_id":"turn","root_turn_id":"root-turn","pointer":pointer(0,10,AT+1)}},"classification":{"state":"normal","boundary":{"kind":"record","pointer":{"start":30,"end":40,"sha256":"55".repeat(32)}}}}}});
+        let old = LosslessSessionEvent {
+            source: SessionEventSource {
+                root_identity: "unix:10:20".into(),
+                relative_path: "one.jsonl".into(),
+                file_device: 10,
+                file_inode: 42,
+                prefix_generation: 0x5678,
+                range_start: 0,
+                range_end: 100,
+                record_sha256: "00".repeat(32),
+                event_index: 0,
+            },
+            timestamp: AT + 3,
+            model: "gpt-6.1-sol".into(),
+            tokens: TokenFacts {
+                total: 5,
+                input: Some(4),
+                cached_input: Some(1),
+                cache_write_input: Some(0),
+                output: Some(1),
+            },
+            period: None,
+            admission: Some(serde_json::from_value(admission).unwrap()),
+        };
+        assert!(old.admission.as_ref().unwrap().valid_for(&old, None));
+        let mut checkpoints = Vec::new();
+        for inode in [42, 99] {
+            let source = RecordedSessionSource {
+                root_identity: "unix:10:20".into(),
+                relative_path: "one.jsonl".into(),
+                file_device: 10,
+                file_inode: inode,
+                file_bytes: 100,
+                modified_nanos: 1,
+            };
+            let mut cp = checkpoint(&source, 100);
+            let mut state = binding.clone();
+            state["account_binding"]["file_inode"] = serde_json::json!(inode);
+            cp.source_admission = Some(serde_json::from_value(state).unwrap());
+            validate_session_checkpoint(&cp).unwrap();
+            store.connection.execute("INSERT INTO session_checkpoints(root_identity,relative_path,file_device,file_inode,committed_offset,discard_until_lf,collector_epoch,cycle_seq,prefix_generation,prefix_sha256,fully_attributed_from_zero,token_baseline_known,history_base_pending,last_model,previous_total,previous_input,previous_cached_input,previous_output,source_admission) VALUES('unix:10:20','one.jsonl','10',?1,100,0,?2,'1',?3,?4,1,1,0,'SOL','20','12','2','8',?5)",params![inode.to_string(),format!("{:032x}",0x1234),format!("{:032x}",0x5678),"00".repeat(32),cp.source_admission.as_ref().unwrap().to_storage().unwrap()]).unwrap();
+            store.connection.execute("INSERT INTO session_ranges VALUES('unix:10:20','one.jsonl','10',?1,0,100,?2,'1',?3,?4)",params![inode.to_string(),format!("{:032x}",0x1234),format!("{:032x}",0x5678),"00".repeat(32)]).unwrap();
+            checkpoints.push(cp);
+        }
+        store.connection.execute("INSERT INTO session_events VALUES('unix:10:20','one.jsonl','10','42',?1,0,100,?2,0,?3,'gpt-6.1-sol','5','4','1','1','0',NULL,NULL,?4)",params![format!("{:032x}",0x5678),"00".repeat(32),AT+3,serde_json::to_string(old.admission.as_ref().unwrap()).unwrap()]).unwrap();
+        store.connection.execute("INSERT INTO usage_history(timestamp,reset_at,remaining_percent,sol_dollars,terra_dollars,luna_dollars,sol_tokens,terra_tokens,luna_tokens) VALUES(?1,?2,90,0,0,0,0,0,0)",params![AT,AT+100]).unwrap();
+        let price = 0.123_456_789_012_345_66_f64;
+        store.connection.execute("INSERT INTO usage_model_history(reset_at,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,model_set_complete,total_dollars,price_version) VALUES(?1,?2,'gpt-6.1-sol','5','4','1','1','0',1,?3,'original-price')",params![AT+100,AT,price]).unwrap();
+        let original = read_session_event_facts(&store.connection).unwrap();
+        let original_checkpoints = store.load_session_collection_state().unwrap().checkpoints;
+        let backup = UsageStore::backup_generations_partitioned_verified(
+            &path,
+            &partition_identity('a', 7),
+            3,
+        )
+        .unwrap();
+        let inputs = store.prepare_source_repair_inputs(backup).unwrap();
+        let mut accepted_faults = Vec::new();
+        for fault in ["five-ids", "reasoning-sixth", "response-to-counter"] {
+            let mut proposed = old.clone();
+            proposed.source.file_inode = 99;
+            proposed
+                .admission
+                .as_mut()
+                .unwrap()
+                .source_binding
+                .file_inode = 99;
+            let numeric = &mut proposed.admission.as_mut().unwrap().numeric;
+            if let event_admission::NumericEventProof::ResponseRecord { candidate, .. } = numeric {
+                if fault == "five-ids" {
+                    candidate.record.ids.response_id = "different-consumption".into();
+                    candidate.key = candidate.record.ids.key();
+                }
+                if fault == "reasoning-sixth" {
+                    candidate.record.usage.reasoning_output = 0;
+                }
+            }
+            if fault == "response-to-counter" {
+                *numeric=serde_json::from_value(serde_json::json!({"kind":"legacy-counter","before":{"pointer":pointer(10,20,AT+2),"total":10,"input":8,"cached_input":2,"cache_write_input":0,"output":2},"after":{"pointer":pointer(20,30,AT+3),"total":15,"input":12,"cached_input":3,"cache_write_input":0,"output":3},"model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},"kind":"turn","interval":"model:gpt-6.1-sol"}})).unwrap();
+            }
+            assert!(
+                proposed
+                    .admission
+                    .as_ref()
+                    .unwrap()
+                    .valid_for(&proposed, None),
+                "fixture must have independent valid qualification: {fault}"
+            );
+            let prefix = SourceEquivalencePrefix {
+                checkpoint: checkpoints[1].clone(),
+                verification_checkpoint: checkpoints[1].clone(),
+                ranges: store
+                    .load_session_ranges_for_checkpoint(&checkpoints[1])
+                    .unwrap(),
+                qualified_events: vec![proposed],
+                numeric_records: vec![],
+                parser_version: "codex-info-session-recorder-v3".into(),
+            };
+            if store
+                .prepare_source_equivalence(
+                    SourceEquivalenceMode::EventBijection,
+                    &checkpoints[0],
+                    vec![prefix],
+                    inputs.clone(),
+                )
+                .is_ok()
+            {
+                accepted_faults.push(fault);
+            }
+            assert_eq!(
+                read_session_event_facts(&store.connection).unwrap(),
+                original
+            );
+            assert_eq!(
+                store.load_session_collection_state().unwrap().checkpoints,
+                original_checkpoints
+            );
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT count(*) FROM source_prefix_repairs", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT total_dollars FROM usage_model_history", [], |r| r
+                        .get::<_, f64>(
+                        0
+                    ))
+                    .unwrap()
+                    .to_bits(),
+                price.to_bits()
+            );
+        }
+        assert!(accepted_faults.is_empty(), "known 5-ID / sixth component / response-kind changes were accepted: {accepted_faults:?}");
+        let mut same_response = old.clone();
+        same_response.source.file_inode = 99;
+        same_response
+            .admission
+            .as_mut()
+            .unwrap()
+            .source_binding
+            .file_inode = 99;
+        let prefix = SourceEquivalencePrefix {
+            checkpoint: checkpoints[1].clone(),
+            verification_checkpoint: checkpoints[1].clone(),
+            ranges: store
+                .load_session_ranges_for_checkpoint(&checkpoints[1])
+                .unwrap(),
+            qualified_events: vec![same_response],
+            numeric_records: vec![],
+            parser_version: "codex-info-session-recorder-v3".into(),
+        };
+        let repair = store
+            .prepare_source_equivalence(
+                SourceEquivalenceMode::EventBijection,
+                &checkpoints[0],
+                vec![prefix],
+                inputs,
+            )
+            .unwrap();
+        let period = store
+            .prepare_period_attribution(
+                &partition_identity('a', 7),
+                &[SessionLifecycleInterval::new(Some(AT), None)],
+            )
+            .unwrap();
+        let mut store = store;
+        store.commit_historical_source_repairs(&period, std::slice::from_ref(&repair))
+            .expect("same known response adds evidence while retaining its unique original canonical row");
+        assert_eq!(
+            read_session_event_facts(&store.connection).unwrap(),
+            original
+        );
+        let payload: String = store
+            .connection
+            .query_row("SELECT payload_json FROM source_prefix_repairs", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            payload["mappings"][0]["canonical_kind"],
+            "retained-response"
+        );
+        assert_ne!(
+            payload["mappings"][0]["qualified"]["source"],
+            payload["mappings"][0]["canonical"]
+        );
+        assert_eq!(store.load_session_events().unwrap().len(), 1);
+        let table = source_qualification_repair::canonical_table(&store.connection).unwrap();
+        let plan = store
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN SELECT * FROM {table}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().all(|step| !step.contains("CORRELATED")),
+            "mapping membership must not expand for each source row: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|step| step.contains("LIST SUBQUERY")),
+            "new proof must invalidate the preceding transaction view: {plan:?}"
+        );
+        let opcodes = store
+            .connection
+            .prepare(&format!("EXPLAIN SELECT * FROM {table}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            opcodes.iter().any(|opcode| opcode == "Once")
+                && opcodes.iter().any(|opcode| opcode == "IdxInsert"),
+            "SQLite builds one indexed membership list: {opcodes:?}"
+        );
+        // Query-plan evidence is independent of the canonical SQL text: its
+        // OpenRead operands must not reopen the immutable provenance table.
+        let proof_root = store
+            .connection
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE type='table' AND name='source_prefix_repairs'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let proof_table_opens = store
+            .connection
+            .prepare(&format!("EXPLAIN SELECT * FROM {table}"))
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .iter()
+            .filter(|(opcode, p2, p3)| opcode == "OpenRead" && *p2 == proof_root && *p3 == 0)
+            .count();
+        assert_eq!(
+            proof_table_opens, 0,
+            "canonical consumer must not reopen the verified proof table"
+        );
+        assert_eq!(
+            store
+                .commit_historical_source_repairs(&period, &[repair])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT total_dollars FROM usage_model_history", [], |r| r
+                    .get::<_, f64>(
+                    0
+                ))
+                .unwrap()
+                .to_bits(),
+            price.to_bits()
+        );
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_event_admission_read_validates_source_numeric_model_and_period() {
+        const AT: i64 = 1_791_871_200;
+        let path = database_path("issue604-event-admission-read");
+        let mut store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        for (name, kind) in [
+            ("reset_at", "INTEGER"),
+            ("window_seconds", "INTEGER"),
+            ("admission_json", "TEXT"),
+        ] {
+            let exists:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_events') WHERE name=?1)",[name],|r|r.get(0)).unwrap();
+            if !exists {
+                store
+                    .connection
+                    .execute_batch(&format!(
+                        "ALTER TABLE session_events ADD COLUMN {name} {kind}"
+                    ))
+                    .unwrap();
+            }
+        }
+        let pointer = |start, end, at| serde_json::json!({"start":start,"end":end,"sha256":"22".repeat(32),"timestamp":at});
+        let witness = |start, end, at, total, input, cached, output| serde_json::json!({"pointer":pointer(start,end,at),"total":total,"input":input,"cached_input":cached,"cache_write_input":0,"output":output});
+        let binding = issue604_source_binding_json()["account_binding"].clone();
+        let legacy = serde_json::json!({
+            "version":1,"source_binding":binding,"verified_prefix_end":100,
+            "ownership":{"start_at":AT,"end_at":null},
+            "numeric":{"kind":"legacy-counter",
+                "before":witness(10,20,AT+2,10,8,2,2),
+                "after":witness(20,30,AT+3,15,12,3,3),
+                "model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},"kind":"turn","interval":"model:gpt-6.1-sol"}},
+            "period":{"rule_version":1,"lower_at":AT+2,"upper_at":AT+10,"evidence_generation":"1","evidence_sha256":"44".repeat(32)}
+        });
+        store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,reset_at,window_seconds,admission_json) VALUES('unix:10:20','one.jsonl','10','42',?1,0,100,?2,0,?3,'gpt-6.1-sol','5','4','1','1','0',?4,200,?5)",params![format!("{:032x}",0x5678_u128),"00".repeat(32),AT+3,AT+100,legacy.to_string()]).unwrap();
+        assert!(
+            read_session_event_facts(&store.connection).is_ok(),
+            "qualified legacy proof must read without changing numbers"
+        );
+        // DATA's legacy priority rule admits an initial setting adopted from
+        // kind=none. Response records still require their own strong context.
+        for kind in ["initial-settings", "turn"] {
+            for interval in ["none", "model:gpt-6.1-sol"] {
+                let mut adopted = legacy.clone();
+                adopted["numeric"]["model_context"]["kind"] = serde_json::json!(kind);
+                adopted["numeric"]["model_context"]["interval"] = serde_json::json!(interval);
+                store
+                    .connection
+                    .execute(
+                        "UPDATE session_events SET admission_json=?1",
+                        [adopted.to_string()],
+                    )
+                    .unwrap();
+                let facts = read_session_event_facts(&store.connection).unwrap_or_else(|error| {
+                    panic!("adopted legacy context must remain valid: {kind}/{interval}: {error}")
+                });
+                assert_eq!(facts.len(), 1);
+                assert_eq!(facts[0].tokens.total, 5);
+                assert_eq!(facts[0].model, "gpt-6.1-sol");
+            }
+        }
+        let mut invalid = legacy.clone();
+        invalid["version"] = serde_json::json!(2);
+        let mut cases = vec![("unknown-version", invalid)];
+        for (name, pointer, replacement) in [
+            ("unknown-field", "/extra", serde_json::json!(1)),
+            (
+                "partition",
+                "/source_binding/partition/storage_epoch",
+                serde_json::json!(8),
+            ),
+            (
+                "source-path",
+                "/source_binding/relative_path",
+                serde_json::json!("elsewhere.jsonl"),
+            ),
+            (
+                "source-generation",
+                "/source_binding/prefix_generation",
+                serde_json::json!("11".repeat(16)),
+            ),
+            ("prefix-end", "/verified_prefix_end", serde_json::json!(20)),
+            ("owner-end", "/ownership/end_at", serde_json::json!(AT + 3)),
+            (
+                "rpc-floor",
+                "/source_binding/proof/began_at",
+                serde_json::json!(AT + 3),
+            ),
+            ("raw-delta", "/numeric/after/total", serde_json::json!(16)),
+            (
+                "raw-knownness",
+                "/numeric/before/input",
+                serde_json::Value::Null,
+            ),
+            (
+                "raw-time",
+                "/numeric/after/pointer/timestamp",
+                serde_json::json!(AT + 4),
+            ),
+            (
+                "model-kind",
+                "/numeric/model_context/kind",
+                serde_json::json!("unknown"),
+            ),
+            (
+                "model-interval",
+                "/numeric/model_context/interval",
+                serde_json::json!("mixed"),
+            ),
+            ("period-rule", "/period/rule_version", serde_json::json!(2)),
+            (
+                "period-bounds",
+                "/period/lower_at",
+                serde_json::json!(AT + 4),
+            ),
+            (
+                "generation-canonical",
+                "/period/evidence_generation",
+                serde_json::json!("01"),
+            ),
+            ("missing-period-proof", "/period", serde_json::Value::Null),
+        ] {
+            let mut value = legacy.clone();
+            if pointer == "/extra" {
+                value["extra"] = replacement;
+            } else {
+                *value.pointer_mut(pointer).unwrap() = replacement;
+            }
+            cases.push((name, value));
+        }
+        for (name, value) in cases {
+            store
+                .connection
+                .execute(
+                    "UPDATE session_events SET admission_json=?1",
+                    [value.to_string()],
+                )
+                .unwrap();
+            assert!(
+                read_session_event_facts(&store.connection).is_err(),
+                "invalid event qualification accepted: {name}"
+            );
+            let stored: String = store
+                .connection
+                .query_row("SELECT total_tokens FROM session_events", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(stored, "5", "rejection must preserve original data: {name}");
+        }
+        let mut unassigned = legacy.clone();
+        unassigned["numeric"]["model_context"] = serde_json::Value::Null;
+        store
+            .connection
+            .execute(
+                "UPDATE session_events SET model='UNATTRIBUTED',admission_json=?1",
+                [unassigned.to_string()],
+            )
+            .unwrap();
+        assert!(
+            read_session_event_facts(&store.connection).is_ok(),
+            "unknown model does not erase qualified numeric facts"
+        );
+        unassigned["numeric"]["model_context"] = legacy["numeric"]["model_context"].clone();
+        unassigned["numeric"]["model_context"]["kind"] = serde_json::json!("unknown");
+        store
+            .connection
+            .execute(
+                "UPDATE session_events SET admission_json=?1",
+                [unassigned.to_string()],
+            )
+            .unwrap();
+        assert!(
+            read_session_event_facts(&store.connection).is_err(),
+            "an unknown model cannot bypass malformed supplied proof validation"
+        );
+        store
+            .connection
+            .execute("UPDATE session_events SET model='gpt-6.1-sol'", [])
+            .unwrap();
+        let ids = source_admission::ResponseIds {
+            thread_id: "binding-thread".into(),
+            session_id: "binding-session".into(),
+            root_turn_id: "root-turn".into(),
+            turn_id: "turn".into(),
+            response_id: "response".into(),
+        };
+        let usage = serde_json::json!({"total":5,"input":4,"cached_input":1,"cache_write_input":0,"output":1,"reasoning_output":1});
+        let mut response = legacy.clone();
+        response["numeric"] = serde_json::json!({"kind":"response-record","candidate":{
+            "key":ids.key(),"record":{"ids":ids,"usage":usage,"turn_usage":usage,"thread_usage":usage},
+            "pointer":pointer(20,30,AT+3),"session_scope_qualified":true,
+            "root_context":{"model":"gpt-6.1-sol","context":{"turn_id":"turn","root_turn_id":"root-turn","pointer":pointer(0,10,AT+1)}},
+            "classification":{"state":"normal","boundary":{"kind":"record","pointer":{"start":30,"end":40,"sha256":"55".repeat(32)}}}
+        }});
+        store
+            .connection
+            .execute(
+                "UPDATE session_events SET admission_json=?1",
+                [response.to_string()],
+            )
+            .unwrap();
+        assert!(
+            read_session_event_facts(&store.connection).is_ok(),
+            "qualified original response must read"
+        );
+        let canonical = store.response_event(&ids.key()).unwrap().unwrap();
+        let mut other_source = canonical.clone();
+        other_source.source.relative_path = "another.jsonl".into();
+        other_source.source.file_inode = 99;
+        let admission = other_source.admission.as_mut().unwrap();
+        admission.source_binding.relative_path = "another.jsonl".into();
+        admission.source_binding.file_inode = 99;
+        assert!(other_source
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&other_source, other_source.period));
+        assert!(
+            same_response(&canonical, &other_source),
+            "ordered five-ID identity is global across qualified physical sources"
+        );
+        assert_eq!(
+            store.response_event(&ids.key()).unwrap().unwrap(),
+            canonical
+        );
+        {
+            let tx = store.connection.transaction().unwrap();
+            recorded_usage::observe(&tx, &canonical).unwrap();
+            recorded_usage::observe(&tx, &other_source).unwrap();
+            let mut other_reset = canonical.clone();
+            other_reset.period.as_mut().unwrap().reset_at += 1;
+            assert!(other_reset
+                .admission
+                .as_ref()
+                .unwrap()
+                .valid_for(&other_reset, other_reset.period));
+            recorded_usage::observe(&tx, &other_reset).unwrap();
+            recorded_usage::finish(&tx).unwrap();
+            let (count,total):(i64,i64)=tx.query_row("SELECT count(*),sum(CAST(json_extract(tokens_json,'$.total') AS INTEGER)) FROM recorded_usage_facts",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(
+                (count, total),
+                (1, 5),
+                "five-ID replay across sources and reported reset must add zero"
+            );
+        }
+        let count: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM recorded_usage_facts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "rollback cannot leave a materialized fact behind");
+        let mut saved_family = canonical.clone();
+        saved_family.model = "SOL".into();
+        if let event_admission::NumericEventProof::ResponseRecord {
+            legacy_family_exact_model,
+            ..
+        } = &mut saved_family.admission.as_mut().unwrap().numeric
+        {
+            *legacy_family_exact_model = Some("gpt-6.1-sol".into());
+        }
+        assert!(saved_family
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&saved_family, saved_family.period));
+        assert!(
+            same_response(&saved_family, &other_source),
+            "a sealed old family key keeps global response identity through its proved exact model"
+        );
+        {
+            let tx = store.connection.transaction().unwrap();
+            recorded_usage::observe(&tx, &saved_family).unwrap();
+            recorded_usage::observe(&tx, &other_source)
+                .expect("sealed family alias must retain the proved exact model");
+            recorded_usage::finish(&tx).unwrap();
+            let (count,model,total):(i64,String,i64)=tx.query_row("SELECT count(*),min(model),sum(CAST(json_extract(tokens_json,'$.total') AS INTEGER)) FROM recorded_usage_facts",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!((count, model, total), (1, "gpt-6.1-sol".into(), 5));
+        }
+        let mut saved_counter = saved_family.clone();
+        let event_admission::NumericEventProof::LegacyCounter(proof) =
+            serde_json::from_value(legacy["numeric"].clone()).unwrap()
+        else {
+            panic!("legacy oracle")
+        };
+        saved_counter.admission.as_mut().unwrap().numeric =
+            event_admission::NumericEventProof::LegacyFamilyCounter {
+                proof,
+                exact_model: "gpt-6.1-sol".into(),
+            };
+        let before_entry = read_session_event_facts(&store.connection).unwrap();
+        for fact in [saved_family.clone(), saved_counter] {
+            assert!(fact
+                .admission
+                .as_ref()
+                .unwrap()
+                .valid_for(&fact, fact.period));
+            let rejected = store
+                .commit_session_collection_with_source_event_facts(
+                    SessionCollectionCommit {
+                        reset_at: AT + 100,
+                        window_seconds: 200,
+                        collector_epoch: 1,
+                        cycle_seq: 1,
+                        samples: &[],
+                        checkpoints: &[],
+                        ranges: &[],
+                        model_totals: &[],
+                        recorded_sessions: &[],
+                    },
+                    &[],
+                    AT + 100,
+                    SessionSourceCommitEvidence {
+                        task: SessionTaskEvidenceInput {
+                            events: &[],
+                            pending_ranges: &[],
+                            token_anchor_recoveries: &[],
+                            token_anchor_resolutions: &[],
+                            task_events: &[],
+                            task_indexed_ranges: &[],
+                        },
+                        timeline_recovery: None,
+                        exact_history_span: None,
+                        sessions_root: path.parent().unwrap(),
+                        lifecycle_intervals: &[],
+                    },
+                    SessionEventCommitEvidence {
+                        source_repairs: &[],
+                        events: std::slice::from_ref(&fact),
+                        period_attribution: None,
+                        response_replays: &[],
+                    },
+                )
+                .err()
+                .expect("normal writer must reject an unsealed family qualification");
+            assert!(matches!(rejected,UsageStoreError::InvalidImport(ref reason) if reason=="legacy family qualification requires a sealed existing-prefix repair"),
+                "normal writer entry must reject the family exception before applying any batch: {rejected}");
+            assert_eq!(
+                read_session_event_facts(&store.connection).unwrap(),
+                before_entry
+            );
+        }
+        let mut wrong_family = saved_family.clone();
+        wrong_family.model = "TERRA".into();
+        assert!(!wrong_family
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&wrong_family, wrong_family.period));
+        let mut changed_reasoning = other_source.clone();
+        if let event_admission::NumericEventProof::ResponseRecord { candidate, .. } =
+            &mut changed_reasoning.admission.as_mut().unwrap().numeric
+        {
+            candidate.record.usage.reasoning_output = 0;
+        }
+        assert!(!same_response(&canonical,&changed_reasoning),"reasoning is the independent sixth identity component even though it is already included in output");
+        assert!(changed_reasoning
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&changed_reasoning, changed_reasoning.period));
+        {
+            let tx = store.connection.transaction().unwrap();
+            recorded_usage::observe(&tx, &canonical).unwrap();
+            assert!(
+                recorded_usage::observe(&tx, &changed_reasoning).is_err(),
+                "recorded fact identity must retain the original independent reasoning component"
+            );
+        }
+
+        let duplicate = store.connection.execute("INSERT INTO session_events SELECT root_identity,'another.jsonl',file_device,'99',prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,reset_at,window_seconds,?1 FROM session_events",[serde_json::to_string(other_source.admission.as_ref().unwrap()).unwrap()]);
+        assert!(
+            duplicate.is_err(),
+            "the persisted global identity index cannot admit a second response event"
+        );
+        assert_eq!(
+            store.response_event(&ids.key()).unwrap().unwrap(),
+            canonical
+        );
+        for (name, pointer, replacement) in [
+            (
+                "response-scope",
+                "/numeric/candidate/session_scope_qualified",
+                serde_json::json!(false),
+            ),
+            (
+                "response-key",
+                "/numeric/candidate/key",
+                serde_json::json!("00".repeat(32)),
+            ),
+            (
+                "response-time",
+                "/numeric/candidate/pointer/timestamp",
+                serde_json::json!(AT + 4),
+            ),
+            (
+                "response-model",
+                "/numeric/candidate/root_context/model",
+                serde_json::json!("gpt-6-luna"),
+            ),
+            (
+                "response-usage",
+                "/numeric/candidate/record/usage/reasoning_output",
+                serde_json::json!(2),
+            ),
+        ] {
+            let mut invalid = response.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            store
+                .connection
+                .execute(
+                    "UPDATE session_events SET admission_json=?1",
+                    [invalid.to_string()],
+                )
+                .unwrap();
+            assert!(
+                read_session_event_facts(&store.connection).is_err(),
+                "invalid response admission accepted: {name}"
+            );
+        }
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_parser_repair_keeps_unchanged_facts_outside_its_fixed_prefix() {
+        verify_parser_repair_immutable_facts(false, false, false, false);
+    }
+
+    #[test]
+    fn issue604_historical_partial_qualification_preserves_saved_current_models() {
+        const AT: i64 = 1_791_871_200;
+        let path = database_path("issue604-historical-partial-current");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let cp = checkpoint(&recorded_source("one.jsonl", 42), 200);
+        let saved = vec![SessionModelTotal {
+            model: "gpt-6.1-sol".into(),
+            total_tokens: 15,
+            input_tokens: Some(15),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+        }];
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: AT + 100,
+                window_seconds: 200,
+                collector_epoch: cp.collector_epoch,
+                cycle_seq: cp.cycle_seq,
+                samples: &[],
+                checkpoints: &[cp],
+                ranges: &[],
+                model_totals: &saved,
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        let witness = |start, end, total| {
+            serde_json::json!({
+                "pointer":{"start":start,"end":end,"sha256":"22".repeat(32),"timestamp":AT+3},
+                "total":total,"input":total,"cached_input":0,"cache_write_input":0,"output":0
+            })
+        };
+        let admission = serde_json::json!({
+            "version":1,"source_binding":issue604_source_binding_json()["account_binding"],
+            "verified_prefix_end":200,"ownership":{"start_at":AT,"end_at":null},
+            "numeric":{"kind":"legacy-counter","before":witness(10,20,10),"after":witness(20,30,15),
+                "model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},"kind":"turn","interval":"none"}},
+            "period":null
+        });
+        store.connection.execute(
+            "INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20','one.jsonl','10','42',?1,0,200,?2,0,?3,'gpt-6.1-sol','5','5','0','0','0',?4)",
+            params![format!("{:032x}", 0x5678_u128), "00".repeat(32), AT+3, admission.to_string()],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO session_events SELECT root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,1,timestamp+1,model,'10','10',cached_input_tokens,output_tokens,cache_write_input_tokens,NULL,NULL,NULL FROM session_events",
+            [],
+        ).unwrap();
+        store
+            .stage_official_quota_inputs(
+                &[(1_u64, AT + 2), (2, AT + 5)]
+                    .into_iter()
+                    .map(
+                        |(sequence, observed_at)| period_evidence::OfficialQuotaInput {
+                            input_id: format!("{sequence:064x}"),
+                            account_scope: identity.account_scope_id.clone(),
+                            sequence,
+                            observed_at,
+                            content_sha256: format!("{sequence:064x}"),
+                            reset_at: Some(AT + 100),
+                            window_seconds: Some(200),
+                            reason: None,
+                        },
+                    )
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let prepared = store
+            .prepare_period_attribution(&identity, &[SessionLifecycleInterval::new(Some(AT), None)])
+            .unwrap();
+        store
+            .commit_historical_source_repairs(&prepared, &[])
+            .unwrap();
+        assert_eq!(
+            store.load_session_collection_state().unwrap().model_totals,
+            saved,
+            "qualifying five of fifteen saved tokens cannot replace the known total by five"
+        );
+        let counts: (i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT count(*),sum(admission_json IS NOT NULL) FROM session_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (2, 1));
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_source_repair_defers_period_only_changes_to_official_attribution() {
+        verify_parser_repair_immutable_facts(true, false, false, false);
+    }
+
+    #[test]
+    fn issue604_numerical_repair_defers_period_only_changes_to_official_attribution() {
+        verify_parser_repair_immutable_facts(true, true, false, false);
+    }
+
+    #[test]
+    fn issue604_source_repair_replays_original_admission_after_official_reassignment() {
+        verify_parser_repair_immutable_facts(true, true, true, false);
+    }
+
+    #[test]
+    fn issue604_source_repair_ack_retains_valid_original_period_support() {
+        verify_parser_repair_immutable_facts(true, true, false, true);
+    }
+
+    fn verify_parser_repair_immutable_facts(
+        refresh_period: bool,
+        numerical: bool,
+        retain_admission: bool,
+        support_expansion: bool,
+    ) {
+        use period_evidence::OfficialQuotaInput;
+        const AT: i64 = 1_791_871_200;
+        let path = database_path("issue604-parser-repair-retained-outside-fact");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let original_checkpoint = checkpoint(
+            &recorded_source("one.jsonl", 42),
+            if refresh_period { 200 } else { 100 },
+        );
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: AT + 100,
+                window_seconds: 200,
+                collector_epoch: original_checkpoint.collector_epoch,
+                cycle_seq: original_checkpoint.cycle_seq,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&original_checkpoint),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        let witness = |start, end, total| {
+            serde_json::json!({
+                "pointer":{"start":start,"end":end,"sha256":"22".repeat(32),"timestamp":AT+3},
+                "total":total,"input":total,"cached_input":0,"cache_write_input":0,"output":0
+            })
+        };
+        let admission = serde_json::json!({
+            "version":1,"source_binding":issue604_source_binding_json()["account_binding"],
+            "verified_prefix_end":200,"ownership":{"start_at":AT,"end_at":null},
+            "numeric":{"kind":"legacy-counter","before":witness(10,20,10),"after":witness(20,30,15),
+                "model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},"kind":"turn","interval":"none"}},
+            "period":null
+        });
+        store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20','one.jsonl','10','42',?1,0,200,?2,0,?3,'gpt-6.1-sol','5','5','0','0','0',?4)",
+            params![format!("{:032x}",0x5678_u128),"00".repeat(32),AT+3,admission.to_string()]).unwrap();
+        if support_expansion {
+            store
+                .stage_official_quota_inputs(
+                    &[(1_u64, AT + 2), (2, AT + 4)]
+                        .into_iter()
+                        .map(|(sequence, observed_at)| OfficialQuotaInput {
+                            input_id: format!("{sequence:064x}"),
+                            account_scope: identity.account_scope_id.clone(),
+                            sequence,
+                            observed_at,
+                            content_sha256: format!("{sequence:064x}"),
+                            reset_at: Some(AT + 100),
+                            window_seconds: Some(200),
+                            reason: None,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let first = store
+                .prepare_period_attribution(
+                    &identity,
+                    &[SessionLifecycleInterval::new(Some(AT), None)],
+                )
+                .unwrap();
+            let mut fact = read_session_event_facts(&store.connection)
+                .unwrap()
+                .remove(0);
+            first.assign(&mut fact).unwrap();
+            let tx = store.connection.transaction().unwrap();
+            period_evidence::commit_snapshot(&tx, &first).unwrap();
+            tx.execute(
+                "UPDATE session_events SET reset_at=?1,window_seconds=200,admission_json=?2",
+                params![AT + 100, serde_json::to_string(&fact.admission).unwrap()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let original = store
+            .source_events_for_qualification_repair(&original_checkpoint)
+            .unwrap();
+        assert_eq!(original.len(), 1);
+        let mut reconstructed = original_checkpoint.clone();
+        reconstructed.source_admission = source_admission::SourceAdmission::from_storage(
+            &issue604_source_binding_json().to_string(),
+            100,
+        );
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 3).unwrap();
+        let inputs = store.prepare_source_repair_inputs(backup).unwrap();
+        let period = store
+            .prepare_period_attribution(&identity, &[SessionLifecycleInterval::new(Some(AT), None)])
+            .unwrap();
+        let before = store.load_session_collection_state().unwrap();
+        if refresh_period {
+            store
+                .stage_official_quota_inputs(&[OfficialQuotaInput {
+                    input_id: "44".repeat(32),
+                    account_scope: identity.account_scope_id.clone(),
+                    sequence: if support_expansion { 3 } else { 1 },
+                    observed_at: AT + if support_expansion { 5 } else { 3 },
+                    content_sha256: "44".repeat(32),
+                    reset_at: Some(AT + 100),
+                    window_seconds: Some(200),
+                    reason: None,
+                }])
+                .unwrap();
+            let period = store
+                .prepare_period_attribution(
+                    &identity,
+                    &[SessionLifecycleInterval::new(Some(AT), None)],
+                )
+                .unwrap();
+            let mut reassigned = original.clone();
+            period.assign(&mut reassigned[0]).unwrap();
+            assert_eq!(
+                reassigned[0].period,
+                Some(event_admission::SessionEventPeriod {
+                    reset_at: AT + 100,
+                    window_seconds: 200
+                })
+            );
+            assert_eq!(original[0].period.is_none(), !support_expansion);
+            let prepare = |qualified, inputs| {
+                if numerical {
+                    store.prepare_source_numerical_repair(
+                        &original_checkpoint,
+                        original.clone(),
+                        qualified,
+                        inputs,
+                        SourceNumericalReplay {
+                            checkpoint: reconstructed.clone(),
+                            records: Vec::new(),
+                            pending: Vec::new(),
+                        },
+                    )
+                } else {
+                    store.prepare_source_prefix_repair_with_parser_inputs(
+                        &original_checkpoint,
+                        &reconstructed,
+                        original.clone(),
+                        qualified,
+                        Vec::new(),
+                        inputs,
+                    )
+                }
+            };
+            let mut invalid = reassigned.clone();
+            invalid[0]
+                .admission
+                .as_mut()
+                .unwrap()
+                .period
+                .as_mut()
+                .unwrap()
+                .lower_at += 1;
+            let invalid = prepare(invalid, inputs.clone()).unwrap();
+            let repair = prepare(
+                if retain_admission {
+                    original.clone()
+                } else {
+                    reassigned.clone()
+                },
+                inputs,
+            )
+            .unwrap();
+            let unchanged = store.load_session_collection_state().unwrap();
+            assert!(store
+                .commit_historical_source_repairs(&period, &[invalid])
+                .is_err());
+            assert_eq!(store.load_session_collection_state().unwrap(), unchanged);
+            assert_eq!(
+                read_session_event_facts(&store.connection).unwrap(),
+                original
+            );
+            store.connection.execute_batch(if support_expansion {
+                "CREATE TRIGGER reject_fixed_period_reassignment BEFORE INSERT ON source_prefix_repairs BEGIN SELECT RAISE(ABORT,'fixture fixed period rollback'); END;"
+            } else {
+                "CREATE TRIGGER reject_fixed_period_reassignment BEFORE UPDATE OF reset_at ON session_events BEGIN SELECT RAISE(ABORT,'fixture fixed period rollback'); END;"
+            }).unwrap();
+            let failure = store
+                .commit_historical_source_repairs(&period, std::slice::from_ref(&repair))
+                .unwrap_err();
+            assert!(failure
+                .to_string()
+                .contains("fixture fixed period rollback"));
+            assert_eq!(store.load_session_collection_state().unwrap(), unchanged);
+            assert_eq!(
+                read_session_event_facts(&store.connection).unwrap(),
+                original
+            );
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT count(*) FROM source_prefix_repairs", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                0
+            );
+            store
+                .connection
+                .execute_batch("DROP TRIGGER reject_fixed_period_reassignment")
+                .unwrap();
+            store.commit_historical_source_repairs(&period, std::slice::from_ref(&repair)).expect("a source-equivalent period change belongs to the fixed official reassignment transaction");
+            assert_eq!(
+                read_session_event_facts(&store.connection).unwrap(),
+                if support_expansion {
+                    original.clone()
+                } else {
+                    reassigned.clone()
+                }
+            );
+            assert_eq!(
+                store.load_session_collection_state().unwrap().checkpoints[0].committed_offset,
+                before.checkpoints[0].committed_offset
+            );
+            let after = store.load_session_collection_state().unwrap();
+            assert_eq!(
+                store
+                    .commit_historical_source_repairs(&period, std::slice::from_ref(&repair))
+                    .unwrap(),
+                None
+            );
+            assert_eq!(store.load_session_collection_state().unwrap(), after);
+            if support_expansion {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE session_events SET admission_json=?1",
+                        [serde_json::to_string(&reassigned[0].admission).unwrap()],
+                    )
+                    .unwrap();
+                let current_original = read_session_event_facts(&store.connection).unwrap();
+                assert_eq!(current_original, reassigned);
+                let mut invalid_proposal = reassigned.clone();
+                invalid_proposal[0]
+                    .admission
+                    .as_mut()
+                    .unwrap()
+                    .period
+                    .as_mut()
+                    .unwrap()
+                    .lower_at += 1;
+                let checkpoint = after.checkpoints[0].clone();
+                let backup =
+                    UsageStore::backup_generations_partitioned_verified(&path, &identity, 3)
+                        .unwrap();
+                let inputs = store.prepare_source_repair_inputs(backup).unwrap();
+                let invalid = store
+                    .prepare_source_numerical_repair(
+                        &checkpoint,
+                        current_original.clone(),
+                        invalid_proposal,
+                        inputs,
+                        SourceNumericalReplay {
+                            checkpoint: checkpoint.clone(),
+                            records: Vec::new(),
+                            pending: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+                assert!(store
+                    .commit_historical_source_repairs(&period, &[invalid])
+                    .is_err());
+                assert_eq!(
+                    read_session_event_facts(&store.connection).unwrap(),
+                    current_original
+                );
+                assert_eq!(store.load_session_collection_state().unwrap(), after);
+                assert_eq!(
+                    store
+                        .connection
+                        .query_row("SELECT count(*) FROM source_prefix_repairs", [], |row| row
+                            .get::<_, i64>(
+                            0
+                        ))
+                        .unwrap(),
+                    1,
+                    "a forged new proposal cannot acknowledge the accepted repair"
+                );
+                store
+                    .connection
+                    .execute(
+                        "UPDATE session_events SET admission_json=?1",
+                        [serde_json::to_string(&original[0].admission).unwrap()],
+                    )
+                    .unwrap();
+                let mut tampered = original[0].admission.clone().unwrap();
+                tampered.period.as_mut().unwrap().upper_at -= 1;
+                store
+                    .connection
+                    .execute(
+                        "UPDATE session_events SET admission_json=?1",
+                        [serde_json::to_string(&tampered).unwrap()],
+                    )
+                    .unwrap();
+                assert!(store
+                    .commit_historical_source_repairs(&period, std::slice::from_ref(&repair))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("source repair acknowledgement changed"));
+                assert_eq!(store.load_session_collection_state().unwrap(), after);
+                assert_eq!(
+                    read_session_event_facts(&store.connection).unwrap()[0].admission,
+                    Some(tampered)
+                );
+                store
+                    .connection
+                    .execute(
+                        "UPDATE session_events SET admission_json=?1",
+                        [serde_json::to_string(&original[0].admission).unwrap()],
+                    )
+                    .unwrap();
+            }
+            if retain_admission || support_expansion {
+                let mut changed = if support_expansion {
+                    &original[0]
+                } else {
+                    &reassigned[0]
+                }
+                .admission
+                .clone()
+                .unwrap();
+                let event_admission::NumericEventProof::LegacyCounter(proof) = &mut changed.numeric
+                else {
+                    panic!("counter fixture")
+                };
+                proof.model_context.as_mut().unwrap().pointer.sha256 = "ff".repeat(32);
+                store
+                    .connection
+                    .execute(
+                        "UPDATE session_events SET admission_json=?1",
+                        [serde_json::to_string(&changed).unwrap()],
+                    )
+                    .unwrap();
+                assert!(store
+                    .commit_historical_source_repairs(&period, &[repair])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("source repair acknowledgement changed"));
+                assert_eq!(store.load_session_collection_state().unwrap(), after);
+                assert_eq!(
+                    read_session_event_facts(&store.connection).unwrap()[0].admission,
+                    Some(changed)
+                );
+            }
+            remove_database(&path);
+            return;
+        }
+        for metadata_change in [false, true] {
+            let mut changed = original.clone();
+            if metadata_change {
+                changed[0].admission.as_mut().unwrap().verified_prefix_end = 201;
+            } else {
+                changed[0].tokens.total = 6;
+                changed[0].tokens.input = Some(6);
+            }
+            let rejected = store
+                .prepare_source_prefix_repair_with_parser_inputs(
+                    &original_checkpoint,
+                    &reconstructed,
+                    original.clone(),
+                    changed,
+                    Vec::new(),
+                    inputs.clone(),
+                )
+                .unwrap();
+            let error = store
+                .commit_historical_source_repairs(&period, &[rejected])
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("qualification repair cannot replace numeric/source facts"));
+            assert_eq!(store.load_session_collection_state().unwrap(), before);
+            assert_eq!(
+                read_session_event_facts(&store.connection).unwrap(),
+                original
+            );
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT count(*) FROM source_prefix_repairs", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                0
+            );
+        }
+        let repair = store
+            .prepare_source_prefix_repair_with_parser_inputs(
+                &original_checkpoint,
+                &reconstructed,
+                original.clone(),
+                original.clone(),
+                Vec::new(),
+                inputs,
+            )
+            .unwrap();
+        store
+            .commit_historical_source_repairs(&period, &[repair])
+            .expect(
+            "an unchanged saved fact is retained, not newly qualified by the shorter parser prefix",
+        );
+        assert_eq!(
+            read_session_event_facts(&store.connection).unwrap(),
+            original
+        );
+        let saved = store.load_session_collection_state().unwrap();
+        assert_eq!(saved.checkpoints[0].committed_offset, 100);
+        assert_eq!(
+            saved.checkpoints[0].prefix_sha256,
+            original_checkpoint.prefix_sha256
+        );
+        assert_eq!(
+            saved.checkpoints[0].source_admission,
+            reconstructed.source_admission
+        );
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_source_repair_provenance_rejects_incomplete_storage_shape() {
+        for ddl in [
+            "CREATE TABLE source_prefix_repairs (repair_id TEXT PRIMARY KEY,payload_json TEXT,payload_sha256 TEXT) WITHOUT ROWID",
+            "CREATE TABLE source_prefix_repairs (repair_id TEXT PRIMARY KEY,payload_json TEXT NOT NULL,payload_sha256 TEXT NOT NULL)",
+        ] {
+            let connection = Connection::open_in_memory().unwrap();
+            connection.execute_batch(ddl).unwrap();
+            assert!(source_qualification_repair::validate_schema(&connection).is_err(),
+                "repair provenance must preserve mandatory bytes and canonical key storage: {ddl}");
+        }
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(source_qualification_repair::SCHEMA)
+            .unwrap();
+        source_qualification_repair::validate_schema(&connection).unwrap();
+    }
+
+    #[test]
+    fn issue604_lossless_event_read_preserves_unknown_components_and_identity() {
+        let path = database_path("issue604-lossless-event-read");
+        let store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        let inserted = store.connection.execute(
+            "INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','source.jsonl','1','2',?1,0,100,?2,0,1791871200,'gpt-6.1-sol','10',NULL,'0','2',NULL)",
+            params![format!("{:032x}",1_u128),"0".repeat(64)],
+        );
+        assert!(
+            inserted.is_ok(),
+            "v16 must preserve a known total with unknown components"
+        );
+        let rows = read_session_event_facts(&store.connection).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].tokens,
+            TokenFacts {
+                total: 10,
+                input: None,
+                cached_input: Some(0),
+                cache_write_input: None,
+                output: Some(2)
+            }
+        );
+        assert_eq!(rows[0].model, "gpt-6.1-sol");
+        assert_eq!(rows[0].timestamp, 1_791_871_200);
+        assert_eq!(
+            rows[0].source,
+            SessionEventSource {
+                root_identity: "root".into(),
+                relative_path: "source.jsonl".into(),
+                file_device: 1,
+                file_inode: 2,
+                prefix_generation: 1,
+                range_start: 0,
+                range_end: 100,
+                record_sha256: "0".repeat(64),
+                event_index: 0,
+            }
+        );
+        let canonical = load_raw_session_events_from_connection(&store.connection).unwrap();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].input_tokens, None);
+        assert_eq!(canonical[0].cached_input_tokens, Some(0));
+        assert_eq!(canonical[0].output_tokens, Some(2));
+        assert_eq!(canonical[0].cache_write_input_tokens, None);
+        assert_eq!(
+            canonical
+                .into_iter()
+                .map(LosslessSessionEvent::from)
+                .collect::<Vec<_>>(),
+            rows,
+            "the production event type must preserve every fact and original source pointer"
+        );
+        let stored: (i64, Option<String>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT count(*),input_tokens,cache_write_input_tokens FROM session_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (1, None, None));
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_lossless_event_read_rejects_noncanonical_numeric_text() {
+        let path = database_path("issue604-lossless-event-numeric-text");
+        let store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        store.connection.execute(
+            "INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','source.jsonl','1','2',?1,0,100,?2,0,1791871200,'gpt-6.1-sol','010','8','0','2',NULL)",
+            params![format!("{:032x}",1_u128),"0".repeat(64)],
+        ).unwrap();
+        assert!(
+            read_session_event_facts(&store.connection).is_err(),
+            "noncanonical TEXT must not be silently normalized"
+        );
+        let stored: String = store
+            .connection
+            .query_row("SELECT total_tokens FROM session_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, "010", "rejected source values are preserved");
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_source_timestamp_respects_the_public_domain() {
+        for (timestamp, accepted) in [
+            (0, false),
+            (1, true),
+            (253_402_300_799, true),
+            (253_402_300_800, false),
+            (i64::MAX, false),
+        ] {
+            let event = SessionEvent {
+                root_identity: "root".into(),
+                relative_path: "source.jsonl".into(),
+                file_device: 1,
+                file_inode: 2,
+                prefix_generation: 1,
+                range_start: 0,
+                range_end: 100,
+                record_sha256: "0".repeat(64),
+                event_index: 0,
+                timestamp,
+                model: "gpt-6.1-sol".into(),
+                total_tokens: 10,
+                input_tokens: Some(8),
+                cached_input_tokens: Some(2),
+                output_tokens: Some(2),
+                cache_write_input_tokens: None,
+            };
+            assert_eq!(
+                validate_session_event(&event).is_ok(),
+                accepted,
+                "timestamp={timestamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue604_model_totals_validate_total_as_well_as_cached_components() {
+        let valid = SessionModelTotal {
+            model: "gpt-6.1-sol".into(),
+            total_tokens: 10,
+            input_tokens: Some(8),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(2),
+            cache_write_input_tokens: None,
+        };
+        assert_eq!(
+            canonicalize_model_totals(std::slice::from_ref(&valid))
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&valid)
+        );
+        let wrong_total = SessionModelTotal {
+            total_tokens: 11,
+            ..valid.clone()
+        };
+        assert!(
+            canonicalize_model_totals(&[wrong_total]).is_err(),
+            "known I+O must equal T"
+        );
+        let overflow = SessionModelTotal {
+            total_tokens: u64::MAX,
+            input_tokens: Some(u64::MAX),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(1),
+            ..valid
+        };
+        assert!(
+            canonicalize_model_totals(&[overflow]).is_err(),
+            "I+O cannot wrap"
+        );
+    }
+
+    #[test]
+    fn issue604_source_tokens_keep_the_full_unsigned_range_as_text() {
+        let path = database_path("issue604-source-uint64");
+        let mut store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        let event = SessionEvent {
+            root_identity: "root".into(),
+            relative_path: "source.jsonl".into(),
+            file_device: 1,
+            file_inode: 2,
+            prefix_generation: 1,
+            range_start: 0,
+            range_end: 100,
+            record_sha256: "0".repeat(64),
+            event_index: 0,
+            timestamp: 1_791_871_200,
+            model: "gpt-6.1-sol".into(),
+            total_tokens: u64::MAX,
+            input_tokens: Some(u64::MAX),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+        };
+        validate_session_event(&event).expect("UInt64 TEXT storage is not signed INTEGER storage");
+        let tx = store.connection.transaction().unwrap();
+        upsert_session_events(
+            &tx,
+            &BTreeMap::from([(session_event_primary_key(&event), event.clone())]),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let stored: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT typeof(total_tokens),total_tokens FROM session_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            ("text".to_owned(), "18446744073709551615".to_owned())
+        );
+        assert_eq!(
+            load_raw_session_events_from_connection(&store.connection)
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&event)
+        );
+        let mut overflow = event.clone();
+        overflow.output_tokens = Some(1);
+        assert!(validate_session_event(&overflow).is_err());
+        let mut wrong_total = event;
+        wrong_total.total_tokens -= 1;
+        assert!(validate_session_event(&wrong_total).is_err());
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_exact_replacement_preserves_other_periods_same_minute_sidecars() {
+        const AT: i64 = 1_791_871_200;
+        const RESET: i64 = AT + 800;
+        let path = database_path("issue604-exact-replacement-period-key");
+        let mut store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        let mut samples = Vec::new();
+        let mut observations = Vec::new();
+        for (reset, tokens) in [(RESET, 10), (RESET + 1, 20)] {
+            let sample = UsageHistorySample {
+                timestamp: AT,
+                reset_at: reset,
+                remaining_percent: Some(90.0),
+                sol_dollars: 0.00005,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: tokens,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            };
+            let observation = UsageHistoryObservation::confirmed_with_models(
+                &sample,
+                vec![SessionModelTotal {
+                    model: "gpt-6.1-sol".into(),
+                    total_tokens: tokens,
+                    input_tokens: Some(tokens),
+                    cached_input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    cache_write_input_tokens: Some(0),
+                }],
+            );
+            store.upsert_sample(&sample).unwrap();
+            let tx = store.connection.transaction().unwrap();
+            upsert_observations(&tx, std::slice::from_ref(&observation)).unwrap();
+            upsert_observation_model_totals(&tx, std::slice::from_ref(&observation), false, None)
+                .unwrap();
+            tx.commit().unwrap();
+            samples.push(sample);
+            observations.push(observation);
+        }
+        let event = SessionEvent {
+            root_identity: "root".into(),
+            relative_path: "source.jsonl".into(),
+            file_device: 1,
+            file_inode: 2,
+            prefix_generation: 1,
+            range_start: 0,
+            range_end: 100,
+            record_sha256: "0".repeat(64),
+            event_index: 0,
+            timestamp: AT + 5,
+            model: "gpt-6.1-sol".into(),
+            total_tokens: 10,
+            input_tokens: Some(10),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+        };
+        let peer_before: (String,String) = store.connection.query_row(
+            "SELECT m.total_tokens,d.snapshot_json FROM usage_model_history m
+             JOIN durable_state d ON d.data_generation=m.timestamp AND json_extract(d.snapshot_json,'$.reset_at')=m.reset_at
+             WHERE m.reset_at=?1 AND m.timestamp=?2", params![RESET+1,AT],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        let tx = store.connection.transaction().unwrap();
+        let (replacement, admitted) = prepare_exact_session_history(
+            &tx,
+            RESET,
+            1000,
+            (AT, AT + 59),
+            &samples[..1],
+            &observations[..1],
+            observations[0].model_totals.as_ref().unwrap(),
+            &[event],
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap();
+        upsert_canonical_samples(&tx, &replacement, false, None).unwrap();
+        upsert_observation_model_totals(&tx, &admitted, false, None).unwrap();
+        upsert_observations(&tx, &admitted).unwrap();
+        tx.commit().unwrap();
+        let peer_after: (String,String) = store.connection.query_row(
+            "SELECT m.total_tokens,d.snapshot_json FROM usage_model_history m
+             JOIN durable_state d ON d.data_generation=m.timestamp AND json_extract(d.snapshot_json,'$.reset_at')=m.reset_at
+             WHERE m.reset_at=?1 AND m.timestamp=?2", params![RESET+1,AT],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).expect("the other exact period must retain its sidecars");
+        assert_eq!(peer_after, peer_before);
+        validate_canonical_history_storage(&store.connection).unwrap();
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_late_quota_receipt_updates_model_minute_without_session_success() {
+        const AT: i64 = 1_791_871_200;
+        const RESET: i64 = AT + 800;
+        let path = database_path("issue604-independent-quota-minute");
+        let mut store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        let sample = UsageHistorySample {
+            timestamp: AT,
+            reset_at: RESET,
+            remaining_percent: None,
+            sol_dollars: 13.598261999999998,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 5,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let mut observation = UsageHistoryObservation::confirmed_with_models(
+            &sample,
+            vec![SessionModelTotal {
+                model: "gpt-6.1-sol".into(),
+                total_tokens: 5,
+                input_tokens: Some(5),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
+                cache_write_input_tokens: Some(0),
+            }],
+        );
+        observation.model_totals_complete = false;
+        store.upsert_sample(&sample).unwrap();
+        let tx = store.connection.transaction().unwrap();
+        upsert_observations(&tx, std::slice::from_ref(&observation)).unwrap();
+        upsert_observation_model_totals(&tx, &[observation], false, None).unwrap();
+        tx.execute(
+            "UPDATE usage_model_history SET total_dollars=?1,price_version='saved-price-revision'",
+            [1.2345678901234567_f64],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let protected = |db: &Connection| {
+            let history: (u64, i64, f64, f64, i64, i64) = db
+                .query_row(
+                    "SELECT sol_dollars,sol_tokens,terra_dollars,luna_dollars,terra_tokens,luna_tokens
+                     FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                    params![RESET, AT],
+                    |r| Ok((r.get::<_, f64>(0)?.to_bits(), r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .unwrap();
+            let model: (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                u64,
+                String,
+            ) = db
+                .query_row(
+                    "SELECT model,total_tokens,input_tokens,cached_input_tokens,output_tokens,
+                            cache_write_input_tokens,model_set_complete,total_dollars,price_version
+                     FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2",
+                    params![RESET, AT],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get::<_, f64>(7)?.to_bits(),
+                            r.get(8)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let json: String = db
+                .query_row(
+                    "SELECT snapshot_json FROM durable_state WHERE singleton>=2 AND data_hash=?1",
+                    [observation_data_hash(RESET, AT)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut json: serde_json::Value = serde_json::from_str(&json).unwrap();
+            json.as_object_mut().unwrap().remove("remaining_percent");
+            (history, model, json)
+        };
+        let before = protected(&store.connection);
+        // Acquisition order is the official authority. Neither Session success
+        // nor the receipt's wall-clock order may choose the minute's quota.
+        for (sequence, observed_at, remaining, expected) in [
+            (2, AT + 20, 80.0, 80.0),
+            (1, AT + 40, 85.0, 80.0),
+            (3, AT + 10, 79.0, 79.0),
+        ] {
+            let receipt = QuotaReceipt {
+                receipt_id: format!("{sequence:064x}"),
+                sequence,
+                observed_at,
+                reset_at: RESET,
+                window_seconds: 1000,
+                remaining_percent: remaining,
+            };
+            store.commit_quota_receipts(&[receipt], false).unwrap();
+            let actual: (Option<f64>, Option<f64>) = store
+                .connection
+                .query_row(
+                    "SELECT h.remaining_percent,json_extract(d.snapshot_json,'$.remaining_percent')
+                 FROM usage_history h JOIN durable_state d ON d.data_hash=?3
+                 WHERE h.reset_at=?1 AND h.timestamp=?2",
+                    params![RESET, AT, observation_data_hash(RESET, AT)],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                actual,
+                (Some(expected), Some(expected)),
+                "accepted official quota must reach its exact model minute without a Session cycle"
+            );
+            assert_eq!(
+                protected(&store.connection),
+                before,
+                "quota cannot reprice or reclassify model evidence"
+            );
+        }
+        let mut stale_session = sample.clone();
+        stale_session.remaining_percent = Some(92.0);
+        store.upsert_sample(&stale_session).unwrap();
+        let retained: Option<f64> = store
+            .connection
+            .query_row(
+                "SELECT remaining_percent FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                params![RESET, AT],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained,
+            Some(79.0),
+            "a later Session projection cannot replace official quota with a cached value"
+        );
+        let tx = store.connection.transaction().unwrap();
+        upsert_observations(&tx, &[UsageHistoryObservation::confirmed(&stale_session)]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            protected(&store.connection),
+            before,
+            "Session quota normalization must preserve model evidence"
+        );
+        let latest = store.latest_quota_receipt().unwrap().unwrap();
+        assert_eq!(store.commit_quota_receipts(&[latest], false).unwrap(), None);
+        validate_canonical_history_storage(&store.connection).unwrap();
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_official_quota_without_model_has_a_durable_exact_minute() {
+        const AT: i64 = 1_791_871_200;
+        const RESET: i64 = AT + 800;
+        let path = database_path("issue604-independent-quota-only");
+        let mut store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        for (sequence, reset, remaining) in [(1, RESET, 80.0), (2, RESET + 1, 81.0)] {
+            store
+                .commit_quota_receipts(
+                    &[QuotaReceipt {
+                        receipt_id: format!("{sequence:064x}"),
+                        sequence,
+                        observed_at: AT + 5,
+                        reset_at: reset,
+                        window_seconds: 1000,
+                        remaining_percent: remaining,
+                    }],
+                    false,
+                )
+                .unwrap();
+            let saved: Option<String> = store
+                .connection
+                .query_row(
+                    "SELECT snapshot_json FROM durable_state WHERE singleton>=2 AND data_hash=?1",
+                    [observation_data_hash(reset, AT)],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            let saved = saved.expect(
+                "accepted quota must persist an exact-minute observation without any Session model",
+            );
+            let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+            assert_eq!(saved["timestamp"], AT);
+            assert_eq!(saved["reset_at"], reset);
+            assert_eq!(saved["remaining_percent"], remaining);
+            assert_eq!(saved["model_source"], "unavailable");
+            for field in [
+                "sol_tokens",
+                "terra_tokens",
+                "luna_tokens",
+                "sol_dollars",
+                "terra_dollars",
+                "luna_dollars",
+            ] {
+                assert!(saved[field].is_null(), "quota cannot invent {field}");
+            }
+        }
+        let counts: (i64, i64, i64) = store.connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM usage_history), (SELECT COUNT(*) FROM usage_model_history),
+                    (SELECT COUNT(*) FROM durable_state WHERE singleton>=2)", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            counts,
+            (0, 0, 2),
+            "same minute in two exact periods remains two quota-only observations"
+        );
+        validate_canonical_history_storage(&store.connection).unwrap();
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_preserved_backup_migrates_v15_exact_period_quota_without_rotation() {
+        const AT: i64 = 1_791_871_200;
+        const MODEL_RESET: i64 = AT + 800;
+        const QUOTA_RESET: i64 = AT + 801;
+        let path = database_path("issue604-preserved-v15-migration");
+        let preserved = path.with_extension("preserved-v15.sqlite3");
+        let migrated_backup = path.with_extension("preserved-v16.sqlite3");
+        let existing_backup = path.with_extension("sqlite3.bak.1");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let sample = UsageHistorySample {
+            timestamp: AT,
+            reset_at: MODEL_RESET,
+            remaining_percent: None,
+            sol_dollars: 13.598261999999998,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 5,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        store.upsert_sample(&sample).unwrap();
+        let mut observation = UsageHistoryObservation::confirmed_with_models(
+            &sample,
+            vec![SessionModelTotal {
+                model: "gpt-6.1-sol".into(),
+                total_tokens: 5,
+                input_tokens: Some(5),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
+                cache_write_input_tokens: Some(0),
+            }],
+        );
+        observation.model_totals_complete = false;
+        let tx = store.connection.transaction().unwrap();
+        upsert_observations(&tx, std::slice::from_ref(&observation)).unwrap();
+        upsert_observation_model_totals(&tx, &[observation], false, None).unwrap();
+        tx.commit().unwrap();
+        let receipt = QuotaReceipt {
+            receipt_id: "a".repeat(64),
+            sequence: 1,
+            observed_at: AT + 5,
+            reset_at: QUOTA_RESET,
+            window_seconds: 1000,
+            remaining_percent: 80.0,
+        };
+        store
+            .connection
+            .execute(
+                "INSERT INTO quota_receipts VALUES(?1,1,?2,?3,1000,80.0,'0')",
+                params![receipt.receipt_id, receipt.observed_at, receipt.reset_at],
+            )
+            .unwrap();
+        downgrade_qualification_fixture(&store.connection);
+        // The production v15 unavailable branch treats a model row from any
+        // reset at the same minute as an orphan. This is the observed veto.
+        store
+            .connection
+            .execute_batch(
+                "DROP TRIGGER durable_history_observation_insert_guard;
+             CREATE TRIGGER durable_history_observation_insert_guard
+             BEFORE INSERT ON durable_state
+             WHEN NEW.singleton>=2
+               AND json_extract(NEW.snapshot_json,'$.model_source')='unavailable'
+               AND EXISTS(SELECT 1 FROM usage_history WHERE timestamp=NEW.data_generation)
+             BEGIN SELECT RAISE(ABORT,'orphan durable history observation'); END;
+             PRAGMA user_version=15;",
+            )
+            .unwrap();
+        let model_cells = |db: &Connection| {
+            let mut query = db
+                .prepare("SELECT * FROM usage_model_history ORDER BY reset_at,timestamp,model")
+                .unwrap();
+            let width = query.column_count();
+            query
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|i| row.get::<_, Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let original_models = model_cells(&store.connection);
+        drop(store);
+        fs::copy(&path, &preserved).unwrap();
+        fs::write(
+            &existing_backup,
+            b"independent retained backup must not rotate",
+        )
+        .unwrap();
+        let preserved_bytes = fs::read(&preserved).unwrap();
+        let intervals = [SessionLifecycleInterval::new(
+            Some(AT - 1),
+            Some(QUOTA_RESET),
+        )];
+        let old_rejection = UsageStore::repair_quota_history_after_backup(
+            &path,
+            &preserved,
+            &identity,
+            &intervals,
+            std::slice::from_ref(&receipt),
+        )
+        .unwrap_err();
+        assert!(old_rejection
+            .to_string()
+            .contains("orphan durable history observation"));
+        let proof = UsageStore::verify_preserved_partition_backup(&path, &preserved, &identity)
+            .expect(
+                "a private preserved backup must qualify without rotating any retained generation",
+            );
+        assert!(UsageStore::migrate_partition_history_after_verified_backup(
+            &path, &identity, &proof
+        )
+        .unwrap());
+        let migrated = UsageStore::open_read_only_partitioned(&path, &identity).unwrap();
+        assert_eq!(account_db_schema_version(&migrated.connection).unwrap(), 16);
+        assert_eq!(model_cells(&migrated.connection), original_models);
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM durable_state WHERE singleton>=2",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        drop(migrated);
+        fs::copy(&path, &migrated_backup).unwrap();
+        assert_eq!(
+            UsageStore::repair_quota_history_after_backup(
+                &path,
+                &migrated_backup,
+                &identity,
+                &intervals,
+                std::slice::from_ref(&receipt),
+            )
+            .unwrap(),
+            1
+        );
+        let repaired = UsageStore::open_read_only_partitioned(&path, &identity).unwrap();
+        assert_eq!(model_cells(&repaired.connection), original_models);
+        assert_eq!(
+            repaired
+                .connection
+                .query_row("SELECT count(*) FROM usage_history", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let quota: (f64,String,Option<i64>) = repaired.connection.query_row(
+            "SELECT json_extract(snapshot_json,'$.remaining_percent'),json_extract(snapshot_json,'$.model_source'),
+                json_extract(snapshot_json,'$.sol_tokens') FROM durable_state WHERE data_hash=?1",
+            [observation_data_hash(QUOTA_RESET, AT)], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(quota, (80.0, "unavailable".into(), None));
+        assert_eq!(fs::read(&preserved).unwrap(), preserved_bytes);
+        assert_eq!(
+            fs::read(&existing_backup).unwrap(),
+            b"independent retained backup must not rotate"
+        );
+        drop(repaired);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_offline_quota_repair_preserves_models_and_replays_idempotently() {
+        const AT: i64 = 1_791_871_200;
+        const RESET: i64 = AT + 800;
+        let path = database_path("issue604-offline-quota-repair");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        for (at, remaining) in [(AT, None), (AT + 120, Some(61.0)), (AT + 180, None)] {
+            let sample = UsageHistorySample {
+                timestamp: at,
+                reset_at: RESET,
+                remaining_percent: remaining,
+                sol_dollars: 13.598261999999998,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 5,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            };
+            store.upsert_sample(&sample).unwrap();
+            let mut observation = UsageHistoryObservation::confirmed_with_models(
+                &sample,
+                vec![SessionModelTotal {
+                    model: "gpt-6.1-sol".into(),
+                    total_tokens: 5,
+                    input_tokens: Some(5),
+                    cached_input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    cache_write_input_tokens: Some(0),
+                }],
+            );
+            observation.model_totals_complete = false;
+            let tx = store.connection.transaction().unwrap();
+            upsert_observations(&tx, std::slice::from_ref(&observation)).unwrap();
+            upsert_observation_model_totals(&tx, &[observation], false, None).unwrap();
+            tx.commit().unwrap();
+        }
+        let receipts = [(1, AT + 5, 80.0), (2, AT + 65, 75.0), (3, AT + 125, 70.0)]
+            .into_iter()
+            .map(|(sequence, observed_at, remaining_percent)| QuotaReceipt {
+                receipt_id: format!("{sequence:064x}"),
+                sequence,
+                observed_at,
+                reset_at: RESET,
+                window_seconds: 1000,
+                remaining_percent,
+            })
+            .collect::<Vec<_>>();
+        // Frozen v15-shaped defect: accepted receipts already exist, while
+        // their projections are NULL, absent, or a conflicting cached quota.
+        for receipt in &receipts {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO quota_receipts VALUES(?1,?2,?3,?4,?5,?6,'0')",
+                    params![
+                        receipt.receipt_id,
+                        receipt.sequence,
+                        receipt.observed_at,
+                        receipt.reset_at,
+                        receipt.window_seconds,
+                        receipt.remaining_percent
+                    ],
+                )
+                .unwrap();
+        }
+        let protected = |db: &Connection| {
+            let mut query = db.prepare("SELECT reset_at,timestamp,model,total_tokens,input_tokens,cached_input_tokens,
+                output_tokens,cache_write_input_tokens,model_set_complete,total_dollars,price_version
+                FROM usage_model_history ORDER BY reset_at,timestamp,model").unwrap();
+            query
+                .query_map([], |row| {
+                    (0..11)
+                        .map(|index| row.get::<_, Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let models_before = protected(&store.connection);
+        let version: i64 = store
+            .connection
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        drop(store);
+        UsageStore::backup_generations(&path, 1).unwrap();
+        let backup = path.with_extension("sqlite3.bak.1");
+        let intervals = [SessionLifecycleInterval::new(Some(AT - 1), Some(RESET))];
+        assert!(UsageStore::repair_quota_history_after_backup(
+            &path,
+            &backup,
+            &partition_identity('b', 7),
+            &intervals,
+            &receipts
+        )
+        .is_err());
+        assert!(UsageStore::repair_quota_history_after_backup(
+            &path,
+            &backup,
+            &identity,
+            &[],
+            &receipts
+        )
+        .is_err());
+        assert_eq!(
+            UsageStore::repair_quota_history_after_backup(
+                &path, &backup, &identity, &intervals, &receipts
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            UsageStore::repair_quota_history_after_backup(
+                &path, &backup, &identity, &intervals, &receipts
+            )
+            .unwrap(),
+            0
+        );
+        let store = UsageStore::open_read_only_partitioned(&path, &identity).unwrap();
+        assert_eq!(protected(&store.connection), models_before);
+        assert_eq!(
+            store
+                .connection
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            version
+        );
+        for (at, expected) in [
+            (AT, Some(80.0)),
+            (AT + 60, Some(75.0)),
+            (AT + 120, Some(70.0)),
+            (AT + 180, None),
+        ] {
+            let quota: Option<f64> = store.connection.query_row(
+                "SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE data_hash=?1",
+                [observation_data_hash(RESET, at)], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(quota, expected);
+        }
+        let model_rows: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM usage_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            model_rows, 3,
+            "quota-only repair cannot manufacture a model sample"
+        );
+        validate_canonical_history_storage(&store.connection).unwrap();
+        let old = UsageStore::open_read_only_partitioned(&backup, &identity).unwrap();
+        let old_quota: Option<f64> = old
+            .connection
+            .query_row(
+                "SELECT remaining_percent FROM usage_history WHERE timestamp=?1",
+                [AT + 120],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_quota,
+            Some(61.0),
+            "repair preserves the conflicting old value in the separate backup"
+        );
+        drop(old);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_other_periods_minute_does_not_materialize_a_quota_receipt() {
+        const AT: i64 = 1_791_871_200;
+        const RESET: i64 = AT + 800;
+        let path = database_path("issue604-unmaterialized-exact-period");
+        let mut store = UsageStore::create_partitioned(&path, &partition_identity('a', 7)).unwrap();
+        let mut sample = UsageHistorySample {
+            timestamp: AT,
+            reset_at: RESET + 1,
+            remaining_percent: None,
+            sol_dollars: 0.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 10,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        store.upsert_sample(&sample).unwrap();
+        let receipt = QuotaReceipt {
+            receipt_id: "a".repeat(64),
+            sequence: 1,
+            observed_at: AT + 5,
+            reset_at: RESET,
+            window_seconds: 1000,
+            remaining_percent: 90.0,
+        };
+        store
+            .commit_quota_receipts(std::slice::from_ref(&receipt), false)
+            .unwrap();
+        assert_eq!(
+            store
+                .unmaterialized_quota_receipts(RESET, 1000, AT, AT + 59)
+                .unwrap(),
+            [receipt]
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1,window_seconds=1000",
+                [RESET + 1],
+            )
+            .unwrap();
+        sample.reset_at = RESET;
+        sample.remaining_percent = Some(90.0);
+        store.upsert_sample(&sample).unwrap();
+        assert!(store
+            .unmaterialized_quota_receipts(RESET, 1000, AT, AT + 59)
+            .unwrap()
+            .is_empty());
+        drop(store);
+        remove_database(&path);
+    }
+
     #[test]
     fn minute_replay_keeps_frozen_family_dollars_distinct_from_exact_model_prices() {
+        verify_minute_replay_saved_prices(false);
+    }
+
+    #[test]
+    fn issue604_minute_repair_preserves_other_exact_periods_entire_observation() {
+        verify_minute_replay_saved_prices(true);
+    }
+
+    // Fixture setup for consumers of already admitted events. Producer byte
+    // qualification is exercised by recorder process fixtures; these tests
+    // supply explicit official inputs and never infer membership from a receipt.
+    fn admit_saved_events_fixture(
+        store: &mut UsageStore,
+        identity: &StoragePartitionIdentity,
+        reset: i64,
+        window: i64,
+    ) {
+        use period_evidence::OfficialQuotaInput;
+        let origin = reset - window;
+        store
+            .stage_official_quota_inputs(
+                &[origin, reset - 1]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, at)| OfficialQuotaInput {
+                        input_id: format!("{:064x}", index + 1),
+                        account_scope: identity.account_scope_id.clone(),
+                        sequence: index as u64 + 1,
+                        observed_at: at,
+                        content_sha256: format!("{:064x}", index + 1),
+                        reset_at: Some(reset),
+                        window_seconds: Some(window),
+                        reason: None,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let prepared = store
+            .prepare_period_attribution(
+                identity,
+                &[SessionLifecycleInterval::new(Some(origin), None)],
+            )
+            .unwrap();
+        let mut facts = read_session_event_facts(&store.connection).unwrap();
+        for event in &mut facts {
+            let source = &event.source;
+            assert!(source.range_end >= source.range_start + 3);
+            let pointer = |start, end, timestamp| serde_json::json!({"start":start,"end":end,"timestamp":timestamp,"sha256":"12".repeat(32)});
+            let proof = serde_json::json!({
+                "before":{"pointer":pointer(source.range_start+1,source.range_start+2,event.timestamp-1),"total":0,
+                    "input":event.tokens.input.map(|_|0),"cached_input":event.tokens.cached_input.map(|_|0),
+                    "cache_write_input":event.tokens.cache_write_input.map(|_|0),"output":event.tokens.output.map(|_|0)},
+                "after":{"pointer":pointer(source.range_start+2,source.range_start+3,event.timestamp),"total":event.tokens.total,
+                    "input":event.tokens.input,"cached_input":event.tokens.cached_input,
+                    "cache_write_input":event.tokens.cache_write_input,"output":event.tokens.output},
+                "model_context":{"pointer":{"start":0,"end":1,"sha256":"34".repeat(32)},"kind":"turn","interval":"none"}
+            });
+            let numeric = if event.model == "SOL" {
+                serde_json::json!({"kind":"legacy-family-counter","proof":proof,"exact_model":"gpt-6.1-sol"})
+            } else {
+                let mut proof = proof;
+                proof["kind"] = serde_json::json!("legacy-counter");
+                proof
+            };
+            event.admission = Some(serde_json::from_value(serde_json::json!({
+                "version":1,"source_binding":{"version":1,"partition":identity,
+                    "root_identity":source.root_identity,"relative_path":source.relative_path,
+                    "file_device":source.file_device,"file_inode":source.file_inode,
+                    "prefix_generation":format!("{:032x}",source.prefix_generation),"prefix_end":source.range_end,
+                    "metadata":{"thread_id":"writer-fixture","session_id":"writer-fixture"},
+                    "proof":{"kind":"rpc","began_at":origin,"ended_at":origin,"process":{"pid":1,"starttime_ticks":1,"executable_device":1,"executable_inode":1}}},
+                "verified_prefix_end":source.range_end,"ownership":{"start_at":origin,"end_at":null},
+                "numeric":numeric,"period":null
+            })).unwrap());
+            prepared.assign(event).unwrap();
+            assert_eq!(
+                event.period,
+                Some(event_admission::SessionEventPeriod {
+                    reset_at: reset,
+                    window_seconds: window
+                })
+            );
+            assert!(event
+                .admission
+                .as_ref()
+                .unwrap()
+                .valid_for(event, event.period));
+        }
+        let tx = store.connection.transaction().unwrap();
+        period_evidence::commit_snapshot(&tx, &prepared).unwrap();
+        upsert_session_event_qualifications(&tx, &facts, false, "fixture", None).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn verify_minute_replay_saved_prices(with_peer: bool) {
         let path = database_path("minute-replay-legacy-dollars");
         let identity = partition_identity('a', 7);
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
@@ -16434,7 +21509,7 @@ mod tests {
             timestamp: AT,
             reset_at: RESET,
             remaining_percent: Some(90.0),
-            sol_dollars: 0.00066,
+            sol_dollars: if with_peer { 0.0 } else { 0.00066 },
             terra_dollars: 0.0,
             luna_dollars: 0.0,
             sol_tokens: 100,
@@ -16444,9 +21519,9 @@ mod tests {
         let model = SessionModelTotal {
             model: "gpt-6.1-sol".into(),
             total_tokens: 100,
-            input_tokens: 90,
-            cached_input_tokens: 20,
-            output_tokens: 10,
+            input_tokens: Some(90),
+            cached_input_tokens: Some(20),
+            output_tokens: Some(10),
             cache_write_input_tokens: Some(0),
         };
         store.upsert_sample(&sample).unwrap();
@@ -16460,7 +21535,7 @@ mod tests {
         tx.commit().unwrap();
         store.connection.execute("UPDATE collection_generation SET reset_at=?1,latest_quota_reset_at=?1,window_seconds=1000", [RESET]).unwrap();
         store.connection.execute("INSERT INTO session_model_totals(model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('gpt-6.1-sol','100','90','20','10','0')", []).unwrap();
-        store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','session.jsonl','1','2',?1,0,1,?2,0,?3,'gpt-6.1-sol','100','90','20','10','0')",params![format!("{:032x}",1_u128),"0".repeat(64),AT+5]).unwrap();
+        store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','session.jsonl','1','2',?1,0,100,?2,0,?3,'gpt-6.1-sol','100','90','20','10','0')",params![format!("{:032x}",1_u128),"0".repeat(64),AT+5]).unwrap();
         store
             .commit_quota_receipts(
                 &[QuotaReceipt {
@@ -16474,8 +21549,67 @@ mod tests {
                 false,
             )
             .unwrap();
-        let saved_price:(f64,Option<String>)=store.connection.query_row("SELECT total_dollars,price_version FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6.1-sol'",[AT],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let saved_price:(f64,Option<String>)=store.connection.query_row("SELECT total_dollars,price_version FROM usage_model_history WHERE timestamp=?1 AND reset_at=?2 AND model='gpt-6.1-sol'",params![AT,RESET],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert!((saved_price.0 - 0.000242).abs() < 1e-12);
+        if with_peer {
+            let peer = UsageHistorySample {
+                reset_at: RESET + 1,
+                sol_tokens: 20,
+                sol_dollars: 2.5,
+                remaining_percent: Some(98.0),
+                ..sample.clone()
+            };
+            store.upsert_sample(&peer).unwrap();
+            let mut observation = UsageHistoryObservation::confirmed_with_models(
+                &peer,
+                vec![SessionModelTotal {
+                    model: "gpt-6.1-sol".into(),
+                    total_tokens: 20,
+                    input_tokens: Some(20),
+                    cached_input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    cache_write_input_tokens: Some(0),
+                }],
+            );
+            observation.model_totals_complete = false;
+            let tx = store.connection.transaction().unwrap();
+            upsert_observation_model_totals(&tx, std::slice::from_ref(&observation), false, None)
+                .unwrap();
+            upsert_observations(&tx, &[observation]).unwrap();
+            tx.execute("UPDATE usage_model_history SET total_dollars=2.5,price_version=NULL WHERE reset_at=?1",[RESET+1]).unwrap();
+            tx.commit().unwrap();
+            store
+                .commit_quota_receipts(
+                    &[QuotaReceipt {
+                        receipt_id: "b".repeat(64),
+                        sequence: 2,
+                        observed_at: AT + 2,
+                        reset_at: RESET + 1,
+                        window_seconds: 1000,
+                        remaining_percent: 98.0,
+                    }],
+                    false,
+                )
+                .unwrap();
+        }
+        let read_peer = |connection: &Connection| {
+            let mut rows = Vec::<Vec<rusqlite::types::Value>>::new();
+            for sql in [
+                "SELECT * FROM usage_history WHERE reset_at=?1 ORDER BY timestamp",
+                "SELECT * FROM usage_model_history WHERE reset_at=?1 ORDER BY timestamp,model",
+                "SELECT * FROM durable_state WHERE singleton>=2 AND json_extract(snapshot_json,'$.reset_at')=?1 ORDER BY singleton",
+            ] {
+                let mut statement = connection.prepare(sql).unwrap();
+                let count = statement.column_count();
+                rows.extend(statement.query_map([RESET+1], |row| {
+                    (0..count).map(|column| row.get(column)).collect::<rusqlite::Result<Vec<_>>>()
+                }).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap());
+            }
+            rows
+        };
+        let peer_before = read_peer(&store.connection);
+        assert_eq!(peer_before.len(), if with_peer { 3 } else { 0 });
+        admit_saved_events_fixture(&mut store, &identity, RESET, 1000);
         let backup =
             UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
         store
@@ -16487,8 +21621,8 @@ mod tests {
         let legacy: f64 = store
             .connection
             .query_row(
-                "SELECT sol_dollars FROM usage_history WHERE timestamp=?1",
-                [AT],
+                "SELECT sol_dollars FROM usage_history WHERE timestamp=?1 AND reset_at=?2",
+                params![AT, RESET],
                 |r| r.get(0),
             )
             .unwrap();
@@ -16496,10 +21630,87 @@ mod tests {
             (legacy - 0.00066).abs() < 1e-12,
             "minute replay must retain the frozen compatibility pricing, actual={legacy}"
         );
-        let after_price:(f64,Option<String>)=store.connection.query_row("SELECT total_dollars,price_version FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6.1-sol'",[AT],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let after_price:(f64,Option<String>)=store.connection.query_row("SELECT total_dollars,price_version FROM usage_model_history WHERE timestamp=?1 AND reset_at=?2 AND model='gpt-6.1-sol'",params![AT,RESET],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(
             after_price, saved_price,
             "exact model cost and its revision remain independent"
+        );
+        assert_eq!(
+            read_peer(&store.connection),
+            peer_before,
+            "other exact-period values, prices, completeness and provenance must be unchanged"
+        );
+        if with_peer {
+            let complete: i64 = store.connection.query_row("SELECT model_set_complete FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2",params![RESET,AT], |row| row.get(0)).unwrap();
+            assert_eq!(
+                complete, 1,
+                "another period's partial set does not downgrade this set"
+            );
+        }
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_startup_minute_repair_cannot_assign_unqualified_events_by_timestamp() {
+        const AT: i64 = 1791871200;
+        const RESET: i64 = AT + 400;
+        let path = database_path("issue604-startup-unqualified");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let original = UsageHistorySample {
+            timestamp: AT,
+            reset_at: RESET,
+            remaining_percent: Some(90.0),
+            sol_dollars: 0.25,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 10,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        store.upsert_sample(&original).unwrap();
+        store.connection.execute("UPDATE collection_generation SET reset_at=?1,latest_quota_reset_at=?1,window_seconds=500",[RESET]).unwrap();
+        store.connection.execute("INSERT INTO session_model_totals(model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('gpt-6.1-sol','5','5','0','0','0')",[]).unwrap();
+        store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','one.jsonl','1','2',?1,0,1,?2,0,?3,'gpt-6.1-sol','5','5','0','0','0')",params![format!("{:032x}",1_u128),"0".repeat(64),AT+5]).unwrap();
+        store
+            .commit_quota_receipts(
+                &[QuotaReceipt {
+                    receipt_id: "a".repeat(64),
+                    sequence: 1,
+                    observed_at: AT + 1,
+                    reset_at: RESET,
+                    window_seconds: 500,
+                    remaining_percent: 90.0,
+                }],
+                false,
+            )
+            .unwrap();
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        let before = legacy_raw_evidence(&store.connection).unwrap();
+        assert_eq!(
+            store
+                .repair_session_minute_history(
+                    &[SessionLifecycleInterval::new(Some(AT - 100), None)],
+                    &backup
+                )
+                .unwrap(),
+            0,
+            "startup cannot treat a timestamp window as saved exact period membership"
+        );
+        assert_eq!(
+            legacy_raw_evidence(&store.connection).unwrap(),
+            before,
+            "unqualified evidence cannot change the legacy original"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM usage_model_history", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
         drop(store);
         remove_database(&path);
@@ -16534,7 +21745,7 @@ mod tests {
             (1, 1791871270, 70, 60, 20, 10),
             (2, 1791871290, 50, 50, 10, 0),
         ] {
-            store.connection.execute("INSERT INTO session_events (root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES ('root','session.jsonl','1','2',?1,0,1,?2,?3,?4,'gpt-6-astra',?5,?6,?7,?8,'0')", params![format!("{:032x}",1_u128), "0".repeat(64), index,timestamp,total.to_string(),input.to_string(),cached.to_string(),output.to_string()]).unwrap();
+            store.connection.execute("INSERT INTO session_events (root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES ('root','session.jsonl','1','2',?1,0,100,?2,?3,?4,'gpt-6-astra',?5,?6,?7,?8,'0')", params![format!("{:032x}",1_u128), "0".repeat(64), index,timestamp,total.to_string(),input.to_string(),cached.to_string(),output.to_string()]).unwrap();
         }
         let receipts = [1791871201, 1791871261, 1791871321]
             .into_iter()
@@ -16553,9 +21764,9 @@ mod tests {
             let offset = SessionModelTotal {
                 model: "gpt-6-astra".into(),
                 total_tokens: 1,
-                input_tokens: 1,
-                cached_input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: Some(1),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
             };
             let recovery = finalize_session_timeline_recovery(
@@ -16573,7 +21784,7 @@ mod tests {
                         file_device: 1,
                         file_inode: 2,
                         start_offset: 0,
-                        end_offset: 1,
+                        end_offset: 100,
                         collector_epoch: 1,
                         cycle_seq: 1,
                         prefix_generation: 1,
@@ -16608,13 +21819,17 @@ mod tests {
             .unwrap();
         let events = store.load_session_events().unwrap();
         let state = store.load_session_collection_state().unwrap();
+        admit_saved_events_fixture(&mut store, &identity, 1791872000, 1000);
         let backup =
             UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
         let intervals = [SessionLifecycleInterval::new(Some(1791871000), None)];
         let raw_before = legacy_raw_evidence(&store.connection).unwrap();
         store
             .connection
-            .execute("UPDATE session_model_totals SET total_tokens='221'", [])
+            .execute(
+                "UPDATE session_model_totals SET total_tokens='221',input_tokens='201'",
+                [],
+            )
             .unwrap();
         assert_eq!(
             store
@@ -16625,7 +21840,10 @@ mod tests {
         );
         store
             .connection
-            .execute("UPDATE session_model_totals SET total_tokens='220'", [])
+            .execute(
+                "UPDATE session_model_totals SET total_tokens='220',input_tokens='200'",
+                [],
+            )
             .unwrap();
         assert_eq!(
             store
@@ -16735,16 +21953,16 @@ mod tests {
                 false,
             )
             .unwrap();
-        store.connection.execute("INSERT INTO session_ranges VALUES ('root','session.jsonl','1','2',0,1,?1,'1',?1,?2)", params![format!("{:032x}",1_u128), "0".repeat(64)]).unwrap();
+        store.connection.execute("INSERT INTO session_ranges VALUES ('root','session.jsonl','1','2',0,100,?1,'1',?1,?2)", params![format!("{:032x}",1_u128), "0".repeat(64)]).unwrap();
         store.connection.execute("UPDATE usage_model_history SET total_tokens='1',input_tokens='1',cached_input_tokens='0',output_tokens='0',cache_write_input_tokens='0' WHERE timestamp=1791871260 AND model='gpt-6-astra'", []).unwrap();
         let current_before_closed_repair = store.load_session_collection_state().unwrap();
         let closed_frame = |total_tokens: u64| {
             let total = SessionModelTotal {
                 model: "gpt-6-astra".into(),
                 total_tokens,
-                input_tokens: 200,
-                cached_input_tokens: 50,
-                output_tokens: total_tokens - 200,
+                input_tokens: Some(200),
+                cached_input_tokens: Some(50),
+                output_tokens: Some(total_tokens - 200),
                 cache_write_input_tokens: Some(0),
             };
             finalize_session_timeline_recovery(
@@ -16762,7 +21980,7 @@ mod tests {
                         file_device: 1,
                         file_inode: 2,
                         start_offset: 0,
-                        end_offset: 1,
+                        end_offset: 100,
                         collector_epoch: 1,
                         cycle_seq: 1,
                         prefix_generation: 1,
@@ -16878,8 +22096,13 @@ mod tests {
             .unwrap();
         let backup =
             UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
-        assert_eq!(store.repair_session_minute_history(&intervals, &backup).unwrap(),1,
-            "a lossless saved endpoint bound to all source components remains usable after offset retirement");
+        assert_eq!(
+            store
+                .repair_session_minute_history(&intervals, &backup)
+                .unwrap(),
+            1,
+            "a lossless saved endpoint bound to all source components remains usable after offset retirement"
+        );
         let restored:String=store.connection.query_row("SELECT total_tokens FROM usage_model_history WHERE timestamp=1791871260 AND model='gpt-6-astra'",[],|r|r.get(0)).unwrap();
         assert_eq!(restored, "220");
         remove_database(&path);
@@ -16920,9 +22143,9 @@ mod tests {
                     observation.model_totals = Some(vec![SessionModelTotal {
                         model: "gpt-6-astra".into(),
                         total_tokens: total,
-                        input_tokens: 200,
-                        cached_input_tokens: 50,
-                        output_tokens: total - 200,
+                        input_tokens: Some(200),
+                        cached_input_tokens: Some(50),
+                        output_tokens: Some(total - 200),
                         cache_write_input_tokens: Some(0),
                     }]);
                     observation.model_totals_complete = false;
@@ -16939,12 +22162,12 @@ mod tests {
             for (index, at, total, input, cached, output) in
                 [(0, 1025, 100, 90, 20, 10), (1, 1085, 120, 110, 30, 10)]
             {
-                store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','session.jsonl','1','2',?1,0,1,?2,?3,?4,'gpt-6-astra',?5,?6,?7,?8,'0')",params![format!("{:032x}",1_u128),"0".repeat(64),index,at,total.to_string(),input.to_string(),cached.to_string(),output.to_string()]).unwrap();
+                store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','session.jsonl','1','2',?1,0,100,?2,?3,?4,'gpt-6-astra',?5,?6,?7,?8,'0')",params![format!("{:032x}",1_u128),"0".repeat(64),index,at,total.to_string(),input.to_string(),cached.to_string(),output.to_string()]).unwrap();
             }
-            store.connection.execute("INSERT INTO session_ranges VALUES('root','session.jsonl','1','2',0,1,?1,'1',?1,?2)",params![format!("{:032x}",1_u128),"0".repeat(64)]).unwrap();
-            store.connection.execute("INSERT INTO session_quota_windows VALUES(1600,600,1025,'root','session.jsonl',0,1,?1)",[if fault=="pointer" {"1".repeat(64)} else {"0".repeat(64)}]).unwrap();
+            store.connection.execute("INSERT INTO session_ranges VALUES('root','session.jsonl','1','2',0,100,?1,'1',?1,?2)",params![format!("{:032x}",1_u128),"0".repeat(64)]).unwrap();
+            store.connection.execute("INSERT INTO session_quota_windows VALUES(1600,600,1025,'root','session.jsonl',0,100,?1)",[if fault=="pointer" {"1".repeat(64)} else {"0".repeat(64)}]).unwrap();
             if fault == "range-window" {
-                store.connection.execute("INSERT INTO session_ranges VALUES('root','zero.jsonl','1','3',0,1,?1,'1',?1,?2)",params![format!("{:032x}",1_u128),"0".repeat(64)]).unwrap();
+                store.connection.execute("INSERT INTO session_ranges VALUES('root','zero.jsonl','1','3',0,100,?1,'1',?1,?2)",params![format!("{:032x}",1_u128),"0".repeat(64)]).unwrap();
                 store
                     .connection
                     .execute(
@@ -16954,7 +22177,7 @@ mod tests {
                     .unwrap();
             }
             if fault == "window" {
-                store.connection.execute("INSERT INTO session_quota_windows VALUES(1600,601,1025,'root','session.jsonl',0,1,?1)",["0".repeat(64)]).unwrap();
+                store.connection.execute("INSERT INTO session_quota_windows VALUES(1600,601,1025,'root','session.jsonl',0,100,?1)",["0".repeat(64)]).unwrap();
             }
             if fault == "successor" {
                 store
@@ -16963,11 +22186,12 @@ mod tests {
                         ..sample_at(1200, 100.0)
                     })
                     .unwrap();
-                store.connection.execute("INSERT INTO session_events VALUES('root','session.jsonl','1','2',?1,0,1,?2,2,1145,'gpt-6-astra','0','0','0','0','0')",params![format!("{:032x}",1_u128),"0".repeat(64)]).unwrap();
-                store.connection.execute("INSERT INTO session_quota_windows VALUES(1740,600,1145,'root','session.jsonl',0,1,?1)",["0".repeat(64)]).unwrap();
+                store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','session.jsonl','1','2',?1,0,100,?2,2,1145,'gpt-6-astra','0','0','0','0','0')",params![format!("{:032x}",1_u128),"0".repeat(64)]).unwrap();
+                store.connection.execute("INSERT INTO session_quota_windows VALUES(1740,600,1145,'root','session.jsonl',0,100,?1)",["0".repeat(64)]).unwrap();
             }
             let events = store.load_session_events().unwrap();
             let current = store.load_session_collection_state().unwrap();
+            admit_saved_events_fixture(&mut store, &identity, 1600, 600);
             let backup =
                 UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
             let repaired = store
@@ -17048,7 +22272,7 @@ mod tests {
         for (index, at, total, input, cached, output) in
             [(0, 1205, 100, 90, 30, 10), (1, 1385, 70, 60, 20, 10)]
         {
-            store.connection.execute("INSERT INTO session_events VALUES ('root','session.jsonl','1','2',?1,0,1,?2,?3,?4,'gpt-6.1-sol',?5,?6,?7,?8,'0')",
+            store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES ('root','session.jsonl','1','2',?1,0,100,?2,?3,?4,'gpt-6.1-sol',?5,?6,?7,?8,'0')",
                 params![format!("{:032x}",1_u128),"0".repeat(64),index,at,total.to_string(),input.to_string(),cached.to_string(),output.to_string()]).unwrap();
         }
         let receipts = [1201, 1381]
@@ -17065,6 +22289,7 @@ mod tests {
             .collect::<Vec<_>>();
         store.commit_quota_receipts(&receipts, false).unwrap();
         let events = store.load_session_events().unwrap();
+        admit_saved_events_fixture(&mut store, &identity, 2000, 1000);
         let backup =
             UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
         assert_eq!(
@@ -17115,7 +22340,7 @@ mod tests {
             for (index, at, total, input, cached, output) in
                 [(0, 1205, 100, 90, 30, 10), (1, 1385, 70, 60, 20, 10)]
             {
-                store.connection.execute("INSERT INTO session_events VALUES('root','session.jsonl','1','2',?1,0,1,?2,?3,?4,'gpt-6.1-sol',?5,?6,?7,?8,'0')",params![format!("{:032x}",1_u128),"0".repeat(64),index,at,total.to_string(),input.to_string(),cached.to_string(),output.to_string()]).unwrap();
+                store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','session.jsonl','1','2',?1,0,100,?2,?3,?4,'gpt-6.1-sol',?5,?6,?7,?8,'0')",params![format!("{:032x}",1_u128),"0".repeat(64),index,at,total.to_string(),input.to_string(),cached.to_string(),output.to_string()]).unwrap();
             }
             let receipt_times = if extra_receipt {
                 vec![1201, 1261, 1381]
@@ -17146,6 +22371,7 @@ mod tests {
             )
             .unwrap();
             tx.commit().unwrap();
+            admit_saved_events_fixture(&mut store, &identity, 2000, 1000);
             let backup =
                 UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
             assert!(
@@ -17172,6 +22398,46 @@ mod tests {
             drop(store);
             remove_database(&path);
         }
+    }
+
+    #[test]
+    fn issue604_lifecycle_range_shape_keeps_empty_and_adjacent_boundaries() {
+        let ranges = vec![
+            SessionLifecycleInterval::new(Some(100), Some(100)),
+            SessionLifecycleInterval::new(Some(100), Some(200)),
+            SessionLifecycleInterval::new(Some(150), Some(150)),
+            SessionLifecycleInterval::new(Some(200), None),
+        ];
+        let canonical = canonical_lifecycle_intervals(&ranges).expect("empty markers are valid");
+        assert_eq!(
+            canonical, ranges,
+            "recorded boundaries cannot be merged away"
+        );
+        assert!(!ranges[0].contains(100));
+        assert!(!ranges[2].contains(150));
+        for (start, end) in [
+            (Some(0), None),
+            (Some(253_402_300_800), None),
+            (Some(1), Some(253_402_300_800)),
+            (Some(200), Some(100)),
+        ] {
+            assert!(
+                canonical_lifecycle_intervals(&[SessionLifecycleInterval::new(start, end)])
+                    .is_err()
+            );
+        }
+        assert!(
+            canonical_lifecycle_intervals(&[SessionLifecycleInterval::new(
+                Some(1),
+                Some(253_402_300_799)
+            )])
+            .is_ok()
+        );
+        assert!(canonical_lifecycle_intervals(&[
+            SessionLifecycleInterval::new(Some(100), Some(200)),
+            SessionLifecycleInterval::new(Some(150), Some(300))
+        ])
+        .is_err());
     }
 
     #[test]
@@ -17217,7 +22483,7 @@ mod tests {
                         prefix_generation, range_start, range_end, record_sha256,
                         event_index, timestamp, model, total_tokens, input_tokens,
                         cached_input_tokens, output_tokens, cache_write_input_tokens
-                     ) VALUES ('root', 'session.jsonl', '1', '2', ?1, 0, 1, ?2,
+                     ) VALUES ('root', 'session.jsonl', '1', '2', ?1, 0, 100, ?2,
                                ?3, ?4, 'SOL', ?5, ?5, '0', '0', '0')",
                     params![
                         format!("{0:032x}", 1_u128),
@@ -17229,6 +22495,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        admit_saved_events_fixture(&mut store, &identity, 2000, 1000);
         let backup =
             UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
         let repaired = store
@@ -17255,7 +22522,7 @@ mod tests {
     }
 
     #[test]
-    fn session_event_replay_requires_physical_source_payload_and_overlap_proof() {
+    fn session_event_replay_requires_the_exact_saved_key_and_payload() {
         let existing = SessionEvent {
             root_identity: "root".to_owned(),
             relative_path: "session.jsonl".to_owned(),
@@ -17269,9 +22536,9 @@ mod tests {
             timestamp: 1_500,
             model: "SOL".to_owned(),
             total_tokens: 100,
-            input_tokens: 100,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(100),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         };
         assert!(session_event_is_replay(&existing, &existing));
@@ -17283,7 +22550,11 @@ mod tests {
             record_sha256: "2".repeat(64),
             ..existing.clone()
         };
-        assert!(session_event_is_replay(&existing, &overlapping_prefix));
+        assert!(!session_event_is_replay(&existing, &overlapping_prefix));
+        assert!(session_event_has_ambiguous_lineage(
+            &existing,
+            &overlapping_prefix
+        ));
 
         // Older recorder builds persisted a family key. Re-reading the same
         // physical record after exact model IDs are preserved must retain
@@ -17292,7 +22563,11 @@ mod tests {
             model: "gpt-6-sol".to_owned(),
             ..overlapping_prefix.clone()
         };
-        assert!(session_event_is_replay(&existing, &exact_id_replay));
+        assert!(!session_event_is_replay(&existing, &exact_id_replay));
+        assert!(session_event_has_ambiguous_lineage(
+            &existing,
+            &exact_id_replay
+        ));
 
         // Two different exact IDs in one family are distinct observations;
         // family projection must not make them replay-equivalent.
@@ -17313,7 +22588,7 @@ mod tests {
 
         let different_payload = SessionEvent {
             total_tokens: 101,
-            input_tokens: 101,
+            input_tokens: Some(101),
             ..overlapping_prefix.clone()
         };
         assert!(!session_event_is_replay(&existing, &different_payload));
@@ -17343,9 +22618,9 @@ mod tests {
         let legacy_total = SessionModelTotal {
             model: "SOL".to_owned(),
             total_tokens: 10,
-            input_tokens: 10,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(10),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
             cache_write_input_tokens: None,
         };
         let expected_legacy = estimate_legacy(
@@ -17369,17 +22644,17 @@ mod tests {
             SessionModelTotal {
                 model: "gpt-7-sol".to_owned(),
                 total_tokens: 10,
-                input_tokens: 10,
-                cached_input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: Some(10),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
             },
             SessionModelTotal {
                 model: "gpt-6-sol".to_owned(),
                 total_tokens: 10,
-                input_tokens: 10,
-                cached_input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: Some(10),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
                 cache_write_input_tokens: None,
             },
         ] {
@@ -17402,9 +22677,9 @@ mod tests {
             SessionModelTotal {
                 model: "gpt-6-sol".to_owned(),
                 total_tokens: 1_000_000,
-                input_tokens: 1_000_000,
-                cached_input_tokens: 1_000_000,
-                output_tokens: 0,
+                input_tokens: Some(1_000_000),
+                cached_input_tokens: Some(1_000_000),
+                output_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
             },
             SessionModelTotal {
@@ -17412,9 +22687,9 @@ mod tests {
                 ..SessionModelTotal {
                     model: "gpt-6-sol".to_owned(),
                     total_tokens: 1_000_000,
-                    input_tokens: 1_000_000,
-                    cached_input_tokens: 1_000_000,
-                    output_tokens: 0,
+                    input_tokens: Some(1_000_000),
+                    cached_input_tokens: Some(1_000_000),
+                    output_tokens: Some(0),
                     cache_write_input_tokens: Some(0),
                 }
             },
@@ -17483,8 +22758,8 @@ mod tests {
             .map(|mut total| {
                 if total.model == "gpt-6.1-sol" {
                     total.total_tokens *= 2;
-                    total.input_tokens *= 2;
-                    total.cached_input_tokens *= 2;
+                    total.input_tokens = total.input_tokens.map(|value| value * 2);
+                    total.cached_input_tokens = total.cached_input_tokens.map(|value| value * 2);
                 }
                 total
             })
@@ -17533,9 +22808,9 @@ mod tests {
         let astra = SessionModelTotal {
             model: "ASTRA".to_owned(),
             total_tokens: 1_400_000,
-            input_tokens: 1_000_000,
-            cached_input_tokens: 200_000,
-            output_tokens: 100_000,
+            input_tokens: Some(1_000_000),
+            cached_input_tokens: Some(200_000),
+            output_tokens: Some(100_000),
             cache_write_input_tokens: Some(100_000),
         };
         let (astra_dollars, astra_revision) =
@@ -17586,9 +22861,9 @@ mod tests {
         let old_family = SessionModelTotal {
             model: "SOL".to_owned(),
             total_tokens: 100,
-            input_tokens: 100,
-            cached_input_tokens: 100,
-            output_tokens: 0,
+            input_tokens: Some(100),
+            cached_input_tokens: Some(100),
+            output_tokens: Some(0),
             cache_write_input_tokens: None,
         };
         let old_observation =
@@ -17625,6 +22900,7 @@ mod tests {
                  ALTER TABLE usage_model_history DROP COLUMN total_dollars;",
             )
             .unwrap();
+        downgrade_qualification_fixture(&connection);
         connection
             .pragma_update(None, "user_version", MODEL_PRICING_PREVIOUS_SCHEMA_VERSION)
             .unwrap();
@@ -17683,9 +22959,9 @@ mod tests {
         let exact = SessionModelTotal {
             model: "gpt-6.1-sol".to_owned(),
             total_tokens: 1_000_000,
-            input_tokens: 1_000_000,
-            cached_input_tokens: 1_000_000,
-            output_tokens: 0,
+            input_tokens: Some(1_000_000),
+            cached_input_tokens: Some(1_000_000),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         };
         let rows = |connection: &Connection| {
@@ -17767,8 +23043,8 @@ mod tests {
 
         let mut larger_exact = exact.clone();
         larger_exact.total_tokens *= 2;
-        larger_exact.input_tokens *= 2;
-        larger_exact.cached_input_tokens *= 2;
+        larger_exact.input_tokens = larger_exact.input_tokens.map(|value| value * 2);
+        larger_exact.cached_input_tokens = larger_exact.cached_input_tokens.map(|value| value * 2);
         let mut second_sample = first_sample;
         second_sample.sol_tokens += exact.total_tokens;
         second_sample.sol_dollars = OLD_FAMILY_DOLLARS + 1.0;
@@ -17819,10 +23095,12 @@ mod tests {
         assert_eq!(second_compatibility_usd, OLD_FAMILY_DOLLARS + 1.0);
 
         let legacy_usage = Usage {
-            input_tokens: old_family.input_tokens,
-            cached_input_tokens: old_family.cached_input_tokens,
+            input_tokens: old_family.input_tokens.expect("known fixture input"),
+            cached_input_tokens: old_family
+                .cached_input_tokens
+                .expect("known fixture cached input"),
             cache_write_input_tokens: Some(0),
-            output_tokens: old_family.output_tokens,
+            output_tokens: old_family.output_tokens.expect("known fixture output"),
         };
         let expected_legacy_cost =
             codex_info_pricing::estimate_legacy("SOL", legacy_usage).unwrap();
@@ -17855,9 +23133,9 @@ mod tests {
         let old_family = SessionModelTotal {
             model: "SOL".to_owned(),
             total_tokens: 100,
-            input_tokens: 100,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(100),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         };
         {
@@ -17893,6 +23171,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        downgrade_qualification_fixture(&connection);
         connection
             .pragma_update(None, "user_version", legacy_version)
             .unwrap();
@@ -17952,9 +23231,9 @@ mod tests {
         let model = SessionModelTotal {
             model: "SOL".to_owned(),
             total_tokens: 100,
-            input_tokens: 100,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(100),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         };
         let mut observation =
@@ -18005,6 +23284,7 @@ mod tests {
         drop(store);
 
         let connection = Connection::open(&path).unwrap();
+        downgrade_qualification_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE session_quota_windows;
@@ -18131,16 +23411,16 @@ mod tests {
             cycle_seq: 9,
             fully_attributed_from_zero: true,
             total_tokens: 20,
-            input_tokens: 12,
-            cached_input_tokens: 2,
-            output_tokens: 8,
+            input_tokens: Some(12),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(8),
             cache_write_input_tokens: Some(0),
         };
         if zero {
             anchor.total_tokens = 0;
-            anchor.input_tokens = 0;
-            anchor.cached_input_tokens = 0;
-            anchor.output_tokens = 0;
+            anchor.input_tokens = Some(0);
+            anchor.cached_input_tokens = Some(0);
+            anchor.output_tokens = Some(0);
         }
         let recovery = SessionTokenAnchorRecovery {
             recovery_id: session_token_anchor_recovery_id(&pending, &anchor),
@@ -18297,9 +23577,9 @@ mod tests {
             timestamp: 1_800_000_010,
             model: "SOL".to_owned(),
             total_tokens: 5,
-            input_tokens: 5,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(5),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         };
         let resolution = SessionTokenAnchorResolution {
@@ -18316,9 +23596,9 @@ mod tests {
         let resolved_model_total = SessionModelTotal {
             model: "SOL".to_owned(),
             total_tokens: 5,
-            input_tokens: 5,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(5),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         };
         if zero {
@@ -18488,7 +23768,182 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_repair_collapses_overlapping_prefix_lineage_replays() {
+    fn issue604_exact_suffix_keeps_a_disjoint_unreconstructed_offset() {
+        let path = database_path("issue604-exact-suffix-retained-offset");
+        let identity = partition_identity('b', 8);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let total = SessionModelTotal {
+            model: "gpt-6.1-sol".into(),
+            total_tokens: 10,
+            input_tokens: Some(10),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+        };
+        let recovery = finalize_session_timeline_recovery(
+            &identity.partition_id,
+            SessionTimelineRecovery {
+                recovery_id: String::new(),
+                canonical_reset_at: 2000,
+                window_seconds: 1000,
+                source_data_generation: 1,
+                projection_end_exclusive: 1500,
+                source_model_totals: Vec::new(),
+                ranges: vec![SessionRange {
+                    root_identity: "root".into(),
+                    relative_path: "old.jsonl".into(),
+                    file_device: 1,
+                    file_inode: 2,
+                    start_offset: 0,
+                    end_offset: 100,
+                    collector_epoch: 1,
+                    cycle_seq: 1,
+                    prefix_generation: 1,
+                    record_sha256: "a".repeat(64),
+                }],
+                points: vec![SessionTimelineRecoveryPoint {
+                    timestamp: 1200,
+                    offset_model_totals: vec![total.clone()],
+                    offset_sol_dollars: 0.001,
+                    offset_terra_dollars: 0.0,
+                    offset_luna_dollars: 0.0,
+                }],
+                final_offset_model_totals: vec![total.clone()],
+                final_offset_sol_dollars: 0.001,
+                final_offset_terra_dollars: 0.0,
+                final_offset_luna_dollars: 0.0,
+            },
+        )
+        .unwrap();
+        let payload = timeline_recovery_payload(&identity.partition_id, &recovery).unwrap();
+        store
+            .connection
+            .execute("UPDATE collection_generation SET data_generation='2'", [])
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_timeline_recoveries VALUES(?1,?2,'2')",
+                params![recovery.recovery_id, payload],
+            )
+            .unwrap();
+        let old = UsageHistorySample {
+            timestamp: 1200,
+            reset_at: 2000,
+            remaining_percent: Some(90.0),
+            sol_dollars: 0.001,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 10,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        store.upsert_sample(&old).unwrap();
+        let sample = UsageHistorySample {
+            timestamp: 1680,
+            remaining_percent: Some(80.0),
+            sol_dollars: 0.002,
+            ..old.clone()
+        };
+        let observation =
+            UsageHistoryObservation::confirmed_with_models(&sample, vec![total.clone()]);
+        let event = SessionEvent {
+            root_identity: "root".into(),
+            relative_path: "new.jsonl".into(),
+            file_device: 1,
+            file_inode: 3,
+            prefix_generation: 1,
+            range_start: 0,
+            range_end: 100,
+            record_sha256: "b".repeat(64),
+            event_index: 0,
+            timestamp: 1600,
+            model: total.model.clone(),
+            total_tokens: 10,
+            input_tokens: Some(10),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+        };
+        let before = legacy_raw_evidence(&store.connection).unwrap();
+        let recoveries =
+            load_session_timeline_recoveries_from_connection(&store.connection).unwrap();
+        {
+            let tx = store.connection.transaction().unwrap();
+            let error = prepare_exact_session_history(
+                &tx,
+                2000,
+                1000,
+                (1380, 1800),
+                std::slice::from_ref(&sample),
+                std::slice::from_ref(&observation),
+                std::slice::from_ref(&total),
+                std::slice::from_ref(&event),
+                &BTreeMap::new(),
+                &recoveries,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("exact history cannot retire an uncovered offset"));
+            tx.rollback().unwrap();
+        }
+        let tx = store.connection.transaction().unwrap();
+        prepare_exact_session_history(
+            &tx,
+            2000,
+            1000,
+            (1680, 1800),
+            &[sample],
+            &[observation],
+            &[total],
+            &[event],
+            &BTreeMap::new(),
+            &recoveries,
+        )
+        .expect("a later exact suffix must not require retirement of the disjoint old offset");
+        tx.commit().unwrap();
+        assert_eq!(
+            store.load_session_timeline_recoveries().unwrap(),
+            recoveries
+        );
+        assert_eq!(legacy_raw_evidence(&store.connection).unwrap(), before);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT payload_json FROM session_timeline_recoveries",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            payload
+        );
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_overlapping_ranges_without_full_prefix_proof_preserve_both_raw_events() {
+        let path = database_path("issue604-unproven-prefix-overlap");
+        let identity = partition_identity('b', 8);
+        let store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        for (prefix, start, end) in [(1_u128, 0, 100), (2, 50, 150)] {
+            store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('root','session.jsonl','1','2',?1,?2,?3,?4,0,1500,'SOL','100','100','0','0','0')",params![format!("{prefix:032x}"),start,end,format!("{prefix:064x}")]).unwrap();
+        }
+        let raw = load_raw_session_events_from_connection(&store.connection).unwrap();
+        assert_eq!(raw.len(), 2);
+        assert_eq!(store.load_session_events().unwrap(), raw,
+            "equal values and intersecting ranges cannot prove the same physical token record across generations");
+        assert!(
+            !session_event_is_replay(&raw[0], &raw[1]),
+            "normal collection cannot silently discard an unverified cross-generation candidate"
+        );
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn lifecycle_repair_retains_unqualified_overlaps_and_their_saved_values() {
         let path = database_path("lifecycle-prefix-replay");
         let identity = partition_identity('b', 8);
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
@@ -18568,63 +24023,31 @@ mod tests {
         assert_eq!(raw_event_count, 3);
         let backup =
             UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
-        let repaired = store
-            .repair_session_lifecycle(&[SessionLifecycleInterval::new(Some(1_400), None)], &backup)
-            .unwrap();
-        assert_eq!(repaired, Some(1));
-        let canonical_events = store.load_session_events().unwrap();
-        assert_eq!(canonical_events.len(), 2);
-        assert!(canonical_events.iter().any(|event| event.timestamp == 1300));
-        let raw_event_count: i64 = store
-            .connection
-            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(raw_event_count, 2, "repair removes only the replay row");
-        let state = store.load_session_collection_state().unwrap();
-        assert_eq!(state.model_totals[0].total_tokens, 100);
-        let row: (f64, i64, Option<f64>, Option<String>) = store
-            .connection
-            .query_row(
-                "SELECT history.sol_dollars, history.sol_tokens,
-                        models.total_dollars, models.price_version
-                 FROM usage_history AS history
-                 JOIN usage_model_history AS models USING (timestamp, reset_at)
-                 WHERE history.timestamp=1500 AND history.reset_at=2000
-                   AND models.model='SOL'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(row.1, 100);
-        assert_eq!(row.0, 0.001);
+        let before = store.load_session_collection_state().unwrap();
+        let raw = load_raw_session_events_from_connection(&store.connection).unwrap();
+        let fingerprint = legacy_raw_evidence(&store.connection).unwrap();
         assert_eq!(
-            row.2, None,
-            "repair must not invent a row-owned legacy price"
+            store
+                .repair_session_lifecycle(
+                    &[SessionLifecycleInterval::new(Some(1_400), None)],
+                    &backup
+                )
+                .unwrap(),
+            None,
+            "ownership/timestamp and overlap do not prove an original numeric record"
         );
-        assert_eq!(row.3, None, "repair must not invent a price revision");
-
-        let reader_identity = codex_info_db_reader::StoragePartitionIdentity {
-            schema_version: "codex-info-account-db-v1".to_owned(),
-            profile_scope_id: "11".repeat(16),
-            account_scope_id: "b".repeat(64),
-            storage_epoch: 8,
-            partition_id: "b".repeat(64),
-        };
-        let snapshot = codex_info_db_reader::DbReader::open_partitioned(&path, &reader_identity)
-            .expect("open repaired partition read-only")
-            .read_snapshot()
-            .expect("read repaired history");
-        let saved = snapshot
-            .history_samples_v3
-            .iter()
-            .find(|sample| sample.timestamp == 1500 && sample.reset_at == reset_at)
-            .expect("repaired V3 history sample");
-        let sol = saved
-            .models
-            .as_ref()
-            .and_then(|models| models.iter().find(|model| model.model == "SOL"))
-            .expect("repaired V3 family history row");
-        assert_eq!(sol.total_dollars, Some(0.001));
+        assert_eq!(store.load_session_collection_state().unwrap(), before);
+        assert_eq!(store.load_session_events().unwrap(), raw);
+        assert_eq!(legacy_raw_evidence(&store.connection).unwrap(), fingerprint);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM usage_model_history", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "unqualified old records cannot create a model/price sidecar"
+        );
         remove_database(&path);
     }
 
@@ -18639,14 +24062,15 @@ mod tests {
                  DROP TRIGGER durable_history_observation_update_guard;
                  DROP TRIGGER usage_history_sidecar_update_guard;
                  DROP TRIGGER usage_history_sidecar_delete_guard;
-                 DROP INDEX usage_history_canonical_timestamp_idx;
-                 DROP INDEX usage_model_history_canonical_timestamp_model_idx;",
+                 DROP INDEX usage_history_canonical_period_timestamp_idx;
+                 DROP INDEX usage_model_history_canonical_period_timestamp_model_idx;",
             )
             .unwrap();
     }
 
     fn downgrade_canonical_history_to_v9(connection: &Connection) {
         drop_canonical_history_constraints(connection);
+        downgrade_qualification_fixture(connection);
         connection
             .execute("DROP TABLE session_quota_windows", [])
             .unwrap();
@@ -18667,19 +24091,28 @@ mod tests {
         let weaker_model = SessionModelTotal {
             model: "SOL".into(),
             total_tokens: 10,
-            input_tokens: 8,
-            cached_input_tokens: 2,
-            output_tokens: 2,
+            input_tokens: Some(8),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(2),
             cache_write_input_tokens: Some(0),
         };
         let stronger_model = SessionModelTotal {
             total_tokens: 20,
-            input_tokens: 16,
-            cached_input_tokens: 4,
-            output_tokens: 4,
+            input_tokens: Some(16),
+            cached_input_tokens: Some(4),
+            output_tokens: Some(4),
             ..weaker_model.clone()
         };
         let connection = Connection::open(&path).unwrap();
+        let repair_bytes =
+            "{\"old_key\":\"SOL\",\"old_cache_write\":null,\"exact_model\":\"gpt-6.1-sol\"}";
+        let repair_sha = format!("{:x}", Sha256::digest(repair_bytes.as_bytes()));
+        connection
+            .execute(
+                "INSERT INTO source_prefix_repairs VALUES(?1,?2,?1)",
+                params![repair_sha, repair_bytes],
+            )
+            .unwrap();
         downgrade_canonical_history_to_v9(&connection);
         connection
             .execute(
@@ -18725,9 +24158,9 @@ mod tests {
                         row.timestamp,
                         &total.model,
                         total.total_tokens.to_string(),
-                        total.input_tokens.to_string(),
-                        total.cached_input_tokens.to_string(),
-                        total.output_tokens.to_string(),
+                        total.input_tokens.map(|value| value.to_string()),
+                        total.cached_input_tokens.map(|value| value.to_string()),
+                        total.output_tokens.map(|value| value.to_string()),
                         total
                             .cache_write_input_tokens
                             .map(|value| value.to_string()),
@@ -18776,6 +24209,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy_raw_evidence(&backup_store).unwrap(), raw_before);
+        for connection in [&backup_store, &store.connection] {
+            let saved: (String, String, String) = connection
+                .query_row(
+                    "SELECT repair_id,payload_json,payload_sha256 FROM source_prefix_repairs",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                saved,
+                (
+                    repair_sha.clone(),
+                    repair_bytes.to_owned(),
+                    repair_sha.clone()
+                ),
+                "backup, migration and reopen preserve the exact repair provenance bytes"
+            );
+        }
         let canonical = store.load_all_raw().unwrap();
         assert_eq!(canonical.len(), 1);
         assert_eq!(canonical[0].timestamp, minute);
@@ -18805,16 +24256,30 @@ mod tests {
                 params![minute + 60, reset_b],
             )
             .is_err());
-        assert!(store
-            .connection
-            .execute(
-                "INSERT INTO usage_history (
+        assert_eq!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO usage_history (
                      timestamp, reset_at, remaining_percent, sol_dollars,
                      terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
                  ) VALUES (?1, ?2, 70, 2, 2, 3, 11, 22, 33)",
-                params![minute, reset_b + 60],
+                    params![minute, reset_b + 60],
+                )
+                .unwrap(),
+            1,
+            "v16 preserves independent exact reset keys in one minute"
+        );
+        let retained: (i64, f64) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM usage_history WHERE timestamp=?1),sol_dollars
+             FROM usage_history WHERE timestamp=?1 AND reset_at=?2",
+                params![minute, reset_b],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .is_err());
+            .unwrap();
+        assert_eq!(retained, (2, canonical[0].sol_dollars));
         assert!(store
             .connection
             .execute(
@@ -18846,20 +24311,26 @@ mod tests {
             )
             .is_err());
 
-        // Normal post-migration writes must collapse observations in one
-        // minute onto the existing canonical timestamp and reset key. A
-        // rolling reset alias cannot recreate a second period or a second
-        // row for that minute.
+        // Current v16 writes canonicalize the minute while keeping every
+        // distinct exact reset key independent.
         let next_observation = sample(minute + 65, reset_b, Some(69.0), 3.0);
         store.upsert_sample(&next_observation).unwrap();
-        let replay_with_reset_alias = sample(minute + 80, reset_b + 30, Some(68.0), 4.0);
-        store.upsert_sample(&replay_with_reset_alias).unwrap();
+        let distinct_reset_observation = sample(minute + 80, reset_b + 30, Some(68.0), 4.0);
+        store.upsert_sample(&distinct_reset_observation).unwrap();
         let canonical = store.load_all_raw().unwrap();
-        assert_eq!(canonical.len(), 2);
-        assert_eq!(canonical[1].timestamp, minute + 60);
-        assert_eq!(canonical[1].reset_at, reset_b);
-        assert_eq!(canonical[1].remaining_percent, Some(68.0));
-        assert_eq!(canonical[1].sol_dollars, 4.0);
+        assert_eq!(canonical.len(), 4);
+        let same_period = canonical
+            .iter()
+            .find(|sample| sample.timestamp == minute + 60 && sample.reset_at == reset_b)
+            .unwrap();
+        assert_eq!(same_period.remaining_percent, Some(69.0));
+        assert_eq!(same_period.sol_dollars, 3.0);
+        let distinct_period = canonical
+            .iter()
+            .find(|sample| sample.timestamp == minute + 60 && sample.reset_at == reset_b + 30)
+            .unwrap();
+        assert_eq!(distinct_period.remaining_percent, Some(68.0));
+        assert_eq!(distinct_period.sol_dollars, 4.0);
 
         // Quota-only acquisition remains an independent durable fact when no
         // usage vector exists for that timestamp.
@@ -18999,13 +24470,540 @@ mod tests {
             token_baseline_known: true,
             history_base_pending: false,
             last_model: Some("SOL".into()),
+            last_model_context_kind: None,
+            last_model_interval: None,
+            source_admission: None,
             last_task_running: None,
             context_usage_tokens: None,
             context_window_tokens: None,
-            previous_total: 20,
-            previous_input: 12,
-            previous_cached_input: 2,
-            previous_output: 8,
+            previous_total: Some(20),
+            previous_input: Some(12),
+            previous_cached_input: Some(2),
+            previous_output: Some(8),
+        }
+    }
+
+    fn issue604_source_binding_json() -> serde_json::Value {
+        serde_json::json!({
+            "version": 2,
+            "stream": "legacy-counter",
+            "metadata": {"thread_id":"binding-thread", "session_id":"binding-session"},
+            "metadata_qualified": true,
+            "strong_context": null,
+            "previous_raw": null,
+            "response_waiting_for_counter": false,
+            "responses": [],
+            "account_binding": {
+                "version": 1,
+                "partition": {
+                    "schema_version":"codex-info-account-db-v1",
+                    "profile_scope_id":"11".repeat(16),
+                    "account_scope_id":"a".repeat(64),
+                    "storage_epoch":7,
+                    "partition_id":"a".repeat(64)
+                },
+                "root_identity":"unix:10:20",
+                "relative_path":"one.jsonl",
+                "file_device":10,
+                "file_inode":42,
+                "prefix_generation":"00000000000000000000000000005678",
+                "prefix_end":100,
+                "metadata":{"thread_id":"binding-thread", "session_id":"binding-session"},
+                "proof": {
+                    "kind":"rpc",
+                    "began_at":1791871200,
+                    "ended_at":1791871201,
+                    "process": {
+                        "pid":1234,
+                        "starttime_ticks":17,
+                        "executable_device":10,
+                        "executable_inode":20
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn issue604_source_account_binding_v1_requires_qualified_shape() {
+        use source_admission::SourceAdmission;
+
+        let rpc = issue604_source_binding_json();
+        let mut historical = rpc.clone();
+        historical["account_binding"]["proof"] = serde_json::json!({
+            "kind":"accepted-prefix",
+            "anchor":{"start":10,"end":20,"sha256":"22".repeat(32),"timestamp":1791871200}
+        });
+        for value in [&rpc, &historical] {
+            let state = SourceAdmission::from_storage(&value.to_string(), 100);
+            assert!(
+                state.is_some(),
+                "a qualified versioned binding must survive storage"
+            );
+            let stored: serde_json::Value =
+                serde_json::from_str(&state.unwrap().to_storage().unwrap()).unwrap();
+            assert_eq!(
+                stored, *value,
+                "original qualification facts must round-trip"
+            );
+        }
+
+        for (pointer, value) in [
+            ("/account_binding/version", serde_json::json!(2)),
+            (
+                "/account_binding/partition/storage_epoch",
+                serde_json::json!(0),
+            ),
+            (
+                "/account_binding/partition/account_scope_id",
+                serde_json::json!("A".repeat(64)),
+            ),
+            (
+                "/account_binding/relative_path",
+                serde_json::json!("../other.jsonl"),
+            ),
+            (
+                "/account_binding/prefix_generation",
+                serde_json::json!("0".repeat(32)),
+            ),
+            ("/account_binding/prefix_end", serde_json::json!(0)),
+            ("/account_binding/prefix_end", serde_json::json!(101)),
+            (
+                "/account_binding/metadata/thread_id",
+                serde_json::json!("another-thread"),
+            ),
+            ("/metadata_qualified", serde_json::json!(false)),
+            ("/account_binding/proof/began_at", serde_json::json!(0)),
+            (
+                "/account_binding/proof/ended_at",
+                serde_json::json!(1791871199),
+            ),
+            (
+                "/account_binding/proof/ended_at",
+                serde_json::json!(253402300800_u64),
+            ),
+            ("/account_binding/proof/process/pid", serde_json::json!(0)),
+            ("/account_binding/proof/process", serde_json::Value::Null),
+        ] {
+            let mut invalid = rpc.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                SourceAdmission::from_storage(&invalid.to_string(), 100).is_none(),
+                "provided invalid binding cannot downgrade to missing: {pointer}"
+            );
+        }
+        let mut invalid = historical;
+        invalid["account_binding"]["proof"]["anchor"]["end"] = serde_json::json!(101);
+        assert!(SourceAdmission::from_storage(&invalid.to_string(), 100).is_none());
+        let mut invalid = rpc.clone();
+        invalid["account_binding"]["unrecognized"] = serde_json::json!(true);
+        assert!(SourceAdmission::from_storage(&invalid.to_string(), 100).is_none());
+        for null in [false, true] {
+            let mut legacy = rpc.clone();
+            if null {
+                legacy["account_binding"] = serde_json::Value::Null;
+            } else {
+                legacy.as_object_mut().unwrap().remove("account_binding");
+            }
+            let state = SourceAdmission::from_storage(&legacy.to_string(), 100).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_str(&state.to_storage().unwrap()).unwrap();
+            assert!(stored.get("account_binding").is_none());
+        }
+    }
+
+    #[test]
+    fn issue604_source_binding_preserves_original_session_facts_during_enrichment() {
+        use source_admission::SourceAdmission;
+
+        let mut value = issue604_source_binding_json();
+        value["account_binding"]["metadata"]["session_id"] = serde_json::Value::Null;
+        let parsed = SourceAdmission::from_storage(&value.to_string(), 100);
+        assert!(
+            parsed.is_some(),
+            "a missing original optional Session id can become known on the same qualified source"
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(&parsed.unwrap().to_storage().unwrap()).unwrap();
+        assert_eq!(
+            stored, value,
+            "original missingness is an immutable saved fact"
+        );
+        for current in [
+            serde_json::Value::Null,
+            serde_json::json!("different-session"),
+        ] {
+            let mut invalid = issue604_source_binding_json();
+            invalid["metadata"]["session_id"] = current;
+            assert!(SourceAdmission::from_storage(&invalid.to_string(), 100).is_none());
+        }
+    }
+
+    #[test]
+    fn issue604_source_binding_checkpoint_round_trip_is_partition_and_source_bound() {
+        use source_admission::SourceAdmission;
+
+        fn commit(store: &mut UsageStore, state: &SessionCheckpoint) -> Result<u64> {
+            let range = SessionRange {
+                root_identity: state.root_identity.clone(),
+                relative_path: state.relative_path.clone(),
+                file_device: state.file_device,
+                file_inode: state.file_inode,
+                start_offset: 0,
+                end_offset: 100,
+                collector_epoch: state.collector_epoch,
+                cycle_seq: state.cycle_seq,
+                prefix_generation: state.prefix_generation,
+                record_sha256: "33".repeat(32),
+            };
+            store.commit_session_collection(SessionCollectionCommit {
+                reset_at: 0,
+                window_seconds: 0,
+                collector_epoch: state.collector_epoch,
+                cycle_seq: state.cycle_seq,
+                samples: &[],
+                checkpoints: std::slice::from_ref(state),
+                ranges: &[range],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+        }
+
+        let source = recorded_source("one.jsonl", 42);
+        let mut state = checkpoint(&source, 100);
+        state.fully_attributed_from_zero = false;
+        state.token_baseline_known = false;
+        state.previous_total = None;
+        state.previous_input = None;
+        state.previous_cached_input = None;
+        state.previous_output = None;
+        state.last_model = None;
+        let json = issue604_source_binding_json();
+        state.source_admission = SourceAdmission::from_storage(&json.to_string(), 100);
+        assert!(
+            state.source_admission.is_some(),
+            "binding must be a stored qualification"
+        );
+        assert!(validate_session_checkpoint(&state).is_ok());
+        let mutations: [fn(&mut SessionCheckpoint); 5] = [
+            |cp| cp.root_identity = "unix:99:20".into(),
+            |cp| cp.relative_path = "other.jsonl".into(),
+            |cp| cp.file_device += 1,
+            |cp| cp.file_inode += 1,
+            |cp| cp.prefix_generation += 1,
+        ];
+        for mutate in mutations {
+            let mut wrong_source = state.clone();
+            mutate(&mut wrong_source);
+            assert!(validate_session_checkpoint(&wrong_source).is_err());
+        }
+
+        let path = database_path("issue604-source-account-binding");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let before = store.load_session_collection_state().unwrap();
+        for (key, value) in [
+            ("profile_scope_id", serde_json::json!("22".repeat(16))),
+            ("account_scope_id", serde_json::json!("b".repeat(64))),
+            ("storage_epoch", serde_json::json!(8)),
+            ("partition_id", serde_json::json!("c".repeat(64))),
+        ] {
+            let mut foreign = json.clone();
+            foreign["account_binding"]["partition"][key] = value;
+            let mut candidate = state.clone();
+            candidate.source_admission = SourceAdmission::from_storage(&foreign.to_string(), 100);
+            assert!(candidate.source_admission.is_some());
+            assert!(store
+                .load_session_ranges_for_checkpoint(&candidate)
+                .is_err());
+            assert!(commit(&mut store, &candidate).is_err());
+            let after = store.load_session_collection_state().unwrap();
+            assert_eq!(after.data_generation, before.data_generation);
+            assert_eq!(after.checkpoints, before.checkpoints);
+        }
+        commit(&mut store, &state).unwrap();
+        drop(store);
+        let store = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let saved = store.load_session_collection_state().unwrap();
+        assert_eq!(saved.checkpoints, [state.clone()]);
+        assert_eq!(
+            store
+                .load_session_ranges_for_checkpoint(&state)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut tampered = json;
+        tampered["account_binding"]["partition"]["account_scope_id"] =
+            serde_json::json!("d".repeat(64));
+        let tampered = tampered.to_string();
+        store
+            .connection
+            .execute(
+                "UPDATE session_checkpoints SET source_admission=?1",
+                [&tampered],
+            )
+            .unwrap();
+        assert!(store.load_session_collection_state().is_err());
+        let preserved: String = store
+            .connection
+            .query_row(
+                "SELECT source_admission FROM session_checkpoints",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved, tampered,
+            "read rejection must preserve the old record"
+        );
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_nullable_anchor_and_checkpoint_preserve_knownness_and_v1_identity() {
+        let path = database_path("issue604-nullable-anchor-checkpoint");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let pending = SessionPendingRange {
+            root_identity: "root".into(),
+            relative_path: "source.jsonl".into(),
+            file_device: 1,
+            file_inode: 3,
+            start_offset: 0,
+            end_offset: 10,
+            collector_epoch: 1,
+            cycle_seq: 2,
+            prefix_generation: 2,
+            record_sha256: "1".repeat(64),
+            parser_version: "fixture-v1".into(),
+            reason: "checkpoint-token-anchor-missing".into(),
+            complete: true,
+        };
+        let anchor = SessionTokenAnchor {
+            root_identity: "root".into(),
+            relative_path: "source.jsonl".into(),
+            file_device: 1,
+            file_inode: 2,
+            prefix_generation: 1,
+            committed_offset: 5,
+            prefix_sha256: "2".repeat(64),
+            collector_epoch: 1,
+            cycle_seq: 1,
+            fully_attributed_from_zero: false,
+            total_tokens: 100,
+            input_tokens: Some(80),
+            cached_input_tokens: Some(20),
+            output_tokens: Some(20),
+            cache_write_input_tokens: None,
+        };
+        assert_eq!(
+            session_token_anchor_recovery_id(&pending, &anchor),
+            "60fe59329b09264057ebf8e850ef3d511ea80d14fab6dba1c8c81a265cd504c4",
+            "the independently encoded v1 identity cannot change for a known anchor"
+        );
+        let mut recoveries = BTreeMap::new();
+        for (input, cached, output, version) in [
+            (Some(80), Some(20), Some(20), 1),
+            (None, Some(20), Some(20), 2),
+            (Some(80), None, Some(20), 2),
+            (Some(80), Some(20), None, 2),
+        ] {
+            let mut anchor = anchor.clone();
+            anchor.input_tokens = input;
+            anchor.cached_input_tokens = cached;
+            anchor.output_tokens = output;
+            let recovery = SessionTokenAnchorRecovery {
+                recovery_id: session_token_anchor_recovery_id(&pending, &anchor),
+                pending: pending.clone(),
+                anchor,
+                current_root_identity: "root".into(),
+                current_relative_path: "source.jsonl".into(),
+                current_file_device: 1,
+                current_file_inode: 3,
+                cursor_offset: 10,
+                cursor_prefix_generation: 2,
+                cursor_collector_epoch: 1,
+                cursor_cycle_seq: 2,
+            };
+            let encoded = encode_session_token_anchor_recovery(&recovery).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(value["version"], version);
+            assert_eq!(
+                decode_session_token_anchor_recovery(&recovery.recovery_id, &encoded).unwrap(),
+                recovery
+            );
+            let mut wrong_version = value;
+            wrong_version["version"] = serde_json::json!(3 - version);
+            assert!(decode_session_token_anchor_recovery(
+                &recovery.recovery_id,
+                &wrong_version.to_string()
+            )
+            .is_err());
+            recoveries.insert(recovery.recovery_id.clone(), recovery);
+        }
+        let tx = store.connection.transaction().unwrap();
+        replace_session_pending_ranges(
+            &tx,
+            &BTreeMap::from([(
+                (
+                    pending.root_identity.clone(),
+                    pending.relative_path.clone(),
+                    pending.file_device,
+                    pending.file_inode,
+                    pending.prefix_generation,
+                    pending.start_offset,
+                ),
+                pending,
+            )]),
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        upsert_session_token_anchor_recoveries(&tx, &recoveries).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            store.load_session_token_anchor_recoveries().unwrap(),
+            recoveries.into_values().collect::<Vec<_>>()
+        );
+        let source = RecordedSessionSource {
+            root_identity: "root".into(),
+            relative_path: "empty.jsonl".into(),
+            file_bytes: 0,
+            modified_nanos: 0,
+            file_device: 1,
+            file_inode: 4,
+        };
+        let mut checkpoint = checkpoint(&source, 0);
+        checkpoint.token_baseline_known = false;
+        checkpoint.fully_attributed_from_zero = false;
+        checkpoint.previous_total = None;
+        checkpoint.previous_input = None;
+        checkpoint.previous_cached_input = None;
+        checkpoint.previous_output = None;
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: 0,
+                window_seconds: 0,
+                collector_epoch: checkpoint.collector_epoch,
+                cycle_seq: checkpoint.cycle_seq,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&checkpoint),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        drop(store);
+        let store = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(
+            store.load_session_collection_state().unwrap().checkpoints,
+            vec![checkpoint]
+        );
+        let nulls: i64 = store.connection.query_row("SELECT previous_total IS NULL AND previous_input IS NULL AND previous_cached_input IS NULL AND previous_output IS NULL FROM session_checkpoints", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            nulls, 1,
+            "an unobserved baseline must not become stored zero"
+        );
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_nullable_model_facts_survive_reload_and_history_projection() {
+        let path = database_path("issue604-nullable-model-facts");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_model_totals VALUES ('gpt-6.1-sol','100',NULL,'20',NULL,NULL)",
+                [],
+            )
+            .unwrap();
+        let saved = store.load_session_collection_state().expect(
+            "a known total with unknown input/output is a valid retained fact, not a read failure",
+        );
+        assert_eq!(saved.model_totals.len(), 1);
+        let sample = UsageHistorySample {
+            timestamp: 1200,
+            reset_at: 2000,
+            remaining_percent: Some(80.0),
+            sol_dollars: 0.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 100,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let mut observation = UsageHistoryObservation::confirmed(&sample);
+        observation.model_totals = Some(saved.model_totals.clone());
+        observation.model_totals_complete = false;
+        store.upsert_sample(&sample).unwrap();
+        let tx = store.connection.transaction().unwrap();
+        upsert_observation_model_totals(&tx, &[observation], false, None).unwrap();
+        tx.commit().unwrap();
+        let row: (String, Option<String>, Option<String>, Option<String>, Option<String>) = store.connection.query_row(
+            "SELECT total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens FROM usage_model_history WHERE timestamp=1200 AND reset_at=2000 AND model='gpt-6.1-sol'",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).unwrap();
+        assert_eq!(row, ("100".into(), None, Some("20".into()), None, None));
+        let price: Option<f64> = store.connection.query_row(
+            "SELECT total_dollars FROM usage_model_history WHERE timestamp=1200 AND reset_at=2000 AND model='gpt-6.1-sol'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(price, None, "unknown input/output cannot be priced as zero");
+        drop(store);
+        let reopened = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(
+            reopened
+                .load_session_collection_state()
+                .unwrap()
+                .model_totals,
+            saved.model_totals
+        );
+        drop(reopened);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue604_active_model_context_uses_scalar_contract_without_rewriting_legacy_labels() {
+        let source = RecordedSessionSource {
+            root_identity: "unix:1:2".into(),
+            relative_path: "one.jsonl".into(),
+            file_bytes: 0,
+            modified_nanos: 0,
+            file_device: 1,
+            file_inode: 2,
+        };
+        let mut state = checkpoint(&source, 0);
+        let legacy = "a".repeat(129);
+        state.last_model = Some(legacy.clone());
+        assert!(
+            validate_session_checkpoint(&state).is_ok(),
+            "unqualified old labels are retained for audit"
+        );
+        assert_eq!(state.last_model.as_deref(), Some(legacy.as_str()));
+        for (model, accepted) in [
+            (legacy, false),
+            ("\u{1f680}".repeat(128), true),
+            ("\u{1f680}".repeat(129), false),
+            ("gpt\u{2066}-6-sol".into(), false),
+        ] {
+            state.last_model = Some(model.clone());
+            state.last_model_context_kind = Some(SessionModelContextKind::Turn);
+            state.last_model_interval = Some(SessionModelInterval::Model(model.clone()));
+            assert_eq!(
+                validate_session_checkpoint(&state).is_ok(),
+                accepted,
+                "active context {model:?}"
+            );
+            assert_eq!(
+                state.last_model.as_deref(),
+                Some(model.as_str()),
+                "validation cannot rewrite stored input"
+            );
         }
     }
 
@@ -19106,9 +25104,9 @@ mod tests {
             cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 20,
-            input_tokens: 12,
-            cached_input_tokens: 2,
-            output_tokens: 8,
+            input_tokens: Some(12),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(8),
         };
         let legacy_sample = sample(1_800_000_000, reset_at, Some(70.0), 3.0);
 
@@ -19129,6 +25127,7 @@ mod tests {
         let legacy_history = store.load_all().unwrap();
         let legacy_state = store.load_session_collection_state().unwrap();
         drop_canonical_history_constraints(&store.connection);
+        downgrade_qualification_fixture(&store.connection);
         store
             .connection
             .execute(
@@ -19245,33 +25244,33 @@ mod tests {
             cache_write_input_tokens: Some(7),
             model: "ASTRA".into(),
             total_tokens: 20,
-            input_tokens: 12,
-            cached_input_tokens: 2,
-            output_tokens: 8,
+            input_tokens: Some(12),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(8),
         };
         let sol_total = SessionModelTotal {
             cache_write_input_tokens: Some(0),
             model: "SOL".into(),
             total_tokens: 20,
-            input_tokens: 12,
-            cached_input_tokens: 2,
-            output_tokens: 8,
+            input_tokens: Some(12),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(8),
         };
         let terra_total = SessionModelTotal {
             cache_write_input_tokens: None,
             model: "TERRA".into(),
             total_tokens: 30,
-            input_tokens: 20,
-            cached_input_tokens: 5,
-            output_tokens: 10,
+            input_tokens: Some(20),
+            cached_input_tokens: Some(5),
+            output_tokens: Some(10),
         };
         let future_total = SessionModelTotal {
             cache_write_input_tokens: Some(3),
             model: "gpt-7-nova".into(),
             total_tokens: 15,
-            input_tokens: 10,
-            cached_input_tokens: 2,
-            output_tokens: 5,
+            input_tokens: Some(10),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(5),
         };
         let current_totals = [
             astra_total.clone(),
@@ -19381,6 +25380,7 @@ mod tests {
                  ALTER TABLE usage_model_history DROP COLUMN total_dollars;",
             )
             .unwrap();
+        downgrade_qualification_fixture(&store.connection);
         store
             .connection
             .pragma_update(
@@ -19826,6 +25826,28 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch(SCHEMA).unwrap();
         connection.execute_batch(PARTITION_SCHEMA).unwrap();
+        // This is an unversioned legacy fixture. New v16-only qualification
+        // columns cannot be presented as an old schema during backup admission.
+        connection
+            .execute_batch(
+                "ALTER TABLE session_checkpoints DROP COLUMN source_admission;
+            ALTER TABLE session_checkpoints DROP COLUMN last_model_interval;
+            ALTER TABLE session_checkpoints DROP COLUMN last_model_context_kind;
+            DROP TABLE session_events;
+            CREATE TABLE session_events (
+                root_identity TEXT NOT NULL, relative_path TEXT NOT NULL,
+                file_device TEXT NOT NULL, file_inode TEXT NOT NULL,
+                prefix_generation TEXT NOT NULL, range_start INTEGER NOT NULL,
+                range_end INTEGER NOT NULL, record_sha256 TEXT NOT NULL,
+                event_index INTEGER NOT NULL, timestamp INTEGER NOT NULL,
+                model TEXT NOT NULL, total_tokens TEXT NOT NULL,
+                input_tokens TEXT NOT NULL, cached_input_tokens TEXT NOT NULL,
+                output_tokens TEXT NOT NULL, cache_write_input_tokens TEXT,
+                PRIMARY KEY(root_identity,relative_path,file_device,file_inode,
+                    prefix_generation,range_start,range_end,record_sha256,event_index)
+            ) WITHOUT ROWID;",
+            )
+            .unwrap();
         connection
             .execute("DROP TABLE recorder_gap_ledger", [])
             .unwrap();
@@ -19940,17 +25962,17 @@ mod tests {
                 cache_write_input_tokens: Some(7),
                 model: "ASTRA".into(),
                 total_tokens: 20,
-                input_tokens: 12,
-                cached_input_tokens: 2,
-                output_tokens: 8,
+                input_tokens: Some(12),
+                cached_input_tokens: Some(2),
+                output_tokens: Some(8),
             },
             SessionModelTotal {
                 cache_write_input_tokens: None,
                 model: "SOL".into(),
                 total_tokens: 20,
-                input_tokens: 12,
-                cached_input_tokens: 2,
-                output_tokens: 8,
+                input_tokens: Some(12),
+                cached_input_tokens: Some(2),
+                output_tokens: Some(8),
             },
         ];
         let committed = store
@@ -20075,6 +26097,7 @@ mod tests {
         // Reproduce the v8 shape exactly: only the new nullable column is
         // absent and every pre-existing row remains in place.
         let connection = Connection::open(&path).unwrap();
+        downgrade_qualification_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE session_quota_windows;
@@ -20300,6 +26323,7 @@ mod tests {
         drop(store);
 
         let connection = Connection::open(&path).unwrap();
+        downgrade_qualification_fixture(&connection);
         connection
             .execute_batch(
                 "DROP TABLE session_quota_windows;
@@ -20607,9 +26631,9 @@ mod tests {
                     cache_write_input_tokens: None,
                     model: "SOL".into(),
                     total_tokens: 20,
-                    input_tokens: 12,
-                    cached_input_tokens: 2,
-                    output_tokens: 8,
+                    input_tokens: Some(12),
+                    cached_input_tokens: Some(2),
+                    output_tokens: Some(8),
                 }],
                 recorded_sessions: &[source],
             })
@@ -21997,9 +28021,9 @@ mod tests {
         let model = SessionModelTotal {
             model: "SOL".into(),
             total_tokens: 5,
-            input_tokens: 4,
-            cached_input_tokens: 1,
-            output_tokens: 1,
+            input_tokens: Some(4),
+            cached_input_tokens: Some(1),
+            output_tokens: Some(1),
             cache_write_input_tokens: Some(0),
         };
         let mut observations = samples
@@ -22309,9 +28333,9 @@ mod tests {
         let model = SessionModelTotal {
             model: "SOL".into(),
             total_tokens: 11,
-            input_tokens: 8,
-            cached_input_tokens: 2,
-            output_tokens: 3,
+            input_tokens: Some(8),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(3),
             cache_write_input_tokens: Some(0),
         };
         let observation =
@@ -22363,9 +28387,9 @@ mod tests {
         let model = SessionModelTotal {
             model: "SOL".into(),
             total_tokens: 11,
-            input_tokens: 8,
-            cached_input_tokens: 2,
-            output_tokens: 3,
+            input_tokens: Some(8),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(3),
             cache_write_input_tokens: Some(0),
         };
         let samples = vec![first.clone(), second.clone()];
@@ -22482,6 +28506,7 @@ mod tests {
         let row = sample(1_700_000_040, 1_700_604_800, Some(64.0), 1.5);
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
         store.upsert_samples(std::slice::from_ref(&row)).unwrap();
+        downgrade_qualification_fixture(&store.connection);
         store
             .connection
             .execute_batch("DROP TABLE IF EXISTS session_quota_windows; DROP TABLE IF EXISTS quota_receipts; PRAGMA user_version=13;")
@@ -22503,7 +28528,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            15
+            16
         );
         assert_eq!(
             restored
@@ -22735,17 +28760,17 @@ mod tests {
         let luna = SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 50,
-            input_tokens: 40,
-            cached_input_tokens: 10,
-            output_tokens: 10,
+            input_tokens: Some(40),
+            cached_input_tokens: Some(10),
+            output_tokens: Some(10),
             cache_write_input_tokens: Some(0),
         };
         let sol = SessionModelTotal {
             model: "SOL".into(),
             total_tokens: 100,
-            input_tokens: 90,
-            cached_input_tokens: 50,
-            output_tokens: 10,
+            input_tokens: Some(90),
+            cached_input_tokens: Some(50),
+            output_tokens: Some(10),
             cache_write_input_tokens: Some(0),
         };
         let source_models = vec![luna.clone(), sol.clone()];
@@ -22828,15 +28853,15 @@ mod tests {
                 source_model_totals: source_models.clone(),
                 ranges: vec![range.clone()],
                 points: vec![
-                    offset(first_at, 10, 9, 5, 1, 0.1),
-                    offset(second_at, 20, 18, 10, 2, 0.2),
+                    offset(first_at, 10, Some(9), Some(5), Some(1), 0.1),
+                    offset(second_at, 20, Some(18), Some(10), Some(2), 0.2),
                 ],
                 final_offset_model_totals: vec![SessionModelTotal {
                     model: "SOL".into(),
                     total_tokens: 25,
-                    input_tokens: 23,
-                    cached_input_tokens: 12,
-                    output_tokens: 2,
+                    input_tokens: Some(23),
+                    cached_input_tokens: Some(12),
+                    output_tokens: Some(2),
                     cache_write_input_tokens: None,
                 }],
                 final_offset_sol_dollars: 0.25,
@@ -22847,9 +28872,9 @@ mod tests {
         .unwrap();
         let corrected_sol = SessionModelTotal {
             total_tokens: 125,
-            input_tokens: 113,
-            cached_input_tokens: 62,
-            output_tokens: 12,
+            input_tokens: Some(113),
+            cached_input_tokens: Some(62),
+            output_tokens: Some(12),
             cache_write_input_tokens: None,
             ..sol.clone()
         };
@@ -22997,9 +29022,9 @@ mod tests {
             Some(&SessionModelTotal {
                 model: "SOL".into(),
                 total_tokens: 125,
-                input_tokens: 113,
-                cached_input_tokens: 62,
-                output_tokens: 12,
+                input_tokens: Some(113),
+                cached_input_tokens: Some(62),
+                output_tokens: Some(12),
                 cache_write_input_tokens: None,
             })
         );
@@ -23040,13 +29065,13 @@ mod tests {
                 projection_end_exclusive: anchor_at + 60,
                 source_model_totals: corrected_models.clone(),
                 ranges: vec![conflicting_range.clone()],
-                points: vec![offset(anchor_at, 5, 5, 0, 0, 0.05)],
+                points: vec![offset(anchor_at, 5, Some(5), Some(0), Some(0), 0.05)],
                 final_offset_model_totals: vec![SessionModelTotal {
                     model: "SOL".into(),
                     total_tokens: 5,
-                    input_tokens: 5,
-                    cached_input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens: Some(5),
+                    cached_input_tokens: Some(0),
+                    output_tokens: Some(0),
                     cache_write_input_tokens: Some(0),
                 }],
                 final_offset_sol_dollars: 0.05,
@@ -23059,7 +29084,7 @@ mod tests {
             luna,
             SessionModelTotal {
                 total_tokens: 130,
-                input_tokens: 118,
+                input_tokens: Some(118),
                 ..corrected_sol
             },
         ];
@@ -24398,9 +30423,9 @@ mod wave_b_correction_tests {
             cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 100,
-            input_tokens: 80,
-            cached_input_tokens: 30,
-            output_tokens: 20,
+            input_tokens: Some(80),
+            cached_input_tokens: Some(30),
+            output_tokens: Some(20),
         };
         assert_eq!(
             store
@@ -24439,9 +30464,9 @@ mod wave_b_correction_tests {
             cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 1_000_000,
-            input_tokens: 800_000,
-            cached_input_tokens: 300_000,
-            output_tokens: 200_000,
+            input_tokens: Some(800_000),
+            cached_input_tokens: Some(300_000),
+            output_tokens: Some(200_000),
         };
 
         let wrong = HistoryContinuityModelRecovery {
@@ -24484,9 +30509,9 @@ mod wave_b_correction_tests {
                 cache_write_input_tokens: None,
                 model: "SOL".into(),
                 total_tokens: 1_000_100,
-                input_tokens: 800_080,
-                cached_input_tokens: 300_030,
-                output_tokens: 200_020,
+                input_tokens: Some(800_080),
+                cached_input_tokens: Some(300_030),
+                output_tokens: Some(200_020),
             }]
         );
         assert!(store
@@ -24525,9 +30550,9 @@ mod wave_b_correction_tests {
                         cache_write_input_tokens: None,
                         model: "SOL".into(),
                         total_tokens: 1_000_100,
-                        input_tokens: 800_080,
-                        cached_input_tokens: 300_030,
-                        output_tokens: 200_020,
+                        input_tokens: Some(800_080),
+                        cached_input_tokens: Some(300_030),
+                        output_tokens: Some(200_020),
                     }],
                     recorded_sessions: &[],
                 })
@@ -24549,34 +30574,34 @@ mod wave_b_correction_tests {
             SessionModelTotal {
                 model: "LUNA".into(),
                 total_tokens: 22_816_483,
-                input_tokens: 22_343_994,
-                cached_input_tokens: 20_068_352,
-                output_tokens: 472_489,
+                input_tokens: Some(22_343_994),
+                cached_input_tokens: Some(20_068_352),
+                output_tokens: Some(472_489),
                 cache_write_input_tokens: Some(0),
             },
             SessionModelTotal {
                 model: "SOL".into(),
                 total_tokens: 555_312_427,
-                input_tokens: 553_537_987,
-                cached_input_tokens: 544_468_480,
-                output_tokens: 1_774_440,
+                input_tokens: Some(553_537_987),
+                cached_input_tokens: Some(544_468_480),
+                output_tokens: Some(1_774_440),
                 cache_write_input_tokens: Some(0),
             },
         ];
         let first_suffix = vec![SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 91_512,
-            input_tokens: 84_194,
-            cached_input_tokens: 73_472,
-            output_tokens: 7_318,
+            input_tokens: Some(84_194),
+            cached_input_tokens: Some(73_472),
+            output_tokens: Some(7_318),
             cache_write_input_tokens: Some(0),
         }];
         let current = vec![SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 2_446_273,
-            input_tokens: 2_382_039,
-            cached_input_tokens: 2_035_200,
-            output_tokens: 64_234,
+            input_tokens: Some(2_382_039),
+            cached_input_tokens: Some(2_035_200),
+            output_tokens: Some(64_234),
             cache_write_input_tokens: Some(0),
         }];
         let observation = |timestamp, reset_at, sol, luna, totals: Vec<SessionModelTotal>| {
@@ -24619,9 +30644,9 @@ mod wave_b_correction_tests {
                     baseline[1].clone(),
                     SessionModelTotal {
                         total_tokens: 22_488_065,
-                        input_tokens: 22_017_725,
-                        cached_input_tokens: 19_808_512,
-                        output_tokens: 470_340,
+                        input_tokens: Some(22_017_725),
+                        cached_input_tokens: Some(19_808_512),
+                        output_tokens: Some(470_340),
                         ..baseline[0].clone()
                     },
                 ],
@@ -24653,9 +30678,9 @@ mod wave_b_correction_tests {
                 vec![SessionModelTotal {
                     model: "LUNA".into(),
                     total_tokens: 1_523_427,
-                    input_tokens: 1_480_000,
-                    cached_input_tokens: 1_280_000,
-                    output_tokens: 43_427,
+                    input_tokens: Some(1_480_000),
+                    cached_input_tokens: Some(1_280_000),
+                    output_tokens: Some(43_427),
                     cache_write_input_tokens: Some(0),
                 }],
             ),
@@ -24706,6 +30731,10 @@ mod wave_b_correction_tests {
         let mut conflict = conflicting.last().unwrap().clone();
         conflict.reset_at = reset_b;
         conflict.model_totals.as_mut().unwrap()[0].total_tokens += 1;
+        *conflict.model_totals.as_mut().unwrap()[0]
+            .input_tokens
+            .as_mut()
+            .unwrap() += 1;
         conflict.luna_tokens = Some(2_446_274);
         conflicting.push(conflict);
         assert!(derive_session_cumulative_recovery(
@@ -24727,25 +30756,25 @@ mod wave_b_correction_tests {
         let old = vec![SessionModelTotal {
             model: "SOL".into(),
             total_tokens: 555_312_427,
-            input_tokens: 553_537_987,
-            cached_input_tokens: 544_468_480,
-            output_tokens: 1_774_440,
+            input_tokens: Some(553_537_987),
+            cached_input_tokens: Some(544_468_480),
+            output_tokens: Some(1_774_440),
             cache_write_input_tokens: Some(0),
         }];
         let current = vec![SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 686_397,
-            input_tokens: 674_095,
-            cached_input_tokens: 546_560,
-            output_tokens: 12_302,
+            input_tokens: Some(674_095),
+            cached_input_tokens: Some(546_560),
+            output_tokens: Some(12_302),
             cache_write_input_tokens: Some(0),
         }];
         let first = vec![SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 0,
-            input_tokens: 0,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         }];
         let observations = vec![
@@ -24792,48 +30821,48 @@ mod wave_b_correction_tests {
         let luna_baseline = SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 50,
-            input_tokens: 40,
-            cached_input_tokens: 30,
-            output_tokens: 10,
+            input_tokens: Some(40),
+            cached_input_tokens: Some(30),
+            output_tokens: Some(10),
             cache_write_input_tokens: Some(0),
         };
         let sol_baseline = SessionModelTotal {
             model: "SOL".into(),
             total_tokens: 100,
-            input_tokens: 80,
-            cached_input_tokens: 60,
-            output_tokens: 20,
+            input_tokens: Some(80),
+            cached_input_tokens: Some(60),
+            output_tokens: Some(20),
             cache_write_input_tokens: Some(0),
         };
         let first = vec![
             SessionModelTotal {
                 total_tokens: 2,
-                input_tokens: 2,
-                cached_input_tokens: 1,
-                output_tokens: 0,
+                input_tokens: Some(2),
+                cached_input_tokens: Some(1),
+                output_tokens: Some(0),
                 ..luna_baseline.clone()
             },
             SessionModelTotal {
                 total_tokens: 101,
-                input_tokens: 81,
-                cached_input_tokens: 61,
-                output_tokens: 20,
+                input_tokens: Some(81),
+                cached_input_tokens: Some(61),
+                output_tokens: Some(20),
                 ..sol_baseline.clone()
             },
         ];
         let current = vec![
             SessionModelTotal {
                 total_tokens: 5,
-                input_tokens: 4,
-                cached_input_tokens: 2,
-                output_tokens: 1,
+                input_tokens: Some(4),
+                cached_input_tokens: Some(2),
+                output_tokens: Some(1),
                 ..luna_baseline.clone()
             },
             SessionModelTotal {
                 total_tokens: 105,
-                input_tokens: 84,
-                cached_input_tokens: 63,
-                output_tokens: 21,
+                input_tokens: Some(84),
+                cached_input_tokens: Some(63),
+                output_tokens: Some(21),
                 ..sol_baseline.clone()
             },
         ];
@@ -24985,25 +31014,25 @@ mod wave_b_correction_tests {
         let baseline = SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 50,
-            input_tokens: 40,
-            cached_input_tokens: 30,
-            output_tokens: 10,
+            input_tokens: Some(40),
+            cached_input_tokens: Some(30),
+            output_tokens: Some(10),
             cache_write_input_tokens: Some(0),
         };
         let first = SessionModelTotal {
-            total_tokens: 2,
-            input_tokens: 2,
-            cached_input_tokens: 1,
+            total_tokens: 12,
+            input_tokens: Some(2),
+            cached_input_tokens: Some(1),
             // This component did not regress, so adding its baseline would
             // be a guess rather than a source-proven recovery.
-            output_tokens: 10,
+            output_tokens: Some(10),
             ..baseline.clone()
         };
         let current = SessionModelTotal {
-            total_tokens: 5,
-            input_tokens: 4,
-            cached_input_tokens: 2,
-            output_tokens: 11,
+            total_tokens: 15,
+            input_tokens: Some(4),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(11),
             ..baseline.clone()
         };
         let observations = vec![
@@ -25037,25 +31066,25 @@ mod wave_b_correction_tests {
             SessionModelTotal {
                 model: "LUNA".into(),
                 total_tokens: 50,
-                input_tokens: 40,
-                cached_input_tokens: 30,
-                output_tokens: 10,
+                input_tokens: Some(40),
+                cached_input_tokens: Some(30),
+                output_tokens: Some(10),
                 cache_write_input_tokens: Some(0),
             },
             SessionModelTotal {
                 model: "SOL".into(),
                 total_tokens: 100,
-                input_tokens: 80,
-                cached_input_tokens: 60,
-                output_tokens: 20,
+                input_tokens: Some(80),
+                cached_input_tokens: Some(60),
+                output_tokens: Some(20),
                 cache_write_input_tokens: Some(0),
             },
             SessionModelTotal {
                 model: "TERRA".into(),
                 total_tokens: 7,
-                input_tokens: 6,
-                cached_input_tokens: 5,
-                output_tokens: 1,
+                input_tokens: Some(6),
+                cached_input_tokens: Some(5),
+                output_tokens: Some(1),
                 cache_write_input_tokens: Some(0),
             },
         ];
@@ -25063,25 +31092,25 @@ mod wave_b_correction_tests {
             SessionModelTotal {
                 model: "ASTRA".into(),
                 total_tokens: 3,
-                input_tokens: 2,
-                cached_input_tokens: 1,
-                output_tokens: 1,
+                input_tokens: Some(2),
+                cached_input_tokens: Some(1),
+                output_tokens: Some(1),
                 cache_write_input_tokens: Some(0),
             },
             SessionModelTotal {
                 model: "LUNA".into(),
                 total_tokens: 5,
-                input_tokens: 4,
-                cached_input_tokens: 2,
-                output_tokens: 1,
+                input_tokens: Some(4),
+                cached_input_tokens: Some(2),
+                output_tokens: Some(1),
                 cache_write_input_tokens: Some(0),
             },
             SessionModelTotal {
                 model: "SOL".into(),
                 total_tokens: 105,
-                input_tokens: 84,
-                cached_input_tokens: 63,
-                output_tokens: 21,
+                input_tokens: Some(84),
+                cached_input_tokens: Some(63),
+                output_tokens: Some(21),
                 cache_write_input_tokens: Some(0),
             },
         ];
@@ -25130,7 +31159,8 @@ mod wave_b_correction_tests {
             .iter_mut()
             .find(|total| total.model == "LUNA")
             .unwrap();
-        luna.output_tokens = 10;
+        luna.total_tokens = 14;
+        luna.output_tokens = Some(10);
         assert!(
             reconcile_rejected_generation_model_totals(&canonical, &mixed)
                 .unwrap()
@@ -25155,34 +31185,34 @@ mod wave_b_correction_tests {
             SessionModelTotal {
                 model: "LUNA".into(),
                 total_tokens: 50,
-                input_tokens: 40,
-                cached_input_tokens: 30,
-                output_tokens: 10,
+                input_tokens: Some(40),
+                cached_input_tokens: Some(30),
+                output_tokens: Some(10),
                 cache_write_input_tokens: Some(0),
             },
             SessionModelTotal {
                 model: "SOL".into(),
                 total_tokens: 100,
-                input_tokens: 80,
-                cached_input_tokens: 60,
-                output_tokens: 20,
+                input_tokens: Some(80),
+                cached_input_tokens: Some(60),
+                output_tokens: Some(20),
                 cache_write_input_tokens: Some(0),
             },
         ];
         let first = vec![SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 2,
-            input_tokens: 2,
-            cached_input_tokens: 1,
-            output_tokens: 0,
+            input_tokens: Some(2),
+            cached_input_tokens: Some(1),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         }];
         let current = vec![SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 5,
-            input_tokens: 4,
-            cached_input_tokens: 2,
-            output_tokens: 1,
+            input_tokens: Some(4),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(1),
             cache_write_input_tokens: Some(0),
         }];
         let before =
@@ -25283,11 +31313,11 @@ mod wave_b_correction_tests {
                  SELECT timestamp, ?1, remaining_percent + 1.0, sol_dollars,
                         terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
                  FROM usage_history WHERE timestamp=?2",
-            params![reset_a + 120, endpoint.timestamp],
+            params![reset_a, endpoint.timestamp],
         );
         assert!(
             duplicate_endpoint.is_err(),
-            "canonical storage must reject a second raw row at the recovery endpoint"
+            "canonical storage must reject the same exact reset/timestamp twice at the recovery endpoint"
         );
         assert_eq!(
             store
@@ -25384,9 +31414,9 @@ mod wave_b_correction_tests {
 
         let next_raw = vec![SessionModelTotal {
             total_tokens: 7,
-            input_tokens: 6,
-            cached_input_tokens: 3,
-            output_tokens: 1,
+            input_tokens: Some(6),
+            cached_input_tokens: Some(3),
+            output_tokens: Some(1),
             ..current[0].clone()
         }];
         let next_corrected = checked_add_model_totals(&next_raw, &baseline).unwrap();
@@ -25439,23 +31469,23 @@ mod wave_b_correction_tests {
         let baseline = vec![SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 50,
-            input_tokens: 40,
-            cached_input_tokens: 30,
-            output_tokens: 10,
+            input_tokens: Some(40),
+            cached_input_tokens: Some(30),
+            output_tokens: Some(10),
             cache_write_input_tokens: Some(0),
         }];
         let first = vec![SessionModelTotal {
             total_tokens: 2,
-            input_tokens: 2,
-            cached_input_tokens: 1,
-            output_tokens: 0,
+            input_tokens: Some(2),
+            cached_input_tokens: Some(1),
+            output_tokens: Some(0),
             ..baseline[0].clone()
         }];
         let current_a = vec![SessionModelTotal {
             total_tokens: 5,
-            input_tokens: 4,
-            cached_input_tokens: 2,
-            output_tokens: 1,
+            input_tokens: Some(4),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(1),
             ..baseline[0].clone()
         }];
         let before =
@@ -25465,9 +31495,9 @@ mod wave_b_correction_tests {
             cumulative_observation(1_788_996_000, reset_a, 28.0, 0.0, 0.10, current_a.clone());
         let rejected_suffix = vec![SessionModelTotal {
             total_tokens: 2,
-            input_tokens: 2,
-            cached_input_tokens: 1,
-            output_tokens: 0,
+            input_tokens: Some(2),
+            cached_input_tokens: Some(1),
+            output_tokens: Some(0),
             ..baseline[0].clone()
         }];
         let corrupt = cumulative_observation(
@@ -25865,6 +31895,269 @@ mod wave_b_correction_tests {
     }
 
     #[test]
+    fn issue604_model_interval_roundtrips_and_legacy_state_is_unknown() {
+        let path = database_path("issue604-model-interval-roundtrip");
+        let target_path = database_path("issue604-model-interval-target");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 61,
+            partition_id: "33".repeat(32),
+        };
+        let source = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let shape = source.connection.query_row(
+            "SELECT type,\"notnull\",dflt_value FROM pragma_table_info('session_checkpoints') WHERE name='last_model_interval'",
+            [],|row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,Option<String>>(2)?))).optional().unwrap();
+        assert_eq!(
+            shape,
+            Some(("TEXT".into(), 0, None)),
+            "legacy absence must remain unknown, not no-context"
+        );
+        let expected = [
+            None,
+            Some("none"),
+            Some("mixed"),
+            Some("unknown"),
+            Some("model:gpt-6.1-sol"),
+        ];
+        for (index, interval) in expected.iter().enumerate() {
+            source.connection.execute(
+                "INSERT INTO session_checkpoints (
+                    root_identity,relative_path,file_device,file_inode,committed_offset,discard_until_lf,
+                    collector_epoch,cycle_seq,prefix_generation,prefix_sha256,
+                    fully_attributed_from_zero,token_baseline_known,last_model,last_model_context_kind,last_model_interval,
+                    previous_total,previous_input,previous_cached_input,previous_output
+                ) VALUES('unix:1:2',?1,'1','2',0,0,?2,'1',?3,?4,0,1,'gpt-6.1-sol','turn',?5,'20','12','2','8')",
+                params![format!("2026/10/interval-{index}.jsonl"),format!("{:032x}",1),format!("{:032x}",2),"a".repeat(64),interval]).unwrap();
+        }
+        let state = source.load_session_collection_state().unwrap();
+        let mut target = UsageStore::create_partitioned(&target_path, &identity).unwrap();
+        target
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: 0,
+                window_seconds: 0,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                samples: &[],
+                checkpoints: &state.checkpoints,
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        let readback = target
+            .connection
+            .prepare("SELECT last_model_interval FROM session_checkpoints ORDER BY relative_path")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(readback, expected.map(|v| v.map(str::to_owned)));
+        for invalid in [
+            "model:gpt-6-luna",
+            "model:",
+            "model: gpt-6.1-sol",
+            "model:gpt-6.1-sol\n",
+            "guessed",
+        ] {
+            if target
+                .connection
+                .execute(
+                    "UPDATE session_checkpoints SET last_model_interval=?1",
+                    [invalid],
+                )
+                .is_ok()
+            {
+                assert!(
+                    target.load_session_collection_state().is_err(),
+                    "invalid state was accepted: {invalid:?}"
+                );
+            }
+        }
+        drop(source);
+        drop(target);
+        cleanup(&path);
+        cleanup(&target_path);
+    }
+
+    #[test]
+    fn issue604_checkpoint_context_kind_survives_reload_and_new_generation() {
+        struct FixtureFiles(Vec<PathBuf>);
+        impl Drop for FixtureFiles {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    cleanup(path);
+                }
+            }
+        }
+        let source_path = database_path("issue604-context-kind-roundtrip-source");
+        let target_path = database_path("issue604-context-kind-roundtrip-target");
+        let _fixtures = FixtureFiles(vec![source_path.clone(), target_path.clone()]);
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "d".repeat(64),
+            storage_epoch: 61,
+            partition_id: "33".repeat(32),
+        };
+        let source = UsageStore::create_partitioned(&source_path, &identity).unwrap();
+        let expected = [
+            (Some("turn"), Some("gpt-6.1-sol")),
+            (Some("initial-settings"), Some("gpt-6-luna")),
+            (Some("none"), None),
+            (Some("unknown"), Some("SOL")),
+            (None, Some("LUNA")),
+        ];
+        for (index, (kind, label)) in expected.iter().enumerate() {
+            source.connection.execute(
+                "INSERT INTO session_checkpoints (
+                    root_identity,relative_path,file_device,file_inode,committed_offset,discard_until_lf,
+                    collector_epoch,cycle_seq,prefix_generation,prefix_sha256,
+                    fully_attributed_from_zero,token_baseline_known,last_model,last_model_context_kind,
+                    previous_total,previous_input,previous_cached_input,previous_output
+                 ) VALUES('unix:1:2',?1,'1','2',0,0,?2,'1',?3,?4,0,1,?5,?6,'20','12','2','8')",
+                params![format!("2026/10/context-kind-{index}.jsonl"),format!("{:032x}",1),
+                    format!("{:032x}",2),"a".repeat(64),label,kind],
+            ).unwrap();
+        }
+        let state = source.load_session_collection_state().unwrap();
+        let mut target = UsageStore::create_partitioned(&target_path, &identity).unwrap();
+        target
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: 0,
+                window_seconds: 0,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                samples: &[],
+                checkpoints: &state.checkpoints,
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        let rows = target
+            .connection
+            .prepare("SELECT last_model_context_kind,last_model FROM session_checkpoints ORDER BY relative_path")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            expected.iter().map(|(kind,label)| (kind.map(str::to_owned),label.map(str::to_owned))).collect::<Vec<_>>(),
+            "reload and a collection commit must retain context authority; legacy NULL stays unknown"
+        );
+    }
+
+    #[test]
+    fn issue604_model_context_kind_migrates_as_unknown_without_rewriting_the_old_label() {
+        let path = database_path("issue604-context-kind-schema");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "d".repeat(64),
+            storage_epoch: 61,
+            partition_id: "33".repeat(32),
+        };
+        let store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let shape: Option<(String, i64, Option<String>)> = store
+            .connection
+            .query_row(
+                "SELECT type,\"notnull\",dflt_value FROM pragma_table_info('session_checkpoints')
+             WHERE name='last_model_context_kind'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            shape,
+            Some(("TEXT".into(), 0, None)),
+            "an absent legacy context kind must remain unknown, not become initial settings"
+        );
+        store.connection.execute(
+            "INSERT INTO session_checkpoints (
+                root_identity,relative_path,file_device,file_inode,committed_offset,discard_until_lf,
+                collector_epoch,cycle_seq,prefix_generation,prefix_sha256,
+                fully_attributed_from_zero,token_baseline_known,last_model,
+                previous_total,previous_input,previous_cached_input,previous_output
+             ) VALUES('unix:1:2','2026/09/context-kind.jsonl','1','2',60,0,
+                ?1,'1',?2,?3,1,1,'SOL','20','12','2','8')",
+            params!["1".repeat(32),"2".repeat(32),"a".repeat(64)],
+        ).unwrap();
+        for allowed in ["none", "initial-settings", "turn", "unknown"] {
+            store
+                .connection
+                .execute(
+                    "UPDATE session_checkpoints SET last_model_context_kind=?1,last_model=?2",
+                    params![allowed, if allowed == "none" { None } else { Some("SOL") }],
+                )
+                .unwrap();
+        }
+        for invalid in ["", "initial", "TURN", "guessed"] {
+            assert!(store
+                .connection
+                .execute(
+                    "UPDATE session_checkpoints SET last_model_context_kind=?1",
+                    [invalid]
+                )
+                .is_err());
+        }
+        for (kind, label) in [
+            ("none", Some("SOL")),
+            ("turn", None),
+            ("initial-settings", None),
+        ] {
+            assert!(store
+                .connection
+                .execute(
+                    "UPDATE session_checkpoints SET last_model_context_kind=?1,last_model=?2",
+                    params![kind, label],
+                )
+                .is_err());
+        }
+        crate::tests::downgrade_qualification_fixture(&store.connection);
+        store
+            .connection
+            .execute_batch("PRAGMA user_version=15;")
+            .unwrap();
+        drop(store);
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        assert!(UsageStore::migrate_partition_history_after_verified_backup(
+            &path, &identity, &backup
+        )
+        .unwrap());
+        let migrated = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let retained: (String,String,String,String,String,Option<String>) = migrated.connection.query_row(
+            "SELECT last_model,previous_total,previous_input,previous_cached_input,previous_output,
+                last_model_context_kind FROM session_checkpoints",[],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).unwrap();
+        assert_eq!(
+            retained,
+            (
+                "SOL".into(),
+                "20".into(),
+                "12".into(),
+                "2".into(),
+                "8".into(),
+                None
+            )
+        );
+        assert!(
+            !UsageStore::migrate_partition_history_after_verified_backup(&path, &identity, &backup)
+                .unwrap()
+        );
+        drop(migrated);
+        fs::remove_file(path.with_extension("sqlite3.bak.1")).unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
     fn issue_362_session_checkpoint_schema_has_nullable_context_columns() {
         let path = database_path("issue-362-context-schema");
         let identity = StoragePartitionIdentity {
@@ -25927,13 +32220,16 @@ mod wave_b_correction_tests {
             token_baseline_known: true,
             history_base_pending: false,
             last_model: Some("SOL".into()),
+            last_model_context_kind: None,
+            last_model_interval: None,
+            source_admission: None,
             last_task_running: None,
             context_usage_tokens: Some(400),
             context_window_tokens: None,
-            previous_total: 20,
-            previous_input: 12,
-            previous_cached_input: 2,
-            previous_output: 8,
+            previous_total: Some(20),
+            previous_input: Some(12),
+            previous_cached_input: Some(2),
+            previous_output: Some(8),
         };
 
         store
@@ -25962,8 +32258,19 @@ mod wave_b_correction_tests {
 
     #[test]
     fn issue_362_checkpoint_schema_accepts_only_supported_legacy_shapes() {
+        struct FixturePath(PathBuf);
+        impl Drop for FixturePath {
+            fn drop(&mut self) {
+                if self.0.parent().is_some_and(Path::exists) {
+                    cleanup(&self.0);
+                }
+            }
+        }
         const SUPPORTED_VERSIONS: &[i64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         const SHAPE_MATRIX: &[(usize, &[i64])] = &[
+            (25, &[16]),
+            (24, &[]),
+            (23, &[]),
             (22, SUPPORTED_VERSIONS),
             (21, &[]),
             (20, SUPPORTED_VERSIONS),
@@ -25972,6 +32279,14 @@ mod wave_b_correction_tests {
             (17, &[0]),
         ];
         let set_version = |connection: &Connection, version: i64| {
+            if version < 16 {
+                crate::tests::downgrade_event_qualification_fixture(connection);
+            } else {
+                let present: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_events') WHERE name='admission_json')",[],|r|r.get(0)).unwrap();
+                if !present {
+                    connection.execute_batch("ALTER TABLE session_events ADD COLUMN reset_at INTEGER; ALTER TABLE session_events ADD COLUMN window_seconds INTEGER; ALTER TABLE session_events ADD COLUMN admission_json TEXT;").unwrap();
+                }
+            }
             if version < 15 {
                 connection
                     .execute_batch("DROP TABLE IF EXISTS session_quota_windows")
@@ -25987,6 +32302,7 @@ mod wave_b_correction_tests {
         };
 
         let path = database_path("issue-362-checkpoint-schema-matrix");
+        let _fixture = FixturePath(path.clone());
         let identity = StoragePartitionIdentity {
             schema_version: "codex-info-account-db-v1".to_owned(),
             profile_scope_id: "11".repeat(16),
@@ -26020,6 +32336,9 @@ mod wave_b_correction_tests {
             }
 
             let column_to_drop = match column_count {
+                25 => Some("source_admission"),
+                24 => Some("last_model_interval"),
+                23 => Some("last_model_context_kind"),
                 22 => Some("context_window_tokens"),
                 21 => Some("context_usage_tokens"),
                 20 => Some("history_base_pending"),
@@ -26041,6 +32360,7 @@ mod wave_b_correction_tests {
         cleanup(&path);
 
         let invalid_path = database_path("issue-362-checkpoint-schema-invalid");
+        let _invalid_fixture = FixturePath(invalid_path.clone());
         let invalid_identity = StoragePartitionIdentity {
             schema_version: "codex-info-account-db-v1".to_owned(),
             profile_scope_id: "11".repeat(16),
@@ -26116,6 +32436,8 @@ mod wave_b_correction_tests {
         let store = UsageStore::create_partitioned(&path, &identity).unwrap();
         drop(store);
         let connection = Connection::open(&path).unwrap();
+        crate::tests::downgrade_qualification_fixture(&connection);
+        connection.execute_batch("PRAGMA user_version=15;").unwrap();
         connection
             .execute(
                 "INSERT INTO session_checkpoints (
@@ -26186,6 +32508,12 @@ mod wave_b_correction_tests {
         );
         drop(unchanged);
 
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        assert!(UsageStore::migrate_partition_history_after_verified_backup(
+            &path, &identity, &backup
+        )
+        .unwrap());
         let store = UsageStore::open_partitioned(&path, &identity).unwrap();
         let checkpoint = store
             .load_session_collection_state()
@@ -26194,6 +32522,9 @@ mod wave_b_correction_tests {
             .remove(0);
         assert_eq!(checkpoint.context_usage_tokens, None);
         assert_eq!(checkpoint.context_window_tokens, None);
+        assert_eq!(checkpoint.last_model_context_kind, None);
+        drop(store);
+        fs::remove_file(path.with_extension("sqlite3.bak.1")).unwrap();
         cleanup(&path);
     }
 }

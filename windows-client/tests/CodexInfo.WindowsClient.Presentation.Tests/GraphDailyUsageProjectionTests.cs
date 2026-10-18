@@ -15,6 +15,32 @@ public sealed class GraphDailyUsageProjectionTests
     private const long SecondsPerDay = 86_400;
 
     [Theory]
+    [InlineData(GraphMetric.Tokens)]
+    [InlineData(GraphMetric.Dollars)]
+    public void Issue604ActualConfirmedPartialDailyUsageRetainsRecordedDelta(GraphMetric metric)
+    {
+        // Same recorded SOL minutes as the normal graph regression. Without
+        // a verified origin, only the observed day-local difference is known.
+        var day = Unix("2026-10-15T00:00:00Z");
+        const long reset = 1_792_655_864;
+        var period = Period("1792655864", 1_792_060_020, reset,
+            Sample(1_792_060_020, reset, Model("gpt-6.1-sol", 42_628_014, 8.926810399999999)) with { ModelsComplete = false },
+            Sample(1_792_060_080, reset, Model("gpt-6.1-sol", 43_329_949, 9.036842)) with { ModelsComplete = false },
+            Sample(1_792_060_140, reset, Model("gpt-6.1-sol", 43_329_949, 9.036842)) with { ModelsComplete = false }) with
+        {
+            OriginAt = null,
+        };
+
+        var scene = DailyScene(day, day + SecondsPerDay, metric, period);
+        var value = Row(scene, day, "SOL");
+
+        Assert.Equal(701_935UL, Value<ulong?>(value, "Tokens"));
+        Assert.Equal(0.1100316, Value<double?>(value, "Dollars")!.Value, precision: 10);
+        Assert.True(Value<bool>(value, "IsPartial"));
+        Assert.All(period.Samples, sample => Assert.False(sample.ModelsComplete));
+    }
+
+    [Theory]
     [InlineData(null, 40UL, 0.4)]
     [InlineData(-86_400L, 40UL, 0.4)]
     [InlineData(0L, 140UL, 1.4)]

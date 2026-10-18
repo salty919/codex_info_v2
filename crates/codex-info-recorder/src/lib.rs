@@ -9,20 +9,37 @@
 
 mod quota_journal;
 
-use chrono::{DateTime, Months, Utc};
+mod historical_worker;
+mod source_equivalence;
+use chrono::{DateTime, Utc};
+pub use codex_info::session_input::TokenSnapshot;
+use codex_info::session_input::{
+    ModelAttributionState, RecordRead, SessionJsonKey, SessionRecordSummary,
+};
 use codex_info::{security, thread_contract};
+use codex_info_db_writer::event_admission::{
+    CounterWitness, EventAdmission, EventOwnership, LegacyCounterProof, LegacyModelProof,
+    NumericEventProof,
+};
+use codex_info_db_writer::source_admission::{
+    ClassificationPointer, PendingResponse, RecordPointer, ResponseClassificationInput,
+    ResponseContext, ResponseModelClassification, SessionMetadata, SourceAccountBinding,
+    SourceAdmission, SourceBindingProof, StrongContext, UsageStream,
+};
 use codex_info_db_writer::{
-    finalize_session_timeline_recovery, session_event_is_replay, session_token_anchor_recovery_id,
-    ActiveThreadRecord, ActiveThreadSnapshot, QuotaTransition, RecordedSessionSource,
+    finalize_session_timeline_recovery, session_event_has_ambiguous_lineage,
+    session_event_is_replay, session_token_anchor_recovery_id, ActiveThreadRecord,
+    ActiveThreadSnapshot, LosslessSessionEvent, QuotaTransition, RecordedSessionSource,
     SessionCheckpoint, SessionCollectionCommit, SessionCollectionState, SessionEvent,
-    SessionEventReattribution, SessionLifecycleInterval, SessionModelTotal, SessionPendingRange,
-    SessionRange, SessionSourceCommitEvidence, SessionTaskEvent, SessionTaskEvidenceInput,
-    SessionTaskIndexedRange, SessionTimelineRecovery, SessionTimelineRecoveryPoint,
-    SessionTokenAnchor, SessionTokenAnchorRecovery, SessionTokenAnchorResolution,
-    StoragePartitionIdentity, UsageHistoryObservation, UsageHistorySample, UsageStore,
-    UsageStoreError, VerifiedPartitionBackup,
+    SessionLifecycleInterval, SessionModelContextKind, SessionModelInterval, SessionModelTotal,
+    SessionPendingRange, SessionRange, SessionSourceCommitEvidence, SessionTaskEvent,
+    SessionTaskEvidenceInput, SessionTaskIndexedRange, SessionTimelineRecovery,
+    SessionTimelineRecoveryPoint, SessionTokenAnchor, SessionTokenAnchorRecovery,
+    SessionTokenAnchorResolution, StoragePartitionIdentity, UsageHistoryObservation,
+    UsageHistorySample, UsageStore, UsageStoreError, VerifiedPartitionBackup,
 };
 use codex_info_pricing::{estimate_legacy, family, Usage as PricingUsage};
+pub use historical_worker::{BackgroundWork, PreparedHistoricalRepair};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,7 +47,7 @@ use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
@@ -60,11 +77,6 @@ const MAX_LOGIN_ID_SCALARS: usize = 254;
 const AUTH_FILE_NAME: &str = "auth.json";
 const MAX_AUTH_FILE_BYTES: usize = 64 * 1024;
 const MAX_ACCOUNT_ID_BYTES: usize = 512;
-// A currently open rollout can use the modern stream format, which has no
-// task_started/task_complete records.  Two recorder cycles cover the race in
-// which the durable scanner reaches EOF immediately before the thread poll.
-const OPEN_ROLLOUT_ACTIVITY_WINDOW: Duration =
-    Duration::from_secs(DEFAULT_INTERVAL_SECS.saturating_mul(2));
 const MAX_THREAD_ID_SCALARS: usize = 128;
 const MAX_TASK_BACKFILL_TARGETS: usize = 4_096;
 const MAX_RECORDER_STATE_BYTES: u64 = 64 * 1024;
@@ -574,12 +586,18 @@ impl Drop for QuotaPoller {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
+            let began = Instant::now();
+            eprintln!("codex-info-recorder diagnostic quota_drain start");
             worker.thread().unpark();
             // A normal process exit cannot abandon the response owned by
             // fetch_quota_snapshot, including a pending journal write.
             if worker.join().is_err() {
                 eprintln!("recorder degraded: quota worker terminated unexpectedly");
             }
+            eprintln!(
+                "codex-info-recorder diagnostic quota_drain finish elapsed_ms={}",
+                began.elapsed().as_millis()
+            );
         }
     }
 }
@@ -594,12 +612,29 @@ pub enum ActiveThreadPollResult {
         epoch: AccountEpochProof,
     },
     /// Reconcile the inventory before classifying an unadmitted active Session.
-    CheckpointMismatch,
+    CheckpointMismatch {
+        sources: Vec<RecordedSessionSource>,
+    },
     Failed(String),
 }
 
 enum ActiveThreadPollCommand {
     Probe { checkpoints: Vec<SessionCheckpoint> },
+}
+
+#[derive(Clone, Default)]
+struct LiveRolloutCache {
+    epoch: Option<AccountEpochProof>,
+    sources: BTreeMap<PathBuf, VerifiedLiveRollout>,
+}
+
+#[derive(Clone)]
+struct VerifiedLiveRollout {
+    device: u64,
+    inode: u64,
+    offset: u64,
+    prefix_hasher: Sha256,
+    parser: thread_contract::RolloutAccumulator,
 }
 
 /// Non-blocking bridge between the recorder cycle and live active-thread
@@ -620,8 +655,10 @@ impl ThreadPoller {
         let waiter = Arc::new(Mutex::new(None::<thread::Thread>));
         let worker_waiter = Arc::clone(&waiter);
         let worker = thread::spawn(move || {
+            let mut cache = LiveRolloutCache::default();
             while let Ok(ActiveThreadPollCommand::Probe { checkpoints }) = commands.recv() {
-                let result = collect_active_thread_snapshot(&sessions_root, &checkpoints);
+                let result =
+                    collect_active_thread_snapshot(&sessions_root, &checkpoints, &mut cache);
                 // Never let an app-server result block or back up the Session
                 // loop. A later cycle will request a fresh snapshot.
                 let _ = results.try_send(result);
@@ -705,6 +742,103 @@ pub enum CodexAuthenticationState {
     AuthRequired,
 }
 
+/// One owned stdio connection. Process qualification is checked after the
+/// initialize handshake (which may exec a launcher) and before admission.
+struct AppServerConnection {
+    child: Child,
+    input: ChildStdin,
+    output: Receiver<Result<String, String>>,
+    #[cfg(unix)]
+    process: LiveProcessSnapshot,
+}
+
+impl AppServerConnection {
+    #[cfg(unix)]
+    fn start(client: &str, deadline: Instant) -> Result<Self, String> {
+        let executable = resolve_codex_executable()?;
+        let mut child = Command::new(executable)
+            .args(["app-server", "--stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| "Codex app-server could not be started".to_owned())?;
+        let prepared = (|| {
+            let mut input = child
+                .stdin
+                .take()
+                .ok_or_else(|| "Codex app-server stdin unavailable".to_owned())?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "Codex app-server stdout unavailable".to_owned())?;
+            let output = app_server_reader(stdout);
+            request_app_server_before_deadline(
+                &mut input,
+                &output,
+                1,
+                "initialize",
+                json!({
+                    "clientInfo": {"name": client, "version": env!("CARGO_PKG_VERSION")},
+                    "capabilities": {"experimentalApi": true}
+                }),
+                deadline,
+            )?;
+            #[cfg(unix)]
+            let process = live_process_snapshot(Path::new("/proc"), child.id())?;
+            #[cfg(not(unix))]
+            return Err("RPC process identity is unavailable".to_owned());
+            #[cfg(unix)]
+            Ok((input, output, process))
+        })();
+        match prepared {
+            #[cfg(unix)]
+            Ok((input, output, process)) => Ok(Self {
+                child,
+                input,
+                output,
+                process,
+            }),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn start(_client: &str, _deadline: Instant) -> Result<Self, String> {
+        Err("RPC process identity is unavailable".to_owned())
+    }
+
+    fn validate_process(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        if live_process_snapshot(Path::new("/proc"), self.child.id())? == self.process {
+            return Ok(());
+        }
+        Err("Codex app-server process identity changed".to_owned())
+    }
+}
+
+impl Drop for AppServerConnection {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub fn confirm_codex_account(epoch: &AccountEpochProof, codex_home: &Path) -> Result<(), String> {
+    if !epoch.validate_current(codex_home) {
+        return Err("Codex account epoch changed before initial confirmation".to_owned());
+    }
+    let state = probe_codex_authentication_state()?;
+    if state != CodexAuthenticationState::Authenticated || !epoch.validate_current(codex_home) {
+        return Err("Codex account initial confirmation is unavailable".to_owned());
+    }
+    Ok(())
+}
+
 fn decode_codex_authentication_state(value: &Value) -> Result<CodexAuthenticationState, String> {
     let object = value
         .as_object()
@@ -715,7 +849,9 @@ fn decode_codex_authentication_state(value: &Value) -> Result<CodexAuthenticatio
         .ok_or_else(|| "Codex account response is invalid".to_owned())?;
     match object.get("account") {
         Some(Value::Null) if requires_openai_auth => Ok(CodexAuthenticationState::AuthRequired),
-        Some(Value::Object(_)) if !requires_openai_auth => {
+        // The provider may require OpenAI credentials while a fully
+        // authenticated ChatGPT account is already present.
+        Some(Value::Object(_)) => {
             decode_app_server_account(value)?;
             Ok(CodexAuthenticationState::Authenticated)
         }
@@ -727,63 +863,33 @@ fn decode_codex_authentication_state(value: &Value) -> Result<CodexAuthenticatio
 /// app-server process. A missing local auth file is never enough to claim
 /// logout: both reads must independently report the auth-required shape.
 pub fn probe_codex_authentication_state() -> Result<CodexAuthenticationState, String> {
-    let executable = resolve_codex_executable()?;
-    let mut child = Command::new(executable)
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "Codex app-server could not be started".to_owned())?;
-    let Some(mut input) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex app-server stdin is unavailable".to_owned());
-    };
-    let Some(stdout) = child.stdout.take() else {
-        drop(input);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex app-server stdout is unavailable".to_owned());
-    };
-    let output = app_server_reader(stdout);
-    let result = (|| {
-        request_app_server(
-            &mut input,
-            &output,
-            1,
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "codex-info-recorder-auth-probe",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": {"experimentalApi": true}
-            }),
-        )?;
-        let before = decode_codex_authentication_state(&request_app_server(
-            &mut input,
-            &output,
-            2,
-            "account/read",
-            json!({}),
-        )?)?;
-        let after = decode_codex_authentication_state(&request_app_server(
-            &mut input,
-            &output,
-            3,
-            "account/read",
-            json!({}),
-        )?)?;
-        if before != after {
-            return Err("Codex account identity changed during auth probe".to_owned());
-        }
-        Ok(before)
-    })();
-    drop(input);
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+    let mut connection = AppServerConnection::start(
+        "codex-info-recorder-auth-probe",
+        Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+    )?;
+    let before = request_app_server(
+        &mut connection.input,
+        &connection.output,
+        2,
+        "account/read",
+        json!({}),
+    )?;
+    let after = request_app_server(
+        &mut connection.input,
+        &connection.output,
+        3,
+        "account/read",
+        json!({}),
+    )?;
+    let state = decode_codex_authentication_state(&before)?;
+    if state != decode_codex_authentication_state(&after)?
+        || state == CodexAuthenticationState::Authenticated
+            && decode_app_server_account(&before)? != decode_app_server_account(&after)?
+    {
+        return Err("Codex account identity changed during auth probe".to_owned());
+    }
+    connection.validate_process()?;
+    Ok(state)
 }
 
 /// One authenticated app-server collection window.  The local auth key,
@@ -1103,46 +1209,23 @@ fn fetch_quota_snapshot(notifications: &SyncSender<QuotaPollResult>) -> QuotaPol
     getrandom::fill(&mut receipt_id)
         .map_err(|_| "quota acquisition identity could not be allocated".to_owned())?;
     let receipt_id = hex_digest(&receipt_id);
-    let executable = resolve_codex_executable()?;
-    let mut child = Command::new(executable)
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "Codex app-server could not be started".to_owned())?;
-    let Some(mut input) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex app-server stdin is unavailable".to_owned());
-    };
-    let Some(stdout) = child.stdout.take() else {
-        drop(input);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err("Codex app-server stdout is unavailable".to_owned());
-    };
-    let output = app_server_reader(stdout);
-    let result = (|| {
-        request_app_server(
-            &mut input,
-            &output,
-            1,
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "codex-info-recorder",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": {"experimentalApi": true}
-            }),
+    let mut connection = AppServerConnection::start(
+        "codex-info-recorder",
+        Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+    )?;
+    (|| {
+        let account_value = request_app_server(
+            &mut connection.input,
+            &connection.output,
+            2,
+            "account/read",
+            json!({}),
         )?;
-        let account_value = request_app_server(&mut input, &output, 2, "account/read", json!({}))?;
         let account = decode_app_server_account(&account_value)?;
         let identity = AccountIdentityWindow::new(authority_before.clone(), account.clone());
         let rate_limits = request_app_server(
-            &mut input,
-            &output,
+            &mut connection.input,
+            &connection.output,
             3,
             "account/rateLimits/read",
             Value::Null,
@@ -1157,8 +1240,13 @@ fn fetch_quota_snapshot(notifications: &SyncSender<QuotaPollResult>) -> QuotaPol
         // This stack frame owns the response until durable commit. Failure
         // reports health but does not fetch a newer value or discard this one.
         persist_quota_receipt(&receipt, &data_root, false, notifications);
-        let account_recheck =
-            request_app_server(&mut input, &output, 4, "account/read", json!({}))?;
+        let account_recheck = request_app_server(
+            &mut connection.input,
+            &connection.output,
+            4,
+            "account/read",
+            json!({}),
+        )?;
         let account_after = decode_app_server_account(&account_recheck)?;
         let authority_after = read_account_authority(&default_codex_home())
             .map_err(|_| "Codex account identity changed during quota read".to_owned())?;
@@ -1169,26 +1257,17 @@ fn fetch_quota_snapshot(notifications: &SyncSender<QuotaPollResult>) -> QuotaPol
         if !identity.is_stable(&authority_after, &account_after) {
             return Err("Codex account identity changed during quota read".to_owned());
         }
+        connection.validate_process()?;
         let epoch = AccountEpochProof::from_verified_authority(authority_after)?;
         persist_quota_receipt(&receipt, &data_root, true, notifications);
-        let snapshot = parse_app_server_quota(&rate_limits, &account.plan_type)
-            .ok()
-            .map(|mut snapshot| {
-                snapshot.observed_at = receipt.observed_at;
-                snapshot
-            });
+        let snapshot =
+            interpret_official_quota(&rate_limits, &account.plan_type, receipt.observed_at).ok();
         Ok(QuotaPollSuccess {
             snapshot,
             login_id: account.email,
             epoch,
         })
-    })();
-    drop(input);
-    // The recorder owns this short-lived app-server connection. Reap it on
-    // every path so a quota outage cannot leak one process per cycle.
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+    })()
 }
 
 fn persist_quota_receipt(
@@ -1343,7 +1422,7 @@ fn request_app_server_before_deadline(
             Ok(Ok(line)) => line,
             Ok(Err(error)) => return Err(error),
             Err(RecvTimeoutError::Timeout) => {
-                return Err("Codex app-server response timed out".to_owned())
+                return Err("Codex app-server response timed out".to_owned());
             }
             Err(RecvTimeoutError::Disconnected) => return Err("Codex app-server exited".to_owned()),
         };
@@ -1376,22 +1455,51 @@ fn request_app_server_before_deadline(
 fn collect_active_thread_snapshot(
     sessions_root: &Path,
     checkpoints: &[SessionCheckpoint],
+    cache: &mut LiveRolloutCache,
 ) -> ActiveThreadPollResult {
-    let (sessions_root, active_paths) = match active_thread_paths(sessions_root) {
+    let (sessions_root, owners_before) = match active_thread_paths(sessions_root) {
         Ok(value) => value,
         Err(error) => return ActiveThreadPollResult::Failed(error),
     };
-    collect_active_thread_snapshot_from_paths(&sessions_root, &active_paths, checkpoints)
+    let active_paths = owners_before.keys().cloned().collect();
+    let mut next_cache = cache.clone();
+    let result = collect_active_thread_snapshot_from_paths(
+        &sessions_root,
+        &active_paths,
+        checkpoints,
+        &mut next_cache,
+    );
+    #[cfg(unix)]
+    match open_codex_session_paths(Path::new("/proc"), &sessions_root) {
+        Ok(owners_after) if owners_after == owners_before => {}
+        _ => {
+            return ActiveThreadPollResult::Failed(
+                "active process owner changed during cycle".to_owned(),
+            );
+        }
+    }
+    if matches!(
+        result,
+        ActiveThreadPollResult::Snapshot { .. } | ActiveThreadPollResult::Empty { .. }
+    ) {
+        *cache = next_cache;
+    }
+    result
 }
 
 fn collect_active_thread_snapshot_from_paths(
     sessions_root: &Path,
     active_paths: &BTreeSet<PathBuf>,
     checkpoints: &[SessionCheckpoint],
+    cache: &mut LiveRolloutCache,
 ) -> ActiveThreadPollResult {
     if active_paths.is_empty() {
         return match AccountEpochProof::capture(&default_codex_home()) {
-            Ok(epoch) => ActiveThreadPollResult::Empty { epoch },
+            Ok(epoch) => {
+                cache.sources.clear();
+                cache.epoch = Some(epoch.clone());
+                ActiveThreadPollResult::Empty { epoch }
+            }
             Err(error) => ActiveThreadPollResult::Failed(error),
         };
     }
@@ -1401,22 +1509,26 @@ fn collect_active_thread_snapshot_from_paths(
         Err(_) => return ActiveThreadPollResult::Failed("session root stat failed".to_owned()),
     };
     let root_identity = root_identity(sessions_root, &root_metadata);
-    let mut candidates = Vec::with_capacity(active_paths.len());
+    let mut admitted_paths = Vec::with_capacity(active_paths.len());
+    let mut missing = Vec::new();
+    let mut missing_sources = Vec::new();
     for path in active_paths.iter().cloned() {
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
-                return ActiveThreadPollResult::Failed("active session disappeared".to_owned())
+                return ActiveThreadPollResult::Failed("active session disappeared".to_owned());
             }
         };
-        let relative_path = match path.strip_prefix(sessions_root) {
-            Ok(relative) if !relative.as_os_str().is_empty() => {
-                relative.to_string_lossy().replace('\\', "/")
-            }
+        let relative_path = match path
+            .strip_prefix(sessions_root)
+            .ok()
+            .and_then(relative_source_key)
+        {
+            Some(relative) => relative,
             _ => {
                 return ActiveThreadPollResult::Failed(
-                    "active session path escaped root".to_owned(),
-                )
+                    "active session relative path rejected".to_owned(),
+                );
             }
         };
         let Some(checkpoint) = checkpoints.iter().find(|checkpoint| {
@@ -1425,73 +1537,65 @@ fn collect_active_thread_snapshot_from_paths(
                 && checkpoint.file_device == file_device(&metadata)
                 && checkpoint.file_inode == file_inode(&metadata)
         }) else {
-            // The inventory may predate this active Session. Only the guarded
-            // collector can admit it; never read uncheckpointed rollout data
-            // or publish a partial/empty thread snapshot here.
-            return ActiveThreadPollResult::CheckpointMismatch;
+            let path_key = json!([root_identity, relative_path]);
+            let physical_key = json!([
+                root_identity,
+                relative_path,
+                file_device(&metadata).to_string(),
+                file_inode(&metadata).to_string()
+            ]);
+            missing.push(json!({
+                "path_key_sha256":hex_bytes(Sha256::digest(path_key.to_string().as_bytes()).as_slice()),
+                "physical_key_sha256":hex_bytes(Sha256::digest(physical_key.to_string().as_bytes()).as_slice()),
+                "file_bytes":metadata.len().to_string(),
+                "root_checkpoint_count":checkpoints.iter().filter(|checkpoint| checkpoint.root_identity==root_identity).count(),
+                "path_checkpoint_count":checkpoints.iter().filter(|checkpoint| checkpoint.root_identity==root_identity && checkpoint.relative_path==relative_path).count(),
+            }));
+            missing_sources.push(recorded_source(
+                root_identity.clone(),
+                relative_path,
+                metadata,
+            ));
+            continue;
         };
-        let thread_id = match read_session_meta_id(sessions_root, &path, &metadata) {
+        admitted_paths.push((path, metadata, checkpoint.clone()));
+    }
+    if !missing.is_empty() {
+        // A complete metadata pass identifies every missing current-account
+        // checkpoint without reading Session bodies or exposing paths/IDs.
+        // Only the guarded collector can admit these candidates; the poller
+        // retains the old snapshot until its normal reconciliation succeeds.
+        eprintln!(
+            "codex-info-recorder active-thread checkpoint coverage {}",
+            json!({"active_paths":active_paths.len(),"checkpoint_matches":admitted_paths.len(),"missing":missing})
+        );
+        return ActiveThreadPollResult::CheckpointMismatch {
+            sources: missing_sources,
+        };
+    }
+    let deadline = Instant::now() + APP_SERVER_RESPONSE_TIMEOUT;
+    let mut candidates = Vec::with_capacity(admitted_paths.len());
+    for (path, metadata, checkpoint) in admitted_paths {
+        let thread_id = match read_session_meta_id(sessions_root, &path, &metadata, deadline) {
             Ok(id) => id,
             Err(error) => return ActiveThreadPollResult::Failed(error),
         };
-        candidates.push((path, metadata, thread_id, checkpoint.clone()));
+        candidates.push((path, metadata, thread_id, checkpoint));
     }
 
-    let deadline = Instant::now() + APP_SERVER_RESPONSE_TIMEOUT;
-    let executable = match resolve_codex_executable() {
-        Ok(path) => path,
-        Err(_) => {
-            return ActiveThreadPollResult::Failed(
-                "Codex app-server executable unavailable".to_owned(),
-            )
-        }
-    };
     let authority_before = match read_account_authority(&default_codex_home()) {
         Ok(authority) => authority,
         Err(error) => return ActiveThreadPollResult::Failed(error),
     };
-    let mut child = match Command::new(executable)
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => {
-            return ActiveThreadPollResult::Failed("Codex app-server start failed".to_owned())
-        }
-    };
-    let Some(mut input) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return ActiveThreadPollResult::Failed("Codex app-server stdin unavailable".to_owned());
-    };
-    let Some(stdout) = child.stdout.take() else {
-        drop(input);
-        let _ = child.kill();
-        let _ = child.wait();
-        return ActiveThreadPollResult::Failed("Codex app-server stdout unavailable".to_owned());
-    };
-    let output = app_server_reader(stdout);
+    let mut connection =
+        match AppServerConnection::start("codex-info-recorder-thread-poller", deadline) {
+            Ok(connection) => connection,
+            Err(error) => return ActiveThreadPollResult::Failed(error),
+        };
     let result = (|| {
-        request_app_server_before_deadline(
-            &mut input,
-            &output,
-            1,
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "codex-info-recorder-thread-poller",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": {"experimentalApi": true}
-            }),
-            deadline,
-        )?;
         let account_value = request_app_server_before_deadline(
-            &mut input,
-            &output,
+            &mut connection.input,
+            &connection.output,
             2,
             "account/read",
             json!({}),
@@ -1499,19 +1603,31 @@ fn collect_active_thread_snapshot_from_paths(
         )?;
         let account = decode_app_server_account(&account_value)?;
         let identity = AccountIdentityWindow::new(authority_before.clone(), account);
+        let epoch_before = AccountEpochProof::from_verified_authority(authority_before.clone())?;
+        let mut next_cache = cache.clone();
+        if next_cache.epoch.as_ref() != Some(&epoch_before) {
+            next_cache.sources.clear();
+        }
+        next_cache.epoch = Some(epoch_before.clone());
         let mut next_request_id = 3_u64;
         let mut seen_ids = BTreeSet::new();
         let mut rollouts = BTreeMap::new();
         let mut thread_items = Vec::with_capacity(candidates.len());
-        for (path, metadata, thread_id, checkpoint) in &candidates {
-            let rollout = read_active_rollout(sessions_root, path, metadata, checkpoint)?;
+        for (path, metadata, thread_id, _) in &candidates {
+            let rollout = read_active_rollout(
+                sessions_root,
+                path,
+                metadata,
+                &mut next_cache.sources,
+                deadline,
+            )?;
             let request_id = next_request_id;
             next_request_id = next_request_id
                 .checked_add(1)
                 .ok_or_else(|| "thread request id exhausted".to_owned())?;
             let result = request_app_server_before_deadline(
-                &mut input,
-                &output,
+                &mut connection.input,
+                &connection.output,
                 request_id,
                 "thread/read",
                 json!({"threadId": thread_id, "includeTurns": false}),
@@ -1542,8 +1658,8 @@ fn collect_active_thread_snapshot_from_paths(
             thread_items.push(thread_item.clone());
         }
         let account_recheck = request_app_server_before_deadline(
-            &mut input,
-            &output,
+            &mut connection.input,
+            &connection.output,
             next_request_id,
             "account/read",
             json!({}),
@@ -1559,7 +1675,11 @@ fn collect_active_thread_snapshot_from_paths(
         if !identity.is_stable(&authority_after, &account_after) {
             return Err("Codex account identity changed during thread read".to_owned());
         }
+        connection.validate_process()?;
         let epoch = AccountEpochProof::from_verified_authority(authority_after)?;
+        if epoch != epoch_before {
+            return Err("Codex account epoch changed during thread read".to_owned());
+        }
         let mut accumulator = thread_contract::ThreadCycleAccumulator::new();
         accumulator
             .accept_page(&json!({"data": thread_items}))
@@ -1584,9 +1704,12 @@ fn collect_active_thread_snapshot_from_paths(
             thread_contract::ThreadCycleOutcome::Snapshots(snapshots) => snapshots,
             thread_contract::ThreadCycleOutcome::NoThread => Vec::new(),
             thread_contract::ThreadCycleOutcome::CycleError => {
-                return Err("active thread cycle rejected".to_owned())
+                return Err("active thread cycle rejected".to_owned());
             }
         };
+        next_cache
+            .sources
+            .retain(|path, _| active_paths.contains(path));
         Ok((
             snapshots
                 .into_iter()
@@ -1608,30 +1731,56 @@ fn collect_active_thread_snapshot_from_paths(
                 })
                 .collect::<Vec<_>>(),
             epoch,
+            next_cache,
         ))
     })();
-    drop(input);
-    let _ = child.kill();
-    let _ = child.wait();
     match result {
-        Ok((threads, epoch)) if threads.is_empty() => ActiveThreadPollResult::Empty { epoch },
-        Ok((threads, epoch)) => ActiveThreadPollResult::Snapshot {
-            snapshot: ActiveThreadSnapshot {
-                observed_at: Utc::now().timestamp(),
-                threads,
-            },
-            epoch,
-        },
+        Ok((threads, epoch, next_cache)) => {
+            *cache = next_cache;
+            if threads.is_empty() {
+                ActiveThreadPollResult::Empty { epoch }
+            } else {
+                ActiveThreadPollResult::Snapshot {
+                    snapshot: ActiveThreadSnapshot {
+                        observed_at: Utc::now().timestamp(),
+                        threads,
+                    },
+                    epoch,
+                }
+            }
+        }
         Err(error) => ActiveThreadPollResult::Failed(error),
     }
+}
+
+fn active_rollout_deadline_error(
+    stage: &'static str,
+    file_bytes: Option<u64>,
+    parse_start_offset: Option<u64>,
+    suffix_read_bytes: u64,
+) -> String {
+    format!(
+        "active rollout deadline exceeded: {}",
+        json!({
+            "schema":"codex-info-live-rollout-deadline-v1",
+            "stage":stage,
+            "file_bytes":file_bytes,
+            "parse_start_offset":parse_start_offset,
+            "suffix_read_bytes":suffix_read_bytes,
+        })
+    )
 }
 
 fn read_active_rollout(
     sessions_root: &Path,
     expected_path: &Path,
     expected_metadata: &Metadata,
-    checkpoint: &SessionCheckpoint,
+    cache: &mut BTreeMap<PathBuf, VerifiedLiveRollout>,
+    deadline: Instant,
 ) -> Result<thread_contract::ValidatedRollout, String> {
+    if Instant::now() >= deadline {
+        return Err(active_rollout_deadline_error("entry", None, None, 0));
+    }
     let canonical = security::canonical_regular_file_under(sessions_root, expected_path)
         .map_err(|_| "active rollout path rejected".to_owned())?;
     if canonical != expected_path {
@@ -1652,180 +1801,179 @@ fn read_active_rollout(
         return Err("active rollout identity rejected".to_owned());
     }
     let snapshot_len = before_file.len();
-    let checkpoint_offset = checkpoint.committed_offset;
-    if checkpoint_offset > snapshot_len {
-        return Err("active rollout checkpoint is ahead of file".to_owned());
-    }
-    let parse_start = if checkpoint.discard_until_lf {
-        match first_rollout_newline_end(&mut file, checkpoint_offset, snapshot_len)? {
-            Some(offset) => offset,
-            None => checkpoint_offset,
+    if snapshot_len > 0 {
+        let mut input = thread_contract::LiveRolloutReader::new(&mut file, deadline);
+        input
+            .seek(SeekFrom::Start(snapshot_len - 1))
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::TimedOut {
+                    active_rollout_deadline_error("tail", Some(snapshot_len), None, 0)
+                } else {
+                    "active rollout seek failed".to_owned()
+                }
+            })?;
+        let mut last = [0_u8; 1];
+        input.read_exact(&mut last).map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                active_rollout_deadline_error("tail", Some(snapshot_len), None, 0)
+            } else {
+                "active rollout tail read failed".to_owned()
+            }
+        })?;
+        if last != *b"\n" {
+            return Err("active rollout tail is incomplete".to_owned());
         }
-    } else {
-        checkpoint_offset
-    };
-    let complete_len = if parse_start == checkpoint_offset && checkpoint.discard_until_lf {
-        parse_start
-    } else {
-        complete_rollout_range_end(&mut file, parse_start, snapshot_len)?
-    };
-    let modified_age = expected_metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.elapsed().ok());
-    let running_seed = open_rollout_running_seed(
-        checkpoint.last_task_running,
-        checkpoint.last_model.is_some(),
-        complete_len > parse_start,
-        modified_age,
-    );
-    let mut parser = thread_contract::RolloutAccumulator::seeded_with_context(
-        checkpoint.last_model.clone(),
-        checkpoint.previous_total,
-        running_seed,
-        checkpoint.context_usage_tokens,
-        checkpoint.context_window_tokens,
-    );
-    if complete_len > parse_start {
-        file.seek(SeekFrom::Start(parse_start))
-            .map_err(|_| "active rollout seek failed".to_owned())?;
-        let appended_len = complete_len
-            .checked_sub(parse_start)
-            .ok_or_else(|| "active rollout offset underflow".to_owned())?;
-        let mut reader = BufReader::new((&mut file).take(appended_len));
-        parser
-            .apply_reader(&mut reader, appended_len)
-            .map_err(|_| "active rollout parse rejected".to_owned())?;
     }
-    let snapshot = parser
+    let mut verified = VerifiedLiveRollout {
+        device: file_device(&before_file),
+        inode: file_inode(&before_file),
+        offset: 0,
+        prefix_hasher: Sha256::new(),
+        parser: thread_contract::RolloutAccumulator::new(),
+    };
+    if let Some(prior) = cache.get(&canonical).filter(|prior| {
+        prior.device == verified.device
+            && prior.inode == verified.inode
+            && prior.offset <= snapshot_len
+    }) {
+        let actual = sha256_open_file_range(
+            &mut thread_contract::LiveRolloutReader::new(&mut file, deadline),
+            0,
+            prior.offset,
+        )
+        .map_err(|error| {
+            if matches!(&error, RecorderError::Io(error) if error.kind() == io::ErrorKind::TimedOut)
+            {
+                active_rollout_deadline_error(
+                    "cached-prefix",
+                    Some(snapshot_len),
+                    Some(prior.offset),
+                    0,
+                )
+            } else {
+                "active rollout prefix read failed".to_owned()
+            }
+        })?;
+        let expected = hex_digest(prior.prefix_hasher.clone().finalize().as_slice());
+        if actual == expected {
+            verified = prior.clone();
+        }
+    }
+    let suffix_len = snapshot_len - verified.offset;
+    let parse_start_offset = verified.offset;
+    file.seek(SeekFrom::Start(verified.offset))
+        .map_err(|_| "active rollout seek failed".to_owned())?;
+    let mut reader = SourceReader::new(BufReader::new((&mut file).take(suffix_len)));
+    reader.hasher = verified.prefix_hasher.clone();
+    let mut rejection = None;
+    verified
+        .parser
+        .apply_live_reader_diagnosed(&mut reader, suffix_len, deadline, &mut rejection)
+        .map_err(|error| {
+            if error == thread_contract::RolloutError::DeadlineExceeded {
+                active_rollout_deadline_error(
+                    "parse",
+                    Some(snapshot_len),
+                    Some(parse_start_offset),
+                    reader.consumed,
+                )
+            } else {
+                let keys = fs::symlink_metadata(sessions_root)
+                    .ok()
+                    .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                    .and_then(|metadata| {
+                        let root = root_identity(sessions_root, &metadata);
+                        let relative = canonical
+                            .strip_prefix(sessions_root)
+                            .ok()
+                            .and_then(relative_source_key)?;
+                        let path = json!([root, relative]);
+                        let physical = json!([
+                            root,
+                            relative,
+                            file_device(&before_file).to_string(),
+                            file_inode(&before_file).to_string()
+                        ]);
+                        Some((
+                            hex_bytes(Sha256::digest(path.to_string().as_bytes()).as_slice()),
+                            hex_bytes(Sha256::digest(physical.to_string().as_bytes()).as_slice()),
+                        ))
+                    });
+                let (path_key, physical_key) = keys
+                    .map(|(path, physical)| (Some(path), Some(physical)))
+                    .unwrap_or_default();
+                format!(
+                    "active rollout parse rejected: {}",
+                    json!({
+                        "schema":"codex-info-live-rollout-rejection-v1",
+                        "path_key_sha256":path_key,
+                        "physical_key_sha256":physical_key,
+                        "file_bytes":snapshot_len,
+                        "parse_start_offset":verified.offset,
+                        "error":error.message(),
+                        "rejection":rejection,
+                    })
+                )
+            }
+        })?;
+    if !reader.valid || reader.consumed != suffix_len {
+        return Err("active rollout consumed range rejected".to_owned());
+    }
+    verified.prefix_hasher = reader.hasher;
+    verified.offset = snapshot_len;
+    let snapshot = verified
+        .parser
         .snapshot()
         .map_err(|_| "active rollout state rejected".to_owned())?;
+    let expected = hex_digest(verified.prefix_hasher.clone().finalize().as_slice());
+    let actual = sha256_open_file_range(
+        &mut thread_contract::LiveRolloutReader::new(&mut file, deadline),
+        0,
+        snapshot_len,
+    )
+    .map_err(|error| {
+        if matches!(&error, RecorderError::Io(error) if error.kind() == io::ErrorKind::TimedOut) {
+            active_rollout_deadline_error(
+                "final-prefix",
+                Some(snapshot_len),
+                Some(parse_start_offset),
+                suffix_len,
+            )
+        } else {
+            "active rollout source recheck failed".to_owned()
+        }
+    })?;
     let after_file = file
         .metadata()
         .map_err(|_| "active rollout post-stat failed".to_owned())?;
     let after_path = fs::symlink_metadata(&canonical)
         .map_err(|_| "active rollout path post-stat failed".to_owned())?;
-    if !same_file_identity(&before_file, &after_file)
+    if actual != expected
+        || after_path.file_type().is_symlink()
+        || !after_path.is_file()
+        || !same_file_identity(&before_file, &after_file)
         || !same_file_identity(&after_file, &after_path)
-        || after_file.len() < before_file.len()
+        || after_file.len() < snapshot_len
     {
         return Err("active rollout changed during read".to_owned());
     }
+    if Instant::now() >= deadline {
+        return Err(active_rollout_deadline_error(
+            "complete",
+            Some(snapshot_len),
+            Some(parse_start_offset),
+            suffix_len,
+        ));
+    }
+    cache.insert(canonical, verified);
     Ok(snapshot)
-}
-
-fn open_rollout_running_seed(
-    recorded: Option<bool>,
-    has_model: bool,
-    has_uncommitted_records: bool,
-    modified_age: Option<Duration>,
-) -> Option<bool> {
-    match recorded {
-        // Explicit task lifecycle evidence always wins, including a recent
-        // post-completion bookkeeping write.
-        Some(value) => Some(value),
-        None if has_model
-            && (has_uncommitted_records
-                || modified_age.is_some_and(|age| age <= OPEN_ROLLOUT_ACTIVITY_WINDOW)) =>
-        {
-            // The path is already proven open by a live Codex process. Model
-            // evidence excludes metadata-only files; recency bridges only the
-            // scanner/thread-poller EOF race.
-            Some(true)
-        }
-        None => None,
-    }
-}
-
-fn first_rollout_newline_end(
-    file: &mut File,
-    start_offset: u64,
-    snapshot_len: u64,
-) -> Result<Option<u64>, String> {
-    file.seek(SeekFrom::Start(start_offset))
-        .map_err(|_| "active rollout seek failed".to_owned())?;
-    let mut reader = BufReader::new(&mut *file);
-    let mut observed = start_offset;
-    loop {
-        let buffer = reader
-            .fill_buf()
-            .map_err(|_| "active rollout read failed".to_owned())?;
-        if buffer.is_empty() {
-            break;
-        }
-        if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-            let consumed = u64::try_from(position)
-                .ok()
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
-            observed = observed
-                .checked_add(consumed)
-                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
-            reader.consume(position + 1);
-            return Ok((observed <= snapshot_len).then_some(observed));
-        } else {
-            let consumed = u64::try_from(buffer.len())
-                .map_err(|_| "active rollout offset overflow".to_owned())?;
-            let buffer_len = buffer.len();
-            observed = observed
-                .checked_add(consumed)
-                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
-            reader.consume(buffer_len);
-        }
-        if observed >= snapshot_len {
-            break;
-        }
-    }
-    Ok(None)
-}
-
-fn complete_rollout_range_end(
-    file: &mut File,
-    start_offset: u64,
-    snapshot_len: u64,
-) -> Result<u64, String> {
-    file.seek(SeekFrom::Start(start_offset))
-        .map_err(|_| "active rollout seek failed".to_owned())?;
-    let mut reader = BufReader::new(&mut *file);
-    let mut observed = start_offset;
-    let mut complete = start_offset;
-    loop {
-        let buffer = reader
-            .fill_buf()
-            .map_err(|_| "active rollout read failed".to_owned())?;
-        if buffer.is_empty() {
-            break;
-        }
-        if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-            let consumed = u64::try_from(position)
-                .ok()
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
-            observed = observed
-                .checked_add(consumed)
-                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
-            reader.consume(position + 1);
-            complete = observed;
-        } else {
-            let consumed = u64::try_from(buffer.len())
-                .map_err(|_| "active rollout offset overflow".to_owned())?;
-            let buffer_len = buffer.len();
-            observed = observed
-                .checked_add(consumed)
-                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
-            reader.consume(buffer_len);
-        }
-        if observed >= snapshot_len {
-            break;
-        }
-    }
-    Ok(complete.min(snapshot_len))
 }
 
 fn read_session_meta_id(
     sessions_root: &Path,
     path: &Path,
     expected_metadata: &Metadata,
+    deadline: Instant,
 ) -> Result<String, String> {
     let canonical = canonical_session_file(sessions_root, path)
         .ok_or_else(|| "session_meta path rejected".to_owned())?;
@@ -1842,7 +1990,10 @@ fn read_session_meta_id(
         return Err("session_meta identity mismatch".to_owned());
     }
     let line = read_bounded_rpc_line(&mut BufReader::new(
-        (&mut file).take(APP_SERVER_MAX_LINE_BYTES as u64 + 1),
+        thread_contract::LiveRolloutReader::new(
+            (&mut file).take(APP_SERVER_MAX_LINE_BYTES as u64 + 1),
+            deadline,
+        ),
     ))?
     .ok_or_else(|| "session_meta is empty".to_owned())?;
     let value: Value =
@@ -1878,11 +2029,22 @@ fn read_session_meta_id(
     Ok(id)
 }
 
-fn active_thread_paths(sessions_root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), String> {
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct LiveProcessSnapshot {
+    pid: u32,
+    parent: u32,
+    starttime: u64,
+    uid: u32,
+    executable: Option<(PathBuf, u64, u64)>,
+}
+
+type ActivePathOwners = BTreeMap<PathBuf, BTreeSet<Vec<LiveProcessSnapshot>>>;
+
+fn active_thread_paths(sessions_root: &Path) -> Result<(PathBuf, ActivePathOwners), String> {
     #[cfg(not(unix))]
     {
         let _ = sessions_root;
-        return Err("active session process inventory unavailable".to_owned());
+        Err("active session process inventory unavailable".to_owned())
     }
     #[cfg(unix)]
     {
@@ -1900,79 +2062,441 @@ fn active_thread_paths(sessions_root: &Path) -> Result<(PathBuf, BTreeSet<PathBu
 }
 
 #[cfg(unix)]
+fn bounded_process_bytes(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+        .map_err(|_| "process input read failed".to_owned())?;
+    if bytes.len() as u64 > limit {
+        return Err("process input limit exceeded".to_owned());
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn live_process_snapshot(proc_root: &Path, pid: u32) -> Result<LiveProcessSnapshot, String> {
+    let process = proc_root.join(pid.to_string());
+    let before =
+        fs::symlink_metadata(&process).map_err(|_| "process owner unavailable".to_owned())?;
+    if !before.is_dir() || before.file_type().is_symlink() {
+        return Err("process directory rejected".to_owned());
+    }
+    let bytes = bounded_process_bytes(&process.join("stat"), 64 * 1024)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "process stat rejected".to_owned())?;
+    let (pid_text, _) = text
+        .split_once(" (")
+        .ok_or_else(|| "process stat rejected".to_owned())?;
+    if pid_text.parse::<u32>().ok() != Some(pid) {
+        return Err("process stat identity differs".to_owned());
+    }
+    let end = text
+        .rfind(')')
+        .ok_or_else(|| "process stat rejected".to_owned())?;
+    let fields: Vec<_> = text[end + 1..].split_ascii_whitespace().collect();
+    let parent = fields
+        .get(1)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| "process parent rejected".to_owned())?;
+    let starttime = fields
+        .get(19)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| "process starttime rejected".to_owned())?;
+    let executable = if before.uid() == rustix::process::geteuid().as_raw() {
+        let path = fs::read_link(process.join("exe"))
+            .map_err(|_| "process executable unavailable".to_owned())?;
+        let metadata = fs::metadata(process.join("exe"))
+            .map_err(|_| "process executable identity unavailable".to_owned())?;
+        Some((path, metadata.dev(), metadata.ino()))
+    } else {
+        None
+    };
+    let after =
+        fs::symlink_metadata(&process).map_err(|_| "process owner disappeared".to_owned())?;
+    if before.uid() != after.uid() || !same_file_identity(&before, &after) {
+        return Err("process owner changed".to_owned());
+    }
+    Ok(LiveProcessSnapshot {
+        pid,
+        parent,
+        starttime,
+        uid: before.uid(),
+        executable,
+    })
+}
+
+#[cfg(unix)]
+fn live_process_ancestry(proc_root: &Path, pid: u32) -> Result<Vec<LiveProcessSnapshot>, String> {
+    let mut ancestry = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut next = pid;
+    loop {
+        if next == 0 || ancestry.len() >= 256 || !seen.insert(next) {
+            return Err("process ancestry rejected".to_owned());
+        }
+        let snapshot = live_process_snapshot(proc_root, next)?;
+        next = snapshot.parent;
+        let complete = snapshot.pid == 1;
+        ancestry.push(snapshot);
+        if complete {
+            return Ok(ancestry);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn live_process_is_observer(
+    proc_root: &Path,
+    ancestry: &[LiveProcessSnapshot],
+) -> Result<bool, String> {
+    let process = ancestry
+        .first()
+        .ok_or_else(|| "process ancestry missing".to_owned())?;
+    let argv = bounded_process_bytes(
+        &proc_root.join(process.pid.to_string()).join("cmdline"),
+        64 * 1024,
+    )?;
+    if argv.last() != Some(&0) || argv.len() < 2 {
+        return Err("process command line rejected".to_owned());
+    }
+    let mut arguments = argv[..argv.len() - 1].split(|byte| *byte == 0);
+    let program = arguments
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "process command line rejected".to_owned())?;
+    let _ = program;
+    if arguments.next() != Some(b"app-server".as_slice()) {
+        return Ok(false);
+    }
+    if process.pid == 1 || process.parent == 1 {
+        return Err("app-server origin unavailable".to_owned());
+    }
+    let own = fs::metadata("/proc/self/exe")
+        .map_err(|_| "collector executable unavailable".to_owned())?;
+    for ancestor in ancestry.iter().skip(1) {
+        let Some((path, device, inode)) = &ancestor.executable else {
+            continue;
+        };
+        if (*device, *inode) == (own.dev(), own.ino()) {
+            return Ok(true);
+        }
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("codex_info" | "codex_info_recorder" | "codex_info_rest")
+        ) {
+            validate_observer_generation(path, *device, *inode)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn validate_observer_generation(path: &Path, device: u64, inode: u64) -> Result<(), String> {
+    let home =
+        std::env::var_os("HOME").ok_or_else(|| "artifact profile root unavailable".to_owned())?;
+    validate_generation_member(
+        &PathBuf::from(home).join(".local/share/codex-info/generations"),
+        path,
+        device,
+        inode,
+    )
+}
+
+#[cfg(unix)]
+fn validate_generation_member(
+    generations: &Path,
+    path: &Path,
+    device: u64,
+    inode: u64,
+) -> Result<(), String> {
+    let rejected = || "observer artifact identity rejected".to_owned();
+    let root = generations.canonicalize().map_err(|_| rejected())?;
+    let generation = path.parent().ok_or_else(rejected)?;
+    let member = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(rejected)?;
+    if generation.parent() != Some(root.as_path())
+        || path.canonicalize().map_err(|_| rejected())? != path
+        || !matches!(
+            member,
+            "codex_info" | "codex_info_recorder" | "codex_info_rest"
+        )
+    {
+        return Err(rejected());
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    let directory = fs::symlink_metadata(generation).map_err(|_| rejected())?;
+    let before = fs::symlink_metadata(path).map_err(|_| rejected())?;
+    let manifest_path = generation.join("manifest.json");
+    let manifest_metadata = fs::symlink_metadata(&manifest_path).map_err(|_| rejected())?;
+    let regular = |metadata: &Metadata, mode| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == uid
+            && metadata.mode() & 0o7777 == mode
+    };
+    if !directory.is_dir()
+        || directory.file_type().is_symlink()
+        || directory.uid() != uid
+        || directory.mode() & 0o7777 != 0o700
+        || !regular(&before, 0o755)
+        || (before.dev(), before.ino()) != (device, inode)
+        || !regular(&manifest_metadata, 0o644)
+    {
+        return Err(rejected());
+    }
+    let raw = bounded_process_bytes(&manifest_path, 1024 * 1024)?;
+    reject_duplicate_json_keys(&raw).map_err(|_| rejected())?;
+    let value: Value = serde_json::from_slice(&raw).map_err(|_| rejected())?;
+    let object = value.as_object().ok_or_else(rejected)?;
+    let exact_keys = |object: &serde_json::Map<String, Value>, keys: &[&str]| {
+        object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+    };
+    if !exact_keys(
+        object,
+        &[
+            "schema",
+            "product",
+            "version",
+            "source_sha",
+            "run_id",
+            "run_attempt",
+            "target",
+            "compatibility",
+            "glibc_minimum",
+            "files",
+        ],
+    ) || object.get("schema").and_then(Value::as_str) != Some("codex-info-linux-bundle-v1")
+        || object.get("product").and_then(Value::as_str) != Some("codex_info")
+        || object.get("target").and_then(Value::as_str) != Some("x86_64-unknown-linux-gnu")
+        || object.get("compatibility").and_then(Value::as_str) != Some("glibc")
+    {
+        return Err(rejected());
+    }
+    let field = |key| object.get(key).and_then(Value::as_str).ok_or_else(rejected);
+    let version = field("version")?;
+    let source = field("source_sha")?;
+    let hex = |value: &str, size| {
+        value.len() == size
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let positive = |value: &str| {
+        !value.is_empty()
+            && !value.starts_with('0')
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let attempt = object
+        .get("run_attempt")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(rejected)?;
+    let glibc: Vec<_> = field("glibc_minimum")?.split('.').collect();
+    if !codex_info::valid_product_version(version)
+        || !hex(source, 40)
+        || !positive(field("run_id")?)
+        || version
+            .split_once("-beta.")
+            .is_some_and(|(_, beta)| beta.rsplit('.').next() != Some(attempt.to_string().as_str()))
+        || glibc.len() < 2
+        || glibc
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(rejected());
+    }
+    let expected_name = format!("{version}-{source}-{}", hex_digest(&raw));
+    if generation.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return Err(rejected());
+    }
+    let entries = object
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(rejected)?;
+    let mut previous: Option<&str> = None;
+    let mut selected = None;
+    for entry in entries {
+        let entry = entry
+            .as_object()
+            .filter(|entry| exact_keys(entry, &["path", "size", "sha256", "mode"]))
+            .ok_or_else(rejected)?;
+        let relative = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(rejected)?;
+        let size = entry
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(rejected)?;
+        let digest = entry
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| hex(value, 64))
+            .ok_or_else(rejected)?;
+        let mode = entry
+            .get("mode")
+            .and_then(Value::as_u64)
+            .filter(|value| matches!(value, 420 | 493))
+            .ok_or_else(rejected)?;
+        if relative.starts_with('/')
+            || relative.contains('\\')
+            || relative
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".."))
+            || matches!(relative, "manifest.json" | "SHA256SUMS")
+            || previous.is_some_and(|previous| previous >= relative)
+        {
+            return Err(rejected());
+        }
+        previous = Some(relative);
+        if relative == member {
+            selected = Some((size, digest, mode));
+        }
+    }
+    let (size, digest, mode) = selected.ok_or_else(rejected)?;
+    if mode != 493 || before.len() != size {
+        return Err(rejected());
+    }
+    let mut file = File::open(path).map_err(|_| rejected())?;
+    let opened = file.metadata().map_err(|_| rejected())?;
+    let mut hasher = Sha256::new();
+    let mut remaining = size;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..count]).map_err(|_| rejected())?;
+        if read == 0 {
+            return Err(rejected());
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let actual = hex_bytes(hasher.finalize().as_slice());
+    let after_file = file.metadata().map_err(|_| rejected())?;
+    let after_path = fs::symlink_metadata(path).map_err(|_| rejected())?;
+    let after_manifest = fs::symlink_metadata(&manifest_path).map_err(|_| rejected())?;
+    let after_directory = fs::symlink_metadata(generation).map_err(|_| rejected())?;
+    let stable = |left: &Metadata, right: &Metadata| {
+        (
+            left.dev(),
+            left.ino(),
+            left.uid(),
+            left.mode(),
+            left.len(),
+            left.mtime(),
+            left.mtime_nsec(),
+            left.ctime(),
+            left.ctime_nsec(),
+        ) == (
+            right.dev(),
+            right.ino(),
+            right.uid(),
+            right.mode(),
+            right.len(),
+            right.mtime(),
+            right.mtime_nsec(),
+            right.ctime(),
+            right.ctime_nsec(),
+        )
+    };
+    if actual != digest
+        || !stable(&before, &opened)
+        || !stable(&opened, &after_file)
+        || !stable(&after_file, &after_path)
+        || !stable(&manifest_metadata, &after_manifest)
+        || !stable(&directory, &after_directory)
+        || bounded_process_bytes(&manifest_path, 1024 * 1024)? != raw
+    {
+        return Err(rejected());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn open_codex_session_paths(
     proc_root: &Path,
     sessions_root: &Path,
-) -> Result<BTreeSet<PathBuf>, String> {
+) -> Result<ActivePathOwners, String> {
     let mut process_entries = 0usize;
-    let mut open_files = BTreeSet::new();
+    let mut open_files = ActivePathOwners::new();
     let processes = fs::read_dir(proc_root).map_err(|_| "process inventory failed".to_owned())?;
     for process in processes {
-        process_entries = process_entries
-            .checked_add(1)
-            .ok_or_else(|| "process inventory limit exceeded".to_owned())?;
+        process_entries += 1;
         if process_entries > MAX_PROC_PROCESS_ENTRIES {
             return Err("process inventory limit exceeded".to_owned());
         }
-        let process = match process {
-            Ok(process) => process,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => return Err("process inventory entry failed".to_owned()),
+        let process = process.map_err(|_| "process inventory entry failed".to_owned())?;
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
         };
-        let name = process.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+        let metadata = match fs::metadata(process.path()) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("process owner unavailable".to_owned()),
+        };
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
             continue;
         }
-        let process_path = process.path();
-        let mut comm = Vec::new();
-        match File::open(process_path.join("comm")) {
-            Ok(file) => {
-                if file.take(64).read_to_end(&mut comm).is_err() {
-                    return Err("process name read failed".to_owned());
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => return Err("process name open failed".to_owned()),
-        }
-        if comm.strip_suffix(b"\n") != Some(b"codex") && comm.as_slice() != b"codex" {
+        let comm = match bounded_process_bytes(&process.path().join("comm"), 64) {
+            Ok(value) => value,
+            Err(_) if !process.path().exists() => continue,
+            Err(error) => return Err(error),
+        };
+        if comm.as_slice() != b"codex\n" && comm.as_slice() != b"codex" {
             continue;
         }
-        let executable = match fs::read_link(process_path.join("exe")) {
-            Ok(path) => path,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => return Err("process executable read failed".to_owned()),
-        };
-        if executable.file_name().and_then(|value| value.to_str()) != Some("codex") {
+        let executable = fs::read_link(process.path().join("exe"))
+            .map_err(|_| "process executable unavailable".to_owned());
+        if executable
+            .as_ref()
+            .is_ok_and(|path| path.file_name().and_then(|name| name.to_str()) != Some("codex"))
+        {
             continue;
         }
-        let descriptors = match fs::read_dir(process_path.join("fd")) {
-            Ok(descriptors) => descriptors,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => return Err("process descriptor inventory failed".to_owned()),
-        };
-        let mut descriptor_count = 0usize;
-        for descriptor in descriptors {
-            descriptor_count = descriptor_count
-                .checked_add(1)
-                .ok_or_else(|| "process descriptor limit exceeded".to_owned())?;
-            if descriptor_count > MAX_CODEX_PROCESS_FDS {
+        let ancestry = live_process_ancestry(proc_root, pid);
+        let descriptors = fs::read_dir(process.path().join("fd"))
+            .map_err(|_| "process descriptor inventory failed".to_owned())?;
+        let mut paths = BTreeSet::new();
+        for (index, descriptor) in descriptors.enumerate() {
+            if index >= MAX_CODEX_PROCESS_FDS {
                 return Err("process descriptor limit exceeded".to_owned());
             }
-            let descriptor = match descriptor {
-                Ok(descriptor) => descriptor,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => return Err("process descriptor entry failed".to_owned()),
-            };
-            let target = match fs::read_link(descriptor.path()) {
-                Ok(path) => path,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => return Err("process descriptor read failed".to_owned()),
-            };
-            let Some(canonical) = canonical_session_file(sessions_root, &target) else {
-                continue;
-            };
-            open_files.insert(canonical);
+            let descriptor =
+                descriptor.map_err(|_| "process descriptor entry failed".to_owned())?;
+            let target = fs::read_link(descriptor.path())
+                .map_err(|_| "process descriptor read failed".to_owned())?;
+            if let Some(path) = canonical_session_file(sessions_root, &target) {
+                paths.insert(path);
+            }
+        }
+        if paths.is_empty() {
+            continue;
+        }
+        let executable = executable?;
+        let ancestry = ancestry?;
+        if ancestry
+            .first()
+            .and_then(|owner| owner.executable.as_ref())
+            .map(|(path, _, _)| path)
+            != Some(&executable)
+        {
+            return Err("process executable changed before descriptor read".to_owned());
+        }
+        let observer = live_process_is_observer(proc_root, &ancestry)?;
+        if live_process_ancestry(proc_root, pid)? != ancestry {
+            return Err("process identity changed during descriptor read".to_owned());
+        }
+        if observer {
+            continue;
+        }
+        for path in paths {
+            open_files.entry(path).or_default().insert(ancestry.clone());
             if open_files.len() > MAX_OPEN_SESSION_FILES {
                 return Err("active session file limit exceeded".to_owned());
             }
@@ -2062,53 +2586,41 @@ fn is_supported_plan(value: &str) -> bool {
     )
 }
 
-fn monthly_quota_window_seconds(reset_at: i64) -> i64 {
-    let Some(end) = DateTime::<Utc>::from_timestamp(reset_at, 0) else {
-        return 31 * 86_400;
-    };
-    end.checked_sub_months(Months::new(1))
-        .map(|start| (end - start).num_seconds().max(1))
-        .unwrap_or(31 * 86_400)
-}
-
-fn parse_app_server_quota(value: &Value, plan_type: &str) -> Result<QuotaSnapshot, String> {
+/// Interpret one account-verified acquisition without changing its observation
+/// time. The acquisition journal owns durability and account verification.
+pub fn interpret_official_quota(
+    value: &Value,
+    plan_type: &str,
+    observed_at: i64,
+) -> Result<QuotaSnapshot, String> {
+    const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799;
+    if !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&observed_at) {
+        return Err("Codex quota observation time is invalid".to_owned());
+    }
+    codex_info::protocol_contract::validate_rate_limits_response(value)
+        .map_err(|_| "Codex quota response is malformed".to_owned())?;
+    let account_family = codex_info::protocol_contract::plan_family_from_wire(Some(plan_type))
+        .ok_or_else(|| "Codex account plan is invalid".to_owned())?;
     let limits = value
         .as_object()
         .and_then(|object| object.get("rateLimits"))
         .and_then(Value::as_object)
         .ok_or_else(|| "Codex quota response is unavailable".to_owned())?;
-    if plan_type.starts_with("enterprise") {
-        if let Some(individual) = limits.get("individualLimit").and_then(Value::as_object) {
-            let remaining = individual
-                .get("remainingPercent")
-                .and_then(Value::as_i64)
-                .filter(|value| (0..=100).contains(value));
-            let reset_at = individual
-                .get("resetsAt")
-                .and_then(Value::as_i64)
-                .filter(|value| *value > 0);
-            if let (Some(remaining), Some(reset_at)) = (remaining, reset_at) {
-                return Ok(QuotaSnapshot {
-                    observed_at: Utc::now().timestamp(),
-                    reset_at,
-                    window_seconds: monthly_quota_window_seconds(reset_at),
-                    remaining_percent: Some(remaining as f64),
-                });
-            }
-        }
+    let quota_family = codex_info::protocol_contract::plan_family_from_wire(
+        limits.get("planType").and_then(Value::as_str),
+    );
+    if quota_family.is_some_and(|family| {
+        family.is_known() && account_family.is_known() && family != account_family
+    }) {
+        return Err("Codex account and quota plans do not match".to_owned());
     }
     let mut selected: Option<(i64, i64, i64, u8)> = None;
     for (key, priority) in [("primary", 0_u8), ("secondary", 1_u8)] {
         let Some(window) = limits.get(key).and_then(Value::as_object) else {
             continue;
         };
-        // The protocol permits an unbounded/unknown window. Its missing
-        // metadata must not veto a fully reported window in the same response.
-        if window.get("resetsAt").is_some_and(Value::is_null)
-            || window.get("windowDurationMins").is_some_and(Value::is_null)
-        {
-            continue;
-        }
+        // Type validation is whole-input. Numeric eligibility is per window;
+        // a missing/unknown duration must not veto an independent valid one.
         let used = window
             .get("usedPercent")
             .and_then(Value::as_i64)
@@ -2116,19 +2628,25 @@ fn parse_app_server_quota(value: &Value, plan_type: &str) -> Result<QuotaSnapsho
         let reset_at = window
             .get("resetsAt")
             .and_then(Value::as_i64)
-            .filter(|value| *value > 0);
+            .filter(|value| (1..=MAX_PUBLIC_UNIX_SECONDS).contains(value));
         let duration_minutes = window
             .get("windowDurationMins")
             .and_then(Value::as_i64)
-            .filter(|value| (1..=527_040).contains(value));
+            .filter(|value| *value > 0);
         let (Some(used), Some(reset_at), Some(duration_minutes)) =
             (used, reset_at, duration_minutes)
         else {
-            return Err("Codex quota window is malformed".to_owned());
+            continue;
         };
-        let window_seconds = duration_minutes
-            .checked_mul(60)
-            .ok_or_else(|| "Codex quota window is too large".to_owned())?;
+        let Some(window_seconds) = duration_minutes.checked_mul(60) else {
+            continue;
+        };
+        if reset_at
+            .checked_sub(window_seconds)
+            .is_none_or(|origin| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&origin))
+        {
+            continue;
+        }
         let candidate = (window_seconds, reset_at, 100 - used, priority);
         let better = selected.is_none_or(|current| {
             candidate.0 > current.0
@@ -2143,76 +2661,19 @@ fn parse_app_server_quota(value: &Value, plan_type: &str) -> Result<QuotaSnapsho
         return Err("Codex quota has no bounded window".to_owned());
     };
     Ok(QuotaSnapshot {
-        observed_at: Utc::now().timestamp(),
+        observed_at,
         reset_at,
         window_seconds,
         remaining_percent: Some(remaining as f64),
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TokenSnapshot {
-    pub total: u64,
-    pub input: u64,
-    pub cached_input: u64,
-    pub output: u64,
-    pub cache_write_input: Option<u64>,
-}
-
-impl TokenSnapshot {
-    fn is_zero(self) -> bool {
-        self.total == 0
-            && self.input == 0
-            && self.cached_input == 0
-            && self.output == 0
-            && self.cache_write_input.unwrap_or(0) == 0
-    }
-
-    fn cache_write_delta_from(self, previous: Self) -> Option<u64> {
-        match (self.cache_write_input, previous.cache_write_input) {
-            (Some(current), Some(before)) => current.checked_sub(before),
-            (Some(current), None) if previous.total == 0 => Some(current),
-            (Some(0), None) => Some(0),
-            _ => None,
-        }
-    }
-
-    fn valid(self) -> bool {
-        self.cached_input <= self.input
-            && self.cache_write_input.is_none_or(|writes| {
-                self.cached_input
-                    .checked_add(writes)
-                    .is_some_and(|value| value <= self.input)
-            })
-    }
-
-    fn is_at_most(self, other: Self) -> bool {
-        self.total <= other.total
-            && self.input <= other.input
-            && self.cached_input <= other.cached_input
-            && self.output <= other.output
-            && match (self.cache_write_input, other.cache_write_input) {
-                (Some(value), Some(limit)) => value <= limit,
-                (Some(_), None) => false,
-                (None, _) => true,
-            }
-    }
-
-    fn has_usage(self) -> bool {
-        self.total > 0
-            || self.input > 0
-            || self.cached_input > 0
-            || self.output > 0
-            || self.cache_write_input.is_some_and(|value| value > 0)
-    }
-}
-
 #[derive(Clone, Debug)]
 struct ModelCounter {
     total: u64,
-    input: u64,
-    cached_input: u64,
-    output: u64,
+    input: Option<u64>,
+    cached_input: Option<u64>,
+    output: Option<u64>,
     cache_write_input: Option<u64>,
 }
 
@@ -2220,9 +2681,9 @@ impl Default for ModelCounter {
     fn default() -> Self {
         Self {
             total: 0,
-            input: 0,
-            cached_input: 0,
-            output: 0,
+            input: Some(0),
+            cached_input: Some(0),
+            output: Some(0),
             // `Some(0)` is the additive identity for a known counter. Any
             // unknown delta still changes the accumulated value to `None`.
             cache_write_input: Some(0),
@@ -2242,41 +2703,18 @@ impl ModelCounter {
     }
 
     fn add(&mut self, delta: TokenSnapshot) -> Result<(), RecorderError> {
-        self.total = self
-            .total
-            .checked_add(delta.total)
-            .ok_or_else(|| RecorderError::Invalid("session token total overflow".to_owned()))?;
-        self.input = self
-            .input
-            .checked_add(delta.input)
-            .ok_or_else(|| RecorderError::Invalid("session input total overflow".to_owned()))?;
-        self.cached_input = self
-            .cached_input
-            .checked_add(delta.cached_input)
-            .ok_or_else(|| {
-                RecorderError::Invalid("session cached input total overflow".to_owned())
+        let sum = self
+            .snapshot()
+            .facts()
+            .checked_sum(delta.facts())
+            .map_err(|_| {
+                RecorderError::Invalid("session token total arithmetic is invalid".to_owned())
             })?;
-        self.output = self
-            .output
-            .checked_add(delta.output)
-            .ok_or_else(|| RecorderError::Invalid("session output total overflow".to_owned()))?;
-        self.cache_write_input = match (self.cache_write_input, delta.cache_write_input) {
-            (Some(left), Some(right)) => Some(left.checked_add(right).ok_or_else(|| {
-                RecorderError::Invalid("session cache-write total overflow".to_owned())
-            })?),
-            _ => None,
-        };
-        if self.cached_input > self.input
-            || self.cache_write_input.is_some_and(|writes| {
-                self.cached_input
-                    .checked_add(writes)
-                    .is_none_or(|value| value > self.input)
-            })
-        {
-            return Err(RecorderError::Invalid(
-                "session token components are inconsistent".to_owned(),
-            ));
-        }
+        self.total = sum.total;
+        self.input = sum.input;
+        self.cached_input = sum.cached_input;
+        self.output = sum.output;
+        self.cache_write_input = sum.cache_write_input;
         Ok(())
     }
 
@@ -2301,12 +2739,17 @@ impl ModelCounter {
         }
     }
 
-    fn dollars(&self, model: &str) -> f64 {
+    fn dollars(&self, model: &str) -> Option<f64> {
+        let (input, cached_input, output) = self
+            .input
+            .zip(self.cached_input)
+            .zip(self.output)
+            .map(|((input, cached), output)| (input, cached, output))?;
         estimate_legacy(
             model,
             PricingUsage {
-                input_tokens: self.input,
-                cached_input_tokens: self.cached_input,
+                input_tokens: input,
+                cached_input_tokens: cached_input,
                 // These three frozen family columns historically priced I-C
                 // without a cache-write field. Treat that legacy projection
                 // as W=0; exact-ID prices remain strict in the model sidecar.
@@ -2315,10 +2758,10 @@ impl ModelCounter {
                 } else {
                     self.cache_write_input
                 },
-                output_tokens: self.output,
+                output_tokens: output,
             },
         )
-        .map_or(0.0, |cost| cost.total_dollars)
+        .map(|cost| cost.total_dollars)
     }
 }
 
@@ -2337,26 +2780,11 @@ impl ModelTotals {
     }
 
     fn canonical_model(model: &str) -> Option<String> {
-        let trimmed = model.trim();
-        if trimmed.is_empty()
-            || trimmed.len() > codex_info_db_writer::MAX_SESSION_MODEL_BYTES
-            || trimmed.chars().any(char::is_control)
-        {
-            return None;
-        }
-        Some(trimmed.to_owned())
+        codex_info_db_writer::model_names::normalize_model_name(model).map(str::to_owned)
     }
 
     fn checkpoint_model(model: &str) -> Option<String> {
-        let trimmed = model.trim();
-        if !trimmed.is_empty()
-            && trimmed.len() <= codex_info_db_writer::MAX_SESSION_MODEL_BYTES
-            && !trimmed.chars().any(char::is_control)
-        {
-            Some(trimmed.to_owned())
-        } else {
-            Self::canonical_model(model)
-        }
+        Self::canonical_model(model)
     }
 
     fn usage_model(model: Option<&str>) -> String {
@@ -2381,43 +2809,18 @@ impl ModelTotals {
         let counter = self.values.get_mut(&model).ok_or_else(|| {
             RecorderError::Invalid("replayed session event is absent from totals".to_owned())
         })?;
-        counter.total = counter
-            .total
-            .checked_sub(delta.total)
-            .ok_or_else(|| RecorderError::Invalid("replayed session total underflow".to_owned()))?;
-        counter.input = counter
-            .input
-            .checked_sub(delta.input)
-            .ok_or_else(|| RecorderError::Invalid("replayed session input underflow".to_owned()))?;
-        counter.cached_input = counter
-            .cached_input
-            .checked_sub(delta.cached_input)
-            .ok_or_else(|| {
-                RecorderError::Invalid("replayed session cached input underflow".to_owned())
+        let difference = counter
+            .snapshot()
+            .facts()
+            .checked_delta(delta.facts())
+            .map_err(|_| {
+                RecorderError::Invalid("replayed session arithmetic is invalid".to_owned())
             })?;
-        counter.output = counter.output.checked_sub(delta.output).ok_or_else(|| {
-            RecorderError::Invalid("replayed session output underflow".to_owned())
-        })?;
-        counter.cache_write_input = match (counter.cache_write_input, delta.cache_write_input) {
-            (Some(current), Some(replayed)) => {
-                Some(current.checked_sub(replayed).ok_or_else(|| {
-                    RecorderError::Invalid("replayed session cache-write underflow".to_owned())
-                })?)
-            }
-            _ => None,
-        };
-        if counter.cached_input > counter.input
-            || counter.cache_write_input.is_some_and(|writes| {
-                counter
-                    .cached_input
-                    .checked_add(writes)
-                    .is_none_or(|value| value > counter.input)
-            })
-        {
-            return Err(RecorderError::Invalid(
-                "replayed session token components are inconsistent".to_owned(),
-            ));
-        }
+        counter.total = difference.total;
+        counter.input = difference.input;
+        counter.cached_input = difference.cached_input;
+        counter.output = difference.output;
+        counter.cache_write_input = difference.cache_write_input;
         Ok(())
     }
 
@@ -2436,13 +2839,37 @@ impl ModelTotals {
             .collect()
     }
 
-    fn dollar_totals(&self) -> (f64, f64, f64) {
-        let mut result = (0.0, 0.0, 0.0);
+    fn dollar_totals(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
+        let mut result = (Some(0.0), Some(0.0), Some(0.0));
         for (model, counter) in &self.values {
             match family(model) {
-                Some("SOL") => result.0 += counter.dollars("SOL"),
-                Some("TERRA") => result.1 += counter.dollars("TERRA"),
-                Some("LUNA") => result.2 += counter.dollars("LUNA"),
+                Some("SOL") => {
+                    result.0 = result
+                        .0
+                        .zip(counter.dollars("SOL"))
+                        .and_then(|(sum, cost)| {
+                            let next: f64 = sum + cost;
+                            next.is_finite().then_some(next)
+                        })
+                }
+                Some("TERRA") => {
+                    result.1 = result
+                        .1
+                        .zip(counter.dollars("TERRA"))
+                        .and_then(|(sum, cost)| {
+                            let next: f64 = sum + cost;
+                            next.is_finite().then_some(next)
+                        })
+                }
+                Some("LUNA") => {
+                    result.2 = result
+                        .2
+                        .zip(counter.dollars("LUNA"))
+                        .and_then(|(sum, cost)| {
+                            let next: f64 = sum + cost;
+                            next.is_finite().then_some(next)
+                        })
+                }
                 _ => {}
             }
         }
@@ -2467,20 +2894,20 @@ impl ModelTotals {
         timestamp: i64,
         reset_at: i64,
         remaining_percent: f64,
-    ) -> UsageHistorySample {
+    ) -> Option<UsageHistorySample> {
         let dollars = self.dollar_totals();
         let tokens = self.token_totals();
-        UsageHistorySample {
+        Some(UsageHistorySample {
             timestamp,
             reset_at,
             remaining_percent: Some(remaining_percent),
-            sol_dollars: dollars.0,
-            terra_dollars: dollars.1,
-            luna_dollars: dollars.2,
+            sol_dollars: dollars.0?,
+            terra_dollars: dollars.1?,
+            luna_dollars: dollars.2?,
             sol_tokens: tokens.0,
             terra_tokens: tokens.1,
             luna_tokens: tokens.2,
-        }
+        })
     }
 }
 
@@ -2513,6 +2940,8 @@ fn session_event_to_timed_usage(event: SessionEvent) -> Result<TimedModelUsage, 
 
 #[derive(Clone)]
 struct PendingBatch {
+    source_repairs: Vec<codex_info_db_writer::PreparedSourceQualificationRepair>,
+    period_attribution: Option<codex_info_db_writer::period_evidence::PreparedPeriodAttribution>,
     reset_at: i64,
     latest_quota_reset_at: i64,
     window_seconds: i64,
@@ -2523,6 +2952,8 @@ struct PendingBatch {
     checkpoints: Vec<SessionCheckpoint>,
     ranges: Vec<SessionRange>,
     durable_events: Vec<SessionEvent>,
+    qualified_events: Vec<LosslessSessionEvent>,
+    response_replays: Vec<LosslessSessionEvent>,
     task_events: Vec<SessionTaskEvent>,
     task_indexed_ranges: Vec<SessionTaskIndexedRange>,
     pending_evidence: Vec<SessionPendingRange>,
@@ -2533,6 +2964,431 @@ struct PendingBatch {
     exact_history_span: Option<(i64, i64)>,
     accepted_ranges: usize,
     sources_seen: usize,
+    source_verifications: BTreeMap<SourceVerificationKey, SourceVerification>,
+}
+
+type SourceVerificationKey = (String, String, u64, u64, u128);
+
+#[derive(Clone, Eq, PartialEq)]
+struct SourceFingerprint {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+#[derive(Clone)]
+struct SourceVerification {
+    fingerprint: SourceFingerprint,
+    checkpoint: SessionCheckpoint,
+    ranges: Vec<SessionRange>,
+    prefix_matches: bool,
+    account_boundary_epoch: Option<u128>,
+    lifecycle_intervals: Vec<SessionLifecycleInterval>,
+}
+
+struct RejectedSourceReadContainer {
+    container: codex_info_db_writer::AcceptedSourceReadContainer,
+    verification: SourceVerification,
+}
+
+#[cfg(test)]
+thread_local! {
+    // Real prefix reads and terminal canonical batch calls, not byte/RSS/SQL counts.
+    static SOURCE_PREFIX_RECOVERY_OBSERVATIONS: std::cell::Cell<(u64, u64)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+struct SourceParserReconstruction {
+    numeric_events: Vec<(SessionEvent, LegacyCounterProof)>,
+    counter_proofs: Vec<LegacyCounterProof>,
+    numeric_records: Vec<Value>,
+    original: SessionCheckpoint,
+    ranges: Vec<SessionRange>,
+    fingerprint: Option<SourceFingerprint>,
+    account_boundary_epoch: Option<u128>,
+    lifecycle_intervals: Vec<SessionLifecycleInterval>,
+    replayed: Option<SessionCheckpoint>,
+    pending: Vec<SessionPendingRange>,
+    raw_conflict: bool,
+    qualification_attempted: bool,
+    read_container: Option<codex_info_db_writer::AcceptedSourceReadContainer>,
+}
+
+fn checkpoint_requires_parser_reconstruction(checkpoint: &SessionCheckpoint) -> bool {
+    checkpoint.committed_offset > 0
+        && (checkpoint.last_model_context_kind.is_none()
+            || checkpoint.last_model_interval.is_none()
+            || checkpoint
+                .source_admission
+                .as_ref()
+                .is_none_or(SourceAdmission::requires_prefix_reconstruction)
+            || (matches!(
+                checkpoint.last_model_context_kind,
+                Some(SessionModelContextKind::InitialSettings | SessionModelContextKind::Turn)
+            ) && checkpoint
+                .source_admission
+                .as_ref()
+                .is_some_and(|state| state.adopted_context.is_none())))
+}
+
+fn checkpoint_can_recover_response_prefix(
+    checkpoint: &SessionCheckpoint,
+    pending: &[SessionPendingRange],
+) -> bool {
+    !checkpoint.fully_attributed_from_zero
+        && checkpoint.committed_offset > 0
+        && !checkpoint_requires_parser_reconstruction(checkpoint)
+        && checkpoint.source_admission.as_ref().is_some_and(|state| {
+            state.stream == UsageStream::ResponseRecord
+                && state
+                    .account_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.matches_checkpoint(checkpoint))
+        })
+        && !pending.iter().any(|range| {
+            range.complete
+                && range.reason != "response-qualification-pending"
+                && range.root_identity == checkpoint.root_identity
+                && range.relative_path == checkpoint.relative_path
+                && range.file_device == checkpoint.file_device
+                && range.file_inode == checkpoint.file_inode
+                && range.prefix_generation == checkpoint.prefix_generation
+                && range.start_offset < checkpoint.committed_offset
+        })
+}
+
+impl SourceParserReconstruction {
+    fn prefix_matches(
+        &self,
+        source: &Source,
+        checkpoint: &SessionCheckpoint,
+        ranges: &[SessionRange],
+    ) -> Result<Option<bool>, RecorderError> {
+        saved_source_prefix_matches_in_container(
+            source,
+            checkpoint,
+            ranges,
+            self.read_container.as_ref(),
+        )
+    }
+    fn matches(
+        &self,
+        checkpoint: &SessionCheckpoint,
+        ranges: &[SessionRange],
+        account_boundary_epoch: Option<u128>,
+        lifecycle_intervals: &[SessionLifecycleInterval],
+    ) -> bool {
+        self.original == *checkpoint
+            && self.ranges == ranges
+            && self.account_boundary_epoch == account_boundary_epoch
+            && self.lifecycle_intervals == lifecycle_intervals
+    }
+
+    fn advance(
+        &mut self,
+        source: &Source,
+        max_bytes: u64,
+        cycle_seq: u64,
+        ownership: Option<&SourceOwnership<'_>>,
+    ) -> Result<u64, RecorderError> {
+        if self.raw_conflict
+            || self.replayed.as_ref().is_some_and(|checkpoint| {
+                checkpoint.committed_offset == self.original.committed_offset
+            })
+        {
+            return Ok(0);
+        }
+        let start = self
+            .replayed
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.committed_offset);
+        let remaining = self.original.committed_offset - start;
+        let mut totals = ModelTotals::default();
+        let mut events = Vec::new();
+        #[cfg(test)]
+        SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| {
+            let (reads, batches) = counts.get();
+            counts.set((reads + 1, batches));
+        });
+        let mut result = scan_source_with_reader(
+            source,
+            self.replayed.as_ref(),
+            false,
+            false,
+            self.original.collector_epoch,
+            cycle_seq,
+            0,
+            0,
+            max_bytes,
+            None,
+            None,
+            None,
+            ownership,
+            &mut totals,
+            &mut events,
+            |file, _| BufReader::new(file.take(remaining)),
+        )?
+        .ok_or_else(|| RecorderError::Invalid("parser reconstruction source changed".into()))?;
+        if result.checkpoint.committed_offset <= start {
+            return Err(RecorderError::Invalid(
+                "parser reconstruction did not reach a complete record".into(),
+            ));
+        }
+        result.checkpoint.prefix_generation = self.original.prefix_generation;
+        result.checkpoint.prefix_sha256 = self.original.prefix_sha256.clone();
+        for pending in &mut result.pending {
+            pending.prefix_generation = self.original.prefix_generation;
+        }
+        self.pending
+            .extend(result.pending.into_iter().filter(|pending| {
+                pending.complete && pending.end_offset <= self.original.committed_offset
+            }));
+        if result.checkpoint.committed_offset == self.original.committed_offset
+            && self.original.token_baseline_known
+        {
+            let same_known = |saved: Option<u64>, replayed: Option<u64>| {
+                saved.is_none_or(|value| replayed == Some(value))
+            };
+            let replayed = &result.checkpoint;
+            self.raw_conflict = !replayed.token_baseline_known
+                || self.original.previous_total != replayed.previous_total
+                || !same_known(self.original.previous_input, replayed.previous_input)
+                || !same_known(
+                    self.original.previous_cached_input,
+                    replayed.previous_cached_input,
+                )
+                || !same_known(self.original.previous_output, replayed.previous_output)
+                || !same_known(
+                    self.original.previous_cache_write_input,
+                    replayed.previous_cache_write_input,
+                );
+        }
+        if ownership.is_some() {
+            self.numeric_events
+                .extend(result.events.into_iter().zip(result.event_proofs));
+            self.counter_proofs.extend(result.counter_proofs);
+            self.numeric_records.extend(result.numeric_records);
+        }
+        self.replayed = Some(result.checkpoint);
+        // All replay events, ranges, task events and temporary totals are
+        // deliberately discarded. Only parser qualification may be saved.
+        Ok(result.consumed_bytes)
+    }
+
+    fn original_repair_checkpoint(&self) -> Option<SessionCheckpoint> {
+        let replay = self
+            .replayed
+            .as_ref()
+            .filter(|cp| cp.committed_offset == self.original.committed_offset)?;
+        let mut checkpoint = self.original.clone();
+        checkpoint.last_model = replay.last_model.clone();
+        checkpoint.last_model_context_kind = replay.last_model_context_kind;
+        checkpoint.last_model_interval = replay.last_model_interval.clone();
+        checkpoint.source_admission = replay.source_admission.clone();
+        if self.raw_conflict {
+            checkpoint.token_baseline_known = replay.token_baseline_known;
+            checkpoint.previous_total = replay.previous_total;
+            checkpoint.previous_input = replay.previous_input;
+            checkpoint.previous_cached_input = replay.previous_cached_input;
+            checkpoint.previous_cache_write_input = replay.previous_cache_write_input;
+            checkpoint.previous_output = replay.previous_output;
+        }
+        Some(checkpoint)
+    }
+
+    fn qualified_checkpoint(&self, cycle_seq: u64) -> Option<SessionCheckpoint> {
+        let replayed = self.replayed.as_ref().filter(|checkpoint| {
+            !self.raw_conflict && checkpoint.committed_offset == self.original.committed_offset
+        })?;
+        let mut qualified = self.original.clone();
+        qualified.cycle_seq = cycle_seq;
+        qualified.last_model = replayed.last_model.clone();
+        qualified.last_model_context_kind = replayed.last_model_context_kind;
+        qualified.last_model_interval = replayed.last_model_interval.clone();
+        qualified.source_admission = replayed.source_admission.clone();
+        qualified.last_task_running = replayed.last_task_running;
+        qualified.context_usage_tokens = replayed.context_usage_tokens;
+        qualified.context_window_tokens = replayed.context_window_tokens;
+        qualified.fully_attributed_from_zero &= self.pending.is_empty();
+        Some(qualified)
+    }
+
+    fn response_prefix_replays(
+        &self,
+        canonical: &[LosslessSessionEvent],
+    ) -> Option<Vec<LosslessSessionEvent>> {
+        let replayed = self.replayed.as_ref().filter(|checkpoint| {
+            !self.raw_conflict && checkpoint.committed_offset == self.original.committed_offset
+        })?;
+        if self
+            .pending
+            .iter()
+            .any(|pending| pending.reason != "response-qualification-pending")
+        {
+            return None;
+        }
+        let saved_state = self.original.source_admission.as_ref()?;
+        let binding = saved_state.account_binding.as_ref()?;
+        let replay_state = replayed.source_admission.as_ref()?;
+        let mut matched_responses = BTreeSet::new();
+        let mut matched_counters = BTreeSet::new();
+        let mut replays = Vec::new();
+        for fact in canonical {
+            let admission = fact.admission.as_ref()?;
+            if admission.source_binding != *binding
+                || !self.lifecycle_intervals.iter().any(|owner| {
+                    owner.start_at == Some(admission.ownership.start_at)
+                        && owner.end_at == admission.ownership.end_at
+                })
+                || !self.ranges.iter().any(|range| {
+                    range.start_offset == fact.source.range_start
+                        && range.end_offset == fact.source.range_end
+                        && range.record_sha256 == fact.source.record_sha256
+                })
+            {
+                return None;
+            }
+            match &admission.numeric {
+                NumericEventProof::ResponseRecord { candidate, .. } => {
+                    let reconstructed = replay_state
+                        .responses
+                        .iter()
+                        .find(|reconstructed| *reconstructed == candidate.as_ref())?;
+                    if fact.source.event_index != reconstructed.pointer.start
+                        || !matched_responses.insert(reconstructed.key.clone())
+                    {
+                        return None;
+                    }
+                    let mut replay = fact.clone();
+                    let proof = replay.admission.as_mut()?;
+                    proof.source_binding = binding.clone();
+                    proof.verified_prefix_end = self.original.committed_offset;
+                    if !proof.valid_for(fact, fact.period)
+                        || !codex_info_db_writer::same_response(fact, &replay)
+                    {
+                        return None;
+                    }
+                    replays.push(replay);
+                }
+                NumericEventProof::LegacyCounter(proof)
+                | NumericEventProof::LegacyFamilyCounter { proof, .. } => {
+                    // The original event ordinal belongs to its accepted
+                    // range, not to a reconstruction chunk's local ordinal.
+                    let (index, (raw, reconstructed)) = self
+                        .numeric_events
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (_, reconstructed))| {
+                            reconstructed.after.pointer.start >= fact.source.range_start
+                                && reconstructed.after.pointer.end <= fact.source.range_end
+                        })
+                        .nth(usize::try_from(fact.source.event_index).ok()?)?;
+                    let expected_model = match &admission.numeric {
+                        NumericEventProof::LegacyFamilyCounter { exact_model, .. } => exact_model,
+                        _ => &fact.model,
+                    };
+                    if reconstructed != proof.as_ref()
+                        || raw.timestamp != fact.timestamp
+                        || raw.model != *expected_model
+                        || LosslessSessionEvent::from(raw.clone()).tokens != fact.tokens
+                        || !matched_counters.insert(index)
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        if replays.is_empty()
+            || matched_counters.len() != self.numeric_events.len()
+            || matched_responses.len() != replay_state.responses.len()
+        {
+            return None;
+        }
+        // Canonical matches discharge only those response candidates which
+        // the accepted parser state had already resolved. Every other saved
+        // parser fact and all five raw components must reproduce exactly.
+        let mut normalized = replayed.clone();
+        normalized.cycle_seq = self.original.cycle_seq;
+        normalized.fully_attributed_from_zero = self.original.fully_attributed_from_zero;
+        let normalized_state = normalized.source_admission.as_mut()?;
+        normalized_state.account_binding = Some(binding.clone());
+        normalized_state
+            .responses
+            .retain(|response| saved_state.responses.iter().any(|saved| saved == response));
+        (normalized == self.original).then_some(replays)
+    }
+}
+
+fn source_verification_key(checkpoint: &SessionCheckpoint) -> SourceVerificationKey {
+    (
+        checkpoint.root_identity.clone(),
+        checkpoint.relative_path.clone(),
+        checkpoint.file_device,
+        checkpoint.file_inode,
+        checkpoint.prefix_generation,
+    )
+}
+
+fn source_root_matches_inventory(source: &Source) -> io::Result<bool> {
+    let relative = Path::new(&source.recorded.relative_path);
+    if relative_source_key(relative).as_deref() != Some(source.recorded.relative_path.as_str()) {
+        return Ok(false);
+    }
+    let mut root = source.path.as_path();
+    for _ in relative.components() {
+        let Some(parent) = root.parent() else {
+            return Ok(false);
+        };
+        root = parent;
+    }
+    if root.join(relative) != source.path {
+        return Ok(false);
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    Ok(metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && root_identity(root, &metadata) == source.recorded.root_identity)
+}
+
+fn source_fingerprint(source: &Source) -> io::Result<Option<SourceFingerprint>> {
+    #[cfg(unix)]
+    {
+        if !source_root_matches_inventory(source)? {
+            return Ok(None);
+        }
+        let metadata = fs::symlink_metadata(&source.path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || file_identity(&metadata) != (source.recorded.file_device, source.recorded.file_inode)
+        {
+            return Ok(None);
+        }
+        Ok(Some(SourceFingerprint {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
+        Ok(None)
+    }
 }
 
 struct WriterLock {
@@ -2659,6 +3515,42 @@ pub struct ProfileLease {
 }
 
 impl ProfileLease {
+    pub fn validate_current(&self, data_root: &Path) -> Result<(), RecorderError> {
+        let path = data_root.join("history/usage_record_daemon.lock");
+        let invalid =
+            || RecorderError::Invalid("profile publisher lease is no longer current".to_owned());
+        let expected = self._file.metadata()?;
+        let before = fs::symlink_metadata(&path)?;
+        if !before.is_file()
+            || before.file_type().is_symlink()
+            || !same_file_identity(&before, &expected)
+        {
+            return Err(invalid());
+        }
+        #[cfg(unix)]
+        if before.uid() != rustix::process::geteuid().as_raw() || before.mode() & 0o077 != 0 {
+            return Err(invalid());
+        }
+        let file = File::open(&path)?;
+        if !same_file_identity(&file.metadata()?, &expected) {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 64 * 1024 {
+            return Err(invalid());
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if value.get("pid").and_then(Value::as_u64) != Some(u64::from(self.pid))
+            || value.get("starttime_ticks").and_then(Value::as_i64) != Some(self.starttime_ticks)
+            || value.get("owner_nonce").and_then(Value::as_str) != Some(self.owner_nonce.as_str())
+            || !same_file_identity(&fs::symlink_metadata(path)?, &expected)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     pub fn acquire(data_root: impl AsRef<Path>) -> Result<Self, RecorderError> {
         let history = data_root.as_ref().join("history");
         let history_metadata = fs::symlink_metadata(&history)?;
@@ -2983,13 +3875,18 @@ impl RecorderStateWriter {
     ) -> Result<(), RecorderError> {
         let _epoch_fence = account_epoch_commit_fence()?;
         let now = Utc::now().timestamp();
-        self.last_commit_unix = Some(now);
-        self.last_state = Some(state.clone());
         self.write_document(
             if has_pending { "degraded" } else { "ready" },
             Some(state),
-            self.last_commit_unix,
-        )
+            Some(now),
+        )?;
+        self.last_commit_unix = Some(now);
+        self.last_state = Some(state.clone());
+        Ok(())
+    }
+
+    pub fn last_published_generation(&self) -> Option<u64> {
+        self.last_state.as_ref().map(|state| state.data_generation)
     }
 
     fn write_document(
@@ -3195,6 +4092,338 @@ pub struct QuotaReplayOutcome {
     pub latest_input_unresolved: bool,
 }
 
+struct SourceAccountContext<'a> {
+    home: &'a Path,
+    epoch: &'a AccountEpochProof,
+    partition: StoragePartitionIdentity,
+}
+
+struct SourceOwnership<'a> {
+    intervals: &'a [SessionLifecycleInterval],
+    eligible_from: Option<i64>,
+}
+
+impl SourceOwnership<'_> {
+    fn contains(&self, timestamp: i64) -> bool {
+        self.same_interval(timestamp, timestamp)
+    }
+
+    fn same_interval(&self, before: i64, after: i64) -> bool {
+        // DATA's public UTC range, through 9999-12-31 23:59:59.
+        (1..=253_402_300_799).contains(&before)
+            && (1..=253_402_300_799).contains(&after)
+            && self
+                .eligible_from
+                .is_none_or(|start| before >= start && after >= start)
+            && self.intervals.iter().any(|interval| {
+                interval.start_at.is_some_and(|start| {
+                    before >= start
+                        && after >= start
+                        && interval
+                            .end_at
+                            .is_none_or(|end| before < end && after < end)
+                })
+            })
+    }
+}
+
+struct SourceBindingCycle {
+    connection: AppServerConnection,
+    identity: AccountIdentityWindow,
+    began_at: i64,
+    deadline: Instant,
+    next_request: u64,
+    active_paths: BTreeMap<String, PathBuf>,
+    conflict: bool,
+}
+
+impl SourceBindingCycle {
+    fn start(context: &SourceAccountContext<'_>) -> Result<Self, String> {
+        if context
+            .home
+            .canonicalize()
+            .ok()
+            .filter(|home| default_codex_home().canonicalize().ok().as_ref() == Some(home))
+            .is_none()
+            || !context.epoch.validate_current(context.home)
+        {
+            return Err("source binding account home changed".into());
+        }
+        let began_at = Utc::now().timestamp();
+        let deadline = Instant::now() + APP_SERVER_RESPONSE_TIMEOUT;
+        let mut connection =
+            AppServerConnection::start("codex-info-recorder-source-binding", deadline)?;
+        let account = request_app_server_before_deadline(
+            &mut connection.input,
+            &connection.output,
+            2,
+            "account/read",
+            json!({}),
+            deadline,
+        )?;
+        let account = decode_app_server_account(&account)?;
+        if !context.epoch.validate_current(context.home) {
+            return Err("source binding account epoch changed".into());
+        }
+        connection.validate_process()?;
+        Ok(Self {
+            connection,
+            identity: AccountIdentityWindow::new(context.epoch.authority.clone(), account),
+            began_at,
+            deadline,
+            next_request: 3,
+            active_paths: BTreeMap::new(),
+            conflict: false,
+        })
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_request;
+        self.next_request = id
+            .checked_add(1)
+            .ok_or("source binding request id exhausted")?;
+        request_app_server_before_deadline(
+            &mut self.connection.input,
+            &self.connection.output,
+            id,
+            method,
+            params,
+            self.deadline,
+        )
+    }
+
+    fn bind(
+        &mut self,
+        context: &SourceAccountContext<'_>,
+        sessions_root: &Path,
+        source: &Source,
+        checkpoint: &SessionCheckpoint,
+        ranges: &[SessionRange],
+    ) -> Result<SourceAccountBinding, String> {
+        let admission = checkpoint
+            .source_admission
+            .as_ref()
+            .filter(|state| state.metadata_qualified && state.valid(checkpoint.committed_offset))
+            .ok_or("source binding metadata is unqualified")?;
+        let metadata = admission
+            .metadata
+            .as_ref()
+            .ok_or("source binding metadata missing")?;
+        if !context.epoch.validate_current(context.home)
+            || saved_source_prefix_matches(source, checkpoint, ranges)
+                .ok()
+                .flatten()
+                != Some(true)
+        {
+            return Err("source binding prefix changed".into());
+        }
+        self.connection.validate_process()?;
+        let response = self.request(
+            "thread/read",
+            json!({"threadId":metadata.thread_id,"includeTurns":false}),
+        )?;
+        let object = response
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .ok_or("source binding thread envelope rejected")?;
+        let item = object
+            .get("thread")
+            .ok_or("source binding thread missing")?;
+        let candidate = thread_contract::validate_thread_item(item)
+            .map_err(|_| "source binding thread rejected")?;
+        let path = candidate.path().and_then(|path| {
+            security::canonical_regular_file_under(sessions_root, Path::new(path)).ok()
+        });
+        if candidate.is_active() {
+            if let Some(path) = path.as_ref() {
+                if self
+                    .active_paths
+                    .get(candidate.id())
+                    .is_some_and(|old| old != path)
+                {
+                    self.conflict = true;
+                    return Err("conflicting active source paths".into());
+                }
+                self.active_paths
+                    .insert(candidate.id().to_owned(), path.clone());
+            }
+        }
+        if candidate.id() != metadata.thread_id || path.as_ref() != Some(&source.path) {
+            return Err("source binding thread identity mismatch".into());
+        }
+        let account = decode_app_server_account(&self.request("account/read", json!({}))?)?;
+        let authority = read_account_authority(context.home)?;
+        if !context.epoch.validate_current(context.home)
+            || !self.identity.is_stable(&authority, &account)
+        {
+            return Err("source binding account identity changed".into());
+        }
+        self.connection.validate_process()?;
+        if saved_source_prefix_matches(source, checkpoint, ranges)
+            .ok()
+            .flatten()
+            != Some(true)
+        {
+            return Err("source binding prefix changed".into());
+        }
+        #[cfg(unix)]
+        let process = {
+            let snapshot = &self.connection.process;
+            let (_, device, inode) = snapshot
+                .executable
+                .as_ref()
+                .ok_or("source binding executable missing")?;
+            codex_info_db_writer::source_admission::SourceBindingProcess {
+                pid: i32::try_from(snapshot.pid).map_err(|_| "source binding pid invalid")?,
+                starttime_ticks: snapshot.starttime,
+                executable_device: *device,
+                executable_inode: *inode,
+            }
+        };
+        #[cfg(not(unix))]
+        return Err("source binding process identity unavailable".into());
+        #[cfg(unix)]
+        Ok(source_account_binding(
+            context,
+            checkpoint,
+            metadata.clone(),
+            SourceBindingProof::Rpc {
+                began_at: self.began_at,
+                ended_at: Utc::now().timestamp(),
+                process,
+            },
+        ))
+    }
+}
+
+fn source_account_binding(
+    context: &SourceAccountContext<'_>,
+    checkpoint: &SessionCheckpoint,
+    metadata: SessionMetadata,
+    proof: SourceBindingProof,
+) -> SourceAccountBinding {
+    SourceAccountBinding {
+        version: 1,
+        partition: context.partition.clone(),
+        root_identity: checkpoint.root_identity.clone(),
+        relative_path: checkpoint.relative_path.clone(),
+        file_device: checkpoint.file_device,
+        file_inode: checkpoint.file_inode,
+        prefix_generation: format!("{:032x}", checkpoint.prefix_generation),
+        prefix_end: checkpoint.committed_offset,
+        metadata,
+        proof,
+    }
+}
+
+fn historical_source_binding(
+    partition: &StoragePartitionIdentity,
+    source: &Source,
+    checkpoint: &SessionCheckpoint,
+    intervals: &[SessionLifecycleInterval],
+) -> Result<Option<SourceAccountBinding>, RecorderError> {
+    historical_source_binding_in_container(partition, source, checkpoint, intervals, None)
+}
+
+fn historical_source_binding_in_container(
+    partition: &StoragePartitionIdentity,
+    source: &Source,
+    checkpoint: &SessionCheckpoint,
+    intervals: &[SessionLifecycleInterval],
+    container: Option<&codex_info_db_writer::AcceptedSourceReadContainer>,
+) -> Result<Option<SourceAccountBinding>, RecorderError> {
+    let Some(admission) = checkpoint.source_admission.as_ref().filter(|state| {
+        state.metadata_qualified
+            && !state.requires_prefix_reconstruction()
+            && state.valid(checkpoint.committed_offset)
+    }) else {
+        return Ok(None);
+    };
+    let (Some(metadata), Some(anchor)) =
+        (admission.metadata.as_ref(), admission.previous_raw.as_ref())
+    else {
+        return Ok(None);
+    };
+    if !checkpoint.token_baseline_known
+        || !(SourceOwnership {
+            intervals,
+            eligible_from: None,
+        })
+        .contains(anchor.timestamp)
+    {
+        return Ok(None);
+    }
+    let before_path = fs::symlink_metadata(&source.path)?;
+    let mut file = File::open(&source.path)?;
+    let before_file = file.metadata()?;
+    if before_path.file_type().is_symlink()
+        || !before_path.is_file()
+        || !same_file_identity(&before_path, &before_file)
+        || file_identity(&before_file) != (source.recorded.file_device, source.recorded.file_inode)
+        || (container.is_none()
+            && file_identity(&before_file) != (checkpoint.file_device, checkpoint.file_inode))
+        || container.is_some_and(|container| {
+            !container.covers(checkpoint)
+                || (container.file_device, container.file_inode) != file_identity(&before_file)
+        })
+        || !source_root_matches_inventory(source)?
+    {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(anchor.start))?;
+    let mut reader = SourceReader::new(BufReader::new((&mut file).take(anchor.end - anchor.start)));
+    let RecordRead::Present(summary, bytes) = read_streaming_record(&mut reader)? else {
+        return Ok(None);
+    };
+    let raw = summary.token_snapshot();
+    let same_known =
+        |saved: Option<u64>, actual: Option<u64>| saved.is_none_or(|value| actual == Some(value));
+    let matches = raw.is_some_and(|raw| {
+        raw.valid_raw()
+            && checkpoint.previous_total == Some(raw.total)
+            && same_known(checkpoint.previous_input, raw.input)
+            && same_known(checkpoint.previous_cached_input, raw.cached_input)
+            && same_known(checkpoint.previous_cache_write_input, raw.cache_write_input)
+            && same_known(checkpoint.previous_output, raw.output)
+    });
+    if !matches
+        || bytes != anchor.end - anchor.start
+        || summary.event_timestamp() != anchor.timestamp
+        || hex_bytes(reader.hasher.clone().finalize().as_slice()) != anchor.sha256
+    {
+        return Ok(None);
+    }
+    drop(reader);
+    let after_file = file.metadata()?;
+    let after_path = fs::symlink_metadata(&source.path)?;
+    if after_path.file_type().is_symlink()
+        || !same_file_identity(&before_file, &after_file)
+        || !same_file_identity(&after_file, &after_path)
+        || !source_root_matches_inventory(source)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(SourceAccountBinding {
+        version: 1,
+        partition: partition.clone(),
+        root_identity: checkpoint.root_identity.clone(),
+        relative_path: checkpoint.relative_path.clone(),
+        file_device: checkpoint.file_device,
+        file_inode: checkpoint.file_inode,
+        prefix_generation: format!("{:032x}", checkpoint.prefix_generation),
+        prefix_end: checkpoint.committed_offset,
+        metadata: metadata.clone(),
+        proof: SourceBindingProof::AcceptedPrefix {
+            anchor: anchor.clone(),
+        },
+    }))
+}
+
+struct HistoricalRepairBatch {
+    period: codex_info_db_writer::period_evidence::PreparedPeriodAttribution,
+    repairs: Vec<codex_info_db_writer::PreparedSourceQualificationRepair>,
+}
+
 pub struct Recorder {
     config: RecorderConfig,
     writer: UsageStore,
@@ -3202,11 +4431,22 @@ pub struct Recorder {
     identity: Option<StoragePartitionIdentity>,
     _writer_lock: Option<WriterLock>,
     pending: Option<PendingBatch>,
+    historical_pending: Option<HistoricalRepairBatch>,
+    historical_preparation_owned: bool,
+    quota_replay_cursor: quota_journal::ReplayCursor,
     last_ranges: Vec<SessionRange>,
     task_backfill: TaskBackfillWorker,
     activation_timestamp: Option<i64>,
     lifecycle_intervals: Vec<SessionLifecycleInterval>,
     account_boundary_epoch: Option<u128>,
+    source_verifications: BTreeMap<SourceVerificationKey, SourceVerification>,
+    source_parser_reconstructions: BTreeMap<SourceVerificationKey, SourceParserReconstruction>,
+    source_event_repair_candidates: BTreeSet<SourceVerificationKey>,
+    source_original_reconstructions: BTreeMap<SourceVerificationKey, SourceParserReconstruction>,
+    rejected_read_containers: BTreeMap<SourceVerificationKey, Vec<RejectedSourceReadContainer>>,
+    rejected_source_equivalences:
+        BTreeMap<(String, String), source_equivalence::RejectedSourceEquivalence>,
+    checkpoint_reconciliation_sources: BTreeSet<(String, String, u64, u64)>,
 }
 
 impl Recorder {
@@ -3321,54 +4561,32 @@ impl Recorder {
         } else {
             UsageStore::create_partitioned(&database, identity)?
         };
-        if existing_database {
-            if let Ok(inventory) = discover_sources(&config.sessions_root) {
-                let corrections = prove_unattributed_event_models(&writer, &inventory.sources)?;
-                if !corrections.is_empty() {
-                    writer.reattribute_unattributed_session_events(&corrections)?;
-                }
-            }
-        }
         let history_now = Utc::now();
-        let history_since = history_now
-            .checked_sub_months(chrono::Months::new(3))
-            .ok_or_else(|| {
-                RecorderError::Invalid("history recovery cutoff is outside supported dates".into())
-            })?
-            .timestamp();
         writer.prune_older_than_three_months(history_now)?;
-        // Older versions retained Session quota responses without projecting
-        // them into history. Recover exact missing minutes once on startup;
-        // a recovery error must not stop new official quota acquisition.
-        match writer.recover_session_quota_history_for_intervals(
-            &config.sessions_root,
-            history_since,
-            &lifecycle_intervals,
-        ) {
-            Ok(restored) if restored > 0 => {
-                eprintln!("recorder recovered {restored} historical quota minutes");
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!("recorder historical quota recovery failed: {error}"),
-        }
-        if existing_database {
-            let recovered = writer.load_session_events().and_then(|events| {
-                if events.is_empty() {
-                    return Ok(0);
-                }
-                drop(events);
-                let backup =
-                    UsageStore::backup_generations_partitioned_verified(&database, identity, 3)?;
-                writer.repair_session_minute_history(&lifecycle_intervals, &backup)
-            });
-            match recovered {
-                Ok(restored) if restored > 0 => {
-                    eprintln!("recorder recovered {restored} historical model minutes");
-                }
-                Ok(_) => {}
-                Err(error) => eprintln!("recorder historical model recovery failed: {error}"),
-            }
-        }
+        // Historical source bytes are reconstructed by their bounded owner
+        // after publication starts. Opening the partition never runs a full
+        // Session recovery pass or converts cached quota into observations.
+        let mut source_event_repair_candidates: BTreeSet<_> = writer
+            .load_unqualified_session_event_facts()?
+            .into_iter()
+            .map(|fact| {
+                (
+                    fact.source.root_identity,
+                    fact.source.relative_path,
+                    fact.source.file_device,
+                    fact.source.file_inode,
+                    fact.source.prefix_generation,
+                )
+            })
+            .collect();
+        source_event_repair_candidates.extend(
+            writer
+                .load_session_collection_state()?
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint_requires_parser_reconstruction(checkpoint))
+                .map(source_verification_key),
+        );
         Ok(Self {
             config,
             writer,
@@ -3376,11 +4594,21 @@ impl Recorder {
             identity: Some(identity.clone()),
             _writer_lock: Some(lock),
             pending: None,
+            historical_pending: None,
+            historical_preparation_owned: false,
+            quota_replay_cursor: Default::default(),
             last_ranges: Vec::new(),
             task_backfill: TaskBackfillWorker::start(),
             activation_timestamp,
             lifecycle_intervals,
             account_boundary_epoch,
+            source_verifications: BTreeMap::new(),
+            source_parser_reconstructions: BTreeMap::new(),
+            source_event_repair_candidates,
+            source_original_reconstructions: BTreeMap::new(),
+            rejected_read_containers: BTreeMap::new(),
+            rejected_source_equivalences: BTreeMap::new(),
+            checkpoint_reconciliation_sources: BTreeSet::new(),
         })
     }
 
@@ -3392,6 +4620,27 @@ impl Recorder {
         writer: UsageStore,
     ) -> Result<Self, RecorderError> {
         config.validate()?;
+        let mut source_event_repair_candidates: BTreeSet<_> = writer
+            .load_unqualified_session_event_facts()?
+            .into_iter()
+            .map(|fact| {
+                (
+                    fact.source.root_identity,
+                    fact.source.relative_path,
+                    fact.source.file_device,
+                    fact.source.file_inode,
+                    fact.source.prefix_generation,
+                )
+            })
+            .collect();
+        source_event_repair_candidates.extend(
+            writer
+                .load_session_collection_state()?
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint_requires_parser_reconstruction(checkpoint))
+                .map(source_verification_key),
+        );
         Ok(Self {
             config,
             writer,
@@ -3399,11 +4648,21 @@ impl Recorder {
             identity: None,
             _writer_lock: None,
             pending: None,
+            historical_pending: None,
+            historical_preparation_owned: false,
+            quota_replay_cursor: Default::default(),
             last_ranges: Vec::new(),
             task_backfill: TaskBackfillWorker::start(),
             activation_timestamp: None,
             lifecycle_intervals: vec![SessionLifecycleInterval::new(None, None)],
             account_boundary_epoch: None,
+            source_verifications: BTreeMap::new(),
+            source_parser_reconstructions: BTreeMap::new(),
+            source_event_repair_candidates,
+            source_original_reconstructions: BTreeMap::new(),
+            rejected_read_containers: BTreeMap::new(),
+            rejected_source_equivalences: BTreeMap::new(),
+            checkpoint_reconciliation_sources: BTreeSet::new(),
         })
     }
 
@@ -3419,6 +4678,22 @@ impl Recorder {
             return Err(RecorderError::AccountBoundaryChanged);
         }
         Ok(self.writer.load_session_collection_state()?)
+    }
+
+    /// Carry native missing-source candidates into the existing guarded
+    /// collection. These physical keys only schedule reads, never admit data.
+    pub fn prioritize_active_thread_sources(&mut self, sources: &[RecordedSessionSource]) {
+        self.checkpoint_reconciliation_sources = sources
+            .iter()
+            .map(|source| {
+                (
+                    source.root_identity.clone(),
+                    source.relative_path.clone(),
+                    source.file_device,
+                    source.file_inode,
+                )
+            })
+            .collect();
     }
 
     /// Persist the display label through the already-owned current account
@@ -3555,17 +4830,21 @@ impl Recorder {
     where
         F: FnOnce() -> bool,
     {
-        let applied = self.writer.applied_quota_receipt_ids()?;
-        let batch = quota_journal::read_unapplied(data_root, account_scope, &applied)
-            .map_err(RecorderError::Invalid)?;
+        let (batch, next_cursor) =
+            quota_journal::read_incremental(data_root, account_scope, &self.quota_replay_cursor)
+                .map_err(RecorderError::Invalid)?;
         let _epoch_fence = account_epoch_commit_fence()?;
         if account_boundary_changed() || !commit_guard() {
             return Err(RecorderError::AccountBoundaryChanged);
         }
+        self.writer
+            .stage_official_quota_inputs(&batch.official_inputs)?;
+        let generation = self
+            .writer
+            .commit_quota_receipts(&batch.receipts, batch.latest_input_unresolved)?;
+        self.quota_replay_cursor = next_cursor;
         Ok(QuotaReplayOutcome {
-            generation: self
-                .writer
-                .commit_quota_receipts(&batch.receipts, batch.latest_input_unresolved)?,
+            generation,
             unresolved: batch.unresolved,
             latest_input_unresolved: batch.latest_input_unresolved.unwrap_or(false),
         })
@@ -3604,6 +4883,41 @@ impl Recorder {
         self.run_cycle_with_quota_guarded(quota, commit_guard)
     }
 
+    /// The resident account owner supplies its current raw epoch as well as
+    /// the final registry/lease fence. Parser/storage adapters above do not
+    /// claim that external account acquisition has happened.
+    pub fn run_account_cycle_with_stored_quota_guarded<F>(
+        &mut self,
+        home: &Path,
+        epoch: &AccountEpochProof,
+        commit_guard: F,
+    ) -> Result<Option<CycleReport>, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let partition = self.identity.clone().ok_or_else(|| {
+            RecorderError::Invalid("account collection requires a partition".into())
+        })?;
+        let quota = self
+            .writer
+            .latest_quota_receipt()?
+            .map(|receipt| QuotaSnapshot {
+                observed_at: receipt.observed_at,
+                reset_at: receipt.reset_at,
+                window_seconds: receipt.window_seconds,
+                remaining_percent: Some(receipt.remaining_percent),
+            });
+        self.run_cycle_with_source_context(
+            quota,
+            Some(SourceAccountContext {
+                home,
+                epoch,
+                partition,
+            }),
+            commit_guard,
+        )
+    }
+
     /// Collect one cycle while optionally admitting a quota observation from
     /// the independent app-server lane. A rejected or failed quota candidate
     /// never blocks local Session progress; a successful boundary resets only
@@ -3628,11 +4942,41 @@ impl Recorder {
     where
         F: FnOnce() -> bool,
     {
+        self.run_cycle_with_source_context(quota, None, commit_guard)
+    }
+
+    fn run_cycle_with_source_context<F>(
+        &mut self,
+        quota: Option<QuotaSnapshot>,
+        source_context: Option<SourceAccountContext<'_>>,
+        commit_guard: F,
+    ) -> Result<Option<CycleReport>, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        if source_context
+            .as_ref()
+            .is_some_and(|context| !context.epoch.validate_current(context.home))
+        {
+            self.pending = None;
+            let _ = commit_guard();
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
         if account_boundary_changed() {
             self.pending = None;
             return Err(RecorderError::AccountBoundaryChanged);
         }
         if self.pending.is_some() {
+            if let Some(context) = source_context.as_ref() {
+                let qualification = self.pending_account_sources_match(context);
+                if !matches!(qualification, Ok(true)) {
+                    self.pending = None;
+                    let _ = commit_guard();
+                    return Err(qualification.err().unwrap_or_else(|| {
+                        RecorderError::Invalid("pending source qualification changed".into())
+                    }));
+                }
+            }
             if account_boundary_changed() || !commit_guard() {
                 self.pending = None;
                 return Err(RecorderError::AccountBoundaryChanged);
@@ -3640,6 +4984,13 @@ impl Recorder {
             return self.commit_pending().map(Some);
         }
 
+        let period_attribution = source_context
+            .as_ref()
+            .map(|context| {
+                self.writer
+                    .prepare_period_attribution(&context.partition, &self.lifecycle_intervals)
+            })
+            .transpose()?;
         let state = self.writer.load_session_collection_state()?;
         // Pending parser evidence survives process restarts. Keep it in the
         // cycle's degraded decision even when the current source scan starts
@@ -3747,22 +5098,37 @@ impl Recorder {
         let mut checkpoints = Vec::new();
         let mut ranges = Vec::new();
         let mut durable_events = Vec::new();
+        let mut qualified_events = Vec::new();
+        let mut response_replays = Vec::new();
+        let canonical_sources = self.writer.canonical_source_snapshot()?;
+        let mut source_repairs = Vec::new();
+        let mut source_repair_inputs = None;
         let mut token_observed_at = Vec::new();
         let mut token_anchor_recoveries = Vec::new();
         let mut token_anchor_resolutions = Vec::new();
         let mut old_epoch_no_delta_proofs = Vec::<SessionPendingRange>::new();
         let mut pending_evidence = inventory_failures
             .into_iter()
-            .map(|failure| {
-                pending_inventory_failure(
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+            .map(|(index, failure)| {
+                let ordinal = u128::try_from(index)
+                    .ok()
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| {
+                        RecorderError::Invalid("inventory diagnostic count overflow".to_owned())
+                    })?;
+                Ok(pending_inventory_failure(
                     inventory_root.clone(),
                     failure,
                     collector_epoch,
                     cycle_seq,
-                )
+                    ordinal,
+                ))
             })
-            .collect::<Vec<_>>();
-        let mut consumed_budget = 0_u64;
+            .collect::<Result<Vec<_>, RecorderError>>()?;
+        let mut consumed_budget = 0;
         let mut pending_ranges = pending_evidence.len();
         let mut current_cycle_unresolved = !pending_evidence.is_empty();
         if durable_pending_count != 0 {
@@ -3787,7 +5153,7 @@ impl Recorder {
         } else {
             0
         };
-        let replayed_events = if period_restarted && period_available {
+        let mut replayed_events = if period_restarted && period_available {
             self.writer
                 .load_session_events()?
                 .into_iter()
@@ -3809,7 +5175,7 @@ impl Recorder {
         for event in &replayed_events {
             totals.add(&event.model, event.delta)?;
         }
-        let initial_totals = totals.clone();
+        let mut initial_totals = totals.clone();
         // The writer exposes one canonical logical event stream. Keep that
         // stream as the admission set while this cycle scans sources so an
         // account-switch/restart prefix replay is removed before it reaches
@@ -3817,14 +5183,76 @@ impl Recorder {
         // non-identical record remains normal source data.
         let mut admitted_session_events = self.writer.load_session_events()?;
 
+        let mut source_verifications = BTreeMap::new();
+        let mut source_binding_cycle: Option<Result<SourceBindingCycle, String>> = None;
+        self.source_parser_reconstructions.retain(|key, _| {
+            sources.iter().any(|source| {
+                key.0 == source.recorded.root_identity
+                    && key.1 == source.recorded.relative_path
+                    && key.2 == source.recorded.file_device
+                    && key.3 == source.recorded.file_inode
+            })
+        });
         let source_count = sources.len();
         let first_source = if source_count == 0 {
             0
         } else {
             usize::try_from(cycle_seq % source_count as u64).unwrap_or(0)
         };
-        for logical_index in 0..source_count {
-            let source = &sources[(first_source + logical_index) % source_count];
+        let mut current_checkpoints = BTreeMap::new();
+        for checkpoint in &state.checkpoints {
+            let key = (
+                checkpoint.root_identity.as_str(),
+                checkpoint.relative_path.as_str(),
+                checkpoint.file_device,
+                checkpoint.file_inode,
+            );
+            let current = current_checkpoints.entry(key).or_insert(checkpoint);
+            if checkpoint.cycle_seq > current.cycle_seq {
+                *current = checkpoint;
+            }
+        }
+        let mut source_order = (0..source_count)
+            .map(|index| (first_source + index) % source_count)
+            .collect::<Vec<_>>();
+        let reconciliation_sources = self
+            .checkpoint_reconciliation_sources
+            .iter()
+            .map(|(root, path, device, inode)| (root.as_str(), path.as_str(), *device, *inode))
+            .collect::<BTreeSet<_>>();
+        // Keep the rotating order within each group. A source whose parser
+        // and account binding are already saved can consume its new suffix
+        // before old NULL parser reconstruction spends the shared budget.
+        // This only schedules reads; all original prefix and commit guards
+        // below still decide whether the bytes can be accepted.
+        source_order.sort_by_key(|index| {
+            let source = &sources[*index].recorded;
+            let key = (
+                source.root_identity.as_str(),
+                source.relative_path.as_str(),
+                source.file_device,
+                source.file_inode,
+            );
+            if reconciliation_sources.contains(&key) {
+                // The finite Thread recovery must attempt the missing native
+                // source, not spend its unchanged budget on unrelated replay.
+                // Only the ordinary scanner and transaction can admit it.
+                0
+            } else if current_checkpoints.get(&key).is_some_and(|checkpoint| {
+                checkpoint.committed_offset < source.file_bytes
+                    && !checkpoint_requires_parser_reconstruction(checkpoint)
+                    && checkpoint
+                        .source_admission
+                        .as_ref()
+                        .is_some_and(|state| state.account_binding.is_some())
+            }) {
+                1
+            } else {
+                2
+            }
+        });
+        for index in source_order {
+            let source = &sources[index];
             let source_token_anchor_recovery =
                 durable_token_anchor_recoveries.iter().find(|recovery| {
                     recovery.current_root_identity == source.recorded.root_identity
@@ -3853,6 +5281,36 @@ impl Recorder {
                         && checkpoint.file_inode == source.recorded.file_inode
                 })
                 .max_by_key(|checkpoint| checkpoint.cycle_seq);
+            if self.historical_preparation_owned {
+                if let Some(checkpoint) = current_checkpoint.filter(|checkpoint| {
+                    checkpoint_covers_observed_end(Some(checkpoint), source)
+                        || checkpoint_requires_parser_reconstruction(checkpoint)
+                }) {
+                    // No new bytes require admission at an unchanged EOF.
+                    // Re-reading its accepted prefix belongs to the historical
+                    // owner. A missing parser state also waits there; never
+                    // promote that cursor or block another source's append.
+                    if checkpoint_requires_parser_reconstruction(checkpoint)
+                        || path_has_legacy_anchor_pending
+                        || path_has_token_anchor_recovery
+                        || self
+                            .source_event_repair_candidates
+                            .contains(&source_verification_key(checkpoint))
+                        || checkpoint_can_recover_response_prefix(checkpoint, &durable_pending)
+                    {
+                        pending_ranges = pending_ranges.saturating_add(1);
+                        current_cycle_unresolved = true;
+                        pending_evidence.push(pending_source_issue(
+                            source,
+                            Some(checkpoint),
+                            collector_epoch,
+                            cycle_seq,
+                            "source-original-qualification-unresolved",
+                        ));
+                    }
+                    continue;
+                }
+            }
             let legacy_replay =
                 if source_token_anchor_recovery.is_none() && !path_has_token_anchor_recovery {
                     legacy_pending_replay(
@@ -3909,22 +5367,111 @@ impl Recorder {
                 .as_ref()
                 .map(|legacy| &legacy.strict_prior)
                 .or_else(|| prior_checkpoint(&state.checkpoints, source));
-            let baseline_existing = boundary_not_committed
-                || baseline_new_partition
-                || (state.collector_epoch == Some(collector_epoch)
-                    && prior
-                        .is_some_and(|checkpoint| checkpoint.collector_epoch != collector_epoch));
+            let baseline_existing = source_context.is_none()
+                && (boundary_not_committed
+                    || baseline_new_partition
+                    || (state.collector_epoch == Some(collector_epoch)
+                        && prior.is_some_and(|checkpoint| {
+                            checkpoint.collector_epoch != collector_epoch
+                        })));
             // At process start the first absolute token counter in each
             // already-present source is a baseline, not usage since zero. A
             // source discovered after a committed cycle is new activity and
             // therefore still starts from zero. Account transitions retain
             // their stronger physical-EOF boundary above.
-            let baseline_first_counter = state.data_generation == 0
+            let baseline_first_counter = source_context.is_none()
+                && state.data_generation == 0
                 && state.checkpoints.is_empty()
                 && prior.is_none()
                 && !baseline_existing;
+            let recovery_for_scan = source_token_anchor_recovery.or_else(|| {
+                legacy_replay
+                    .as_ref()
+                    .and_then(|legacy| legacy.recovery.as_ref())
+            });
+            let pending_for_scan = legacy_replay
+                .as_ref()
+                .map(|legacy| &legacy.pending)
+                .or_else(|| source_token_anchor_recovery.map(|recovery| &recovery.pending));
+            let reconstruct_parser = !baseline_existing
+                && legacy_replay.is_none()
+                && recovery_for_scan.is_none()
+                && prior.is_some_and(checkpoint_requires_parser_reconstruction);
+            let recover_response_prefix = !self.historical_preparation_owned
+                && !baseline_existing
+                && legacy_replay.is_none()
+                && recovery_for_scan.is_none()
+                && prior.is_some_and(|checkpoint| {
+                    checkpoint_can_recover_response_prefix(checkpoint, &durable_pending)
+                        && source_context.as_ref().is_some_and(|context| {
+                            checkpoint
+                                .source_admission
+                                .as_ref()
+                                .and_then(|state| state.account_binding.as_ref())
+                                .is_some_and(|binding| binding.partition == context.partition)
+                        })
+                        && !self
+                            .source_event_repair_candidates
+                            .contains(&source_verification_key(checkpoint))
+                });
+            if !reconstruct_parser && !recover_response_prefix {
+                if let Some(checkpoint) = prior {
+                    self.source_parser_reconstructions
+                        .remove(&source_verification_key(checkpoint));
+                }
+            }
+            let saved_prefix = prior
+                .filter(|checkpoint| {
+                    !baseline_existing
+                        && legacy_replay.is_none()
+                        && (checkpoint.collector_epoch == collector_epoch
+                            || source_context.is_some())
+                        && checkpoint.committed_offset > 0
+                        && (checkpoint.source_admission.is_some() || reconstruct_parser)
+                        && checkpoint_can_resume_offset(checkpoint, source)
+                })
+                .map(|checkpoint| {
+                    self.writer
+                        .load_session_ranges_for_checkpoint(checkpoint)
+                        .map(|ranges| (checkpoint, ranges))
+                })
+                .transpose()?;
+            let fingerprint = source_fingerprint(source).ok().flatten();
+            if let Some((checkpoint, ranges)) = saved_prefix.as_ref() {
+                if let Some(verified) = self
+                    .source_verifications
+                    .get(&source_verification_key(checkpoint))
+                    .filter(|verified| {
+                        ((!reconstruct_parser && !recover_response_prefix)
+                            || !verified.prefix_matches)
+                            && !self
+                                .source_event_repair_candidates
+                                .contains(&source_verification_key(checkpoint))
+                            && fingerprint.as_ref() == Some(&verified.fingerprint)
+                            && verified.checkpoint == **checkpoint
+                            && verified.ranges == *ranges
+                            && verified.account_boundary_epoch == self.account_boundary_epoch
+                            && verified.lifecycle_intervals == self.lifecycle_intervals
+                    })
+                {
+                    source_verifications
+                        .insert(source_verification_key(checkpoint), verified.clone());
+                    if !verified.prefix_matches {
+                        pending_ranges = pending_ranges.saturating_add(1);
+                        current_cycle_unresolved = true;
+                        pending_evidence.push(pending_source_issue(
+                            source,
+                            prior,
+                            collector_epoch,
+                            cycle_seq,
+                            "source-prefix-unverified",
+                        ));
+                    }
+                    continue;
+                }
+            }
             if consumed_budget >= self.config.chunk_bytes && !baseline_existing {
-                if checkpoint_covers_observed_end(prior, source) {
+                if checkpoint_covers_observed_end(prior, source) && !reconstruct_parser {
                     continue;
                 }
                 if baseline_first_counter {
@@ -3945,15 +5492,613 @@ impl Recorder {
                 ));
                 continue;
             }
-            let recovery_for_scan = source_token_anchor_recovery.or_else(|| {
-                legacy_replay
+            let prefix_matches = || {
+                saved_prefix
                     .as_ref()
-                    .and_then(|legacy| legacy.recovery.as_ref())
-            });
-            let pending_for_scan = legacy_replay
-                .as_ref()
-                .map(|legacy| &legacy.pending)
-                .or_else(|| source_token_anchor_recovery.map(|recovery| &recovery.pending));
+                    .map_or(Ok(Some(true)), |(checkpoint, ranges)| {
+                        saved_source_prefix_matches(source, checkpoint, ranges)
+                    })
+            };
+            let replay_prefix_unchanged =
+                saved_prefix.as_ref().is_some_and(|(checkpoint, ranges)| {
+                    self.source_parser_reconstructions
+                        .get(&source_verification_key(checkpoint))
+                        .or_else(|| {
+                            self.source_original_reconstructions
+                                .get(&source_verification_key(checkpoint))
+                        })
+                        .is_some_and(|reconstruction| {
+                            reconstruction.matches(
+                                checkpoint,
+                                ranges,
+                                self.account_boundary_epoch,
+                                &self.lifecycle_intervals,
+                            ) && fingerprint.as_ref().is_some_and(|current| {
+                                reconstruction.fingerprint.as_ref() == Some(current)
+                            })
+                        })
+                });
+            let prefix_before = if replay_prefix_unchanged {
+                Some(true)
+            } else {
+                prefix_matches().unwrap_or(None)
+            };
+            if prefix_before != Some(true) {
+                if prefix_before == Some(false) {
+                    if let Some((checkpoint, ranges)) = saved_prefix.as_ref() {
+                        if let Some(fingerprint) = fingerprint.as_ref().filter(|before| {
+                            source_fingerprint(source).ok().flatten().as_ref() == Some(*before)
+                        }) {
+                            source_verifications.insert(
+                                source_verification_key(checkpoint),
+                                SourceVerification {
+                                    fingerprint: fingerprint.clone(),
+                                    checkpoint: (*checkpoint).clone(),
+                                    ranges: ranges.clone(),
+                                    prefix_matches: false,
+                                    account_boundary_epoch: self.account_boundary_epoch,
+                                    lifecycle_intervals: self.lifecycle_intervals.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+                pending_ranges = pending_ranges.saturating_add(1);
+                current_cycle_unresolved = true;
+                pending_evidence.push(pending_source_issue(
+                    source,
+                    prior,
+                    collector_epoch,
+                    cycle_seq,
+                    "source-prefix-unverified",
+                ));
+                continue;
+            }
+            if reconstruct_parser {
+                // A missing parser state cannot make a nonzero offset safe.
+                // Reconstruct qualification first; old numeric events never
+                // enter this cycle's admission or projection vectors.
+                if let Some((checkpoint, accepted_ranges)) = saved_prefix.as_ref() {
+                    let key = source_verification_key(checkpoint);
+                    let reconstruction = self
+                        .source_parser_reconstructions
+                        .entry(key)
+                        .or_insert_with(|| SourceParserReconstruction {
+                            numeric_events: Vec::new(),
+                            counter_proofs: Vec::new(),
+                            numeric_records: Vec::new(),
+                            original: (*checkpoint).clone(),
+                            ranges: accepted_ranges.clone(),
+                            fingerprint: None,
+                            account_boundary_epoch: self.account_boundary_epoch,
+                            lifecycle_intervals: self.lifecycle_intervals.clone(),
+                            replayed: None,
+                            pending: Vec::new(),
+                            raw_conflict: false,
+                            qualification_attempted: false,
+                            read_container: None,
+                        });
+                    if !reconstruction.matches(
+                        checkpoint,
+                        accepted_ranges,
+                        self.account_boundary_epoch,
+                        &self.lifecycle_intervals,
+                    ) {
+                        *reconstruction = SourceParserReconstruction {
+                            numeric_events: Vec::new(),
+                            counter_proofs: Vec::new(),
+                            numeric_records: Vec::new(),
+                            original: (*checkpoint).clone(),
+                            ranges: accepted_ranges.clone(),
+                            fingerprint: None,
+                            account_boundary_epoch: self.account_boundary_epoch,
+                            lifecycle_intervals: self.lifecycle_intervals.clone(),
+                            replayed: None,
+                            pending: Vec::new(),
+                            raw_conflict: false,
+                            qualification_attempted: false,
+                            read_container: None,
+                        };
+                    }
+                    let replay_ownership = source_context.as_ref().map(|_| SourceOwnership {
+                        intervals: &self.lifecycle_intervals,
+                        eligible_from: checkpoint
+                            .source_admission
+                            .as_ref()
+                            .and_then(|state| state.account_binding.as_ref())
+                            .and_then(|binding| match binding.proof {
+                                SourceBindingProof::Rpc { began_at, .. } => Some(began_at),
+                                _ => None,
+                            }),
+                    });
+                    let advanced = reconstruction.advance(
+                        source,
+                        self.config.chunk_bytes.saturating_sub(consumed_budget),
+                        cycle_seq,
+                        replay_ownership.as_ref(),
+                    );
+                    let after = source_fingerprint(source).ok().flatten();
+                    let prefix_after = if fingerprint.is_some() && fingerprint == after {
+                        Some(true)
+                    } else {
+                        prefix_matches().unwrap_or(None)
+                    };
+                    match advanced {
+                        Ok(bytes) if prefix_after == Some(true) => {
+                            consumed_budget = consumed_budget.saturating_add(bytes);
+                            reconstruction.fingerprint = after;
+                            let sealed_repair = source_context.is_some()
+                                && self
+                                    .source_event_repair_candidates
+                                    .contains(&source_verification_key(checkpoint));
+                            let qualification = if sealed_repair {
+                                reconstruction.original_repair_checkpoint()
+                            } else {
+                                reconstruction.qualified_checkpoint(cycle_seq)
+                            };
+                            if let Some(mut qualified) = qualification {
+                                if sealed_repair {
+                                    let context =
+                                        source_context.as_ref().expect("qualified partition");
+                                    let prepared = period_attribution
+                                        .as_ref()
+                                        .expect("partition period evidence");
+                                    let binding = checkpoint
+                                        .source_admission
+                                        .as_ref()
+                                        .and_then(|state| state.account_binding.as_ref())
+                                        .cloned()
+                                        .or(historical_source_binding(
+                                            &context.partition,
+                                            source,
+                                            &qualified,
+                                            &self.lifecycle_intervals,
+                                        )?);
+                                    let result = if let (
+                                        Some(binding),
+                                        Some(database),
+                                        Some(identity),
+                                    ) =
+                                        (binding, self.database.as_ref(), self.identity.as_ref())
+                                    {
+                                        prepare_original_event_qualification(
+                                            &mut self.writer,
+                                            reconstruction,
+                                            OriginalQualificationInput {
+                                                source,
+                                                checkpoint,
+                                                accepted: accepted_ranges,
+                                                binding: &binding,
+                                                prepared,
+                                                ownership: replay_ownership.as_ref(),
+                                                database,
+                                                identity,
+                                                repair_inputs: &mut source_repair_inputs,
+                                                budget: 0,
+                                            },
+                                        )
+                                    } else {
+                                        Err(RecorderError::Invalid(
+                                            "original parser has no accepted account fence".into(),
+                                        ))
+                                    };
+                                    match result {
+                                        Ok((_, Some(repair))) => {
+                                            qualified = repair.verification_checkpoint().clone();
+                                            source_repairs.push(repair);
+                                        }
+                                        Ok((_, None)) => continue,
+                                        Err(error) => {
+                                            eprintln!("recorder original parser repair unavailable: {error}");
+                                            pending_evidence.push(pending_source_issue(
+                                                source,
+                                                prior,
+                                                collector_epoch,
+                                                cycle_seq,
+                                                "source-original-qualification-unresolved",
+                                            ));
+                                            current_cycle_unresolved = true;
+                                            continue;
+                                        }
+                                    }
+                                    qualified.cycle_seq = cycle_seq;
+                                }
+                                checkpoints.push(qualified);
+                                if !reconstruction.pending.is_empty() {
+                                    current_cycle_unresolved = true;
+                                    pending_ranges =
+                                        pending_ranges.saturating_add(reconstruction.pending.len());
+                                    pending_evidence.extend(
+                                        reconstruction.pending.iter().cloned().map(
+                                            |mut pending| {
+                                                pending.collector_epoch = collector_epoch;
+                                                pending.cycle_seq = cycle_seq;
+                                                pending
+                                            },
+                                        ),
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                        _ => {
+                            // Do not retain parser state derived during an
+                            // unverified read, including a changed old prefix.
+                            reconstruction.fingerprint = None;
+                            reconstruction.replayed = None;
+                            reconstruction.pending.clear();
+                            reconstruction.raw_conflict = false;
+                        }
+                    }
+                    pending_evidence.push(pending_source_issue(
+                        source,
+                        prior,
+                        collector_epoch,
+                        cycle_seq,
+                        if reconstruction.raw_conflict {
+                            "source-parser-state-conflict"
+                        } else {
+                            "source-parser-state-backlog"
+                        },
+                    ));
+                } else {
+                    pending_evidence.push(pending_source_issue(
+                        source,
+                        prior,
+                        collector_epoch,
+                        cycle_seq,
+                        "source-parser-state-unverified",
+                    ));
+                }
+                pending_ranges = pending_ranges.saturating_add(1);
+                current_cycle_unresolved = true;
+                continue;
+            }
+            if recover_response_prefix
+                && !self.checkpoint_reconciliation_sources.contains(&(
+                    source.recorded.root_identity.clone(),
+                    source.recorded.relative_path.clone(),
+                    source.recorded.file_device,
+                    source.recorded.file_inode,
+                ))
+            {
+                if let Some((checkpoint, accepted)) =
+                    saved_prefix.as_ref().filter(|(checkpoint, ranges)| {
+                        checkpoint.committed_offset == source.recorded.file_bytes
+                            && source_ranges_cover_checkpoint(
+                                checkpoint,
+                                ranges,
+                                source.recorded.file_bytes,
+                            )
+                    })
+                {
+                    let key = source_verification_key(checkpoint);
+                    let recovery = self
+                        .source_parser_reconstructions
+                        .entry(key.clone())
+                        .or_insert_with(|| SourceParserReconstruction {
+                            original: (*checkpoint).clone(),
+                            ranges: accepted.clone(),
+                            fingerprint: None,
+                            account_boundary_epoch: self.account_boundary_epoch,
+                            lifecycle_intervals: self.lifecycle_intervals.clone(),
+                            replayed: None,
+                            pending: Vec::new(),
+                            raw_conflict: false,
+                            qualification_attempted: false,
+                            read_container: None,
+                            numeric_events: Vec::new(),
+                            counter_proofs: Vec::new(),
+                            numeric_records: Vec::new(),
+                        });
+                    if !recovery.matches(
+                        checkpoint,
+                        accepted,
+                        self.account_boundary_epoch,
+                        &self.lifecycle_intervals,
+                    ) {
+                        *recovery = SourceParserReconstruction {
+                            original: (*checkpoint).clone(),
+                            ranges: accepted.clone(),
+                            fingerprint: None,
+                            account_boundary_epoch: self.account_boundary_epoch,
+                            lifecycle_intervals: self.lifecycle_intervals.clone(),
+                            replayed: None,
+                            pending: Vec::new(),
+                            raw_conflict: false,
+                            qualification_attempted: false,
+                            read_container: None,
+                            numeric_events: Vec::new(),
+                            counter_proofs: Vec::new(),
+                            numeric_records: Vec::new(),
+                        };
+                    }
+                    let mut qualified_replays = None;
+                    if !recovery.qualification_attempted {
+                        let binding = checkpoint
+                            .source_admission
+                            .as_ref()
+                            .and_then(|state| state.account_binding.as_ref())
+                            .expect("recovery binding");
+                        let ownership = SourceOwnership {
+                            intervals: &self.lifecycle_intervals,
+                            eligible_from: match binding.proof {
+                                SourceBindingProof::Rpc { began_at, .. } => Some(began_at),
+                                SourceBindingProof::AcceptedPrefix { .. } => None,
+                            },
+                        };
+                        let advanced = recovery.advance(
+                            source,
+                            self.config.chunk_bytes.saturating_sub(consumed_budget),
+                            cycle_seq,
+                            Some(&ownership),
+                        );
+                        let after = source_fingerprint(source).ok().flatten();
+                        let stable = (fingerprint.is_some() && fingerprint == after)
+                            || prefix_matches().unwrap_or(None) == Some(true);
+                        match advanced {
+                            Ok(bytes) if stable => {
+                                consumed_budget = consumed_budget.saturating_add(bytes);
+                                recovery.fingerprint = after;
+                                if recovery.replayed.as_ref().is_some_and(|replayed| {
+                                    replayed.committed_offset == checkpoint.committed_offset
+                                }) {
+                                    // A terminal failure is retained alongside bounded
+                                    // progress; it cannot cause a same-prefix full retry.
+                                    recovery.qualification_attempted = true;
+                                    if !recovery.raw_conflict {
+                                        #[cfg(test)]
+                                        SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| {
+                                            let (reads, batches) = counts.get();
+                                            counts.set((reads, batches + 1));
+                                        });
+                                        if let Ok(canonical) =
+                                            self.writer.canonical_events_for_checkpoint(checkpoint)
+                                        {
+                                            qualified_replays =
+                                                recovery.response_prefix_replays(&canonical);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                recovery.qualification_attempted = true;
+                                recovery.raw_conflict = true;
+                                recovery.fingerprint = after;
+                            }
+                        }
+                    }
+                    if let Some(replays) = qualified_replays {
+                        // A rejected account/commit guard must be able to
+                        // resubmit this proof without rereading the prefix.
+                        recovery.qualification_attempted = false;
+                        let mut qualified = (*checkpoint).clone();
+                        qualified.fully_attributed_from_zero = true;
+                        qualified.cycle_seq = cycle_seq;
+                        if let Some(fingerprint) = recovery.fingerprint.clone() {
+                            source_verifications.insert(
+                                key,
+                                SourceVerification {
+                                    fingerprint,
+                                    checkpoint: qualified.clone(),
+                                    ranges: accepted.clone(),
+                                    prefix_matches: true,
+                                    account_boundary_epoch: self.account_boundary_epoch,
+                                    lifecycle_intervals: self.lifecycle_intervals.clone(),
+                                },
+                            );
+                        }
+                        checkpoints.push(qualified);
+                        response_replays.extend(replays);
+                    } else {
+                        current_cycle_unresolved = true;
+                        pending_ranges = pending_ranges.saturating_add(1);
+                        pending_evidence.push(pending_source_issue(
+                            source,
+                            prior,
+                            collector_epoch,
+                            cycle_seq,
+                            if recovery.qualification_attempted {
+                                "source-original-qualification-unresolved"
+                            } else {
+                                "source-parser-state-backlog"
+                            },
+                        ));
+                    }
+                    continue;
+                }
+            }
+            let mut proposed_binding = None;
+            let ownership = if let Some(context) = source_context.as_ref() {
+                if let Some((checkpoint, _)) = saved_prefix.as_ref() {
+                    if let Some(binding) = checkpoint
+                        .source_admission
+                        .as_ref()
+                        .and_then(|state| state.account_binding.as_ref())
+                    {
+                        if binding.partition != context.partition
+                            || !binding.matches_checkpoint(checkpoint)
+                        {
+                            return Err(RecorderError::Invalid(
+                                "stored source binding mismatch".into(),
+                            ));
+                        }
+                        proposed_binding = Some(binding.clone());
+                    } else {
+                        proposed_binding = match historical_source_binding(
+                            &context.partition,
+                            source,
+                            checkpoint,
+                            &self.lifecycle_intervals,
+                        ) {
+                            Ok(binding) => binding,
+                            Err(_) => {
+                                pending_ranges = pending_ranges.saturating_add(1);
+                                current_cycle_unresolved = true;
+                                pending_evidence.push(pending_source_issue(
+                                    source,
+                                    prior,
+                                    collector_epoch,
+                                    cycle_seq,
+                                    "source-binding-anchor-unverified",
+                                ));
+                                continue;
+                            }
+                        };
+                    }
+                }
+                let eligible_from = if let Some(binding) = proposed_binding.as_ref() {
+                    match binding.proof {
+                        SourceBindingProof::Rpc { began_at, .. } => Some(began_at),
+                        SourceBindingProof::AcceptedPrefix { .. } => None,
+                    }
+                } else {
+                    let cycle = source_binding_cycle
+                        .get_or_insert_with(|| SourceBindingCycle::start(context));
+                    let Ok(cycle) = cycle else {
+                        if !context.epoch.validate_current(context.home) {
+                            let _ = commit_guard();
+                            return Err(RecorderError::AccountBoundaryChanged);
+                        }
+                        current_cycle_unresolved = true;
+                        pending_ranges = pending_ranges.saturating_add(1);
+                        pending_evidence.push(pending_source_issue(
+                            source,
+                            prior,
+                            collector_epoch,
+                            cycle_seq,
+                            "source-account-binding-unavailable",
+                        ));
+                        continue;
+                    };
+                    Some(cycle.began_at)
+                };
+                Some(SourceOwnership {
+                    intervals: &self.lifecycle_intervals,
+                    eligible_from,
+                })
+            } else {
+                None
+            };
+            let source_totals_before = totals.clone();
+            if let (Some((checkpoint, accepted)), Some(binding), Some(prepared)) = (
+                saved_prefix.as_ref(),
+                proposed_binding.as_ref(),
+                period_attribution.as_ref(),
+            ) {
+                if self
+                    .source_event_repair_candidates
+                    .contains(&source_verification_key(checkpoint))
+                {
+                    if checkpoint.committed_offset < source.recorded.file_bytes {
+                        // The saved parser/binding and accepted prefix already
+                        // qualify normal append. Old numeric qualification is
+                        // a separate incomplete job; it cannot consume this
+                        // source's suffix budget before that append is read.
+                        current_cycle_unresolved = true;
+                        let mut unresolved_prefix = pending_source_issue(
+                            source,
+                            prior,
+                            collector_epoch,
+                            cycle_seq,
+                            "source-original-qualification-unresolved",
+                        );
+                        // This job starts at byte zero of the OLD prefix.
+                        // The suffix can have its own first-record pending
+                        // row at the saved C in this same transaction.
+                        unresolved_prefix.start_offset = 0;
+                        unresolved_prefix.end_offset = 0;
+                        pending_evidence.push(unresolved_prefix);
+                    } else if let (Some(database), Some(identity)) =
+                        (self.database.as_ref(), self.identity.as_ref())
+                    {
+                        let recovery = self
+                            .source_original_reconstructions
+                            .entry(source_verification_key(checkpoint))
+                            .or_insert_with(|| SourceParserReconstruction {
+                                original: (*checkpoint).clone(),
+                                ranges: accepted.clone(),
+                                fingerprint: None,
+                                account_boundary_epoch: self.account_boundary_epoch,
+                                lifecycle_intervals: self.lifecycle_intervals.clone(),
+                                replayed: None,
+                                pending: Vec::new(),
+                                raw_conflict: false,
+                                qualification_attempted: false,
+                                read_container: None,
+                                numeric_events: Vec::new(),
+                                counter_proofs: Vec::new(),
+                                numeric_records: Vec::new(),
+                            });
+                        if !recovery.matches(
+                            checkpoint,
+                            accepted,
+                            self.account_boundary_epoch,
+                            &self.lifecycle_intervals,
+                        ) {
+                            *recovery = SourceParserReconstruction {
+                                original: (*checkpoint).clone(),
+                                ranges: accepted.clone(),
+                                fingerprint: None,
+                                account_boundary_epoch: self.account_boundary_epoch,
+                                lifecycle_intervals: self.lifecycle_intervals.clone(),
+                                replayed: None,
+                                pending: Vec::new(),
+                                raw_conflict: false,
+                                qualification_attempted: false,
+                                read_container: None,
+                                numeric_events: Vec::new(),
+                                counter_proofs: Vec::new(),
+                                numeric_records: Vec::new(),
+                            };
+                        }
+                        if source_fingerprint(source).ok().flatten() == fingerprint {
+                            // prefix_before has just verified these ranges, or
+                            // reused the same process-local immutable proof.
+                            recovery.fingerprint = fingerprint.clone();
+                        }
+                        match prepare_original_event_qualification(
+                            &mut self.writer,
+                            recovery,
+                            OriginalQualificationInput {
+                                source,
+                                checkpoint,
+                                accepted,
+                                binding,
+                                prepared,
+                                ownership: ownership.as_ref(),
+                                database,
+                                identity,
+                                repair_inputs: &mut source_repair_inputs,
+                                budget: self.config.chunk_bytes.saturating_sub(consumed_budget),
+                            },
+                        ) {
+                            Ok((read, repair)) => {
+                                consumed_budget = consumed_budget.saturating_add(read);
+                                if let Some(repair) = repair {
+                                    source_repairs.push(repair);
+                                } else {
+                                    current_cycle_unresolved = true;
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "recorder original event qualification unavailable: {error}"
+                                );
+                                current_cycle_unresolved = true;
+                                pending_evidence.push(pending_source_issue(
+                                    source,
+                                    prior,
+                                    collector_epoch,
+                                    cycle_seq,
+                                    "source-original-qualification-unresolved",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            let source_events_before = events.len();
             let result = scan_source(
                 source,
                 prior,
@@ -3969,6 +6114,7 @@ impl Recorder {
                 legacy_replay
                     .as_ref()
                     .map(|legacy| legacy.prefix_generation),
+                ownership.as_ref(),
                 &mut totals,
                 &mut events,
             );
@@ -4019,6 +6165,168 @@ impl Recorder {
                 ));
                 continue;
             };
+            if prefix_matches().unwrap_or(None) != Some(true) {
+                totals = source_totals_before;
+                events.truncate(source_events_before);
+                pending_ranges = pending_ranges.saturating_add(1);
+                current_cycle_unresolved = true;
+                pending_evidence.push(pending_source_issue(
+                    source,
+                    prior,
+                    collector_epoch,
+                    cycle_seq,
+                    "source-prefix-unverified",
+                ));
+                continue;
+            }
+            if let Some(context) = source_context.as_ref() {
+                let mut proven_ranges = saved_prefix
+                    .as_ref()
+                    .map_or_else(Vec::new, |(_, ranges)| ranges.clone());
+                proven_ranges.extend(result.range.iter().cloned());
+                proven_ranges.sort_unstable();
+                proven_ranges.dedup();
+                let binding = if let Some(binding) = proposed_binding {
+                    Ok(binding)
+                } else {
+                    match source_binding_cycle.as_mut() {
+                        Some(Ok(cycle)) => cycle.bind(
+                            context,
+                            &self.config.sessions_root,
+                            source,
+                            &result.checkpoint,
+                            &proven_ranges,
+                        ),
+                        _ => Err("source binding acquisition unavailable".into()),
+                    }
+                };
+                let conflict = source_binding_cycle
+                    .as_ref()
+                    .is_some_and(|cycle| cycle.as_ref().is_ok_and(|cycle| cycle.conflict));
+                if conflict {
+                    return Err(RecorderError::Invalid(
+                        "conflicting active source paths".into(),
+                    ));
+                }
+                if !context.epoch.validate_current(context.home) {
+                    let _ = commit_guard();
+                    return Err(RecorderError::AccountBoundaryChanged);
+                }
+                let mut qualified = false;
+                if let Ok(binding) = binding {
+                    let previous_binding = result
+                        .checkpoint
+                        .source_admission
+                        .as_ref()
+                        .and_then(|state| state.account_binding.as_ref())
+                        .cloned();
+                    if let Some(admission) = result.checkpoint.source_admission.as_mut() {
+                        admission.account_binding = Some(binding);
+                    }
+                    if let Some(admission) = result.checkpoint.source_admission.as_ref() {
+                        qualified = admission.valid(result.checkpoint.committed_offset)
+                            && admission.account_binding.as_ref().is_some_and(|binding| {
+                                binding.partition == context.partition
+                                    && binding.matches_checkpoint(&result.checkpoint)
+                            })
+                            && saved_source_prefix_matches(
+                                source,
+                                &result.checkpoint,
+                                &proven_ranges,
+                            )
+                            .ok()
+                            .flatten()
+                                == Some(true);
+                        if qualified && admission.account_binding != previous_binding {
+                            result.changed = true;
+                        }
+                    }
+                } else {
+                    // No second app-server is started for another unbound
+                    // source after this acquisition group has failed.
+                    source_binding_cycle = Some(Err("source binding acquisition failed".into()));
+                }
+                if !qualified {
+                    totals = source_totals_before;
+                    events.truncate(source_events_before);
+                    pending_ranges = pending_ranges.saturating_add(1);
+                    current_cycle_unresolved = true;
+                    pending_evidence.push(pending_source_issue(
+                        source,
+                        prior,
+                        collector_epoch,
+                        cycle_seq,
+                        "source-account-binding-unqualified",
+                    ));
+                    continue;
+                }
+            }
+            // Only a fully inspected, stable EOF can skip a future read.
+            // The map remains a candidate until the DB batch and readback
+            // below succeed; a rejected commit guard never promotes it.
+            if !baseline_existing
+                && legacy_replay.is_none()
+                && recovery_for_scan.is_none()
+                && result.checkpoint.source_admission.is_some()
+                && !result.unresolved
+                && result.pending.is_empty()
+            {
+                if let Some(fingerprint) = fingerprint.as_ref().filter(|before| {
+                    before.bytes == result.checkpoint.committed_offset
+                        && source_fingerprint(source).ok().flatten().as_ref() == Some(*before)
+                }) {
+                    let checkpoint = if result.changed {
+                        &result.checkpoint
+                    } else {
+                        prior.unwrap_or(&result.checkpoint)
+                    };
+                    let mut proven_ranges = saved_prefix
+                        .as_ref()
+                        .map_or_else(Vec::new, |(_, ranges)| ranges.clone());
+                    proven_ranges.extend(result.range.iter().cloned());
+                    proven_ranges.sort_unstable();
+                    proven_ranges.dedup();
+                    if source_ranges_cover_checkpoint(checkpoint, &proven_ranges, fingerprint.bytes)
+                    {
+                        source_verifications.insert(
+                            source_verification_key(checkpoint),
+                            SourceVerification {
+                                fingerprint: fingerprint.clone(),
+                                checkpoint: checkpoint.clone(),
+                                ranges: proven_ranges,
+                                prefix_matches: true,
+                                account_boundary_epoch: self.account_boundary_epoch,
+                                lifecycle_intervals: self.lifecycle_intervals.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            let mut ambiguous_lineage = false;
+            for candidate in &result.events {
+                if !canonical_sources.is_proved_replay(candidate)?
+                    && admitted_session_events
+                        .iter()
+                        .any(|old| session_event_has_ambiguous_lineage(old, candidate))
+                {
+                    ambiguous_lineage = true;
+                    break;
+                }
+            }
+            if ambiguous_lineage {
+                totals = source_totals_before;
+                events.truncate(source_events_before);
+                pending_ranges = pending_ranges.saturating_add(1);
+                current_cycle_unresolved = true;
+                pending_evidence.push(pending_source_issue(
+                    source,
+                    prior,
+                    collector_epoch,
+                    cycle_seq,
+                    "source-prefix-lineage-unresolved",
+                ));
+                continue;
+            }
             if result.token_anchor_resolution.is_none() {
                 if let Some(recovery) = recovery_for_scan {
                     result.pending.push(recovery.pending.clone());
@@ -4047,7 +6355,8 @@ impl Recorder {
             for event in result.events {
                 let replay = admitted_session_events
                     .iter()
-                    .any(|existing| session_event_is_replay(existing, &event));
+                    .any(|existing| session_event_is_replay(existing, &event))
+                    || canonical_sources.is_proved_replay(&event)?;
                 if replay {
                     if reset_at > 0
                         && event.timestamp >= window_start
@@ -4069,6 +6378,278 @@ impl Recorder {
                 }
             }
             result.events = admitted_events;
+            if let Some(binding) = result
+                .checkpoint
+                .source_admission
+                .as_ref()
+                .and_then(|state| state.account_binding.as_ref())
+            {
+                for event in &result.events {
+                    let proof = result
+                        .event_proofs
+                        .get(event.event_index as usize)
+                        .ok_or_else(|| {
+                            RecorderError::Invalid(
+                                "source event has no original numeric proof".into(),
+                            )
+                        })?;
+                    let intervals = self
+                        .lifecycle_intervals
+                        .iter()
+                        .filter(|interval| {
+                            interval.start_at.is_some_and(|start| {
+                                proof.before.pointer.timestamp >= start
+                                    && proof.after.pointer.timestamp >= start
+                                    && interval.end_at.is_none_or(|end| {
+                                        proof.before.pointer.timestamp < end
+                                            && proof.after.pointer.timestamp < end
+                                    })
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if intervals.len() != 1 {
+                        return Err(RecorderError::Invalid(
+                            "source event ownership is not unique".into(),
+                        ));
+                    }
+                    let mut fact = LosslessSessionEvent::from(event.clone());
+                    fact.admission = Some(EventAdmission {
+                        version: 1,
+                        source_binding: binding.clone(),
+                        verified_prefix_end: result.checkpoint.committed_offset,
+                        ownership: EventOwnership {
+                            start_at: intervals[0].start_at.expect("finite ownership start"),
+                            end_at: intervals[0].end_at,
+                        },
+                        numeric: NumericEventProof::LegacyCounter(Box::new(proof.clone())),
+                        period: None,
+                    });
+                    if !fact
+                        .admission
+                        .as_ref()
+                        .expect("provided admission")
+                        .valid_for(&fact, None)
+                    {
+                        return Err(RecorderError::Invalid(
+                            "source event qualification is invalid".into(),
+                        ));
+                    }
+                    if let Some(prepared) = period_attribution.as_ref() {
+                        prepared.assign(&mut fact)?;
+                    }
+                    qualified_events.push(fact);
+                }
+            }
+            if let Some(binding) = result
+                .checkpoint
+                .source_admission
+                .as_ref()
+                .and_then(|state| state.account_binding.clone())
+            {
+                let responses = result
+                    .checkpoint
+                    .source_admission
+                    .as_ref()
+                    .expect("source state")
+                    .responses
+                    .clone();
+                let mut resolved = Vec::new();
+                for candidate in responses {
+                    let Some(model) = candidate.qualified_model().map(str::to_owned) else {
+                        continue;
+                    };
+                    if candidate.record.usage.total == 0 {
+                        continue;
+                    }
+                    let owners = self
+                        .lifecycle_intervals
+                        .iter()
+                        .filter(|owner| {
+                            owner
+                                .start_at
+                                .is_some_and(|start| candidate.pointer.timestamp >= start)
+                                && owner
+                                    .end_at
+                                    .is_none_or(|end| candidate.pointer.timestamp < end)
+                        })
+                        .collect::<Vec<_>>();
+                    if owners.len() != 1 {
+                        continue;
+                    }
+                    let range = result
+                        .range
+                        .as_ref()
+                        .filter(|range| {
+                            range.start_offset <= candidate.pointer.start
+                                && range.end_offset >= candidate.pointer.end
+                        })
+                        .cloned()
+                        .or(self.writer.source_range_for_pointer(
+                            &result.checkpoint,
+                            candidate.pointer.start,
+                            candidate.pointer.end,
+                        )?);
+                    let Some(range) = range else {
+                        return Err(RecorderError::Invalid(
+                            "response root has no accepted original range".into(),
+                        ));
+                    };
+                    let usage = candidate.record.usage;
+                    let raw = SessionEvent {
+                        root_identity: range.root_identity,
+                        relative_path: range.relative_path,
+                        file_device: range.file_device,
+                        file_inode: range.file_inode,
+                        prefix_generation: range.prefix_generation,
+                        range_start: range.start_offset,
+                        range_end: range.end_offset,
+                        record_sha256: range.record_sha256,
+                        event_index: candidate.pointer.start,
+                        timestamp: candidate.pointer.timestamp,
+                        model,
+                        total_tokens: usage.total,
+                        input_tokens: Some(usage.input),
+                        cached_input_tokens: Some(usage.cached_input),
+                        cache_write_input_tokens: Some(usage.cache_write_input),
+                        output_tokens: Some(usage.output),
+                    };
+                    let mut fact = LosslessSessionEvent::from(raw.clone());
+                    fact.admission = Some(EventAdmission {
+                        version: 1,
+                        source_binding: binding.clone(),
+                        verified_prefix_end: result.checkpoint.committed_offset,
+                        ownership: EventOwnership {
+                            start_at: owners[0].start_at.expect("finite owner"),
+                            end_at: owners[0].end_at,
+                        },
+                        numeric: NumericEventProof::ResponseRecord {
+                            candidate: Box::new(candidate.clone()),
+                            legacy_family_exact_model: None,
+                        },
+                        period: None,
+                    });
+                    // Model classification does not prove account admission.
+                    // In particular, a root already on disk before this
+                    // source's first RPC binding remains an original pending
+                    // candidate; it must not abort other accepted appends.
+                    let existing=qualified_events.iter().chain(response_replays.iter()).find(|fact| {
+                        matches!(fact.admission.as_ref().map(|a|&a.numeric),Some(NumericEventProof::ResponseRecord {candidate:other,..}) if other.key==candidate.key)
+                    }).cloned().or(self.writer.response_event(&candidate.key)?);
+                    let lineage_unresolved = existing
+                        .as_ref()
+                        .is_none_or(|old| !codex_info_db_writer::same_response(old, &fact))
+                        && admitted_session_events
+                            .iter()
+                            .any(|old| session_event_has_ambiguous_lineage(old, &raw));
+                    if lineage_unresolved
+                        || !fact
+                            .admission
+                            .as_ref()
+                            .expect("response admission")
+                            .valid_for(&fact, None)
+                    {
+                        let mut pending = pending_source_issue(
+                            source,
+                            Some(&result.checkpoint),
+                            collector_epoch,
+                            cycle_seq,
+                            if lineage_unresolved {
+                                "response-prefix-lineage-unresolved"
+                            } else {
+                                "response-source-qualification-unresolved"
+                            },
+                        );
+                        pending.start_offset = candidate.pointer.start;
+                        pending.end_offset = candidate.pointer.end;
+                        let hash = (0..64)
+                            .step_by(2)
+                            .map(|offset| {
+                                candidate
+                                    .pointer
+                                    .sha256
+                                    .get(offset..offset + 2)
+                                    .and_then(|byte| u8::from_str_radix(byte, 16).ok())
+                            })
+                            .collect::<Option<Vec<_>>>()
+                            .ok_or_else(|| {
+                                RecorderError::Invalid("response root digest is invalid".into())
+                            })?;
+                        pending.record_sha256 = format!("{:x}", Sha256::digest(hash));
+                        pending.complete = true;
+                        result.pending.retain(|old| {
+                            !(old.start_offset == pending.start_offset
+                                && old.end_offset == pending.end_offset
+                                && old.reason == "response-qualification-pending")
+                        });
+                        result.pending.push(pending);
+                        result.unresolved = true;
+                        continue;
+                    }
+                    if let Some(prepared) = period_attribution.as_ref() {
+                        prepared.assign(&mut fact)?;
+                    }
+                    if let Some(existing) = existing {
+                        if codex_info_db_writer::same_response(&existing, &fact) {
+                            response_replays.push(fact);
+                        } else {
+                            if let Some(pending) = result.pending.iter_mut().find(|pending| {
+                                pending.start_offset == candidate.pointer.start
+                                    && pending.end_offset == candidate.pointer.end
+                            }) {
+                                pending.reason = "response-record-conflict".into();
+                            } else {
+                                let mut pending = pending_source_issue(
+                                    source,
+                                    Some(&result.checkpoint),
+                                    collector_epoch,
+                                    cycle_seq,
+                                    "response-record-conflict",
+                                );
+                                pending.start_offset = candidate.pointer.start;
+                                pending.prefix_generation = result.checkpoint.prefix_generation;
+                                pending.end_offset = candidate.pointer.end;
+                                let bytes = (0..64)
+                                    .step_by(2)
+                                    .map(|offset| {
+                                        u8::from_str_radix(
+                                            &candidate.pointer.sha256[offset..offset + 2],
+                                            16,
+                                        )
+                                        .expect("validated root digest")
+                                    })
+                                    .collect::<Vec<_>>();
+                                pending.record_sha256 = format!("{:x}", Sha256::digest(bytes));
+                                pending.complete = true;
+                                result.pending.push(pending);
+                            }
+                            result.unresolved = true;
+                            continue;
+                        }
+                    } else {
+                        result.events.push(raw);
+                        qualified_events.push(fact);
+                    }
+                    result.pending.retain(|pending| {
+                        !(pending.reason == "response-qualification-pending"
+                            && pending.start_offset == candidate.pointer.start
+                            && pending.end_offset == candidate.pointer.end)
+                    });
+                    resolved.push(candidate.pointer.start);
+                }
+                if !resolved.is_empty() {
+                    result
+                        .checkpoint
+                        .source_admission
+                        .as_mut()
+                        .expect("source state")
+                        .responses
+                        .retain(|candidate| !resolved.contains(&candidate.pointer.start));
+                    result.changed = true;
+                }
+            }
+            result.finalize_prefix_qualification();
+            result.changed |=
+                prior.is_none_or(|old| !same_checkpoint_content(old, &result.checkpoint));
             consumed_budget = consumed_budget.saturating_add(result.consumed_bytes);
             if result.unresolved {
                 pending_ranges = pending_ranges.saturating_add(result.pending.len().max(1));
@@ -4090,12 +6671,111 @@ impl Recorder {
             pending_evidence.extend(result.pending);
         }
 
+        if let Some(prepared) = period_attribution.as_ref().filter(|_| period_available) {
+            let (mut saved, incomplete) = self.writer.session_events_for_prepared_period(
+                prepared,
+                reset_at,
+                window_seconds,
+            )?;
+            for repair in &source_repairs {
+                for fact in repair.qualified_events() {
+                    if !canonical_sources.is_retired(&fact.source)?
+                        && fact.period.is_some_and(|period| {
+                            period.reset_at == reset_at && period.window_seconds == window_seconds
+                        })
+                    {
+                        let raw = SessionEvent::try_from(fact.clone())?;
+                        if !saved.contains(&raw) {
+                            saved.push(raw);
+                        }
+                    }
+                }
+            }
+            saved.sort_by_key(|event| (event.timestamp, event.range_start, event.event_index));
+            if incomplete && !period_restarted {
+                // A newly qualified subset does not disprove the saved
+                // same-period absolute value. Keep that baseline while old
+                // sources are pending; only new admitted events below add
+                // usage. Qualifying an old event must not add it twice.
+                initial_totals = ModelTotals::from_state(&state.model_totals);
+            } else {
+                initial_totals = ModelTotals::default();
+                for event in &saved {
+                    let timed = session_event_to_timed_usage(event.clone())?;
+                    initial_totals.add(&timed.model, timed.delta)?;
+                }
+            }
+            events = qualified_events
+                .iter()
+                .filter(|fact| {
+                    fact.period.is_some_and(|period| {
+                        period.reset_at == reset_at && period.window_seconds == window_seconds
+                    })
+                })
+                .cloned()
+                .map(SessionEvent::try_from)
+                .map(|event| {
+                    event
+                        .map_err(RecorderError::from)
+                        .and_then(session_event_to_timed_usage)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            totals = initial_totals.clone();
+            for event in &events {
+                totals.add(&event.model, event.delta)?;
+            }
+            replayed_events = if period_restarted {
+                saved
+                    .iter()
+                    .cloned()
+                    .map(session_event_to_timed_usage)
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
+            admitted_session_events = saved;
+            admitted_session_events.extend(
+                qualified_events
+                    .iter()
+                    .filter(|fact| {
+                        fact.period.is_some_and(|period| {
+                            period.reset_at == reset_at && period.window_seconds == window_seconds
+                        })
+                    })
+                    .cloned()
+                    .map(SessionEvent::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            current_cycle_unresolved |= incomplete
+                || qualified_events.iter().any(|fact| {
+                    fact.period.is_none()
+                        && fact.timestamp >= window_start
+                        && fact.timestamp < reset_at
+                });
+        }
+
         // A bounded scan can cross a minute boundary. Include records written
         // while it ran, rather than permanently dropping their first minute
         // when their checkpoints are acknowledged below.
         if period_available {
             timeline_end = timeline_end.max(Utc::now().timestamp()).min(reset_at);
         }
+        // Exact membership already proves each event's own continuous owner.
+        // A reactivation limits new source admission, not this account's
+        // earlier, independently owned part of the same official period.
+        let history_window_start = if period_attribution.is_some() {
+            reset_at.saturating_sub(window_seconds)
+        } else {
+            window_start
+        };
+        let retained_offset_end = if period_attribution.is_some() && period_available {
+            self.writer
+                .timeline_history_end(reset_at, window_seconds)?
+                .map(|end| (end + 59).div_euclid(60) * 60)
+        } else {
+            None
+        };
+        current_cycle_unresolved |= retained_offset_end.is_some();
 
         // A currently committed exact anchor resolution can clear its own
         // durable pending row in the same writer transaction. Complete
@@ -4123,7 +6803,7 @@ impl Recorder {
                 .unmaterialized_quota_receipts(
                     reset_at,
                     window_seconds,
-                    window_start,
+                    history_window_start,
                     timeline_end,
                 )?
                 .into_iter()
@@ -4148,7 +6828,7 @@ impl Recorder {
                 .iter()
                 .copied()
                 .filter(|at| {
-                    *at >= window_start
+                    *at >= history_window_start
                         && *at <= timeline_end
                         && self.lifecycle_intervals.iter().any(|interval| {
                             interval.start_at.is_none_or(|start| *at >= start)
@@ -4173,7 +6853,7 @@ impl Recorder {
                     .as_ref()
                     .filter(|_| admitted_quota.is_some())
                     .filter(|candidate| {
-                        candidate.observed_at >= window_start
+                        candidate.observed_at >= history_window_start
                             && candidate.observed_at <= timeline_end
                     })
                     .map(|candidate| candidate.observed_at.div_euclid(60) * 60);
@@ -4186,7 +6866,9 @@ impl Recorder {
                         first_changed = minute;
                     }
                 }
-                if let Some(offset_start) = self
+                if let Some(offset_end) = retained_offset_end {
+                    first_changed = first_changed.max(offset_end);
+                } else if let Some(offset_start) = self
                     .writer
                     .timeline_history_start(reset_at, window_seconds)?
                 {
@@ -4195,7 +6877,7 @@ impl Recorder {
                 let admitted = admitted_session_events
                     .iter()
                     .filter(|event| {
-                        event.timestamp >= window_start && event.timestamp <= timeline_end
+                        event.timestamp >= history_window_start && event.timestamp <= timeline_end
                     })
                     .cloned()
                     .map(session_event_to_timed_usage)
@@ -4233,7 +6915,10 @@ impl Recorder {
                 .first()
                 .map(|sample| (sample.timestamp, timeline_end))
         });
-        let timeline_recovery = if exact_history.is_none() && !period_restarted && period_available
+        let timeline_recovery = if period_attribution.is_none()
+            && exact_history.is_none()
+            && !period_restarted
+            && period_available
         {
             if let Some(identity) = self.identity.as_ref() {
                 build_timeline_recovery(
@@ -4268,7 +6953,7 @@ impl Recorder {
         };
         let (samples, history_models) = if let Some(projection) = exact_history {
             projection
-        } else if timeline_recovery.is_some() || !period_available {
+        } else if period_attribution.is_some() || timeline_recovery.is_some() || !period_available {
             (Vec::new(), BTreeMap::new())
         } else {
             build_history(
@@ -4288,7 +6973,7 @@ impl Recorder {
                     .min(timeline_end);
                 let mut latest_event = None;
                 for event in admitted_session_events.iter().filter(|event| {
-                    event.timestamp >= window_start && event.timestamp <= timeline_end
+                    event.timestamp >= history_window_start && event.timestamp <= timeline_end
                 }) {
                     let timed = session_event_to_timed_usage(event.clone())?;
                     source.add(&timed.model, timed.delta)?;
@@ -4313,6 +6998,11 @@ impl Recorder {
             .transpose()?
             .flatten();
         let quota_sample = quota.as_ref().and_then(|candidate| {
+            if retained_offset_end
+                .is_some_and(|end| candidate.observed_at.div_euclid(60) * 60 < end)
+            {
+                return None;
+            }
             if self
                 .activation_timestamp
                 .is_some_and(|boundary| candidate.observed_at < boundary)
@@ -4328,7 +7018,7 @@ impl Recorder {
                 .as_ref()
                 .and_then(|(_, canonical_reset, _, _)| {
                     candidate.remaining_percent.and_then(|remaining| {
-                        quota_models.as_ref().map(|models| {
+                        quota_models.as_ref().and_then(|models| {
                             models.history_sample(
                                 candidate.observed_at,
                                 *canonical_reset,
@@ -4407,11 +7097,17 @@ impl Recorder {
             self.activation_timestamp
                 .is_none_or(|boundary| event.timestamp >= boundary)
         });
+        qualified_events.retain(|event| {
+            self.activation_timestamp
+                .is_none_or(|boundary| event.timestamp >= boundary)
+        });
         task_events.retain(|event| {
             self.activation_timestamp
                 .is_none_or(|boundary| event.timestamp >= boundary)
         });
         self.pending = Some(PendingBatch {
+            source_repairs,
+            period_attribution,
             reset_at,
             latest_quota_reset_at,
             window_seconds,
@@ -4424,6 +7120,8 @@ impl Recorder {
             checkpoints,
             ranges,
             durable_events,
+            qualified_events,
+            response_replays,
             task_events,
             task_indexed_ranges,
             pending_evidence,
@@ -4432,7 +7130,22 @@ impl Recorder {
             model_totals,
             timeline_recovery,
             exact_history_span,
+            source_verifications,
         });
+        if let Some(context) = source_context.as_ref() {
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|batch| !batch.source_repairs.is_empty())
+                && !self.pending_account_sources_match(context)?
+            {
+                self.pending = None;
+                let _ = commit_guard();
+                return Err(RecorderError::Invalid(
+                    "repair source prefix changed before commit".into(),
+                ));
+            }
+        }
         if account_boundary_changed() || !commit_guard() {
             self.pending = None;
             return Err(RecorderError::AccountBoundaryChanged);
@@ -4440,8 +7153,615 @@ impl Recorder {
         self.commit_pending().map(Some)
     }
 
+    pub fn acknowledge_existing_owner_guarded<F>(
+        &mut self,
+        commit_guard: F,
+    ) -> Result<Option<SessionCollectionState>, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let _fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() || !commit_guard() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        let identity = self.identity.as_ref().ok_or_else(|| {
+            RecorderError::Invalid("owner acknowledgement requires a partition".into())
+        })?;
+        Ok(self.writer.acknowledge_existing_session_owner(identity)?)
+    }
+
+    /// Reconstruct accepted prefixes of an inactive partition without reading
+    /// new suffixes or creating a Session collection cycle for that account.
+    pub fn repair_historical_sources_guarded<F>(
+        &mut self,
+        commit_guard: F,
+    ) -> Result<Option<u64>, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        self.repair_saved_sources_guarded(true, commit_guard)
+    }
+
+    /// Repair old physical sources for the selected account before append.
+    /// Regular pending usage keeps its own fixed evidence and takes priority.
+    pub fn repair_replaced_sources_guarded<F>(
+        &mut self,
+        commit_guard: F,
+    ) -> Result<Option<u64>, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        if self.pending.is_some() || !self.checkpoint_reconciliation_sources.is_empty() {
+            return Ok(None);
+        }
+        self.repair_saved_sources_guarded(false, commit_guard)
+    }
+
+    fn repair_saved_sources_guarded<F>(
+        &mut self,
+        include_same_physical: bool,
+        commit_guard: F,
+    ) -> Result<Option<u64>, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let Some(prepared) = self.prepare_saved_sources(include_same_physical)? else {
+            return Ok(None);
+        };
+        self.commit_prepared_historical_repair(prepared, commit_guard)
+    }
+
+    fn prepare_saved_sources(
+        &mut self,
+        include_same_physical: bool,
+    ) -> Result<Option<PreparedHistoricalRepair>, RecorderError> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| RecorderError::Invalid("historical repair requires a partition".into()))?
+            .clone();
+        if self.historical_pending.is_none() {
+            let period = self
+                .writer
+                .prepare_period_attribution(&identity, &self.lifecycle_intervals)?;
+            let state = self.writer.load_session_collection_state()?;
+            let root = self.config.sessions_root.canonicalize()?;
+            let root_metadata = fs::symlink_metadata(&root)?;
+            let root_key = root_identity(&root, &root_metadata);
+            let mut repair_inputs = None;
+            let (mut repairs, equivalence_sources, mut consumed) =
+                self.prepare_source_equivalences(&state, &period, &mut repair_inputs)?;
+            let mut attempted = 0_u64;
+            let mut unavailable = 0_u64;
+            let mut rejected = 0_u64;
+            let mut cached_rejected = 0_u64;
+            let mut incomplete = 0_u64;
+            let mut binding_unknown = 0_u64;
+            let mut container_candidates = 0_u64;
+            let mut containers_verified = 0_u64;
+            let mut container_hash_rejected = 0_u64;
+            for checkpoint in &state.checkpoints {
+                if equivalence_sources.contains(&source_verification_key(checkpoint)) {
+                    continue;
+                }
+                let key = source_verification_key(checkpoint);
+                if !self.source_event_repair_candidates.contains(&key)
+                    || consumed >= self.config.chunk_bytes
+                {
+                    continue;
+                }
+                attempted = attempted.saturating_add(1);
+                if checkpoint.root_identity != root_key
+                    || relative_source_key(Path::new(&checkpoint.relative_path)).as_deref()
+                        != Some(&checkpoint.relative_path)
+                {
+                    unavailable = unavailable.saturating_add(1);
+                    continue;
+                }
+                let path = root.join(&checkpoint.relative_path);
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    unavailable = unavailable.saturating_add(1);
+                    continue;
+                };
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || path.canonicalize().ok().as_ref() != Some(&path)
+                {
+                    unavailable = unavailable.saturating_add(1);
+                    continue;
+                }
+                let source = Source {
+                    path,
+                    recorded: recorded_source(
+                        root_key.clone(),
+                        checkpoint.relative_path.clone(),
+                        metadata,
+                    ),
+                };
+                if !include_same_physical
+                    && (source.recorded.file_device, source.recorded.file_inode)
+                        == (checkpoint.file_device, checkpoint.file_inode)
+                {
+                    continue;
+                }
+                let accepted = self.writer.load_session_ranges_for_checkpoint(checkpoint)?;
+                let current_fingerprint = source_fingerprint(&source)?;
+                let read_container = if (source.recorded.file_device, source.recorded.file_inode)
+                    != (checkpoint.file_device, checkpoint.file_inode)
+                {
+                    if !source_ranges_cover_checkpoint(
+                        checkpoint,
+                        &accepted,
+                        source.recorded.file_bytes,
+                    ) {
+                        unavailable = unavailable.saturating_add(1);
+                        continue;
+                    }
+                    let mut verified = None;
+                    for container in self.writer.accepted_source_read_containers(
+                        checkpoint,
+                        source.recorded.file_device,
+                        source.recorded.file_inode,
+                    )? {
+                        container_candidates = container_candidates.saturating_add(1);
+                        let rejected =
+                            self.rejected_read_containers
+                                .get(&key)
+                                .is_some_and(|entries| {
+                                    entries.iter().any(|entry| {
+                                        let proof = &entry.verification;
+                                        entry.container == container
+                                            && Some(&proof.fingerprint)
+                                                == current_fingerprint.as_ref()
+                                            && proof.checkpoint == *checkpoint
+                                            && proof.ranges == accepted
+                                            && proof.account_boundary_epoch
+                                                == self.account_boundary_epoch
+                                            && proof.lifecycle_intervals == self.lifecycle_intervals
+                                    })
+                                });
+                        if rejected {
+                            cached_rejected = cached_rejected.saturating_add(1);
+                            container_hash_rejected = container_hash_rejected.saturating_add(1);
+                            continue;
+                        }
+                        let cached = self.source_original_reconstructions.get(&key).is_some_and(
+                            |recovery| {
+                                recovery.matches(
+                                    checkpoint,
+                                    &accepted,
+                                    self.account_boundary_epoch,
+                                    &self.lifecycle_intervals,
+                                ) && recovery.read_container.as_ref() == Some(&container)
+                                    && recovery.fingerprint.is_some()
+                                    && recovery.fingerprint == current_fingerprint
+                            },
+                        );
+                        let matches = if cached {
+                            Some(true)
+                        } else {
+                            saved_source_prefix_matches_in_container(
+                                &source,
+                                checkpoint,
+                                &accepted,
+                                Some(&container),
+                            )?
+                        };
+                        if matches == Some(true) {
+                            containers_verified = containers_verified.saturating_add(1);
+                            verified = Some(container);
+                            break;
+                        } else if matches == Some(false) {
+                            container_hash_rejected = container_hash_rejected.saturating_add(1);
+                            // Only a completed, stable byte rejection is reusable.
+                            // IO/racing metadata never creates a negative proof.
+                            if let Some(fingerprint) =
+                                current_fingerprint.as_ref().filter(|before| {
+                                    source_fingerprint(&source).ok().flatten().as_ref()
+                                        == Some(*before)
+                                })
+                            {
+                                let entries = self
+                                    .rejected_read_containers
+                                    .entry(key.clone())
+                                    .or_default();
+                                entries.retain(|entry| {
+                                    (
+                                        entry.container.file_device,
+                                        entry.container.file_inode,
+                                        entry
+                                            .container
+                                            .ranges
+                                            .first()
+                                            .map(|range| range.prefix_generation),
+                                    ) != (
+                                        container.file_device,
+                                        container.file_inode,
+                                        container
+                                            .ranges
+                                            .first()
+                                            .map(|range| range.prefix_generation),
+                                    )
+                                });
+                                entries.push(RejectedSourceReadContainer {
+                                    container: container.clone(),
+                                    verification: SourceVerification {
+                                        fingerprint: fingerprint.clone(),
+                                        checkpoint: checkpoint.clone(),
+                                        ranges: accepted.clone(),
+                                        prefix_matches: false,
+                                        account_boundary_epoch: self.account_boundary_epoch,
+                                        lifecycle_intervals: self.lifecycle_intervals.clone(),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    let Some(container) = verified else {
+                        unavailable = unavailable.saturating_add(1);
+                        continue;
+                    };
+                    Some(container)
+                } else {
+                    None
+                };
+                if self.source_verifications.get(&key).is_some_and(|proof| {
+                    !proof.prefix_matches
+                        && Some(&proof.fingerprint) == current_fingerprint.as_ref()
+                        && proof.checkpoint == *checkpoint
+                        && proof.ranges == accepted
+                        && proof.account_boundary_epoch == self.account_boundary_epoch
+                        && proof.lifecycle_intervals == self.lifecycle_intervals
+                }) {
+                    cached_rejected = cached_rejected.saturating_add(1);
+                    continue;
+                }
+                let saved_binding = checkpoint
+                    .source_admission
+                    .as_ref()
+                    .and_then(|state| state.account_binding.as_ref());
+                if saved_binding.is_some_and(|binding| {
+                    binding.partition != identity || !binding.matches_checkpoint(checkpoint)
+                }) {
+                    continue;
+                }
+                let ownership = SourceOwnership {
+                    intervals: &self.lifecycle_intervals,
+                    eligible_from: match saved_binding.map(|binding| &binding.proof) {
+                        Some(SourceBindingProof::Rpc { began_at, .. }) => Some(*began_at),
+                        _ => None,
+                    },
+                };
+                if self
+                    .source_original_reconstructions
+                    .get(&key)
+                    .is_some_and(|recovery| {
+                        !recovery.matches(
+                            checkpoint,
+                            &accepted,
+                            self.account_boundary_epoch,
+                            &self.lifecycle_intervals,
+                        ) || recovery.read_container != read_container
+                    })
+                {
+                    // A different accepted container requires a new full byte
+                    // proof and parser replay, never an alias of prior state.
+                    self.source_original_reconstructions.remove(&key);
+                }
+                let recovery = self
+                    .source_original_reconstructions
+                    .entry(key)
+                    .or_insert_with(|| SourceParserReconstruction {
+                        original: checkpoint.clone(),
+                        ranges: accepted.clone(),
+                        fingerprint: read_container.as_ref().and(current_fingerprint.clone()),
+                        account_boundary_epoch: self.account_boundary_epoch,
+                        lifecycle_intervals: self.lifecycle_intervals.clone(),
+                        replayed: None,
+                        pending: Vec::new(),
+                        raw_conflict: false,
+                        qualification_attempted: false,
+                        read_container: read_container.clone(),
+                        numeric_events: Vec::new(),
+                        counter_proofs: Vec::new(),
+                        numeric_records: Vec::new(),
+                    });
+                if !recovery.matches(
+                    checkpoint,
+                    &accepted,
+                    self.account_boundary_epoch,
+                    &self.lifecycle_intervals,
+                ) || recovery.read_container != read_container
+                {
+                    return Err(RecorderError::Invalid(
+                        "historical reconstruction input changed".into(),
+                    ));
+                }
+                // Old checkpoints can lack every parser qualification field.
+                // Reconstruct only their accepted N before deriving an old
+                // account binding; a current-account RPC cannot fill this gap.
+                let before = source_fingerprint(&source)?;
+                if before.is_none() || before != recovery.fingerprint {
+                    let matches = saved_source_prefix_matches_in_container(
+                        &source,
+                        checkpoint,
+                        &accepted,
+                        read_container.as_ref(),
+                    )?;
+                    if matches != Some(true) {
+                        rejected = rejected.saturating_add(1);
+                        if let Some(fingerprint) = before.filter(|_| matches == Some(false)) {
+                            if Some(&fingerprint) != source_fingerprint(&source)?.as_ref() {
+                                continue;
+                            }
+                            self.source_verifications.insert(
+                                source_verification_key(checkpoint),
+                                SourceVerification {
+                                    fingerprint,
+                                    checkpoint: checkpoint.clone(),
+                                    ranges: accepted.clone(),
+                                    prefix_matches: false,
+                                    account_boundary_epoch: self.account_boundary_epoch,
+                                    lifecycle_intervals: self.lifecycle_intervals.clone(),
+                                },
+                            );
+                        }
+                        continue;
+                    }
+                }
+                let read = recovery.advance(
+                    &source,
+                    self.config.chunk_bytes.saturating_sub(consumed),
+                    checkpoint.cycle_seq,
+                    Some(&ownership),
+                )?;
+                consumed = consumed.saturating_add(read);
+                let after = source_fingerprint(&source)?;
+                if before != after
+                    && saved_source_prefix_matches_in_container(
+                        &source,
+                        checkpoint,
+                        &accepted,
+                        read_container.as_ref(),
+                    )? != Some(true)
+                {
+                    self.source_original_reconstructions
+                        .remove(&source_verification_key(checkpoint));
+                    continue;
+                }
+                recovery.fingerprint = after;
+                let Some(reconstructed) = recovery.original_repair_checkpoint() else {
+                    incomplete = incomplete.saturating_add(1);
+                    continue;
+                };
+                let binding = match saved_binding {
+                    Some(binding) => Some(binding.clone()),
+                    None => historical_source_binding_in_container(
+                        &identity,
+                        &source,
+                        &reconstructed,
+                        &self.lifecycle_intervals,
+                        read_container.as_ref(),
+                    )?,
+                };
+                let Some(binding) = binding else {
+                    binding_unknown = binding_unknown.saturating_add(1);
+                    continue;
+                };
+                let Some(database) = self.database.as_ref() else {
+                    continue;
+                };
+                match prepare_original_event_qualification(
+                    &mut self.writer,
+                    recovery,
+                    OriginalQualificationInput {
+                        source: &source,
+                        checkpoint,
+                        accepted: &accepted,
+                        binding: &binding,
+                        prepared: &period,
+                        ownership: Some(&ownership),
+                        database,
+                        identity: &identity,
+                        repair_inputs: &mut repair_inputs,
+                        budget: self.config.chunk_bytes.saturating_sub(consumed),
+                    },
+                ) {
+                    Ok((read, repair)) => {
+                        consumed = consumed.saturating_add(read);
+                        if let Some(repair) = repair {
+                            repairs.push(if let Some(container) = read_container {
+                                self.writer
+                                    .attach_source_read_container(repair, container)?
+                            } else {
+                                repair
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("recorder historical accepted-prefix repair unavailable: {error}")
+                    }
+                }
+            }
+            eprintln!("recorder historical accepted-prefix round attempted={attempted} unavailable={unavailable} rejected={rejected} cached_rejected={cached_rejected} incomplete={incomplete} binding_unknown={binding_unknown} parser_read_bytes={consumed} container_candidates={container_candidates} containers_verified={containers_verified} container_hash_rejected={container_hash_rejected} prepared={}",repairs.len());
+            if !include_same_physical && repairs.is_empty() {
+                // The normal usage transaction owns period reassignment
+                // unless this lane has a completed physical-source repair.
+                // Do not publish an incomplete normal-prefix candidate.
+                return Ok(None);
+            }
+            self.historical_pending = Some(HistoricalRepairBatch { period, repairs });
+        }
+        let batch = self.historical_pending.as_ref().expect("prepared above");
+        let mut sources = Vec::new();
+        for repair in &batch.repairs {
+            for checkpoint in repair.verification_checkpoints() {
+                let path = self.config.sessions_root.join(&checkpoint.relative_path);
+                let metadata = fs::symlink_metadata(&path)?;
+                let source = Source {
+                    path,
+                    recorded: recorded_source(
+                        checkpoint.root_identity.clone(),
+                        checkpoint.relative_path.clone(),
+                        metadata,
+                    ),
+                };
+                let accepted = self.writer.load_session_ranges_for_checkpoint(checkpoint)?;
+                let fingerprint = source_fingerprint(&source)?.ok_or_else(|| {
+                    RecorderError::Invalid("historical repair source identity changed".into())
+                })?;
+                if saved_source_prefix_matches_in_container(
+                    &source,
+                    checkpoint,
+                    &accepted,
+                    repair.read_container(),
+                )? != Some(true)
+                    || source_fingerprint(&source)?.as_ref() != Some(&fingerprint)
+                {
+                    self.historical_pending = None;
+                    return Err(RecorderError::Invalid(
+                        "historical repair source changed before commit".into(),
+                    ));
+                }
+                sources.push((source, fingerprint));
+            }
+        }
+        Ok(Some(PreparedHistoricalRepair {
+            batch: self.historical_pending.take().expect("prepared above"),
+            sources,
+        }))
+    }
+
+    /// Only the live writer commits a prepared historical candidate. No
+    /// original Session prefix is read on this recording/publication path.
+    pub fn commit_prepared_historical_repair<F>(
+        &mut self,
+        prepared: PreparedHistoricalRepair,
+        commit_guard: F,
+    ) -> Result<Option<u64>, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        if self.pending.is_some() || !self.checkpoint_reconciliation_sources.is_empty() {
+            return Ok(None);
+        }
+        for (source, fingerprint) in &prepared.sources {
+            if source_fingerprint(source)?.as_ref() != Some(fingerprint) {
+                return Err(RecorderError::Invalid(
+                    "historical repair source changed after preparation".into(),
+                ));
+            }
+        }
+        let batch = prepared.batch;
+        let _fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() || !commit_guard() {
+            self.historical_pending = None;
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        let result = self
+            .writer
+            .commit_historical_source_repairs(&batch.period, &batch.repairs)?;
+        for repair in &batch.repairs {
+            let key = source_verification_key(repair.checkpoint());
+            self.source_event_repair_candidates.remove(&key);
+            self.source_original_reconstructions.remove(&key);
+            self.source_parser_reconstructions.remove(&key);
+            for checkpoint in repair.verification_checkpoints() {
+                self.source_parser_reconstructions
+                    .remove(&source_verification_key(checkpoint));
+            }
+            for event in repair.qualified_events() {
+                self.source_parser_reconstructions.remove(&(
+                    event.source.root_identity.clone(),
+                    event.source.relative_path.clone(),
+                    event.source.file_device,
+                    event.source.file_inode,
+                    event.source.prefix_generation,
+                ));
+            }
+        }
+        self.historical_pending = None;
+        Ok(result)
+    }
+
     pub fn into_writer(self) -> UsageStore {
         self.writer
+    }
+
+    fn pending_account_sources_match(
+        &self,
+        context: &SourceAccountContext<'_>,
+    ) -> Result<bool, RecorderError> {
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| RecorderError::Invalid("recorder pending batch is missing".into()))?;
+        let metadata = fs::symlink_metadata(&self.config.sessions_root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(false);
+        }
+        let root = self.config.sessions_root.canonicalize()?;
+        for checkpoint in pending
+            .checkpoints
+            .iter()
+            .chain(
+                pending
+                    .source_repairs
+                    .iter()
+                    .flat_map(|repair| repair.verification_checkpoints()),
+            )
+            .filter(|checkpoint| checkpoint.committed_offset > 0)
+        {
+            let Some(admission) = checkpoint
+                .source_admission
+                .as_ref()
+                .filter(|admission| admission.valid(checkpoint.committed_offset))
+            else {
+                return Ok(false);
+            };
+            if !admission.account_binding.as_ref().is_some_and(|binding| {
+                binding.partition == context.partition && binding.matches_checkpoint(checkpoint)
+            }) {
+                return Ok(false);
+            }
+            let relative = Path::new(&checkpoint.relative_path);
+            if relative_source_key(relative).as_deref() != Some(&checkpoint.relative_path) {
+                return Ok(false);
+            }
+            let path = root.join(relative);
+            if path.canonicalize()? != path {
+                return Ok(false);
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            let source = Source {
+                path,
+                recorded: recorded_source(
+                    checkpoint.root_identity.clone(),
+                    checkpoint.relative_path.clone(),
+                    metadata,
+                ),
+            };
+            let mut ranges = self.writer.load_session_ranges_for_checkpoint(checkpoint)?;
+            ranges.extend(
+                pending
+                    .ranges
+                    .iter()
+                    .filter(|range| {
+                        range.root_identity == checkpoint.root_identity
+                            && range.relative_path == checkpoint.relative_path
+                            && range.file_device == checkpoint.file_device
+                            && range.file_inode == checkpoint.file_inode
+                            && range.prefix_generation == checkpoint.prefix_generation
+                    })
+                    .cloned(),
+            );
+            ranges.sort_unstable();
+            ranges.dedup();
+            if saved_source_prefix_matches(&source, checkpoint, &ranges)? != Some(true) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn commit_pending(&mut self) -> Result<CycleReport, RecorderError> {
@@ -4464,29 +7784,37 @@ impl Recorder {
             model_totals: &pending.model_totals,
             recorded_sessions: &[],
         };
-        let result = self.writer.commit_session_collection_with_source_quota(
-            commit,
-            &pending.observations,
-            pending.latest_quota_reset_at,
-            SessionSourceCommitEvidence {
-                task: SessionTaskEvidenceInput {
-                    events: &pending.durable_events,
-                    pending_ranges: &pending.pending_evidence,
-                    token_anchor_recoveries: &pending.token_anchor_recoveries,
-                    token_anchor_resolutions: &pending.token_anchor_resolutions,
-                    task_events: &pending.task_events,
-                    task_indexed_ranges: &pending.task_indexed_ranges,
+        let result = self
+            .writer
+            .commit_session_collection_with_source_event_facts(
+                commit,
+                &pending.observations,
+                pending.latest_quota_reset_at,
+                SessionSourceCommitEvidence {
+                    task: SessionTaskEvidenceInput {
+                        events: &pending.durable_events,
+                        pending_ranges: &pending.pending_evidence,
+                        token_anchor_recoveries: &pending.token_anchor_recoveries,
+                        token_anchor_resolutions: &pending.token_anchor_resolutions,
+                        task_events: &pending.task_events,
+                        task_indexed_ranges: &pending.task_indexed_ranges,
+                    },
+                    timeline_recovery: pending.timeline_recovery.as_ref(),
+                    exact_history_span: if pending.timeline_recovery.is_none() {
+                        pending.exact_history_span
+                    } else {
+                        None
+                    },
+                    sessions_root: &self.config.sessions_root,
+                    lifecycle_intervals: &self.lifecycle_intervals,
                 },
-                timeline_recovery: pending.timeline_recovery.as_ref(),
-                exact_history_span: if pending.timeline_recovery.is_none() {
-                    pending.exact_history_span
-                } else {
-                    None
+                codex_info_db_writer::SessionEventCommitEvidence {
+                    source_repairs: &pending.source_repairs,
+                    events: &pending.qualified_events,
+                    period_attribution: pending.period_attribution.as_ref(),
+                    response_replays: &pending.response_replays,
                 },
-                sessions_root: &self.config.sessions_root,
-                lifecycle_intervals: &self.lifecycle_intervals,
-            },
-        )?;
+            )?;
         let read_back = self.writer.load_session_collection_state()?;
         if read_back.data_generation != result.data_generation
             || read_back.collector_epoch != Some(pending.collector_epoch)
@@ -4524,6 +7852,37 @@ impl Recorder {
             sources_seen: pending.sources_seen,
         };
         self.last_ranges = pending.ranges.clone();
+        self.source_verifications = pending.source_verifications.clone();
+        self.checkpoint_reconciliation_sources
+            .retain(|(root, path, device, inode)| {
+                !read_back.checkpoints.iter().any(|checkpoint| {
+                    checkpoint.root_identity == *root
+                        && checkpoint.relative_path == *path
+                        && checkpoint.file_device == *device
+                        && checkpoint.file_inode == *inode
+                })
+            });
+        for repair in &pending.source_repairs {
+            self.source_event_repair_candidates
+                .remove(&source_verification_key(repair.checkpoint()));
+            self.source_original_reconstructions
+                .remove(&source_verification_key(repair.checkpoint()));
+            self.source_parser_reconstructions
+                .remove(&source_verification_key(repair.checkpoint()));
+            for checkpoint in repair.verification_checkpoints() {
+                self.source_parser_reconstructions
+                    .remove(&source_verification_key(checkpoint));
+            }
+            for event in repair.qualified_events() {
+                self.source_parser_reconstructions.remove(&(
+                    event.source.root_identity.clone(),
+                    event.source.relative_path.clone(),
+                    event.source.file_device,
+                    event.source.file_inode,
+                    event.source.prefix_generation,
+                ));
+            }
+        }
         self.pending = None;
         Ok(report)
     }
@@ -4574,11 +7933,194 @@ fn admit_quota_period(
     Some((transition, reset_at, candidate.reset_at, window_seconds))
 }
 
+fn response_classification_name(summary: &SessionRecordSummary) -> Option<&str> {
+    if summary.root_duplicates & (SessionJsonKey::Type.bit() | SessionJsonKey::Payload.bit()) != 0
+        || summary.payload_duplicates & SessionJsonKey::Type.bit() != 0
+    {
+        return None;
+    }
+    if summary.outer_type.as_deref() == Some("event_msg") {
+        if !summary.payload_object
+            || !summary.payload.event_type_seen
+            || summary.payload.event_type_malformed
+        {
+            return None;
+        }
+    } else if summary.event_type().is_some()
+        && summary.payload_object
+        && summary.payload.event_type_seen
+        && (summary.payload.event_type_malformed
+            || summary.payload.event_type.as_deref() != summary.outer_type.as_deref())
+    {
+        return None;
+    }
+    summary.event_type()
+}
+
+fn observe_response_classification(
+    admission: &mut SourceAdmission,
+    summary: &SessionRecordSummary,
+    proof: &ClassificationPointer,
+    pointer: Option<&RecordPointer>,
+) {
+    use ResponseClassificationInput as Input;
+    let name = response_classification_name(summary);
+    let strong = matches!(name, Some("turn_context" | "thread_context"))
+        .then(|| {
+            summary
+                .qualified_context_model()
+                .and_then(ModelTotals::checkpoint_model)
+                .zip(pointer)
+                .map(|(model, pointer)| ResponseContext {
+                    model,
+                    context: StrongContext {
+                        turn_id: summary.payload.response.turn_id.clone(),
+                        root_turn_id: summary.payload.response.root_turn_id.clone(),
+                        pointer: pointer.clone(),
+                    },
+                })
+        })
+        .flatten();
+    let snapshot = summary.payload.snapshot.record();
+    let root = summary.payload.response.record();
+    let input = match summary.outer_type.as_deref() {
+        Some("session_meta") => {
+            if !admission.metadata_qualified || !summary.metadata_shape_valid() {
+                Input::Unknown
+            } else if summary.history_base_continuation() {
+                Input::HistoryBoundary
+            } else {
+                Input::NoOp
+            }
+        }
+        Some("token_usage_record") => {
+            if !summary.duplicate_fields
+                && summary.payload_object
+                && pointer.is_some()
+                && admission.metadata_qualified
+                && root.as_ref().is_some_and(|root| {
+                    admission.metadata.as_ref().is_some_and(|meta| {
+                        meta.thread_id == root.ids.thread_id
+                            && meta.session_id.as_deref() == Some(&root.ids.session_id)
+                    })
+                })
+            {
+                Input::NextRoot
+            } else {
+                Input::Unknown
+            }
+        }
+        Some("compacted") => {
+            if summary.noop_valid() != Some(true) {
+                Input::Unknown
+            } else if summary.payload.snapshot_non_null {
+                snapshot.as_ref().map_or(Input::Unknown, Input::Snapshot)
+            } else {
+                Input::NoOp
+            }
+        }
+        _ => match name {
+            Some("token_count") => Input::Counter,
+            Some("task_started" | "task_complete" | "task_completed" | "turn_aborted") => {
+                Input::Task
+            }
+            Some("turn_context" | "thread_context") => {
+                strong
+                    .as_ref()
+                    .map_or(Input::Unknown, |context| Input::Strong {
+                        context,
+                        is_turn: name == Some("turn_context"),
+                    })
+            }
+            Some("thread_settings_applied") => {
+                if summary.context_envelope_valid()
+                    && summary
+                        .event_model()
+                        .and_then(ModelTotals::checkpoint_model)
+                        .is_some()
+                {
+                    Input::NoOp
+                } else {
+                    Input::Unknown
+                }
+            }
+            _ if summary.noop_valid() == Some(true) => Input::NoOp,
+            _ => Input::Unknown,
+        },
+    };
+    admission.observe_response_classification(&input, proof);
+    if let Some(response) = admission.responses.last_mut() {
+        let last = (!summary.duplicate_fields && summary.last_token_snapshot().is_some())
+            .then(|| summary.payload.last_token_usage.response_usage())
+            .flatten();
+        response.observe_counter_association(&input, proof, pointer, last);
+    }
+}
+
 struct Source {
     path: PathBuf,
     recorded: RecordedSessionSource,
 }
 
+/// Hashes bytes consumed by the parser, including LF and isolated bad lines.
+/// BufReader prefetch and an uncommitted tail are not accepted source bytes.
+struct SourceReader<R> {
+    inner: R,
+    hasher: Sha256,
+    record_hasher: Sha256,
+    consumed: u64,
+    valid: bool,
+}
+
+impl<R> SourceReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            record_hasher: Sha256::new(),
+            consumed: 0,
+            valid: true,
+        }
+    }
+}
+
+impl<R: BufRead> Read for SourceReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(bytes)?;
+        self.hasher.update(&bytes[..count]);
+        self.record_hasher.update(&bytes[..count]);
+        if let Some(next) = self.consumed.checked_add(count as u64) {
+            self.consumed = next;
+        } else {
+            self.valid = false;
+        }
+        Ok(count)
+    }
+}
+
+impl<R: BufRead> BufRead for SourceReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, count: usize) {
+        match self.inner.fill_buf() {
+            Ok(bytes) if count <= bytes.len() => {
+                self.hasher.update(&bytes[..count]);
+                self.record_hasher.update(&bytes[..count]);
+                if let Some(next) = self.consumed.checked_add(count as u64) {
+                    self.consumed = next;
+                } else {
+                    self.valid = false;
+                }
+            }
+            _ => self.valid = false,
+        }
+        self.inner.consume(count);
+    }
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
 struct InventoryFailure {
     relative_path: String,
     reason: String,
@@ -4615,15 +8157,8 @@ fn pending_inventory_failure(
     failure: InventoryFailure,
     collector_epoch: u128,
     cycle_seq: u64,
+    ordinal: u128,
 ) -> SessionPendingRange {
-    let source = RecordedSessionSource {
-        root_identity: root_identity.clone(),
-        relative_path: failure.relative_path.clone(),
-        file_bytes: 0,
-        modified_nanos: 0,
-        file_device: 0,
-        file_inode: 0,
-    };
     SessionPendingRange {
         root_identity,
         relative_path: failure.relative_path,
@@ -4633,7 +8168,9 @@ fn pending_inventory_failure(
         end_offset: 0,
         collector_epoch,
         cycle_seq,
-        prefix_generation: prefix_generation(collector_epoch, &source, EMPTY_SHA256),
+        // Inventory predicates have no physical source prefix. Their sorted
+        // ordinal distinguishes diagnostic keys only within this inventory.
+        prefix_generation: ordinal,
         record_sha256: EMPTY_SHA256.to_owned(),
         parser_version: PARSER_VERSION.to_owned(),
         reason: failure.reason,
@@ -4691,21 +8228,28 @@ fn initial_source_baseline_checkpoint(
         token_baseline_known: false,
         history_base_pending: false,
         last_model: None,
+        last_model_context_kind: Some(SessionModelContextKind::Unknown),
+        last_model_interval: Some(SessionModelInterval::Unknown),
+        source_admission: None,
         last_task_running: None,
         context_usage_tokens: None,
         context_window_tokens: None,
-        previous_total: 0,
-        previous_input: 0,
-        previous_cached_input: 0,
-        previous_output: 0,
+        previous_total: None,
+        previous_input: None,
+        previous_cached_input: None,
+        previous_output: None,
         previous_cache_write_input: None,
     }
 }
 
 struct SourceOutcome {
     checkpoint: SessionCheckpoint,
+    prefix_qualification_candidate: bool,
     range: Option<SessionRange>,
     events: Vec<SessionEvent>,
+    event_proofs: Vec<LegacyCounterProof>,
+    counter_proofs: Vec<LegacyCounterProof>,
+    numeric_records: Vec<Value>,
     token_observed_at: Vec<i64>,
     task_events: Vec<SessionTaskEvent>,
     task_indexed_ranges: Vec<SessionTaskIndexedRange>,
@@ -4715,6 +8259,678 @@ struct SourceOutcome {
     unresolved: bool,
     changed: bool,
     consumed_bytes: u64,
+}
+
+impl SourceOutcome {
+    fn finalize_prefix_qualification(&mut self) {
+        let end = self.checkpoint.committed_offset;
+        let unresolved_response = self
+            .checkpoint
+            .source_admission
+            .as_ref()
+            .is_some_and(|state| !state.responses.is_empty());
+        let independent_prefix_gap = self
+            .pending
+            .iter()
+            .any(|pending| pending.complete && pending.start_offset < end);
+        self.checkpoint.fully_attributed_from_zero =
+            self.prefix_qualification_candidate && !independent_prefix_gap && !unresolved_response;
+        self.unresolved = !self.pending.is_empty() || unresolved_response;
+    }
+}
+
+struct OriginalQualificationInput<'a> {
+    source: &'a Source,
+    checkpoint: &'a SessionCheckpoint,
+    accepted: &'a [SessionRange],
+    binding: &'a SourceAccountBinding,
+    prepared: &'a codex_info_db_writer::period_evidence::PreparedPeriodAttribution,
+    ownership: Option<&'a SourceOwnership<'a>>,
+    database: &'a Path,
+    identity: &'a StoragePartitionIdentity,
+    repair_inputs: &'a mut Option<codex_info_db_writer::PreparedSourceRepairInputs>,
+    budget: u64,
+}
+
+fn prepare_original_event_qualification(
+    writer: &mut UsageStore,
+    reconstruction: &mut SourceParserReconstruction,
+    input: OriginalQualificationInput<'_>,
+) -> Result<
+    (
+        u64,
+        Option<codex_info_db_writer::PreparedSourceQualificationRepair>,
+    ),
+    RecorderError,
+> {
+    let OriginalQualificationInput {
+        source,
+        checkpoint,
+        accepted,
+        binding,
+        prepared,
+        ownership,
+        database,
+        identity,
+        repair_inputs,
+        budget,
+    } = input;
+    let before = source_fingerprint(source)?;
+    if (before.is_none() || before != reconstruction.fingerprint)
+        && reconstruction.prefix_matches(source, checkpoint, accepted)? != Some(true)
+    {
+        return Err(RecorderError::Invalid(
+            "original accepted prefix hash is unavailable".into(),
+        ));
+    }
+    let read = reconstruction.advance(source, budget, checkpoint.cycle_seq, ownership)?;
+    let after = source_fingerprint(source)?;
+    if after != before && reconstruction.prefix_matches(source, checkpoint, accepted)? != Some(true)
+    {
+        return Err(RecorderError::Invalid(
+            "original prefix changed during bounded reconstruction".into(),
+        ));
+    }
+    reconstruction.fingerprint = after;
+    let Some(replay) = reconstruction
+        .replayed
+        .as_ref()
+        .filter(|cp| cp.committed_offset == checkpoint.committed_offset)
+    else {
+        return Ok((read, None));
+    };
+    if checkpoint.token_baseline_known
+        && (replay.previous_total != checkpoint.previous_total
+            || replay.previous_input != checkpoint.previous_input
+            || replay.previous_cached_input != checkpoint.previous_cached_input
+            || replay.previous_output != checkpoint.previous_output
+            || replay.previous_cache_write_input != checkpoint.previous_cache_write_input)
+    {
+        let repair = prepare_original_numerical_repair(
+            writer,
+            reconstruction,
+            OriginalQualificationInput {
+                source,
+                checkpoint,
+                accepted,
+                binding,
+                prepared,
+                ownership,
+                database,
+                identity,
+                repair_inputs,
+                budget: 0,
+            },
+        )?;
+        return Ok((read, Some(repair)));
+    }
+    let original = writer.source_events_for_qualification_repair(checkpoint)?;
+    if original.is_empty() {
+        return Ok((
+            read,
+            Some(prepare_original_numerical_repair(
+                writer,
+                reconstruction,
+                OriginalQualificationInput {
+                    source,
+                    checkpoint,
+                    accepted,
+                    binding,
+                    prepared,
+                    ownership,
+                    database,
+                    identity,
+                    repair_inputs,
+                    budget: 0,
+                },
+            )?),
+        ));
+    }
+    if original.iter().all(|event| event.admission.is_some()) {
+        return Ok((read, None));
+    }
+    let mut qualified = Vec::new();
+    let mut retirements = Vec::new();
+    for old in &original {
+        if old.admission.is_some() {
+            qualified.push(old.clone());
+            continue;
+        }
+        let counters = reconstruction
+            .counter_proofs
+            .iter()
+            .filter(|proof| {
+                proof.after.pointer.start >= old.source.range_start
+                    && proof.after.pointer.end <= old.source.range_end
+                    && proof.after.total > proof.before.total
+            })
+            .collect::<Vec<_>>();
+        if let Some(counter) = usize::try_from(old.source.event_index)
+            .ok()
+            .and_then(|index| counters.get(index))
+            .copied()
+        {
+            let responses = replay
+                .source_admission
+                .as_ref()
+                .into_iter()
+                .flat_map(|state| &state.responses)
+                .filter(|candidate| candidate.matched_counter() == Some(&counter.after.pointer))
+                .collect::<Vec<_>>();
+            if let [candidate] = responses.as_slice() {
+                let candidate = *candidate;
+                let model = candidate.qualified_model().ok_or_else(|| {
+                    RecorderError::Invalid("original response request model is unknown".into())
+                })?;
+                let owners = ownership
+                    .into_iter()
+                    .flat_map(|owner| owner.intervals)
+                    .filter(|owner| {
+                        owner
+                            .start_at
+                            .is_some_and(|start| candidate.pointer.timestamp >= start)
+                            && owner
+                                .end_at
+                                .is_none_or(|end| candidate.pointer.timestamp < end)
+                    })
+                    .collect::<Vec<_>>();
+                if owners.len() != 1 {
+                    return Err(RecorderError::Invalid(
+                        "original response ownership is not unique".into(),
+                    ));
+                }
+                let range = accepted
+                    .iter()
+                    .find(|range| {
+                        range.start_offset <= candidate.pointer.start
+                            && range.end_offset >= candidate.pointer.end
+                    })
+                    .ok_or_else(|| {
+                        RecorderError::Invalid("original response has no accepted range".into())
+                    })?;
+                let legacy_family = matches!(old.model.as_str(), "SOL" | "TERRA" | "LUNA")
+                    && codex_info_pricing::family(model) == Some(old.model.as_str());
+                let usage = candidate.record.usage;
+                let mut fact = LosslessSessionEvent::from(SessionEvent {
+                    root_identity: range.root_identity.clone(),
+                    relative_path: range.relative_path.clone(),
+                    file_device: range.file_device,
+                    file_inode: range.file_inode,
+                    prefix_generation: range.prefix_generation,
+                    range_start: range.start_offset,
+                    range_end: range.end_offset,
+                    record_sha256: range.record_sha256.clone(),
+                    event_index: candidate.pointer.start,
+                    timestamp: candidate.pointer.timestamp,
+                    model: if legacy_family {
+                        old.model.clone()
+                    } else {
+                        model.to_owned()
+                    },
+                    total_tokens: usage.total,
+                    input_tokens: Some(usage.input),
+                    cached_input_tokens: Some(usage.cached_input),
+                    cache_write_input_tokens: Some(usage.cache_write_input),
+                    output_tokens: Some(usage.output),
+                });
+                fact.admission = Some(EventAdmission {
+                    version: 1,
+                    source_binding: binding.clone(),
+                    verified_prefix_end: checkpoint.committed_offset,
+                    ownership: EventOwnership {
+                        start_at: owners[0].start_at.expect("finite owner"),
+                        end_at: owners[0].end_at,
+                    },
+                    numeric: NumericEventProof::ResponseRecord {
+                        candidate: Box::new(candidate.clone()),
+                        legacy_family_exact_model: if legacy_family {
+                            Some(model.to_owned())
+                        } else {
+                            None
+                        },
+                    },
+                    period: None,
+                });
+                prepared.assign(&mut fact)?;
+                retirements.push(codex_info_db_writer::SourceCounterRetirement {
+                    original: old.clone(),
+                    replacement: fact.clone(),
+                    counter: counter.clone(),
+                });
+                qualified.push(fact);
+                continue;
+            }
+        }
+        let candidates = reconstruction
+            .numeric_events
+            .iter()
+            .map(|(event, proof)| (event, proof))
+            .filter(|(_, proof)| {
+                proof.after.pointer.start >= old.source.range_start
+                    && proof.after.pointer.end <= old.source.range_end
+            })
+            .collect::<Vec<_>>();
+        let Some((raw, proof)) = usize::try_from(old.source.event_index)
+            .ok()
+            .and_then(|index| candidates.get(index))
+        else {
+            return Ok((
+                read,
+                Some(prepare_original_numerical_repair(
+                    writer,
+                    reconstruction,
+                    OriginalQualificationInput {
+                        source,
+                        checkpoint,
+                        accepted,
+                        binding,
+                        prepared,
+                        ownership,
+                        database,
+                        identity,
+                        repair_inputs,
+                        budget: 0,
+                    },
+                )?),
+            ));
+        };
+        let legacy_family = matches!(old.model.as_str(), "SOL" | "TERRA" | "LUNA")
+            && codex_info_pricing::family(&raw.model) == Some(old.model.as_str());
+        if old.timestamp != raw.timestamp
+            || (old.model != raw.model && !legacy_family)
+            || old.tokens != LosslessSessionEvent::from((*raw).clone()).tokens
+        {
+            let repair = prepare_original_numerical_repair(
+                writer,
+                reconstruction,
+                OriginalQualificationInput {
+                    source,
+                    checkpoint,
+                    accepted,
+                    binding,
+                    prepared,
+                    ownership,
+                    database,
+                    identity,
+                    repair_inputs,
+                    budget: 0,
+                },
+            )?;
+            return Ok((read, Some(repair)));
+        }
+        let owners = ownership
+            .into_iter()
+            .flat_map(|owner| owner.intervals)
+            .filter(|owner| {
+                owner.start_at.is_some_and(|start| {
+                    proof.before.pointer.timestamp >= start
+                        && proof.after.pointer.timestamp >= start
+                }) && owner.end_at.is_none_or(|end| {
+                    proof.before.pointer.timestamp < end && proof.after.pointer.timestamp < end
+                })
+            })
+            .collect::<Vec<_>>();
+        if owners.len() != 1 {
+            return Err(RecorderError::Invalid(
+                "original numeric ownership is not unique".into(),
+            ));
+        }
+        let mut fact = old.clone();
+        fact.admission = Some(EventAdmission {
+            version: 1,
+            source_binding: binding.clone(),
+            verified_prefix_end: checkpoint.committed_offset,
+            ownership: EventOwnership {
+                start_at: owners[0].start_at.expect("finite owned original"),
+                end_at: owners[0].end_at,
+            },
+            numeric: if legacy_family {
+                NumericEventProof::LegacyFamilyCounter {
+                    proof: Box::new((*proof).clone()),
+                    exact_model: raw.model.clone(),
+                }
+            } else {
+                NumericEventProof::LegacyCounter(Box::new((*proof).clone()))
+            },
+            period: None,
+        });
+        prepared.assign(&mut fact)?;
+        qualified.push(fact);
+    }
+    let missing_numeric = reconstruction.numeric_events.iter().any(|(_, proof)| {
+        !qualified.iter().any(|fact| {
+            fact.admission
+                .as_ref()
+                .is_some_and(|admission| match &admission.numeric {
+                    NumericEventProof::LegacyCounter(saved)
+                    | NumericEventProof::LegacyFamilyCounter { proof: saved, .. } => {
+                        saved.after.pointer == proof.after.pointer
+                    }
+                    _ => false,
+                })
+        })
+    });
+    let missing_response=replay.source_admission.as_ref().into_iter().flat_map(|state|&state.responses).filter(|candidate|candidate.qualified_model().is_some()).any(|candidate|!qualified.iter().any(|fact|matches!(fact.admission.as_ref().map(|a|&a.numeric),Some(NumericEventProof::ResponseRecord {candidate:saved,..}) if saved.key==candidate.key)));
+    if missing_numeric || missing_response {
+        return Ok((
+            read,
+            Some(prepare_original_numerical_repair(
+                writer,
+                reconstruction,
+                OriginalQualificationInput {
+                    source,
+                    checkpoint,
+                    accepted,
+                    binding,
+                    prepared,
+                    ownership,
+                    database,
+                    identity,
+                    repair_inputs,
+                    budget: 0,
+                },
+            )?),
+        ));
+    }
+    if reconstruction.prefix_matches(source, checkpoint, accepted)? != Some(true) {
+        return Err(RecorderError::Invalid(
+            "original prefix changed during qualification".into(),
+        ));
+    }
+    if repair_inputs.is_none() {
+        let backup = UsageStore::backup_generations_partitioned_verified(database, identity, 3)?;
+        *repair_inputs = Some(writer.prepare_source_repair_inputs(backup)?);
+    }
+    Ok((
+        read,
+        Some(writer.prepare_source_prefix_repair_with_parser_inputs(
+            checkpoint,
+            &{
+                let mut restored = checkpoint.clone();
+                if checkpoint_requires_parser_reconstruction(checkpoint) {
+                    let replay = reconstruction
+                        .qualified_checkpoint(checkpoint.cycle_seq)
+                        .ok_or_else(|| {
+                            RecorderError::Invalid(
+                                "original parser qualification incomplete".into(),
+                            )
+                        })?;
+                    restored.last_model = replay.last_model;
+                    restored.last_model_context_kind = replay.last_model_context_kind;
+                    restored.last_model_interval = replay.last_model_interval;
+                    restored.source_admission = replay.source_admission;
+                }
+                restored
+            },
+            original,
+            qualified,
+            retirements,
+            repair_inputs.as_ref().expect("prepared above").clone(),
+        )?),
+    ))
+}
+
+fn prepare_original_numerical_repair(
+    writer: &mut UsageStore,
+    reconstruction: &SourceParserReconstruction,
+    input: OriginalQualificationInput<'_>,
+) -> Result<codex_info_db_writer::PreparedSourceQualificationRepair, RecorderError> {
+    let OriginalQualificationInput {
+        source,
+        checkpoint,
+        accepted,
+        binding,
+        prepared,
+        ownership,
+        database,
+        identity,
+        repair_inputs,
+        ..
+    } = input;
+    let mut restored = reconstruction
+        .original_repair_checkpoint()
+        .ok_or_else(|| RecorderError::Invalid("numerical original prefix is incomplete".into()))?;
+    restored
+        .source_admission
+        .as_mut()
+        .ok_or_else(|| {
+            RecorderError::Invalid("numerical replay has no source qualification".into())
+        })?
+        .account_binding = Some(binding.clone());
+    let original = writer.source_events_for_qualification_repair(checkpoint)?;
+    let mut qualified = original
+        .iter()
+        .filter(|fact| fact.admission.is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    let full_numeric = reconstruction.pending.iter().all(|pending| {
+        matches!(
+            pending.reason.as_str(),
+            "initial-counter-prefix-unknown"
+                | "account-counter-prefix-unknown"
+                | "counter-outside-account-ownership"
+                | "raw-counter-regression-or-invalid-delta"
+                | "model-interval-unqualified"
+                | "response-record-missing"
+        )
+    });
+    if !full_numeric {
+        // Unknown bytes cannot disprove an unmatched old event. Independent
+        // new qualified records can still be recovered as a partial result.
+        qualified.extend(
+            original
+                .iter()
+                .filter(|fact| fact.admission.is_none())
+                .cloned(),
+        );
+    }
+    let mut used = Vec::new();
+    for (raw, proof) in &reconstruction.numeric_events {
+        let owners = ownership
+            .into_iter()
+            .flat_map(|owner| owner.intervals)
+            .filter(|owner| {
+                owner.start_at.is_some_and(|start| {
+                    proof.before.pointer.timestamp >= start
+                        && proof.after.pointer.timestamp >= start
+                }) && owner.end_at.is_none_or(|end| {
+                    proof.before.pointer.timestamp < end && proof.after.pointer.timestamp < end
+                })
+            })
+            .collect::<Vec<_>>();
+        if owners.len() != 1 {
+            continue;
+        }
+        let range = accepted
+            .iter()
+            .find(|range| {
+                range.start_offset <= proof.after.pointer.start
+                    && proof.after.pointer.end <= range.end_offset
+            })
+            .ok_or_else(|| {
+                RecorderError::Invalid("numeric original has no accepted range".into())
+            })?;
+        let raw_fact = LosslessSessionEvent::from(raw.clone());
+        let same = original.iter().find(|old| {
+            old.admission.is_none()
+                && !used.contains(&old.source)
+                && old.timestamp == raw.timestamp
+                && old.tokens == raw_fact.tokens
+                && (old.model == raw.model
+                    || (matches!(old.model.as_str(), "SOL" | "TERRA" | "LUNA")
+                        && codex_info_pricing::family(&raw.model) == Some(old.model.as_str())))
+                && old.source.range_start <= proof.after.pointer.start
+                && proof.after.pointer.end <= old.source.range_end
+        });
+        let mut fact = if let Some(old) = same {
+            used.push(old.source.clone());
+            old.clone()
+        } else {
+            let mut fact = raw_fact;
+            fact.source = codex_info_db_writer::SessionEventSource {
+                root_identity: range.root_identity.clone(),
+                relative_path: range.relative_path.clone(),
+                file_device: range.file_device,
+                file_inode: range.file_inode,
+                prefix_generation: range.prefix_generation,
+                range_start: range.start_offset,
+                range_end: range.end_offset,
+                record_sha256: range.record_sha256.clone(),
+                event_index: proof.after.pointer.start,
+            };
+            fact
+        };
+        if qualified.iter().any(|old| {
+            old.admission.is_some()
+                && old.timestamp == fact.timestamp
+                && old.tokens == fact.tokens
+                && old
+                    .admission
+                    .as_ref()
+                    .is_some_and(|admission| match &admission.numeric {
+                        NumericEventProof::LegacyCounter(saved) => {
+                            old.model == raw.model && saved.after.pointer == proof.after.pointer
+                        }
+                        NumericEventProof::LegacyFamilyCounter {
+                            proof: saved,
+                            exact_model,
+                        } => {
+                            // The existing family key has its own verified
+                            // exact-model evidence. Replaying those same bytes
+                            // must keep that key and its original admission.
+                            exact_model == &raw.model
+                                && codex_info_pricing::family(exact_model)
+                                    == Some(old.model.as_str())
+                                && saved.after.pointer == proof.after.pointer
+                        }
+                        _ => false,
+                    })
+        }) {
+            continue;
+        }
+        let legacy_family = matches!(fact.model.as_str(), "SOL" | "TERRA" | "LUNA");
+        fact.admission = Some(EventAdmission {
+            version: 1,
+            source_binding: binding.clone(),
+            verified_prefix_end: checkpoint.committed_offset,
+            ownership: EventOwnership {
+                start_at: owners[0].start_at.expect("finite owned original"),
+                end_at: owners[0].end_at,
+            },
+            numeric: if legacy_family {
+                NumericEventProof::LegacyFamilyCounter {
+                    proof: Box::new(proof.clone()),
+                    exact_model: raw.model.clone(),
+                }
+            } else {
+                NumericEventProof::LegacyCounter(Box::new(proof.clone()))
+            },
+            period: None,
+        });
+        prepared.assign(&mut fact)?;
+        qualified.retain(|old| old.source != fact.source);
+        qualified.push(fact);
+    }
+    let admission = restored.source_admission.as_ref().expect("validated above");
+    for candidate in &admission.responses {
+        let Some(model) = candidate.qualified_model() else {
+            continue;
+        };
+        let owners = ownership
+            .into_iter()
+            .flat_map(|owner| owner.intervals)
+            .filter(|owner| {
+                owner
+                    .start_at
+                    .is_some_and(|start| candidate.pointer.timestamp >= start)
+                    && owner
+                        .end_at
+                        .is_none_or(|end| candidate.pointer.timestamp < end)
+            })
+            .collect::<Vec<_>>();
+        if owners.len() != 1 {
+            continue;
+        }
+        let range = accepted
+            .iter()
+            .find(|range| {
+                range.start_offset <= candidate.pointer.start
+                    && candidate.pointer.end <= range.end_offset
+            })
+            .ok_or_else(|| {
+                RecorderError::Invalid("response original has no accepted range".into())
+            })?;
+        let usage = candidate.record.usage;
+        let mut fact = LosslessSessionEvent::from(SessionEvent {
+            root_identity: range.root_identity.clone(),
+            relative_path: range.relative_path.clone(),
+            file_device: range.file_device,
+            file_inode: range.file_inode,
+            prefix_generation: range.prefix_generation,
+            range_start: range.start_offset,
+            range_end: range.end_offset,
+            record_sha256: range.record_sha256.clone(),
+            event_index: candidate.pointer.start,
+            timestamp: candidate.pointer.timestamp,
+            model: model.to_owned(),
+            total_tokens: usage.total,
+            input_tokens: Some(usage.input),
+            cached_input_tokens: Some(usage.cached_input),
+            cache_write_input_tokens: Some(usage.cache_write_input),
+            output_tokens: Some(usage.output),
+        });
+        fact.admission = Some(EventAdmission {
+            version: 1,
+            source_binding: binding.clone(),
+            verified_prefix_end: checkpoint.committed_offset,
+            ownership: EventOwnership {
+                start_at: owners[0].start_at.expect("finite response owner"),
+                end_at: owners[0].end_at,
+            },
+            numeric: NumericEventProof::ResponseRecord {
+                candidate: Box::new(candidate.clone()),
+                legacy_family_exact_model: None,
+            },
+            period: None,
+        });
+        prepared.assign(&mut fact)?;
+        if let Some(saved) = writer.response_event(&candidate.key)? {
+            if codex_info_db_writer::same_response(&saved, &fact) {
+                continue;
+            }
+            return Err(RecorderError::Invalid(
+                "original response conflicts with another canonical source".into(),
+            ));
+        }
+        if !qualified
+            .iter()
+            .any(|old| codex_info_db_writer::same_response(old, &fact))
+        {
+            qualified.push(fact);
+        }
+    }
+    if reconstruction.prefix_matches(source, checkpoint, accepted)? != Some(true) {
+        return Err(RecorderError::Invalid(
+            "numerical original changed before preparation".into(),
+        ));
+    }
+    if repair_inputs.is_none() {
+        let backup = UsageStore::backup_generations_partitioned_verified(database, identity, 3)?;
+        *repair_inputs = Some(writer.prepare_source_repair_inputs(backup)?);
+    }
+    writer
+        .prepare_source_numerical_repair(
+            checkpoint,
+            original,
+            qualified,
+            repair_inputs.as_ref().expect("prepared above").clone(),
+            codex_info_db_writer::SourceNumericalReplay {
+                checkpoint: restored,
+                records: reconstruction.numeric_records.clone(),
+                pending: reconstruction.pending.clone(),
+            },
+        )
+        .map_err(RecorderError::from)
 }
 
 struct LegacyPendingReplay {
@@ -4735,18 +8951,39 @@ struct TaskObservation {
     running: bool,
 }
 
+fn relative_source_key(relative: &Path) -> Option<String> {
+    let parts = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str().filter(|name| !name.contains('\\')),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if parts.is_empty() {
+        return None;
+    }
+    let key = parts.join("/");
+    // Unix components() hides repeated separators and internal `.` segments.
+    // A stored key must keep the original relative spelling losslessly.
+    #[cfg(unix)]
+    if relative.to_str() != Some(key.as_str()) {
+        return None;
+    }
+    Some(key)
+}
+
 fn discover_sources(root: &Path) -> Result<SourceInventory, RecorderError> {
     let root = match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(RecorderError::Invalid(
                 "sessions root must be a regular directory".to_owned(),
-            ))
+            ));
         }
         Ok(_) => root.canonicalize()?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(RecorderError::Invalid(
                 "sessions root does not exist".to_owned(),
-            ))
+            ));
         }
         Err(error) => return Err(error.into()),
     };
@@ -4757,22 +8994,15 @@ fn discover_sources(root: &Path) -> Result<SourceInventory, RecorderError> {
     collect_jsonl(&root, &mut paths, &mut failures)?;
     paths.sort();
     let mut sources = Vec::with_capacity(paths.len());
+    let mut invalid_relative_path = false;
     for path in paths {
         let relative = path
             .strip_prefix(&root)
             .map_err(|_| RecorderError::Invalid("session path escaped root".to_owned()))?;
-        let relative_path = relative.to_string_lossy().replace('\\', "/");
-        if relative_path.is_empty()
-            || relative
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            failures.push(InventoryFailure {
-                relative_path: "__inventory__".to_owned(),
-                reason: "invalid-session-relative-path".to_owned(),
-            });
+        let Some(relative_path) = relative_source_key(relative) else {
+            invalid_relative_path = true;
             continue;
-        }
+        };
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -4788,6 +9018,12 @@ fn discover_sources(root: &Path) -> Result<SourceInventory, RecorderError> {
             recorded: recorded_source(root_identity.clone(), relative_path, metadata),
         });
     }
+    if invalid_relative_path {
+        failures.push(InventoryFailure {
+            relative_path: "__inventory__".to_owned(),
+            reason: "invalid-session-relative-path".to_owned(),
+        });
+    }
     Ok(SourceInventory {
         root_identity,
         sources,
@@ -4800,18 +9036,37 @@ fn collect_jsonl(
     output: &mut Vec<PathBuf>,
     failures: &mut Vec<InventoryFailure>,
 ) -> Result<(), RecorderError> {
+    let result = collect_jsonl_below(path, path, output, failures);
+    failures.sort();
+    failures.dedup();
+    result
+}
+
+fn inventory_failure(root: &Path, path: &Path, reason: String) -> InventoryFailure {
+    InventoryFailure {
+        relative_path: path
+            .strip_prefix(root)
+            .ok()
+            .and_then(relative_source_key)
+            .unwrap_or_else(|| "__inventory__".to_owned()),
+        reason,
+    }
+}
+
+fn collect_jsonl_below(
+    root: &Path,
+    path: &Path,
+    output: &mut Vec<PathBuf>,
+    failures: &mut Vec<InventoryFailure>,
+) -> Result<(), RecorderError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
-            failures.push(InventoryFailure {
-                relative_path: path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("__inventory__")
-                    .to_owned(),
-                reason: format!("inventory-stat-failed: {error}"),
-            });
+            failures.push(inventory_failure(
+                root,
+                path,
+                format!("inventory-stat-failed: {error}"),
+            ));
             return Ok(());
         }
     };
@@ -4835,30 +9090,27 @@ fn collect_jsonl(
             .filter_map(|entry| match entry {
                 Ok(entry) => Some(entry),
                 Err(error) => {
-                    failures.push(InventoryFailure {
-                        relative_path: "__inventory__".to_owned(),
-                        reason: format!("directory-entry-read-failed: {error}"),
-                    });
+                    failures.push(inventory_failure(
+                        root,
+                        path,
+                        format!("directory-entry-read-failed: {error}"),
+                    ));
                     None
                 }
             })
             .collect::<Vec<_>>(),
         Err(error) => {
-            failures.push(InventoryFailure {
-                relative_path: path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("__inventory__")
-                    .to_owned(),
-                reason: format!("directory-read-failed: {error}"),
-            });
+            failures.push(inventory_failure(
+                root,
+                path,
+                format!("directory-read-failed: {error}"),
+            ));
             return Ok(());
         }
     };
     entries.sort_by_key(|entry| entry.path());
     for entry in entries {
-        if let Err(error) = collect_jsonl(&entry.path(), output, failures) {
+        if let Err(error) = collect_jsonl_below(root, &entry.path(), output, failures) {
             eprintln!(
                 "recorder degraded: session source {} could not be inventoried: {error}",
                 entry.path().display()
@@ -4983,7 +9235,9 @@ fn legacy_pending_replay(
     };
     let anchor = strict_prior
         .token_baseline_known
-        .then(|| SessionTokenAnchor {
+        .then_some(strict_prior.previous_total)
+        .flatten()
+        .map(|total| SessionTokenAnchor {
             root_identity: strict_prior.root_identity.clone(),
             relative_path: strict_prior.relative_path.clone(),
             file_device: strict_prior.file_device,
@@ -4994,7 +9248,7 @@ fn legacy_pending_replay(
             collector_epoch: strict_prior.collector_epoch,
             cycle_seq: strict_prior.cycle_seq,
             fully_attributed_from_zero: strict_prior.fully_attributed_from_zero,
-            total_tokens: strict_prior.previous_total,
+            total_tokens: total,
             input_tokens: strict_prior.previous_input,
             cached_input_tokens: strict_prior.previous_cached_input,
             output_tokens: strict_prior.previous_output,
@@ -5113,7 +9367,7 @@ fn legacy_pending_no_delta_proof(
         };
     }
     let prior_snapshot = TokenSnapshot {
-        total: strict_prior.previous_total,
+        total: strict_prior.previous_total.unwrap_or(0),
         input: strict_prior.previous_input,
         cached_input: strict_prior.previous_cached_input,
         output: strict_prior.previous_output,
@@ -5304,7 +9558,9 @@ fn legacy_pending_bytes_have_no_delta(bytes: &[u8], known_zero_anchor: bool) -> 
         {
             return false;
         }
-        if summary.usage_unparsed()
+        if !summary.input_shape_valid_for_coverage()
+            || summary.response_stream_marker()
+            || summary.usage_unparsed()
             || (summary.task_running().is_some() && summary.event_timestamp() <= 0)
         {
             return false;
@@ -5385,12 +9641,130 @@ fn checkpoint_can_resume_offset(checkpoint: &SessionCheckpoint, source: &Source)
         && checkpoint.committed_offset <= source.recorded.file_bytes
 }
 
+fn source_ranges_cover_checkpoint(
+    checkpoint: &SessionCheckpoint,
+    ranges: &[SessionRange],
+    file_bytes: u64,
+) -> bool {
+    if checkpoint.committed_offset == 0 || ranges.is_empty() {
+        return false;
+    }
+    let mut ordered = ranges.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|range| (range.start_offset, range.end_offset));
+    let mut covered = 0;
+    for range in ordered {
+        if range.root_identity != checkpoint.root_identity
+            || range.relative_path != checkpoint.relative_path
+            || range.file_device != checkpoint.file_device
+            || range.file_inode != checkpoint.file_inode
+            || range.prefix_generation != checkpoint.prefix_generation
+            || range.start_offset >= checkpoint.committed_offset
+            || range.start_offset > covered
+            || range.start_offset >= range.end_offset
+            || range.end_offset > file_bytes
+        {
+            return false;
+        }
+        covered = covered.max(range.end_offset);
+    }
+    covered >= checkpoint.committed_offset
+}
+
+// None means the input was not fully verified (including identity changes).
+// Some(false) is a stable content rejection, after reading every saved range.
+fn saved_source_prefix_matches(
+    source: &Source,
+    checkpoint: &SessionCheckpoint,
+    ranges: &[SessionRange],
+) -> Result<Option<bool>, RecorderError> {
+    saved_source_prefix_matches_in_container(source, checkpoint, ranges, None)
+}
+
+fn saved_source_prefix_matches_in_container(
+    source: &Source,
+    checkpoint: &SessionCheckpoint,
+    ranges: &[SessionRange],
+    container: Option<&codex_info_db_writer::AcceptedSourceReadContainer>,
+) -> Result<Option<bool>, RecorderError> {
+    let identity_matches = if let Some(container) = container {
+        container.covers(checkpoint)
+            && container.root_identity == source.recorded.root_identity
+            && container.relative_path == source.recorded.relative_path
+            && (container.file_device, container.file_inode)
+                == (source.recorded.file_device, source.recorded.file_inode)
+    } else {
+        // The scanner freezes the length of its opened file, which may
+        // include an append after inventory. Check coverage against the
+        // actual file below, while retaining the physical identity fence.
+        checkpoint.root_identity == source.recorded.root_identity
+            && checkpoint.relative_path == source.recorded.relative_path
+            && checkpoint.file_device == source.recorded.file_device
+            && checkpoint.file_inode == source.recorded.file_inode
+    };
+    if !identity_matches || !source_root_matches_inventory(source)? {
+        return Ok(None);
+    }
+    let before_path = fs::symlink_metadata(&source.path)?;
+    if before_path.file_type().is_symlink() || !before_path.is_file() {
+        return Ok(None);
+    }
+    let mut file = File::open(&source.path)?;
+    let before_file = file.metadata()?;
+    let identity = (source.recorded.file_device, source.recorded.file_inode);
+    if file_identity(&before_path) != identity
+        || file_identity(&before_file) != identity
+        || before_file.len() < source.recorded.file_bytes
+        || !source_ranges_cover_checkpoint(checkpoint, ranges, before_file.len())
+    {
+        return Ok(None);
+    }
+    if container.is_some_and(|container| {
+        container
+            .ranges
+            .iter()
+            .any(|range| range.end_offset > before_file.len())
+    }) {
+        return Ok(None);
+    }
+    let mut matches = true;
+    let mut hashes = BTreeMap::new();
+    for range in ranges.iter().chain(
+        container
+            .into_iter()
+            .flat_map(|container| &container.ranges),
+    ) {
+        let key = (range.start_offset, range.end_offset);
+        if let std::collections::btree_map::Entry::Vacant(entry) = hashes.entry(key) {
+            entry.insert(sha256_open_file_range(
+                &mut file,
+                range.start_offset,
+                range.end_offset,
+            )?);
+        }
+        matches &= hashes[&key] == range.record_sha256;
+    }
+    file.seek(SeekFrom::Start(checkpoint.committed_offset - 1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    matches &= last[0] == b'\n';
+    let after_file = file.metadata()?;
+    let after_path = fs::symlink_metadata(&source.path)?;
+    let stable = after_path.is_file()
+        && !after_path.file_type().is_symlink()
+        && file_identity(&after_file) == identity
+        && file_identity(&after_path) == identity
+        && after_file.len() >= before_file.len()
+        && after_path.len() >= before_file.len()
+        && source_root_matches_inventory(source)?;
+    Ok(stable.then_some(matches))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source(
     source: &Source,
     prior: Option<&SessionCheckpoint>,
     baseline_existing: bool,
-    baseline_first_counter: bool,
+    _baseline_first_counter: bool,
     collector_epoch: u128,
     cycle_seq: u64,
     reset_at: i64,
@@ -5399,9 +9773,84 @@ fn scan_source(
     saved_token_anchor_recovery: Option<&SessionTokenAnchorRecovery>,
     legacy_pending: Option<&SessionPendingRange>,
     legacy_prefix_generation: Option<u128>,
+    ownership: Option<&SourceOwnership<'_>>,
     totals: &mut ModelTotals,
     events: &mut Vec<TimedModelUsage>,
 ) -> Result<Option<SourceOutcome>, RecorderError> {
+    scan_source_with_reader(
+        source,
+        prior,
+        baseline_existing,
+        _baseline_first_counter,
+        collector_epoch,
+        cycle_seq,
+        reset_at,
+        window_start,
+        max_bytes,
+        saved_token_anchor_recovery,
+        legacy_pending,
+        legacy_prefix_generation,
+        ownership,
+        totals,
+        events,
+        |file, limit| BufReader::new(file.take(limit)),
+    )
+}
+
+#[derive(Default)]
+struct SessionPendingEvidence {
+    entries: Vec<(u64, u64, String, bool)>,
+}
+
+impl SessionPendingEvidence {
+    fn record(&mut self, (start, end, reason, complete): (u64, u64, &'static str, bool)) {
+        // Records arrive in byte order. Only the immediately preceding entry
+        // can refer to another failed condition of this same physical record.
+        if let Some(previous) = self
+            .entries
+            .last_mut()
+            .filter(|previous| (previous.0, previous.1, previous.3) == (start, end, complete))
+        {
+            let mut reasons = previous.2.split('+').collect::<BTreeSet<_>>();
+            reasons.insert(reason);
+            if reasons.contains("response-snapshot-invalid") {
+                reasons.remove("invalid-noop-record");
+            }
+            previous.2 = reasons.into_iter().collect::<Vec<_>>().join("+");
+        } else {
+            self.range((start, end, reason, complete));
+        }
+    }
+
+    fn range(&mut self, (start, end, reason, complete): (u64, u64, &'static str, bool)) {
+        // Source-wide anchor and backlog evidence is independent of record
+        // rejection, even when its bounds happen to equal a record's bounds.
+        self.entries.push((start, end, reason.to_owned(), complete));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_source_with_reader<R: BufRead>(
+    source: &Source,
+    prior: Option<&SessionCheckpoint>,
+    baseline_existing: bool,
+    _baseline_first_counter: bool,
+    collector_epoch: u128,
+    cycle_seq: u64,
+    reset_at: i64,
+    window_start: i64,
+    max_bytes: u64,
+    saved_token_anchor_recovery: Option<&SessionTokenAnchorRecovery>,
+    legacy_pending: Option<&SessionPendingRange>,
+    legacy_prefix_generation: Option<u128>,
+    ownership: Option<&SourceOwnership<'_>>,
+    totals: &mut ModelTotals,
+    events: &mut Vec<TimedModelUsage>,
+    make_reader: impl FnOnce(File, u64) -> R,
+) -> Result<Option<SourceOutcome>, RecorderError> {
+    if !source_root_matches_inventory(source)? {
+        return Ok(None);
+    }
     let before_path = fs::symlink_metadata(&source.path)?;
     if before_path.file_type().is_symlink() || !before_path.is_file() {
         return Ok(None);
@@ -5424,7 +9873,7 @@ fn scan_source(
     let continuous = prior.filter(|checkpoint| {
         legacy_prefix_generation.is_none()
             && !baseline_existing
-            && checkpoint.collector_epoch == collector_epoch
+            && (checkpoint.collector_epoch == collector_epoch || ownership.is_some())
             && checkpoint.root_identity == source.recorded.root_identity
             && checkpoint.relative_path == source.recorded.relative_path
             && checkpoint.file_device == source.recorded.file_device
@@ -5446,7 +9895,7 @@ fn scan_source(
                 .filter(|checkpoint| checkpoint.token_baseline_known)
                 .filter(|_| continuous.is_none())
                 .map(|checkpoint| TokenSnapshot {
-                    total: checkpoint.previous_total,
+                    total: checkpoint.previous_total.unwrap_or(0),
                     input: checkpoint.previous_input,
                     cached_input: checkpoint.previous_cached_input,
                     output: checkpoint.previous_output,
@@ -5485,7 +9934,7 @@ fn scan_source(
             checkpoint_context_usage_tokens,
             checkpoint_context_window_tokens,
             TokenSnapshot {
-                total: checkpoint.previous_total,
+                total: checkpoint.previous_total.unwrap_or(0),
                 input: checkpoint.previous_input,
                 cached_input: checkpoint.previous_cached_input,
                 output: checkpoint.previous_output,
@@ -5525,7 +9974,7 @@ fn scan_source(
             0,
             false,
             prior.is_none() && !baseline_existing,
-            prior.is_none() && !baseline_existing && !baseline_first_counter,
+            false,
             false,
             None,
             None,
@@ -5541,8 +9990,34 @@ fn scan_source(
     if start_offset > snapshot_len {
         return Ok(None);
     }
+    let mut model_context = if start_offset == 0 {
+        ModelAttributionState::new()
+    } else if let Some(checkpoint) = continuous {
+        ModelAttributionState {
+            model: checkpoint.last_model.clone(),
+            kind: checkpoint
+                .last_model_context_kind
+                .unwrap_or(SessionModelContextKind::Unknown),
+            interval: checkpoint
+                .last_model_interval
+                .clone()
+                .unwrap_or(SessionModelInterval::Unknown),
+        }
+    } else {
+        ModelAttributionState {
+            model: last_model.take(),
+            kind: SessionModelContextKind::Unknown,
+            interval: SessionModelInterval::Unknown,
+        }
+    };
+    let mut source_admission = if start_offset == 0 {
+        Some(SourceAdmission::from_prefix_start())
+    } else if let Some(checkpoint) = continuous {
+        checkpoint.source_admission.clone()
+    } else {
+        None
+    };
 
-    let resumed_partial = discard_until_lf;
     let zero_anchor_snapshot = recovery_anchor.filter(|anchor| anchor.is_zero());
     let zero_anchor_fully_attributed = saved_token_anchor_recovery
         .map(|recovery| recovery.anchor.fully_attributed_from_zero)
@@ -5562,13 +10037,16 @@ fn scan_source(
         fully_attributed = true;
     }
     file.seek(SeekFrom::Start(start_offset))?;
-    let mut reader = BufReader::new(file.take(snapshot_len - start_offset));
+    let mut metadata_file = file.try_clone()?;
+    let mut reader = SourceReader::new(make_reader(file, snapshot_len - start_offset));
+    let mut accepted_content_hash = Sha256::new();
+    let mut accepted_content_bytes = 0;
     let admitted_start = start_offset;
     let mut physical_offset = start_offset;
     let mut consumed_bytes = 0_u64;
     let mut unresolved = false;
     let mut unresolved_start = None;
-    let mut pending_evidence = Vec::<(u64, u64, &'static str, bool)>::new();
+    let mut pending_evidence = SessionPendingEvidence::default();
     let mut candidate_totals = totals.clone();
     let mut candidate_events = Vec::new();
     let mut token_observed_at = Vec::new();
@@ -5579,6 +10057,9 @@ fn scan_source(
     // vector is what lets a later reset boundary reconstruct outage-spanning
     // usage without rereading or double-adding checkpoints.
     let mut all_candidate_events = Vec::new();
+    let mut event_proofs = Vec::new();
+    let mut counter_proofs = Vec::new();
+    let mut numeric_records = Vec::new();
     let mut recovery_match = zero_anchor_at_source_start.map(|anchor| (anchor, 0, 0));
     let mut token_count_seen = false;
     let mut read_any = false;
@@ -5588,6 +10069,7 @@ fn scan_source(
             break;
         }
         let record_start = physical_offset;
+        reader.record_hasher = Sha256::new();
         let record = read_streaming_record(&mut reader)?;
         let (summary, bytes) = match record {
             RecordRead::End => break,
@@ -5596,15 +10078,47 @@ fn scan_source(
                 record_index = record_index.saturating_add(1);
                 consumed_bytes = consumed_bytes.saturating_add(bytes);
                 unresolved = true;
+                model_context.invalidate();
+                if let Some(admission) = source_admission.as_mut() {
+                    admission.adopted_context = None;
+                }
                 if terminated {
                     // A complete malformed line is exact source evidence.
                     // Keep its bytes in this contiguous range and continue
                     // so later records cannot be stranded behind a poison
                     // line forever.
                     physical_offset = physical_offset.saturating_add(bytes);
+                    accepted_content_hash = reader.hasher.clone();
+                    accepted_content_bytes = reader.consumed;
                     read_any = true;
                     discard_until_lf = false;
-                    pending_evidence.push((
+                    if let Some(admission) = source_admission.as_mut() {
+                        admission.observe_response_classification(
+                            &ResponseClassificationInput::Unknown,
+                            &ClassificationPointer {
+                                start: record_start,
+                                end: physical_offset,
+                                sha256: hex_bytes(
+                                    reader.record_hasher.clone().finalize().as_slice(),
+                                ),
+                            },
+                        );
+                        if let Some(response) = admission.responses.last_mut() {
+                            response.observe_counter_association(
+                                &ResponseClassificationInput::Unknown,
+                                &ClassificationPointer {
+                                    start: record_start,
+                                    end: physical_offset,
+                                    sha256: hex_bytes(
+                                        reader.record_hasher.clone().finalize().as_slice(),
+                                    ),
+                                },
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                    pending_evidence.record((
                         record_start,
                         physical_offset,
                         "malformed-json-record",
@@ -5613,7 +10127,7 @@ fn scan_source(
                     continue;
                 }
                 let pending_end = record_start.saturating_add(bytes);
-                pending_evidence.push((
+                pending_evidence.record((
                     record_start,
                     pending_end,
                     "unterminated-malformed-json-record",
@@ -5627,7 +10141,7 @@ fn scan_source(
                 consumed_bytes = consumed_bytes.saturating_add(bytes);
                 unresolved = true;
                 let pending_end = record_start.saturating_add(bytes);
-                pending_evidence.push((record_start, pending_end, "partial-json-record", false));
+                pending_evidence.record((record_start, pending_end, "partial-json-record", false));
                 unresolved_start = Some(record_start);
                 discard_until_lf = true;
                 break;
@@ -5638,6 +10152,193 @@ fn scan_source(
         read_any = true;
         consumed_bytes = consumed_bytes.saturating_add(bytes);
         physical_offset = physical_offset.saturating_add(bytes);
+        accepted_content_hash = reader.hasher.clone();
+        accepted_content_bytes = reader.consumed;
+        if !summary.envelope_metadata_shape_valid() {
+            // Position/history metadata is not a numeric/state authority.
+            // Preserve independent facts while keeping this prefix unresolved.
+            unresolved = true;
+            pending_evidence.record((
+                record_start,
+                physical_offset,
+                if !summary.ordinal_shape_valid() {
+                    "ordinal-envelope-invalid"
+                } else {
+                    "response-metadata-envelope-invalid"
+                },
+                true,
+            ));
+        }
+        let original_timestamp = summary.event_timestamp();
+        let classification_pointer = ClassificationPointer {
+            start: record_start,
+            end: physical_offset,
+            sha256: hex_bytes(reader.record_hasher.clone().finalize().as_slice()),
+        };
+        let pointer = (1..=253_402_300_799)
+            .contains(&original_timestamp)
+            .then(|| RecordPointer {
+                start: record_start,
+                end: physical_offset,
+                timestamp: original_timestamp,
+                sha256: classification_pointer.sha256.clone(),
+            });
+        let response_marker = summary.response_stream_marker();
+        if response_marker {
+            let admission =
+                source_admission.get_or_insert_with(SourceAdmission::from_response_boundary);
+            admission.stream = UsageStream::ResponseRecord;
+        }
+        if let Some(admission) = source_admission.as_mut() {
+            if summary.outer_type.as_deref() == Some("session_meta") {
+                let next = summary
+                    .payload
+                    .metadata_id
+                    .clone()
+                    .map(|thread_id| SessionMetadata {
+                        thread_id,
+                        session_id: summary.payload.response.session_id.clone(),
+                    });
+                let valid = !summary.duplicate_fields
+                    && summary.payload_object
+                    && !summary.payload.metadata_id_malformed
+                    && summary.payload.response.malformed_identifiers
+                        & SessionJsonKey::SessionId.bit()
+                        == 0
+                    && (!summary.payload.response.session_id_seen
+                        || summary.payload.response.session_id.is_some())
+                    && next.as_ref().is_some_and(|next| {
+                        admission.metadata.as_ref().is_none_or(|old| {
+                            old.thread_id == next.thread_id
+                                && (old.session_id.is_none()
+                                    || next.session_id.is_none()
+                                    || old.session_id == next.session_id)
+                        })
+                    });
+                if valid {
+                    let mut next = next.expect("valid metadata has an identity");
+                    if next.session_id.is_none() {
+                        next.session_id = admission
+                            .metadata
+                            .as_ref()
+                            .and_then(|old| old.session_id.clone());
+                    }
+                    admission.metadata = Some(next);
+                    admission.metadata_qualified = true;
+                } else {
+                    admission.metadata_qualified = false;
+                    unresolved = true;
+                    pending_evidence.record((
+                        record_start,
+                        physical_offset,
+                        "session-metadata-unqualified",
+                        true,
+                    ));
+                }
+            }
+            observe_response_classification(
+                admission,
+                &summary,
+                &classification_pointer,
+                pointer.as_ref(),
+            );
+            if summary.outer_type.as_deref() == Some("token_usage_record") {
+                let record = (!summary.duplicate_fields && summary.payload_object)
+                    .then(|| summary.payload.response.record())
+                    .flatten();
+                if let (Some(record), Some(pointer)) = (record, pointer.as_ref()) {
+                    let session_scope_qualified = admission.metadata_qualified
+                        && admission.metadata.as_ref().is_some_and(|meta| {
+                            meta.thread_id == record.ids.thread_id
+                                && meta.session_id.as_deref() == Some(&record.ids.session_id)
+                        });
+                    let root_context = admission
+                        .strong_context
+                        .as_ref()
+                        .filter(|context| {
+                            model_context.kind == SessionModelContextKind::Turn
+                                && context.turn_id.is_some()
+                                && context.root_turn_id.is_some()
+                        })
+                        .and_then(|context| {
+                            model_context.model.as_ref().map(|model| ResponseContext {
+                                model: model.clone(),
+                                context: context.clone(),
+                            })
+                        });
+                    admission.push_response(PendingResponse {
+                        key: record.ids.key(),
+                        record,
+                        pointer: pointer.clone(),
+                        session_scope_qualified,
+                        root_context,
+                        classification: ResponseModelClassification::AwaitingBoundary,
+                        counter_association: codex_info_db_writer::source_admission::ResponseCounterAssociation::Awaiting,
+                    });
+                    admission.response_waiting_for_counter = true;
+                    unresolved = true;
+                    pending_evidence.record((
+                        record_start,
+                        physical_offset,
+                        "response-qualification-pending",
+                        true,
+                    ));
+                } else {
+                    unresolved = true;
+                    pending_evidence.record((
+                        record_start,
+                        physical_offset,
+                        "response-record-invalid",
+                        true,
+                    ));
+                }
+            } else if summary.outer_type.as_deref() == Some("compacted")
+                && summary.payload.snapshot_non_null
+                && (summary.duplicate_fields
+                    || !summary.payload_object
+                    || pointer.is_none()
+                    || summary.payload.snapshot.record().is_none())
+            {
+                unresolved = true;
+                pending_evidence.record((
+                    record_start,
+                    physical_offset,
+                    "response-snapshot-invalid",
+                    true,
+                ));
+            }
+        }
+        let had_response_before_counter = source_admission.as_mut().is_some_and(|admission| {
+            if summary.event_type() == Some("token_count") && summary.context_envelope_valid() {
+                std::mem::take(&mut admission.response_waiting_for_counter)
+            } else {
+                false
+            }
+        });
+        let noop_valid = summary.noop_valid();
+        let known_state = summary.known_state_input();
+        if noop_valid == Some(false) || (noop_valid.is_none() && !known_state) {
+            unresolved = true;
+            model_context.invalidate();
+            if let Some(admission) = source_admission.as_mut() {
+                admission.strong_context = None;
+                admission.adopted_context = None;
+            }
+            pending_evidence.record((
+                record_start,
+                physical_offset,
+                if noop_valid.is_some() {
+                    "invalid-noop-record"
+                } else {
+                    "unrecognized-usage-control-record"
+                },
+                true,
+            ));
+            continue;
+        }
+        if noop_valid == Some(true) {
+            continue;
+        }
         if summary.history_base_continuation()
             && !token_count_seen
             && prior.is_none()
@@ -5649,55 +10350,128 @@ fn scan_source(
         if summary.event_type() == Some("token_count") {
             token_count_seen = true;
         }
-        if summary.usage_unparsed() {
+        let prior_context_kind = model_context.kind;
+        let invalid_context = model_context.observe_context(&summary);
+        if let Some(admission) = source_admission.as_mut() {
+            if model_context.kind == SessionModelContextKind::Unknown {
+                admission.adopted_context = None;
+            } else if !invalid_context
+                && (matches!(
+                    summary.event_type(),
+                    Some("turn_context" | "thread_context")
+                ) || (summary.event_type() == Some("thread_settings_applied")
+                    && prior_context_kind == SessionModelContextKind::None))
+            {
+                admission.adopted_context = Some(classification_pointer.clone());
+            }
+        }
+        if matches!(
+            summary.event_type(),
+            Some("turn_context" | "thread_context")
+        ) {
+            if let Some(admission) = source_admission.as_mut() {
+                admission.strong_context = (!invalid_context)
+                    .then(|| {
+                        pointer.as_ref().map(|pointer| StrongContext {
+                            turn_id: summary.payload.response.turn_id.clone(),
+                            root_turn_id: summary.payload.response.root_turn_id.clone(),
+                            pointer: pointer.clone(),
+                        })
+                    })
+                    .flatten();
+            }
+        }
+        let usage_unparsed = summary.usage_unparsed();
+        if invalid_context || usage_unparsed {
             unresolved = true;
             // This is a complete line with an untrusted usage shape. Admit
             // its exact bytes, but do not stop subsequent safe records.
             discard_until_lf = false;
-            pending_evidence.push((
+            pending_evidence.record((
                 record_start,
                 physical_offset,
-                "usage-payload-unparsed",
+                if invalid_context {
+                    "model-context-unqualified"
+                } else {
+                    "usage-payload-unparsed"
+                },
                 true,
             ));
-            continue;
+            if invalid_context {
+                continue;
+            }
         }
         if let Some(running) = summary.task_running() {
-            last_task_running = Some(running);
-            let timestamp = summary.event_timestamp();
-            if timestamp <= 0 {
+            if !summary.task_shape_valid() {
                 unresolved = true;
-                pending_evidence.push((
+                pending_evidence.record((
                     record_start,
                     physical_offset,
-                    "task-event-timestamp-invalid",
+                    "task-event-invalid",
                     true,
                 ));
             } else {
+                last_task_running = Some(running);
                 candidate_task_events.push(TaskObservation {
                     event_index: current_record_index,
-                    timestamp,
+                    timestamp: summary.event_timestamp(),
                     running,
                 });
             }
         }
-        if summary.event_type() != Some("thread_settings_applied") || last_model.is_none() {
-            if let Some(model) = summary.event_model() {
-                last_model = ModelTotals::checkpoint_model(model);
-            }
+        if summary.context_unparsed() {
+            unresolved = true;
+            pending_evidence.record((record_start, physical_offset, "context-pair-invalid", true));
         }
         if let Some((usage, window)) = summary.context_pair() {
             context_usage_tokens = Some(usage);
             context_window_tokens = Some(window);
         }
+        if usage_unparsed {
+            // A valid context pair is independent of a malformed cumulative
+            // counter. Its common envelope has already been checked by the
+            // pair accessor; the raw anchor remains unchanged here.
+            continue;
+        }
         let Some(current) = summary.token_snapshot() else {
             continue;
         };
-        if !current.valid() {
+        let facts_json = |facts: codex_info_db_writer::TokenFacts| json!({"total":facts.total,"input":facts.input,"cached_input":facts.cached_input,"cache_write_input":facts.cache_write_input,"output":facts.output});
+        let outcome = if !current.valid_raw() {
+            "invalid-token-components"
+        } else if summary.context_window_tokens() == Some(current.total)
+            && [current.input, current.cached_input, current.output]
+                .into_iter()
+                .all(|n| n == Some(0))
+            && current.cache_write_input.is_none_or(|n| n == 0)
+        {
+            "context-adjustment"
+        } else if history_base_pending {
+            "history-counter-baseline"
+        } else if ownership.is_some_and(|owner| {
+            !owner.contains(summary.event_timestamp())
+                || !baseline_known
+                || source_admission
+                    .as_ref()
+                    .and_then(|state| state.previous_raw.as_ref())
+                    .is_none_or(|before| {
+                        !owner.same_interval(before.timestamp, summary.event_timestamp())
+                    })
+        }) {
+            "account-counter-baseline"
+        } else if !baseline_known {
+            "initial-counter-baseline"
+        } else if current.facts().checked_delta(previous.facts()).is_err() {
+            "raw-counter-regression-or-invalid-delta"
+        } else {
+            "checked-counter-delta"
+        };
+        numeric_records.push(json!({"pointer":{"start":record_start,"end":physical_offset,"sha256":hex_bytes(reader.record_hasher.clone().finalize().as_slice())},"timestamp":summary.event_timestamp(),"before":baseline_known.then(||facts_json(previous.facts())),"raw":facts_json(current.facts()),"outcome":outcome}));
+        if !current.valid_raw() {
             unresolved = true;
             // Invalid token components are retained as source evidence while
             // arithmetic remains fail-closed; later records are still read.
-            pending_evidence.push((
+            pending_evidence.record((
                 record_start,
                 physical_offset,
                 "invalid-token-components",
@@ -5717,62 +10491,215 @@ fn scan_source(
                 .or_else(|| prior.map(|checkpoint| checkpoint.fully_attributed_from_zero))
                 .unwrap_or(false);
             recovery_match = Some((current, record_start, physical_offset));
+            if let Some(admission) = source_admission.as_mut() {
+                admission.previous_raw = pointer.clone();
+            }
+            model_context.start_interval();
             continue;
         }
-        let delta = if history_base_pending {
-            history_base_pending = false;
-            baseline_known = true;
-            let last = summary.last_token_snapshot();
-            if !last.is_some_and(|last| last.valid() && last.is_at_most(current)) {
-                unresolved = true;
-                pending_evidence.push((
-                    record_start,
-                    physical_offset,
-                    "history-base-last-token-usage-invalid",
-                    true,
-                ));
-                previous = current;
-                continue;
-            }
-            previous = current;
-            last.expect("validated history-base last token usage")
-        } else {
-            if !baseline_known {
+        if summary
+            .context_window_tokens()
+            .is_some_and(|window| window == current.total)
+        {
+            let zeros = [current.input, current.cached_input, current.output];
+            if zeros.into_iter().all(|value| value == Some(0))
+                && current.cache_write_input.is_none_or(|value| value == 0)
+            {
+                // The documented context adjustment changes only the raw
+                // comparison counter; it is not a response or consumption.
                 previous = current;
                 baseline_known = true;
+                history_base_pending = false;
+                if let Some(admission) = source_admission.as_mut() {
+                    admission.previous_raw = pointer.clone();
+                }
+                model_context.start_interval();
                 continue;
             }
-            if current.total < previous.total
-                || current.input < previous.input
-                || current.cached_input < previous.cached_input
-                || current.output < previous.output
-                || matches!(
-                    (current.cache_write_input, previous.cache_write_input),
-                    (Some(current), Some(previous)) if current < previous
-                )
+            if zeros
+                .into_iter()
+                .all(|value| value.is_none_or(|value| value == 0))
+                && current.cache_write_input.is_none_or(|value| value == 0)
             {
-                previous = current;
+                unresolved = true;
+                pending_evidence.record((
+                    record_start,
+                    physical_offset,
+                    "ambiguous-context-adjustment",
+                    true,
+                ));
                 continue;
             }
-            let delta = TokenSnapshot {
-                total: current.total - previous.total,
-                input: current.input - previous.input,
-                cached_input: current.cached_input - previous.cached_input,
-                output: current.output - previous.output,
-                cache_write_input: current.cache_write_delta_from(previous),
-            };
+        }
+        if history_base_pending {
+            history_base_pending = false;
+            baseline_known = false;
+        }
+        if let Some(ownership) = ownership {
+            let timestamp = summary.event_timestamp();
+            let owned = ownership.contains(timestamp);
+            let previous_owned = baseline_known
+                && source_admission
+                    .as_ref()
+                    .and_then(|state| state.previous_raw.as_ref())
+                    .is_some_and(|before| ownership.same_interval(before.timestamp, timestamp));
+            if !owned || !previous_owned {
+                // Keep the raw observation, but an outside/unknown endpoint
+                // cannot become this account's consumption interval. The
+                // first owned observation is a zero-addition baseline.
+                previous = current;
+                baseline_known = true;
+                if let Some(admission) = source_admission.as_mut() {
+                    admission.previous_raw = pointer.clone();
+                }
+                model_context.start_interval();
+                if !owned || current.total > 0 {
+                    unresolved = true;
+                    pending_evidence.record((
+                        record_start,
+                        physical_offset,
+                        if owned {
+                            "account-counter-prefix-unknown"
+                        } else {
+                            "counter-outside-account-ownership"
+                        },
+                        true,
+                    ));
+                }
+                continue;
+            }
+        }
+        if !baseline_known {
             previous = current;
-            delta
+            baseline_known = true;
+            if let Some(admission) = source_admission.as_mut() {
+                admission.previous_raw = pointer.clone();
+            }
+            model_context.start_interval();
+            if current.total > 0 {
+                unresolved = true;
+                pending_evidence.record((
+                    record_start,
+                    physical_offset,
+                    "initial-counter-prefix-unknown",
+                    true,
+                ));
+            }
+            continue;
+        }
+        let before_facts = previous.facts();
+        let before_pointer = source_admission
+            .as_ref()
+            .and_then(|state| state.previous_raw.clone());
+        let legacy_model_proof = source_admission
+            .as_ref()
+            .and_then(|state| state.adopted_context.clone())
+            .filter(|_| {
+                matches!(
+                    model_context.kind,
+                    SessionModelContextKind::InitialSettings | SessionModelContextKind::Turn
+                )
+            })
+            .map(|pointer| LegacyModelProof {
+                pointer,
+                kind: model_context.kind.as_str().to_owned(),
+                interval: model_context.interval.to_storage(),
+            });
+        let delta = match current.facts().checked_delta(before_facts) {
+            Ok(delta) => TokenSnapshot::from_facts(delta),
+            Err(_) => {
+                unresolved = true;
+                pending_evidence.record((
+                    record_start,
+                    physical_offset,
+                    "raw-counter-regression-or-invalid-delta",
+                    true,
+                ));
+                continue;
+            }
         };
+        previous = current;
+        if let Some(admission) = source_admission.as_mut() {
+            admission.previous_raw = pointer.clone();
+        }
         let timestamp = summary.event_timestamp();
-        let model = ModelTotals::usage_model(last_model.as_deref());
+        if let (Some(before), Some(after)) = (before_pointer.as_ref(), pointer.as_ref()) {
+            let witness =
+                |pointer: RecordPointer, facts: codex_info_db_writer::TokenFacts| CounterWitness {
+                    pointer,
+                    total: facts.total,
+                    input: facts.input,
+                    cached_input: facts.cached_input,
+                    cache_write_input: facts.cache_write_input,
+                    output: facts.output,
+                };
+            counter_proofs.push(LegacyCounterProof {
+                before: witness(before.clone(), before_facts),
+                after: witness(after.clone(), current.facts()),
+                model_context: legacy_model_proof.clone(),
+            });
+        }
+        if source_admission
+            .as_ref()
+            .is_none_or(|admission| admission.stream != UsageStream::LegacyCounter)
+        {
+            model_context.start_interval();
+            if delta.has_usage() && !had_response_before_counter {
+                unresolved = true;
+                pending_evidence.record((
+                    record_start,
+                    physical_offset,
+                    if source_admission.is_some() {
+                        "response-record-missing"
+                    } else {
+                        "source-admission-unknown"
+                    },
+                    true,
+                ));
+            }
+            continue;
+        }
+        let qualified_model = model_context.interval_model().map(str::to_owned);
+        let model = ModelTotals::usage_model(qualified_model.as_deref());
+        model_context.start_interval();
         let timed_event = (timestamp > 0 && delta.has_usage()).then(|| TimedModelUsage {
             timestamp,
             model: model.clone(),
             delta,
         });
         if let Some(event) = timed_event.as_ref() {
+            let witness = |pointer, facts: codex_info_db_writer::TokenFacts| CounterWitness {
+                pointer,
+                total: facts.total,
+                input: facts.input,
+                cached_input: facts.cached_input,
+                cache_write_input: facts.cache_write_input,
+                output: facts.output,
+            };
+            let before = before_pointer.ok_or_else(|| {
+                RecorderError::Invalid("accepted delta has no original baseline pointer".into())
+            })?;
+            let after = pointer.clone().ok_or_else(|| {
+                RecorderError::Invalid("accepted delta has no original endpoint pointer".into())
+            })?;
+            event_proofs.push(LegacyCounterProof {
+                before: witness(before, before_facts),
+                after: witness(after, current.facts()),
+                model_context: qualified_model.as_ref().and(legacy_model_proof),
+            });
             all_candidate_events.push(event.clone());
+        }
+        if qualified_model.is_none() {
+            if delta.has_usage() {
+                unresolved = true;
+                pending_evidence.record((
+                    record_start,
+                    physical_offset,
+                    "model-interval-unqualified",
+                    true,
+                ));
+            }
+            continue;
         }
         if reset_at == 0 {
             // Quota authority is not available yet.  Keep the source-derived
@@ -5798,9 +10725,9 @@ fn scan_source(
         }
     }
 
-    if !unresolved && physical_offset < snapshot_len && consumed_bytes >= max_bytes {
+    if physical_offset < snapshot_len && consumed_bytes >= max_bytes && unresolved_start.is_none() {
         unresolved = true;
-        pending_evidence.push((physical_offset, snapshot_len, "cycle-budget-backlog", false));
+        pending_evidence.range((physical_offset, snapshot_len, "cycle-budget-backlog", false));
     }
     if let Some(pending) = legacy_pending {
         if pending.end_offset > snapshot_len
@@ -5811,7 +10738,7 @@ fn scan_source(
         }
     }
     let end_offset = unresolved_start.unwrap_or(physical_offset);
-    let after_file = reader.get_ref().get_ref().metadata()?;
+    let after_file = metadata_file.metadata()?;
     let after_path = fs::symlink_metadata(&source.path)?;
     if after_path.file_type().is_symlink()
         || !after_path.is_file()
@@ -5823,7 +10750,7 @@ fn scan_source(
     if recovery_anchor.is_some() && !recovery_anchor_found {
         unresolved = true;
         if saved_token_anchor_recovery.is_none() {
-            pending_evidence.push((
+            pending_evidence.range((
                 admitted_start,
                 end_offset,
                 "checkpoint-token-anchor-missing",
@@ -5831,9 +10758,29 @@ fn scan_source(
             ));
         }
     }
-    let accepted_digest = (end_offset > admitted_start)
-        .then(|| sha256_file_range(&source.path, admitted_start, end_offset))
-        .transpose()?;
+    let accepted_digest = if end_offset > admitted_start {
+        let parsed = hex_digest(accepted_content_hash.finalize().as_slice());
+        if !reader.valid
+            || accepted_content_bytes != end_offset - admitted_start
+            || sha256_open_file_range(&mut metadata_file, admitted_start, end_offset)? != parsed
+        {
+            return Ok(None);
+        }
+        let verified_path = fs::symlink_metadata(&source.path)?;
+        if verified_path.file_type().is_symlink()
+            || !verified_path.is_file()
+            || file_identity(&verified_path) != file_identity(&before_file)
+            || verified_path.len() < snapshot_len
+        {
+            return Ok(None);
+        }
+        Some(parsed)
+    } else {
+        None
+    };
+    if !source_root_matches_inventory(source)? {
+        return Ok(None);
+    }
     if admitted_start == 0 {
         prefix_sha256 = accepted_digest
             .clone()
@@ -5843,16 +10790,7 @@ fn scan_source(
                 prefix_generation(collector_epoch, &source.recorded, &prefix_sha256);
         }
     }
-    if !unresolved
-        && !discard_until_lf
-        && end_offset == after_file.len()
-        && (fully_attributed || admitted_start == 0 || resumed_partial)
-    {
-        fully_attributed = true;
-    }
-    if unresolved {
-        fully_attributed = false;
-    }
+    let prefix_qualification_candidate = fully_attributed || admitted_start == 0;
     if !unresolved {
         discard_until_lf = false;
     }
@@ -5870,11 +10808,14 @@ fn scan_source(
         fully_attributed_from_zero: fully_attributed,
         token_baseline_known: baseline_known,
         history_base_pending,
-        last_model,
+        last_model: model_context.model,
+        last_model_context_kind: Some(model_context.kind),
+        last_model_interval: Some(model_context.interval),
+        source_admission,
         last_task_running,
         context_usage_tokens,
         context_window_tokens,
-        previous_total: previous.total,
+        previous_total: baseline_known.then_some(previous.total),
         previous_input: previous.input,
         previous_cached_input: previous.cached_input,
         previous_output: previous.output,
@@ -5965,6 +10906,7 @@ fn scan_source(
         ));
     };
     let pending = pending_evidence
+        .entries
         .into_iter()
         .map(|(start_offset, end_offset, reason, complete)| {
             let record_sha256 = if start_offset == end_offset {
@@ -5984,7 +10926,7 @@ fn scan_source(
                 prefix_generation: checkpoint.prefix_generation,
                 record_sha256,
                 parser_version: PARSER_VERSION.to_owned(),
-                reason: reason.to_owned(),
+                reason,
                 complete,
             })
         })
@@ -6009,7 +10951,8 @@ fn scan_source(
                 .find(|item| item.reason == "checkpoint-token-anchor-missing");
             original
                 .zip(missing_anchor_pending)
-                .map(|(original, pending)| {
+                .and_then(|(original, pending)| {
+                    let total_tokens = original.previous_total?;
                     let anchor = SessionTokenAnchor {
                         root_identity: original.root_identity.clone(),
                         relative_path: original.relative_path.clone(),
@@ -6021,14 +10964,14 @@ fn scan_source(
                         collector_epoch: original.collector_epoch,
                         cycle_seq: original.cycle_seq,
                         fully_attributed_from_zero: original.fully_attributed_from_zero,
-                        total_tokens: original.previous_total,
+                        total_tokens,
                         input_tokens: original.previous_input,
                         cached_input_tokens: original.previous_cached_input,
                         output_tokens: original.previous_output,
                         cache_write_input_tokens: original.previous_cache_write_input,
                     };
                     let recovery_id = session_token_anchor_recovery_id(pending, &anchor);
-                    SessionTokenAnchorRecovery {
+                    Some(SessionTokenAnchorRecovery {
                         recovery_id,
                         pending: pending.clone(),
                         anchor,
@@ -6040,7 +10983,7 @@ fn scan_source(
                         cursor_prefix_generation: checkpoint.prefix_generation,
                         cursor_collector_epoch: checkpoint.collector_epoch,
                         cursor_cycle_seq: checkpoint.cycle_seq,
-                    }
+                    })
                 })
         }
     } else {
@@ -6067,10 +11010,14 @@ fn scan_source(
         );
     *totals = candidate_totals;
     events.extend(candidate_events);
-    Ok(Some(SourceOutcome {
+    let mut outcome = SourceOutcome {
         checkpoint,
+        prefix_qualification_candidate,
         range,
         events: durable_events,
+        event_proofs,
+        counter_proofs,
+        numeric_records,
         token_observed_at,
         task_events,
         task_indexed_ranges: task_indexed_range.into_iter().collect(),
@@ -6080,7 +11027,10 @@ fn scan_source(
         unresolved,
         changed,
         consumed_bytes,
-    }))
+    };
+    outcome.finalize_prefix_qualification();
+    outcome.changed = prior.is_none_or(|old| !same_checkpoint_content(old, &outcome.checkpoint));
+    Ok(Some(outcome))
 }
 
 fn previous_line_feed(file: &mut File, before: u64) -> Result<Option<u64>, RecorderError> {
@@ -6189,114 +11139,6 @@ fn model_context_before_boundary(
         scan_end = start;
     }
     Ok(initial_settings_model)
-}
-
-fn range_contains_model_context(
-    file: &mut File,
-    start: u64,
-    end: u64,
-) -> Result<bool, RecorderError> {
-    file.seek(SeekFrom::Start(start))?;
-    let mut reader = BufReader::new((&mut *file).take(end - start));
-    let mut consumed = 0_u64;
-    while consumed < end - start {
-        match read_streaming_record(&mut reader)? {
-            RecordRead::Present(summary, bytes) => {
-                consumed = consumed.checked_add(bytes).ok_or_else(|| {
-                    RecorderError::Invalid("session repair range overflow".to_owned())
-                })?;
-                if matches!(
-                    summary.event_type(),
-                    Some("turn_context" | "thread_context" | "thread_settings_applied")
-                ) && summary.event_model().is_some()
-                {
-                    return Ok(true);
-                }
-            }
-            RecordRead::Invalid(bytes, true) => {
-                consumed = consumed.checked_add(bytes).ok_or_else(|| {
-                    RecorderError::Invalid("session repair range overflow".to_owned())
-                })?;
-            }
-            RecordRead::End if consumed == end - start => break,
-            RecordRead::End | RecordRead::Invalid(_, false) | RecordRead::Unterminated(_) => {
-                return Err(RecorderError::Invalid(
-                    "session repair range framing changed".to_owned(),
-                ));
-            }
-        }
-    }
-    Ok(false)
-}
-
-#[allow(clippy::type_complexity)]
-fn prove_unattributed_event_models(
-    writer: &UsageStore,
-    sources: &[Source],
-) -> Result<Vec<SessionEventReattribution>, RecorderError> {
-    let unattributed = writer
-        .load_session_events()?
-        .into_iter()
-        .filter(|event| event.model == UNATTRIBUTED_MODEL)
-        .collect::<Vec<_>>();
-    if unattributed.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut groups =
-        BTreeMap::<(String, String, u64, u64, u128, u64, u64, String), Vec<SessionEvent>>::new();
-    for event in unattributed {
-        groups
-            .entry((
-                event.root_identity.clone(),
-                event.relative_path.clone(),
-                event.file_device,
-                event.file_inode,
-                event.prefix_generation,
-                event.range_start,
-                event.range_end,
-                event.record_sha256.clone(),
-            ))
-            .or_default()
-            .push(event);
-    }
-
-    let mut corrections = Vec::new();
-    for ((root, relative, device, inode, _, start, end, expected_sha), events) in groups {
-        let Some(source) = sources.iter().find(|source| {
-            source.recorded.root_identity == root
-                && source.recorded.relative_path == relative
-                && source.recorded.file_device == device
-                && source.recorded.file_inode == inode
-        }) else {
-            return Ok(Vec::new());
-        };
-        if start >= end
-            || end > source.recorded.file_bytes
-            || sha256_file_range(&source.path, start, end)? != expected_sha
-        {
-            return Ok(Vec::new());
-        }
-        let before = fs::metadata(&source.path)?;
-        let mut file = File::open(&source.path)?;
-        let model = model_context_before_boundary(&mut file, start)?;
-        let corrected_model = ModelTotals::usage_model(model.as_deref());
-        if corrected_model == UNATTRIBUTED_MODEL
-            || range_contains_model_context(&mut file, start, end)?
-            || sha256_file_range(&source.path, start, end)? != expected_sha
-        {
-            return Ok(Vec::new());
-        }
-        let after = fs::metadata(&source.path)?;
-        if !same_file_identity(&before, &after) || after.len() < end {
-            return Ok(Vec::new());
-        }
-        corrections.extend(events.into_iter().map(|event| SessionEventReattribution {
-            event,
-            corrected_model: corrected_model.clone(),
-        }));
-    }
-    Ok(corrections)
 }
 
 fn build_task_backfill_targets(
@@ -6537,18 +11379,7 @@ fn scan_task_backfill_target(
         let (summary, bytes) = match record {
             RecordRead::End => break,
             RecordRead::Present(summary, bytes) => (summary, bytes),
-            RecordRead::Invalid(bytes, true) => {
-                let Some(next_offset) = offset.checked_add(bytes) else {
-                    return Ok(None);
-                };
-                if next_offset > target.range.end_offset {
-                    return Ok(None);
-                }
-                offset = next_offset;
-                range_record_index = range_record_index.saturating_add(1);
-                continue;
-            }
-            RecordRead::Invalid(_, false) | RecordRead::Unterminated(_) => return Ok(None),
+            RecordRead::Invalid(_, _) | RecordRead::Unterminated(_) => return Ok(None),
         };
         let Some(next_offset) = offset.checked_add(bytes) else {
             return Ok(None);
@@ -6564,6 +11395,9 @@ fn scan_task_backfill_target(
             continue;
         }
         range_start_seen = true;
+        if !summary.input_shape_valid_for_coverage() {
+            return Ok(None);
+        }
         if let Some(running) = summary.task_running() {
             let timestamp = summary.event_timestamp();
             if timestamp <= 0 {
@@ -6641,6 +11475,9 @@ fn same_checkpoint_content(left: &SessionCheckpoint, right: &SessionCheckpoint) 
         && left.fully_attributed_from_zero == right.fully_attributed_from_zero
         && left.token_baseline_known == right.token_baseline_known
         && left.last_model == right.last_model
+        && left.last_model_context_kind == right.last_model_context_kind
+        && left.last_model_interval == right.last_model_interval
+        && left.source_admission == right.source_admission
         && left.last_task_running == right.last_task_running
         && left.previous_total == right.previous_total
         && left.previous_input == right.previous_input
@@ -6650,12 +11487,20 @@ fn same_checkpoint_content(left: &SessionCheckpoint, right: &SessionCheckpoint) 
 }
 
 fn sha256_file_range(path: &Path, start: u64, end: u64) -> Result<String, RecorderError> {
+    let mut file = File::open(path)?;
+    sha256_open_file_range(&mut file, start, end)
+}
+
+fn sha256_open_file_range(
+    file: &mut (impl Read + Seek),
+    start: u64,
+    end: u64,
+) -> Result<String, RecorderError> {
     if start > end || end > i64::MAX as u64 {
         return Err(RecorderError::Invalid(
             "session range exceeds SQLite offset".to_owned(),
         ));
     }
-    let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
     let mut remaining = end - start;
     let mut buffer = [0_u8; 64 * 1024];
@@ -6844,15 +11689,18 @@ fn build_history(
         if minute <= 0 {
             continue;
         }
-        let dollars = totals.dollar_totals();
+        let (Some(sol_dollars), Some(terra_dollars), Some(luna_dollars)) = totals.dollar_totals()
+        else {
+            continue;
+        };
         let tokens = totals.token_totals();
         let sample = UsageHistorySample {
             timestamp: minute,
             reset_at,
             remaining_percent: None,
-            sol_dollars: dollars.0,
-            terra_dollars: dollars.1,
-            luna_dollars: dollars.2,
+            sol_dollars,
+            terra_dollars,
+            luna_dollars,
             sol_tokens: tokens.0,
             terra_tokens: tokens.1,
             luna_tokens: tokens.2,
@@ -6931,7 +11779,10 @@ fn build_timeline_recovery(
             "timeline recovery totals do not match the source append".to_owned(),
         ));
     }
-    let dollars = offsets.dollar_totals();
+    let (Some(sol_dollars), Some(terra_dollars), Some(luna_dollars)) = offsets.dollar_totals()
+    else {
+        return Ok(None);
+    };
     let final_tokens = offsets.token_totals();
     let mut recovery_points = Vec::with_capacity(points.len());
     for (timestamp, model_totals) in points {
@@ -6939,9 +11790,9 @@ fn build_timeline_recovery(
         recovery_points.push(SessionTimelineRecoveryPoint {
             timestamp,
             offset_model_totals: model_totals,
-            offset_sol_dollars: weighted_dollars(point_totals.0, final_tokens.0, dollars.0),
-            offset_terra_dollars: weighted_dollars(point_totals.1, final_tokens.1, dollars.1),
-            offset_luna_dollars: weighted_dollars(point_totals.2, final_tokens.2, dollars.2),
+            offset_sol_dollars: weighted_dollars(point_totals.0, final_tokens.0, sol_dollars),
+            offset_terra_dollars: weighted_dollars(point_totals.1, final_tokens.1, terra_dollars),
+            offset_luna_dollars: weighted_dollars(point_totals.2, final_tokens.2, luna_dollars),
         });
     }
     let mut canonical_ranges = ranges.to_vec();
@@ -6966,9 +11817,9 @@ fn build_timeline_recovery(
         ranges: canonical_ranges,
         points: recovery_points,
         final_offset_model_totals: final_offsets,
-        final_offset_sol_dollars: dollars.0,
-        final_offset_terra_dollars: dollars.1,
-        final_offset_luna_dollars: dollars.2,
+        final_offset_sol_dollars: sol_dollars,
+        final_offset_terra_dollars: terra_dollars,
+        final_offset_luna_dollars: luna_dollars,
     };
     Ok(Some(finalize_session_timeline_recovery(
         &identity.partition_id,
@@ -6988,1040 +11839,10 @@ fn weighted_dollars(value: u64, final_value: u64, final_dollars: f64) -> f64 {
     }
 }
 
-enum RecordRead {
-    End,
-    Present(Box<SessionRecordSummary>, u64),
-    Invalid(u64, bool),
-    Unterminated(u64),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SessionRecordParseError {
-    Syntax,
-    Io,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SessionJsonKey {
-    Type,
-    Timestamp,
-    Model,
-    Payload,
-    ThreadSettings,
-    HistoryBase,
-    Info,
-    TotalTokenUsage,
-    LastTokenUsage,
-    ModelContextWindow,
-    TotalTokens,
-    CacheWriteInputTokens,
-    InputTokens,
-    CachedInputTokens,
-    OutputTokens,
-    Other,
-}
-
-const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 15] = [
-    (b"type", SessionJsonKey::Type),
-    (b"timestamp", SessionJsonKey::Timestamp),
-    (b"model", SessionJsonKey::Model),
-    (b"payload", SessionJsonKey::Payload),
-    (b"thread_settings", SessionJsonKey::ThreadSettings),
-    (b"history_base", SessionJsonKey::HistoryBase),
-    (b"info", SessionJsonKey::Info),
-    (b"total_token_usage", SessionJsonKey::TotalTokenUsage),
-    (b"last_token_usage", SessionJsonKey::LastTokenUsage),
-    (b"model_context_window", SessionJsonKey::ModelContextWindow),
-    (b"total_tokens", SessionJsonKey::TotalTokens),
-    (
-        b"cache_write_input_tokens",
-        SessionJsonKey::CacheWriteInputTokens,
-    ),
-    (b"input_tokens", SessionJsonKey::InputTokens),
-    (b"cached_input_tokens", SessionJsonKey::CachedInputTokens),
-    (b"output_tokens", SessionJsonKey::OutputTokens),
-];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SessionJsonObject {
-    Root,
-    Payload,
-    ThreadSettings,
-    Info,
-    TokenUsage,
-    LastTokenUsage,
-}
-
-#[derive(Clone, Debug, Default)]
-struct TokenUsageSummary {
-    total: Option<u64>,
-    cache_write_input: Option<u64>,
-    input: Option<u64>,
-    cached_input: Option<u64>,
-    output: Option<u64>,
-    total_seen: bool,
-    malformed: bool,
-}
-
-impl TokenUsageSummary {
-    fn snapshot(&self) -> Option<TokenSnapshot> {
-        Some(TokenSnapshot {
-            total: self.total?,
-            cache_write_input: self.cache_write_input,
-            input: self.input.unwrap_or(0),
-            cached_input: self.cached_input.unwrap_or(0),
-            output: self.output.unwrap_or(0),
-        })
-    }
-
-    fn valid_snapshot(&self) -> Option<TokenSnapshot> {
-        (!self.malformed).then(|| self.snapshot()).flatten()
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct PayloadSummary {
-    event_type: Option<String>,
-    model: Option<String>,
-    model_seen: bool,
-    model_malformed: bool,
-    thread_settings_seen: bool,
-    thread_settings_object: bool,
-    thread_settings_model: Option<String>,
-    thread_settings_model_seen: bool,
-    thread_settings_model_malformed: bool,
-    history_base_seen: bool,
-    history_base_non_null: bool,
-    info_seen: bool,
-    info_null: bool,
-    info_object: bool,
-    token_usage_seen: bool,
-    token_usage_object: bool,
-    token_usage: TokenUsageSummary,
-    last_token_usage_seen: bool,
-    last_token_usage_object: bool,
-    last_token_usage: TokenUsageSummary,
-    context_window: Option<u64>,
-    context_window_seen: bool,
-    context_window_malformed: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-struct SessionRecordSummary {
-    outer_type: Option<String>,
-    timestamp: Option<String>,
-    timestamp_seen: bool,
-    timestamp_malformed: bool,
-    root_model: Option<String>,
-    root_model_seen: bool,
-    root_model_malformed: bool,
-    payload_seen: bool,
-    payload_object: bool,
-    payload: PayloadSummary,
-}
-
-impl SessionRecordSummary {
-    fn event_type(&self) -> Option<&str> {
-        match self.outer_type.as_deref() {
-            Some(
-                "task_started"
-                | "task_complete"
-                | "task_completed"
-                | "turn_aborted"
-                | "token_count"
-                | "turn_context"
-                | "thread_context"
-                | "thread_settings_applied",
-            ) => self.outer_type.as_deref(),
-            _ => self.payload.event_type.as_deref(),
-        }
-    }
-
-    fn event_model(&self) -> Option<&str> {
-        let (model, malformed) = match self.event_type() {
-            Some("turn_context" | "thread_context") => {
-                if self.payload.model.is_some() {
-                    (self.payload.model.as_deref(), self.payload.model_malformed)
-                } else {
-                    (self.root_model.as_deref(), self.root_model_malformed)
-                }
-            }
-            Some("thread_settings_applied") => {
-                if self.payload.thread_settings_model.is_some() {
-                    (
-                        self.payload.thread_settings_model.as_deref(),
-                        self.payload.thread_settings_model_malformed,
-                    )
-                } else if self.payload.model.is_some() {
-                    (self.payload.model.as_deref(), self.payload.model_malformed)
-                } else {
-                    (self.root_model.as_deref(), self.root_model_malformed)
-                }
-            }
-            _ => (None, false),
-        };
-        if malformed || model.is_some_and(|model| model.chars().any(char::is_control)) {
-            return None;
-        }
-        let model = model?;
-        (!model.trim().is_empty()).then_some(model)
-    }
-
-    fn token_snapshot(&self) -> Option<TokenSnapshot> {
-        (self.event_type() == Some("token_count") && self.payload_object)
-            .then(|| self.payload.token_usage.snapshot())
-            .flatten()
-    }
-
-    fn history_base_continuation(&self) -> bool {
-        self.outer_type.as_deref() == Some("session_meta")
-            && self.payload_object
-            && self.payload.history_base_seen
-            && self.payload.history_base_non_null
-    }
-
-    fn last_token_snapshot(&self) -> Option<TokenSnapshot> {
-        (self.event_type() == Some("token_count")
-            && self.payload_object
-            && self.payload.info_object
-            && self.payload.last_token_usage_seen
-            && self.payload.last_token_usage_object)
-            .then(|| self.payload.last_token_usage.valid_snapshot())
-            .flatten()
-    }
-
-    fn context_usage_tokens(&self) -> Option<u64> {
-        (self.event_type() == Some("token_count")
-            && self.payload_object
-            && self.payload.info_object
-            && self.payload.last_token_usage_seen
-            && self.payload.last_token_usage_object)
-            .then(|| {
-                self.payload
-                    .last_token_usage
-                    .valid_snapshot()
-                    .map(|value| value.total)
-            })
-            .flatten()
-    }
-
-    fn context_window_tokens(&self) -> Option<u64> {
-        (self.event_type() == Some("token_count")
-            && self.payload_object
-            && self.payload.info_object
-            && self.payload.context_window_seen)
-            .then_some(self.payload.context_window)
-            .flatten()
-    }
-
-    fn context_pair(&self) -> Option<(u64, u64)> {
-        self.context_usage_tokens()
-            .zip(self.context_window_tokens())
-    }
-
-    fn event_timestamp(&self) -> i64 {
-        self.timestamp
-            .as_deref()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.timestamp())
-            .unwrap_or(0)
-    }
-
-    /// A known event with a field shape that cannot be attributed safely must
-    /// not become the end of an incremental checkpoint.  `info: null` is the
-    /// producer's valid no-sample token-count envelope and remains a no-op.
-    fn usage_unparsed(&self) -> bool {
-        match self.event_type() {
-            Some("token_count") => {
-                if !self.payload_object || !self.payload.info_seen {
-                    return true;
-                }
-                if self.payload.info_null {
-                    return false;
-                }
-                let timestamp_valid = self
-                    .timestamp
-                    .as_deref()
-                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                    .is_some();
-                !self.payload.info_object
-                    || !self.payload.token_usage_seen
-                    || !self.payload.token_usage_object
-                    || !self.payload.token_usage.total_seen
-                    || self.payload.token_usage.malformed
-                    || self.payload.context_window_malformed
-                    || self.timestamp_malformed
-                    || !self.timestamp_seen
-                    || !timestamp_valid
-            }
-            Some("turn_context" | "thread_context") => self.event_model().is_none(),
-            Some("thread_settings_applied") => self.event_model().is_none(),
-            _ => false,
-        }
-    }
-
-    fn task_running(&self) -> Option<bool> {
-        match self.event_type() {
-            Some("task_started") => Some(true),
-            Some("task_complete" | "task_completed" | "turn_aborted") => Some(false),
-            _ => None,
-        }
-    }
-}
-
-struct SessionRecordInput<'a, R: BufRead> {
-    reader: &'a mut R,
-    consumed: u64,
-    saw_bytes: bool,
-    terminated: bool,
-    eof: bool,
-    depth: usize,
-}
-
-impl<'a, R: BufRead> SessionRecordInput<'a, R> {
-    fn new(reader: &'a mut R) -> Self {
-        Self {
-            reader,
-            consumed: 0,
-            saw_bytes: false,
-            terminated: false,
-            eof: false,
-            depth: 0,
-        }
-    }
-
-    fn peek_byte(&mut self) -> Result<Option<u8>, SessionRecordParseError> {
-        let buffer = self
-            .reader
-            .fill_buf()
-            .map_err(|_| SessionRecordParseError::Io)?;
-        if buffer.is_empty() {
-            self.eof = true;
-            return Ok(None);
-        }
-        if buffer[0] == b'\n' {
-            return Ok(None);
-        }
-        Ok(Some(buffer[0]))
-    }
-
-    fn next_byte(&mut self) -> Result<Option<u8>, SessionRecordParseError> {
-        let buffer = self
-            .reader
-            .fill_buf()
-            .map_err(|_| SessionRecordParseError::Io)?;
-        if buffer.is_empty() {
-            self.eof = true;
-            return Ok(None);
-        }
-        if buffer[0] == b'\n' {
-            self.consume(1);
-            self.terminated = true;
-            return Ok(None);
-        }
-        let byte = buffer[0];
-        self.consume(1);
-        self.saw_bytes = true;
-        Ok(Some(byte))
-    }
-
-    fn consume(&mut self, amount: usize) {
-        self.reader.consume(amount);
-        self.consumed = self.consumed.saturating_add(amount as u64);
-    }
-
-    fn next_required(&mut self) -> Result<u8, SessionRecordParseError> {
-        self.next_byte()?.ok_or(SessionRecordParseError::Syntax)
-    }
-
-    fn consume_if(&mut self, expected: u8) -> Result<bool, SessionRecordParseError> {
-        if self.peek_byte()? == Some(expected) {
-            let _ = self.next_byte()?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn skip_whitespace(&mut self) -> Result<(), SessionRecordParseError> {
-        while matches!(self.peek_byte()?, Some(b' ' | b'\t' | b'\r')) {
-            let _ = self.next_byte()?;
-        }
-        Ok(())
-    }
-
-    fn enter_container(&mut self) -> Result<(), SessionRecordParseError> {
-        // serde_json's default recursion limit is 128. Keep the same
-        // structural guard while allowing record size itself to remain
-        // unbounded for streamed payloads.
-        if self.depth >= 128 {
-            return Err(SessionRecordParseError::Syntax);
-        }
-        self.depth += 1;
-        Ok(())
-    }
-
-    fn leave_container(&mut self) {
-        self.depth = self.depth.saturating_sub(1);
-    }
-
-    fn parse_record(&mut self) -> Result<SessionRecordSummary, SessionRecordParseError> {
-        self.skip_whitespace()?;
-        let mut summary = SessionRecordSummary::default();
-        match self.peek_byte()? {
-            Some(b'{') => self.parse_object(SessionJsonObject::Root, &mut summary)?,
-            Some(b'[') => self.skip_array()?,
-            Some(_) => self.skip_value()?,
-            None => return Err(SessionRecordParseError::Syntax),
-        }
-        self.skip_whitespace()?;
-        if self.peek_byte()?.is_some() {
-            return Err(SessionRecordParseError::Syntax);
-        }
-        Ok(summary)
-    }
-
-    fn parse_object(
-        &mut self,
-        object: SessionJsonObject,
-        summary: &mut SessionRecordSummary,
-    ) -> Result<(), SessionRecordParseError> {
-        self.enter_container()?;
-        let result = (|| {
-            if self.next_required()? != b'{' {
-                return Err(SessionRecordParseError::Syntax);
-            }
-            self.skip_whitespace()?;
-            if self.consume_if(b'}')? {
-                return Ok(());
-            }
-            loop {
-                let key = self.parse_key()?;
-                self.skip_whitespace()?;
-                if self.next_required()? != b':' {
-                    return Err(SessionRecordParseError::Syntax);
-                }
-                self.skip_whitespace()?;
-                self.parse_object_value(object, key, summary)?;
-                self.skip_whitespace()?;
-                if self.consume_if(b'}')? {
-                    return Ok(());
-                }
-                if !self.consume_if(b',')? {
-                    return Err(SessionRecordParseError::Syntax);
-                }
-                self.skip_whitespace()?;
-                if self.peek_byte()? == Some(b'}') {
-                    return Err(SessionRecordParseError::Syntax);
-                }
-            }
-        })();
-        self.leave_container();
-        result
-    }
-
-    fn parse_object_value(
-        &mut self,
-        object: SessionJsonObject,
-        key: SessionJsonKey,
-        summary: &mut SessionRecordSummary,
-    ) -> Result<(), SessionRecordParseError> {
-        match object {
-            SessionJsonObject::Root => match key {
-                SessionJsonKey::Type => {
-                    summary.outer_type = self.parse_text_value()?.0;
-                }
-                SessionJsonKey::Timestamp => {
-                    summary.timestamp_seen = true;
-                    let (value, malformed) = self.parse_text_value()?;
-                    summary.timestamp = value;
-                    summary.timestamp_malformed = malformed;
-                }
-                SessionJsonKey::Model => {
-                    summary.root_model_seen = true;
-                    let (value, malformed) = self.parse_text_value()?;
-                    summary.root_model = value;
-                    summary.root_model_malformed = malformed;
-                }
-                SessionJsonKey::Payload => {
-                    summary.payload_seen = true;
-                    summary.payload = PayloadSummary::default();
-                    if self.peek_byte()? == Some(b'{') {
-                        summary.payload_object = true;
-                        self.parse_object(SessionJsonObject::Payload, summary)?;
-                    } else {
-                        summary.payload_object = false;
-                        self.skip_value()?;
-                    }
-                }
-                _ => self.skip_value()?,
-            },
-            SessionJsonObject::Payload => match key {
-                SessionJsonKey::Type => {
-                    summary.payload.event_type = self.parse_text_value()?.0;
-                }
-                SessionJsonKey::Model => {
-                    summary.payload.model_seen = true;
-                    let (value, malformed) = self.parse_text_value()?;
-                    summary.payload.model = value;
-                    summary.payload.model_malformed = malformed;
-                }
-                SessionJsonKey::ThreadSettings => {
-                    summary.payload.thread_settings_seen = true;
-                    summary.payload.thread_settings_model = None;
-                    summary.payload.thread_settings_model_seen = false;
-                    summary.payload.thread_settings_model_malformed = false;
-                    if self.peek_byte()? == Some(b'{') {
-                        summary.payload.thread_settings_object = true;
-                        self.parse_object(SessionJsonObject::ThreadSettings, summary)?;
-                    } else {
-                        summary.payload.thread_settings_object = false;
-                        self.skip_value()?;
-                    }
-                }
-                SessionJsonKey::HistoryBase => {
-                    summary.payload.history_base_seen = true;
-                    summary.payload.history_base_non_null = self.peek_byte()? != Some(b'n');
-                    self.skip_value()?;
-                }
-                SessionJsonKey::Info => {
-                    summary.payload.info_seen = true;
-                    summary.payload.info_null = self.peek_byte()? == Some(b'n');
-                    summary.payload.info_object = false;
-                    summary.payload.token_usage_seen = false;
-                    summary.payload.token_usage_object = false;
-                    summary.payload.token_usage = TokenUsageSummary::default();
-                    if self.peek_byte()? == Some(b'{') {
-                        summary.payload.info_object = true;
-                        self.parse_object(SessionJsonObject::Info, summary)?;
-                    } else {
-                        self.skip_value()?;
-                    }
-                }
-                _ => self.skip_value()?,
-            },
-            SessionJsonObject::ThreadSettings => {
-                if key == SessionJsonKey::Model {
-                    summary.payload.thread_settings_model_seen = true;
-                    let (value, malformed) = self.parse_text_value()?;
-                    summary.payload.thread_settings_model = value;
-                    summary.payload.thread_settings_model_malformed = malformed;
-                } else {
-                    self.skip_value()?;
-                }
-            }
-            SessionJsonObject::Info => {
-                if key == SessionJsonKey::TotalTokenUsage {
-                    summary.payload.token_usage_seen = true;
-                    summary.payload.token_usage_object = false;
-                    summary.payload.token_usage = TokenUsageSummary::default();
-                    if self.peek_byte()? == Some(b'{') {
-                        summary.payload.token_usage_object = true;
-                        self.parse_object(SessionJsonObject::TokenUsage, summary)?;
-                        if !summary.payload.token_usage.total_seen {
-                            summary.payload.token_usage.malformed = true;
-                        }
-                    } else {
-                        self.skip_value()?;
-                        summary.payload.token_usage.malformed = true;
-                    }
-                } else if key == SessionJsonKey::LastTokenUsage {
-                    summary.payload.last_token_usage_seen = true;
-                    summary.payload.last_token_usage_object = false;
-                    summary.payload.last_token_usage = TokenUsageSummary::default();
-                    if self.peek_byte()? == Some(b'{') {
-                        summary.payload.last_token_usage_object = true;
-                        self.parse_object(SessionJsonObject::LastTokenUsage, summary)?;
-                        if !summary.payload.last_token_usage.total_seen {
-                            summary.payload.last_token_usage.malformed = true;
-                        }
-                    } else {
-                        self.skip_value()?;
-                        summary.payload.last_token_usage.malformed = true;
-                    }
-                } else if key == SessionJsonKey::ModelContextWindow {
-                    summary.payload.context_window_seen = true;
-                    let (value, malformed) = self.parse_u64_value()?;
-                    summary.payload.context_window = value;
-                    summary.payload.context_window_malformed = malformed || value.is_none();
-                } else {
-                    self.skip_value()?;
-                }
-            }
-            SessionJsonObject::TokenUsage | SessionJsonObject::LastTokenUsage => {
-                let token_usage = match object {
-                    SessionJsonObject::TokenUsage => &mut summary.payload.token_usage,
-                    SessionJsonObject::LastTokenUsage => &mut summary.payload.last_token_usage,
-                    _ => unreachable!("token usage parser object is exhaustive"),
-                };
-                match key {
-                    SessionJsonKey::TotalTokens => {
-                        token_usage.total_seen = true;
-                        let (value, malformed) = self.parse_u64_value()?;
-                        token_usage.total = value;
-                        token_usage.malformed |= malformed || value.is_none();
-                    }
-                    SessionJsonKey::CacheWriteInputTokens => {
-                        let (value, malformed) = self.parse_u64_value()?;
-                        token_usage.cache_write_input = value;
-                        token_usage.malformed |= malformed;
-                    }
-                    SessionJsonKey::InputTokens => {
-                        let (value, malformed) = self.parse_u64_value()?;
-                        token_usage.input = value;
-                        token_usage.malformed |= malformed;
-                    }
-                    SessionJsonKey::CachedInputTokens => {
-                        let (value, malformed) = self.parse_u64_value()?;
-                        token_usage.cached_input = value;
-                        token_usage.malformed |= malformed;
-                    }
-                    SessionJsonKey::OutputTokens => {
-                        let (value, malformed) = self.parse_u64_value()?;
-                        token_usage.output = value;
-                        token_usage.malformed |= malformed;
-                    }
-                    _ => self.skip_value()?,
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn parse_key(&mut self) -> Result<SessionJsonKey, SessionRecordParseError> {
-        if self.next_required()? != b'"' {
-            return Err(SessionRecordParseError::Syntax);
-        }
-        let mut matches = [true; SESSION_JSON_KEYS.len()];
-        let mut length = 0usize;
-        loop {
-            let byte = self.next_required()?;
-            match byte {
-                b'"' => break,
-                b'\\' => {
-                    let character = self.parse_escape_character()?;
-                    if character.is_ascii() {
-                        let byte = character as u8;
-                        for (index, (candidate, _)) in SESSION_JSON_KEYS.iter().enumerate() {
-                            if matches[index] && candidate.get(length).copied() != Some(byte) {
-                                matches[index] = false;
-                            }
-                        }
-                    } else {
-                        matches.fill(false);
-                    }
-                    length = length.saturating_add(1);
-                }
-                byte if byte < 0x20 => return Err(SessionRecordParseError::Syntax),
-                byte if byte < 0x80 => {
-                    for (index, (candidate, _)) in SESSION_JSON_KEYS.iter().enumerate() {
-                        if matches[index] && candidate.get(length).copied() != Some(byte) {
-                            matches[index] = false;
-                        }
-                    }
-                    length = length.saturating_add(1);
-                }
-                byte => {
-                    self.consume_utf8_character(byte)?;
-                    matches.fill(false);
-                    length = length.saturating_add(1);
-                }
-            }
-        }
-        Ok(SESSION_JSON_KEYS
-            .iter()
-            .enumerate()
-            .find_map(|(index, (candidate, key))| {
-                (matches[index] && candidate.len() == length).then_some(*key)
-            })
-            .unwrap_or(SessionJsonKey::Other))
-    }
-
-    fn parse_text_value(&mut self) -> Result<(Option<String>, bool), SessionRecordParseError> {
-        if self.peek_byte()? == Some(b'"') {
-            let (value, truncated) = self.parse_text()?;
-            return Ok((Some(value), truncated));
-        }
-        let is_null = self.peek_byte()? == Some(b'n');
-        self.skip_value()?;
-        Ok((None, !is_null))
-    }
-
-    fn parse_text(&mut self) -> Result<(String, bool), SessionRecordParseError> {
-        if self.next_required()? != b'"' {
-            return Err(SessionRecordParseError::Syntax);
-        }
-        let mut text = String::with_capacity(codex_info_db_writer::MAX_SESSION_MODEL_BYTES);
-        let mut truncated = false;
-        loop {
-            let byte = self.next_required()?;
-            match byte {
-                b'"' => return Ok((text, truncated)),
-                b'\\' => {
-                    let character = self.parse_escape_character()?;
-                    if text.len().saturating_add(character.len_utf8())
-                        <= codex_info_db_writer::MAX_SESSION_MODEL_BYTES
-                    {
-                        text.push(character);
-                    } else {
-                        truncated = true;
-                    }
-                }
-                byte if byte < 0x20 => return Err(SessionRecordParseError::Syntax),
-                byte if byte < 0x80 => {
-                    if text.len() < codex_info_db_writer::MAX_SESSION_MODEL_BYTES {
-                        text.push(byte as char);
-                    } else {
-                        truncated = true;
-                    }
-                }
-                byte => {
-                    let (bytes, length) = self.read_utf8_character(byte)?;
-                    let value = std::str::from_utf8(&bytes[..length])
-                        .map_err(|_| SessionRecordParseError::Syntax)?;
-                    if text.len().saturating_add(value.len())
-                        <= codex_info_db_writer::MAX_SESSION_MODEL_BYTES
-                    {
-                        text.push_str(value);
-                    } else {
-                        truncated = true;
-                    }
-                }
-            }
-        }
-    }
-
-    fn skip_string(&mut self) -> Result<(), SessionRecordParseError> {
-        if self.next_required()? != b'"' {
-            return Err(SessionRecordParseError::Syntax);
-        }
-        loop {
-            let byte = self.next_required()?;
-            match byte {
-                b'"' => return Ok(()),
-                b'\\' => {
-                    self.parse_escape_character()?;
-                }
-                byte if byte < 0x20 => return Err(SessionRecordParseError::Syntax),
-                byte if byte < 0x80 => {}
-                byte => {
-                    self.consume_utf8_character(byte)?;
-                }
-            }
-        }
-    }
-
-    fn parse_escape_character(&mut self) -> Result<char, SessionRecordParseError> {
-        match self.next_required()? {
-            b'"' => Ok('"'),
-            b'\\' => Ok('\\'),
-            b'/' => Ok('/'),
-            b'b' => Ok('\u{0008}'),
-            b'f' => Ok('\u{000c}'),
-            b'n' => Ok('\n'),
-            b'r' => Ok('\r'),
-            b't' => Ok('\t'),
-            b'u' => {
-                let first = self.parse_hex_quad()?;
-                if (0xD800..=0xDBFF).contains(&first) {
-                    if self.next_required()? != b'\\' || self.next_required()? != b'u' {
-                        return Err(SessionRecordParseError::Syntax);
-                    }
-                    let second = self.parse_hex_quad()?;
-                    if !(0xDC00..=0xDFFF).contains(&second) {
-                        return Err(SessionRecordParseError::Syntax);
-                    }
-                    let codepoint = 0x1_0000
-                        + ((u32::from(first) - 0xD800) << 10)
-                        + (u32::from(second) - 0xDC00);
-                    char::from_u32(codepoint).ok_or(SessionRecordParseError::Syntax)
-                } else if (0xDC00..=0xDFFF).contains(&first) {
-                    Err(SessionRecordParseError::Syntax)
-                } else {
-                    char::from_u32(u32::from(first)).ok_or(SessionRecordParseError::Syntax)
-                }
-            }
-            _ => Err(SessionRecordParseError::Syntax),
-        }
-    }
-
-    fn parse_hex_quad(&mut self) -> Result<u16, SessionRecordParseError> {
-        let mut value = 0u16;
-        for _ in 0..4 {
-            value = (value << 4)
-                | u16::from(
-                    char::from(self.next_required()?)
-                        .to_digit(16)
-                        .ok_or(SessionRecordParseError::Syntax)? as u8,
-                );
-        }
-        Ok(value)
-    }
-
-    fn read_utf8_character(
-        &mut self,
-        first: u8,
-    ) -> Result<([u8; 4], usize), SessionRecordParseError> {
-        let length = match first {
-            0xC2..=0xDF => 2,
-            0xE0..=0xEF => 3,
-            0xF0..=0xF4 => 4,
-            _ => return Err(SessionRecordParseError::Syntax),
-        };
-        let mut bytes = [0u8; 4];
-        bytes[0] = first;
-        for byte in &mut bytes[1..length] {
-            *byte = self.next_required()?;
-            if !(*byte >= 0x80 && *byte <= 0xBF) {
-                return Err(SessionRecordParseError::Syntax);
-            }
-        }
-        std::str::from_utf8(&bytes[..length]).map_err(|_| SessionRecordParseError::Syntax)?;
-        Ok((bytes, length))
-    }
-
-    fn consume_utf8_character(&mut self, first: u8) -> Result<(), SessionRecordParseError> {
-        let _ = self.read_utf8_character(first)?;
-        Ok(())
-    }
-
-    fn parse_u64_value(&mut self) -> Result<(Option<u64>, bool), SessionRecordParseError> {
-        match self.peek_byte()? {
-            Some(b'-' | b'0'..=b'9') => {
-                let value = self.parse_number()?;
-                Ok((value, value.is_none()))
-            }
-            Some(b'n') => {
-                self.skip_value()?;
-                Ok((None, false))
-            }
-            Some(_) => {
-                self.skip_value()?;
-                Ok((None, true))
-            }
-            None => Err(SessionRecordParseError::Syntax),
-        }
-    }
-
-    fn parse_number(&mut self) -> Result<Option<u64>, SessionRecordParseError> {
-        let negative = self.consume_if(b'-')?;
-        let mut integer = true;
-        let mut overflow = false;
-        let mut value = 0u64;
-        match self.next_byte()? {
-            Some(b'0') => {
-                if matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
-                    return Err(SessionRecordParseError::Syntax);
-                }
-            }
-            Some(byte @ b'1'..=b'9') => {
-                value = u64::from(byte - b'0');
-                while let Some(byte @ b'0'..=b'9') = self.peek_byte()? {
-                    let _ = self.next_byte()?;
-                    if let Some(next) = value
-                        .checked_mul(10)
-                        .and_then(|value| value.checked_add(u64::from(byte - b'0')))
-                    {
-                        value = next;
-                    } else {
-                        overflow = true;
-                    }
-                }
-            }
-            _ => return Err(SessionRecordParseError::Syntax),
-        }
-        if self.consume_if(b'.')? {
-            integer = false;
-            if !matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
-                return Err(SessionRecordParseError::Syntax);
-            }
-            while matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
-                let _ = self.next_byte()?;
-            }
-        }
-        if matches!(self.peek_byte()?, Some(b'e' | b'E')) {
-            integer = false;
-            let _ = self.next_byte()?;
-            if !self.consume_if(b'+')? {
-                let _ = self.consume_if(b'-')?;
-            }
-            if !matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
-                return Err(SessionRecordParseError::Syntax);
-            }
-            while matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
-                let _ = self.next_byte()?;
-            }
-        }
-        Ok((!negative && integer && !overflow).then_some(value))
-    }
-
-    fn parse_literal(&mut self, literal: &[u8]) -> Result<(), SessionRecordParseError> {
-        for expected in literal {
-            if self.next_required()? != *expected {
-                return Err(SessionRecordParseError::Syntax);
-            }
-        }
-        Ok(())
-    }
-
-    fn skip_value(&mut self) -> Result<(), SessionRecordParseError> {
-        self.skip_whitespace()?;
-        match self.peek_byte()? {
-            Some(b'"') => self.skip_string(),
-            Some(b'{') => self.skip_object(),
-            Some(b'[') => self.skip_array(),
-            Some(b'n') => self.parse_literal(b"null"),
-            Some(b't') => self.parse_literal(b"true"),
-            Some(b'f') => self.parse_literal(b"false"),
-            Some(b'-' | b'0'..=b'9') => self.parse_number().map(|_| ()),
-            Some(_) | None => Err(SessionRecordParseError::Syntax),
-        }
-    }
-
-    fn skip_object(&mut self) -> Result<(), SessionRecordParseError> {
-        self.enter_container()?;
-        let result = (|| {
-            if self.next_required()? != b'{' {
-                return Err(SessionRecordParseError::Syntax);
-            }
-            self.skip_whitespace()?;
-            if self.consume_if(b'}')? {
-                return Ok(());
-            }
-            loop {
-                self.skip_string()?;
-                self.skip_whitespace()?;
-                if self.next_required()? != b':' {
-                    return Err(SessionRecordParseError::Syntax);
-                }
-                self.skip_value()?;
-                self.skip_whitespace()?;
-                if self.consume_if(b'}')? {
-                    return Ok(());
-                }
-                if !self.consume_if(b',')? {
-                    return Err(SessionRecordParseError::Syntax);
-                }
-                self.skip_whitespace()?;
-                if self.peek_byte()? == Some(b'}') {
-                    return Err(SessionRecordParseError::Syntax);
-                }
-            }
-        })();
-        self.leave_container();
-        result
-    }
-
-    fn skip_array(&mut self) -> Result<(), SessionRecordParseError> {
-        self.enter_container()?;
-        let result = (|| {
-            if self.next_required()? != b'[' {
-                return Err(SessionRecordParseError::Syntax);
-            }
-            self.skip_whitespace()?;
-            if self.consume_if(b']')? {
-                return Ok(());
-            }
-            loop {
-                self.skip_value()?;
-                self.skip_whitespace()?;
-                if self.consume_if(b']')? {
-                    return Ok(());
-                }
-                if !self.consume_if(b',')? {
-                    return Err(SessionRecordParseError::Syntax);
-                }
-                self.skip_whitespace()?;
-                if self.peek_byte()? == Some(b']') {
-                    return Err(SessionRecordParseError::Syntax);
-                }
-            }
-        })();
-        self.leave_container();
-        result
-    }
-
-    fn finish_record(&mut self) -> Result<bool, SessionRecordParseError> {
-        if self.terminated {
-            return Ok(true);
-        }
-        let buffer = self
-            .reader
-            .fill_buf()
-            .map_err(|_| SessionRecordParseError::Io)?;
-        if buffer.is_empty() {
-            self.eof = true;
-            return Ok(false);
-        }
-        if buffer[0] == b'\n' {
-            self.consume(1);
-            self.terminated = true;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn drain_record(&mut self) -> Result<bool, SessionRecordParseError> {
-        if self.terminated {
-            return Ok(true);
-        }
-        loop {
-            let buffer = self
-                .reader
-                .fill_buf()
-                .map_err(|_| SessionRecordParseError::Io)?;
-            if buffer.is_empty() {
-                self.eof = true;
-                return Ok(false);
-            }
-            if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                self.saw_bytes |= position > 0;
-                self.consume(position + 1);
-                self.terminated = true;
-                return Ok(true);
-            }
-            self.saw_bytes = true;
-            let length = buffer.len();
-            self.consume(length);
-        }
-    }
-}
-
 fn read_streaming_record<R: BufRead>(reader: &mut R) -> Result<RecordRead, RecorderError> {
-    if reader.fill_buf()?.is_empty() {
-        return Ok(RecordRead::End);
-    }
-    let mut input = SessionRecordInput::new(reader);
-    let parsed = input.parse_record();
-    if matches!(parsed.as_ref(), Err(SessionRecordParseError::Io)) {
-        return Err(RecorderError::Invalid(
-            "session source read failed while parsing".to_owned(),
-        ));
-    }
-    if parsed.is_err() {
-        if !input.saw_bytes && input.eof && !input.terminated {
-            return Ok(RecordRead::End);
-        }
-        let terminated = if input.terminated {
-            true
-        } else {
-            input.drain_record().map_err(|_| {
-                RecorderError::Invalid("session source read failed while draining".to_owned())
-            })?
-        };
-        if terminated {
-            return Ok(RecordRead::Invalid(input.consumed, true));
-        }
-        return Ok(RecordRead::Unterminated(input.consumed));
-    }
-    if input.finish_record().map_err(|_| {
-        RecorderError::Invalid("session source read failed while framing".to_owned())
-    })? {
-        return Ok(RecordRead::Present(
-            Box::new(parsed.expect("parsed session record")),
-            input.consumed,
-        ));
-    }
-    Ok(RecordRead::Unterminated(input.consumed))
+    codex_info::session_input::read_streaming_record(reader, |message| {
+        RecorderError::Invalid(message.to_owned())
+    })
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -8342,12 +12163,14 @@ mod tests {
             .unwrap();
         if old_baseline_unknown {
             assert!(!old_checkpoint.token_baseline_known);
-            assert_eq!(old_checkpoint.previous_total, 0);
+            assert_eq!(old_checkpoint.previous_total, Some(0));
         } else {
             assert!(old_checkpoint.token_baseline_known);
             assert!(old_checkpoint.fully_attributed_from_zero);
             assert!(TokenSnapshot {
-                total: old_checkpoint.previous_total,
+                total: old_checkpoint
+                    .previous_total
+                    .expect("known fixture baseline"),
                 input: old_checkpoint.previous_input,
                 cached_input: old_checkpoint.previous_cached_input,
                 output: old_checkpoint.previous_output,
@@ -8484,7 +12307,7 @@ mod tests {
         fs::set_permissions(auth, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    fn token(total: u64, timestamp: i64) -> String {
+    pub(crate) fn token(total: u64, timestamp: i64) -> String {
         format!(
             "{{\"type\":\"event_msg\",\"timestamp\":\"{}\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"total_tokens\":{},\"input_tokens\":{},\"cached_input_tokens\":0,\"output_tokens\":0}}}}}}}}\n",
             DateTime::<Utc>::from_timestamp(timestamp, 0)
@@ -8562,19 +12385,28 @@ mod tests {
         assert_eq!(first[0].context_usage_tokens, Some(400));
         assert_eq!(first[0].context_window_tokens, Some(16_000));
         let metadata = fs::metadata(&source).unwrap();
-        let mut complete = first[0].clone();
-        complete.committed_offset = metadata.len();
-        let direct =
-            read_active_rollout(&root.join("sessions"), &source, &metadata, &complete).unwrap();
+        let direct = read_active_rollout(
+            &root.join("sessions"),
+            &source,
+            &metadata,
+            &mut BTreeMap::new(),
+            Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+        )
+        .unwrap();
         assert_eq!(direct.context_usage_tokens(), Some(400));
         assert_eq!(direct.context_window_tokens(), Some(16_000));
-
-        let mut incomplete = complete.clone();
-        incomplete.context_window_tokens = None;
-        let direct_incomplete =
-            read_active_rollout(&root.join("sessions"), &source, &metadata, &incomplete).unwrap();
-        assert_eq!(direct_incomplete.context_usage_tokens(), None);
-        assert_eq!(direct_incomplete.context_window_tokens(), None);
+        let restarted_live = read_active_rollout(
+            &root.join("sessions"),
+            &source,
+            &metadata,
+            &mut BTreeMap::new(),
+            Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted_live, direct,
+            "cold live state comes from the original prefix"
+        );
         drop(recorder);
 
         fs::OpenOptions::new()
@@ -8740,28 +12572,28 @@ mod tests {
             })),
             Ok(CodexAuthenticationState::AuthRequired)
         );
-        assert_eq!(
-            decode_codex_authentication_state(&json!({
-                "account": {
-                    "type": "chatgpt",
-                    "email": "current@example.com",
-                    "planType": "pro"
-                },
-                "requiresOpenaiAuth": false
-            })),
-            Ok(CodexAuthenticationState::Authenticated)
-        );
+        // OpenAI app-server auth example: requiresOpenaiAuth describes the
+        // provider's credential requirement, independently of the account.
+        for requires in [true, false] {
+            assert_eq!(
+                decode_codex_authentication_state(&json!({
+                    "account":{"type":"chatgpt","email":"current@example.com","planType":"pro"},
+                    "requiresOpenaiAuth":requires,
+                })),
+                Ok(CodexAuthenticationState::Authenticated)
+            );
+        }
         for inconsistent in [
             json!({"account": null, "requiresOpenaiAuth": false}),
             json!({
                 "account": {
-                    "type": "chatgpt",
-                    "email": "current@example.com",
-                    "planType": "pro"
+                    "type": "apiKey"
                 },
                 "requiresOpenaiAuth": true
             }),
-            json!({"account": null}),
+            json!({"account":null}),
+            json!({"account":{"type":"chatgpt","email":"current@example.com","planType":"pro"},"requiresOpenaiAuth":"true"}),
+            json!({"account":{"type":"chatgpt","email":null,"planType":"pro"},"requiresOpenaiAuth":true}),
         ] {
             assert!(decode_codex_authentication_state(&inconsistent).is_err());
         }
@@ -8941,6 +12773,264 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn issue604_inventory_rejects_invalid_source_paths_without_blocking_valid_sources() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let sessions = root.join("sessions");
+        fs::create_dir_all(sessions.join("a")).unwrap();
+        let database = root.join("usage_history.sqlite3");
+        UsageStore::create_partitioned(&database, &identity()).unwrap();
+        let good = sessions.join("a/b.jsonl");
+        let at = Utc::now().timestamp() - 30;
+        fs::write(
+            &good,
+            format!(
+                "{}\n{}{}{}",
+                json!({"type":"session_meta","payload":{"id":"thread","session_id":"thread"}}),
+                issue604_context_record("turn_context", json!("gpt-6-astra"), at),
+                token(0, at),
+                token(10, at + 1)
+            ),
+        )
+        .unwrap();
+        for (name, id) in [
+            ("bad-\u{fffd}.jsonl", "replacement-character"),
+            ("e\u{301}.jsonl", "decomposed-name"),
+            ("\u{e9}.jsonl", "composed-name"),
+        ] {
+            fs::write(
+                sessions.join(name),
+                format!("{}\n", json!({"type":"session_meta","payload":{"id":id}})),
+            )
+            .unwrap();
+        }
+        let unsupported = [
+            sessions.join("a\\b.jsonl"),
+            sessions.join(std::ffi::OsString::from_vec(b"bad-\xff.jsonl".to_vec())),
+        ];
+        for path in &unsupported {
+            fs::write(path, b"unaccepted original\n").unwrap();
+        }
+        let expected = BTreeSet::from([
+            "a/b.jsonl".to_owned(),
+            "bad-\u{fffd}.jsonl".to_owned(),
+            "e\u{301}.jsonl".to_owned(),
+            "\u{e9}.jsonl".to_owned(),
+        ]);
+        let inventory = discover_sources(&sessions).unwrap();
+        assert_eq!(
+            inventory
+                .sources
+                .iter()
+                .map(|source| source.recorded.relative_path.clone())
+                .collect::<Vec<_>>(),
+            expected.iter().cloned().collect::<Vec<_>>(),
+            "unsupported names cannot alias the distinct original UTF-8 paths"
+        );
+        assert_eq!(inventory.failures.len(), 1, "one root inventory condition");
+        assert_eq!(inventory.failures[0].relative_path, "__inventory__");
+        assert_eq!(
+            inventory.failures[0].reason,
+            "invalid-session-relative-path"
+        );
+        let metadata = fs::metadata(&sessions).unwrap();
+        assert_eq!(
+            inventory.root_identity,
+            format!("unix:{}:{}", metadata.dev(), metadata.ino())
+        );
+
+        let mut recorder =
+            Recorder::open_partitioned(config(root, 65536), &database, &identity()).unwrap();
+        for (total, observed_at) in [(10, at + 10), (15, at + 11)] {
+            if total == 15 {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&good)
+                    .unwrap()
+                    .write_all(token(15, at + 2).as_bytes())
+                    .unwrap();
+            }
+            let report = recorder
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at,
+                    reset_at: at + 3600,
+                    window_seconds: 7200,
+                    remaining_percent: Some(99.0),
+                }))
+                .expect("unsupported paths cannot block the independent valid source")
+                .unwrap();
+            assert!(report.pending_ranges > 0, "inventory remains incomplete");
+            assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, total);
+            assert_eq!(
+                recorder
+                    .state()
+                    .unwrap()
+                    .checkpoints
+                    .into_iter()
+                    .map(|checkpoint| checkpoint.relative_path)
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+            for path in &unsupported {
+                assert_eq!(fs::read(path).unwrap(), b"unaccepted original\n");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue604_live_rejects_invalid_source_paths_before_checkpoint_reconciliation() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        for name in [
+            std::ffi::OsString::from("a\\b.jsonl"),
+            std::ffi::OsString::from_vec(b"bad-\xff.jsonl".to_vec()),
+        ] {
+            let source = root.join(name);
+            fs::write(&source, b"unaccepted original\n").unwrap();
+            let result = collect_active_thread_snapshot_from_paths(
+                &root,
+                &BTreeSet::from([source]),
+                &[],
+                &mut LiveRolloutCache::default(),
+            );
+            assert!(
+                matches!(result, ActiveThreadPollResult::Failed(_)),
+                "an unsupported source key cannot be recovered by requesting a checkpoint: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue604_inventory_diagnostics_preserve_locations_and_independent_source_commits() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let sessions = root.join("sessions");
+        let unavailable = [
+            sessions.join("left/unavailable"),
+            sessions.join("right/unavailable"),
+            sessions.join("__inventory__"),
+        ];
+        for path in &unavailable {
+            fs::create_dir_all(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o0)).unwrap();
+        }
+        let denied = fs::read_dir(&unavailable[0])
+            .err()
+            .map(|error| error.kind());
+        let database = root.join("usage_history.sqlite3");
+        UsageStore::create_partitioned(&database, &identity()).unwrap();
+        let source = sessions.join("good.jsonl");
+        let at = Utc::now().timestamp() - 30;
+        fs::write(
+            &source,
+            format!(
+                "{}\n{}{}{}",
+                json!({"type":"session_meta","payload":{"id":"thread","session_id":"thread"}}),
+                issue604_context_record("turn_context", json!("gpt-6-astra"), at),
+                token(0, at),
+                token(10, at + 1)
+            ),
+        )
+        .unwrap();
+        let unsupported = sessions.join("bad\\name.jsonl");
+        fs::write(&unsupported, b"unaccepted original\n").unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(root, 65536), &database, &identity()).unwrap();
+        let quota = |observed_at| {
+            Some(QuotaSnapshot {
+                observed_at,
+                reset_at: at + 3600,
+                window_seconds: 7200,
+                remaining_percent: Some(99.0),
+            })
+        };
+        // Restore directory access before checking results, including RED.
+        let first = recorder.run_cycle_with_quota(quota(at + 10));
+        let second = if first.is_ok() {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(token(15, at + 2).as_bytes())
+                .unwrap();
+            Some(recorder.run_cycle_with_quota(quota(at + 11)))
+        } else {
+            None
+        };
+        for path in &unavailable {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(denied, Some(io::ErrorKind::PermissionDenied));
+        let first = first
+            .expect("inventory diagnostic collisions cannot reject an independent valid source")
+            .unwrap();
+        assert_eq!(first.pending_ranges, 4);
+        let second = second.unwrap().unwrap().unwrap();
+        assert_eq!(second.pending_ranges, 4);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 15);
+        let mut diagnostics = recorder.writer.load_session_pending_ranges().unwrap();
+        diagnostics.sort_by(|left, right| {
+            (&left.relative_path, &left.reason).cmp(&(&right.relative_path, &right.reason))
+        });
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|row| (row.relative_path.as_str(), row.prefix_generation))
+                .collect::<Vec<_>>(),
+            vec![
+                ("__inventory__", 1),
+                ("__inventory__", 2),
+                ("left/unavailable", 3),
+                ("right/unavailable", 4),
+            ]
+        );
+        assert!(diagnostics[0].reason.starts_with("directory-read-failed:"));
+        assert_eq!(diagnostics[1].reason, "invalid-session-relative-path");
+        assert!(diagnostics.iter().all(|row| {
+            row.file_device == 0
+                && row.file_inode == 0
+                && row.start_offset == 0
+                && row.end_offset == 0
+                && row.record_sha256 == EMPTY_SHA256
+                && !row.complete
+        }));
+        assert_eq!(fs::read(unsupported).unwrap(), b"unaccepted original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue604_inventory_repeated_predicate_is_recorded_once() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("unavailable");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o0)).unwrap();
+        let denied = fs::read_dir(&root).err().map(|error| error.kind());
+        let mut paths = Vec::new();
+        let mut failures = Vec::new();
+        let first = collect_jsonl(&root, &mut paths, &mut failures);
+        let second = collect_jsonl(&root, &mut paths, &mut failures);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(denied, Some(io::ErrorKind::PermissionDenied));
+        first.unwrap();
+        second.unwrap();
+        assert!(paths.is_empty());
+        assert_eq!(
+            failures.len(),
+            1,
+            "the same inventory predicate is one condition"
+        );
+        assert_eq!(failures[0].relative_path, "__inventory__");
+        assert!(failures[0].reason.starts_with("directory-read-failed:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn session_root_identity_remains_legacy_checkpoint_compatible() {
         let root = temp_root("legacy-root-identity");
         let metadata = fs::metadata(&root).unwrap();
@@ -8975,6 +13065,956 @@ mod tests {
         );
         assert_eq!(recorder.run_cycle().unwrap().unwrap().generation, 3);
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn issue604_context_record(event_type: &str, model: Value, at: i64) -> String {
+        format!(
+            "{}\n",
+            json!({
+                "type":"event_msg", "timestamp":DateTime::<Utc>::from_timestamp(at,0).unwrap().to_rfc3339(),
+                "payload":{"type":event_type,"model":model}
+            })
+        )
+    }
+
+    #[test]
+    fn issue604_adopted_legacy_context_pointer_survives_resume_and_priority() {
+        for (kind, model) in [
+            ("thread_settings_applied", "gpt-6-luna"),
+            ("turn_context", "gpt-6.1-sol"),
+        ] {
+            let (root, database) = prepare(&format!("issue604-adopted-context-{kind}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let context: Value =
+                serde_json::from_str(&issue604_context_record(kind, json!(model), at)).unwrap();
+            let context = format!("{context}\n");
+            let original = format!("{context}{}{}", token(0, at), token(10, at));
+            fs::write(&source, &original).unwrap();
+            let expected = json!({"start":0,"end":context.len(),
+                "sha256":format!("{:x}",Sha256::digest(context.as_bytes()))});
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            let mut stored: Value = serde_json::from_str(
+                &state.checkpoints[0]
+                    .source_admission
+                    .as_ref()
+                    .unwrap()
+                    .to_storage()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                stored["adopted_context"], expected,
+                "adopted context must retain its original pointer: {kind}"
+            );
+            assert_eq!(recorder.model_totals().unwrap()[model].total, 10);
+            let end = state.checkpoints[0].committed_offset;
+            for (field, value) in [
+                ("end", json!(end + 1)),
+                ("start", json!(context.len())),
+                ("sha256", json!("not-a-hash")),
+                ("extra", json!(true)),
+            ] {
+                let mut invalid = stored.clone();
+                invalid["adopted_context"][field] = value;
+                assert!(
+                    SourceAdmission::from_storage(&invalid.to_string(), end).is_none(),
+                    "malformed adopted pointer must reject: {field}"
+                );
+            }
+            // An older v2 state lacks this proof. Restore it from the same
+            // accepted prefix while preserving the already-recorded 10.
+            stored.as_object_mut().unwrap().remove("adopted_context");
+            assert!(SourceAdmission::from_storage(&stored.to_string(), end).is_some());
+            drop(recorder);
+            let db = rusqlite::Connection::open(&database).unwrap();
+            db.execute(
+                "UPDATE session_checkpoints SET source_admission=?1",
+                [stored.to_string()],
+            )
+            .unwrap();
+            drop(db);
+            let ignored_model = if kind == "turn_context" {
+                json!(7)
+            } else {
+                json!("gpt-6-astra")
+            };
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(
+                    format!(
+                        "{}{}",
+                        issue604_context_record("thread_settings_applied", ignored_model, at + 1),
+                        token(15, at + 1)
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            let restored: Value = serde_json::from_str(
+                &state.checkpoints[0]
+                    .source_admission
+                    .as_ref()
+                    .unwrap()
+                    .to_storage()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                restored["adopted_context"], expected,
+                "ignored weak settings must not replace the recovered source pointer: {kind}"
+            );
+            // Qualification restores only [0,C). Collect the new suffix in
+            // the next ordinary cycle; replayed usage must never be added.
+            recorder.run_cycle().unwrap().unwrap();
+            assert_eq!(recorder.model_totals().unwrap()[model].total, 15);
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.total_tokens)
+                    .collect::<Vec<_>>(),
+                [10, 5]
+            );
+            assert!(events.iter().all(|event| event.model == model));
+            let mut missing_time: Value = serde_json::from_str(&issue604_context_record(
+                "turn_context",
+                json!("gpt-6-astra"),
+                at + 2,
+            ))
+            .unwrap();
+            missing_time.as_object_mut().unwrap().remove("timestamp");
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(format!("{missing_time}\n{}", token(20, at + 2)).as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            let invalidated: Value = serde_json::from_str(
+                &state.checkpoints[0]
+                    .source_admission
+                    .as_ref()
+                    .unwrap()
+                    .to_storage()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(invalidated["adopted_context"].is_null());
+            assert_eq!(
+                state.checkpoints[0].last_model_context_kind,
+                Some(SessionModelContextKind::Unknown)
+            );
+            assert_eq!(recorder.model_totals().unwrap()[model].total, 15);
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[2].model, UNATTRIBUTED_MODEL);
+            assert_eq!(events[2].total_tokens, 5);
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_malformed_record_invalidates_adopted_legacy_context() {
+        for (case, broken) in [
+            ("malformed", "{bad-json}\n"),
+            ("unknown", "{\"type\":\"unknown-usage-control\"}\n"),
+        ] {
+            let (root, database) = prepare(&format!("issue604-adopted-invalid-{case}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            fs::write(
+                &source,
+                format!(
+                    "{}{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                    token(0, at),
+                    token(10, at),
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            assert!(recorder.state().unwrap().checkpoints[0]
+                .source_admission
+                .as_ref()
+                .unwrap()
+                .to_storage()
+                .unwrap()
+                .contains("adopted_context"));
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(broken.as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            assert_eq!(
+                state.checkpoints[0].last_model_context_kind,
+                Some(SessionModelContextKind::Unknown)
+            );
+            let stored: Value = serde_json::from_str(
+                &state.checkpoints[0]
+                    .source_admission
+                    .as_ref()
+                    .unwrap()
+                    .to_storage()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                stored["adopted_context"].is_null(),
+                "invalid control retains an active adopted pointer: {case}"
+            );
+            assert_eq!(recorder.model_totals().unwrap()["gpt-6.1-sol"].total, 10);
+            assert_eq!(recorder.writer.load_session_events().unwrap().len(), 1);
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(token(15, at + 1).as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1].model, UNATTRIBUTED_MODEL);
+            assert_eq!(events[1].total_tokens, 5);
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_context_priority_survives_recorder_restart() {
+        let (root, database) = prepare("issue604-context-priority");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                token(0, at)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0].last_model_context_kind,
+            Some(codex_info_db_writer::SessionModelContextKind::Turn)
+        );
+        drop(recorder);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}{}{}",
+                    issue604_context_record("thread_settings_applied", json!("gpt-6-luna"), at + 1),
+                    token(5, at + 1),
+                    issue604_context_record("thread_settings_applied", json!(7), at + 2),
+                    token(10, at + 2)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let totals = recorder.model_totals().unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals["gpt-6.1-sol"].total, 10);
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0].last_model_context_kind,
+            Some(codex_info_db_writer::SessionModelContextKind::Turn)
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_mixed_interval_survives_restart_until_next_valid_baseline() {
+        let (root, database) = prepare("issue604-context-mixed");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                token(0, at)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                issue604_context_record("turn_context", json!("gpt-6-luna"), at + 1).as_bytes(),
+            )
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        drop(recorder);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6-astra"), at + 2),
+                    token(10, at + 2),
+                    token(15, at + 3)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let totals = recorder.model_totals().unwrap();
+        assert_eq!(
+            totals.len(),
+            1,
+            "the mixed interval must not become a public model or a zero"
+        );
+        assert_eq!(
+            totals["gpt-6-astra"].total, 5,
+            "only the next independent interval is attributable"
+        );
+        let events = recorder.writer.load_session_events().unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.total_tokens).sum::<u64>(),
+            15,
+            "unassigned numeric consumption is retained"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.model == UNATTRIBUTED_MODEL)
+                .map(|e| e.total_tokens)
+                .sum::<u64>(),
+            10
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_direct_root_envelopes_preserve_presence_and_independent_facts() {
+        for case in 0..9 {
+            let (root, database) = prepare(&format!("issue604-direct-envelope-{case}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let time = DateTime::<Utc>::from_timestamp(at + 1, 0)
+                .unwrap()
+                .to_rfc3339();
+            let mut baseline: Value = serde_json::from_str(&token(0, at)).unwrap();
+            baseline["payload"]["info"]["last_token_usage"] = json!({"total_tokens":0});
+            baseline["payload"]["info"]["model_context_window"] = json!(1000);
+            fs::write(
+                &source,
+                format!(
+                    "{}{baseline}\n",
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at)
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let mut incoming = json!({"type":"turn_context","timestamp":time,"model":"gpt-6-luna"});
+            match case {
+                0 => {}
+                1 => incoming["type"] = json!("thread_settings_applied"),
+                2 => incoming["payload"] = json!({"type":false}),
+                3 => incoming["payload"] = json!({"type":null}),
+                4 => incoming["payload"] = json!({"type":"another-event"}),
+                5 => incoming["payload"] = json!({"type":"turn_context"}),
+                6 | 7 => {
+                    incoming = serde_json::from_str(&token(10, at + 1)).unwrap();
+                    incoming["type"] = json!("token_count");
+                    incoming["payload"]["type"] =
+                        if case == 6 { json!(false) } else { Value::Null };
+                    incoming["payload"]["info"]["last_token_usage"] = json!({"total_tokens":7});
+                    incoming["payload"]["info"]["model_context_window"] = json!(2000);
+                }
+                8 => incoming["payload"] = json!(false),
+                _ => unreachable!(),
+            }
+            let counter_rejected = matches!(case, 6 | 7);
+            let append = if counter_rejected {
+                format!("{incoming}\n")
+            } else {
+                format!("{incoming}\n{}", token(10, at + 1))
+            };
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(append.as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let valid = matches!(case, 0 | 1 | 5);
+            let state = recorder.state().unwrap();
+            let checkpoint = &state.checkpoints[0];
+            assert_eq!(
+                checkpoint.previous_total,
+                Some(if counter_rejected { 0 } else { 10 }),
+                "case {case}"
+            );
+            assert_eq!(
+                (
+                    checkpoint.context_usage_tokens,
+                    checkpoint.context_window_tokens
+                ),
+                (Some(0), Some(1000)),
+                "case {case}"
+            );
+            assert_eq!(checkpoint.fully_attributed_from_zero, valid, "case {case}");
+            assert_eq!(
+                checkpoint.last_model_context_kind,
+                Some(if valid || counter_rejected {
+                    SessionModelContextKind::Turn
+                } else {
+                    SessionModelContextKind::Unknown
+                }),
+                "case {case}"
+            );
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), usize::from(!counter_rejected), "case {case}");
+            if let Some(event) = events.first() {
+                let model = if case == 1 {
+                    "gpt-6.1-sol"
+                } else if valid {
+                    "gpt-6-luna"
+                } else {
+                    UNATTRIBUTED_MODEL
+                };
+                assert_eq!(event.model, model, "case {case}");
+                assert_eq!(event.total_tokens, 10, "case {case}");
+            }
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_strong_context_ids_obey_legacy_knownness_and_invalidity() {
+        for case in 0..7 {
+            let valid = case < 3;
+            let (root, database) = prepare(&format!("issue604-context-ids-{case}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+            fs::write(
+                &source,
+                format!(
+                    "{}{}{}\n",
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                    token(0, at),
+                    json!({"type":"task_started","timestamp":time})
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let mut incoming: Value = serde_json::from_str(&issue604_context_record(
+                "turn_context",
+                json!("gpt-6-luna"),
+                at + 1,
+            ))
+            .unwrap();
+            match case {
+                0 => {}
+                1 => {
+                    incoming["payload"]["turn_id"] = Value::Null;
+                    incoming["payload"]["root_turn_id"] = Value::Null;
+                }
+                2 => {
+                    incoming["payload"]["turn_id"] = json!("turn");
+                    incoming["payload"]["root_turn_id"] = json!("root");
+                }
+                3 => incoming["payload"]["turn_id"] = json!(false),
+                4 => incoming["payload"]["root_turn_id"] = json!(""),
+                5 => incoming["payload"]["turn_id"] = json!("unsafe\u{202e}turn"),
+                6 => {}
+                _ => unreachable!(),
+            }
+            let incoming = if case == 6 {
+                format!(
+                    "{{\"type\":\"event_msg\",\"timestamp\":\"{time}\",\"payload\":{{\"type\":\"turn_context\",\"model\":\"gpt-6-luna\",\"turn_id\":\"turn\",\"turn_id\":\"turn\"}}}}\n"
+                )
+            } else {
+                format!("{incoming}\n")
+            };
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(format!("{}{}", incoming, token(10, at + 1)).as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            let checkpoint = &state.checkpoints[0];
+            let expected_kind = if valid {
+                SessionModelContextKind::Turn
+            } else {
+                SessionModelContextKind::Unknown
+            };
+            assert_eq!(
+                checkpoint.last_model_context_kind,
+                Some(expected_kind),
+                "case {case}"
+            );
+            assert_eq!(checkpoint.previous_total, Some(10), "case {case}");
+            assert_eq!(checkpoint.last_task_running, Some(true), "case {case}");
+            assert_eq!(checkpoint.fully_attributed_from_zero, valid, "case {case}");
+            if !valid {
+                assert!(checkpoint
+                    .source_admission
+                    .as_ref()
+                    .unwrap()
+                    .strong_context
+                    .is_none());
+            }
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), 1, "case {case}");
+            assert_eq!(events[0].total_tokens, 10);
+            assert_eq!(
+                events[0].model,
+                if valid {
+                    "gpt-6-luna"
+                } else {
+                    UNATTRIBUTED_MODEL
+                },
+                "case {case}"
+            );
+            drop(recorder);
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            assert_eq!(
+                recorder.state().unwrap().checkpoints[0].last_model_context_kind,
+                Some(expected_kind)
+            );
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(
+                    format!(
+                        "{}{}",
+                        issue604_context_record("turn_context", json!("gpt-6-astra"), at + 2),
+                        token(15, at + 2)
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let events = recorder.writer.load_session_events().unwrap();
+            let restored = events
+                .iter()
+                .filter(|event| event.model == "gpt-6-astra")
+                .collect::<Vec<_>>();
+            assert_eq!(restored.len(), 1, "case {case}");
+            assert_eq!(restored[0].total_tokens, 5, "case {case}");
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_invalid_context_does_not_retroactively_heal_the_interval() {
+        let (root, database) = prepare("issue604-context-invalid");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                token(0, at)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(issue604_context_record("turn_context", Value::Null, at + 1).as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        drop(recorder);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6-astra"), at + 2),
+                    token(10, at + 2),
+                    token(15, at + 3)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let totals = recorder.model_totals().unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(
+            totals["gpt-6-astra"].total, 5,
+            "later context restores only future independent intervals"
+        );
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0].last_model_context_kind,
+            Some(codex_info_db_writer::SessionModelContextKind::Turn)
+        );
+        assert_eq!(
+            recorder
+                .writer
+                .load_session_events()
+                .unwrap()
+                .iter()
+                .map(|e| e.total_tokens)
+                .sum::<u64>(),
+            15
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_rejected_counter_keeps_interval_state_and_anchor() {
+        let (root, database) = prepare("issue604-context-rejected-counter");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                token(100, at)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6-luna"), at + 1),
+                    token(90, at + 1)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0].previous_total,
+            Some(100),
+            "a rejected counter is not a new anchor"
+        );
+        drop(recorder);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6-astra"), at + 2),
+                    token(110, at + 2),
+                    token(115, at + 3)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let totals = recorder.model_totals().unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals["gpt-6-astra"].total, 5);
+        assert_eq!(
+            recorder
+                .writer
+                .load_session_events()
+                .unwrap()
+                .iter()
+                .map(|event| event.total_tokens)
+                .sum::<u64>(),
+            15
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_invalid_counter_does_not_replace_the_context_or_anchor() {
+        let (root, database) = prepare("issue604-invalid-counter-context");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                token(0, at)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let mut bad_time: Value = serde_json::from_str(&token(2, at + 1)).unwrap();
+        bad_time["timestamp"] = json!("not-a-timestamp");
+        let mut bad_number: Value = serde_json::from_str(&token(3, at + 2)).unwrap();
+        bad_number["payload"]["info"]["total_token_usage"]["input_tokens"] = json!(-1);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{bad_time}\n{bad_number}\n").as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let checkpoint = &recorder.state().unwrap().checkpoints[0];
+        assert_eq!(checkpoint.previous_total, Some(0));
+        assert_eq!(
+            checkpoint.last_model_context_kind,
+            Some(SessionModelContextKind::Turn),
+            "a known invalid numeric sample is not an unknown model control"
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(10, at + 3), token(15, at + 4)).as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let totals = recorder.model_totals().unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals["gpt-6.1-sol"].total, 15);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_restart_does_not_requalify_a_saved_mixed_delta_from_the_last_context() {
+        let (root, database) = prepare("issue604-restart-mixed-requalification");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                token(0, at)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6-luna"), at + 1),
+                    issue604_context_record("turn_context", json!("gpt-6-astra"), at + 2)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(10, at + 3), token(15, at + 4)).as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 5);
+        let before = recorder.writer.load_session_events().unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .filter(|e| e.model == UNATTRIBUTED_MODEL)
+                .map(|e| e.total_tokens)
+                .sum::<u64>(),
+            10
+        );
+        drop(recorder);
+        let recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        assert_eq!(
+            recorder.writer.load_session_events().unwrap(),
+            before,
+            "restart cannot replace interval proof with the last model name"
+        );
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 5);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_streamed_model_names_follow_the_owner_contract() {
+        let cases = [
+            (
+                format!("{}gpt-6.1-sol{}", "\u{3000}".repeat(2048), " ".repeat(2048)),
+                Some("gpt-6.1-sol".to_owned()),
+            ),
+            ("a".repeat(128), Some("a".repeat(128))),
+            ("a".repeat(129), None),
+            ("\u{1f680}".repeat(128), Some("\u{1f680}".repeat(128))),
+            ("\u{1f680}".repeat(129), None),
+            ("\ngpt-6.1-sol".into(), None),
+            ("gpt-6.1-sol\t".into(), None),
+            ("\u{85}gpt-6.1-sol".into(), None),
+            ("gpt\u{202e}-6.1-sol".into(), None),
+            (
+                "\u{a0}e\u{301}\u{2003}X\u{3000}".into(),
+                Some("e\u{301}\u{2003}X".into()),
+            ),
+        ];
+        for (index, (original, expected)) in cases.into_iter().enumerate() {
+            let (root, database) = prepare(&format!("issue604-streamed-model-{index}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            fs::write(
+                &source,
+                format!(
+                    "{}{}{}",
+                    issue604_context_record("turn_context", json!(original), at),
+                    token(0, at),
+                    token(5, at + 1)
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16 * 1024), &database, &identity())
+                    .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let totals = recorder.model_totals().unwrap();
+            match expected {
+                Some(model) => {
+                    assert_eq!(totals.len(), 1, "valid source model case {index}");
+                    assert_eq!(totals[&model].total, 5, "source model case {index}");
+                }
+                None => assert!(
+                    totals.is_empty(),
+                    "invalid source model case {index} became public"
+                ),
+            }
+            assert_eq!(
+                recorder
+                    .writer
+                    .load_session_events()
+                    .unwrap()
+                    .iter()
+                    .map(|event| event.total_tokens)
+                    .sum::<u64>(),
+                5,
+                "model validity does not erase the numeric fact"
+            );
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+        // Exercise each wire position once; the character decision table
+        // above owns normalization rather than multiplying it by positions.
+        for (index, expected) in [
+            Some("gpt-6.1-sol"),
+            Some("gpt-6.1-sol"),
+            Some("gpt-6.1-sol"),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (root, database) = prepare(&format!("issue604-model-position-{index}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let padded = format!("{}gpt-6.1-sol{}", "\u{3000}".repeat(2048), " ".repeat(2048));
+            let timestamp = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+            let context = match index {
+                0 => {
+                    json!({"type":"turn_context","timestamp":timestamp,"model":padded,"payload":{}})
+                }
+                1 => {
+                    json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"thread_settings_applied","thread_settings":{"model":padded}}})
+                }
+                2 => {
+                    json!({"type":"turn_context","timestamp":timestamp,"model":"gpt-6.1-sol","payload":{"model":padded}})
+                }
+                _ => {
+                    json!({"type":"turn_context","timestamp":timestamp,"model":"gpt-6-astra","payload":{"model":padded}})
+                }
+            };
+            fs::write(
+                &source,
+                format!("{context}\n{}{}", token(0, at), token(5, at + 1)),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16 * 1024), &database, &identity())
+                    .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let totals = recorder.model_totals().unwrap();
+            if let Some(model) = expected {
+                assert_eq!(totals.len(), 1);
+                assert_eq!(totals[model].total, 5, "model position {index}");
+            } else {
+                assert!(
+                    totals.is_empty(),
+                    "conflicting supplied positions cannot select one model"
+                );
+            }
+            assert_eq!(
+                recorder
+                    .writer
+                    .load_session_events()
+                    .unwrap()
+                    .iter()
+                    .map(|event| event.total_tokens)
+                    .sum::<u64>(),
+                5
+            );
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -9077,13 +14117,16 @@ mod tests {
                 token_baseline_known: true,
                 history_base_pending: false,
                 last_model: None,
+                last_model_context_kind: None,
+                last_model_interval: None,
+                source_admission: None,
                 last_task_running: None,
                 context_usage_tokens: None,
                 context_window_tokens: None,
-                previous_total: 0,
-                previous_input: 0,
-                previous_cached_input: 0,
-                previous_output: 0,
+                previous_total: None,
+                previous_input: None,
+                previous_cached_input: None,
+                previous_output: None,
                 previous_cache_write_input: None,
             });
         }
@@ -9149,13 +14192,16 @@ mod tests {
                 token_baseline_known: true,
                 history_base_pending: false,
                 last_model: None,
+                last_model_context_kind: None,
+                last_model_interval: None,
+                source_admission: None,
                 last_task_running: None,
                 context_usage_tokens: None,
                 context_window_tokens: None,
-                previous_total: 0,
-                previous_input: 0,
-                previous_cached_input: 0,
-                previous_output: 0,
+                previous_total: None,
+                previous_input: None,
+                previous_cached_input: None,
+                previous_output: None,
                 previous_cache_write_input: None,
             }
         };
@@ -9287,16 +14333,19 @@ mod tests {
             prefix_generation,
             prefix_sha256: EMPTY_SHA256.to_owned(),
             fully_attributed_from_zero: true,
-            token_baseline_known: true,
+            token_baseline_known: false,
             history_base_pending: false,
             last_model: None,
+            last_model_context_kind: None,
+            last_model_interval: None,
+            source_admission: None,
             last_task_running: None,
             context_usage_tokens: None,
             context_window_tokens: None,
-            previous_total: 0,
-            previous_input: 0,
-            previous_cached_input: 0,
-            previous_output: 0,
+            previous_total: None,
+            previous_input: None,
+            previous_cached_input: None,
+            previous_output: None,
             previous_cache_write_input: None,
         };
         let range = SessionRange {
@@ -9421,6 +14470,4619 @@ mod tests {
         assert!(totals.to_totals().is_empty());
     }
 
+    pub(crate) fn issue604_parser_state_fixture(
+        name: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, Recorder, i64) {
+        issue604_parser_state_fixture_at(name, Utc::now().timestamp() - 30)
+    }
+
+    fn issue604_parser_state_fixture_at(
+        name: &str,
+        at: i64,
+    ) -> (PathBuf, PathBuf, PathBuf, Recorder, i64) {
+        let (root, database) = prepare(name);
+        let source = root.join("sessions/one.jsonl");
+        let original = format!(
+            "{}\n{}{}{}",
+            json!({"type":"session_meta","payload":{"id":"thread","session_id":"thread"}}),
+            issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+            token(0, at),
+            token(10, at + 1)
+        );
+        fs::write(&source, original).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: at + 2,
+                reset_at: at + 3600,
+                window_seconds: 7200,
+                remaining_percent: Some(99.0),
+            }))
+            .unwrap();
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6.1-sol"].total, 10);
+        (root, database, source, recorder, at)
+    }
+
+    #[test]
+    fn issue604_postscan_binding_accepts_the_fixed_prefix_opened_after_inventory_growth() {
+        let (root, database, path, recorder, at) =
+            issue604_parser_state_fixture("postscan-inventory-growth");
+        let old = recorder.state().unwrap().checkpoints.remove(0);
+        let mut ranges = recorder
+            .writer
+            .load_session_ranges_for_checkpoint(&old)
+            .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(token(15, at + 3).as_bytes())
+            .unwrap();
+        let source = discover_sources(&root.join("sessions"))
+            .unwrap()
+            .sources
+            .remove(0);
+        let inventory_end = source.recorded.file_bytes;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(token(20, at + 4).as_bytes())
+            .unwrap();
+        let expected_end = fs::metadata(&path).unwrap().len();
+        let mut totals = ModelTotals::default();
+        let mut events = Vec::new();
+        let result = scan_source(
+            &source,
+            Some(&old),
+            false,
+            false,
+            old.collector_epoch,
+            old.cycle_seq + 1,
+            at + 3600,
+            at - 3600,
+            16384,
+            None,
+            None,
+            None,
+            None,
+            &mut totals,
+            &mut events,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.checkpoint.committed_offset, expected_end);
+        assert_eq!(result.checkpoint.previous_total, Some(20));
+        assert!(expected_end > inventory_end);
+        ranges.extend(result.range.iter().cloned());
+        assert_eq!(saved_source_prefix_matches(&source,&result.checkpoint,&ranges).unwrap(),Some(true),
+            "postscan account qualification must validate the actual opened fixed prefix, not reject an append because inventory was older");
+        // Actual truncation remains a rejection. The consumed range cannot
+        // be covered by an inventory length or a different physical file.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(expected_end - 1)
+            .unwrap();
+        assert_eq!(
+            saved_source_prefix_matches(&source, &result.checkpoint, &ranges).unwrap(),
+            None
+        );
+        assert_eq!(recorder.state().unwrap().checkpoints, [old]);
+        drop(recorder);
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_owner_startup_commits_only_a_fenced_existing_snapshot() {
+        let (root, _database, _source, mut recorder, at) =
+            issue604_parser_state_fixture("issue604-owner-startup-ack");
+        let receipt = codex_info_db_writer::QuotaReceipt {
+            receipt_id: "a".repeat(64),
+            sequence: 1,
+            observed_at: at + 2,
+            reset_at: at + 3600,
+            window_seconds: 7200,
+            remaining_percent: 99.0,
+        };
+        recorder
+            .writer
+            .commit_quota_receipts(std::slice::from_ref(&receipt), false)
+            .unwrap();
+        let before = recorder.state().unwrap();
+        assert!(matches!(
+            recorder.acknowledge_existing_owner_guarded(|| false),
+            Err(RecorderError::AccountBoundaryChanged)
+        ));
+        assert_eq!(recorder.state().unwrap(), before);
+        let after = recorder
+            .acknowledge_existing_owner_guarded(|| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.data_generation, before.data_generation + 1);
+        assert_eq!(after.cycle_seq, before.cycle_seq + 1);
+        assert_eq!(after.collector_epoch, before.collector_epoch);
+        assert_eq!(after.checkpoints, before.checkpoints);
+        assert_eq!(after.model_totals, before.model_totals);
+        assert_eq!(after.reset_at, before.reset_at);
+        assert_eq!(after.latest_quota_reset_at, before.latest_quota_reset_at);
+        assert_eq!(
+            recorder.writer.latest_quota_receipt().unwrap(),
+            Some(receipt)
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue604_partial_period_qualification_preserves_saved_current_models() {
+        use rusqlite::{params, OptionalExtension};
+
+        let (root, database, _source, mut recorder, at) = issue604_parser_state_fixture_at(
+            "partial-period-keeps-current",
+            Utc::now().timestamp() - 180,
+        );
+        write_test_account_authority(&root, "synthetic-upgrade-account");
+        let epoch = AccountEpochProof::capture(&root).unwrap();
+        let before = recorder.state().unwrap();
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "UPDATE session_events SET reset_at=NULL,window_seconds=NULL,admission_json=NULL",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE session_checkpoints SET source_admission=NULL,last_model_context_kind=NULL,last_model_interval=NULL",
+            [],
+        ).unwrap();
+        let saved_price: (Option<f64>, Option<String>) = db.query_row(
+            "SELECT total_dollars,price_version FROM usage_model_history WHERE reset_at=?1 AND model='gpt-6.1-sol' ORDER BY timestamp DESC LIMIT 1",
+            [before.reset_at], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        drop(db);
+        recorder.lifecycle_intervals = vec![SessionLifecycleInterval::new(Some(at - 1), None)];
+        let receipt = codex_info_db_writer::QuotaReceipt {
+            receipt_id: "b".repeat(64),
+            sequence: 1,
+            // The first post-upgrade receipt is in a later minute, as in
+            // production; it is not a rewrite of the existing model minute.
+            observed_at: Utc::now().timestamp(),
+            reset_at: before.reset_at,
+            window_seconds: before.window_seconds,
+            remaining_percent: 98.0,
+        };
+        recorder
+            .writer
+            .commit_quota_receipts(std::slice::from_ref(&receipt), false)
+            .unwrap();
+        recorder
+            .writer
+            .stage_official_quota_inputs(&[
+                codex_info_db_writer::period_evidence::OfficialQuotaInput {
+                    input_id: receipt.receipt_id.clone(),
+                    account_scope: identity().account_scope_id,
+                    sequence: 1,
+                    observed_at: receipt.observed_at,
+                    content_sha256: "c".repeat(64),
+                    reset_at: Some(receipt.reset_at),
+                    window_seconds: Some(receipt.window_seconds),
+                    reason: None,
+                },
+            ])
+            .unwrap();
+        // The old format has accepted bytes and a saved value of ten, but
+        // has not yet acquired the new original-source qualification.
+        let worker = recorder.start_historical_repair_worker().unwrap();
+        for _ in 0..2 {
+            recorder
+                .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recorder.state().unwrap().model_totals, before.model_totals,
+                "a partial qualified ledger cannot replace the saved same-period aggregate with an empty set");
+            assert_eq!(
+                recorder.writer.latest_quota_receipt().unwrap(),
+                Some(receipt.clone())
+            );
+        }
+        let db = Connection::open(&database).unwrap();
+        let known: i64 = db.query_row(
+            "SELECT COUNT(*) FROM usage_model_history WHERE reset_at=?1 AND model='gpt-6.1-sol' AND total_tokens='10'",
+            [before.reset_at], |row| row.get(0),
+        ).unwrap();
+        assert!(known > 0, "the saved model minute must remain available");
+        let current: Option<(String, Option<f64>, Option<String>)> = db.query_row(
+            "SELECT total_tokens,total_dollars,price_version FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6.1-sol'",
+            params![before.reset_at, receipt.observed_at.div_euclid(60) * 60],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().unwrap();
+        assert_eq!(current, Some(("10".to_owned(), saved_price.0, saved_price.1)),
+            "partial old-source qualification must not replace the newly saved model minute by an empty vector");
+        drop(db);
+        drop(worker);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_startup_keeps_historical_raw_reads_out_of_owner_initialization() {
+        use rustix::fs::inotify;
+        let (root, database, source, recorder, at) =
+            issue604_parser_state_fixture("issue604-startup-bounded-history");
+        let original = recorder.state().unwrap();
+        drop(recorder);
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &source, inotify::WatchFlags::ACCESS).unwrap();
+        let reopened = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 700),
+            &database,
+            &identity(),
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(Some(at - 1), None)],
+        )
+        .unwrap();
+        assert!(!issue604_drain_source_access(&watch),
+            "owner initialization must not replay all accepted Session bytes before bounded work starts");
+        assert_eq!(reopened.state().unwrap().checkpoints, original.checkpoints);
+        assert_eq!(
+            reopened.state().unwrap().model_totals,
+            original.model_totals
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_live_cycle_defers_old_parser_prefix_to_its_background_owner() {
+        use rustix::fs::inotify;
+        let (root, database, old_source, mut recorder, at) =
+            issue604_parser_state_fixture("live-defers-old-parser");
+        let active = root.join("sessions/active.jsonl");
+        fs::write(
+            &active,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at + 2),
+                token(0, at + 2)
+            ),
+        )
+        .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        drop(recorder);
+        Connection::open(&database).unwrap().execute(
+            "UPDATE session_checkpoints SET source_admission=NULL,last_model_context_kind=NULL,last_model_interval=NULL WHERE relative_path='one.jsonl'", []
+        ).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        let before = recorder.state().unwrap();
+        let old_before = before
+            .checkpoints
+            .iter()
+            .find(|cp| cp.relative_path == "one.jsonl")
+            .unwrap()
+            .clone();
+        let worker = recorder.start_historical_repair_worker().unwrap();
+        // The real owner exists but has no request yet. A live collection may
+        // neither perform that owner's prefix work nor wait for its result.
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &old_source, inotify::WatchFlags::ACCESS).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap()
+            .write_all(token(5, at + 3).as_bytes())
+            .unwrap();
+        SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.set((0, 0)));
+        let report = recorder.run_cycle().unwrap().unwrap();
+        let old_was_read = issue604_drain_source_access(&watch);
+        let prefix_reads = SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get().0);
+        let after = recorder.state().unwrap();
+        let old_after = after
+            .checkpoints
+            .iter()
+            .find(|cp| cp.relative_path == "one.jsonl")
+            .unwrap()
+            .clone();
+        let total = recorder.model_totals().unwrap()["gpt-6.1-sol"].total;
+        let new_events = recorder
+            .writer
+            .load_session_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.relative_path == "active.jsonl")
+            .collect::<Vec<_>>();
+        drop(watch);
+        drop(worker);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!((old_was_read, prefix_reads), (false, 0), "a missing old parser state must not read its accepted prefix on the live collection thread");
+        assert!(after.data_generation > before.data_generation);
+        assert_eq!(
+            old_after, old_before,
+            "deferred parser state must not be promoted"
+        );
+        assert!(
+            report.pending_ranges > 0,
+            "unqualified original evidence remains pending"
+        );
+        assert_eq!(total, 15);
+        assert_eq!(new_events.len(), 1);
+        assert_eq!(new_events[0].total_tokens, 5);
+    }
+
+    #[test]
+    fn issue604_nonzero_null_parser_state_reconstructs_without_readding_usage() {
+        for chunk in [1, 16384] {
+            let (root, database, source, mut recorder, at) =
+                issue604_parser_state_fixture(&format!("issue604-null-parser-{chunk}"));
+            let original = fs::read_to_string(&source).unwrap();
+            let boundary = original.len() as u64;
+            let events = recorder.writer.load_session_events().unwrap();
+            let totals = recorder.state().unwrap().model_totals;
+            Connection::open(&database).unwrap().execute(
+                "UPDATE session_checkpoints SET source_admission=NULL,last_model_context_kind=NULL,last_model_interval=NULL", []
+            ).unwrap();
+            recorder.config.chunk_bytes = chunk;
+            for _ in 0..original.lines().count() + 1 {
+                recorder.run_cycle().unwrap();
+                let state = recorder.state().unwrap();
+                assert_eq!(
+                    state.checkpoints[0].committed_offset, boundary,
+                    "state replay must not move the durable cursor"
+                );
+                assert_eq!(state.checkpoints[0].previous_total, Some(10));
+                assert_eq!(
+                    state.model_totals, totals,
+                    "old counters cannot be added by qualification"
+                );
+                assert_eq!(recorder.writer.load_session_events().unwrap(), events);
+            }
+            let checkpoint = recorder.state().unwrap().checkpoints.remove(0);
+            let admission = checkpoint
+                .source_admission
+                .expect("a finite fixed prefix must reconstruct missing parser state");
+            assert_eq!(admission.stream, UsageStream::LegacyCounter);
+            assert!(admission.metadata_qualified);
+            assert_eq!(admission.metadata.unwrap().thread_id, "thread");
+            assert_eq!(admission.previous_raw.unwrap().end, boundary);
+            assert_eq!(
+                checkpoint.last_model_context_kind,
+                Some(SessionModelContextKind::Turn)
+            );
+            assert_eq!(checkpoint.last_model.as_deref(), Some("gpt-6.1-sol"));
+            recorder.config.chunk_bytes = 16384;
+            OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(token(15, at + 3).as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap();
+            assert_eq!(recorder.model_totals().unwrap()["gpt-6.1-sol"].total, 15);
+            assert_eq!(
+                recorder.writer.load_session_events().unwrap().len(),
+                events.len() + 1
+            );
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn issue604_bound_response_prefix_fixture(
+        name: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        Recorder,
+        AccountEpochProof,
+        i64,
+        String,
+    ) {
+        let (root, database) = prepare(name);
+        write_test_account_authority(&root, "synthetic-response-account");
+        let epoch = AccountEpochProof::capture(&root).unwrap();
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp() - 30;
+        let stamp = |timestamp| {
+            DateTime::<Utc>::from_timestamp(timestamp, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let prefix = format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"thread","session_id":"session"}}),
+            json!({"type":"turn_context","timestamp":stamp(at),"payload":{
+                "model":"gpt-6.1-sol","turn_id":"turn","root_turn_id":"root-turn"}}),
+            json!({"type":"task_started","timestamp":stamp(at),"payload":{}}),
+            json!({"type":"event_msg","timestamp":stamp(at),"payload":{"type":"token_count",
+                "info":{"total_token_usage":{"total_tokens":0,"input_tokens":0,
+                    "cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0}}}})
+        );
+        fs::write(&source, prefix).unwrap();
+        let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 16384),
+            &database,
+            &identity(),
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(Some(at - 10), None)],
+        )
+        .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let baseline = &recorder.state().unwrap().checkpoints[0];
+        assert!(baseline.fully_attributed_from_zero);
+        assert_eq!(baseline.previous_total, Some(0));
+        // The original accepted raw zero supplies the existing historical
+        // binding path. Two official points provide a real closed period span.
+        recorder
+            .writer
+            .stage_official_quota_inputs(
+                &[at - 1, at + 10]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, observed_at)| {
+                        codex_info_db_writer::period_evidence::OfficialQuotaInput {
+                            input_id: format!("{:064x}", index + 1),
+                            account_scope: identity().account_scope_id,
+                            sequence: index as u64 + 1,
+                            observed_at,
+                            content_sha256: "a".repeat(64),
+                            reset_at: Some(at + 3600),
+                            window_seconds: Some(7200),
+                            reason: None,
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        recorder
+            .writer
+            .commit_quota_receipts(
+                &[at - 1, at + 10]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, observed_at)| codex_info_db_writer::QuotaReceipt {
+                        receipt_id: format!("{:064x}", index + 1),
+                        sequence: index as i64 + 1,
+                        observed_at,
+                        reset_at: at + 3600,
+                        window_seconds: 7200,
+                        remaining_percent: 99.0,
+                    })
+                    .collect::<Vec<_>>(),
+                false,
+            )
+            .unwrap();
+        let usage = json!({"total_tokens":10,"input_tokens":9,"cached_input_tokens":3,
+            "cache_write_input_tokens":2,"output_tokens":1,"reasoning_output_tokens":1});
+        let suffix = format!(
+            "{}\n{}\n",
+            json!({"type":"token_usage_record","timestamp":stamp(at + 1),"payload":{
+                "thread_id":"thread","session_id":"session","turn_id":"turn",
+                "root_turn_id":"root-turn","response_id":"response-a","usage":usage,
+                "turn_token_usage":usage,"thread_token_usage":usage}}),
+            json!({"type":"event_msg","timestamp":stamp(at + 2),"payload":{"type":"token_count",
+                "info":{"total_token_usage":{"total_tokens":10,"input_tokens":9,
+                    "cached_input_tokens":3,"cache_write_input_tokens":2,"output_tokens":1}}}})
+        );
+        (root, database, source, recorder, epoch, at, suffix)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue604_resolved_response_keeps_accepted_prefix_qualified() {
+        let mut qualifications = Vec::new();
+        for case in [
+            "resolved",
+            "independent-complete",
+            "outside-budget",
+            "outside-partial",
+        ] {
+            let (root, database, source, mut recorder, epoch, at, response) =
+                issue604_bound_response_prefix_fixture(&format!(
+                    "issue604-prefix-qualified-{case}"
+                ));
+            let accepted_before = fs::metadata(&source).unwrap().len();
+            let outside = format!(
+                "{}\n",
+                json!({"type":"event_msg",
+                "timestamp":DateTime::<Utc>::from_timestamp(at + 3, 0).unwrap().to_rfc3339(),
+                "payload":{"type":"agent_message","message":"synthetic suffix"}})
+            );
+            let tail = match case {
+                "independent-complete" => "{broken}\n".to_owned(),
+                "outside-budget" => outside,
+                "outside-partial" => "{\"type\":\"event_msg\",\"payload\":".to_owned(),
+                _ => String::new(),
+            };
+            OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(format!("{response}{tail}").as_bytes())
+                .unwrap();
+            if case == "outside-budget" {
+                recorder.config.chunk_bytes = response.len() as u64;
+            }
+            let report = recorder
+                .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                .unwrap()
+                .unwrap();
+            let state = recorder.state().unwrap();
+            let checkpoint = &state.checkpoints[0];
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), 1, "{case}: one response is one event");
+            let event = &events[0];
+            assert_eq!(
+                (
+                    event.total_tokens,
+                    event.input_tokens,
+                    event.cached_input_tokens,
+                    event.cache_write_input_tokens,
+                    event.output_tokens
+                ),
+                (10, Some(9), Some(3), Some(2), Some(1)),
+                "{case}"
+            );
+            assert_eq!(event.timestamp, at + 1, "{case}");
+            assert_eq!(event.model, "gpt-6.1-sol", "{case}");
+            let ids = codex_info_db_writer::source_admission::ResponseIds {
+                thread_id: "thread".into(),
+                session_id: "session".into(),
+                root_turn_id: "root-turn".into(),
+                turn_id: "turn".into(),
+                response_id: "response-a".into(),
+            };
+            let canonical = recorder
+                .writer
+                .response_event(&ids.key())
+                .unwrap()
+                .expect("the normal transaction admits the response evidence");
+            assert!(
+                matches!(
+                    canonical.admission.as_ref().map(|proof| &proof.numeric),
+                    Some(NumericEventProof::ResponseRecord { .. })
+                ),
+                "{case}"
+            );
+            assert!(
+                checkpoint
+                    .source_admission
+                    .as_ref()
+                    .unwrap()
+                    .responses
+                    .is_empty(),
+                "{case}"
+            );
+            assert_eq!(
+                (
+                    checkpoint.previous_total,
+                    checkpoint.previous_input,
+                    checkpoint.previous_cached_input,
+                    checkpoint.previous_cache_write_input,
+                    checkpoint.previous_output
+                ),
+                (Some(10), Some(9), Some(3), Some(2), Some(1)),
+                "{case}"
+            );
+            let pending = recorder.writer.load_session_pending_ranges().unwrap();
+            assert!(
+                !pending
+                    .iter()
+                    .any(|range| range.reason == "response-qualification-pending"),
+                "{case}"
+            );
+            if case == "independent-complete" {
+                assert!(
+                    pending
+                        .iter()
+                        .any(|range| range.complete
+                            && range.end_offset <= checkpoint.committed_offset),
+                    "{case}"
+                );
+            } else if case.starts_with("outside-") {
+                assert_eq!(
+                    checkpoint.committed_offset,
+                    accepted_before + response.len() as u64,
+                    "{case}"
+                );
+                assert!(
+                    fs::metadata(&source).unwrap().len() > checkpoint.committed_offset,
+                    "{case}"
+                );
+                assert!(
+                    report.pending_ranges > 0,
+                    "{case}: unfinished suffix remains visible"
+                );
+                assert!(
+                    pending.iter().any(|range| !range.complete
+                        && range.start_offset >= checkpoint.committed_offset),
+                    "{case}"
+                );
+            }
+            qualifications.push((case, checkpoint.fully_attributed_from_zero));
+            let totals = state.model_totals;
+            recorder.config.chunk_bytes = 16384;
+            recorder
+                .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                .unwrap();
+            assert_eq!(
+                recorder.writer.load_session_events().unwrap(),
+                events,
+                "{case}: no replay addition"
+            );
+            assert_eq!(recorder.state().unwrap().model_totals, totals, "{case}");
+            drop(recorder);
+            let mut reopened = Recorder::open_partitioned_for_account_with_lifecycle(
+                config(&root, 16384),
+                &database,
+                &identity(),
+                None,
+                None,
+                vec![SessionLifecycleInterval::new(Some(at - 10), None)],
+            )
+            .unwrap();
+            reopened
+                .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                .unwrap();
+            assert_eq!(
+                reopened.writer.load_session_events().unwrap(),
+                events,
+                "{case}: reopen is idempotent"
+            );
+            assert_eq!(reopened.state().unwrap().model_totals, totals, "{case}");
+            drop(reopened);
+            fs::remove_dir_all(root).unwrap();
+        }
+        assert_eq!(qualifications,[("resolved",true),("independent-complete",false),
+            ("outside-budget",true),("outside-partial",true)],
+            "qualification describes the admitted prefix, not a resolved temporary response or outside work");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue604_persisted_response_prefix_recovers_without_readding_usage() {
+        let mut outcomes = Vec::new();
+        for case in [
+            "recover",
+            "missing-canonical",
+            "independent-complete",
+            "rewritten-prefix",
+            "append-priority",
+            "thread-priority",
+            "guard-retry",
+        ] {
+            let (root, database, source, mut recorder, epoch, at, response) =
+                issue604_bound_response_prefix_fixture(&format!("issue604-prefix-recover-{case}"));
+            OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(response.as_bytes())
+                .unwrap();
+            recorder
+                .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                .unwrap();
+            let saved = recorder.writer.load_session_events().unwrap();
+            assert_eq!(saved.len(), 1, "{case}");
+            assert_eq!(
+                (
+                    saved[0].total_tokens,
+                    saved[0].input_tokens,
+                    saved[0].cached_input_tokens,
+                    saved[0].cache_write_input_tokens,
+                    saved[0].output_tokens
+                ),
+                (10, Some(9), Some(3), Some(2), Some(1)),
+                "{case}"
+            );
+            let original = fs::read_to_string(&source).unwrap();
+            let db = Connection::open(&database).unwrap();
+            // Reproduce only the old false flag, retaining the accepted
+            // parser state, original bytes, binding and canonical numeric row.
+            db.execute(
+                "UPDATE session_checkpoints SET fully_attributed_from_zero=0",
+                [],
+            )
+            .unwrap();
+            let original_checkpoint = recorder.state().unwrap().checkpoints.remove(0);
+            assert!(
+                original_checkpoint
+                    .source_admission
+                    .as_ref()
+                    .unwrap()
+                    .account_binding
+                    .is_some(),
+                "{case}"
+            );
+            assert_eq!(
+                original_checkpoint
+                    .source_admission
+                    .as_ref()
+                    .unwrap()
+                    .stream,
+                UsageStream::ResponseRecord,
+                "{case}"
+            );
+            assert_eq!(
+                (
+                    original_checkpoint.previous_total,
+                    original_checkpoint.previous_input,
+                    original_checkpoint.previous_cached_input,
+                    original_checkpoint.previous_cache_write_input,
+                    original_checkpoint.previous_output
+                ),
+                (Some(10), Some(9), Some(3), Some(2), Some(1)),
+                "{case}"
+            );
+            if case == "missing-canonical" {
+                assert_eq!(db.execute("DELETE FROM session_events", []).unwrap(), 1);
+                assert_eq!(
+                    db.execute("DELETE FROM session_model_totals", []).unwrap(),
+                    1
+                );
+            } else if case == "independent-complete" {
+                db.execute("INSERT INTO session_pending_ranges(root_identity,relative_path,file_device,file_inode,
+                    prefix_generation,start_offset,end_offset,collector_epoch,cycle_seq,record_sha256,parser_version,reason,complete)
+                    VALUES(?1,?2,?3,?4,?5,0,?6,?7,?8,?9,?10,'account-counter-prefix-unknown',1)",
+                    rusqlite::params![original_checkpoint.root_identity,original_checkpoint.relative_path,
+                        original_checkpoint.file_device.to_string(),original_checkpoint.file_inode.to_string(),
+                        format!("{:032x}",original_checkpoint.prefix_generation),original_checkpoint.committed_offset,
+                        format!("{:032x}",original_checkpoint.collector_epoch),original_checkpoint.cycle_seq.to_string(),
+                        sha256_file_range(&source,0,original_checkpoint.committed_offset).unwrap(),PARSER_VERSION]).unwrap();
+            } else if case == "rewritten-prefix" {
+                fs::write(&source, original.replace("response-a", "response-b")).unwrap();
+            }
+            let events_before = recorder.writer.load_session_events().unwrap();
+            let totals_before = recorder.state().unwrap().model_totals;
+            drop(db);
+            drop(recorder);
+            let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+                config(&root, 1),
+                &database,
+                &identity(),
+                None,
+                None,
+                vec![SessionLifecycleInterval::new(Some(at - 10), None)],
+            )
+            .unwrap();
+            SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.set((0, 0)));
+            let key = source_verification_key(&original_checkpoint);
+            let mut progress = Vec::new();
+            let mut checkpoint_held = true;
+            let mut priority_ok = true;
+            let mut guard_retry_observed = case != "guard-retry";
+            let numeric_history = || {
+                let db = Connection::open(&database).unwrap();
+                let mut statement = db.prepare(
+                    "SELECT json_array(reset_at,timestamp,model,total_tokens,input_tokens,
+                        cached_input_tokens,cache_write_input_tokens,output_tokens)
+                     FROM usage_model_history WHERE timestamp<=?1 ORDER BY reset_at,timestamp,model",
+                ).unwrap();
+                let rows = statement
+                    .query_map([at + 10], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows
+            };
+            let history_before = (case == "guard-retry").then(numeric_history);
+            if let Some(history) = history_before.as_ref() {
+                assert!(
+                    history.iter().any(|row| {
+                        let values: Vec<Value> = serde_json::from_str(row).unwrap();
+                        values[3] == json!("10")
+                    }),
+                    "the legal fixture has a recorded numeric history prefix of ten"
+                );
+            }
+            for cycle in 0..original.lines().count() + 2 {
+                let collected =
+                    recorder.run_account_cycle_with_stored_quota_guarded(&root, &epoch, || {
+                        case != "guard-retry"
+                            || SOURCE_PREFIX_RECOVERY_OBSERVATIONS
+                                .with(|counts| counts.get().1 == 0)
+                    });
+                if case == "guard-retry"
+                    && SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get().1 > 0)
+                {
+                    assert!(
+                        matches!(collected, Err(RecorderError::AccountBoundaryChanged)),
+                        "the guard rejects only after the canonical batch ran"
+                    );
+                    let before_retry =
+                        SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get());
+                    assert!(before_retry.0 > 0);
+                    assert_eq!(before_retry.1, 1);
+                    assert!(recorder.pending.is_none());
+                    assert_eq!(
+                        recorder.state().unwrap().checkpoints[0],
+                        original_checkpoint
+                    );
+                    assert_eq!(
+                        recorder.writer.load_session_events().unwrap(),
+                        events_before
+                    );
+                    assert_eq!(recorder.state().unwrap().model_totals, totals_before);
+                    assert_eq!(numeric_history(), *history_before.as_ref().unwrap());
+                    recorder
+                        .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                        .unwrap();
+                    let after_retry =
+                        SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get());
+                    assert_eq!(
+                        after_retry.0, before_retry.0,
+                        "retry does not reconstruct the source again"
+                    );
+                    assert_eq!(
+                        after_retry.1,
+                        before_retry.1 + 1,
+                        "retry rechecks one canonical batch"
+                    );
+                    assert!(recorder.state().unwrap().checkpoints[0].fully_attributed_from_zero);
+                    assert_eq!(numeric_history(), *history_before.as_ref().unwrap());
+                    guard_retry_observed = true;
+                } else {
+                    collected.unwrap();
+                }
+                let cp = recorder.state().unwrap().checkpoints.remove(0);
+                if !cp.fully_attributed_from_zero {
+                    checkpoint_held &= cp == original_checkpoint;
+                }
+                if let Some(offset) = recorder
+                    .source_parser_reconstructions
+                    .get(&key)
+                    .and_then(|state| state.replayed.as_ref())
+                    .map(|cp| cp.committed_offset)
+                {
+                    if progress.last().copied() != Some(offset) {
+                        progress.push(offset);
+                    }
+                }
+                assert_eq!(
+                    recorder.writer.load_session_events().unwrap(),
+                    events_before,
+                    "{case}: no numeric addition"
+                );
+                assert_eq!(
+                    recorder.state().unwrap().model_totals,
+                    totals_before,
+                    "{case}: totals remain unchanged"
+                );
+                if cycle == 0 && matches!(case, "append-priority" | "thread-priority") {
+                    let before = SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get());
+                    let position = progress.last().copied().unwrap_or(0);
+                    if case == "append-priority" {
+                        let tail = format!(
+                            "{}\n",
+                            json!({"type":"event_msg",
+                            "timestamp":DateTime::<Utc>::from_timestamp(at+3,0).unwrap().to_rfc3339(),
+                            "payload":{"type":"agent_message","message":"synthetic append"}})
+                        );
+                        OpenOptions::new()
+                            .append(true)
+                            .open(&source)
+                            .unwrap()
+                            .write_all(tail.as_bytes())
+                            .unwrap();
+                    } else {
+                        let wanted = recorded_source(
+                            original_checkpoint.root_identity.clone(),
+                            original_checkpoint.relative_path.clone(),
+                            fs::metadata(&source).unwrap(),
+                        );
+                        recorder.prioritize_active_thread_sources(&[wanted]);
+                    }
+                    recorder
+                        .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                        .unwrap();
+                    let after = SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get());
+                    let cp = recorder.state().unwrap().checkpoints.remove(0);
+                    priority_ok &= before.0 > 0 && before == after;
+                    if case == "append-priority" {
+                        priority_ok &= cp.committed_offset == fs::metadata(&source).unwrap().len()
+                            && cp.committed_offset > original_checkpoint.committed_offset;
+                    } else {
+                        priority_ok &= cp == original_checkpoint
+                            && recorder
+                                .source_parser_reconstructions
+                                .get(&key)
+                                .and_then(|state| state.replayed.as_ref())
+                                .is_some_and(|cp| cp.committed_offset == position);
+                    }
+                    assert_eq!(
+                        recorder.writer.load_session_events().unwrap(),
+                        events_before,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        recorder.state().unwrap().model_totals,
+                        totals_before,
+                        "{case}"
+                    );
+                    break;
+                }
+                if cp.fully_attributed_from_zero {
+                    break;
+                }
+            }
+            let recovered = recorder.state().unwrap().checkpoints.remove(0);
+            let terminal_before = SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get());
+            let mut terminal_stable = true;
+            if case == "missing-canonical" {
+                recorder
+                    .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                    .unwrap();
+                recorder
+                    .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                    .unwrap();
+                terminal_stable = terminal_before.0 > 0
+                    && terminal_before.1 == 1
+                    && SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get())
+                        == terminal_before;
+            }
+            if case == "guard-retry" {
+                recorder
+                    .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                    .unwrap();
+                assert_eq!(
+                    SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get()),
+                    terminal_before,
+                    "a committed prefix does not restart qualification"
+                );
+                assert_eq!(numeric_history(), *history_before.as_ref().unwrap());
+            }
+            let mut expected = original_checkpoint.clone();
+            expected.fully_attributed_from_zero = true;
+            expected.cycle_seq = recovered.cycle_seq;
+            let recovery_ok = if matches!(case, "recover" | "guard-retry") {
+                recovered == expected
+                    && progress.len() >= 2
+                    && progress.windows(2).all(|pair| pair[0] < pair[1])
+                    && terminal_before.0 > 0
+                    && terminal_before.1 == (if case == "guard-retry" { 2 } else { 1 })
+                    && guard_retry_observed
+            } else if matches!(case, "append-priority" | "thread-priority") {
+                priority_ok
+            } else {
+                !recovered.fully_attributed_from_zero
+                    && recovered == original_checkpoint
+                    && terminal_stable
+            };
+            outcomes.push((case, recovery_ok, checkpoint_held));
+            assert_eq!(
+                recorder.writer.load_session_events().unwrap(),
+                events_before,
+                "{case}"
+            );
+            assert_eq!(
+                recorder.state().unwrap().model_totals,
+                totals_before,
+                "{case}"
+            );
+            if case == "independent-complete" {
+                assert!(recorder
+                    .writer
+                    .load_session_pending_ranges()
+                    .unwrap()
+                    .iter()
+                    .any(|pending| pending.complete
+                        && pending.reason == "account-counter-prefix-unknown"));
+            }
+            if !matches!(case, "rewritten-prefix" | "append-priority") {
+                assert_eq!(
+                    fs::read_to_string(&source).unwrap(),
+                    original,
+                    "{case}: source bytes preserved"
+                );
+            }
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+        assert_eq!(outcomes,[("recover",true,true),("missing-canonical",true,true),
+            ("independent-complete",true,true),("rewritten-prefix",true,true),
+            ("append-priority",true,true),("thread-priority",true,true),("guard-retry",true,true)],
+            "only a fully matched fixed prefix recovers; incomplete/terminal recovery never rewrites or blocks the current checkpoint");
+    }
+
+    #[test]
+    fn issue604_v1_response_state_reconstructs_original_classification_without_counter_fallback() {
+        let (root, database) = prepare("issue604-v1-parser-state");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp() - 30;
+        let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+        let usage = json!({"total_tokens":10,"input_tokens":9,"cached_input_tokens":3,"cache_write_input_tokens":2,"output_tokens":1,"reasoning_output_tokens":1});
+        let original = format!(
+            "{}\n{}\n{}{}\n{}",
+            json!({"type":"session_meta","payload":{"id":"thread","session_id":"session"}}),
+            json!({"type":"turn_context","timestamp":time,"payload":{"model":"gpt-6-astra","turn_id":"turn","root_turn_id":"root-turn"}}),
+            token(0, at),
+            json!({"type":"token_usage_record","timestamp":time,"payload":{"thread_id":"thread","session_id":"session","turn_id":"turn","root_turn_id":"root-turn","response_id":"response","usage":usage,"turn_token_usage":usage,"thread_token_usage":usage}}),
+            token(10, at + 1)
+        );
+        fs::write(&source, &original).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        let before = recorder.state().unwrap();
+        let admission = before.checkpoints[0].source_admission.as_ref().unwrap();
+        assert_eq!(
+            admission.responses[0].qualified_model(),
+            Some("gpt-6-astra")
+        );
+        let mut v1: Value = serde_json::from_str(&admission.to_storage().unwrap()).unwrap();
+        v1["version"] = json!(1);
+        v1.as_object_mut().unwrap().remove("adopted_context");
+        for response in v1["responses"].as_array_mut().unwrap() {
+            response.as_object_mut().unwrap().remove("classification");
+        }
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE session_checkpoints SET source_admission=?1",
+                [v1.to_string()],
+            )
+            .unwrap();
+        recorder.config.chunk_bytes = 1;
+        for _ in 0..original.lines().count() + 1 {
+            recorder.run_cycle().unwrap();
+            let state = recorder.state().unwrap();
+            assert_eq!(state.checkpoints[0].committed_offset, original.len() as u64);
+            assert_eq!(state.model_totals, before.model_totals);
+            assert!(recorder.writer.load_session_events().unwrap().is_empty());
+        }
+        let checkpoint = recorder.state().unwrap().checkpoints.remove(0);
+        let recovered = checkpoint.source_admission.unwrap();
+        assert_eq!(
+            recovered.responses.len(),
+            1,
+            "state-only replay cannot duplicate an old root"
+        );
+        assert_eq!(
+            recovered.responses[0].pointer,
+            admission.responses[0].pointer
+        );
+        assert_eq!(
+            recovered.responses[0].qualified_model(),
+            Some("gpt-6-astra"),
+            "v1 classification must come from its original interval"
+        );
+        recorder.config.chunk_bytes = 16384;
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(15, at + 2).as_bytes())
+            .unwrap();
+        let report = recorder.run_cycle().unwrap().unwrap();
+        assert!(report.pending_ranges > 0);
+        assert!(
+            recorder.writer.load_session_events().unwrap().is_empty(),
+            "response stream cannot fall back to a legacy counter delta"
+        );
+        assert_eq!(recorder.state().unwrap().model_totals, before.model_totals);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_parser_reconstruction_preserves_conflicting_saved_raw_anchor() {
+        let (root, database, source, mut recorder, at) =
+            issue604_parser_state_fixture("issue604-parser-raw-conflict");
+        let original = fs::read_to_string(&source).unwrap();
+        let events = recorder.writer.load_session_events().unwrap();
+        let totals = recorder.state().unwrap().model_totals;
+        Connection::open(&database).unwrap().execute(
+            "UPDATE session_checkpoints SET source_admission=NULL,last_model_context_kind=NULL,last_model_interval=NULL,previous_total='9',previous_input='9'", []
+        ).unwrap();
+        recorder.config.chunk_bytes = 1;
+        for _ in 0..original.lines().count() + 1 {
+            recorder.run_cycle().unwrap();
+        }
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(15, at + 3).as_bytes())
+            .unwrap();
+        recorder.config.chunk_bytes = 16384;
+        recorder.run_cycle().unwrap();
+        let state = recorder.state().unwrap();
+        assert_eq!(
+            state.checkpoints[0].previous_total,
+            Some(9),
+            "known raw conflict requires original repair, not anchor replacement"
+        );
+        assert_eq!(state.checkpoints[0].committed_offset, original.len() as u64);
+        assert!(state.checkpoints[0].source_admission.is_none());
+        assert_eq!(state.model_totals, totals);
+        assert_eq!(recorder.writer.load_session_events().unwrap(), events);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue604_source_read_rejects_root_replacement_with_unchanged_file() {
+        struct ReplaceRootAfterRead {
+            inner: BufReader<std::io::Take<File>>,
+            consumed: usize,
+            length: usize,
+            replacement: Option<(PathBuf, PathBuf)>,
+            triggered: Arc<AtomicBool>,
+        }
+        impl ReplaceRootAfterRead {
+            fn replace_root(&mut self) {
+                if self.consumed == self.length {
+                    if let Some((root, retired)) = self.replacement.take() {
+                        fs::rename(&root, &retired).unwrap();
+                        fs::create_dir(&root).unwrap();
+                        fs::hard_link(retired.join("one.jsonl"), root.join("one.jsonl")).unwrap();
+                        self.triggered.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+        impl Read for ReplaceRootAfterRead {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let read = self.inner.read(bytes)?;
+                self.consumed += read;
+                self.replace_root();
+                Ok(read)
+            }
+        }
+        impl BufRead for ReplaceRootAfterRead {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                self.inner.fill_buf()
+            }
+            fn consume(&mut self, bytes: usize) {
+                self.inner.consume(bytes);
+                self.consumed += bytes;
+                self.replace_root();
+            }
+        }
+        for changed in [false, true] {
+            let (root, _) = prepare(&format!("issue604-root-during-read-{changed}"));
+            let sessions = root.join("sessions");
+            let path = sessions.join("one.jsonl");
+            let at = Utc::now().timestamp();
+            let original = format!(
+                "{}{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                token(0, at),
+                token(10, at + 1)
+            );
+            fs::write(&path, &original).unwrap();
+            let root_before = file_identity(&fs::metadata(&sessions).unwrap());
+            let file_before = file_identity(&fs::metadata(&path).unwrap());
+            let source = Source {
+                path: path.clone(),
+                recorded: recorded_source(
+                    root_identity(&sessions, &fs::metadata(&sessions).unwrap()),
+                    "one.jsonl".into(),
+                    fs::metadata(&path).unwrap(),
+                ),
+            };
+            let mut totals = ModelTotals::default();
+            totals
+                .add(
+                    "gpt-6-luna",
+                    TokenSnapshot {
+                        total: 7,
+                        input: Some(7),
+                        cached_input: Some(0),
+                        output: Some(0),
+                        cache_write_input: Some(0),
+                    },
+                )
+                .unwrap();
+            let previous_totals = totals.to_totals();
+            let mut events = Vec::new();
+            let triggered = Arc::new(AtomicBool::new(false));
+            let result = scan_source_with_reader(
+                &source,
+                None,
+                false,
+                false,
+                1,
+                1,
+                at + 100,
+                at - 100,
+                64 * 1024,
+                None,
+                None,
+                None,
+                None,
+                &mut totals,
+                &mut events,
+                |file, limit| ReplaceRootAfterRead {
+                    inner: BufReader::new(file.take(limit)),
+                    consumed: 0,
+                    length: original.len(),
+                    replacement: changed.then(|| (sessions.clone(), root.join("retired-sessions"))),
+                    triggered: Arc::clone(&triggered),
+                },
+            )
+            .unwrap();
+            assert_eq!(triggered.load(Ordering::SeqCst), changed);
+            assert_eq!(file_identity(&fs::metadata(&path).unwrap()), file_before);
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(
+                file_identity(&fs::metadata(&sessions).unwrap()) != root_before,
+                changed
+            );
+            if changed {
+                assert!(
+                    result.is_none(),
+                    "a replacement root cannot inherit the inventoried namespace"
+                );
+                assert_eq!(totals.to_totals(), previous_totals);
+                assert!(
+                    events.is_empty(),
+                    "rejected root cannot add projection events"
+                );
+            } else {
+                let accepted = result.expect("unchanged root remains admissible");
+                assert_eq!(accepted.checkpoint.committed_offset, original.len() as u64);
+                assert_eq!(accepted.events.len(), 1);
+                assert_eq!(accepted.events[0].total_tokens, 10);
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue604_stale_root_cannot_qualify_saved_prefix_or_reuse() {
+        let (root, _) = prepare("issue604-stale-root-prefix");
+        let sessions = root.join("sessions");
+        let path = sessions.join("one.jsonl");
+        let at = Utc::now().timestamp();
+        let original = format!(
+            "{}{}{}",
+            issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+            token(0, at),
+            token(10, at + 1)
+        );
+        fs::write(&path, &original).unwrap();
+        let source = Source {
+            path: path.clone(),
+            recorded: recorded_source(
+                root_identity(&sessions, &fs::metadata(&sessions).unwrap()),
+                "one.jsonl".into(),
+                fs::metadata(&path).unwrap(),
+            ),
+        };
+        let before_identity = file_identity(&fs::metadata(&path).unwrap());
+        let mut totals = ModelTotals::default();
+        let mut events = Vec::new();
+        let accepted = scan_source(
+            &source,
+            None,
+            false,
+            false,
+            1,
+            1,
+            at + 100,
+            at - 100,
+            64 * 1024,
+            None,
+            None,
+            None,
+            None,
+            &mut totals,
+            &mut events,
+        )
+        .unwrap()
+        .unwrap();
+        let ranges = [accepted.range.unwrap()];
+        assert_eq!(
+            saved_source_prefix_matches(&source, &accepted.checkpoint, &ranges).unwrap(),
+            Some(true)
+        );
+        assert!(source_fingerprint(&source).unwrap().is_some());
+        let retired = root.join("retired-sessions");
+        fs::rename(&sessions, &retired).unwrap();
+        fs::create_dir(&sessions).unwrap();
+        fs::hard_link(retired.join("one.jsonl"), &path).unwrap();
+        assert_eq!(
+            file_identity(&fs::metadata(&path).unwrap()),
+            before_identity
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let qualified_prefix =
+            saved_source_prefix_matches(&source, &accepted.checkpoint, &ranges).unwrap();
+        let reusable = source_fingerprint(&source).unwrap().is_some();
+        assert_eq!(
+            (qualified_prefix, reusable),
+            (None, false),
+            "neither prefix content nor file metadata proves the old root namespace"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_source_digest_must_cover_the_bytes_used_by_the_parser() {
+        struct RewriteAfterRead {
+            inner: BufReader<std::io::Take<File>>,
+            consumed: usize,
+            length: usize,
+            replacement: Option<(PathBuf, Vec<u8>)>,
+            triggered: Arc<AtomicBool>,
+        }
+        impl Read for RewriteAfterRead {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let read = self.inner.read(bytes)?;
+                self.consumed += read;
+                self.rewrite();
+                Ok(read)
+            }
+        }
+        impl BufRead for RewriteAfterRead {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                self.inner.fill_buf()
+            }
+            fn consume(&mut self, bytes: usize) {
+                self.inner.consume(bytes);
+                self.consumed += bytes;
+                self.rewrite();
+            }
+        }
+        impl RewriteAfterRead {
+            fn rewrite(&mut self) {
+                if self.consumed != self.length {
+                    return;
+                }
+                if let Some((path, replacement)) = self.replacement.take() {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .write_all(&replacement)
+                        .unwrap();
+                    self.triggered.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        for (changed, suffix) in [
+            (false, ""),
+            (true, ""),
+            (false, "{\"type\":\"event_msg\""),
+            (false, "not-json\n"),
+        ] {
+            let (root, _) = prepare(&format!(
+                "issue604-source-read-digest-{changed}-{}",
+                suffix.len()
+            ));
+            let path = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let text = |total| {
+                format!(
+                    "{}{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                    token(0, at),
+                    token(total, at + 1)
+                )
+            };
+            let original = format!("{}{suffix}", text(10));
+            let replacement = format!("{}{suffix}", text(if changed { 90 } else { 10 }));
+            assert_eq!(original.len(), replacement.len());
+            fs::write(&path, &original).unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            let before_identity = file_identity(&metadata);
+            let source = Source {
+                path: path.clone(),
+                recorded: recorded_source(
+                    root_identity(
+                        &root.join("sessions"),
+                        &fs::metadata(root.join("sessions")).unwrap(),
+                    ),
+                    "one.jsonl".into(),
+                    metadata,
+                ),
+            };
+            let mut totals = ModelTotals::default();
+            totals
+                .add(
+                    "gpt-6-luna",
+                    TokenSnapshot {
+                        total: 7,
+                        input: Some(7),
+                        cached_input: Some(0),
+                        output: Some(0),
+                        cache_write_input: Some(0),
+                    },
+                )
+                .unwrap();
+            let previous_totals = totals.to_totals();
+            let mut events = Vec::new();
+            let triggered = Arc::new(AtomicBool::new(false));
+            let result = scan_source_with_reader(
+                &source,
+                None,
+                false,
+                false,
+                1,
+                1,
+                at + 100,
+                at - 100,
+                64 * 1024,
+                None,
+                None,
+                None,
+                None,
+                &mut totals,
+                &mut events,
+                |file, limit| RewriteAfterRead {
+                    inner: BufReader::new(file.take(limit)),
+                    consumed: 0,
+                    length: original.len(),
+                    replacement: Some((path.clone(), replacement.as_bytes().to_vec())),
+                    triggered: Arc::clone(&triggered),
+                },
+            )
+            .unwrap();
+            assert!(
+                triggered.load(Ordering::SeqCst),
+                "the file rewrite must occur inside the read"
+            );
+            assert_eq!(
+                file_identity(&fs::metadata(&path).unwrap()),
+                before_identity
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
+            if changed {
+                assert!(
+                    result.is_none(),
+                    "parsed usage10 cannot be saved with a fingerprint of usage90"
+                );
+                assert_eq!(
+                    totals.to_totals(),
+                    previous_totals,
+                    "rejected source cannot change existing totals"
+                );
+                assert!(
+                    events.is_empty(),
+                    "rejected source cannot add projection events"
+                );
+            } else {
+                let accepted = result.expect("unchanged source remains admissible");
+                let prefix_end = original.rfind('\n').unwrap() + 1;
+                assert_eq!(accepted.checkpoint.committed_offset, prefix_end as u64);
+                let expected_digest = hex_bytes(&Sha256::digest(Sha256::digest(
+                    &original.as_bytes()[..prefix_end],
+                )));
+                assert_eq!(accepted.range.unwrap().record_sha256, expected_digest);
+                assert_eq!(accepted.events.len(), 1);
+                assert_eq!(accepted.events[0].total_tokens, 10);
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn issue604_drain_source_access(watch: &rustix::fd::OwnedFd) -> bool {
+        use rustix::fs::inotify;
+        let mut buffer = [std::mem::MaybeUninit::uninit(); 512];
+        let mut reader = inotify::Reader::new(watch, &mut buffer);
+        let mut accessed = false;
+        loop {
+            match reader.next() {
+                Ok(event) => accessed |= event.events().contains(inotify::ReadFlags::ACCESS),
+                Err(rustix::io::Errno::WOULDBLOCK) => return accessed,
+                Err(error) => panic!("source access observation failed: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_reuses_committed_unchanged_eof_without_reading_original_bytes() {
+        use rustix::fs::inotify;
+        let (root, database) = prepare("issue604-unchanged-source-proof");
+        let source = root.join("sessions/a.jsonl");
+        let at = Utc::now().timestamp() - 30;
+        fs::write(
+            &source,
+            format!(
+                "{}\n{}{}{}",
+                json!({"type":"session_meta","payload":{"id":"thread","session_id":"thread"}}),
+                issue604_context_record("turn_context", json!("gpt-6-astra"), at),
+                token(0, at),
+                token(10, at + 1)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: at + 2,
+                reset_at: at + 3600,
+                window_seconds: 7200,
+                remaining_percent: Some(99.0),
+            }))
+            .unwrap();
+        let state = recorder.state().unwrap();
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 10);
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &source, inotify::WatchFlags::ACCESS).unwrap();
+        let report = recorder.run_cycle().unwrap().unwrap();
+        assert!(
+            !issue604_drain_source_access(&watch),
+            "a committed unchanged EOF must not read the original bytes again"
+        );
+        assert_eq!(report.accepted_ranges, 0);
+        assert_eq!(report.generation, state.data_generation + 1);
+        assert_eq!(recorder.state().unwrap().checkpoints, state.checkpoints);
+
+        // A metadata-only change invalidates reuse, without creating usage.
+        File::open(&source)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + Duration::from_secs(1)),
+            )
+            .unwrap();
+        let report = recorder.run_cycle().unwrap().unwrap();
+        assert!(issue604_drain_source_access(&watch));
+        assert_eq!(report.accepted_ranges, 0);
+        assert_eq!(recorder.state().unwrap().checkpoints, state.checkpoints);
+        recorder.run_cycle().unwrap();
+        assert!(!issue604_drain_source_access(&watch));
+
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(15, at + 2).as_bytes())
+            .unwrap();
+        assert!(matches!(
+            recorder.run_cycle_with_quota_guarded(None, || false),
+            Err(RecorderError::AccountBoundaryChanged)
+        ));
+        assert!(issue604_drain_source_access(&watch));
+        assert_eq!(recorder.state().unwrap().checkpoints, state.checkpoints);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 10);
+
+        recorder.run_cycle().unwrap();
+        assert!(
+            issue604_drain_source_access(&watch),
+            "an uncommitted parsed candidate must not become reusable proof"
+        );
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 15);
+        recorder.run_cycle().unwrap();
+        assert!(!issue604_drain_source_access(&watch));
+        drop(watch);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue604_historical_read_budget_does_not_starve_next_collection() {
+        let (root, database, source, mut recorder, at) =
+            issue604_parser_state_fixture("historical-budget-normal-progress");
+        let active = root.join("sessions/z-active.jsonl");
+        fs::write(
+            &active,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at + 2),
+                token(0, at + 3)
+            ),
+        )
+        .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let before = recorder.state().unwrap();
+        assert_eq!(before.cycle_seq, 2);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6.1-sol"].total, 10);
+        let active_before = before
+            .checkpoints
+            .iter()
+            .find(|cp| cp.relative_path == "z-active.jsonl")
+            .unwrap();
+        let accepted_end = active_before.committed_offset;
+        let original = fs::read_to_string(&source).unwrap();
+        let old = before
+            .checkpoints
+            .iter()
+            .find(|cp| cp.relative_path == "one.jsonl")
+            .unwrap();
+        let old_inode = old.file_inode;
+        drop(recorder);
+        // The existing independent-container fixture shape supplies an
+        // accepted, byte-identical carrier; it is not a numeric repair proof.
+        replace_source_file_with_new_inode(&source, &original);
+        let metadata = fs::metadata(&source).unwrap();
+        assert_ne!(metadata.ino(), old_inode);
+        let db = Connection::open(&database).unwrap();
+        assert_eq!(db.execute(
+            "INSERT INTO session_ranges(root_identity,relative_path,file_device,file_inode,start_offset,
+                end_offset,collector_epoch,cycle_seq,prefix_generation,record_sha256)
+             SELECT root_identity,relative_path,?1,?2,0,committed_offset,collector_epoch,cycle_seq,
+                prefix_generation,?3 FROM session_checkpoints WHERE relative_path='one.jsonl'",
+            rusqlite::params![metadata.dev().to_string(),metadata.ino().to_string(),
+                hex_digest(Sha256::digest(original.as_bytes()).as_slice())],
+        ).unwrap(),1);
+        drop(db);
+        let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 1),
+            &database,
+            &identity(),
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(Some(at - 1), None)],
+        )
+        .unwrap();
+        SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.set((0, 0)));
+        assert_eq!(
+            recorder.repair_replaced_sources_guarded(|| true).unwrap(),
+            None
+        );
+        assert!(
+            SOURCE_PREFIX_RECOVERY_OBSERVATIONS.with(|counts| counts.get().0) > 0,
+            "a real historical parser read consumed this phase's chunk"
+        );
+        assert!(
+            recorder
+                .source_original_reconstructions
+                .values()
+                .any(|recovery| {
+                    recovery.replayed.as_ref().is_some_and(|cp| {
+                        cp.committed_offset > 0
+                            && cp.committed_offset < recovery.original.committed_offset
+                    })
+                }),
+            "the historical phase progressed, but has not completed its fixed prefix"
+        );
+        assert_eq!(recorder.state().unwrap().checkpoints, before.checkpoints);
+        OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .unwrap()
+            .write_all(token(5, at + 4).as_bytes())
+            .unwrap();
+        let expected_end = fs::metadata(&active).unwrap().len();
+        assert!(expected_end > accepted_end);
+        let report = recorder.run_cycle().unwrap().unwrap();
+        let after = recorder.state().unwrap();
+        let active_after = after
+            .checkpoints
+            .iter()
+            .find(|cp| cp.relative_path == "z-active.jsonl")
+            .unwrap();
+        let events = recorder.writer.load_session_events().unwrap();
+        let active_events = events
+            .iter()
+            .filter(|event| event.relative_path == "z-active.jsonl")
+            .collect::<Vec<_>>();
+        let progress = (
+            active_after.committed_offset,
+            active_after.previous_total,
+            active_events
+                .iter()
+                .map(|event| event.total_tokens)
+                .sum::<u64>(),
+            recorder.model_totals().unwrap()["gpt-6.1-sol"].total,
+            report.accepted_ranges,
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            progress,
+            (expected_end, Some(5), 5, 15, 1),
+            "the next normal phase owns a fresh chunk budget and consumes its accepted suffix"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_historical_reuses_changed_prefix_rejection_until_input_changes() {
+        use rustix::fs::inotify;
+        let (root, database, source, recorder, at) =
+            issue604_parser_state_fixture("historical-negative-proof");
+        let before = recorder.state().unwrap();
+        drop(recorder);
+        let bytes = fs::read_to_string(&source).unwrap();
+        let replacement = bytes.replace("\"total_tokens\":10", "\"total_tokens\":90");
+        assert_ne!(replacement, bytes);
+        assert_eq!(replacement.len(), bytes.len());
+        fs::write(&source, &replacement).unwrap();
+        let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 16384),
+            &database,
+            &identity(),
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(Some(at - 1), None)],
+        )
+        .unwrap();
+        recorder.repair_historical_sources_guarded(|| true).unwrap();
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &source, inotify::WatchFlags::ACCESS).unwrap();
+        recorder.repair_historical_sources_guarded(|| true).unwrap();
+        assert!(
+            !issue604_drain_source_access(&watch),
+            "unchanged fully rejected historical bytes must not be reread every cycle"
+        );
+        assert_eq!(recorder.state().unwrap().checkpoints, before.checkpoints);
+        assert_eq!(
+            recorder
+                .writer
+                .load_session_events()
+                .unwrap()
+                .iter()
+                .map(|event| event.total_tokens)
+                .sum::<u64>(),
+            10
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(15, at + 3).as_bytes())
+            .unwrap();
+        recorder.repair_historical_sources_guarded(|| true).unwrap();
+        assert!(
+            issue604_drain_source_access(&watch),
+            "changed fingerprint invalidates the negative proof"
+        );
+        drop(recorder);
+        drop(watch);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_reuses_rejected_independent_container_until_its_fixed_inputs_change() {
+        use rustix::fs::inotify;
+        let (root, database, source, recorder, at) =
+            issue604_parser_state_fixture("independent-container-negative-proof");
+        let before = recorder.state().unwrap();
+        let old = before.checkpoints[0].clone();
+        drop(recorder);
+        let bytes = fs::read_to_string(&source).unwrap();
+        let replacement = bytes.replace("\"total_tokens\":10", "\"total_tokens\":90");
+        assert_ne!(replacement, bytes);
+        assert_eq!(replacement.len(), bytes.len());
+        let next = source.with_extension("replacement");
+        fs::write(&next, &replacement).unwrap();
+        let metadata = fs::metadata(&next).unwrap();
+        assert_ne!(metadata.ino(), old.file_inode);
+        fs::rename(next, &source).unwrap();
+        let db = Connection::open(&database).unwrap();
+        db.execute("INSERT INTO session_ranges SELECT root_identity,relative_path,?1,?2,0,?3,collector_epoch,cycle_seq,prefix_generation,?4 FROM session_checkpoints LIMIT 1",
+            rusqlite::params![metadata.dev().to_string(),metadata.ino().to_string(),replacement.len() as i64,hex_digest(Sha256::digest(replacement.as_bytes()).as_slice())]).unwrap();
+        drop(db);
+        let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 16384),
+            &database,
+            &identity(),
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(Some(at - 1), None)],
+        )
+        .unwrap();
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &source, inotify::WatchFlags::ACCESS).unwrap();
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(!issue604_drain_source_access(&watch),"both complete sets were already checked and rejected; identical fixed inputs must retain the rejection without rereading");
+        assert_eq!(recorder.state().unwrap().checkpoints, before.checkpoints);
+        // Metadata changes invalidate the rejection; neither an append nor a
+        // recheck can silently replace the old physical checkpoint or usage.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(15, at + 3).as_bytes())
+            .unwrap();
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(issue604_drain_source_access(&watch));
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(!issue604_drain_source_access(&watch));
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "UPDATE session_ranges SET record_sha256=?1 WHERE file_inode=?2",
+            rusqlite::params!["ab".repeat(32), metadata.ino().to_string()],
+        )
+        .unwrap();
+        drop(db);
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(
+            issue604_drain_source_access(&watch),
+            "accepted range/hash changes invalidate the exact rejected input"
+        );
+        assert_eq!(recorder.state().unwrap().checkpoints, before.checkpoints);
+        assert_eq!(
+            recorder
+                .writer
+                .load_session_events()
+                .unwrap()
+                .iter()
+                .map(|e| e.total_tokens)
+                .sum::<u64>(),
+            10
+        );
+        drop(watch);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    struct Issue604EquivalenceFixture {
+        root: PathBuf,
+        database: PathBuf,
+        source: PathBuf,
+        recorder: Recorder,
+        at: i64,
+        old: SessionCheckpoint,
+        current: SessionCheckpoint,
+        ranges: Vec<SessionRange>,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn issue604_equivalence_fixture(name: &str) -> Issue604EquivalenceFixture {
+        let (root, database, source, mut recorder, at) = issue604_parser_state_fixture(name);
+        let old = recorder.state().unwrap().checkpoints[0].clone();
+        let bytes = fs::read(&source).unwrap();
+        replace_source_file_with_new_inode(&source, &bytes);
+        let metadata = fs::metadata(&source).unwrap();
+        assert_ne!(metadata.ino(), old.file_inode);
+        let mut current = old.clone();
+        current.file_device = metadata.dev();
+        current.file_inode = metadata.ino();
+        current.prefix_generation = old.prefix_generation.wrapping_add(1).max(1);
+        current.cycle_seq += 1;
+        if let Some(binding) = current
+            .source_admission
+            .as_mut()
+            .and_then(|admission| admission.account_binding.as_mut())
+        {
+            binding.file_device = current.file_device;
+            binding.file_inode = current.file_inode;
+            binding.prefix_generation = format!("{:032x}", current.prefix_generation);
+        }
+        let mut ranges = recorder
+            .writer
+            .load_session_ranges_for_checkpoint(&old)
+            .unwrap();
+        for range in &mut ranges {
+            range.file_device = current.file_device;
+            range.file_inode = current.file_inode;
+            range.prefix_generation = current.prefix_generation;
+            range.cycle_seq = current.cycle_seq;
+        }
+        let state = recorder.state().unwrap();
+        recorder
+            .writer
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: state.reset_at,
+                window_seconds: state.window_seconds,
+                collector_epoch: state.collector_epoch.unwrap(),
+                cycle_seq: current.cycle_seq,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&current),
+                ranges: &ranges,
+                model_totals: &state.model_totals,
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        Issue604EquivalenceFixture {
+            root,
+            database,
+            source,
+            recorder,
+            at,
+            old,
+            current,
+            ranges,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_reuses_rejected_source_equivalence_until_its_fixed_inputs_change() {
+        use rustix::fs::inotify;
+        let Issue604EquivalenceFixture {
+            root,
+            database,
+            source,
+            mut recorder,
+            at,
+            old,
+            current,
+            ranges,
+        } = issue604_equivalence_fixture("source-equivalence-negative-proof");
+        // A well-formed old, unqualified value has no corresponding record
+        // in either accepted copy. It must stay pending, without repeatedly
+        // reading the same independently accepted bytes after publication.
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,
+                prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,
+                model,total_tokens,input_tokens,cached_input_tokens,output_tokens,
+                cache_write_input_tokens)
+             SELECT root_identity,relative_path,file_device,file_inode,prefix_generation,
+                range_start,range_end,record_sha256,event_index+1,timestamp,model,'11','11',
+                cached_input_tokens,output_tokens,cache_write_input_tokens
+             FROM session_events WHERE file_inode=?1 LIMIT 1",
+            [old.file_inode.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        recorder.lifecycle_intervals = vec![SessionLifecycleInterval::new(Some(at - 1), None)];
+        let before = recorder.state().unwrap();
+        let original_events = recorder
+            .writer
+            .source_physical_event_inventory(&old)
+            .unwrap();
+        let period = recorder
+            .writer
+            .prepare_period_attribution(&identity(), &recorder.lifecycle_intervals)
+            .unwrap();
+        let mut inputs = None;
+        let (repairs, handled, _) = recorder
+            .prepare_source_equivalences(&before, &period, &mut inputs)
+            .unwrap();
+        assert!(repairs.is_empty());
+        assert!(
+            inputs.is_some(),
+            "the first complete counterpart proof was attempted"
+        );
+        assert_eq!(handled.len(), 2);
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &source, inotify::WatchFlags::ACCESS).unwrap();
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(
+            !issue604_drain_source_access(&watch),
+            "unchanged rejected equivalence must not reread the source every collection cycle"
+        );
+        assert_eq!(recorder.state().unwrap(), before);
+        assert_eq!(
+            recorder
+                .writer
+                .source_physical_event_inventory(&old)
+                .unwrap(),
+            original_events
+        );
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(
+            issue604_drain_source_access(&watch),
+            "changed file metadata invalidates the rejection"
+        );
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(!issue604_drain_source_access(&watch));
+
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "UPDATE session_events SET total_tokens='12',input_tokens='12'
+             WHERE file_inode=?1 AND total_tokens='11' AND admission_json IS NULL",
+            [old.file_inode.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(
+            issue604_drain_source_access(&watch),
+            "changed old numeric inventory invalidates the rejection"
+        );
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(!issue604_drain_source_access(&watch));
+
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "UPDATE session_ranges SET record_sha256=?1 WHERE file_inode=?2",
+            rusqlite::params!["ab".repeat(32), current.file_inode.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        recorder.repair_replaced_sources_guarded(|| true).unwrap();
+        assert!(
+            issue604_drain_source_access(&watch),
+            "changed accepted ranges invalidate the rejection"
+        );
+
+        let db = Connection::open(&database).unwrap();
+        db.execute(
+            "UPDATE session_ranges SET record_sha256=?1 WHERE file_inode=?2",
+            rusqlite::params![ranges[0].record_sha256, current.file_inode.to_string()],
+        )
+        .unwrap();
+        db.execute(
+            "DELETE FROM session_events WHERE file_inode=?1 AND total_tokens='12'
+                AND admission_json IS NULL",
+            [old.file_inode.to_string()],
+        )
+        .unwrap();
+        drop(db);
+        let state = recorder.state().unwrap();
+        let mut inputs = None;
+        let (repairs, _, _) = recorder
+            .prepare_source_equivalences(&state, &period, &mut inputs)
+            .unwrap();
+        assert_eq!(
+            repairs.len(),
+            1,
+            "a fully repaired inventory resumes the original acceptance path"
+        );
+        assert!(issue604_drain_source_access(&watch));
+        assert_eq!(recorder.state().unwrap(), before);
+        let prepared = recorder
+            .prepare_saved_sources(false)
+            .unwrap()
+            .expect("a completed real equivalence candidate is ready for its live writer");
+        assert_eq!(prepared.batch.repairs.len(), 1);
+        let events_before = recorder.writer.load_session_events().unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(
+            matches!(
+                recorder.commit_prepared_historical_repair(prepared, ||true),
+                Err(RecorderError::Invalid(message)) if message == "historical repair source changed after preparation"
+            ),
+            "a prepared background result cannot commit after its original changes"
+        );
+        assert_eq!(recorder.state().unwrap(), before);
+        assert_eq!(
+            recorder.writer.load_session_events().unwrap(),
+            events_before
+        );
+        drop(watch);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_equivalence_resumes_fixed_prefix_after_unaccepted_append() {
+        let Issue604EquivalenceFixture {
+            root,
+            source,
+            mut recorder,
+            at,
+            current,
+            ..
+        } = issue604_equivalence_fixture("source-equivalence-append-progress");
+        recorder.config.chunk_bytes = 1;
+        recorder.lifecycle_intervals = vec![SessionLifecycleInterval::new(Some(at - 1), None)];
+        let fixed_bytes = fs::read(&source).unwrap();
+        let record_ends = fixed_bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index as u64 + 1))
+            .collect::<Vec<_>>();
+        assert_eq!(record_ends.len(), 4);
+        assert_eq!(record_ends.last().copied(), Some(current.committed_offset));
+        let before = recorder.state().unwrap();
+        let events_before = recorder.writer.load_session_events().unwrap();
+        let period = recorder
+            .writer
+            .prepare_period_attribution(&identity(), &recorder.lifecycle_intervals)
+            .unwrap();
+        let key = source_verification_key(&current);
+        let mut inputs = None;
+        let (repairs, _, _) = recorder
+            .prepare_source_equivalences(&before, &period, &mut inputs)
+            .unwrap();
+        assert!(repairs.is_empty());
+        assert_eq!(
+            recorder.source_original_reconstructions[&key]
+                .replayed
+                .as_ref()
+                .unwrap()
+                .committed_offset,
+            record_ends[0]
+        );
+
+        // This independently known suffix is outside the accepted fixed N.
+        // Its metadata change must neither reset old-prefix progress nor
+        // admit its 999 tokens as historical consumption.
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(999, at + 3).as_bytes())
+            .unwrap();
+        let appended = fs::read(&source).unwrap();
+        assert_eq!(&appended[..fixed_bytes.len()], fixed_bytes.as_slice());
+        assert!(appended.len() > fixed_bytes.len());
+        let (repairs, _, _) = recorder
+            .prepare_source_equivalences(&before, &period, &mut inputs)
+            .unwrap();
+        assert!(repairs.is_empty());
+        assert_eq!(
+            recorder.source_original_reconstructions[&key]
+                .replayed
+                .as_ref()
+                .unwrap()
+                .committed_offset,
+            record_ends[1],
+            "unchanged accepted bytes must resume at the next record despite a later append"
+        );
+
+        let (repairs, _, _) = recorder
+            .prepare_source_equivalences(&before, &period, &mut inputs)
+            .unwrap();
+        assert!(repairs.is_empty());
+        let (repairs, _, _) = recorder
+            .prepare_source_equivalences(&before, &period, &mut inputs)
+            .unwrap();
+        assert_eq!(
+            repairs.len(),
+            1,
+            "four bounded phases must finish the four fixed records"
+        );
+        let facts = repairs[0].qualified_events();
+        assert_eq!(
+            facts.iter().map(|event| event.tokens.total).sum::<u64>(),
+            10
+        );
+        assert!(facts
+            .iter()
+            .all(|event| event.source.range_end <= current.committed_offset));
+        assert_eq!(recorder.state().unwrap(), before);
+        assert_eq!(
+            recorder.writer.load_session_events().unwrap(),
+            events_before
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_equivalence_budget_defers_later_source_prefix_reads() {
+        use rustix::fs::inotify;
+        let Issue604EquivalenceFixture {
+            root,
+            database,
+            source,
+            mut recorder,
+            at,
+            old,
+            current,
+            ..
+        } = issue604_equivalence_fixture("source-equivalence-budget");
+        let later = root.join("sessions/z-later.jsonl");
+        fs::write(&later, fs::read(&source).unwrap()).unwrap();
+        let later_metadata = fs::metadata(&later).unwrap();
+        let state = recorder.state().unwrap();
+        let mut later_checkpoints = vec![old.clone(), current.clone()];
+        let mut later_ranges = Vec::new();
+        for checkpoint in &mut later_checkpoints {
+            let mut ranges = recorder
+                .writer
+                .load_session_ranges_for_checkpoint(checkpoint)
+                .unwrap();
+            checkpoint.relative_path = "z-later.jsonl".into();
+            if checkpoint.file_inode == current.file_inode {
+                checkpoint.file_device = later_metadata.dev();
+                checkpoint.file_inode = later_metadata.ino();
+            }
+            checkpoint.cycle_seq = state.cycle_seq + 1;
+            if let Some(binding) = checkpoint
+                .source_admission
+                .as_mut()
+                .and_then(|admission| admission.account_binding.as_mut())
+            {
+                binding.relative_path = checkpoint.relative_path.clone();
+                binding.file_device = checkpoint.file_device;
+                binding.file_inode = checkpoint.file_inode;
+            }
+            for range in &mut ranges {
+                range.relative_path = checkpoint.relative_path.clone();
+                range.file_device = checkpoint.file_device;
+                range.file_inode = checkpoint.file_inode;
+                range.cycle_seq = checkpoint.cycle_seq;
+            }
+            later_ranges.extend(ranges);
+        }
+        recorder
+            .writer
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: state.reset_at,
+                window_seconds: state.window_seconds,
+                collector_epoch: state.collector_epoch.unwrap(),
+                cycle_seq: state.cycle_seq + 1,
+                samples: &[],
+                checkpoints: &later_checkpoints,
+                ranges: &later_ranges,
+                model_totals: &state.model_totals,
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        drop(recorder);
+        let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 1),
+            &database,
+            &identity(),
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(Some(at - 1), None)],
+        )
+        .unwrap();
+        let before = recorder.state().unwrap();
+        let period = recorder
+            .writer
+            .prepare_period_attribution(&identity(), &recorder.lifecycle_intervals)
+            .unwrap();
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &later, inotify::WatchFlags::ACCESS).unwrap();
+        let (repairs, handled, consumed) = recorder
+            .prepare_source_equivalences(&before, &period, &mut None)
+            .unwrap();
+        assert!(repairs.is_empty());
+        assert_eq!(
+            handled.len(),
+            4,
+            "deferred sources remain pending under their existing owner"
+        );
+        assert!(
+            consumed >= recorder.config.chunk_bytes,
+            "the first complete record consumed this round's byte budget"
+        );
+        assert!(
+            !issue604_drain_source_access(&watch),
+            "an exhausted repair budget must not hash every later accepted source prefix"
+        );
+        assert_eq!(recorder.state().unwrap(), before);
+        drop(watch);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_reuses_known_changed_prefix_rejection_until_input_changes() {
+        use rustix::fs::inotify;
+        let (root, database) = prepare("issue604-rejected-source-proof");
+        let source = root.join("sessions/a.jsonl");
+        let at = Utc::now().timestamp() - 30;
+        let prefix = format!(
+            "{}\n{}{}",
+            json!({"type":"session_meta","payload":{"id":"thread","session_id":"thread"}}),
+            issue604_context_record("turn_context", json!("gpt-6-astra"), at),
+            token(0, at)
+        );
+        let original = format!("{prefix}{}", token(10, at + 1));
+        fs::write(&source, &original).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: at + 2,
+                reset_at: at + 3600,
+                window_seconds: 7200,
+                remaining_percent: Some(99.0),
+            }))
+            .unwrap();
+        let state = recorder.state().unwrap();
+        let replacement = format!("{prefix}{}", token(90, at + 1));
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&source, replacement).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(15, at + 2).as_bytes())
+            .unwrap();
+        assert!(recorder.run_cycle().unwrap().unwrap().pending_ranges > 0);
+        assert_eq!(recorder.state().unwrap().checkpoints, state.checkpoints);
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &source, inotify::WatchFlags::ACCESS).unwrap();
+        let report = recorder.run_cycle().unwrap().unwrap();
+        assert!(
+            !issue604_drain_source_access(&watch),
+            "a fully inspected unchanged bad prefix must retain its rejection without rereading"
+        );
+        assert!(report.pending_ranges > 0);
+        assert_eq!(report.accepted_ranges, 0);
+        assert_eq!(recorder.state().unwrap().checkpoints, state.checkpoints);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 10);
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(20, at + 3).as_bytes())
+            .unwrap();
+        assert!(recorder.run_cycle().unwrap().unwrap().pending_ranges > 0);
+        assert!(issue604_drain_source_access(&watch));
+        assert_eq!(recorder.state().unwrap().checkpoints, state.checkpoints);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 10);
+        drop(watch);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue604_reuses_eof_proof_when_another_source_exhausts_the_budget() {
+        use rustix::fs::inotify;
+        let (root, database) = prepare("issue604-eof-proof-budget");
+        let source_a = root.join("sessions/a.jsonl");
+        let source_b = root.join("sessions/b.jsonl");
+        let at = Utc::now().timestamp() - 30;
+        for (path, id, model, total, modified) in [
+            (&source_a, "a", "gpt-6-astra", 10, 100),
+            (&source_b, "b", "gpt-6-luna", 1, 101),
+        ] {
+            fs::write(
+                path,
+                format!(
+                    "{}\n{}{}{}",
+                    json!({"type":"session_meta","payload":{"id":id,"session_id":id}}),
+                    issue604_context_record("turn_context", json!(model), at),
+                    token(0, at),
+                    token(total, at + 1)
+                ),
+            )
+            .unwrap();
+            File::open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(modified)),
+                )
+                .unwrap();
+        }
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: at + 2,
+                reset_at: at + 3600,
+                window_seconds: 7200,
+                remaining_percent: Some(99.0),
+            }))
+            .unwrap();
+        assert_eq!(recorder.state().unwrap().cycle_seq, 1);
+        // Inventory is lexical by path. Cycle 3 starts with b, so its new
+        // record consumes the budget before unchanged a is visited.
+        recorder.run_cycle().unwrap();
+        assert_eq!(recorder.state().unwrap().cycle_seq, 2);
+        recorder.config.chunk_bytes = 1;
+        OpenOptions::new()
+            .append(true)
+            .open(&source_b)
+            .unwrap()
+            .write_all(token(2, at + 2).as_bytes())
+            .unwrap();
+        let watch =
+            inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(&watch, &source_a, inotify::WatchFlags::ACCESS).unwrap();
+        let report = recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(report.sources_seen, 2);
+        assert_eq!(report.accepted_ranges, 1);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-luna"].total, 2);
+        assert!(!issue604_drain_source_access(&watch));
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().sources_seen, 2);
+        assert!(
+            !issue604_drain_source_access(&watch),
+            "an unrelated source consuming the budget must not invalidate unchanged EOF proof"
+        );
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 10);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6-luna"].total, 2);
+        drop(watch);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_prefix_resume_rejects_changed_bytes_without_stopping_other_sources() {
+        for changed in [true, false] {
+            let (root, database) = prepare(&format!("issue604-resume-prefix-{changed}"));
+            let source_a = root.join("sessions/a.jsonl");
+            let source_b = root.join("sessions/b.jsonl");
+            let at = Utc::now().timestamp() - 30;
+            let metadata = |id: &str| {
+                format!(
+                    "{}\n",
+                    json!({"type":"session_meta","payload":{"id":id,"session_id":id}})
+                )
+            };
+            let a_prefix = format!(
+                "{}{}{}",
+                metadata("thread-a"),
+                issue604_context_record("turn_context", json!("gpt-6-astra"), at),
+                token(0, at)
+            );
+            let original_a = format!("{a_prefix}{}", token(10, at + 1));
+            fs::write(&source_a, &original_a).unwrap();
+            fs::write(
+                &source_b,
+                format!(
+                    "{}{}{}{}",
+                    metadata("thread-b"),
+                    issue604_context_record("turn_context", json!("gpt-6-luna"), at),
+                    token(0, at),
+                    token(1, at + 1)
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder
+                .run_cycle_with_quota(Some(QuotaSnapshot {
+                    observed_at: at + 2,
+                    reset_at: at + 3600,
+                    window_seconds: 7200,
+                    remaining_percent: Some(99.0),
+                }))
+                .unwrap();
+            let original_checkpoint = recorder
+                .state()
+                .unwrap()
+                .checkpoints
+                .into_iter()
+                .find(|cp| cp.relative_path == "a.jsonl")
+                .unwrap();
+            assert_eq!(
+                original_checkpoint.committed_offset,
+                original_a.len() as u64
+            );
+            assert_eq!(original_checkpoint.previous_total, Some(10));
+            assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 10);
+            assert_eq!(recorder.model_totals().unwrap()["gpt-6-luna"].total, 1);
+            let old_a_events = recorder
+                .writer
+                .load_session_events()
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.relative_path == "a.jsonl")
+                .collect::<Vec<_>>();
+            if changed {
+                let rewritten = format!("{a_prefix}{}", token(90, at + 1));
+                assert_eq!(rewritten.len(), original_a.len());
+                fs::write(&source_a, rewritten).unwrap();
+                assert_eq!(
+                    file_identity(&fs::metadata(&source_a).unwrap()),
+                    (
+                        original_checkpoint.file_device,
+                        original_checkpoint.file_inode
+                    )
+                );
+            }
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source_a)
+                .unwrap()
+                .write_all(token(15, at + 2).as_bytes())
+                .unwrap();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source_b)
+                .unwrap()
+                .write_all(token(2, at + 2).as_bytes())
+                .unwrap();
+            let report = recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            let checkpoint = state
+                .checkpoints
+                .iter()
+                .find(|cp| cp.relative_path == "a.jsonl")
+                .unwrap();
+            if changed {
+                assert_eq!(
+                    checkpoint, &original_checkpoint,
+                    "a saved parser state cannot advance through a changed accepted prefix"
+                );
+                assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 10);
+                assert_eq!(
+                    recorder
+                        .writer
+                        .load_session_events()
+                        .unwrap()
+                        .into_iter()
+                        .filter(|event| event.relative_path == "a.jsonl")
+                        .collect::<Vec<_>>(),
+                    old_a_events
+                );
+                assert!(report.pending_ranges > 0);
+            } else {
+                assert_eq!(checkpoint.previous_total, Some(15));
+                assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 15);
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source_a)
+                    .unwrap()
+                    .write_all(token(20, at + 3).as_bytes())
+                    .unwrap();
+                recorder.run_cycle().unwrap();
+                assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 20);
+            }
+            assert_eq!(recorder.model_totals().unwrap()["gpt-6-luna"].total, 2);
+            let other = recorder
+                .state()
+                .unwrap()
+                .checkpoints
+                .into_iter()
+                .find(|cp| cp.relative_path == "b.jsonl")
+                .unwrap();
+            assert_eq!(
+                other.committed_offset,
+                fs::metadata(&source_b).unwrap().len()
+            );
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_zero_cursor_backlog_reparses_metadata_and_request_context() {
+        let (root, database) = prepare("issue604-zero-cursor-backlog");
+        let at = Utc::now().timestamp() - 30;
+        let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+        let line = |value: Value| format!("{value}\n");
+        let first = root.join("sessions/z-first.jsonl");
+        let backlog = root.join("sessions/a-backlog.jsonl");
+        fs::write(
+            &first,
+            line(json!({"type":"session_meta","timestamp":time,
+                "payload":{"id":"first","session_id":"first-session"}})),
+        )
+        .unwrap();
+        let usage = json!({"total_tokens":5,"input_tokens":3,"cached_input_tokens":0,
+            "cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0});
+        let response = json!({"thread_id":"thread","session_id":"session",
+            "turn_id":"turn","root_turn_id":"root-turn","response_id":"response",
+            "usage":usage,"turn_token_usage":usage,"thread_token_usage":usage});
+        let original = [
+            line(json!({"type":"session_meta","timestamp":time,
+                "payload":{"id":"thread","session_id":"session"}})),
+            line(json!({"type":"thread_settings_applied","timestamp":time,
+                "payload":{"model":"gpt-6-luna"}})),
+            line(json!({"type":"turn_context","timestamp":time,
+                "payload":{"model":"gpt-6-astra","turn_id":"turn","root_turn_id":"root-turn"}})),
+            line(json!({"type":"token_usage_record","timestamp":time,"payload":response})),
+            line(json!({"type":"event_msg","timestamp":time,"payload":{"type":"token_count",
+                "info":{"total_token_usage":usage,"last_token_usage":usage,"model_context_window":128000}}})),
+        ]
+        .concat();
+        fs::write(&backlog, &original).unwrap();
+        for (path, modified) in [(&first, 100), (&backlog, 99)] {
+            fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(modified)),
+                )
+                .unwrap();
+        }
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        let state = recorder.state().unwrap();
+        let checkpoint = state
+            .checkpoints
+            .iter()
+            .find(|p| p.relative_path == "a-backlog.jsonl")
+            .unwrap();
+        assert_eq!(
+            checkpoint.committed_offset, 0,
+            "the first source used this cycle's budget"
+        );
+        drop(recorder);
+
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        let state = recorder.state().unwrap();
+        let checkpoint = state
+            .checkpoints
+            .iter()
+            .find(|p| p.relative_path == "a-backlog.jsonl")
+            .unwrap();
+        let admission = checkpoint
+            .source_admission
+            .as_ref()
+            .expect("byte-zero parsing must retain the original metadata");
+        assert!(admission.metadata_qualified);
+        assert_eq!(admission.metadata.as_ref().unwrap().thread_id, "thread");
+        assert_eq!(
+            checkpoint.last_model_context_kind,
+            Some(SessionModelContextKind::None)
+        );
+
+        recorder.run_cycle().unwrap();
+        let state = recorder.state().unwrap();
+        let checkpoint = state
+            .checkpoints
+            .iter()
+            .find(|p| p.relative_path == "a-backlog.jsonl")
+            .unwrap();
+        assert_eq!(
+            checkpoint.last_model_context_kind,
+            Some(SessionModelContextKind::InitialSettings)
+        );
+        assert_eq!(checkpoint.last_model.as_deref(), Some("gpt-6-luna"));
+        for _ in 0..3 {
+            recorder.run_cycle().unwrap();
+        }
+        let state = recorder.state().unwrap();
+        let checkpoint = state
+            .checkpoints
+            .iter()
+            .find(|p| p.relative_path == "a-backlog.jsonl")
+            .unwrap();
+        assert_eq!(checkpoint.committed_offset, original.len() as u64);
+        let responses = &checkpoint.source_admission.as_ref().unwrap().responses;
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].session_scope_qualified);
+        assert_eq!(responses[0].qualified_model(), Some("gpt-6-astra"));
+        assert_eq!(fs::read_to_string(&backlog).unwrap(), original);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_response_model_classification_uses_only_the_bounded_original_interval() {
+        let at = Utc::now().timestamp() - 30;
+        let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+        let line = |value: Value| format!("{value}\n");
+        let usage = json!({"total_tokens":10,"input_tokens":9,"cached_input_tokens":3,
+            "cache_write_input_tokens":2,"output_tokens":1,"reasoning_output_tokens":1});
+        let response = json!({"thread_id":"thread","session_id":"root-session","turn_id":"turn",
+            "root_turn_id":"root-turn","response_id":"response-a", "usage":usage,
+            "turn_token_usage":usage,"thread_token_usage":usage});
+        let context = |kind: &str, model: &str, turn: &str| {
+            line(json!({"type":kind,"timestamp":time,
+            "payload":{"model":model,"turn_id":turn,"root_turn_id":"root-turn"}}))
+        };
+        let metadata = line(json!({"type":"session_meta","timestamp":time,
+            "payload":{"id":"thread","session_id":"root-session"}}));
+        let root_record =
+            line(json!({"type":"token_usage_record","timestamp":time,"payload":response}));
+        let snapshot = line(json!({"type":"compacted","timestamp":time,
+            "payload":{"message":"","latest_token_usage_record":response}}));
+        let strong = context("turn_context", "gpt-6.1-sol", "turn");
+        let counter = token(10, at + 1);
+        let mut second = response.clone();
+        second["response_id"] = json!("response-b");
+        let mut mismatch = response.clone();
+        mismatch["response_id"] = json!("not-the-root");
+        let cases = [
+            ("counter", counter.clone(), Some("gpt-6.1-sol")),
+            ("missing-session-scope", counter.clone(), None),
+            (
+                "named-bad-counter",
+                line(json!({"type":"token_count","timestamp":"bad", "payload":{"info":false}})),
+                Some("gpt-6.1-sol"),
+            ),
+            (
+                "task",
+                task_event("task_complete", at + 1),
+                Some("gpt-6.1-sol"),
+            ),
+            (
+                "next-root",
+                line(json!({"type":"token_usage_record","timestamp":time,"payload":second})),
+                Some("gpt-6.1-sol"),
+            ),
+            (
+                "changed-context",
+                context("turn_context", "gpt-6-astra", "next-turn"),
+                Some("gpt-6.1-sol"),
+            ),
+            (
+                "reaffirm-and-noop",
+                format!(
+                    "{strong}{}{counter}",
+                    line(
+                        json!({"type":"response_item","timestamp":time,"payload":{"type":"message","role":"user","content":[]}})
+                    )
+                ),
+                Some("gpt-6.1-sol"),
+            ),
+            ("eof", String::new(), None),
+            (
+                "compaction",
+                format!("{snapshot}{strong}"),
+                Some("gpt-6.1-sol"),
+            ),
+            ("snapshot-eof", snapshot.clone(), None),
+            (
+                "thread-is-not-replacement",
+                format!(
+                    "{snapshot}{}",
+                    context("thread_context", "gpt-6.1-sol", "turn")
+                ),
+                None,
+            ),
+            (
+                "replacement-model-changed",
+                format!(
+                    "{snapshot}{}",
+                    context("turn_context", "gpt-6-astra", "turn")
+                ),
+                None,
+            ),
+            (
+                "replacement-turn-changed",
+                format!(
+                    "{snapshot}{}",
+                    context("turn_context", "gpt-6.1-sol", "other-turn")
+                ),
+                None,
+            ),
+            (
+                "counter-before-replacement",
+                format!("{snapshot}{counter}{strong}"),
+                None,
+            ),
+            (
+                "snapshot-conflict",
+                line(
+                    json!({"type":"compacted","timestamp":time,"payload":{"message":"","latest_token_usage_record":mismatch}}),
+                ),
+                None,
+            ),
+            (
+                "unknown-then-recovery",
+                format!(
+                    "{}{strong}{counter}",
+                    line(json!({"type":"unknown_control","timestamp":time,"payload":{}}))
+                ),
+                None,
+            ),
+            (
+                "ambiguous-counter-type",
+                format!(
+                    "{}{counter}",
+                    line(
+                        json!({"type":"token_count","timestamp":time,"payload":{"type":false,"info":null}})
+                    )
+                ),
+                None,
+            ),
+            (
+                "history-boundary",
+                line(
+                    json!({"type":"session_meta","timestamp":time,"payload":{"id":"thread","session_id":"root-session","history_base":{}}}),
+                ),
+                None,
+            ),
+        ];
+        for (name, suffix, expected) in cases {
+            let (root, database) = prepare(&format!("issue604-response-class-{name}"));
+            let source = root.join("sessions/one.jsonl");
+            let metadata = if name == "missing-session-scope" {
+                line(json!({"type":"session_meta","timestamp":time,"payload":{"id":"thread"}}))
+            } else {
+                metadata.clone()
+            };
+            fs::write(&source, format!("{metadata}{strong}{root_record}{suffix}")).unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap();
+            let saved = recorder.state().unwrap().checkpoints[0]
+                .source_admission
+                .clone()
+                .unwrap();
+            let pending = &saved.responses[0];
+            assert_eq!(pending.qualified_model(), expected, "{name}");
+            assert_eq!(
+                pending.root_context.as_ref().unwrap().model,
+                "gpt-6.1-sol",
+                "original context stays as evidence: {name}"
+            );
+            assert_eq!(pending.record.usage.total, 10);
+            assert_eq!(pending.pointer.timestamp, at);
+            assert!(
+                recorder.writer.load_session_events().unwrap().is_empty(),
+                "model class is not source/account/period admission"
+            );
+            drop(recorder);
+            let restarted =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            assert_eq!(
+                restarted.state().unwrap().checkpoints[0]
+                    .source_admission
+                    .as_ref(),
+                Some(&saved),
+                "saved class changed on restart: {name}"
+            );
+            drop(restarted);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        // The compaction decision spans a saved EOF and a collector restart.
+        let (root, database) = prepare("issue604-response-class-restart");
+        let source = root.join("sessions/one.jsonl");
+        fs::write(
+            &source,
+            format!("{metadata}{strong}{root_record}{snapshot}"),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1), &database, &identity()).unwrap();
+        for _ in 0..4 {
+            recorder.run_cycle().unwrap();
+        }
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0]
+                .source_admission
+                .as_ref()
+                .unwrap()
+                .responses[0]
+                .qualified_model(),
+            None
+        );
+        drop(recorder);
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1), &database, &identity()).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(strong.as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap();
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0]
+                .source_admission
+                .as_ref()
+                .unwrap()
+                .responses[0]
+                .qualified_model(),
+            Some("gpt-6.1-sol")
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, database) = prepare("issue604-response-class-legacy-state");
+        let source = root.join("sessions/one.jsonl");
+        fs::write(&source, format!("{metadata}{strong}{root_record}")).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        let admission = recorder.state().unwrap().checkpoints[0]
+            .source_admission
+            .clone()
+            .unwrap();
+        let mut legacy: Value = serde_json::from_str(&admission.to_storage().unwrap()).unwrap();
+        legacy["version"] = json!(1);
+        legacy.as_object_mut().unwrap().remove("adopted_context");
+        for response in legacy["responses"].as_array_mut().unwrap() {
+            response.as_object_mut().unwrap().remove("classification");
+        }
+        drop(recorder);
+        let fixture = Connection::open(&database).unwrap();
+        fixture
+            .execute(
+                "UPDATE session_checkpoints SET source_admission=?1",
+                [legacy.to_string()],
+            )
+            .unwrap();
+        drop(fixture);
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(counter.as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap();
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0]
+                .source_admission
+                .as_ref()
+                .unwrap()
+                .responses[0]
+                .qualified_model(),
+            None,
+            "a late counter cannot establish an unrecorded v1 interval"
+        );
+        let mut next = response.clone();
+        next["response_id"] = json!("new-root-after-v1");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{counter}",
+                    line(json!({"type":"token_usage_record","timestamp":time,"payload":next}))
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        recorder.run_cycle().unwrap();
+        let saved = recorder.state().unwrap().checkpoints[0]
+            .source_admission
+            .clone()
+            .unwrap();
+        assert_eq!(
+            saved.responses[0].qualified_model(),
+            Some("gpt-6.1-sol"),
+            "the original replayed context qualifies this root when its own interval closes"
+        );
+        assert_eq!(saved.responses[1].qualified_model(), Some("gpt-6.1-sol"));
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_pre_turn_compaction_preserves_prior_context_without_qualifying_normal_responses() {
+        let at = Utc::now().timestamp() - 30;
+        let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+        let line = |value: Value| format!("{value}\n");
+        let context = |model: &str, turn: Option<&str>, root_turn: Option<&str>| {
+            line(json!({"type":"turn_context","timestamp":time,
+                "payload":{"model":model,"turn_id":turn,"root_turn_id":root_turn}}))
+        };
+        let metadata = line(json!({"type":"session_meta","timestamp":time,
+            "payload":{"id":"thread","session_id":"root-session"}}));
+        let usage = json!({"total_tokens":10,"input_tokens":9,"cached_input_tokens":3,
+            "cache_write_input_tokens":2,"output_tokens":1,"reasoning_output_tokens":1});
+        let response = json!({"thread_id":"thread","session_id":"root-session",
+            "turn_id":"new-turn","root_turn_id":"new-root","response_id":"response",
+            "usage":usage,"turn_token_usage":usage,"thread_token_usage":usage});
+        let root_record =
+            line(json!({"type":"token_usage_record","timestamp":time,"payload":response}));
+        let snapshot = line(json!({"type":"compacted","timestamp":time,
+            "payload":{"message":"","latest_token_usage_record":response}}));
+        let previous = context("gpt-6-astra", Some("old-turn"), Some("old-root"));
+        let replacement = context("gpt-6-astra", Some("new-turn"), Some("new-root"));
+        let cases = [
+            (
+                "pre-turn-compaction",
+                previous.clone(),
+                format!("{snapshot}{replacement}"),
+                Some("gpt-6-astra"),
+            ),
+            (
+                "normal-other-turn",
+                previous.clone(),
+                token(10, at + 1),
+                None,
+            ),
+            (
+                "different-replacement-model",
+                previous.clone(),
+                format!(
+                    "{snapshot}{}",
+                    context("gpt-6-luna", Some("new-turn"), Some("new-root"))
+                ),
+                None,
+            ),
+            (
+                "missing-previous-ids",
+                context("gpt-6-astra", None, None),
+                format!("{snapshot}{replacement}"),
+                None,
+            ),
+            (
+                "new-context-before-snapshot",
+                previous.clone(),
+                format!("{replacement}{snapshot}{replacement}"),
+                None,
+            ),
+            (
+                "previous-context-reaffirmation",
+                previous.clone(),
+                format!("{previous}{snapshot}{replacement}"),
+                Some("gpt-6-astra"),
+            ),
+        ];
+        for (name, initial, suffix, expected) in cases {
+            let (root, database) = prepare(&format!("issue604-prior-context-{name}"));
+            let source = root.join("sessions/one.jsonl");
+            let original = format!("{metadata}{initial}{root_record}{suffix}");
+            fs::write(&source, &original).unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap();
+            let saved = recorder.state().unwrap().checkpoints[0]
+                .source_admission
+                .clone()
+                .unwrap();
+            assert_eq!(saved.responses[0].qualified_model(), expected, "{name}");
+            assert_eq!(saved.responses[0].record.usage.total, 10);
+            assert_eq!(saved.responses[0].pointer.timestamp, at);
+            assert!(recorder.writer.load_session_events().unwrap().is_empty());
+            drop(recorder);
+            let restarted =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            assert_eq!(
+                restarted.state().unwrap().checkpoints[0]
+                    .source_admission
+                    .as_ref(),
+                Some(&saved),
+                "original context and classification must survive restart: {name}"
+            );
+            assert_eq!(fs::read_to_string(&source).unwrap(), original);
+            drop(restarted);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        let (root, database) = prepare("issue604-prior-context-split-restart");
+        let source = root.join("sessions/one.jsonl");
+        fs::write(
+            &source,
+            format!("{metadata}{previous}{root_record}{snapshot}"),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1), &database, &identity()).unwrap();
+        for _ in 0..4 {
+            recorder.run_cycle().unwrap();
+        }
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0]
+                .source_admission
+                .as_ref()
+                .unwrap()
+                .responses[0]
+                .qualified_model(),
+            None
+        );
+        drop(recorder);
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1), &database, &identity()).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(replacement.as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap();
+        assert_eq!(
+            recorder.state().unwrap().checkpoints[0]
+                .source_admission
+                .as_ref()
+                .unwrap()
+                .responses[0]
+                .qualified_model(),
+            Some("gpt-6-astra")
+        );
+        assert!(recorder.writer.load_session_events().unwrap().is_empty());
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_response_stream_persists_unqualified_roots_without_counter_fallback() {
+        fn response(id: &str, total: u64, at: i64) -> String {
+            let usage = json!({
+                "total_tokens":total,"input_tokens":total-1,"cached_input_tokens":3,
+                "cache_write_input_tokens":2,"output_tokens":1,"reasoning_output_tokens":1
+            });
+            format!(
+                "{}\n",
+                json!({
+                    "type":"token_usage_record",
+                    "timestamp":DateTime::<Utc>::from_timestamp(at,0).unwrap().to_rfc3339(),
+                    "payload":{
+                        "thread_id":"thread","session_id":"root-session","turn_id":"turn",
+                        "root_turn_id":"root-turn","response_id":id,
+                        "usage":usage,"turn_token_usage":usage,"thread_token_usage":usage
+                    }
+                })
+            )
+        }
+        fn drain(recorder: &mut Recorder, source: &Path) {
+            let end = fs::metadata(source).unwrap().len();
+            for _ in 0..8 {
+                recorder.run_cycle().unwrap();
+                if recorder.state().unwrap().checkpoints[0].committed_offset == end {
+                    return;
+                }
+            }
+            panic!("finite complete-record batch did not reach the fixed prefix");
+        }
+        fn state(database: &Path) -> Value {
+            let connection = Connection::open(database).unwrap();
+            let encoded: String = connection
+                .query_row(
+                    "SELECT source_admission FROM session_checkpoints",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&encoded).unwrap()
+        }
+        for chunk_bytes in [1, 16384] {
+            let (root, database) = prepare(&format!("issue604-response-stream-{chunk_bytes}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp() - 30;
+            let metadata = format!(
+                "{}\n",
+                json!({
+                    "type":"session_meta",
+                    "timestamp":DateTime::<Utc>::from_timestamp(at,0).unwrap().to_rfc3339(),
+                    "payload":{"id":"thread","session_id":"root-session"}
+                })
+            );
+            fs::write(
+                &source,
+                format!(
+                    "{metadata}{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                    token(0, at)
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, chunk_bytes), &database, &identity())
+                    .unwrap();
+            drain(&mut recorder, &source);
+            let first = response("response-a", 10, at + 1);
+            let first_start = fs::metadata(&source).unwrap().len();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(format!("{first}{}", token(10, at + 2)).as_bytes())
+                .unwrap();
+            drain(&mut recorder, &source);
+            assert!(
+                recorder.writer.load_session_events().unwrap().is_empty(),
+                "a response without strong turn IDs cannot be replaced by the legacy counter delta"
+            );
+            let saved = state(&database);
+            assert_eq!(saved["stream"], "response-record");
+            assert_eq!(saved["responses"].as_array().unwrap().len(), 1);
+            let candidate = &saved["responses"][0];
+            assert_eq!(candidate["record"]["ids"]["response_id"], "response-a");
+            assert_eq!(candidate["record"]["usage"]["total"], 10);
+            assert_eq!(candidate["record"]["usage"]["reasoning_output"], 1);
+            assert_eq!(candidate["pointer"]["timestamp"], at + 1);
+            assert_eq!(candidate["pointer"]["start"], first_start);
+            assert_eq!(
+                candidate["pointer"]["end"],
+                first_start + first.len() as u64
+            );
+            let expected_hash = Sha256::digest(first.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(candidate["pointer"]["sha256"], expected_hash);
+            drop(recorder);
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, chunk_bytes), &database, &identity())
+                    .unwrap();
+            assert_eq!(
+                state(&database),
+                saved,
+                "restart changed the admitted source state"
+            );
+            // A counter with no new root still cannot switch back to the
+            // legacy stream. Both pending roots must survive the next commit.
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(
+                    format!(
+                        "{}{}{}",
+                        token(20, at + 3),
+                        response("response-b", 7, at + 4),
+                        token(27, at + 5)
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            drain(&mut recorder, &source);
+            assert!(recorder.writer.load_session_events().unwrap().is_empty());
+            let saved = state(&database);
+            assert_eq!(saved["stream"], "response-record");
+            let responses = saved["responses"].as_array().unwrap();
+            assert_eq!(
+                responses.len(),
+                2,
+                "a later pending root overwrote an earlier one"
+            );
+            assert_eq!(responses[0]["record"]["usage"]["total"], 10);
+            assert_eq!(responses[1]["record"]["usage"]["total"], 7);
+            assert_eq!(
+                recorder.state().unwrap().checkpoints[0].previous_total,
+                Some(27)
+            );
+            assert!(recorder
+                .writer
+                .load_session_pending_ranges()
+                .unwrap()
+                .iter()
+                .any(|range| range.reason == "response-record-missing"));
+            recorder.run_cycle().unwrap();
+            assert_eq!(
+                state(&database),
+                saved,
+                "unchanged replay duplicated a response"
+            );
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_response_stream_marker_never_falls_back_on_bad_or_snapshot_records() {
+        for case in 0..9 {
+            let (root, database) = prepare(&format!("issue604-response-marker-{case}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp() - 20;
+            let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+            let usage = json!({"total_tokens":10,"input_tokens":9,"cached_input_tokens":3,
+                "cache_write_input_tokens":2,"output_tokens":1,"reasoning_output_tokens":1});
+            let mut payload = json!({
+                "thread_id":"thread","session_id":"root-session","turn_id":"turn",
+                "root_turn_id":"root-turn","response_id":"response",
+                "usage":usage,"turn_token_usage":usage,"thread_token_usage":usage
+            });
+            let mut record_type = "token_usage_record";
+            match case {
+                0 => payload["usage"]["total_tokens"] = json!(-1),
+                1 => {
+                    payload["usage"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("reasoning_output_tokens");
+                }
+                2 => payload = json!(false),
+                3 => {
+                    record_type = "compacted";
+                    payload = json!({"message":"","latest_token_usage_record":payload});
+                }
+                4 => {
+                    record_type = "compacted";
+                    payload = json!({"message":"","latest_token_usage_record":false});
+                }
+                5 => {
+                    record_type = "compacted";
+                    payload = json!({"message":"","latest_token_usage_record":null});
+                }
+                6 => payload["usage"]["input_tokens"] = json!(9223372036854775808_u64),
+                7 => payload["response_id"] = json!("unsafe\u{202e}id"),
+                8 => payload["thread_token_usage"]["reasoning_output_tokens"] = json!(2),
+                _ => unreachable!(),
+            }
+            fs::write(
+                &source,
+                format!(
+                    "{}\n{}{}{}\n{}",
+                    json!({"type":"session_meta","timestamp":time,
+                    "payload":{"id":"thread","session_id":"root-session"}}),
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                    token(0, at),
+                    json!({"type":record_type,"timestamp":time,"payload":payload}),
+                    token(10, at + 1)
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(
+                events.len(),
+                usize::from(case == 5),
+                "case {case}: only a null snapshot leaves the legacy stream selected"
+            );
+            let connection = Connection::open(&database).unwrap();
+            let saved: String = connection
+                .query_row(
+                    "SELECT source_admission FROM session_checkpoints",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let saved: Value = serde_json::from_str(&saved).unwrap();
+            assert_eq!(
+                saved["stream"],
+                if case == 5 {
+                    "legacy-counter"
+                } else {
+                    "response-record"
+                }
+            );
+            assert!(
+                saved["responses"].as_array().unwrap().is_empty(),
+                "case {case}: snapshots and invalid roots must not become response consumption"
+            );
+            assert_eq!(
+                recorder.state().unwrap().checkpoints[0].previous_total,
+                Some(10)
+            );
+            drop(connection);
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_duplicate_keys_are_scoped_to_the_recognized_input() {
+        for case in 0..7 {
+            let (root, database) = prepare(&format!("issue604-duplicate-scope-{case}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp() - 20;
+            let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+            let mut metadata = format!(
+                "{}\n",
+                json!({"type":"session_meta","timestamp":time,
+                "payload":{"id":"thread","session_id":"root-session"}})
+            );
+            let usage = json!({"total_tokens":10,"input_tokens":9,"cached_input_tokens":3,
+                "cache_write_input_tokens":2,"output_tokens":1,"reasoning_output_tokens":1});
+            let response = json!({"type":"token_usage_record","timestamp":time,"payload":{
+                "thread_id":"thread","session_id":"root-session","turn_id":"turn",
+                "root_turn_id":"root-turn","response_id":"response",
+                "usage":usage,"turn_token_usage":usage,"thread_token_usage":usage
+            }})
+            .to_string();
+            let update = match case {
+                0 => token(10, at + 1).replacen(
+                    "\"info\":{",
+                    "\"response_id\":\"a\",\"response_id\":\"b\",\"info\":{",
+                    1,
+                ),
+                1 => format!(
+                    "{}\n{}",
+                    response.replacen(
+                        "\"payload\":{",
+                        "\"payload\":{\"model\":\"a\",\"model\":\"b\",",
+                        1
+                    ),
+                    token(10, at + 1)
+                ),
+                2 => format!(
+                    "{}\n{}",
+                    response.replacen(
+                        "\"total_tokens\":10",
+                        "\"total_tokens\":9,\"total_tokens\":10",
+                        1
+                    ),
+                    token(10, at + 1)
+                ),
+                3 => token(10, at + 1).replacen(
+                    "\"total_tokens\":10",
+                    "\"total_tokens\":9,\"total_tokens\":10",
+                    1,
+                ),
+                4 => format!(
+                    "{}\n{}",
+                    json!({"type":"turn_context","timestamp":time,"payload":{"model":"SOL"}})
+                        .to_string()
+                        .replacen(
+                            "\"model\":\"SOL\"",
+                            "\"model\":\"LUNA\",\"model\":\"SOL\"",
+                            1
+                        ),
+                    token(10, at + 1)
+                ),
+                5 => {
+                    metadata =
+                        metadata.replacen("\"payload\":{", "\"payload\":{\"response_id\":3,", 1);
+                    token(10, at + 1)
+                }
+                6 => token(10, at + 1).replacen(
+                    "\"total_token_usage\":{",
+                    "\"model\":\"a\",\"model\":\"b\",\"total_token_usage\":{",
+                    1,
+                ),
+                _ => unreachable!(),
+            };
+            fs::write(
+                &source,
+                format!(
+                    "{metadata}{}{}{update}",
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                    token(0, at)
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(
+                events.len(),
+                if [1, 2, 3].contains(&case) { 0 } else { 1 },
+                "case {case}"
+            );
+            if let Some(event) = events.first() {
+                assert_eq!(event.total_tokens, 10, "case {case}");
+                assert_eq!(
+                    event.model,
+                    if case == 4 {
+                        UNATTRIBUTED_MODEL
+                    } else {
+                        "gpt-6.1-sol"
+                    },
+                    "case {case}"
+                );
+            }
+            let checkpoint = &recorder.state().unwrap().checkpoints[0];
+            assert_eq!(
+                checkpoint.previous_total,
+                Some(if case == 3 { 0 } else { 10 }),
+                "case {case}"
+            );
+            let connection = Connection::open(&database).unwrap();
+            let saved: String = connection
+                .query_row(
+                    "SELECT source_admission FROM session_checkpoints",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let saved: Value = serde_json::from_str(&saved).unwrap();
+            assert_eq!(
+                saved["responses"].as_array().unwrap().len(),
+                usize::from(case == 1),
+                "case {case}"
+            );
+            assert_eq!(
+                saved["metadata_qualified"], true,
+                "case {case}: unused ID field poisoned metadata"
+            );
+            drop(connection);
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_context_compacted_notification_preserves_numeric_admission() {
+        let (root, database) = prepare("issue604-context-compacted-numeric-admission");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp();
+        let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+        fs::write(
+            &source,
+            format!(
+                "{}\n{}{}\n{}",
+                json!({"type":"session_meta","timestamp":time,"payload":{"id":"thread","session_id":"root-session"}}),
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                json!({"type":"task_started","timestamp":time,"payload":{}}),
+                token(0, at)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let marker = format!(
+            "{}\n",
+            json!({"type":"event_msg","timestamp":time,"payload":{"type":"context_compacted"}})
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{marker}{}", token(5, at + 1)).as_bytes())
+            .unwrap();
+        let report = recorder.run_cycle().unwrap().unwrap();
+        let events = recorder.writer.load_session_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].total_tokens, 5);
+        assert_eq!(events[0].model, "gpt-6.1-sol");
+        let state = recorder.state().unwrap();
+        let checkpoint = &state.checkpoints[0];
+        assert_eq!(checkpoint.previous_total, Some(5));
+        assert_eq!(checkpoint.last_task_running, Some(true));
+        assert!(checkpoint.fully_attributed_from_zero);
+        assert_eq!(report.pending_ranges, 0);
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6.1-sol"].total, 5);
+        assert_eq!(
+            checkpoint.committed_offset,
+            fs::metadata(&source).unwrap().len()
+        );
+        assert!(legacy_pending_bytes_have_no_delta(marker.as_bytes(), true));
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_mcp_call_history_preserves_numeric_admission() {
+        let (root, database) = prepare("issue604-mcp-numeric-admission");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp();
+        let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+        fs::write(&source,format!("{}\n{}{}\n{}",
+            json!({"type":"session_meta","timestamp":time,"payload":{"id":"thread","session_id":"root-session"}}),
+            issue604_context_record("turn_context",json!("gpt-6.1-sol"),at),
+            json!({"type":"task_started","timestamp":time,"payload":{}}),token(0,at))).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let begin = json!({"type":"event_msg","timestamp":time,"payload":{
+            "type":"mcp_tool_call_begin","call_id":"synthetic-call","turn_id":"synthetic-turn",
+            "invocation":{"type":"task_complete","model":"gpt-6-luna","usage":{"total_tokens":999}}
+        }});
+        let end = json!({"type":"event_msg","timestamp":time,"payload":{
+            "type":"mcp_tool_call_end","action_name":"synthetic-action","app_name":"synthetic-app",
+            "call_id":"synthetic-call","connector_id":"synthetic-connector","duration":1,
+            "invocation":{"model":"gpt-6-luna"},"link_id":null,"read_only_hint":true,
+            "result":{"type":"task_complete","model":"gpt-6-luna",
+                "counter":{"type":"token_count","info":{"total_token_usage":{"total_tokens":999}}}},
+            "turn_id":"synthetic-turn"
+        }});
+        let subagent = json!({"type":"event_msg","timestamp":time,"payload":{
+            "type":"sub_agent_activity","event_id":"synthetic-event","occurred_at_ms":1,
+            "agent_thread_id":"synthetic-agent","agent_path":"synthetic-path",
+            "kind":{"type":"task_complete","model":"gpt-6-luna","usage":{"total_tokens":999}}
+        }});
+        let web = json!({"type":"event_msg","timestamp":time,"payload":{
+            "type":"web_search_end","call_id":"synthetic-search","query":"synthetic-query",
+            "action":"synthetic-action","results":[{"type":"task_complete","model":"gpt-6-luna",
+                "usage":{"total_tokens":999}}]
+        }});
+        let patch = json!({"type":"event_msg","timestamp":time,"payload":{
+            "type":"patch_apply_end","call_id":"synthetic-patch","turn_id":"synthetic-turn",
+            "stdout":"synthetic result","stderr":"","success":true,"status":"completed",
+            "changes":{"synthetic.rs":{"type":"update","unified_diff":"synthetic diff",
+                "model":"gpt-6-luna","usage":{"total_tokens":999},"task_complete":true}}
+        }});
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{begin}\n{end}\n{subagent}\n{web}\n{patch}\n{}",
+                    token(10, at + 1)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let report = recorder.run_cycle().unwrap().unwrap();
+        let events = recorder.writer.load_session_events().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "tool bodies cannot create additional consumption"
+        );
+        assert_eq!(events[0].total_tokens, 10);
+        assert_eq!(
+            events[0].model, "gpt-6.1-sol",
+            "MCP history preserves the admitted model"
+        );
+        let state = recorder.state().unwrap();
+        let checkpoint = &state.checkpoints[0];
+        assert_eq!(checkpoint.previous_total, Some(10));
+        assert_eq!(checkpoint.last_task_running, Some(true));
+        assert!(checkpoint.fully_attributed_from_zero);
+        assert_eq!(
+            report.pending_ranges, 0,
+            "MCP history is not invalid control or unprocessed input"
+        );
+        assert_eq!(recorder.model_totals().unwrap()["gpt-6.1-sol"].total, 10);
+        assert_eq!(
+            checkpoint.committed_offset,
+            fs::metadata(&source).unwrap().len()
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, database) = prepare("issue604-mcp-response-admission");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp() - 20;
+        let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+        fs::write(&source,format!("{}\n{}\n{}\n{}",
+            json!({"type":"session_meta","timestamp":time,"payload":{"id":"thread","session_id":"root-session"}}),
+            json!({"type":"turn_context","timestamp":time,"payload":{"model":"gpt-6.1-sol","turn_id":"turn","root_turn_id":"root-turn"}}),
+            json!({"type":"task_started","timestamp":time,"payload":{}}),token(0,at))).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let before_totals = recorder.state().unwrap().model_totals;
+        let usage = json!({"total_tokens":10,"input_tokens":9,"cached_input_tokens":3,
+            "cache_write_input_tokens":2,"output_tokens":1,"reasoning_output_tokens":1});
+        let response = json!({"type":"token_usage_record",
+            "timestamp":DateTime::<Utc>::from_timestamp(at+1,0).unwrap().to_rfc3339(),
+            "payload":{"thread_id":"thread","session_id":"root-session","turn_id":"turn",
+                "root_turn_id":"root-turn","response_id":"synthetic-response","usage":usage,
+                "turn_token_usage":usage,"thread_token_usage":usage}});
+        let mut response_begin = begin.clone();
+        let mut response_end = end.clone();
+        let mut response_subagent = subagent.clone();
+        let mut response_web = web.clone();
+        let mut response_patch = patch.clone();
+        let tool_time = json!(DateTime::<Utc>::from_timestamp(at + 2, 0)
+            .unwrap()
+            .to_rfc3339());
+        response_begin["timestamp"] = tool_time.clone();
+        response_end["timestamp"] = tool_time.clone();
+        response_subagent["timestamp"] = tool_time.clone();
+        response_web["timestamp"] = tool_time.clone();
+        response_patch["timestamp"] = tool_time;
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{response}\n{response_begin}\n{response_end}\n{response_subagent}\n{response_web}\n{response_patch}\n{}",
+                    token(10, at + 3)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert!(
+            recorder.writer.load_session_events().unwrap().is_empty(),
+            "response history cannot fall back to a legacy counter after MCP"
+        );
+        let state = recorder.state().unwrap();
+        let checkpoint = &state.checkpoints[0];
+        let admission = checkpoint.source_admission.as_ref().unwrap();
+        assert_eq!(admission.responses.len(), 1);
+        assert_eq!(
+            admission.responses[0].qualified_model(),
+            Some("gpt-6.1-sol")
+        );
+        assert_eq!(admission.responses[0].record.usage.total, 10);
+        assert_eq!(checkpoint.previous_total, Some(10));
+        assert_eq!(checkpoint.last_task_running, Some(true));
+        assert_eq!(state.model_totals, before_totals);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_recognized_noops_validate_their_actual_payload_before_preserving_model() {
+        let cases = [
+            (
+                "response_item",
+                None,
+                json!({"type":"message","model":"ignored"}),
+                json!(false),
+            ),
+            (
+                "world_state",
+                None,
+                json!({"full":false,"state":null}),
+                json!({"full":"false","state":null}),
+            ),
+            (
+                "inter_agent_communication_metadata",
+                None,
+                json!({"trigger_turn":true}),
+                json!({"trigger_turn":null}),
+            ),
+            (
+                "compacted",
+                None,
+                json!({"message":"","replacement_history":[{}],"replacement_history_metadata":[{}],
+                "window_number":u64::MAX,"window_id":u64::MAX,"first_window_id":null,"previous_window_id":"previous"}),
+                json!({"message":"","replacement_history":[{}],"replacement_history_metadata":[]}),
+            ),
+            (
+                "event_msg",
+                Some("thread_goal_updated"),
+                json!({"threadId":"thread","turnId":null,"goal":{
+                "threadId":"thread","objective":"goal","status":"active","tokensUsed":-1,
+                "timeUsedSeconds":-2,"createdAt":i64::MIN,"updatedAt":i64::MAX,"tokenBudget":null}}),
+                json!({"threadId":"thread","goal":{"threadId":"other","objective":"goal","status":"active",
+                    "tokensUsed":1,"timeUsedSeconds":1,"createdAt":0,"updatedAt":1}}),
+            ),
+            (
+                "event_msg",
+                Some("item_completed"),
+                json!({"thread_id":"thread","turn_id":"turn","item":{},
+                "started_at_ms":null,"completed_at_ms":0}),
+                json!({"thread_id":"thread","turn_id":"turn","item":{},"completed_at_ms":null}),
+            ),
+            (
+                "event_msg",
+                Some("agent_message"),
+                json!({"message":""}),
+                json!({"message":false}),
+            ),
+            (
+                "event_msg",
+                Some("user_message"),
+                json!({"message":"message"}),
+                json!({"message":{}}),
+            ),
+            (
+                "event_msg",
+                Some("agent_reasoning"),
+                json!({"text":"reason"}),
+                json!({"text":null}),
+            ),
+            (
+                "event_msg",
+                Some("agent_reasoning_raw_content"),
+                json!({"text":"reason"}),
+                json!({"text":[]}),
+            ),
+            (
+                "event_msg",
+                Some("agent_reasoning_section_break"),
+                json!({"item_id":"","summary_index":i64::MIN}),
+                json!({"summary_index":1.5}),
+            ),
+            (
+                "unrecognized_control",
+                None,
+                json!({}),
+                json!({"type":"token_count"}),
+            ),
+            ("malformed_json", None, json!({}), json!({})),
+        ];
+        for (index, (outer, inner, valid, invalid)) in cases.into_iter().enumerate() {
+            for (is_valid, mut payload) in [(true, valid), (false, invalid)] {
+                if outer == "malformed_json" && !is_valid {
+                    continue;
+                }
+                let preserves_model =
+                    is_valid && !matches!(outer, "unrecognized_control" | "malformed_json");
+                let (root, database) = prepare(&format!("issue604-noop-{index}-{is_valid}"));
+                let source = root.join("sessions/one.jsonl");
+                let at = Utc::now().timestamp() - 20;
+                let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+                fs::write(&source,format!("{}\n{}{}\n{}",
+                    json!({"type":"session_meta","timestamp":time,"payload":{"id":"thread","session_id":"root-session"}}),
+                    issue604_context_record("turn_context",json!("gpt-6.1-sol"),at),
+                    json!({"type":"task_started","timestamp":time,"payload":{}}),token(0,at)
+                )).unwrap();
+                let mut recorder =
+                    Recorder::open_partitioned(config(&root, 16384), &database, &identity())
+                        .unwrap();
+                recorder.run_cycle().unwrap().unwrap();
+                if let Some(inner) = inner {
+                    payload["type"] = json!(inner);
+                }
+                let appended_start = fs::metadata(&source).unwrap().len();
+                let control = if outer == "malformed_json" {
+                    "{broken}\n".to_owned()
+                } else {
+                    format!(
+                        "{}\n",
+                        json!({"type":outer,"timestamp":time,"payload":payload})
+                    )
+                };
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source)
+                    .unwrap()
+                    .write_all(format!("{}{}", control, token(10, at + 1)).as_bytes())
+                    .unwrap();
+                recorder.run_cycle().unwrap().unwrap();
+                let events = recorder.writer.load_session_events().unwrap();
+                assert_eq!(events.len(), 1, "case {index}/{is_valid}");
+                assert_eq!(events[0].total_tokens, 10, "case {index}/{is_valid}");
+                assert_eq!(
+                    events[0].model,
+                    if preserves_model {
+                        "gpt-6.1-sol"
+                    } else {
+                        UNATTRIBUTED_MODEL
+                    },
+                    "case {index}/{is_valid}: only an admitted NoOp can preserve model continuity"
+                );
+                let checkpoint = &recorder.state().unwrap().checkpoints[0];
+                assert_eq!(checkpoint.previous_total, Some(10));
+                assert_eq!(
+                    checkpoint.last_task_running,
+                    Some(true),
+                    "NoOp cannot stop the task"
+                );
+                assert_eq!(
+                    checkpoint.fully_attributed_from_zero, preserves_model,
+                    "case {index}/{is_valid}"
+                );
+                let digest =
+                    sha256_file_range(&source, appended_start, checkpoint.committed_offset)
+                        .unwrap();
+                let target = TaskBackfillTarget {
+                    path: source.clone(),
+                    expected_record_sha256: Some(digest.clone()),
+                    range: SessionTaskIndexedRange {
+                        root_identity: checkpoint.root_identity.clone(),
+                        relative_path: checkpoint.relative_path.clone(),
+                        file_device: checkpoint.file_device,
+                        file_inode: checkpoint.file_inode,
+                        prefix_generation: checkpoint.prefix_generation,
+                        collector_epoch: checkpoint.collector_epoch,
+                        cycle_seq: checkpoint.cycle_seq,
+                        start_offset: appended_start,
+                        end_offset: checkpoint.committed_offset,
+                        record_sha256: digest,
+                    },
+                };
+                assert_eq!(
+                    scan_task_backfill_target(&target).unwrap().is_some(),
+                    preserves_model,
+                    "case {index}/{is_valid}: background indexing cannot certify an unknown control span"
+                );
+                if !preserves_model {
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(&source)
+                        .unwrap()
+                        .write_all(
+                            format!(
+                                "{}{}",
+                                issue604_context_record(
+                                    "turn_context",
+                                    json!("gpt-6.1-sol"),
+                                    at + 2
+                                ),
+                                token(15, at + 3)
+                            )
+                            .as_bytes(),
+                        )
+                        .unwrap();
+                    recorder.run_cycle().unwrap().unwrap();
+                    let events = recorder.writer.load_session_events().unwrap();
+                    assert_eq!(events.len(), 2);
+                    assert_eq!(
+                        events[0].model, UNATTRIBUTED_MODEL,
+                        "later context cannot heal the old delta"
+                    );
+                    assert_eq!(events[1].model, "gpt-6.1-sol");
+                    assert_eq!(events[1].total_tokens, 5);
+                }
+                drop(recorder);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn issue604_legacy_no_delta_proof_requires_known_legacy_records() {
+        let at = Utc::now().to_rfc3339();
+        let usage = json!({"total_tokens":10,"input_tokens":9,"cached_input_tokens":3,
+            "cache_write_input_tokens":2,"output_tokens":1,"reasoning_output_tokens":1});
+        let response = json!({"thread_id":"thread","session_id":"root-session","turn_id":"turn",
+            "root_turn_id":"root-turn","response_id":"response","usage":usage,
+            "turn_token_usage":usage,"thread_token_usage":usage});
+        for (outer, payload, expected) in [
+            ("world_state", json!({"full":false,"state":null}), true),
+            ("world_state", json!({"full":"false","state":null}), false),
+            ("unrecognized_control", json!({}), false),
+            ("token_usage_record", response.clone(), false),
+            (
+                "compacted",
+                json!({"message":"","latest_token_usage_record":response}),
+                false,
+            ),
+            (
+                "compacted",
+                json!({"message":"","latest_token_usage_record":null}),
+                true,
+            ),
+        ] {
+            let record = format!(
+                "{}\n",
+                json!({"type":outer,"timestamp":at,"payload":payload})
+            );
+            assert_eq!(
+                legacy_pending_bytes_have_no_delta(record.as_bytes(), true),
+                expected,
+                "{outer}: legacy counter equality cannot prove this record has no unrecorded usage"
+            );
+        }
+    }
+
+    #[test]
+    fn issue604_task_record_admission_keeps_audit_and_independent_counter() {
+        for case in 0..8 {
+            let valid = case >= 6;
+            let (root, database) = prepare(&format!("issue604-task-admission-{case}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+            fs::write(
+                &source,
+                format!(
+                    "{}{}{}\n",
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                    token(0, at),
+                    json!({"type":"task_started","timestamp":time})
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let start = fs::metadata(&source).unwrap().len();
+            let mut incoming = json!({"type":"task_complete","timestamp":time});
+            match case {
+                0 => incoming["timestamp"] = json!("invalid"),
+                1 => incoming["payload"] = json!(false),
+                2 => incoming["payload"] = json!({"type":false}),
+                3 => incoming["payload"] = json!({"type":null}),
+                4 => incoming["payload"] = json!({"type":"task_started"}),
+                5 => {
+                    incoming.as_object_mut().unwrap().remove("timestamp");
+                }
+                6 => {}
+                7 => {
+                    incoming = json!({"type":"event_msg","timestamp":time,"payload":{"type":"task_complete"}})
+                }
+                _ => unreachable!(),
+            }
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(format!("{incoming}\n{}", token(10, at + 1)).as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            let checkpoint = &state.checkpoints[0];
+            assert_eq!(
+                checkpoint.last_task_running,
+                Some(!valid),
+                "case {case}: invalid task changed the prior audit value"
+            );
+            assert_eq!(checkpoint.previous_total, Some(10), "case {case}");
+            assert_eq!(
+                checkpoint.last_model_context_kind,
+                Some(SessionModelContextKind::Turn),
+                "case {case}"
+            );
+            assert_eq!(checkpoint.fully_attributed_from_zero, valid, "case {case}");
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), 1, "case {case}");
+            assert_eq!(
+                (events[0].model.as_str(), events[0].total_tokens),
+                ("gpt-6.1-sol", 10),
+                "case {case}"
+            );
+            assert_eq!(
+                recorder.writer.load_session_task_events().unwrap().len(),
+                1 + usize::from(valid),
+                "case {case}"
+            );
+            let digest = sha256_file_range(&source, start, checkpoint.committed_offset).unwrap();
+            let target = TaskBackfillTarget {
+                path: source.clone(),
+                expected_record_sha256: Some(digest.clone()),
+                range: SessionTaskIndexedRange {
+                    root_identity: checkpoint.root_identity.clone(),
+                    relative_path: checkpoint.relative_path.clone(),
+                    file_device: checkpoint.file_device,
+                    file_inode: checkpoint.file_inode,
+                    start_offset: start,
+                    end_offset: checkpoint.committed_offset,
+                    collector_epoch: checkpoint.collector_epoch,
+                    cycle_seq: checkpoint.cycle_seq,
+                    prefix_generation: checkpoint.prefix_generation,
+                    record_sha256: digest,
+                },
+            };
+            assert_eq!(
+                scan_task_backfill_target(&target).unwrap().is_some(),
+                valid,
+                "case {case}: task backfill disagrees with primary admission"
+            );
+            drop(recorder);
+            let recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            assert_eq!(
+                recorder.state().unwrap().checkpoints[0].last_task_running,
+                Some(!valid),
+                "case {case}: restart changed audit state"
+            );
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_record_rejections_preserve_all_reasons_and_healthy_source_progress() {
+        for malformed_counter in [true, false] {
+            let (root, database) =
+                prepare(&format!("issue604-rejection-union-{malformed_counter}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let mut baseline: Value = serde_json::from_str(&token(10, at)).unwrap();
+            baseline["payload"]["info"]["last_token_usage"] = json!({"total_tokens":0});
+            baseline["payload"]["info"]["model_context_window"] = json!(1000);
+            let prefix = format!(
+                "{}{baseline}\n",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at)
+            );
+            fs::write(&source, &prefix).unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let mut incoming: Value = serde_json::from_str(&token(5, at + 1)).unwrap();
+            if malformed_counter {
+                incoming["payload"]["info"]["total_token_usage"]["total_tokens"] = json!(-1);
+            }
+            incoming["payload"]["info"]["model_context_window"] = json!("invalid");
+            let rejected = format!("{incoming}\n");
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(rejected.as_bytes())
+                .unwrap();
+            fs::write(
+                root.join("sessions/healthy.jsonl"),
+                format!(
+                    "{}{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6-luna"), at),
+                    token(0, at),
+                    token(7, at + 1)
+                ),
+            )
+            .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let pending = recorder.writer.load_session_pending_ranges().unwrap();
+            let rejected_ranges = pending
+                .iter()
+                .filter(|range| {
+                    range.relative_path == "one.jsonl" && range.start_offset == prefix.len() as u64
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rejected_ranges.len(), 1);
+            let range = rejected_ranges[0];
+            assert_eq!(range.end_offset, (prefix.len() + rejected.len()) as u64);
+            assert_eq!(
+                range.record_sha256,
+                sha256_file_range(&source, range.start_offset, range.end_offset).unwrap()
+            );
+            let counter_reason = if malformed_counter {
+                "usage-payload-unparsed"
+            } else {
+                "raw-counter-regression-or-invalid-delta"
+            };
+            assert_eq!(
+                range.reason.split('+').collect::<BTreeSet<_>>(),
+                BTreeSet::from(["context-pair-invalid", counter_reason])
+            );
+            let state = recorder.state().unwrap();
+            let checkpoint = state
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
+                .unwrap();
+            assert_eq!(checkpoint.previous_total, Some(10));
+            assert_eq!(checkpoint.context_usage_tokens, Some(0));
+            assert_eq!(checkpoint.context_window_tokens, Some(1000));
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].model, "gpt-6-luna");
+            assert_eq!(events[0].total_tokens, 7);
+            drop(recorder);
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            assert_eq!(
+                recorder.writer.load_session_pending_ranges().unwrap(),
+                pending
+            );
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(token(15, at + 2).as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let events = recorder.writer.load_session_events().unwrap();
+            let sol = events
+                .iter()
+                .filter(|event| event.model == "gpt-6.1-sol")
+                .collect::<Vec<_>>();
+            assert_eq!(sol.len(), 1);
+            assert_eq!(sol[0].total_tokens, 5);
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_invalid_counter_does_not_block_independent_valid_context() {
+        for case in 0..4 {
+            let (root, database) = prepare(&format!("issue604-independent-counter-{case}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let mut baseline: Value = serde_json::from_str(&token(0, at)).unwrap();
+            baseline["payload"]["info"]["last_token_usage"] = json!({"total_tokens":0});
+            baseline["payload"]["info"]["model_context_window"] = json!(1000);
+            fs::write(
+                &source,
+                format!(
+                    "{}{baseline}\n",
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at)
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let mut incoming: Value = serde_json::from_str(&token(10, at + 1)).unwrap();
+            incoming["payload"]["info"]["last_token_usage"] =
+                json!({"total_tokens":7,"input_tokens":0,"output_tokens":0});
+            incoming["payload"]["info"]["model_context_window"] = json!(2000);
+            match case {
+                0 => incoming["payload"]["info"]["total_token_usage"]["total_tokens"] = json!(-1),
+                1 => {
+                    incoming["payload"]["info"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("total_token_usage");
+                }
+                2 => incoming["timestamp"] = json!("1970-01-01T00:00:00Z"),
+                3 => {
+                    incoming["type"] = json!("token_count");
+                    incoming["payload"]["type"] = json!("turn_context");
+                }
+                _ => unreachable!(),
+            }
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(format!("{incoming}\n").as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            let checkpoint = &state.checkpoints[0];
+            let expected = if case < 2 {
+                (Some(7), Some(2000))
+            } else {
+                (Some(0), Some(1000))
+            };
+            assert_eq!(
+                (
+                    checkpoint.context_usage_tokens,
+                    checkpoint.context_window_tokens
+                ),
+                expected,
+                "case {case}: independent pair admission or common envelope guard failed"
+            );
+            assert_eq!(
+                checkpoint.previous_total,
+                Some(0),
+                "case {case}: invalid counter changed the raw anchor"
+            );
+            assert!(
+                recorder.writer.load_session_events().unwrap().is_empty(),
+                "case {case}: invalid counter became usage"
+            );
+            assert_eq!(
+                checkpoint.last_model_context_kind,
+                Some(SessionModelContextKind::Turn)
+            );
+            drop(recorder);
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            let checkpoint = &recorder.state().unwrap().checkpoints[0];
+            assert_eq!(
+                (
+                    checkpoint.context_usage_tokens,
+                    checkpoint.context_window_tokens
+                ),
+                expected,
+                "case {case}: restart lost the accepted pair"
+            );
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(token(10, at + 2).as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), 1, "case {case}");
+            assert_eq!(events[0].total_tokens, 10, "case {case}");
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_context_metadata_failure_does_not_drop_valid_usage() {
+        let missing = None;
+        let cases = [
+            (
+                "bad-window-type",
+                Some(json!("bad")),
+                Some(json!({"total_tokens":5})),
+                true,
+            ),
+            (
+                "bad-window-negative",
+                Some(json!(-1)),
+                Some(json!({"total_tokens":5})),
+                true,
+            ),
+            (
+                "zero-window",
+                Some(json!(0)),
+                Some(json!({"total_tokens":5})),
+                true,
+            ),
+            (
+                "null-window",
+                Some(Value::Null),
+                Some(json!({"total_tokens":5})),
+                false,
+            ),
+            (
+                "missing-window",
+                missing.clone(),
+                Some(json!({"total_tokens":5})),
+                false,
+            ),
+            ("bad-last-type", Some(json!(2000)), Some(json!(7)), true),
+            (
+                "bad-last-components",
+                Some(json!(2000)),
+                Some(json!({"total_tokens":5,"input_tokens":6})),
+                true,
+            ),
+            ("null-last", Some(json!(2000)), Some(Value::Null), false),
+            ("missing-last", Some(json!(2000)), missing, false),
+        ];
+        for (case, window, last, invalid) in cases {
+            let (root, database) = prepare(&format!("issue604-independent-context-{case}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let mut baseline: Value = serde_json::from_str(&token(0, at)).unwrap();
+            baseline["payload"]["info"]["model_context_window"] = json!(1000);
+            baseline["payload"]["info"]["last_token_usage"] = json!({"total_tokens":0});
+            fs::write(&source, format!("{}{}{}\n",
+                format_args!("{}\n", json!({"type":"session_meta","payload":{"id":"independent-context","session_id":"root-session"}})),
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                baseline)).unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let mut incoming: Value = serde_json::from_str(&token(10, at + 1)).unwrap();
+            if let Some(window) = window {
+                incoming["payload"]["info"]["model_context_window"] = window;
+            }
+            if let Some(last) = last {
+                incoming["payload"]["info"]["last_token_usage"] = last;
+            }
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(format!("{incoming}\n").as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), 1, "{case}: valid raw counter was dropped");
+            assert_eq!(events[0].total_tokens, 10, "{case}");
+            assert_eq!(events[0].timestamp, at + 1, "{case}");
+            assert_eq!(
+                recorder.model_totals().unwrap()["gpt-6.1-sol"].total,
+                10,
+                "{case}"
+            );
+            let state = recorder.state().unwrap();
+            let checkpoint = &state.checkpoints[0];
+            assert_eq!(
+                checkpoint.previous_total,
+                Some(10),
+                "{case}: valid raw anchor did not advance"
+            );
+            assert_eq!(
+                (
+                    checkpoint.context_usage_tokens,
+                    checkpoint.context_window_tokens
+                ),
+                (Some(0), Some(1000)),
+                "{case}: an incomplete or invalid pair replaced the last valid pair"
+            );
+            if invalid {
+                assert!(
+                    !checkpoint.fully_attributed_from_zero,
+                    "{case}: bad context was called complete"
+                );
+                assert!(
+                    recorder
+                        .writer
+                        .load_session_pending_ranges()
+                        .unwrap()
+                        .iter()
+                        .any(|pending| pending.reason == "context-pair-invalid"),
+                    "{case}: missing retained context failure"
+                );
+            }
+            drop(recorder);
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            assert_eq!(
+                recorder.writer.load_session_events().unwrap(),
+                events,
+                "{case}: restart changed the accepted event"
+            );
+            let mut good: Value = serde_json::from_str(&token(15, at + 2)).unwrap();
+            good["payload"]["info"]["last_token_usage"] =
+                json!({"total_tokens":7,"input_tokens":0,"output_tokens":0});
+            good["payload"]["info"]["model_context_window"] = json!(2000);
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(format!("{good}\n").as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.total_tokens)
+                    .collect::<Vec<_>>(),
+                [10, 5],
+                "{case}"
+            );
+            let checkpoint = &recorder.state().unwrap().checkpoints[0];
+            assert_eq!(
+                (
+                    checkpoint.context_usage_tokens,
+                    checkpoint.context_window_tokens
+                ),
+                (Some(7), Some(2000)),
+                "{case}: a valid context adjustment shape was rejected as consumption arithmetic"
+            );
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_nullable_counter_facts_survive_collection_and_restart() {
+        let (root, database) = prepare("issue604-nullable-counter-facts");
+        let source = root.join("sessions/one.jsonl");
+        let at = Utc::now().timestamp();
+        let partial = |total, at| {
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339(),
+                    "type": "event_msg", "payload": {"type": "token_count", "info": {
+                        "total_token_usage": {"total_tokens": total}
+                    }}
+                })
+            )
+        };
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                partial(100, at)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert!(
+            recorder.writer.load_session_events().unwrap().is_empty(),
+            "the first positive counter is only a baseline"
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(partial(110, at + 1).as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        let state = recorder.state().unwrap();
+        let saved_events = recorder.writer.load_session_events().unwrap();
+        assert_eq!(saved_events.len(), 1);
+        assert_eq!(
+            (
+                saved_events[0].total_tokens,
+                saved_events[0].input_tokens,
+                saved_events[0].cached_input_tokens,
+                saved_events[0].output_tokens,
+                saved_events[0].cache_write_input_tokens
+            ),
+            (10, None, None, None, None)
+        );
+        assert_eq!(state.model_totals.len(), 1);
+        assert_eq!(
+            (
+                state.model_totals[0].total_tokens,
+                state.model_totals[0].input_tokens,
+                state.model_totals[0].cached_input_tokens,
+                state.model_totals[0].output_tokens
+            ),
+            (10, None, None, None)
+        );
+        assert_eq!(
+            (
+                state.checkpoints[0].previous_total,
+                state.checkpoints[0].previous_input,
+                state.checkpoints[0].previous_output
+            ),
+            (Some(110), None, None)
+        );
+        drop(recorder);
+        let mut reopened =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        assert_eq!(reopened.state().unwrap().model_totals, state.model_totals);
+        assert_eq!(reopened.writer.load_session_events().unwrap(), saved_events);
+        reopened.run_cycle().unwrap().unwrap();
+        assert_eq!(reopened.writer.load_session_events().unwrap(), saved_events);
+        let raw = |total, input, cached, output, at| {
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339(),
+                    "type": "event_msg", "payload": {"type": "token_count", "info": {
+                        "total_token_usage": {"total_tokens": total, "input_tokens": input,
+                            "cached_input_tokens": cached, "cache_write_input_tokens": 0, "output_tokens": output}
+                    }}
+                })
+            )
+        };
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}",
+                    raw(120, 100, 20, 20, at + 2),
+                    raw(130, 110, 25, 20, at + 3)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        reopened.run_cycle().unwrap().unwrap();
+        let continued = reopened.writer.load_session_events().unwrap();
+        assert_eq!(continued.len(), 3);
+        assert_eq!(
+            (
+                continued[1].total_tokens,
+                continued[1].input_tokens,
+                continued[1].cache_write_input_tokens
+            ),
+            (10, None, None)
+        );
+        assert_eq!(
+            (
+                continued[2].total_tokens,
+                continued[2].input_tokens,
+                continued[2].cached_input_tokens,
+                continued[2].output_tokens,
+                continued[2].cache_write_input_tokens
+            ),
+            (10, Some(10), Some(5), Some(0), Some(0))
+        );
+        let totals = &reopened.state().unwrap().model_totals[0];
+        assert_eq!(
+            (
+                totals.total_tokens,
+                totals.input_tokens,
+                totals.cached_input_tokens,
+                totals.output_tokens,
+                totals.cache_write_input_tokens
+            ),
+            (30, None, None, None, None),
+            "a known later delta does not fill the earlier unknown components"
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_recognized_context_adjustment_is_not_consumption() {
+        for (initial, input, output) in [(0, 0, 0), (100, 80, 20)] {
+            let (root, database) =
+                prepare(&format!("issue604-context-adjustment-counter-{initial}"));
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let raw = |total, input, output, at, window| {
+                format!(
+                    "{}\n",
+                    json!({
+                        "timestamp": DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339(),
+                        "type": "event_msg", "payload": {"type": "token_count", "info": {
+                            "total_token_usage": {"total_tokens": total, "input_tokens": input,
+                                "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": output},
+                            "model_context_window": window
+                        }}
+                    })
+                )
+            };
+            fs::write(
+                &source,
+                format!(
+                    "{}{}{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                    raw(initial, input, output, at, 40),
+                    raw(40, 0, 0, at + 1, 40),
+                    raw(45, 3, 2, at + 2, 40)
+                ),
+            )
+            .unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(
+                events.len(),
+                1,
+                "adjusting context contributes no usage event"
+            );
+            assert_eq!(
+                (
+                    events[0].total_tokens,
+                    events[0].input_tokens,
+                    events[0].output_tokens
+                ),
+                (5, Some(3), Some(2))
+            );
+            assert_eq!(
+                recorder.state().unwrap().checkpoints[0].previous_total,
+                Some(45)
+            );
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_unknown_cache_write_endpoint_does_not_become_a_zero_baseline() {
+        let snapshot = |total, writes| TokenSnapshot {
+            total,
+            input: Some(total),
+            cached_input: Some(0),
+            output: Some(0),
+            cache_write_input: writes,
+        };
+        let cases = [
+            (snapshot(0, None), snapshot(10, Some(4)), None),
+            (snapshot(10, None), snapshot(20, Some(0)), None),
+            (snapshot(0, None), snapshot(0, Some(0)), None),
+            (snapshot(10, Some(3)), snapshot(20, None), None),
+            (snapshot(10, None), snapshot(20, None), None),
+            (snapshot(0, Some(0)), snapshot(10, Some(4)), Some(4)),
+            (snapshot(10, Some(3)), snapshot(20, Some(5)), Some(2)),
+        ];
+        for (before, after, expected) in cases {
+            assert_eq!(
+                after
+                    .facts()
+                    .checked_delta(before.facts())
+                    .unwrap()
+                    .cache_write_input,
+                expected,
+                "known total zero does not observe an omitted component: {before:?} -> {after:?}"
+            );
+        }
+        let mut totals = ModelTotals::default();
+        totals.add("ASTRA", snapshot(10, None)).unwrap();
+        totals.add("ASTRA", snapshot(10, Some(2))).unwrap();
+        assert_eq!(totals.to_totals()[0].total_tokens, 20);
+        assert_eq!(totals.to_totals()[0].cache_write_input_tokens, None);
+    }
+
     #[test]
     fn known_cache_write_delta_is_preserved_from_zero() {
         let mut totals = ModelTotals::default();
@@ -9430,9 +19092,9 @@ mod tests {
                 "ASTRA",
                 TokenSnapshot {
                     total: 10,
-                    input: 8,
-                    cached_input: 2,
-                    output: 2,
+                    input: Some(8),
+                    cached_input: Some(2),
+                    output: Some(2),
                     cache_write_input: Some(3),
                 },
             )
@@ -9455,8 +19117,20 @@ mod tests {
         let first_source = root.join("sessions/a.jsonl");
         let second_source = root.join("sessions/b.jsonl");
         let now = Utc::now().timestamp();
-        fs::write(&first_source, token(10, now)).unwrap();
-        fs::write(&second_source, token(20, now)).unwrap();
+        let time = DateTime::<Utc>::from_timestamp(now - 2, 0)
+            .unwrap()
+            .to_rfc3339();
+        let proven_source = |id: &str, total| {
+            format!(
+                "{}\n{}\n{}{}",
+                json!({"type":"session_meta","timestamp":time,"payload":{"id":id}}),
+                json!({"type":"turn_context","timestamp":time,"payload":{"model":"gpt-6-astra"}}),
+                token(0, now - 1),
+                token(total, now)
+            )
+        };
+        fs::write(&first_source, proven_source("first", 10)).unwrap();
+        fs::write(&second_source, proven_source("second", 20)).unwrap();
         let mut recorder =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 0);
@@ -9483,10 +19157,14 @@ mod tests {
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
         let huge = format!(
-            "{{\"type\":\"tool_result\",\"output\":\"{}\"}}\n",
+            "{{\"type\":\"response_item\",\"timestamp\":\"{}\",\"payload\":{{\"type\":\"function_call_output\",\"output\":\"{}\"}}}}\n",
+            DateTime::<Utc>::from_timestamp(now, 0)
+                .unwrap()
+                .to_rfc3339(),
             "x".repeat(4 * 1024 * 1024 + 1)
         );
-        fs::write(&source, format!("{}{}", huge, token(20, now))).unwrap();
+        let metadata = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"large-thread\",\"session_id\":\"large-session\"}}\n";
+        fs::write(&source, format!("{metadata}{}{}", huge, token(20, now))).unwrap();
         let mut recorder =
             Recorder::open_partitioned(config(&root, 128), &database, &identity()).unwrap();
         assert_eq!(recorder.run_cycle().unwrap().unwrap().accepted_ranges, 1);
@@ -9498,9 +19176,14 @@ mod tests {
             .write_all(token(25, now + 1).as_bytes())
             .unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
+        let events = recorder.writer.load_session_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].total_tokens, 5);
+        assert_eq!(events[0].timestamp, now + 1);
+        assert_eq!(events[0].model, UNATTRIBUTED_MODEL);
+        assert!(
+            recorder.model_totals().unwrap().is_empty(),
+            "unassigned usage is internal evidence"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -10371,7 +20054,11 @@ mod tests {
             [(60, "10", 80.0), (120, "10", 70.0), (180, "20", 60.0)]
         {
             let actual:Option<String>=db.query_row("SELECT total_tokens FROM usage_model_history WHERE timestamp=?1 AND model='gpt-6-astra'",[start+offset],|r|r.get(0)).optional().unwrap();
-            assert_eq!(actual.as_deref(),Some(expected),"every independently accepted receipt minute needs its own source-known prefix at offset {offset}");
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected),
+                "every independently accepted receipt minute needs its own source-known prefix at offset {offset}"
+            );
             let actual_quota: Option<f64> = db
                 .query_row(
                     "SELECT remaining_percent FROM usage_history WHERE timestamp=?1",
@@ -10561,6 +20248,7 @@ mod tests {
     }
 
     fn assert_normal_source_quota_cycle(reject_projection: bool) {
+        use rusqlite::OptionalExtension;
         let (root, database) = prepare(if reject_projection {
             "normal-source-quota-rejected"
         } else {
@@ -10603,7 +20291,7 @@ mod tests {
             .unwrap();
         let db = Connection::open(&database).unwrap();
         if reject_projection {
-            db.execute_batch(&format!("CREATE TRIGGER test_reject_source_quota BEFORE UPDATE OF remaining_percent ON usage_history WHEN NEW.timestamp={} AND NEW.remaining_percent=88 BEGIN SELECT RAISE(ABORT,'source quota test rejection'); END;",start+60)).unwrap();
+            db.execute_batch("CREATE TRIGGER test_reject_source_quota BEFORE INSERT ON session_quota_windows BEGIN SELECT RAISE(ABORT,'source window metadata test rejection'); END;").unwrap();
             assert!(
                 recorder.run_cycle_with_quota(Some(quota.clone())).is_err(),
                 "source quota failure cannot acknowledge a partial source/model cycle"
@@ -10627,16 +20315,28 @@ mod tests {
                 .unwrap();
         }
         let report = recorder.run_cycle_with_quota(Some(quota)).unwrap().unwrap();
-        let remaining: Option<f64> = db
+        let remaining: Option<Option<f64>> = db
             .query_row(
                 "SELECT remaining_percent FROM usage_history WHERE timestamp=?1",
                 [start + 60],
                 |r| r.get(0),
             )
+            .optional()
             .unwrap();
-        assert_eq!(remaining,Some(88.0),"already admitted source quota must be recorded in its own minute during the normal cycle");
-        let durable:Option<f64>=db.query_row("SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2",rusqlite::params![start+60,reset],|r|r.get(0)).unwrap();
-        assert_eq!(durable, Some(88.0));
+        assert_eq!(
+            remaining, None,
+            "an unqualified source minute cannot become an official quota observation"
+        );
+        let durable:Option<Option<f64>>=db.query_row("SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2",rusqlite::params![start+60,reset],|r|r.get(0)).optional().unwrap();
+        assert_eq!(durable, None);
+        let window: (i64, i64, i64) = db
+            .query_row(
+                "SELECT reset_at,window_seconds,observed_at FROM session_quota_windows",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(window, (reset, 3600, start + 70));
         let earlier: f64 = db
             .query_row(
                 "SELECT remaining_percent FROM usage_history WHERE timestamp=?1",
@@ -10648,7 +20348,18 @@ mod tests {
             earlier, 90.0,
             "source recovery cannot override an earlier official receipt"
         );
-        assert_eq!(recorder.model_totals().unwrap()["gpt-6-astra"].total, 20);
+        assert!(
+            recorder.model_totals().unwrap().is_empty(),
+            "source metadata alone cannot qualify a model aggregate"
+        );
+        let raw_total: i64 = db
+            .query_row(
+                "SELECT coalesce(sum(cast(total_tokens AS INTEGER)),0) FROM session_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_total, 20, "unqualified source facts remain lossless");
         assert_eq!(report.generation, recorder.state().unwrap().data_generation);
         drop(db);
         drop(recorder);
@@ -10790,7 +20501,10 @@ mod tests {
         }
         for (minute, expected) in [(0, "10"), (60, "15"), (120, "35"), (180, "35"), (240, "35")] {
             let total:String=db.query_row("SELECT total_tokens FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6-astra'",rusqlite::params![reset,start+minute],|r|r.get(0)).unwrap();
-            assert_eq!(total,expected,"minute={minute}: raw prefix must include only source events through its minute end");
+            assert_eq!(
+                total, expected,
+                "minute={minute}: raw prefix must include only source events through its minute end"
+            );
         }
         let raw_before = recorder.writer.load_all().unwrap();
         let events_before = recorder.writer.load_session_events().unwrap();
@@ -10815,9 +20529,9 @@ mod tests {
                 model: "gpt-6-astra".into(),
                 delta: TokenSnapshot {
                     total,
-                    input: total,
-                    cached_input: 0,
-                    output: 0,
+                    input: Some(total),
+                    cached_input: Some(0),
+                    output: Some(0),
                     cache_write_input: Some(0),
                 },
             })
@@ -10854,13 +20568,19 @@ mod tests {
     }
 
     #[test]
-    fn official_reset_same_minute_replaces_old_models_atomically() {
+    fn official_reset_same_minute_keeps_both_periods_atomically() {
         const AT: i64 = 2_000_000_040;
         const WINDOW: i64 = 604_800;
         let (root, database) = prepare("official-reset-same-minute");
         fs::write(
             root.join("sessions/one.jsonl"),
-            format!("{}{}", token(10, AT - 1), token(15, AT)),
+            format!(
+                "{}\n{}\n{}{}",
+                json!({"type":"session_meta","payload":{"id":"issue604-same-minute"}}),
+                json!({"type":"turn_context","timestamp":DateTime::<Utc>::from_timestamp(AT - 2, 0).unwrap().to_rfc3339(),"payload":{"model":"gpt-6.1-sol"}}),
+                token(10, AT - 1),
+                token(15, AT)
+            ),
         )
         .unwrap();
         let mut recorder =
@@ -10877,6 +20597,19 @@ mod tests {
         let before = recorder.state().unwrap();
         assert!(!before.model_totals.is_empty());
         let db = Connection::open(&database).unwrap();
+        let original_model_rows: Vec<(String, String)> = db
+            .prepare("SELECT model,total_tokens FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 ORDER BY model")
+            .unwrap()
+            .query_map([AT + WINDOW, AT], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(original_model_rows.len(), 1);
+        assert_eq!(original_model_rows[0].0, "gpt-6.1-sol");
+        assert_eq!(
+            original_model_rows[0].1, "5",
+            "the accepted delta is 15 - 10"
+        );
         db.execute_batch("CREATE TRIGGER fail_reset BEFORE UPDATE ON collection_generation BEGIN SELECT RAISE(ABORT, 'injected reset commit failure'); END;").unwrap();
         let new_quota = QuotaSnapshot {
             observed_at: AT + 10,
@@ -10900,11 +20633,26 @@ mod tests {
         let after = recorder.state().unwrap();
         assert!(after.model_totals.is_empty());
         assert_eq!(after.checkpoints, before.checkpoints);
-        let row: (i64, f64, i64) = db.query_row(
-            "SELECT reset_at, remaining_percent, sol_tokens+terra_tokens+luna_tokens FROM usage_history WHERE timestamp=?1",
-            [AT], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).unwrap();
-        assert_eq!(row, (AT + 10 + WINDOW, 100.0, 0));
+        let rows: Vec<(i64, f64, i64)> = db
+            .prepare("SELECT reset_at,remaining_percent,sol_tokens+terra_tokens+luna_tokens FROM usage_history WHERE timestamp=?1 ORDER BY reset_at")
+            .unwrap()
+            .query_map([AT], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [(AT + WINDOW, 10.0, 5), (AT + 10 + WINDOW, 100.0, 0)],
+            "the new period has its own zero; the prior accepted period remains intact"
+        );
+        let retained_models: Vec<(String, String)> = db
+            .prepare("SELECT model,total_tokens FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 ORDER BY model")
+            .unwrap()
+            .query_map([AT + WINDOW, AT], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(retained_models, original_model_rows);
         let events: i64 = db
             .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
             .unwrap();
@@ -11050,49 +20798,12 @@ mod tests {
     #[test]
     fn paginated_history_base_survives_cycle_and_restart_before_first_token() {
         let (root, database) = prepare("paginated-history-base");
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute(
-                "ALTER TABLE session_checkpoints DROP COLUMN history_base_pending",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "ALTER TABLE session_checkpoints DROP COLUMN context_usage_tokens",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "ALTER TABLE session_checkpoints DROP COLUMN context_window_tokens",
-                [],
-            )
-            .unwrap();
-        let columns = {
-            let mut statement = connection
-                .prepare("SELECT name FROM pragma_table_info('session_checkpoints') ORDER BY cid")
-                .unwrap();
-            statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        assert_eq!(columns.len(), 19);
-        for absent_column in [
-            "history_base_pending",
-            "context_usage_tokens",
-            "context_window_tokens",
-        ] {
-            assert!(!columns.iter().any(|column| column == absent_column));
-        }
-        assert_eq!(columns[17], "last_task_running");
-        assert_eq!(columns[18], "previous_cache_write_input");
+        // Legacy schema migration is exercised against supported versioned
+        // shapes in the writer. This test owns history-base state across
+        // recorder batches/restarts, using the current complete schema.
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
-        let session_meta =
-            "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"paginated\",\"history_base\":{\"id\":\"prior\"}}}\n";
+        let session_meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\",\"session_id\":\"root-session\",\"history_mode\":\"paginated\",\"history_base\":{\"id\":\"prior\"}}}\n";
         fs::write(&source, session_meta).unwrap();
 
         let mut recorder =
@@ -11118,17 +20829,26 @@ mod tests {
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         recorder.run_cycle().unwrap().unwrap();
 
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL],
-            TokenSnapshot {
-                total: 111_867,
-                input: 111_867,
-                cached_input: 0,
-                output: 0,
-                cache_write_input: None,
-            }
+        assert!(
+            recorder.model_totals().unwrap().is_empty(),
+            "an inherited prefix without a model proof cannot become a public model total"
         );
-        assert!(!recorder.state().unwrap().checkpoints[0].history_base_pending);
+        let events = recorder.writer.load_session_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].total_tokens, 7,
+            "only the later exact counter delta is consumption"
+        );
+        assert_eq!(events[0].input_tokens, Some(7));
+        assert_eq!(events[0].timestamp, now + 1);
+        assert_eq!(events[0].model, UNATTRIBUTED_MODEL);
+        let checkpoint = &recorder.state().unwrap().checkpoints[0];
+        assert!(!checkpoint.history_base_pending);
+        assert_eq!(checkpoint.previous_total, Some(2_049_976_193));
+        assert!(
+            !checkpoint.fully_attributed_from_zero,
+            "the inherited unknown prefix is not complete"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -11165,13 +20885,16 @@ mod tests {
             token_baseline_known: true,
             history_base_pending: false,
             last_model: None,
+            last_model_context_kind: None,
+            last_model_interval: None,
+            source_admission: None,
             last_task_running: None,
             context_usage_tokens: None,
             context_window_tokens: None,
-            previous_total: 10,
-            previous_input: 10,
-            previous_cached_input: 0,
-            previous_output: 0,
+            previous_total: Some(10),
+            previous_input: Some(10),
+            previous_cached_input: None,
+            previous_output: None,
             previous_cache_write_input: None,
         };
         let second = token(15, now + 1);
@@ -11195,6 +20918,7 @@ mod tests {
             now + 60,
             now - 60,
             4096,
+            None,
             None,
             None,
             None,
@@ -11489,7 +21213,7 @@ mod tests {
             .into_iter()
             .find(|checkpoint| checkpoint.relative_path == "one.jsonl")
             .unwrap();
-        assert_eq!(old_checkpoint.previous_total, 80);
+        assert_eq!(old_checkpoint.previous_total, Some(80));
         assert!(old_checkpoint.token_baseline_known);
         assert!(old_checkpoint.fully_attributed_from_zero);
 
@@ -12037,7 +21761,7 @@ mod tests {
             .into_iter()
             .find(|checkpoint| checkpoint.file_inode == current_inode)
             .unwrap();
-        assert_eq!(checkpoint.previous_total, 0);
+        assert_eq!(checkpoint.previous_total, Some(0));
         assert!(!checkpoint.token_baseline_known);
         let backlog = legacy.writer.load_session_pending_ranges().unwrap();
         assert_eq!(backlog.len(), 1);
@@ -12431,8 +22155,7 @@ mod tests {
                 .to_rfc3339()
         );
         let invalid_timestamp = "{\"type\":\"event_msg\",\"timestamp\":\"not-a-timestamp\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":0,\"input_tokens\":0,\"cached_input_tokens\":0,\"output_tokens\":0}}}}\n".to_owned();
-        let history_base =
-            "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"paginated\",\"history_base\":{\"id\":\"prior\"}}}\n";
+        let history_base = "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"paginated\",\"history_base\":{\"id\":\"prior\"}}}\n";
         let partial = "{\"type\":\"session_meta\"";
         let large_prefix = format!(
             "{{\"type\":\"session_meta\",\"padding\":\"{}\"}}\n{}",
@@ -12720,7 +22443,7 @@ mod tests {
             .unwrap();
         assert!(old_checkpoint.token_baseline_known);
         assert!(old_checkpoint.fully_attributed_from_zero);
-        assert_eq!(old_checkpoint.previous_total, 0);
+        assert_eq!(old_checkpoint.previous_total, Some(0));
         assert_eq!(
             recorder
                 .model_totals()
@@ -12754,8 +22477,7 @@ mod tests {
         let legacy_pending =
             seed_legacy_complete_anchor_pending(&database, &source, &current_checkpoint);
         assert_ne!(
-            legacy_pending.prefix_generation,
-            current_checkpoint.prefix_generation,
+            legacy_pending.prefix_generation, current_checkpoint.prefix_generation,
             "strict prior identity and exact pending bytes authorize replay independently of a later cursor lineage"
         );
         assert_eq!(
@@ -13354,9 +23076,15 @@ mod tests {
         let (root, database) = prepare("account-activation-baseline");
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
+        let context = |kind: &str, model: &str, timestamp| {
+            let time = DateTime::<Utc>::from_timestamp(timestamp, 0)
+                .unwrap()
+                .to_rfc3339();
+            format!("{}\n", json!({"type":kind,"timestamp":time,"model":model}))
+        };
         let existing = format!(
-            "{}\n{}{}{}",
-            json!({"type":"thread_context","model":"gpt-5.6-sol"}),
+            "{}{}{}{}",
+            context("thread_context", "gpt-5.6-sol", now - 3),
             task_event("task_started", now - 2),
             token(10, now - 1),
             token(15, now)
@@ -13397,7 +23125,15 @@ mod tests {
             .append(true)
             .open(&source)
             .unwrap()
-            .write_all(format!("{}{}", token(20, now + 1), token(25, now + 2)).as_bytes())
+            .write_all(
+                format!(
+                    "{}{}{}",
+                    context("turn_context", "gpt-5.6-sol", now + 1),
+                    token(20, now + 1),
+                    token(25, now + 2)
+                )
+                .as_bytes(),
+            )
             .unwrap();
         recorder.run_cycle().unwrap().unwrap();
         assert_eq!(recorder.model_totals().unwrap()["gpt-5.6-sol"].total, 5);
@@ -13412,8 +23148,8 @@ mod tests {
             .unwrap()
             .write_all(
                 format!(
-                    "{}\n{}{}",
-                    json!({"type":"turn_context","model":"gpt-5.6-luna"}),
+                    "{}{}{}",
+                    context("turn_context", "gpt-5.6-luna", now + 3),
                     token(30, now + 3),
                     token(35, now + 4)
                 )
@@ -13689,6 +23425,215 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn issue604_account_pending_retry_revalidates_original_prefix() {
+        for change in [
+            "rewrite",
+            "replace",
+            "root-replace",
+            "missing",
+            "unchanged",
+            "append",
+            "guard-reject",
+        ] {
+            let (root, database) = prepare(&format!("issue604-pending-source-{change}"));
+            write_test_account_authority(&root, "pending-source-account");
+            let epoch = AccountEpochProof::capture(&root).unwrap();
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp() - 30;
+            let mut original = format!(
+                "{}\n{}{}{}",
+                json!({"type":"session_meta","payload":{"id":"pending-thread","session_id":"pending-session"}}),
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                token(0, at),
+                token(10, at + 1)
+            );
+            fs::write(&source, &original).unwrap();
+            let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+                config(&root, 16384),
+                &database,
+                &identity(),
+                None,
+                None,
+                vec![SessionLifecycleInterval::new(Some(at - 10), None)],
+            )
+            .unwrap();
+            // Save original raw counters without manufacturing a period from
+            // a single later observation or a fixed legacy history offset.
+            recorder.run_cycle_with_quota(None).unwrap();
+            // The original accepted raw pointer belongs to this finite
+            // ownership interval. Qualify it through the real account path.
+            // The numeric events also require their own closed official span;
+            // one later receipt cannot assign earlier source timestamps.
+            recorder
+                .writer
+                .stage_official_quota_inputs(
+                    &[at - 1, at + 10]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, observed_at)| {
+                            let sequence = index as u64 + 1;
+                            codex_info_db_writer::period_evidence::OfficialQuotaInput {
+                                input_id: format!("{sequence:064x}"),
+                                account_scope: identity().account_scope_id,
+                                sequence,
+                                observed_at,
+                                content_sha256: "a".repeat(64),
+                                reset_at: Some(at + 3600),
+                                window_seconds: Some(7200),
+                                reason: None,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            recorder
+                .writer
+                .commit_quota_receipts(
+                    &[at - 1, at + 10]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, observed_at)| {
+                            let sequence = index as i64 + 1;
+                            codex_info_db_writer::QuotaReceipt {
+                                receipt_id: format!("{sequence:064x}"),
+                                sequence,
+                                observed_at,
+                                reset_at: at + 3600,
+                                window_seconds: 7200,
+                                remaining_percent: 99.0,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    false,
+                )
+                .unwrap();
+            // Existing unqualified 10 tokens stay raw. The newly bound 10->15
+            // suffix supplies this fixture's independently qualified 5.
+            original.push_str(&token(15, at + 2));
+            fs::write(&source, &original).unwrap();
+            recorder
+                .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+                .unwrap();
+            let before = recorder.state().unwrap();
+            assert_eq!(before.model_totals[0].total_tokens, 5);
+            assert!(before.checkpoints[0]
+                .source_admission
+                .as_ref()
+                .and_then(|admission| admission.account_binding.as_ref())
+                .is_some());
+            let old_events = recorder.writer.load_session_events().unwrap();
+            let db = Connection::open(&database).unwrap();
+            db.execute_batch("CREATE TRIGGER reject_pending BEFORE UPDATE ON collection_generation BEGIN SELECT RAISE(ABORT, 'fixture pending save failure'); END;").unwrap();
+            let candidate = format!("{original}{}", token(20, at + 3));
+            fs::write(&source, &candidate).unwrap();
+            let failed =
+                recorder.run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true);
+            assert!(
+                matches!(failed, Err(RecorderError::Writer(_))),
+                "{change}: {failed:?}"
+            );
+            assert_eq!(recorder.state().unwrap(), before, "{change}");
+            let pending = recorder.pending.as_ref().expect("failed batch retained");
+            assert_eq!(
+                pending.checkpoints[0].committed_offset,
+                candidate.len() as u64
+            );
+            assert_eq!(pending.model_totals[0].total_tokens, 10);
+            let priority_path = root.join("sessions/priority.jsonl");
+            fs::write(
+                &priority_path,
+                b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"new-active\"}}\n",
+            )
+            .unwrap();
+            let priority = recorded_source(
+                before.checkpoints[0].root_identity.clone(),
+                "priority.jsonl".into(),
+                fs::metadata(&priority_path).unwrap(),
+            );
+            recorder.prioritize_active_thread_sources(&[priority]);
+            match change {
+                "rewrite" => fs::write(
+                    &source,
+                    candidate.replace("\"total_tokens\":15", "\"total_tokens\":16"),
+                )
+                .unwrap(),
+                "replace" => replace_source_file_with_new_inode(&source, &candidate),
+                "root-replace" => {
+                    fs::rename(root.join("sessions"), root.join("old-sessions")).unwrap();
+                    fs::create_dir(root.join("sessions")).unwrap();
+                    fs::hard_link(root.join("old-sessions/one.jsonl"), &source).unwrap();
+                }
+                "missing" => fs::remove_file(&source).unwrap(),
+                "append" => {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&source)
+                        .unwrap()
+                        .write_all(token(25, at + 4).as_bytes())
+                        .unwrap();
+                }
+                "unchanged" | "guard-reject" => {}
+                _ => unreachable!(),
+            }
+            db.execute_batch("DROP TRIGGER reject_pending").unwrap();
+            let guard_calls = std::cell::Cell::new(0);
+            let retry = recorder.run_account_cycle_with_stored_quota_guarded(&root, &epoch, || {
+                guard_calls.set(guard_calls.get() + 1);
+                change != "guard-reject"
+            });
+            if matches!(change, "unchanged" | "append") {
+                retry.unwrap().unwrap();
+                let after = recorder.state().unwrap();
+                assert_eq!(
+                    after.data_generation,
+                    before.data_generation + 1,
+                    "{change}"
+                );
+                assert_eq!(after.model_totals[0].total_tokens, 10, "{change}");
+                assert_eq!(
+                    after.checkpoints[0].committed_offset,
+                    candidate.len() as u64,
+                    "{change}"
+                );
+                assert_eq!(guard_calls.get(), 1, "{change}");
+            } else {
+                assert!(
+                    retry.is_err(),
+                    "changed source must reject the old pending batch: {change}"
+                );
+                assert_eq!(recorder.state().unwrap(), before, "{change}");
+                assert_eq!(
+                    recorder.writer.load_session_events().unwrap(),
+                    old_events,
+                    "{change}"
+                );
+                if change == "guard-reject" {
+                    assert_eq!(guard_calls.get(), 1);
+                }
+            }
+            assert!(recorder.pending.is_none(), "{change}");
+            assert!(
+                recorder
+                    .state()
+                    .unwrap()
+                    .checkpoints
+                    .iter()
+                    .all(|checkpoint| checkpoint.relative_path != "priority.jsonl"),
+                "{change}: a new scheduling hint cannot rebuild a fixed pending batch"
+            );
+            assert_eq!(
+                recorder.checkpoint_reconciliation_sources.len(),
+                1,
+                "{change}: the unattempted source hint remains for a fresh cycle"
+            );
+            drop(db);
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn account_guard_rejects_prepared_batch_without_a_commit() {
         let (root, database) = prepare("account-commit-guard");
         let source = root.join("sessions/one.jsonl");
@@ -13747,9 +23692,9 @@ mod tests {
         let legacy = SessionModelTotal {
             model: "SOL".to_owned(),
             total_tokens: 100,
-            input_tokens: 100,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(100),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
             cache_write_input_tokens: Some(0),
         };
         let exact_model = ModelTotals::usage_model(Some("gpt-6.1-sol"));
@@ -13761,9 +23706,9 @@ mod tests {
                 &exact_model,
                 TokenSnapshot {
                     total: 10,
-                    input: 10,
-                    cached_input: 0,
-                    output: 0,
+                    input: Some(10),
+                    cached_input: Some(0),
+                    output: Some(0),
                     cache_write_input: Some(0),
                 },
             )
@@ -13792,18 +23737,19 @@ mod tests {
                 "gpt-6.1-sol",
                 TokenSnapshot {
                     total: 1_000_000,
-                    input: 1_000_000,
-                    cached_input: 1_000_000,
-                    output: 0,
+                    input: Some(1_000_000),
+                    cached_input: Some(1_000_000),
+                    output: Some(0),
                     cache_write_input: Some(0),
                 },
             )
             .unwrap();
 
-        assert_eq!(totals.dollar_totals().0, 0.5);
+        assert_eq!(totals.dollar_totals().0, Some(0.5));
         assert_eq!(
             totals
                 .history_sample(1_800_000_000, 1_800_604_800, 90.0)
+                .expect("known fixture prices")
                 .sol_dollars,
             0.5
         );
@@ -13813,97 +23759,103 @@ mod tests {
     fn legacy_family_dollars_keep_fixed_rates_when_cache_write_is_unknown() {
         let counter = ModelCounter {
             total: 110,
-            input: 100,
-            cached_input: 20,
-            output: 10,
+            input: Some(100),
+            cached_input: Some(20),
+            output: Some(10),
             cache_write_input: None,
         };
-        assert!((counter.dollars("SOL") - 0.00071).abs() < f64::EPSILON);
+        assert!(
+            (counter.dollars("SOL").expect("known fixture price") - 0.00071).abs() < f64::EPSILON
+        );
     }
 
     #[test]
-    fn overlapping_prefix_replay_is_removed_without_dropping_a_following_event() {
-        let (root, database) = prepare("prefix-replay-no-double");
+    fn unproven_prefix_overlap_retains_the_source_and_collects_other_appends() {
+        let (root, database) = prepare("prefix-lineage-pending");
         let source = root.join("sessions/one.jsonl");
+        let other = root.join("sessions/two.jsonl");
         let now = Utc::now().timestamp();
         fs::write(&source, token(10, now)).unwrap();
+        fs::write(&other, token(10, now)).unwrap();
         let mut recorder =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         recorder.run_cycle().unwrap().unwrap();
-
-        fs::OpenOptions::new()
+        OpenOptions::new()
             .append(true)
             .open(&source)
             .unwrap()
             .write_all(token(15, now + 1).as_bytes())
             .unwrap();
         recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
-        let before = recorder.state().unwrap();
-        let checkpoint = before.checkpoints[0].clone();
-
-        // Simulate the incident's physical cause: the same JSONL prefix is
-        // admitted again under a fresh lineage after a restart/account
-        // transition. The recorder must classify the overlapping token row as
-        // the same physical evidence before it reaches totals or history.
+        let original_events = recorder.writer.load_session_events().unwrap();
+        assert_eq!(original_events.len(), 1);
         let connection = Connection::open(&database).unwrap();
+        // A distinct saved lineage has no accepted prefix proof. Byte-range
+        // intersection with the older row cannot establish record identity.
         connection
             .execute(
-                "UPDATE session_checkpoints
-                 SET committed_offset=0, prefix_generation=?1,
-                     prefix_sha256=?2, fully_attributed_from_zero=0,
-                     token_baseline_known=0, previous_total='0',
-                     previous_input='0', previous_cached_input='0',
-                     previous_output='0', previous_cache_write_input=NULL
-                 WHERE root_identity=?3 AND relative_path=?4
-                   AND file_device=?5 AND file_inode=?6",
-                rusqlite::params![
-                    format!("{:032x}", 0x99_u128),
-                    EMPTY_SHA256,
-                    &checkpoint.root_identity,
-                    &checkpoint.relative_path,
-                    checkpoint.file_device.to_string(),
-                    checkpoint.file_inode.to_string(),
-                ],
+                "UPDATE session_checkpoints SET committed_offset=0, prefix_generation=?1,
+             prefix_sha256=?2, fully_attributed_from_zero=0, token_baseline_known=0,
+             previous_total='0',previous_input='0',previous_cached_input='0',previous_output='0',
+             previous_cache_write_input=NULL,source_admission=NULL
+             WHERE relative_path='one.jsonl'",
+                rusqlite::params![format!("{:032x}", 0x99_u128), EMPTY_SHA256],
             )
             .unwrap();
-        drop(connection);
-
-        recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
-        );
-        let connection = Connection::open(&database).unwrap();
-        let event_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(event_count, 1, "the replay row must never be persisted");
-        drop(connection);
-
-        // A genuinely new append after the replay is still admitted. This is
-        // the guard against a blanket dedupe that would lose normal usage.
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&source)
+        let blocked = recorder
+            .state()
             .unwrap()
-            .write_all(token(20, now + 2).as_bytes())
+            .checkpoints
+            .into_iter()
+            .find(|cp| cp.relative_path == "one.jsonl")
             .unwrap();
-        recorder.run_cycle().unwrap().unwrap();
-        assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            10
-        );
-        let connection = Connection::open(&database).unwrap();
-        let event_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(event_count, 2);
+        for (total, at) in [(15, now + 2), (20, now + 3)] {
+            OpenOptions::new()
+                .append(true)
+                .open(&other)
+                .unwrap()
+                .write_all(token(total, at).as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            assert_eq!(
+                state
+                    .checkpoints
+                    .iter()
+                    .find(|cp| cp.relative_path == "one.jsonl"),
+                Some(&blocked)
+            );
+            assert_eq!(
+                state
+                    .checkpoints
+                    .iter()
+                    .find(|cp| cp.relative_path == "two.jsonl")
+                    .unwrap()
+                    .committed_offset,
+                fs::metadata(&other).unwrap().len()
+            );
+            assert!(recorder
+                .writer
+                .load_session_pending_ranges()
+                .unwrap()
+                .iter()
+                .any(|pending| pending.relative_path == "one.jsonl"
+                    && pending.reason == "source-prefix-lineage-unresolved"));
+            let saved = recorder.writer.load_session_events().unwrap();
+            assert!(saved.contains(&original_events[0]));
+            assert_eq!(
+                saved
+                    .iter()
+                    .filter(|event| event.relative_path == "one.jsonl")
+                    .count(),
+                1
+            );
+            assert_eq!(saved.iter().filter(|event| event.relative_path=="two.jsonl").map(|event|event.total_tokens).sum::<u64>(), total - 10,
+                "the independent raw append is saved once; this adapter grants no account/period qualification");
+        }
         drop(connection);
-        let _ = fs::remove_dir_all(root);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -14048,23 +24000,135 @@ mod tests {
     }
 
     #[test]
+    fn issue604_official_window_does_not_derive_a_calendar_from_plan() {
+        let observed_at = 1_800_000_000;
+        for plan in [
+            "pro",
+            "ent26",
+            "enterprise",
+            "enterprise_cbp_automation",
+            "enterprise_cbp_usage_based",
+        ] {
+            let mut value = json!({"rateLimits": {
+                "planType": plan,
+                "individualLimit": {"limit":"100", "remainingPercent":73, "resetsAt":1_800_604_800, "used":"27"}
+            }});
+            assert!(
+                interpret_official_quota(&value, plan, observed_at).is_err(),
+                "plan={plan}: an unreported duration is unknown"
+            );
+            value["rateLimits"]["primary"] =
+                json!({"usedPercent":10,"resetsAt":1_800_018_000,"windowDurationMins":300});
+            value["rateLimits"]["secondary"] =
+                json!({"usedPercent":20,"resetsAt":1_800_604_800,"windowDurationMins":10080});
+            let snapshot = interpret_official_quota(&value, plan, observed_at).unwrap();
+            assert_eq!(
+                (
+                    snapshot.reset_at,
+                    snapshot.window_seconds,
+                    snapshot.remaining_percent
+                ),
+                (1_800_604_800, 604800, Some(80.0)),
+                "plan={plan}: all selected values must come from the same window"
+            );
+        }
+    }
+
+    #[test]
+    fn issue604_official_window_uses_public_domain_and_independent_candidates() {
+        let observed_at = 1_800_000_000;
+        let long = json!({"rateLimits":{"primary":{"usedPercent":20,"resetsAt":1_900_000_000,"windowDurationMins":527041}}});
+        let snapshot = interpret_official_quota(&long, "pro", observed_at).unwrap();
+        assert_eq!(snapshot.window_seconds, 31_622_460);
+        let weekly = json!({"usedPercent":20,"resetsAt":1_800_604_800,"windowDurationMins":10080});
+        for unavailable in [
+            json!({"usedPercent":10}),
+            json!({"usedPercent":10,"resetsAt":null,"windowDurationMins":null}),
+            json!({"usedPercent":101,"resetsAt":1_800_604_800,"windowDurationMins":10080}),
+            json!({"usedPercent":10,"resetsAt":253_402_300_800_i64,"windowDurationMins":10080}),
+            json!({"usedPercent":10,"resetsAt":60,"windowDurationMins":1}),
+            json!({"usedPercent":10,"resetsAt":1_800_604_800,"windowDurationMins":i64::MAX}),
+        ] {
+            assert!(interpret_official_quota(
+                &json!({"rateLimits":{"primary":unavailable}}),
+                "pro",
+                observed_at
+            )
+            .is_err());
+            for (primary, secondary) in [(&unavailable, &weekly), (&weekly, &unavailable)] {
+                let value = json!({"rateLimits":{"primary":primary,"secondary":secondary}});
+                let snapshot = interpret_official_quota(&value, "pro", observed_at).unwrap();
+                assert_eq!(
+                    (
+                        snapshot.reset_at,
+                        snapshot.window_seconds,
+                        snapshot.remaining_percent
+                    ),
+                    (1_800_604_800, 604800, Some(80.0))
+                );
+            }
+        }
+        let boundary = json!({"rateLimits":{"primary":{"usedPercent":0,"resetsAt":61,"windowDurationMins":1}}});
+        assert_eq!(
+            interpret_official_quota(&boundary, "pro", 1)
+                .unwrap()
+                .window_seconds,
+            60
+        );
+    }
+
+    #[test]
+    fn issue604_official_window_checks_types_identity_and_original_time() {
+        let observed_at = 1_791_763_418;
+        let valid = json!({"rateLimits":{"planType":"pro","primary":{"usedPercent":20,"resetsAt":1_800_604_800,"windowDurationMins":10080}}});
+        assert_eq!(
+            interpret_official_quota(&valid, "pro", observed_at)
+                .unwrap()
+                .observed_at,
+            observed_at
+        );
+        for at in [0, -1, 253_402_300_800_i64] {
+            assert!(interpret_official_quota(&valid, "pro", at).is_err());
+        }
+        let mut mismatch = valid.clone();
+        mismatch["rateLimits"]["planType"] = json!("enterprise");
+        assert!(interpret_official_quota(&mismatch, "pro", observed_at).is_err());
+        assert!(interpret_official_quota(&valid, "Pro", observed_at).is_err());
+        for bad in [json!(true), json!(1.5), json!("20")] {
+            let mut value = valid.clone();
+            value["rateLimits"]["secondary"] =
+                json!({"usedPercent":bad,"resetsAt":1_800_604_800,"windowDurationMins":10080});
+            assert!(interpret_official_quota(&value, "pro", observed_at).is_err());
+        }
+        let mut bad = valid.clone();
+        bad["rateLimits"]["credits"] = json!([]);
+        assert!(interpret_official_quota(&bad, "pro", observed_at).is_err());
+        let mut extended = valid.clone();
+        extended["rateLimits"]["unrecognizedMetadata"] = json!({"arbitrary":true});
+        assert_eq!(
+            interpret_official_quota(&extended, "pro", observed_at),
+            interpret_official_quota(&valid, "pro", observed_at)
+        );
+    }
+
+    #[test]
     fn app_server_quota_parser_selects_weekly_over_short_window() {
         let value = json!({
             "rateLimits": {
                 "primary": {
                     "usedPercent": 10,
-                    "resetsAt": 1_800,
+                    "resetsAt": 1_800_001_800,
                     "windowDurationMins": 300
                 },
                 "secondary": {
                     "usedPercent": 20,
-                    "resetsAt": 2_000,
+                    "resetsAt": 1_800_002_000,
                     "windowDurationMins": 10_080
                 }
             }
         });
-        let snapshot = parse_app_server_quota(&value, "pro").unwrap();
-        assert_eq!(snapshot.reset_at, 2_000);
+        let snapshot = interpret_official_quota(&value, "pro", 1_800_000_000).unwrap();
+        assert_eq!(snapshot.reset_at, 1_800_002_000);
         assert_eq!(snapshot.window_seconds, 604_800);
         assert_eq!(snapshot.remaining_percent, Some(80.0));
         assert!(snapshot.observed_at > 0);
@@ -14094,7 +24158,7 @@ mod tests {
                     "primary": primary,
                     "secondary": secondary,
                 }});
-                let snapshot = parse_app_server_quota(&response, "pro")
+                let snapshot = interpret_official_quota(&response, "pro", 1_800_000_000)
                     .expect("a nullable window must not reject the reported weekly quota");
                 assert_eq!(snapshot.reset_at, 1_800_604_800);
                 assert_eq!(snapshot.window_seconds, 604_800);
@@ -14105,7 +24169,7 @@ mod tests {
                 "secondary": null,
             }});
             assert!(
-                parse_app_server_quota(&response, "pro").is_err(),
+                interpret_official_quota(&response, "pro", 1_800_000_000).is_err(),
                 "a missing period must not be invented when no bounded window is reported"
             );
         }
@@ -14184,45 +24248,844 @@ mod tests {
             &sessions.canonicalize().unwrap(),
             &BTreeSet::from([session.canonicalize().unwrap()]),
             &[],
+            &mut LiveRolloutCache::default(),
         );
-        assert_eq!(result, ActiveThreadPollResult::CheckpointMismatch);
+        assert!(
+            matches!(result, ActiveThreadPollResult::CheckpointMismatch { sources } if sources.len() == 1)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn active_rollout_uses_checkpoint_offset_and_preserves_display_model() {
+    fn issue604_checkpoint_reconciliation_collects_the_missing_physical_source_with_existing_budget(
+    ) {
+        let (root, database) = prepare("active-source-existing-budget");
+        let sessions = root.join("sessions");
+        let noop = b"{\"type\":\"response_item\",\"timestamp\":\"2026-10-17T00:00:00Z\",\"payload\":{\"type\":\"message\"}}\n";
+        fs::write(sessions.join("c-seed.jsonl"), noop).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 700), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        assert_eq!(recorder.state().unwrap().cycle_seq, 1);
+        // On cycle 2, the unchanged seed is first, then the large old source.
+        // Without the missing-source handoff it consumes the same 700-byte
+        // budget before the newly active source has an accepted checkpoint.
+        fs::write(sessions.join("a-backlog.jsonl"), noop.repeat(1000)).unwrap();
+        let active_path = sessions.join("b-active.jsonl");
+        let active_bytes = format!(
+            "{}\n{}",
+            json!({"type":"session_meta","payload":{"id":"active-thread"}}),
+            token(0, Utc::now().timestamp())
+        );
+        assert!(active_bytes.len() < 700);
+        fs::write(&active_path, &active_bytes).unwrap();
+        let state = recorder.state().unwrap();
+        let result = collect_active_thread_snapshot_from_paths(
+            &sessions.canonicalize().unwrap(),
+            &BTreeSet::from([active_path.canonicalize().unwrap()]),
+            &state.checkpoints,
+            &mut LiveRolloutCache::default(),
+        );
+        let ActiveThreadPollResult::CheckpointMismatch { sources } = result else {
+            panic!("unadmitted active source must request guarded collection");
+        };
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].relative_path, "b-active.jsonl");
+        recorder.prioritize_active_thread_sources(&sources);
+        assert!(matches!(
+            recorder.run_cycle_with_quota_guarded(None, || false),
+            Err(RecorderError::AccountBoundaryChanged)
+        ));
+        assert_eq!(
+            recorder.state().unwrap(),
+            state,
+            "the hint cannot commit through a failed epoch guard"
+        );
+        recorder
+            .run_cycle_with_quota_guarded(None, || true)
+            .unwrap();
+        let readback = recorder.state().unwrap();
+        assert!(readback.checkpoints.iter().any(|checkpoint| {
+            checkpoint.relative_path == "b-active.jsonl"
+                && checkpoint.file_device == sources[0].file_device
+                && checkpoint.file_inode == sources[0].file_inode
+                && checkpoint.committed_offset == active_bytes.len() as u64
+        }), "the one existing guarded collection must inspect the source that requested reconciliation");
+        assert_eq!(recorder.config.chunk_bytes, 700);
+        assert!(
+            recorder
+                .writer
+                .load_session_pending_ranges()
+                .unwrap()
+                .iter()
+                .any(|pending| {
+                    pending.relative_path == "a-backlog.jsonl"
+                        && pending.reason == "cycle-budget-backlog"
+                }),
+            "unprocessed historical bytes retain their backlog evidence"
+        );
+        assert!(
+            recorder.checkpoint_reconciliation_sources.is_empty(),
+            "only committed readback retires the scheduling hint"
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue604_active_checkpoint_gap_diagnostic_is_complete_and_anonymous() {
+        const CHILD_ROOT: &str = "CODEX_INFO_ISSUE604_GAP_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let recorder = Recorder::open_partitioned(
+                config(&root, 16384),
+                root.join("usage_history.sqlite3"),
+                &identity(),
+            )
+            .unwrap();
+            let paths = ["a.jsonl", "b.jsonl", "c.jsonl"]
+                .map(|name| root.join("sessions").join(name).canonicalize().unwrap())
+                .into_iter()
+                .collect();
+            assert!(matches!(
+                collect_active_thread_snapshot_from_paths(
+                    &root.join("sessions").canonicalize().unwrap(),
+                    &paths,
+                    &recorder.state().unwrap().checkpoints,
+                    &mut LiveRolloutCache::default(),
+                ),
+                ActiveThreadPollResult::CheckpointMismatch { sources } if sources.len() == 2
+            ));
+            return;
+        }
+        let (root, database) = prepare("issue604-active-checkpoint-gap");
+        for name in ["a.jsonl", "b.jsonl"] {
+            fs::write(
+                root.join("sessions").join(name),
+                format!(
+                    "{}\n{}",
+                    json!({"type":"session_meta","payload":{"id":"private-thread-id"}}),
+                    token(0, Utc::now().timestamp())
+                ),
+            )
+            .unwrap();
+        }
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        assert_eq!(recorder.state().unwrap().checkpoints.len(), 2);
+        drop(recorder);
+        replace_source_file_with_new_inode(
+            &root.join("sessions/b.jsonl"),
+            b"unread replaced body\n",
+        );
+        fs::write(root.join("sessions/c.jsonl"), b"unread new body\n").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::issue604_active_checkpoint_gap_diagnostic_is_complete_and_anonymous",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let prefix = "codex-info-recorder active-thread checkpoint coverage ";
+        let rows = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one complete native coverage diagnostic is required"
+        );
+        let diagnostic: Value = serde_json::from_str(rows[0]).unwrap();
+        assert_eq!(diagnostic["active_paths"], 3);
+        assert_eq!(diagnostic["checkpoint_matches"], 1);
+        let missing = diagnostic["missing"].as_array().unwrap();
+        assert_eq!(missing.len(), 2);
+        assert_eq!(missing[0]["path_checkpoint_count"], 1);
+        assert_eq!(missing[1]["path_checkpoint_count"], 0);
+        let root_metadata = fs::metadata(root.join("sessions")).unwrap();
+        let root_key = format!("unix:{}:{}", root_metadata.dev(), root_metadata.ino());
+        for (row, name) in missing.iter().zip(["b.jsonl", "c.jsonl"]) {
+            let metadata = fs::metadata(root.join("sessions").join(name)).unwrap();
+            // The diagnostic contract is exactly one SHA-256 over the UTF-8
+            // compact JSON array. Build the expected digest independently of
+            // the recorder's digest/hex helpers.
+            let path_bytes = serde_json::to_vec(&json!([root_key, name])).unwrap();
+            let physical_bytes = serde_json::to_vec(&json!([
+                root_key,
+                name,
+                metadata.dev().to_string(),
+                metadata.ino().to_string()
+            ]))
+            .unwrap();
+            assert_eq!(
+                row["path_key_sha256"],
+                format!("{:x}", Sha256::digest(&path_bytes))
+            );
+            assert_eq!(
+                row["physical_key_sha256"],
+                format!("{:x}", Sha256::digest(&physical_bytes))
+            );
+        }
+        for row in missing {
+            for key in ["path_key_sha256", "physical_key_sha256"] {
+                assert_eq!(row[key].as_str().unwrap().len(), 64);
+            }
+            assert_eq!(row["root_checkpoint_count"], 2);
+        }
+        for private in [
+            "a.jsonl",
+            "b.jsonl",
+            "c.jsonl",
+            "private-thread-id",
+            "unread replaced body",
+            "unread new body",
+            root.to_str().unwrap(),
+        ] {
+            assert!(
+                !rows[0].contains(private),
+                "private source data leaked in diagnostic"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue604_observer_artifact_requires_manifest_and_exact_member_bytes() {
+        let root = temp_root("issue604-observer-generation");
+        let generations = root.join("generations");
+        fs::create_dir_all(&generations).unwrap();
+        let payload = b"bounded artifact fixture\n";
+        let reference_sha = |bytes: &[u8]| {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            reference_sha(payload),
+            "053b344bfba0ce74e5f40fff5406eac427edea69f9bcfbfcbafc118179716086",
+            "independent Python hashlib fixture vector"
+        );
+        let document = json!({
+            "schema":"codex-info-linux-bundle-v1", "product":"codex_info", "version":"1.0.165",
+            "source_sha":"1234567890123456789012345678901234567890", "run_id":"123", "run_attempt":1,
+            "target":"x86_64-unknown-linux-gnu", "compatibility":"glibc", "glibc_minimum":"2.39",
+            "files":[{"path":"codex_info", "size":payload.len(),
+                "sha256":reference_sha(payload), "mode":493}]
+        });
+        let build = |bytes: &[u8]| {
+            let name = format!(
+                "1.0.165-1234567890123456789012345678901234567890-{}",
+                reference_sha(bytes)
+            );
+            let generation = generations.join(name);
+            fs::create_dir_all(&generation).unwrap();
+            fs::set_permissions(&generation, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(generation.join("manifest.json"), bytes).unwrap();
+            fs::set_permissions(
+                generation.join("manifest.json"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            let member = generation.join("codex_info");
+            fs::write(&member, payload).unwrap();
+            fs::set_permissions(&member, fs::Permissions::from_mode(0o755)).unwrap();
+            member
+        };
+        let check = |member: &Path| {
+            let metadata = fs::metadata(member).unwrap();
+            validate_generation_member(&generations, member, metadata.dev(), metadata.ino())
+        };
+        let raw = serde_json::to_vec(&document).unwrap();
+        let member = build(&raw);
+        assert!(
+            check(&member).is_ok(),
+            "an exact manifest-bound member must qualify"
+        );
+        fs::write(&member, b"different artifact bytes\n").unwrap();
+        assert!(
+            check(&member).is_err(),
+            "a product-like filename does not rescue altered bytes"
+        );
+        fs::write(&member, payload).unwrap();
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(check(&member).is_err());
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = fs::metadata(&member).unwrap();
+        assert!(validate_generation_member(
+            &generations,
+            &member,
+            metadata.dev(),
+            metadata.ino() + 1
+        )
+        .is_err());
+
+        let mut wrong_schema = document.clone();
+        wrong_schema["schema"] = json!("unrecognized");
+        assert!(check(&build(&serde_json::to_vec(&wrong_schema).unwrap())).is_err());
+        let duplicate = format!(
+            "{{\"product\":\"codex_info\",{}",
+            std::str::from_utf8(&raw[1..]).unwrap()
+        );
+        assert!(
+            check(&build(duplicate.as_bytes())).is_err(),
+            "duplicate metadata cannot qualify even when values agree"
+        );
+        let mut bad_entry = document.clone();
+        bad_entry["files"][0]["path"] = json!("../codex_info");
+        assert!(check(&build(&serde_json::to_vec(&bad_entry).unwrap())).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue604_live_path_owners_require_stable_identity_and_known_ancestry() {
+        use std::os::unix::fs::symlink;
+        let root = temp_root("issue604-live-owners");
+        let sessions = root.join("sessions");
+        let proc_root = root.join("proc");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&proc_root).unwrap();
+        let source = sessions.join("one.jsonl");
+        fs::write(&source, b"{}\n").unwrap();
+        for (name, content) in [
+            ("codex", "workload"),
+            ("client", "client"),
+            ("init", "init"),
+            ("codex_info", "unproven"),
+        ] {
+            fs::write(root.join(name), content).unwrap();
+        }
+        let write_stat = |pid: u32, parent: u32, start: u64| {
+            let mut fields = vec!["0".to_owned(); 20];
+            fields[0] = "S".to_owned();
+            fields[1] = parent.to_string();
+            fields[19] = start.to_string();
+            fs::write(
+                proc_root.join(pid.to_string()).join("stat"),
+                format!("{pid} (fixture) {}\n", fields.join(" ")),
+            )
+            .unwrap();
+        };
+        for (pid, parent, executable) in [(1, 0, "init"), (11, 1, "client"), (101, 11, "codex")] {
+            let process = proc_root.join(pid.to_string());
+            fs::create_dir_all(process.join("fd")).unwrap();
+            fs::write(process.join("comm"), format!("{executable}\n")).unwrap();
+            fs::write(process.join("cmdline"), format!("{executable}\0")).unwrap();
+            symlink(root.join(executable), process.join("exe")).unwrap();
+            write_stat(pid, parent, u64::from(pid));
+        }
+        symlink(&source, proc_root.join("101/fd/3")).unwrap();
+        let original = open_codex_session_paths(&proc_root, &sessions).unwrap();
+        assert_eq!(original.len(), 1);
+        write_stat(101, 11, 999);
+        let reused_pid = open_codex_session_paths(&proc_root, &sessions).unwrap();
+        assert_ne!(
+            original, reused_pid,
+            "a path-only set loses PID reuse identity"
+        );
+
+        let process = proc_root.join("102");
+        fs::create_dir_all(process.join("fd")).unwrap();
+        fs::write(process.join("comm"), b"codex\n").unwrap();
+        fs::write(process.join("cmdline"), b"codex\0").unwrap();
+        symlink(root.join("codex"), process.join("exe")).unwrap();
+        symlink(&source, process.join("fd/3")).unwrap();
+        write_stat(102, 11, 102);
+        let shared = open_codex_session_paths(&proc_root, &sessions).unwrap();
+        assert_ne!(
+            shared, reused_pid,
+            "two owners of one path must both survive"
+        );
+        fs::remove_dir_all(&process).unwrap();
+
+        fs::write(
+            proc_root.join("101/cmdline"),
+            b"codex\0app-server\0--stdio\0",
+        )
+        .unwrap();
+        fs::remove_file(proc_root.join("11/exe")).unwrap();
+        symlink(std::env::current_exe().unwrap(), proc_root.join("11/exe")).unwrap();
+        assert!(
+            open_codex_session_paths(&proc_root, &sessions)
+                .unwrap()
+                .is_empty(),
+            "a proven observer is not a workload"
+        );
+
+        fs::remove_file(proc_root.join("11/exe")).unwrap();
+        symlink(root.join("codex_info"), proc_root.join("11/exe")).unwrap();
+        assert!(
+            open_codex_session_paths(&proc_root, &sessions).is_err(),
+            "a product-like name is not artifact evidence"
+        );
+        fs::remove_file(proc_root.join("11/exe")).unwrap();
+        symlink(root.join("client"), proc_root.join("11/exe")).unwrap();
+        write_stat(11, 101, 11);
+        assert!(
+            open_codex_session_paths(&proc_root, &sessions).is_err(),
+            "ancestry cycles are unknown"
+        );
+        write_stat(11, 1, 11);
+        write_stat(101, 1, 999);
+        assert!(
+            open_codex_session_paths(&proc_root, &sessions).is_err(),
+            "orphan app-server origin is unknown"
+        );
+        write_stat(101, 11, 999);
+        fs::remove_file(proc_root.join("101/stat")).unwrap();
+        assert!(
+            open_codex_session_paths(&proc_root, &sessions).is_err(),
+            "missing identity is not an empty inventory"
+        );
+        fs::remove_file(proc_root.join("101/fd/3")).unwrap();
+        fs::remove_file(proc_root.join("101/exe")).unwrap();
+        assert!(
+            open_codex_session_paths(&proc_root, &sessions)
+                .unwrap()
+                .is_empty(),
+            "a completely enumerated empty FD set has no owner on this surface"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "large live-prefix deadline acceptance runs with --release"
+    )]
+    fn issue604_live_rollout_streams_a_source_larger_than_snapshot_file_limit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().to_path_buf();
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("large.jsonl");
+        let now = 1_791_700_000;
+        let mut file = File::create(&path).unwrap();
+        write!(file, "{}\n{}{}",
+            json!({"type":"turn_context","timestamp":"2026-10-10T00:00:00Z","payload":{"model":"gpt-6.1-sol"}}),
+            task_event("task_started", now), context_token(40, 8, 1000, now)
+        ).unwrap();
+        file.write_all(br#"{"type":"response_item","timestamp":"2026-10-10T00:00:00Z","payload":{"type":"message","content":""#).unwrap();
+        // A validated NoOp body is streamed without retaining it. Neither a
+        // giant allocation nor a fabricated short source stands in for >256MiB.
+        let block = [b'x'; 64 * 1024];
+        let mut remaining = security::MAX_SESSION_FILE_BYTES + 1;
+        while remaining != 0 {
+            let count = remaining.min(block.len() as u64) as usize;
+            file.write_all(&block[..count]).unwrap();
+            remaining -= count as u64;
+        }
+        file.write_all(b"\"}}\n").unwrap();
+        drop(file);
+        let mut cache = BTreeMap::new();
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(metadata.len() > security::MAX_SESSION_FILE_BYTES);
+        let first = read_active_rollout(
+            &sessions,
+            &path,
+            &metadata,
+            &mut cache,
+            Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(first.model(), "gpt-6.1-sol");
+        assert_eq!(first.total_tokens(), Some(40));
+        assert_eq!(first.context_usage_tokens(), Some(8));
+        assert_eq!(first.context_window_tokens(), Some(1000));
+        assert_eq!(first.last_task_running(), Some(true));
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        write!(
+            file,
+            "{}{}",
+            task_event("task_complete", now + 1),
+            token(45, now + 1)
+        )
+        .unwrap();
+        drop(file);
+        let appended = read_active_rollout(
+            &sessions,
+            &path,
+            &fs::metadata(&path).unwrap(),
+            &mut cache,
+            Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(appended.total_tokens(), Some(45));
+        assert_eq!(appended.last_task_running(), Some(false));
+        assert_eq!(
+            read_active_rollout(
+                &sessions,
+                &path,
+                &fs::metadata(&path).unwrap(),
+                &mut BTreeMap::new(),
+                Instant::now() + APP_SERVER_RESPONSE_TIMEOUT
+            )
+            .unwrap(),
+            appended,
+            "restart must validate the same full original prefix"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "large live-prefix deadline acceptance runs with --release"
+    )]
+    fn issue604_live_rollouts_share_the_existing_cycle_deadline() {
+        let temporary = tempfile::tempdir().unwrap();
+        let sessions = temporary.path();
+        let first_path = sessions.join("first.jsonl");
+        let second_path = sessions.join("second.jsonl");
+        let now = 1_791_700_000;
+        let mut file = File::create(&first_path).unwrap();
+        write!(file, "{}\n{}{}",
+            json!({"type":"turn_context","timestamp":"2026-10-10T00:00:00Z","payload":{"model":"gpt-6.1-sol"}}),
+            task_event("task_started", now), context_token(40, 8, 1000, now)
+        ).unwrap();
+        file.write_all(br#"{"type":"response_item","timestamp":"2026-10-10T00:00:00Z","payload":{"type":"message","content":""#).unwrap();
+        let block = [b'x'; 64 * 1024];
+        let mut remaining = security::MAX_SESSION_FILE_BYTES + 1;
+        while remaining != 0 {
+            let count = remaining.min(block.len() as u64) as usize;
+            file.write_all(&block[..count]).unwrap();
+            remaining -= count as u64;
+        }
+        file.write_all(b"\"}}\n").unwrap();
+        drop(file);
+        fs::copy(&first_path, &second_path).unwrap();
+
+        // Both active sources consume the same existing attempt deadline. Each
+        // must validate its full fixed prefix before any resulting state is used.
+        let deadline = Instant::now() + APP_SERVER_RESPONSE_TIMEOUT;
+        let mut cache = BTreeMap::new();
+        for path in [&first_path, &second_path] {
+            let metadata = fs::metadata(path).unwrap();
+            assert!(metadata.len() > security::MAX_SESSION_FILE_BYTES);
+            let snapshot = read_active_rollout(sessions, path, &metadata, &mut cache, deadline)
+                .expect("both complete sources must fit the one existing cycle deadline");
+            assert_eq!(snapshot.model(), "gpt-6.1-sol");
+            assert_eq!(snapshot.total_tokens(), Some(40));
+            assert_eq!(snapshot.context_usage_tokens(), Some(8));
+            assert_eq!(snapshot.context_window_tokens(), Some(1000));
+            assert_eq!(snapshot.last_task_running(), Some(true));
+            assert_eq!(cache[path].offset, metadata.len());
+        }
+        assert_eq!(cache.len(), 2);
+        assert!(Instant::now() < deadline);
+    }
+
+    #[test]
+    fn issue604_invalid_envelope_metadata_keeps_local_facts_without_confirming_the_prefix() {
+        for (field, value, expected_reason) in [
+            ("ordinal", json!(true), "ordinal-envelope-invalid"),
+            ("metadata", json!([]), "response-metadata-envelope-invalid"),
+        ] {
+            let (root, database) = prepare("issue604-ordinal-local-coverage");
+            let source = root.join("sessions/one.jsonl");
+            let at = Utc::now().timestamp();
+            let baseline = format!(
+                "{}{}",
+                issue604_context_record("turn_context", json!("gpt-6.1-sol"), at),
+                token(0, at)
+            );
+            fs::write(&source, &baseline).unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            assert!(recorder.state().unwrap().checkpoints[0].fully_attributed_from_zero);
+            let mut invalid = json!({"type":"response_item","timestamp":DateTime::<Utc>::from_timestamp(at+1,0).unwrap().to_rfc3339(),"payload":{"type":"function_call_output","output":"opaque"}});
+            invalid[field] = value;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(format!("{invalid}\n{}", token(5, at + 1)).as_bytes())
+                .unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+            let state = recorder.state().unwrap();
+            let checkpoint = &state.checkpoints[0];
+            assert_eq!(checkpoint.previous_total, Some(5));
+            assert_eq!(checkpoint.last_model.as_deref(), Some("gpt-6.1-sol"));
+            assert!(
+                !checkpoint.fully_attributed_from_zero,
+                "malformed envelope metadata cannot prove complete source coverage"
+            );
+            assert!(recorder
+                .writer
+                .load_session_pending_ranges()
+                .unwrap()
+                .iter()
+                .any(|pending| pending.reason == expected_reason));
+            let events = recorder.writer.load_session_events().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].total_tokens, 5);
+            assert_eq!(events[0].model, "gpt-6.1-sol");
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_live_rejection_identifies_the_boundary_without_source_values() {
+        let temporary = tempfile::tempdir().unwrap();
+        let sessions = temporary.path();
+        let path = sessions.join("private-session-source.jsonl");
+        let at = 1_791_700_000;
+        let original = format!(
+            "{}{}",
+            task_event("task_started", at),
+            context_token(40, 8, 1000, at)
+        );
+        fs::write(&path, &original).unwrap();
+        let mut cache = BTreeMap::new();
+        let first = read_active_rollout(
+            sessions,
+            &path,
+            &fs::metadata(&path).unwrap(),
+            &mut cache,
+            Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+        )
+        .unwrap();
+        let rejected = format!(
+            "{}\n",
+            json!({"type":"event_msg","timestamp":"2026-10-10T00:00:00Z","payload":{"type":"private-event-value","text":"private-body-value","model":"private-model-value","id":"private-id-value"}})
+        );
+        fs::write(&path, format!("{original}{rejected}")).unwrap();
+        let error = read_active_rollout(
+            sessions,
+            &path,
+            &fs::metadata(&path).unwrap(),
+            &mut cache,
+            Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+        )
+        .unwrap_err();
+        let detail: Value = serde_json::from_str(
+            error
+                .strip_prefix("active rollout parse rejected: ")
+                .expect("categorical rejection metadata must reach the native caller"),
+        )
+        .unwrap();
+        assert_eq!(detail["schema"], "codex-info-live-rollout-rejection-v1");
+        assert_eq!(detail["parse_start_offset"], original.len() as u64);
+        assert_eq!(
+            detail["file_bytes"],
+            (original.len() + rejected.len()) as u64
+        );
+        assert_eq!(detail["rejection"]["record_ordinal"], 1);
+        assert_eq!(detail["rejection"]["start_offset"], 0);
+        assert_eq!(detail["rejection"]["end_offset"], rejected.len() as u64);
+        assert_eq!(detail["rejection"]["category"], "record-shape");
+        assert_eq!(detail["rejection"]["shape"]["outer_kind"], "event_msg");
+        assert_eq!(detail["rejection"]["shape"]["event_kind"], "unrecognized");
+        assert_eq!(detail["rejection"]["shape"]["known_state_input"], false);
+        assert_eq!(detail["rejection"]["shape"]["coverage_shape_valid"], false);
+        for forbidden in [
+            "private-session-source",
+            "private-event-value",
+            "private-body-value",
+            "private-model-value",
+            "private-id-value",
+            sessions.to_str().unwrap(),
+        ] {
+            assert!(
+                !error.contains(forbidden),
+                "diagnostics must not carry source values"
+            );
+        }
+        assert_eq!(cache[&path].offset, original.len() as u64);
+        assert_eq!(cache[&path].parser.snapshot().unwrap(), first);
+    }
+
+    #[test]
+    fn issue604_live_expired_cycle_keeps_the_verified_source_cache() {
+        let temporary = tempfile::tempdir().unwrap();
+        let sessions = temporary.path();
+        let path = sessions.join("one.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}{}",
+                task_event("task_started", 1_791_700_000),
+                context_token(40, 8, 1000, 1_791_700_000)
+            ),
+        )
+        .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let mut cache = BTreeMap::new();
+        let first = read_active_rollout(
+            sessions,
+            &path,
+            &metadata,
+            &mut cache,
+            Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(first.total_tokens(), Some(40));
+        assert_eq!(first.last_task_running(), Some(true));
+        let offset = cache[&path].offset;
+        let error = read_active_rollout(sessions, &path, &metadata, &mut cache, Instant::now())
+            .unwrap_err();
+        let detail: Value = serde_json::from_str(
+            error
+                .strip_prefix("active rollout deadline exceeded: ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detail["schema"], "codex-info-live-rollout-deadline-v1");
+        assert_eq!(detail["stage"], "entry");
+        assert!(detail["file_bytes"].is_null());
+        assert!(detail["parse_start_offset"].is_null());
+        assert_eq!(detail["suffix_read_bytes"], 0);
+        assert!(!error.contains(sessions.to_str().unwrap()));
+        assert!(!error.contains("gpt-6.1-sol"));
+        assert_eq!(cache[&path].offset, offset);
+        assert_eq!(cache[&path].parser.snapshot().unwrap(), first);
+    }
+
+    #[test]
+    fn issue604_live_prefix_is_the_only_state_authority() {
+        let root = temp_root("issue604-live-prefix");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("one.jsonl");
+        let now = 1_791_700_000;
+        let context = format!(
+            "{}\n",
+            json!({"type":"turn_context", "timestamp":"2026-10-10T00:00:00Z",
+                "payload":{"model":"gpt-6.1-sol"}})
+        );
+        let original = format!(
+            "{context}{}{}",
+            task_event("task_started", now),
+            context_token(40, 8, 1000, now)
+        );
+        fs::write(&path, &original).unwrap();
+        let mut cache = BTreeMap::new();
+        let mut read = || {
+            read_active_rollout(
+                &sessions,
+                &path,
+                &fs::metadata(&path).unwrap(),
+                &mut cache,
+                Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+            )
+        };
+        let first = read().unwrap();
+        assert_eq!(
+            first.model(),
+            "gpt-6.1-sol",
+            "audit model is not live evidence"
+        );
+        assert_eq!(first.last_task_running(), Some(true));
+        assert_eq!(first.total_tokens(), Some(40));
+        assert_eq!(first.context_usage_tokens(), Some(8));
+        assert_eq!(first.context_window_tokens(), Some(1000));
+        assert_eq!(
+            read().unwrap(),
+            first,
+            "unchanged verified prefix is stable"
+        );
+
+        let appended = format!(
+            "{original}{}{}",
+            task_event("task_complete", now + 1),
+            token(45, now + 1)
+        );
+        fs::write(&path, &appended).unwrap();
+        let complete = read().unwrap();
+        assert_eq!(complete.last_task_running(), Some(false));
+        assert_eq!(complete.total_tokens(), Some(45));
+        assert_eq!(complete.model(), "gpt-6.1-sol");
+
+        fs::write(
+            &path,
+            format!(
+                "{appended}{}{{\"type\":\"task_started\",\"timestamp\":\"bad\"}}\n",
+                task_event("task_started", now + 2)
+            ),
+        )
+        .unwrap();
+        assert!(
+            read().is_err(),
+            "invalid append cannot publish the preceding valid start"
+        );
+        fs::write(&path, &appended).unwrap();
+        assert_eq!(
+            read().unwrap(),
+            complete,
+            "failed candidate must not advance state"
+        );
+
+        fs::write(&path, format!("{appended}{{\"type\":\"task_started\"")).unwrap();
+        assert!(
+            read().is_err(),
+            "a partial tail keeps the previous complete live snapshot"
+        );
+
+        let rewritten = format!(
+            "{}{}",
+            context.replace("gpt-6.1-sol", "gpt-6-astra"),
+            token(12, now + 3)
+        );
+        fs::write(&path, &rewritten).unwrap();
+        let replaced = read().unwrap();
+        assert_eq!(replaced.model(), "gpt-6-astra");
+        assert_eq!(
+            replaced.last_task_running(),
+            None,
+            "fresh mtime/raw/model cannot invent a task"
+        );
+        assert_eq!(replaced.total_tokens(), Some(12));
+        assert_eq!(replaced.context_usage_tokens(), None);
+        assert_eq!(
+            read_active_rollout(
+                &sessions,
+                &path,
+                &fs::metadata(&path).unwrap(),
+                &mut BTreeMap::new(),
+                Instant::now() + APP_SERVER_RESPONSE_TIMEOUT
+            )
+            .unwrap(),
+            replaced,
+            "collector restart rebuilds the same original state",
+        );
+
+        // A usage checkpoint may have isolated this malformed task already.
+        // Its offset cannot turn that prefix into a verified live source.
+        fs::write(
+            &path,
+            format!("{{\"type\":\"task_started\",\"timestamp\":\"bad\"}}\n{original}"),
+        )
+        .unwrap();
+        assert!(
+            read().is_err(),
+            "the whole original prefix must obey live admission"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_rollout_never_invents_missing_model_or_task() {
         let root = temp_root("active-thread-record");
         let sessions = root.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         let path = sessions.join("one.jsonl");
         let session_meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-1\"}}\n";
         fs::write(&path, session_meta).unwrap();
-        let metadata = fs::metadata(&path).unwrap();
-        let root_metadata = fs::metadata(&sessions).unwrap();
-        let checkpoint = SessionCheckpoint {
-            root_identity: root_identity(&sessions, &root_metadata),
-            relative_path: "one.jsonl".to_owned(),
-            file_device: file_device(&metadata),
-            file_inode: file_inode(&metadata),
-            committed_offset: session_meta.len() as u64,
-            discard_until_lf: false,
-            collector_epoch: 7,
-            cycle_seq: 3,
-            prefix_generation: 9,
-            prefix_sha256: EMPTY_SHA256.to_owned(),
-            fully_attributed_from_zero: true,
-            token_baseline_known: true,
-            history_base_pending: false,
-            last_model: Some("gpt-5.6-sol".to_owned()),
-            last_task_running: Some(true),
-            context_usage_tokens: None,
-            context_window_tokens: None,
-            previous_total: 42,
-            previous_input: 40,
-            previous_cached_input: 0,
-            previous_output: 2,
-            previous_cache_write_input: Some(0),
-        };
         fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -14230,16 +25093,23 @@ mod tests {
             .write_all(token(43, Utc::now().timestamp()).as_bytes())
             .unwrap();
         let metadata = fs::metadata(&path).unwrap();
-        let snapshot = read_active_rollout(&sessions, &path, &metadata, &checkpoint).unwrap();
-        assert!(snapshot.is_running());
-        assert_eq!(snapshot.model(), "gpt-5.6-sol");
-        assert_eq!(snapshot.model_label(), "gpt-5.6-sol");
+        let snapshot = read_active_rollout(
+            &sessions,
+            &path,
+            &metadata,
+            &mut BTreeMap::new(),
+            Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(snapshot.last_task_running(), None);
+        assert_eq!(snapshot.model(), "不明");
+        assert_eq!(snapshot.model_label(), "不明");
         assert_eq!(snapshot.total_tokens(), Some(43));
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn active_rollout_reads_bounded_append_after_large_committed_prefix() {
+    fn active_rollout_rejects_unverified_prefix_beyond_file_limit() {
         let root = temp_root("active-thread-large-prefix");
         let sessions = root.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
@@ -14255,60 +25125,14 @@ mod tests {
             .write_all(token(43, Utc::now().timestamp()).as_bytes())
             .unwrap();
         let metadata = fs::metadata(&path).unwrap();
-        let root_metadata = fs::metadata(&sessions).unwrap();
-        let checkpoint = SessionCheckpoint {
-            root_identity: root_identity(&sessions, &root_metadata),
-            relative_path: "large.jsonl".to_owned(),
-            file_device: file_device(&metadata),
-            file_inode: file_inode(&metadata),
-            committed_offset,
-            discard_until_lf: false,
-            collector_epoch: 7,
-            cycle_seq: 3,
-            prefix_generation: 9,
-            prefix_sha256: EMPTY_SHA256.to_owned(),
-            fully_attributed_from_zero: true,
-            token_baseline_known: true,
-            history_base_pending: false,
-            last_model: Some("gpt-5.6-sol".to_owned()),
-            last_task_running: Some(true),
-            context_usage_tokens: None,
-            context_window_tokens: None,
-            previous_total: 42,
-            previous_input: 40,
-            previous_cached_input: 0,
-            previous_output: 2,
-            previous_cache_write_input: Some(0),
-        };
-
-        let snapshot = read_active_rollout(&sessions, &path, &metadata, &checkpoint).unwrap();
-        assert!(snapshot.is_running());
-        assert_eq!(snapshot.total_tokens(), Some(43));
+        assert!(read_active_rollout(
+            &sessions,
+            &path,
+            &metadata,
+            &mut BTreeMap::new(),
+            Instant::now() + APP_SERVER_RESPONSE_TIMEOUT
+        )
+        .is_err());
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn open_rollout_recency_bridges_only_unknown_lifecycle_state() {
-        assert_eq!(
-            open_rollout_running_seed(None, true, false, Some(OPEN_ROLLOUT_ACTIVITY_WINDOW)),
-            Some(true)
-        );
-        assert_eq!(
-            open_rollout_running_seed(
-                None,
-                true,
-                false,
-                Some(OPEN_ROLLOUT_ACTIVITY_WINDOW + Duration::from_secs(1))
-            ),
-            None
-        );
-        assert_eq!(
-            open_rollout_running_seed(None, false, true, Some(Duration::ZERO)),
-            None
-        );
-        assert_eq!(
-            open_rollout_running_seed(Some(false), true, true, Some(Duration::ZERO)),
-            Some(false)
-        );
     }
 }

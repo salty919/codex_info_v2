@@ -6,6 +6,7 @@ import hashlib
 import json
 import pathlib
 import re
+import shlex
 import subprocess  # nosec B404 # offline Bash fixture, no host services.
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ MEMBERS = {
     "codex-info-update.timer": (b"[Timer]\nOnActiveSec=5min\n", 0o644),
 }
 FUNCTIONS = (
+    "version_python",
     "atomic_text", "atomic_symlink", "atomic_unlink", "write_journal", "read_journal",
     "journal_owner_stale", "current_generation", "legacy_combined_record_at",
     "legacy_combined_record", "legacy_combined_present", "validate_legacy_combined_enable_link",
@@ -101,7 +103,7 @@ curl() {
         *) return 99 ;;
     esac
 }
-python3() { /usr/bin/python3 "$SHIM" "$@"; }
+python3() { /usr/bin/python3 -B "$SHIM" "$@"; }
 if [[ "$STEP" == install ]]; then
     perform_install
 else
@@ -110,6 +112,8 @@ fi
 """
 
 SHIM = r"""import os, pathlib, signal, sys
+if sys.argv[1] == "-B":
+    del sys.argv[1]
 assert sys.argv[1] == "-"
 sys.argv = sys.argv[1:]
 code = sys.stdin.read()
@@ -206,7 +210,11 @@ class LegacyRecoveryTests(unittest.TestCase):
         # Optional on the defect baseline; actual production functions after the fix.
         for name in ("capture_legacy_combined_prestate", "validate_legacy_combined_recovery", "wait_legacy_combined_ready"):
             functions.extend(re.findall(rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", source))
-        script = prefix + "\n" + "\n".join(functions) + MODEL
+        # The source-owned version loader is also a read_journal dependency.
+        # Bind it to this source, not Bash's /proc executable or the old image
+        # whose recovery bytes are independently exercised by the fixture.
+        authority = "\nrunning_installer_source=" + shlex.quote(str(INSTALLER)) + "\n"
+        script = prefix + authority + "\n".join(functions) + MODEL
         result = subprocess.run(  # nosec B603 # fixed shell/env; literal fixture and repository functions.
             ["/bin/bash", "--noprofile", "--norc", "-s"], input=script,
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": str(self.home), "SHIM": str(self.shim),

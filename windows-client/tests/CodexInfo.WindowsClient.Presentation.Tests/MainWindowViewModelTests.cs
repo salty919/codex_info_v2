@@ -626,6 +626,7 @@ public sealed class MainWindowViewModelTests
     [Theory]
     [InlineData("v3")]
     [InlineData("v4")]
+    [InlineData("v5")]
     public async Task MainWindowModelCountsPairRunningAndOpen(string apiVersion)
     {
         var current = CurrentSnapshot(activeThreadCount: 1) with
@@ -633,6 +634,7 @@ public sealed class MainWindowViewModelTests
             ApiVersion = apiVersion,
             OpenSessionThreadCount = 3,
         };
+        if (apiVersion == "v5") current = current with { Models = [], ModelsStatus = ApiCurrentModelsStatus.Unavailable };
         var stoppedSol = ThreadDetails("gpt-5.6-sol", "stopped-sol") with
         {
             ParentId = "running-luna",

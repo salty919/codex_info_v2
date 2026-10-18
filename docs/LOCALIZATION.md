@@ -37,6 +37,7 @@ UTCの順で解決し、非空で不正な`TZ`はUTCへfail closedします。`T
 
 - epoch秒、並び順、期間の境界はUTCで保持します。
 - 絶対時刻、履歴期間、グラフ横軸はactive表示timezoneへ変換し、数値UTC offset（例`+09:00`）を付けます。
+- Graphのコンパクトな横軸目盛りだけは`MM/dd HH:mm`を使い、残る隣接目盛りのUTC秒差が60未満なら全目盛りへ`:ss`を付けます。候補のlocal年が一つでなければ全目盛りの先頭へ`yyyy/`を付けます。数字はGregorian calendar・ASCII digit・24時間表記です。この年・秒の判定後も、夏時間のfold等により異なるUTC秒が同じlocal文字列になる場合は、全目盛りへ各instantの`±HH:MM`を付けて区別します。上の日付境界labelは`MM/dd`、hoverは同じ元epochを`yyyy/MM/dd HH:mm:ss ±HH:MM`で表示します。これは軸に同じ長い日付を反復しないための表示形式であり、表示timezoneや元時刻を変える規則ではありません。目盛りを間引く場合も、年・秒表示/offsetの必要性は間引く前の候補で決めます。期間名やMainの絶対時刻は以下の別の書式を維持します。
 - 日本語catalogの絶対時刻はGregorian calendar・ASCII digit・24時間表記の
   `yyyy/MM/dd HH:mm ±HH:MM`へ固定します。fixture `1787356800` はUTCで
   `2026/08/22 00:00 +00:00`、Asia/Tokyoで`2026/08/22 09:00 +09:00`です。
@@ -206,7 +207,7 @@ Tab topology、semantic page manifest、source/translation hash、bounds、clip�
 raw記録する。Setupはexact key集合の一回性、unknown→en、単一resolved localeを別joinで確認し、実装者と
 異なる担当が三値判定する。実装、実画像、UIA hostログは未取得である。
 
-## 未確定
+## 製品証拠の取得状況
 
 locale集合、key集合、fallback、UIA/semantic join規則は本Decisionで確定した。実artifact、fresh画像、
 スクリーンリーダー/UIA操作ログ、独立製品判定は未取得であり、製品状態は`PRODUCT_PENDING`である。

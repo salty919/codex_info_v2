@@ -26,7 +26,10 @@
   </Window.Styles>
   <Grid Margin="28" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="14">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
-      <StackPanel Orientation="Horizontal" Spacing="8"><PathIcon Classes="heading-icon" Data="{StaticResource IconConnection}" /><StackPanel VerticalAlignment="Center"><TextBlock Classes="window-title" Text="{Binding PageTitle}" /><TextBlock Classes="label" Text="{Binding Texts.Setup}" IsVisible="{Binding !IsConnectionSettings}" /></StackPanel></StackPanel>
+      <Grid ColumnDefinitions="*,Auto" Margin="0,0,2,0">
+        <StackPanel Orientation="Horizontal" Spacing="8"><PathIcon Classes="heading-icon" Data="{StaticResource IconConnection}" /><StackPanel VerticalAlignment="Center"><TextBlock Classes="window-title" Text="{Binding PageTitle}" /><TextBlock Classes="label" Text="{Binding Texts.Setup}" IsVisible="{Binding !IsConnectionSettings}" /></StackPanel></StackPanel>
+        <Button Grid.Column="1" Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Setup.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
+      </Grid>
       <Button Grid.Column="1" Classes="window-control" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Setup.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
     </Grid>
     <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8">
@@ -103,7 +106,7 @@
       </ScrollViewer>
     </Border>
     <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10">
-
+      <Button Classes="secondary" Click="OnBack" IsEnabled="{Binding CanGoBack}" AutomationProperties.AutomationId="Setup.Back" AutomationProperties.Name="{Binding Texts.Back}" ToolTip.Tip="{Binding Texts.Back}" Content="{Binding Texts.Back}" />
       <Button Classes="secondary" Click="OnRefresh" IsVisible="{Binding !IsDoneStep}" IsEnabled="{Binding CanRefresh}" AutomationProperties.AutomationId="Setup.Refresh" AutomationProperties.Name="{Binding RefreshButtonText}" ToolTip.Tip="{Binding RefreshButtonText}" Content="{Binding RefreshButtonText}" />
       <Button Classes="secondary" IsVisible="{Binding !IsDoneStep}" Click="OnClose" AutomationProperties.Name="{Binding Texts.Close}" ToolTip.Tip="{Binding Texts.Close}" Content="{Binding Texts.Close}" />
       <Button Classes="primary" IsEnabled="{Binding CanContinue}" Click="OnContinue" AutomationProperties.Name="{Binding ContinueText}" ToolTip.Tip="{Binding ContinueText}" Content="{Binding ContinueText}" />

@@ -1,24 +1,27 @@
 use chrono::Utc;
 use codex_info_account_locator::{
-    current_account_scope_id, ensure_partition_with_activation, locate_existing_partition,
-    locate_existing_partitions, mark_partition_initialized, prepare_recorder_data_root,
-    set_partition_login_id as set_registry_login_id, AccountPartition,
+    admit_partition, close_partition_ownership_at, current_account_scope_id,
+    locate_existing_partitions, mark_partition_initialized, partition_requires_confirmation,
+    prepare_recorder_data_root, reserve_partition_at,
+    set_partition_login_id as set_registry_login_id, AccountConfirmation, AccountPartition,
 };
 use codex_info_db_writer::{
     ActiveThreadSnapshot, SessionCheckpoint, SessionLifecycleInterval, StoragePartitionIdentity,
     UsageStore,
 };
 use codex_info_recorder::{
-    probe_codex_authentication_state, synchronize_inactive_partition, AccountEpochProof,
-    ActiveThreadPollResult, CodexAuthenticationState, FixedRateSchedule, ProfileLease,
-    QuotaPollEvent, QuotaPoller, Recorder, RecorderConfig, RecorderError, RecorderStateWriter,
-    ThreadPoller, DEFAULT_CHUNK_BYTES, DEFAULT_INTERVAL_SECS,
+    confirm_codex_account, probe_codex_authentication_state, synchronize_inactive_partition,
+    AccountEpochProof, ActiveThreadPollResult, BackgroundWork, CodexAuthenticationState,
+    FixedRateSchedule, PreparedHistoricalRepair, ProfileLease, QuotaPollEvent, QuotaPoller,
+    Recorder, RecorderConfig, RecorderError, RecorderStateWriter, ThreadPoller,
+    DEFAULT_CHUNK_BYTES, DEFAULT_INTERVAL_SECS,
 };
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const RECORDER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,6 +41,35 @@ fn shutdown_sleep(duration: Duration) {
     }
 }
 
+fn run_inactive_history<I, S, F, E>(
+    recollection: bool,
+    mut stopped: S,
+    jobs: I,
+    mut run: F,
+) -> Result<bool, E>
+where
+    I: IntoIterator,
+    S: FnMut() -> bool,
+    F: FnMut(I::Item) -> Result<(), E>,
+{
+    if stopped() {
+        return Ok(false);
+    }
+    if recollection {
+        return Ok(true);
+    }
+    for job in jobs {
+        if stopped() {
+            return Ok(false);
+        }
+        run(job)?;
+        if stopped() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn install_shutdown_signal() -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -55,6 +87,7 @@ fn install_shutdown_signal() -> io::Result<()> {
                 runtime.block_on(async move {
                     if terminate.recv().await.is_some() {
                         SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                        eprintln!("codex-info-recorder diagnostic shutdown requested");
                         owner.unpark();
                     }
                 });
@@ -63,7 +96,7 @@ fn install_shutdown_signal() -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Options {
     codex_home: PathBuf,
     sessions_root: PathBuf,
@@ -74,7 +107,162 @@ struct Options {
     chunk_bytes: u64,
     interval_secs: u64,
     once: bool,
-    activation_timestamp: Option<i64>,
+}
+
+fn start_inactive_history(
+    options: Options,
+    epoch: AccountEpochProof,
+    lease: Arc<ProfileLease>,
+) -> Result<BackgroundWork<Result<(), RecorderError>>, RecorderError> {
+    let mut recorders = None;
+    BackgroundWork::start("codex-info-inactive-history", move || {
+        if shutdown_requested() {
+            return Ok(());
+        }
+        if !recorder_epoch_matches(&options, &epoch, &lease) {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        if recorders.is_none() {
+            let partitions = locate_existing_partitions(&options.codex_home, &options.data_root)
+                .map_err(|error| {
+                    RecorderError::Invalid(format!("inactive catalog unavailable: {error}"))
+                })?;
+            let mut opened = Vec::new();
+            for partition in partitions {
+                if shutdown_requested() {
+                    return Ok(());
+                }
+                if partition.account_scope_id == options.partition.account_scope_id {
+                    continue;
+                }
+                let identity = StoragePartitionIdentity {
+                    schema_version: "codex-info-account-db-v1".into(),
+                    profile_scope_id: partition.profile_scope_id.clone(),
+                    account_scope_id: partition.account_scope_id.clone(),
+                    storage_epoch: partition.storage_epoch,
+                    partition_id: partition.partition_id.clone(),
+                };
+                match synchronize_inactive_partition(
+                    &partition.database_path,
+                    &identity,
+                    partition.login_id.as_deref(),
+                )
+                .and_then(|()| {
+                    Recorder::open_partitioned_for_account_with_lifecycle(
+                        RecorderConfig {
+                            sessions_root: options.sessions_root.clone(),
+                            chunk_bytes: options.chunk_bytes,
+                        },
+                        &partition.database_path,
+                        &identity,
+                        partition.activation_timestamp,
+                        None,
+                        partition
+                            .lifecycle_intervals
+                            .iter()
+                            .map(|interval| {
+                                SessionLifecycleInterval::new(interval.start_at, interval.end_at)
+                            })
+                            .collect(),
+                    )
+                }) {
+                    Ok(recorder) => opened.push((partition.account_scope_id, recorder)),
+                    Err(error) => eprintln!(
+                        "codex-info-recorder inactive history initialization unavailable: {error}"
+                    ),
+                }
+            }
+            recorders = Some(opened);
+        }
+        run_inactive_history(
+            false,
+            shutdown_requested,
+            recorders.as_mut().expect("initialized"),
+            |(scope, historical)| {
+                let guard = || recorder_epoch_matches(&options, &epoch, &lease);
+                let result = historical
+                    .replay_quota_journal(&options.data_root, scope, guard)
+                    .and_then(|_| {
+                        if shutdown_requested() {
+                            Ok(None)
+                        } else {
+                            historical.repair_historical_sources_guarded(guard)
+                        }
+                    });
+                match result {
+                    Ok(Some(generation)) => {
+                        eprintln!("codex-info-recorder inactive historical generation={generation}")
+                    }
+                    Ok(None) => {}
+                    Err(RecorderError::AccountBoundaryChanged) => {
+                        return Err(RecorderError::AccountBoundaryChanged)
+                    }
+                    Err(error) => eprintln!(
+                        "codex-info-recorder inactive accepted-prefix repair unavailable: {error}"
+                    ),
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    })
+}
+
+type CurrentHistoryWorker = BackgroundWork<Result<Option<PreparedHistoricalRepair>, RecorderError>>;
+
+fn service_current_history<F>(
+    current_history: &mut Option<CurrentHistoryWorker>,
+    recorder: &mut Recorder,
+    state_writer: &mut RecorderStateWriter,
+    mut epoch_matches: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut() -> bool,
+{
+    let Some(worker) = current_history.as_mut() else {
+        return Ok(());
+    };
+    let completed = worker.try_result();
+    if worker.is_unavailable() {
+        eprintln!("codex-info-recorder historical preparation worker disconnected; recording continues independently");
+        *current_history = None;
+        return Ok(());
+    }
+    let result = match completed {
+        Some(Ok(Some(prepared))) => {
+            let began = Instant::now();
+            eprintln!("codex-info-recorder diagnostic history_commit start");
+            let result = recorder.commit_prepared_historical_repair(prepared, &mut epoch_matches);
+            eprintln!(
+                "codex-info-recorder diagnostic history_commit finish elapsed_ms={} success={}",
+                began.elapsed().as_millis(),
+                result.is_ok()
+            );
+            result
+        }
+        Some(Err(error)) => Err(error),
+        Some(Ok(None)) | None => Ok(None),
+    };
+    match result {
+        Ok(Some(generation)) => {
+            if !epoch_matches() {
+                return Err(RecorderError::AccountBoundaryChanged.into());
+            }
+            state_writer.write_committed(&recorder.state()?, true)?;
+            eprintln!("codex-info-recorder current accepted-prefix generation={generation}");
+        }
+        Ok(None) => {}
+        Err(RecorderError::AccountBoundaryChanged) => {
+            return Err(RecorderError::AccountBoundaryChanged.into())
+        }
+        Err(error) => {
+            eprintln!("codex-info-recorder current accepted-prefix repair unavailable: {error}")
+        }
+    }
+    if worker.request() {
+        eprintln!("codex-info-recorder diagnostic history_prepare requested");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,16 +397,6 @@ impl AdaptiveThreadCadence {
     }
 }
 
-fn desired_acquisition_degraded(quota: LaneHealth, threads: LaneHealth) -> Option<bool> {
-    if quota == LaneHealth::Failed || threads == LaneHealth::Failed {
-        Some(true)
-    } else if quota == LaneHealth::Ready && threads == LaneHealth::Ready {
-        Some(false)
-    } else {
-        None
-    }
-}
-
 fn sync_quota_poll_health(recorder: &mut Recorder, quota: LaneHealth) {
     if quota != LaneHealth::Unknown {
         if let Err(error) = recorder.set_quota_acquisition_degraded(quota == LaneHealth::Failed) {
@@ -292,7 +470,27 @@ where
                 epoch,
             ))
         }
-        ActiveThreadPollResult::CheckpointMismatch => {
+        ActiveThreadPollResult::CheckpointMismatch { sources } => {
+            if !sources.is_empty() {
+                let state = recorder.state()?;
+                if !epoch_matches(cycle_epoch) {
+                    return Err(RecorderError::AccountBoundaryChanged.into());
+                }
+                if sources.iter().all(|source| {
+                    state.checkpoints.iter().any(|checkpoint| {
+                        checkpoint.root_identity == source.root_identity
+                            && checkpoint.relative_path == source.relative_path
+                            && checkpoint.file_device == source.file_device
+                            && checkpoint.file_inode == source.file_inode
+                    })
+                }) {
+                    // The normal writer admitted these sources while the
+                    // asynchronous probe still held its older inventory.
+                    // Keep last-good health until a complete probe succeeds.
+                    return Ok(false);
+                }
+            }
+            recorder.prioritize_active_thread_sources(&sources);
             if cadence.checkpoint_recovery.request(cycle_epoch) {
                 // No new candidate has been admitted yet. Preserve both the
                 // last complete snapshot and its health while the owner runs
@@ -313,13 +511,8 @@ where
         }
     };
     if let Some((snapshot, epoch)) = snapshot {
-        // A successful thread probe cannot establish a new complete root
-        // while quota is still unknown. Preserve the entire last publication
-        // (including an existing failure), just as health synchronization
-        // does, until a normal cycle has a decided quota outcome.
-        if desired_acquisition_degraded(quota_health, LaneHealth::Ready).is_none() {
-            return Ok(false);
-        }
+        // A same-epoch Thread observation is independent of quota acquisition.
+        // Commit its facts and health even when quota has not completed yet.
         if !epoch_matches(&epoch) {
             return Err(RecorderError::AccountBoundaryChanged.into());
         }
@@ -363,17 +556,6 @@ where
         return Err(RecorderError::AccountBoundaryChanged.into());
     }
     match publication {
-        CyclePublication::Committed { .. }
-            if quota_health != LaneHealth::Ready
-                && !recorder.has_accepted_quota().unwrap_or_else(|error| {
-                    eprintln!("codex-info-recorder quota authority read failed: {error}");
-                    false
-                }) =>
-        {
-            // Accepted current-account input survives restart. Its publication
-            // does not depend on a fresh network response or queue notification.
-            eprintln!("codex-info-recorder awaiting durable current-account quota");
-        }
         CyclePublication::Committed { has_pending } => match recorder.state() {
             Ok(state) => {
                 if !epoch_matches(cycle_epoch) {
@@ -413,7 +595,15 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn complete_cycle_publication_and_wait<Submit, Drain, WaitFor, Sleep, Clock, EpochCheck>(
+fn complete_cycle_publication_and_wait<
+    Submit,
+    Drain,
+    WaitFor,
+    Sleep,
+    Clock,
+    EpochCheck,
+    AfterPublication,
+>(
     publication: CyclePublication,
     options: &Options,
     cycle_epoch: &AccountEpochProof,
@@ -429,6 +619,7 @@ fn complete_cycle_publication_and_wait<Submit, Drain, WaitFor, Sleep, Clock, Epo
     sleep: &mut Sleep,
     clock: &mut Clock,
     epoch_matches: &mut EpochCheck,
+    after_publication: &mut AfterPublication,
 ) -> Result<bool, Box<dyn std::error::Error>>
 where
     Submit: FnMut(&[SessionCheckpoint]) -> bool,
@@ -437,6 +628,8 @@ where
     Sleep: FnMut(Duration),
     Clock: FnMut() -> Instant,
     EpochCheck: FnMut(&AccountEpochProof) -> bool,
+    AfterPublication:
+        FnMut(&mut Recorder, &mut RecorderStateWriter) -> Result<(), Box<dyn std::error::Error>>,
 {
     if let Ok(state) = recorder.state() {
         let _ = cadence.submit(clock(), &state.checkpoints, submit);
@@ -470,6 +663,12 @@ where
         if cadence.checkpoint_recovery.pending {
             *thread_health = LaneHealth::Failed;
             sync_acquisition_health(recorder, quota_health, *thread_health);
+        }
+        if !shutdown_requested() && !cadence.checkpoint_recovery.pending {
+            if !epoch_matches(cycle_epoch) {
+                return Err(RecorderError::AccountBoundaryChanged.into());
+            }
+            after_publication(recorder, state_writer)?;
         }
         return Ok(false);
     }
@@ -556,6 +755,12 @@ where
             wait.missed_deadlines
         );
     }
+    if !shutdown_requested() && !cadence.checkpoint_recovery.pending {
+        if !epoch_matches(cycle_epoch) {
+            return Err(RecorderError::AccountBoundaryChanged.into());
+        }
+        after_publication(recorder, state_writer)?;
+    }
     Ok(true)
 }
 
@@ -569,7 +774,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut options = Options::parse(arguments)?;
     prepare_recorder_data_root(&options.data_root)
         .map_err(|error| format!("prepare recorder data root: {error}"))?;
-    let _profile_lease = ProfileLease::acquire(&options.data_root)?;
+    let _profile_lease = Arc::new(ProfileLease::acquire(&options.data_root)?);
     let previous_authority = RecorderStateWriter::read_previous_authority(&options.data_root)?;
     if AccountEpochProof::capture(&options.codex_home).is_err() {
         let auth_path = options.codex_home.join("auth.json");
@@ -578,34 +783,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return run_without_account(&options, &_profile_lease)
             }
             _ => {
+                if _profile_lease.validate_current(&options.data_root).is_ok() {
+                    let _ =
+                        close_partition_ownership_at(&options.data_root, Utc::now().timestamp());
+                }
                 return Err(RecorderError::Invalid(
                     "Codex account authority is present but invalid".to_owned(),
                 )
-                .into())
+                .into());
             }
         }
     }
-    // A configured activation is useful for deterministic restart fixtures,
-    // but it must never become the boundary of a future account switch.  If
-    // the currently-authenticated partition is not the registry's open
-    // interval (or cannot yet be located), admit the switch at wall-clock
-    // time.  Existing-account admission itself remains idempotent in the
-    // locator, so a restart ignores either value.
-    let requested_activation = match options.activation_timestamp {
-        Some(configured)
-            if locate_existing_partition(&options.codex_home, &options.data_root)
-                .is_ok_and(|partition| partition.current_interval_end.is_none()) =>
-        {
-            Some(configured)
-        }
-        Some(_) | None => Some(Utc::now().timestamp()),
-    };
-    let partition = ensure_partition_with_activation(
+    let partition = reserve_partition_at(
         &options.codex_home,
         &options.data_root,
-        requested_activation,
+        Utc::now().timestamp(),
     )
-    .map_err(|error| format!("locate or allocate account database: {error}"))?;
+    .map_err(|error| format!("reserve account database: {error}"))?;
+    let began_at = Utc::now().timestamp();
+    let startup_epoch = AccountEpochProof::capture(&options.codex_home)
+        .map_err(|_| RecorderError::AccountBoundaryChanged)?;
+    _profile_lease.validate_current(&options.data_root)?;
+    let initial = partition_requires_confirmation(&options.data_root, &partition)?;
+    if initial {
+        if let Err(error) = confirm_codex_account(&startup_epoch, &options.codex_home) {
+            if !startup_epoch.validate_current(&options.codex_home) {
+                let _ = close_partition_ownership_at(&options.data_root, Utc::now().timestamp());
+            }
+            return Err(RecorderError::Invalid(error).into());
+        }
+    }
+    _profile_lease.validate_current(&options.data_root)?;
+    let confirmation = if initial {
+        AccountConfirmation::InitialRpc { began_at }
+    } else {
+        AccountConfirmation::Saved { began_at }
+    };
+    let partition = startup_epoch.run_if_current(&options.codex_home, || {
+        admit_partition(
+            &options.codex_home,
+            &options.data_root,
+            &partition,
+            confirmation,
+            || {
+                (_profile_lease.validate_current(&options.data_root).is_ok()
+                    && startup_epoch.validate_current(&options.codex_home))
+                .then(|| Utc::now().timestamp())
+            },
+        )
+    })??;
     if options.database.as_os_str().is_empty() {
         options.database = partition.database_path.clone();
     } else if options.database != partition.database_path {
@@ -625,8 +851,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             previous.partition_id.as_deref() != Some(options.identity.partition_id.as_str())
         })
         .map(|previous| previous.transition_fingerprint.as_str());
-    let startup_epoch = AccountEpochProof::capture(&options.codex_home)
-        .map_err(|_| RecorderError::AccountBoundaryChanged)?;
     // The raw input owner starts before Session storage admission. A broken
     // derived table or a temporarily unavailable writer must not stop quota
     // acquisition; the accepted journal can be replayed after storage recovers.
@@ -641,7 +865,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if shutdown_requested() {
             return Ok(());
         }
-        if !recorder_epoch_matches(&options, &startup_epoch) {
+        if !recorder_epoch_matches(&options, &startup_epoch, &_profile_lease) {
             return Err(RecorderError::AccountBoundaryChanged.into());
         }
         let initialized = (|| -> Result<Recorder, Box<dyn std::error::Error>> {
@@ -662,7 +886,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 3,
             )?;
             if recorder.reconcile_session_lifecycle_guarded(&startup_backup, || {
-                recorder_epoch_matches(&options, &startup_epoch)
+                recorder_epoch_matches(&options, &startup_epoch, &_profile_lease)
             })? {
                 eprintln!("codex-info-recorder repaired session totals across account lifecycles");
             }
@@ -673,7 +897,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match initialized {
             Ok(recorder) => break recorder,
             Err(error) => {
-                if !recorder_epoch_matches(&options, &startup_epoch) {
+                if !recorder_epoch_matches(&options, &startup_epoch, &_profile_lease) {
                     return Err(RecorderError::AccountBoundaryChanged.into());
                 }
                 eprintln!("codex-info-recorder degraded Session startup: {error}");
@@ -684,63 +908,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
-    // Existing inactive partitions have no live writer. Bring every
-    // initialized partition to the same durable history schema now, while
-    // this process owns the profile lease. Login metadata is optional and
-    // never decides whether historical data is canonicalized.
-    match locate_existing_partitions(&options.codex_home, &options.data_root) {
-        Ok(partitions) => {
-            for partition in partitions {
-                if partition.account_scope_id == options.partition.account_scope_id {
-                    continue;
-                }
-                let identity = StoragePartitionIdentity {
-                    schema_version: "codex-info-account-db-v1".to_owned(),
-                    profile_scope_id: partition.profile_scope_id.clone(),
-                    account_scope_id: partition.account_scope_id.clone(),
-                    storage_epoch: partition.storage_epoch,
-                    partition_id: partition.partition_id.clone(),
-                };
-                if let Err(error) = synchronize_inactive_partition(
-                    &partition.database_path,
-                    &identity,
-                    partition.login_id.as_deref(),
-                )
-                .and_then(|()| {
-                    // Inactive accounts have no later collection cycle. Apply
-                    // the same source-bound startup recovery before publishing
-                    // their retained history, using their registry ownership.
-                    Recorder::open_partitioned_for_account_with_lifecycle(
-                        RecorderConfig {
-                            sessions_root: options.sessions_root.clone(),
-                            chunk_bytes: options.chunk_bytes,
-                        },
-                        &partition.database_path,
-                        &identity,
-                        partition.activation_timestamp,
-                        None,
-                        partition
-                            .lifecycle_intervals
-                            .iter()
-                            .map(|interval| {
-                                SessionLifecycleInterval::new(interval.start_at, interval.end_at)
-                            })
-                            .collect(),
-                    )
-                    .map(drop)
-                }) {
-                    eprintln!(
-                        "codex-info-recorder degraded inactive account history synchronization failed: {error}"
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            eprintln!("codex-info-recorder degraded inactive account catalog failed: {error}")
-        }
+    if shutdown_requested() {
+        return Ok(());
     }
     let mut state_writer =
         RecorderStateWriter::new(&options.data_root, &options.identity, &_profile_lease)?;
+    if !recorder_epoch_matches(&options, &startup_epoch, &_profile_lease) {
+        return Err(RecorderError::AccountBoundaryChanged.into());
+    }
+    if let Some(state) = recorder.acknowledge_existing_owner_guarded(|| {
+        recorder_epoch_matches(&options, &startup_epoch, &_profile_lease)
+    })? {
+        state_writer.write_committed(&state, true)?;
+    }
+    // Historical file reads and inactive DB work have separate owners. Their
+    // pending or failed result cannot postpone a quota/Session collection.
+    let mut current_history = recorder
+        .start_historical_repair_worker()
+        .map_err(|error| {
+            eprintln!("codex-info-recorder historical preparation unavailable: {error}");
+        })
+        .ok();
+    let mut inactive_history = start_inactive_history(
+        options.clone(),
+        startup_epoch.clone(),
+        Arc::clone(&_profile_lease),
+    )
+    .map_err(|error| {
+        eprintln!("codex-info-recorder inactive history worker unavailable: {error}");
+    })
+    .ok();
     let thread_poller = ThreadPoller::start(options.sessions_root.clone());
     let mut schedule = FixedRateSchedule::new(Duration::from_secs(options.interval_secs));
     let mut thread_cadence = AdaptiveThreadCadence::default();
@@ -752,13 +949,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let cycle_epoch = AccountEpochProof::capture(&options.codex_home)
             .map_err(|_| RecorderError::AccountBoundaryChanged)?;
-        if !recorder_epoch_matches(&options, &cycle_epoch) {
+        if !recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease) {
             return Err(RecorderError::AccountBoundaryChanged.into());
         }
+        let early_recollection = if thread_cadence.checkpoint_recovery.pending {
+            if !thread_cadence.begin_checkpoint_recovery(&cycle_epoch) {
+                shutdown_sleep(schedule.time_until_deadline(Instant::now()));
+                schedule.complete_cycle(Instant::now());
+                continue;
+            }
+            true
+        } else {
+            false
+        };
+        let replay_began = Instant::now();
+        eprintln!("codex-info-recorder diagnostic quota_replay start");
         let replay_failed = match recorder.replay_quota_journal(
             &options.data_root,
             &options.partition.account_scope_id,
-            || recorder_epoch_matches(&options, &cycle_epoch),
+            || recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease),
         ) {
             Ok(outcome) => {
                 if outcome.unresolved != 0 {
@@ -777,6 +986,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 true
             }
         };
+        eprintln!(
+            "codex-info-recorder diagnostic quota_replay finish elapsed_ms={}",
+            replay_began.elapsed().as_millis()
+        );
         let mut quota_health = if replay_failed {
             LaneHealth::Failed
         } else {
@@ -784,22 +997,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         sync_quota_poll_health(&mut recorder, quota_poll_health);
         sync_acquisition_health(&mut recorder, quota_health, thread_health);
-        let early_recollection = if thread_cadence.checkpoint_recovery.pending {
-            if !thread_cadence.begin_checkpoint_recovery(&cycle_epoch) {
-                shutdown_sleep(schedule.time_until_deadline(Instant::now()));
-                schedule.complete_cycle(Instant::now());
-                continue;
+        // Receipt/health commits are independent of a potentially long
+        // bounded source reconstruction. Acknowledge their real DB generation
+        // before starting that work; never refresh an unchanged generation.
+        if recorder.has_accepted_quota()? {
+            let state = recorder.state()?;
+            if state.data_generation > state_writer.last_published_generation().unwrap_or(0)
+                && state.collector_epoch.is_some()
+                && state.cycle_seq > 0
+            {
+                if !recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease) {
+                    return Err(RecorderError::AccountBoundaryChanged.into());
+                }
+                state_writer.write_committed(&state, true)?;
             }
-            true
-        } else {
-            false
-        };
+        }
         // Drain notifications for health reporting only. The durable receipt
         // store, including replay after restart, owns the actual quota input.
         let _ = quota_poller.latest();
-        let publication = match recorder
-            .run_cycle_with_stored_quota_guarded(|| recorder_epoch_matches(&options, &cycle_epoch))
-        {
+        if shutdown_requested() {
+            return Ok(());
+        }
+        let collection_began = Instant::now();
+        eprintln!("codex-info-recorder diagnostic session_collection start");
+        let publication = match recorder.run_account_cycle_with_stored_quota_guarded(
+            &options.codex_home,
+            &cycle_epoch,
+            || recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease),
+        ) {
             Ok(Some(report)) => {
                 eprintln!(
                     "codex-info-recorder generation={} accepted={} pending={} sources={}",
@@ -826,6 +1051,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CyclePublication::Degraded
             }
         };
+        eprintln!(
+            "codex-info-recorder diagnostic session_collection finish elapsed_ms={}",
+            collection_began.elapsed().as_millis()
+        );
         if early_recollection && matches!(publication, CyclePublication::Degraded) {
             let now = Instant::now();
             reject_checkpoint_recollection(
@@ -841,7 +1070,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // app-server timeout or malformed response must not delay the next
         // Session token cycle.
         if let Some(event) = quota_poller.take_events().into_iter().last() {
-            if !recorder_epoch_matches(&options, &cycle_epoch) {
+            if !recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease) {
                 return Err(RecorderError::AccountBoundaryChanged.into());
             }
             let input_unrecognized = matches!(event, QuotaPollEvent::InputStored { .. });
@@ -850,7 +1079,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     login_id, epoch, ..
                 }
                 | QuotaPollEvent::InputStored { login_id, epoch } => {
-                    if !recorder_epoch_matches(&options, &epoch) {
+                    if !recorder_epoch_matches(&options, &epoch, &_profile_lease) {
                         return Err(RecorderError::AccountBoundaryChanged.into());
                     }
                     quota_poll_health = LaneHealth::Ready;
@@ -871,7 +1100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "codex-info-recorder degraded account DB label persistence failed: {error}"
                         );
                     }
-                    if !recorder_epoch_matches(&options, &epoch) {
+                    if !recorder_epoch_matches(&options, &epoch, &_profile_lease) {
                         return Err(RecorderError::AccountBoundaryChanged.into());
                     }
                     match epoch.run_if_current(&options.codex_home, || {
@@ -895,7 +1124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("codex-info-recorder quota lane degraded");
                 }
             }
-            if !recorder_epoch_matches(&options, &cycle_epoch) {
+            if !recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease) {
                 return Err(RecorderError::AccountBoundaryChanged.into());
             }
             sync_quota_poll_health(&mut recorder, quota_poll_health);
@@ -907,7 +1136,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             |duration: Duration| thread_poller.wait_for_interruptible(duration, shutdown_requested);
         let mut sleep = shutdown_sleep;
         let mut clock = || Instant::now();
-        let mut epoch_matches = |epoch: &AccountEpochProof| recorder_epoch_matches(&options, epoch);
+        let mut epoch_matches =
+            |epoch: &AccountEpochProof| recorder_epoch_matches(&options, epoch, &_profile_lease);
+        let mut after_publication = |recorder: &mut Recorder,
+                                     state_writer: &mut RecorderStateWriter|
+         -> Result<(), Box<dyn std::error::Error>> {
+            if shutdown_requested() {
+                return Ok(());
+            }
+            if let Some(worker) = inactive_history.as_mut() {
+                if let Some(Err(error)) = worker.try_result() {
+                    if matches!(error, RecorderError::AccountBoundaryChanged) {
+                        return Err(error.into());
+                    }
+                    eprintln!("codex-info-recorder inactive history unavailable: {error}");
+                }
+                if worker.is_unavailable() {
+                    eprintln!("codex-info-recorder inactive history worker disconnected; recording continues independently");
+                    inactive_history = None;
+                } else {
+                    worker.request();
+                }
+            }
+            service_current_history(&mut current_history, recorder, state_writer, || {
+                recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease)
+            })
+        };
         if !complete_cycle_publication_and_wait(
             publication,
             &options,
@@ -924,6 +1178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut sleep,
             &mut clock,
             &mut epoch_matches,
+            &mut after_publication,
         )? {
             return Ok(());
         }
@@ -945,6 +1200,8 @@ fn run_without_account(
             .into())
         }
     }
+    profile_lease.validate_current(&options.data_root)?;
+    close_partition_ownership_at(&options.data_root, Utc::now().timestamp())?;
     let mut state_writer = RecorderStateWriter::new_idle(&options.data_root, profile_lease)?;
     state_writer.write_idle_no_account()?;
     if options.once {
@@ -1015,10 +1272,6 @@ impl Options {
                 .filter(|value| *value > 0)
                 .unwrap_or(DEFAULT_INTERVAL_SECS),
             once: false,
-            activation_timestamp: std::env::var("CODEX_INFO_ACCOUNT_ACTIVATION_UNIX")
-                .ok()
-                .and_then(|value| value.parse::<i64>().ok())
-                .filter(|value| *value > 0),
         };
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -1027,8 +1280,7 @@ impl Options {
                 "--help" | "-h" => {
                     println!(
                         "codex_info_recorder [--once] [--sessions-root PATH] [--database PATH] \
-                         [--chunk-bytes N] [--interval-secs N] \
-                         [--account-activation-unix N]"
+                         [--chunk-bytes N] [--interval-secs N]"
                     );
                     std::process::exit(0);
                 }
@@ -1046,18 +1298,7 @@ impl Options {
                         return Err("--interval-secs must be positive".into());
                     }
                 }
-                "--account-activation-unix" => {
-                    let value = next_u64(&mut arguments, argument)?;
-                    options.activation_timestamp = Some(
-                        i64::try_from(value)
-                            .ok()
-                            .filter(|value| *value > 0)
-                            .ok_or_else(|| {
-                                "--account-activation-unix must be a positive Unix second"
-                                    .to_owned()
-                            })?,
-                    );
-                }
+
                 unknown => return Err(format!("unknown argument: {unknown}")),
             }
         }
@@ -1074,8 +1315,18 @@ fn account_authority_matches(options: &Options) -> bool {
         .is_ok_and(|scope| scope == options.partition.account_scope_id)
 }
 
-fn recorder_epoch_matches(options: &Options, epoch: &AccountEpochProof) -> bool {
-    epoch.validate_current(&options.codex_home) && account_authority_matches(options)
+fn recorder_epoch_matches(
+    options: &Options,
+    epoch: &AccountEpochProof,
+    lease: &ProfileLease,
+) -> bool {
+    let matches = epoch.validate_current(&options.codex_home) && account_authority_matches(options);
+    let lease_current = lease.validate_current(&options.data_root).is_ok();
+    if !matches && lease_current {
+        // Record observed identity loss; RPC-only failure does not reach it.
+        let _ = close_partition_ownership_at(&options.data_root, Utc::now().timestamp());
+    }
+    matches && lease_current
 }
 
 fn next_path<I>(arguments: &mut I, argument: String) -> Result<PathBuf, String>
@@ -1115,6 +1366,76 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn issue604_checkpoint_recollection_and_stop_do_not_wait_for_inactive_history() {
+        let recollection_calls = Cell::new(0);
+        let recollection = run_inactive_history(
+            true,
+            || false,
+            [0, 1],
+            |_| {
+                recollection_calls.set(recollection_calls.get() + 1);
+                Ok::<(), ()>(())
+            },
+        );
+
+        let stopped_calls = Cell::new(0);
+        let stopped = run_inactive_history(
+            false,
+            || true,
+            [0, 1],
+            |_| {
+                stopped_calls.set(stopped_calls.get() + 1);
+                Ok::<(), ()>(())
+            },
+        );
+
+        let between_calls = Cell::new(0);
+        let stop_between = Cell::new(false);
+        let between = run_inactive_history(
+            false,
+            || stop_between.get(),
+            [0, 1],
+            |_| {
+                between_calls.set(between_calls.get() + 1);
+                stop_between.set(true);
+                Ok::<(), ()>(())
+            },
+        );
+
+        let normal_calls = Cell::new(0);
+        let normal = run_inactive_history(
+            false,
+            || false,
+            [0, 1],
+            |_| {
+                normal_calls.set(normal_calls.get() + 1);
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert_eq!(
+            recollection_calls.get(),
+            0,
+            "recollection starts no inactive job"
+        );
+        assert_eq!(
+            recollection,
+            Ok(true),
+            "recollection continues to the active phase"
+        );
+        assert_eq!(stopped_calls.get(), 0, "an existing stop starts no job");
+        assert_eq!(stopped, Ok(false), "an existing stop does not continue");
+        assert_eq!(
+            between_calls.get(),
+            1,
+            "stop prevents the next independent job"
+        );
+        assert_eq!(between, Ok(false), "a stop between jobs does not continue");
+        assert_eq!(normal_calls.get(), 2, "ordinary history runs both jobs");
+        assert_eq!(normal, Ok(true), "ordinary history continues");
+    }
+
+    #[test]
     fn version_is_the_recorder_package_version() {
         assert!(!super::RECORDER_VERSION.is_empty());
         assert!(super::RECORDER_VERSION
@@ -1123,35 +1444,134 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_health_only_recovers_after_both_lanes_are_ready() {
-        assert_eq!(
-            desired_acquisition_degraded(LaneHealth::Ready, LaneHealth::Ready),
-            Some(false)
-        );
-        assert_eq!(
-            desired_acquisition_degraded(LaneHealth::Failed, LaneHealth::Ready),
-            Some(true)
-        );
-        assert_eq!(
-            desired_acquisition_degraded(LaneHealth::Ready, LaneHealth::Failed),
-            Some(true)
-        );
-        assert_eq!(
-            desired_acquisition_degraded(LaneHealth::Failed, LaneHealth::Failed),
-            Some(true)
-        );
-        assert_eq!(
-            desired_acquisition_degraded(LaneHealth::Unknown, LaneHealth::Ready),
-            None
-        );
-        assert_eq!(
-            desired_acquisition_degraded(LaneHealth::Ready, LaneHealth::Unknown),
-            None
-        );
-        assert_eq!(
-            desired_acquisition_degraded(LaneHealth::Unknown, LaneHealth::Unknown),
-            None
-        );
+    fn issue604_normal_publication_precedes_optional_history() {
+        let mut outcomes = Vec::new();
+        for case in [
+            "normal",
+            "once",
+            "no-commit",
+            "degraded",
+            "recollection",
+            "boundary",
+            "stop",
+        ] {
+            SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+            let mut fixture = issue_362_fixture(&format!("history-after-publication-{case}"));
+            fixture.seed_state(false, false);
+            fixture
+                .recorder
+                .run_cycle_with_quota(None)
+                .unwrap()
+                .unwrap();
+            let normal_generation = fixture.recorder.state().unwrap().data_generation;
+            assert!(normal_generation > fixture.state_writer.last_published_generation().unwrap());
+            fixture.options.once = case == "once";
+            let publication = match case {
+                "no-commit" => CyclePublication::NoCommit,
+                "degraded" => CyclePublication::Degraded,
+                _ => CyclePublication::Committed { has_pending: false },
+            };
+            let anchor = Instant::now();
+            let now = Cell::new(anchor);
+            let trace = std::cell::RefCell::new(Vec::new());
+            let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+            let mut cadence = AdaptiveThreadCadence::default();
+            let mut thread_health = LaneHealth::Ready;
+            let mut submit = |_: &[SessionCheckpoint]| {
+                trace.borrow_mut().push("submit");
+                true
+            };
+            let mut polled = Some(if case == "recollection" {
+                ActiveThreadPollResult::CheckpointMismatch {
+                    sources: Vec::new(),
+                }
+            } else {
+                fixture.poll_result("after-normal", 2)
+            });
+            let mut drain = || {
+                trace.borrow_mut().push("drain");
+                polled.take().into_iter().collect()
+            };
+            let mut wait_for = |duration| {
+                trace.borrow_mut().push("wait");
+                now.set(now.get() + duration);
+                None
+            };
+            let mut sleep = |duration| {
+                trace.borrow_mut().push("sleep");
+                now.set(now.get() + duration);
+            };
+            let mut clock = || now.get();
+            let mut epoch_matches = |_: &AccountEpochProof| case != "boundary";
+            let calls = Cell::new(0);
+            let ordered = Cell::new(false);
+            let acknowledged = Cell::new(false);
+            let after_wait = Cell::new(false);
+            let mut history = |recorder: &mut Recorder,
+                               writer: &mut RecorderStateWriter|
+             -> Result<(), Box<dyn std::error::Error>> {
+                calls.set(calls.get() + 1);
+                ordered.set(trace.borrow().starts_with(&["submit", "drain"]));
+                let state = recorder.state()?;
+                acknowledged.set(
+                    state.data_generation >= normal_generation
+                        && writer.last_published_generation() == Some(state.data_generation),
+                );
+                after_wait.set(
+                    now.get()
+                        == if case == "once" {
+                            anchor
+                        } else {
+                            anchor + Duration::from_secs(60)
+                        },
+                );
+                trace.borrow_mut().push("history");
+                Ok(())
+            };
+            SHUTDOWN_REQUESTED.store(case == "stop", Ordering::Release);
+            let result = complete_cycle_publication_and_wait(
+                publication,
+                &fixture.options,
+                &fixture.epoch,
+                &mut fixture.recorder,
+                &mut fixture.state_writer,
+                LaneHealth::Ready,
+                &mut thread_health,
+                &mut schedule,
+                &mut cadence,
+                &mut submit,
+                &mut drain,
+                &mut wait_for,
+                &mut sleep,
+                &mut clock,
+                &mut epoch_matches,
+                &mut history,
+            );
+            SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+            if case == "boundary" {
+                assert!(matches!(
+                    result.unwrap_err().downcast_ref::<RecorderError>(),
+                    Some(RecorderError::AccountBoundaryChanged)
+                ));
+            } else {
+                assert_eq!(result.unwrap(), !matches!(case, "once" | "stop"), "{case}");
+            }
+            if case == "recollection" {
+                assert!(cadence.checkpoint_recovery.pending);
+            }
+            let should_run = !matches!(case, "recollection" | "boundary" | "stop");
+            outcomes.push((
+                case,
+                calls.get(),
+                !should_run || (ordered.get() && after_wait.get()),
+                !matches!(case, "normal" | "once") || acknowledged.get(),
+            ));
+            fixture.cleanup();
+        }
+        assert_eq!(outcomes,[("normal",1,true,true),("once",1,true,true),
+            ("no-commit",1,true,true),("degraded",1,true,true),("recollection",0,true,true),
+            ("boundary",0,true,true),("stop",0,true,true)],
+            "normal commit, Thread drain and publication precede optional history; recovery and stop take priority");
     }
 
     struct Issue362AsyncFixture {
@@ -1274,7 +1694,6 @@ mod tests {
             chunk_bytes: 4096,
             interval_secs: 60,
             once: false,
-            activation_timestamp: None,
         };
         let lease = ProfileLease::acquire(&data_root).expect("profile lease");
         let epoch = AccountEpochProof::capture(&codex_home).expect("account epoch");
@@ -1600,6 +2019,7 @@ mod tests {
             &mut sleep,
             &mut clock,
             &mut epoch_matches,
+            &mut |_, _| Ok(()),
         )
         .expect("adaptive wait");
         assert_eq!(starts, (1..=12).map(|slot| slot * 5).collect::<Vec<_>>());
@@ -1679,6 +2099,7 @@ mod tests {
             &mut sleep,
             &mut clock,
             &mut epoch_matches,
+            &mut |_, _| Ok(()),
         )
     }
 
@@ -1762,16 +2183,139 @@ mod tests {
     }
 
     #[test]
-    fn issue_134_pending_quota_preserves_complete_root() {
+    fn issue604_main_cycles_publish_two_receipts_while_history_is_blocked() {
+        use codex_info_db_writer::QuotaReceipt;
+        use std::io::Write;
+        let mut fixture = issue_362_fixture("main-history-isolation");
+        fixture.seed_state(false, false);
+        let at = Utc::now().timestamp().div_euclid(60) * 60 - 180;
+        let reset = at + 3600;
+        let source = fixture.options.sessions_root.join("active.jsonl");
+        let token = |total, timestamp| {
+            format!(
+                "{}\n",
+                serde_json::json!({"timestamp":chrono::DateTime::<Utc>::from_timestamp(timestamp,0).unwrap().to_rfc3339(),
+                "type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{
+                    "total_tokens":total,"input_tokens":total,"cached_input_tokens":0,"output_tokens":0,"cache_write_input_tokens":0}}}})
+            )
+        };
+        fs::write(&source, format!("{}\n{}\n{}",
+            serde_json::json!({"type":"session_meta","timestamp":chrono::DateTime::<Utc>::from_timestamp(at,0).unwrap().to_rfc3339(),"payload":{"id":"thread","session_id":"thread"}}),
+            serde_json::json!({"type":"turn_context","timestamp":chrono::DateTime::<Utc>::from_timestamp(at,0).unwrap().to_rfc3339(),"payload":{"model":"gpt-6.1-sol"}}), token(0,at))).unwrap();
+        let (began, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let mut worker: Option<CurrentHistoryWorker> = Some(
+            BackgroundWork::start("blocked-main-history", move || {
+                began.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(None)
+            })
+            .unwrap(),
+        );
+        assert!(worker.as_mut().unwrap().request());
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+        let mut cadence = AdaptiveThreadCadence::default();
+        let mut health = LaneHealth::Ready;
+        let before = fixture.recorder.state().unwrap().cycle_seq;
+        for index in 0..2_u64 {
+            let observed = at + index as i64 * 60 + 10;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&source)
+                .unwrap()
+                .write_all(token((index + 1) * 5, observed).as_bytes())
+                .unwrap();
+            // Inject an already independently accepted official receipt at
+            // the production writer boundary; its raw-input proof is owned
+            // by the quota journal's separate direct tests.
+            let mut writer =
+                UsageStore::open_partitioned(&fixture.options.database, &fixture.options.identity)
+                    .unwrap();
+            writer
+                .commit_quota_receipts(
+                    &[QuotaReceipt {
+                        receipt_id: format!("{:064x}", index + 1),
+                        sequence: index as i64 + 1,
+                        observed_at: observed,
+                        reset_at: reset,
+                        window_seconds: 3600,
+                        remaining_percent: 80.0 - index as f64,
+                    }],
+                    false,
+                )
+                .unwrap();
+            drop(writer);
+            fixture
+                .recorder
+                .run_cycle_with_stored_quota_guarded(|| true)
+                .unwrap()
+                .unwrap();
+            complete_cycle_publication_and_wait(
+                CyclePublication::Committed { has_pending: false },
+                &fixture.options,
+                &fixture.epoch,
+                &mut fixture.recorder,
+                &mut fixture.state_writer,
+                LaneHealth::Ready,
+                &mut health,
+                &mut schedule,
+                &mut cadence,
+                &mut |_| false,
+                &mut || Vec::new(),
+                &mut |duration| {
+                    now.set(now.get() + duration);
+                    None
+                },
+                &mut |duration| now.set(now.get() + duration),
+                &mut || now.get(),
+                &mut |_| true,
+                &mut |recorder, state_writer| {
+                    service_current_history(&mut worker, recorder, state_writer, || true)
+                },
+            )
+            .unwrap();
+            let state = fixture.recorder.state().unwrap();
+            assert_eq!(state.cycle_seq, before + index + 1);
+            assert_eq!(
+                fixture.state_writer.last_published_generation().unwrap(),
+                state.data_generation
+            );
+            assert_eq!(
+                fixture.recorder.model_totals().unwrap()["gpt-6.1-sol"].total,
+                (index + 1) * 5
+            );
+            assert!(
+                worker.as_mut().unwrap().try_result().is_none(),
+                "in-flight work cannot be a committed historical batch"
+            );
+        }
+        assert_eq!(now.get(), anchor + Duration::from_secs(120));
+        let db = rusqlite::Connection::open(&fixture.options.database).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM quota_receipts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(db);
+        release.send(()).unwrap();
+        drop(worker);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue604_pending_quota_keeps_independent_thread_commit_and_publication() {
         for degraded in [false, true] {
             let mut fixture = issue_362_fixture("pending-quota-retention");
             let before_ack = fixture.seed_state(false, degraded);
-            let before_row = issue_134_thread_row(&fixture);
             let before_generation = fixture.recorder.state().unwrap().data_generation;
             let anchor = Instant::now();
             let now = Cell::new(anchor);
             let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
-            let candidate = fixture.poll_result("not-yet-complete-root", 2);
+            let candidate = fixture.poll_result("independent-ready-thread", 2);
             let (mut submits, mut drains, mut waits) = (0, 0, 0);
             issue_362_drive_cycle(
                 &mut fixture,
@@ -1787,16 +2331,21 @@ mod tests {
                 &mut waits,
             )
             .unwrap();
+            let (payload, thread_degraded) = issue_134_thread_row(&fixture);
+            let threads: Value = serde_json::from_str(&payload).unwrap();
             assert_eq!(
-                issue_134_thread_row(&fixture),
-                before_row,
-                "an unfinished quota probe is not a failed or complete new root"
+                threads[0]["title"], "independent-ready-thread",
+                "quota acquisition has no veto over a valid same-epoch Thread snapshot"
             );
+            assert_eq!(thread_degraded, 0);
+            let committed = fixture.recorder.state().unwrap().data_generation;
+            assert!(committed > before_generation);
             assert_eq!(
-                fixture.recorder.state().unwrap().data_generation,
-                before_generation
+                fixture.state_writer.last_published_generation().unwrap(),
+                committed,
+                "missing quota cannot hide independently committed data"
             );
-            assert_eq!(fixture.state_bytes(), before_ack);
+            assert_ne!(fixture.state_bytes(), before_ack);
             assert_eq!(now.get(), anchor + Duration::from_secs(60));
             assert_eq!((submits, drains, waits), (1, 1, 1));
             fixture.cleanup();
@@ -1804,7 +2353,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_134_pending_quota_does_not_publish_first_thread_candidate() {
+    fn issue604_pending_quota_does_not_discard_first_thread_observation() {
         let mut fixture = issue_362_fixture("pending-quota-first-root");
         let mut health = LaneHealth::Unknown;
         let mut cadence = AdaptiveThreadCadence::default();
@@ -1830,20 +2379,11 @@ mod tests {
                     r.get(0)
                 })
                 .unwrap();
-            if quota == LaneHealth::Unknown {
-                assert_eq!(rows, 0, "a partial first root must not be published");
-                assert!(!committed);
-                assert_eq!(
-                    fixture.recorder.state().unwrap().data_generation,
-                    before_generation
-                );
-                assert_eq!(health, LaneHealth::Unknown);
-            } else {
-                assert!(committed);
-                assert_eq!(rows, 1);
-                assert_eq!(issue_134_thread_row(&fixture), ("[]".to_owned(), 0));
-                assert_eq!(health, LaneHealth::Ready);
-            }
+            assert_eq!(rows, 1, "quota cannot discard an observed empty Thread set");
+            assert!(committed);
+            assert!(fixture.recorder.state().unwrap().data_generation > before_generation);
+            assert_eq!(issue_134_thread_row(&fixture), ("[]".to_owned(), 0));
+            assert_eq!(health, LaneHealth::Ready);
         }
         fixture.cleanup();
     }
@@ -1975,14 +2515,178 @@ mod tests {
             &mut sleep,
             &mut || now.get(),
             &mut |_| true,
+            &mut |_, _| Ok(()),
         )
         .expect("checkpoint cycle");
     }
 
     #[test]
+    fn issue604_delayed_checkpoint_mismatch_uses_current_committed_inventory() {
+        use std::os::unix::fs::MetadataExt;
+        let mut fixture = issue_362_fixture("delayed-checkpoint-mismatch");
+        fixture.seed_state(false, false);
+        let root = &fixture.options.sessions_root;
+        let noop = b"{\"type\":\"response_item\",\"timestamp\":\"2026-10-17T00:00:00Z\",\"payload\":{\"type\":\"message\"}}\n";
+        let active = root.join("active.jsonl");
+        fs::write(&active, noop).unwrap();
+        let root_metadata = fs::metadata(root).unwrap();
+        let metadata = fs::metadata(&active).unwrap();
+        let source = codex_info_db_writer::RecordedSessionSource {
+            root_identity: format!("unix:{}:{}", root_metadata.dev(), root_metadata.ino()),
+            relative_path: "active.jsonl".to_owned(),
+            file_device: metadata.dev(),
+            file_inode: metadata.ino(),
+            file_bytes: metadata.len(),
+            modified_nanos: metadata
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        };
+        let delayed = ActiveThreadPollResult::CheckpointMismatch {
+            sources: vec![source.clone()],
+        };
+        assert!(fixture.recorder.state().unwrap().checkpoints.is_empty());
+        fixture.recorder.run_cycle_with_quota(None).unwrap();
+        let committed = fixture.recorder.state().unwrap();
+        assert!(committed.checkpoints.iter().any(|checkpoint| {
+            checkpoint.root_identity == source.root_identity
+                && checkpoint.relative_path == source.relative_path
+                && checkpoint.file_device == source.file_device
+                && checkpoint.file_inode == source.file_inode
+                && checkpoint.committed_offset == noop.len() as u64
+        }));
+        let before = issue_134_thread_row(&fixture);
+        let generation = fixture.recorder.generation().unwrap();
+        let publication = fixture.state_bytes();
+        for attempted in [true, false] {
+            let mut cadence = AdaptiveThreadCadence::default();
+            if attempted {
+                assert!(cadence.checkpoint_recovery.request(&fixture.epoch));
+                assert!(cadence.begin_checkpoint_recovery(&fixture.epoch));
+            }
+            let mut health = LaneHealth::Ready;
+            assert!(
+                !commit_thread_poll_result(
+                    delayed.clone(),
+                    &fixture.epoch,
+                    &mut fixture.recorder,
+                    LaneHealth::Ready,
+                    &mut health,
+                    &mut cadence,
+                    Instant::now(),
+                    |_| true,
+                )
+                .unwrap(),
+                "checkpoint presence does not establish Thread success"
+            );
+            assert_eq!(
+                health,
+                LaneHealth::Ready,
+                "resolved old mismatch is not failure"
+            );
+            assert_eq!(issue_134_thread_row(&fixture), before);
+            assert_eq!(fixture.recorder.generation().unwrap(), generation);
+            assert_eq!(fixture.state_bytes(), publication);
+            assert!(!cadence.checkpoint_recovery.pending);
+            assert!(!cadence.begin_checkpoint_recovery(&fixture.epoch));
+        }
+        fixture.seed_state(false, true);
+        let failed_before = issue_134_thread_row(&fixture);
+        let failed_generation = fixture.recorder.generation().unwrap();
+        let mut cadence = AdaptiveThreadCadence::default();
+        let mut health = LaneHealth::Failed;
+        assert!(!commit_thread_poll_result(
+            delayed,
+            &fixture.epoch,
+            &mut fixture.recorder,
+            LaneHealth::Ready,
+            &mut health,
+            &mut cadence,
+            Instant::now(),
+            |_| true,
+        )
+        .unwrap());
+        assert_eq!(
+            health,
+            LaneHealth::Failed,
+            "only a complete snapshot can recover"
+        );
+        assert_eq!(issue_134_thread_row(&fixture), failed_before);
+        assert_eq!(fixture.recorder.generation().unwrap(), failed_generation);
+        assert!(!cadence.checkpoint_recovery.pending);
+
+        for physical_key in ["root", "path", "device", "inode", "mixed"] {
+            fixture.seed_state(false, false);
+            let payload = issue_134_thread_row(&fixture).0;
+            let mut missing = source.clone();
+            match physical_key {
+                "root" => missing.root_identity.push_str("-different"),
+                "path" | "mixed" => missing.relative_path = "missing.jsonl".to_owned(),
+                "device" => missing.file_device += 1,
+                "inode" => missing.file_inode += 1,
+                _ => unreachable!(),
+            }
+            let sources = if physical_key == "mixed" {
+                vec![source.clone(), missing]
+            } else {
+                vec![missing]
+            };
+            let mut cadence = AdaptiveThreadCadence::default();
+            assert!(cadence.checkpoint_recovery.request(&fixture.epoch));
+            assert!(cadence.begin_checkpoint_recovery(&fixture.epoch));
+            let mut health = LaneHealth::Ready;
+            assert!(!commit_thread_poll_result(
+                ActiveThreadPollResult::CheckpointMismatch { sources },
+                &fixture.epoch,
+                &mut fixture.recorder,
+                LaneHealth::Ready,
+                &mut health,
+                &mut cadence,
+                Instant::now(),
+                |_| true,
+            )
+            .unwrap());
+            assert_eq!(health, LaneHealth::Failed, "{physical_key}");
+            assert_eq!(
+                issue_134_thread_row(&fixture),
+                (payload, 1),
+                "{physical_key}"
+            );
+            assert!(!cadence.checkpoint_recovery.pending);
+            assert!(!cadence.begin_checkpoint_recovery(&fixture.epoch));
+        }
+        fixture.cleanup();
+    }
+
+    #[test]
     fn issue_134_checkpoint_reconciliation_recovers_on_original_deadline() {
+        use std::os::unix::fs::MetadataExt;
         let mut fixture = issue_362_fixture("checkpoint-reconcile-success");
         fixture.seed_state(false, false);
+        fixture.recorder.run_cycle_with_quota(None).unwrap();
+        assert_eq!(fixture.recorder.state().unwrap().cycle_seq, 1);
+        let root = &fixture.options.sessions_root;
+        let noop = b"{\"type\":\"response_item\",\"timestamp\":\"2026-10-17T00:00:00Z\",\"payload\":{\"type\":\"message\"}}\n";
+        fs::write(root.join("a-backlog.jsonl"), noop.repeat(3000)).unwrap();
+        let active = root.join("b-active.jsonl");
+        fs::write(&active, noop).unwrap();
+        let root_metadata = fs::metadata(root).unwrap();
+        let metadata = fs::metadata(&active).unwrap();
+        let missing = codex_info_db_writer::RecordedSessionSource {
+            root_identity: format!("unix:{}:{}", root_metadata.dev(), root_metadata.ino()),
+            relative_path: "b-active.jsonl".to_owned(),
+            file_device: metadata.dev(),
+            file_inode: metadata.ino(),
+            file_bytes: metadata.len(),
+            modified_nanos: metadata
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        };
         let before = issue_134_thread_row(&fixture);
         let anchor = Instant::now();
         let now = Cell::new(anchor);
@@ -1995,7 +2699,9 @@ mod tests {
             &mut health,
             &mut schedule,
             &now,
-            Some(ActiveThreadPollResult::CheckpointMismatch),
+            Some(ActiveThreadPollResult::CheckpointMismatch {
+                sources: vec![missing.clone()],
+            }),
             true,
         );
         assert_eq!(now.get(), anchor);
@@ -2005,10 +2711,37 @@ mod tests {
             "pending admission must not publish error or partial threads"
         );
         assert!(cadence.begin_checkpoint_recovery(&fixture.epoch));
+        // The production loop runs replaced-prefix repair before collection.
+        // A missing active source owns this same cycle budget first. No old
+        // prefix input may be touched until that guarded collection runs.
+        let held_root = fixture.options.sessions_root.with_extension("held");
+        fs::rename(&fixture.options.sessions_root, &held_root).unwrap();
+        let deferred = fixture.recorder.repair_replaced_sources_guarded(|| true);
+        fs::rename(&held_root, &fixture.options.sessions_root).unwrap();
+        assert!(
+            matches!(deferred, Ok(None)),
+            "unrelated prefix repair must defer without scanning or spending the recovery budget"
+        );
         fixture
             .recorder
             .run_cycle_with_quota_guarded(None, || true)
             .expect("one guarded collection");
+        assert!(
+            fixture
+                .recorder
+                .state()
+                .unwrap()
+                .checkpoints
+                .iter()
+                .any(|checkpoint| {
+                    checkpoint.relative_path == missing.relative_path
+                        && checkpoint.file_device == missing.file_device
+                        && checkpoint.file_inode == missing.file_inode
+                        && checkpoint.committed_offset == noop.len() as u64
+                }),
+            "main must pass the exact missing source into its one existing guarded recollection"
+        );
+        assert_eq!(fixture.options.chunk_bytes, 4096);
         let complete = fixture.poll_result("verified new Session", 2);
         issue_134_drive_checkpoint_cycle(
             &mut fixture,
@@ -2048,7 +2781,9 @@ mod tests {
             &mut health,
             &mut schedule,
             &now,
-            Some(ActiveThreadPollResult::CheckpointMismatch),
+            Some(ActiveThreadPollResult::CheckpointMismatch {
+                sources: Vec::new(),
+            }),
             true,
         );
         assert!(cadence.begin_checkpoint_recovery(&fixture.epoch));
@@ -2058,7 +2793,9 @@ mod tests {
             &mut health,
             &mut schedule,
             &now,
-            Some(ActiveThreadPollResult::CheckpointMismatch),
+            Some(ActiveThreadPollResult::CheckpointMismatch {
+                sources: Vec::new(),
+            }),
             true,
         );
         assert_eq!(now.get(), anchor + Duration::from_secs(60));
@@ -2086,7 +2823,9 @@ mod tests {
             &mut health,
             &mut schedule,
             &now,
-            Some(ActiveThreadPollResult::CheckpointMismatch),
+            Some(ActiveThreadPollResult::CheckpointMismatch {
+                sources: Vec::new(),
+            }),
             false,
         );
         assert_eq!(now.get(), anchor + Duration::from_secs(6));
@@ -2131,7 +2870,9 @@ mod tests {
             &mut health,
             &mut schedule,
             &now,
-            Some(ActiveThreadPollResult::CheckpointMismatch),
+            Some(ActiveThreadPollResult::CheckpointMismatch {
+                sources: Vec::new(),
+            }),
             true,
         );
         assert_eq!(issue_134_thread_row(&fixture), before);
@@ -2155,7 +2896,9 @@ mod tests {
             &mut health,
             &mut schedule,
             &now,
-            Some(ActiveThreadPollResult::CheckpointMismatch),
+            Some(ActiveThreadPollResult::CheckpointMismatch {
+                sources: Vec::new(),
+            }),
             true,
         );
         assert!(cadence.begin_checkpoint_recovery(&fixture.epoch));
@@ -2204,7 +2947,9 @@ mod tests {
             &mut LaneHealth::Ready,
             &mut FixedRateSchedule::anchored(anchor, Duration::from_secs(60)),
             &now,
-            Some(ActiveThreadPollResult::CheckpointMismatch),
+            Some(ActiveThreadPollResult::CheckpointMismatch {
+                sources: Vec::new(),
+            }),
             true,
         );
         assert_eq!(issue_134_thread_row(&fixture).1, 1);
@@ -2227,7 +2972,9 @@ mod tests {
             LaneHealth::Ready,
             &mut schedule,
             &now,
-            Some(ActiveThreadPollResult::CheckpointMismatch),
+            Some(ActiveThreadPollResult::CheckpointMismatch {
+                sources: Vec::new()
+            }),
             vec![true; 8],
             None,
             &mut submits,
@@ -2255,7 +3002,9 @@ mod tests {
             LaneHealth::Ready,
             &mut schedule,
             &now,
-            Some(ActiveThreadPollResult::CheckpointMismatch),
+            Some(ActiveThreadPollResult::CheckpointMismatch {
+                sources: Vec::new(),
+            }),
             vec![true; 8],
             None,
             &mut 0,

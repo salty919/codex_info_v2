@@ -11,6 +11,7 @@ CONTROL_SCHEMA="codex-info-control-state-v1"
 REPOSITORY="salty919/codex_info_v2"
 RELEASES_URL="https://api.github.com/repos/salty919/codex_info_v2/releases/latest"
 HEALTH_URL="http://127.0.0.1:8787/v1/health"
+CURRENT_URL="http://127.0.0.1:8787/v4/current"
 DETAILS_URL="http://127.0.0.1:8787/v1/details"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 CURL_BIN="${CURL_BIN:-curl}"
@@ -2685,7 +2686,7 @@ proc_identity_check() {
     [[ "$owner" == "$pid" ]] || safe_blocked 'listener socket is not owned by MainPID'
 }
 health_readback() {
-    local pid="$1" before="$2" version="$3" source="$4" manifest_hash="$5" binary_hash="$6" response details after after_pid expected_exe health_limit health_now health_remaining readback_deadline
+    local pid="$1" before="$2" version="$3" source="$4" manifest_hash="$5" binary_hash="$6" response details after after_pid expected_exe health_limit health_now health_remaining readback_deadline current_status current_version
     expected_exe="$generations_dir/$version-$source-$manifest_hash/codex_info_rest"
     proc_identity_check "$pid" "$binary_hash" "$expected_exe"
     health_now="$(now_unix)" || safe_blocked 'health clock is unavailable'
@@ -2720,7 +2721,19 @@ PY
     health_now="$(now_unix)" || safe_blocked 'details clock is unavailable'
     health_limit=$((readback_deadline - health_now))
     (( health_limit > 0 )) || safe_blocked 'details readiness deadline expired'
-    details="$("$CURL_BIN" --fail --silent --show-error --proto '=http' --max-time "$health_limit" "$DETAILS_URL")" || safe_blocked 'details request failed'
+    response="$("$CURL_BIN" --silent --show-error --proto '=http' --max-time "$health_limit" --write-out $'\n%{http_code}' "$CURRENT_URL")" || safe_blocked 'current request failed'
+    current_status="${response##*$'\n'}"
+    details="${response%$'\n'*}"
+    current_version=v4
+    if [[ "$current_status" == 404 ]]; then
+        health_now="$(now_unix)" || safe_blocked 'details clock is unavailable'
+        health_limit=$((readback_deadline - health_now))
+        (( health_limit > 0 )) || safe_blocked 'details readiness deadline expired'
+        details="$("$CURL_BIN" --fail --silent --show-error --proto '=http' --max-time "$health_limit" "$DETAILS_URL")" || safe_blocked 'details request failed'
+        current_version=legacy
+    elif [[ "$current_status" != 200 ]]; then
+        safe_blocked 'current response is unavailable'
+    fi
     python3 -c '
 import json,sys
 def pairs(items):
@@ -2732,12 +2745,34 @@ def pairs(items):
 try: document=json.load(sys.stdin,object_pairs_hook=pairs)
 except Exception as error: raise SystemExit(str(error))
 if not isinstance(document,dict): raise SystemExit("details is not an object")
-if document.get("state") not in {"ready","auth_required","error"}:
+if document.get("state") not in {"ready","auth_required"}:
     raise SystemExit("details state is unknown")
 observed_at=document.get("observed_at")
-if isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0:
+if not (sys.argv[1] == "v4" and document["state"] == "auth_required" and observed_at is None) and (isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0):
     raise SystemExit("details observed_at is invalid")
-' <<< "$details"
+if sys.argv[1] == "v4":
+    required={"api_version","state","observed_at","authenticated","plan_label","quota","models_status","models","active_thread_count","open_session_thread_count"}
+    if set(document) != required or document["api_version"] != "v4": raise SystemExit("current schema is unknown")
+    def uint(value): return type(value) is int and 0 <= value <= 18446744073709551615
+    if type(document["authenticated"]) is not bool or not (document["plan_label"] is None or isinstance(document["plan_label"],str)): raise SystemExit("current account metadata is invalid")
+    if not all(uint(document[k]) for k in ("active_thread_count","open_session_thread_count")) or document["active_thread_count"] > document["open_session_thread_count"]: raise SystemExit("current thread counts are invalid")
+    quota=document["quota"]
+    if quota is not None:
+        if not isinstance(quota,dict) or set(quota) != {"remaining_percent","reset_at","window_seconds","monthly"}: raise SystemExit("current quota schema is invalid")
+        remaining=quota["remaining_percent"]
+        if type(remaining) not in {int,float} or not 0 <= remaining <= 100 or not uint(quota["reset_at"]) or quota["reset_at"] == 0 or not uint(quota["window_seconds"]) or quota["window_seconds"] == 0 or type(quota["monthly"]) is not bool: raise SystemExit("current quota is invalid")
+    if document["models_status"] not in {"complete","partial","unavailable"} or not isinstance(document["models"],list): raise SystemExit("current models are invalid")
+    if document["models_status"] == "unavailable" and document["models"]: raise SystemExit("unavailable current models are not empty")
+    previous=""
+    for model in document["models"]:
+        if not isinstance(model,dict) or set(model) != {"model","total_tokens","input_tokens","cached_input_tokens","cache_write_input_tokens","output_tokens","estimated_cost"}: raise SystemExit("current model schema is invalid")
+        if not isinstance(model["model"],str) or model["model"] <= previous or not uint(model["total_tokens"]): raise SystemExit("current model identity or total is invalid")
+        previous=model["model"]
+        for key in ("input_tokens","cached_input_tokens","cache_write_input_tokens","output_tokens"):
+            if model[key] is not None and (not uint(model[key]) or model[key] > model["total_tokens"]): raise SystemExit("current component is invalid")
+        cost=model["estimated_cost"]
+        if cost is not None and (not isinstance(cost,dict) or set(cost) != {"price_version","ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars"}): raise SystemExit("current price schema is invalid")
+' "$current_version" <<< "$details"
     local recorder_pid
     recorder_pid="$(recorder_systemd_pid)"; [[ "$recorder_pid" != 0 ]] || safe_blocked 'recorder service has no MainPID'
     recorder_identity_check "$recorder_pid" "$version" "$source" "$manifest_hash"

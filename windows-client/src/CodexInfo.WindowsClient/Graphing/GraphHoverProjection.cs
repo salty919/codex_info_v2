@@ -3,7 +3,10 @@
 
 namespace CodexInfo.WindowsClient.Graphing;
 
-internal sealed record GraphHoverSnapshot(long Timestamp, IReadOnlyList<GraphHoverRow> Rows);
+internal sealed record GraphHoverSnapshot(long Timestamp, IReadOnlyList<GraphHoverRow> Rows)
+{
+    internal IReadOnlyList<string> Details { get; init; } = [];
+}
 
 internal readonly record struct GraphHoverRow(
     GraphSeries Series,
@@ -28,6 +31,7 @@ internal static class GraphHoverProjection
     {
         ArgumentNullException.ThrowIfNull(scene);
         ArgumentNullException.ThrowIfNull(visibleSeries);
+        if (scene.IsRecordedScope) return FindRecorded(scene, timestamp, visibleSeries);
         if (!double.IsFinite(timestamp) ||
             timestamp < scene.PeriodStartAt ||
             timestamp > scene.PeriodEndAt)
@@ -57,6 +61,55 @@ internal static class GraphHoverProjection
             scene.PeriodStartAt,
             scene.PeriodEndAt,
             visibleSeries);
+    }
+
+    private static GraphHoverSnapshot? FindRecorded(GraphScene scene, double timestamp, IReadOnlySet<GraphSeries> visibleSeries)
+    {
+        if (!double.IsFinite(timestamp) || timestamp < scene.PeriodStartAt || timestamp > scene.PeriodEndAt || scene.RecordedBundle is not { } bundle)
+            return null;
+        var culture = System.Globalization.CultureInfo.CurrentCulture;
+        string Tokens(ulong? value) => value?.ToString("N0", culture) ?? Localization.RecordedUsageText.Unknown;
+        bool Visible(string name) => ViewModels.ModelUsageViewModel.DisplayFamilyName(name) switch
+        {
+            "SOL" => visibleSeries.Contains(GraphSeries.Sol),
+            "TERRA" => visibleSeries.Contains(GraphSeries.Terra),
+            "LUNA" => visibleSeries.Contains(GraphSeries.Luna),
+            "ASTRA" => visibleSeries.Contains(GraphSeries.Astra),
+            _ => visibleSeries.Any(series => series != GraphSeries.Remaining),
+        };
+        var quotaIndices = visibleSeries.Contains(GraphSeries.Remaining)
+            ? Enumerable.Range(0, scene.Timestamps.Count).Where(index => scene.RemainingObserved[index] &&
+                double.IsFinite(scene.ObservedRemainingValues[index])).ToArray() : [];
+        var modelTimes = scene.IsSavedObservation
+            ? bundle.Observations.Where(row => row.Models.Any(model => Visible(model.StoredModelKey))).Select(row => row.Timestamp)
+            : bundle.Samples.Where(row => row.Models.Any(model => Visible(model.Name))).Select(row => row.Timestamp);
+        var times = modelTimes.Concat(quotaIndices.Select(index => (long)scene.Timestamps[index])).Distinct().ToArray();
+        if (times.Length == 0) return null;
+        var at = times.OrderBy(time => Math.Abs(time - timestamp)).ThenBy(time => time).First();
+        var details = new List<string> { Localization.RecordedUsageText.PeriodUnknown };
+        var rows = quotaIndices.Where(index => scene.Timestamps[index] == at)
+            .Select(index => new GraphHoverRow(GraphSeries.Remaining, null, scene.ObservedRemainingValues[index])).ToArray();
+        foreach (var observation in bundle.QuotaObservations.Where(row => row.ObservedAt == at))
+            details.Add($"R: {observation.ResetAt.ToString(culture)}");
+        if (scene.IsSavedObservation)
+        {
+            foreach (var saved in bundle.Observations.Where(row => row.Timestamp == at))
+            {
+                var models = saved.Models.Where(model => Visible(model.StoredModelKey)).ToArray();
+                if (models.Length == 0) continue;
+                details.Add("R: " + (saved.RawResetAt?.ToString(culture) ?? Localization.RecordedUsageText.Unknown));
+                foreach (var model in models)
+                    details.Add($"{model.StoredModelKey}: T {Tokens(model.TotalTokens)} / I {Tokens(model.InputTokens)} / C {Tokens(model.CachedInputTokens)} / W {Tokens(model.CacheWriteInputTokens)} / O {Tokens(model.OutputTokens)} / USD {model.TotalDollars?.ToString("R", culture) ?? Localization.RecordedUsageText.PriceUnknown}");
+                details.AddRange(saved.UnresolvedReasons.Select(Localization.RecordedUsageText.Reason));
+            }
+        }
+        else
+        {
+            foreach (var model in bundle.Samples.Where(sample => sample.Timestamp == at).SelectMany(sample => sample.Models)
+                .Where(model => Visible(model.Name)))
+                details.Add($"{model.Name}: T {Tokens(model.TotalTokens)} / I {Tokens(model.InputTokens)} / C {Tokens(model.CachedInputTokens)} / W {Tokens(model.CacheWriteInputTokens)} / O {Tokens(model.OutputTokens)} / USD {model.Cost?.TotalDollars.ToString("R", culture) ?? Localization.RecordedUsageText.PriceUnknown}");
+        }
+        return new(at, rows) { Details = details.AsReadOnly() };
     }
 
     private static GraphScene? FindOwningPeriod(

@@ -117,11 +117,15 @@
   </Window.Styles>
   <Grid Margin="24" RowDefinitions="44,36,*,Auto" RowSpacing="12">
     <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
-      <Grid Grid.Column="0" ColumnDefinitions="Auto,*" ColumnSpacing="10"
+      <Grid Grid.Column="0" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10"
             Background="Transparent" PointerPressed="OnTitlePointerPressed">
         <PathIcon Classes="heading-icon" Data="{StaticResource IconSettings}" />
         <TextBlock Classes="window-title" Grid.Column="1"
                    Text="{Binding Texts.Settings}" VerticalAlignment="Center" />
+        <Button Grid.Column="2" Classes="window-control" Click="OnMinimizeWindow"
+                AutomationProperties.Name="{Binding Texts.Minimize}"
+                AutomationProperties.AutomationId="Settings.Window.Minimize"
+                Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
       </Grid>
       <Button Grid.Column="1" Classes="window-control"
               Click="OnClose"

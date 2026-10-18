@@ -318,7 +318,7 @@ public sealed class MainLayoutParityTests
         Assert.Equal("0,0,16,0", items.Attribute("Margin")?.Value);
         var header = table.Descendants().Single(element =>
             element.Name.LocalName == "Grid" &&
-            element.Elements().Any(child => child.Attribute("Text")?.Value == "{Binding Texts.ModelLabel}"));
+            element.Elements().Any(child => child.Attribute("Text")?.Value == "{Binding ModelUsageHeading}"));
         Assert.Equal(items.Attribute("Margin")?.Value, header.Attribute("Margin")?.Value);
         var row = items.Descendants().Single(element =>
             element.Name.LocalName == "Grid" && element.Attribute("Height")?.Value == "22");

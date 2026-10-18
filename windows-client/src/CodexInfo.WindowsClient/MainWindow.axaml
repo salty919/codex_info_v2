@@ -175,7 +175,7 @@
     <Border Grid.Row="1" Classes="section" Padding="13,5" IsVisible="{Binding ShowAuthenticatedContent}">
       <Grid RowDefinitions="*,6" ColumnDefinitions="*,Auto" ColumnSpacing="14" RowSpacing="4">
         <StackPanel Spacing="2" VerticalAlignment="Center">
-          <TextBlock Classes="label" Text="{Binding Texts.RemainingQuota}" />
+          <TextBlock Classes="label" Text="{Binding QuotaHeading}" />
           <TextBlock FontSize="36"
                      FontWeight="SemiBold"
                      Foreground="{DynamicResource ThemeF2F6FC}"
@@ -262,7 +262,7 @@
                      AutomationProperties.AutomationId="Main.QuotaPeriodGauge"
                      AutomationProperties.Name="{Binding QuotaWindowText}"
                      AutomationProperties.HelpText="{Binding QuotaRemainingText}" />
-          <TextBlock Grid.Row="2" Classes="metric-label" Margin="0,2,0,0" VerticalAlignment="Top" Text="{Binding Texts.ResetTime}" />
+          <TextBlock Grid.Row="2" Classes="metric-label" Margin="0,2,0,0" VerticalAlignment="Top" Text="{Binding QuotaResetHeading}" />
           <TextBlock Grid.Row="2" Grid.Column="2" Classes="metric-value" Margin="0,2,0,0" VerticalAlignment="Top" Text="{Binding ResetAtText}" AutomationProperties.AutomationId="Main.QuotaResetAt" />
           <TextBlock Grid.Row="2" Grid.Column="3" Classes="metric-label" Margin="12,2,0,0" VerticalAlignment="Top" Text="{Binding Texts.ObservedAt}" />
           <TextBlock Grid.Row="2" Grid.Column="5" Classes="metric-value" Margin="0,2,0,0" VerticalAlignment="Top" Text="{Binding ObservedAtText}" AutomationProperties.AutomationId="Main.QuotaObservedAt" />
@@ -328,7 +328,9 @@
         <Grid Margin="0,0,16,0"
               ColumnDefinitions="2.4*,*,*,*,*,*,*"
               ColumnSpacing="6">
-          <TextBlock Classes="metric-label" VerticalAlignment="Center" Text="{Binding Texts.ModelLabel}" />
+          <TextBlock Classes="metric-label" VerticalAlignment="Center" Text="{Binding ModelUsageHeading}" TextTrimming="CharacterEllipsis"
+                     ToolTip.Tip="{Binding ModelUsagePeriodText}" AutomationProperties.Name="{Binding ModelUsagePeriodText}"
+                     AutomationProperties.AutomationId="Main.RecordedUsageScope" />
           <TextBlock Grid.Column="1" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Input}" />
           <TextBlock Grid.Column="3" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.CachedInput}" />
           <TextBlock Grid.Column="5" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Output}" />
