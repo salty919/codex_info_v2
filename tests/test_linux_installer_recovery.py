@@ -296,7 +296,7 @@ class LegacyRecoveryTests(unittest.TestCase):
             'trap \'if [[ "$BASH_COMMAND" == initialize_mutating_action ]]; then '
             'trap - DEBUG; source "$HOME/startup-model.sh"; fi\' DEBUG\n'
         )
-        return subprocess.run(  # nosec B603 # digest-pinned isolated executable, stub host effects.
+        return subprocess.run(  # noqa: S603 -- digest-pinned isolated executable, stub host effects.  # nosec B603
             ["/bin/bash", str(self.paths["install.sh"]), "--startup-reconcile", "--quiet"],
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": str(self.home),
                  "BASH_ENV": str(hook), "SHIM": str(self.shim), "DESIRED": "running",

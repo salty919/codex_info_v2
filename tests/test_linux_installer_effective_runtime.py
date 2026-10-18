@@ -187,7 +187,7 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         self.override = self.unit_dir / "codex-info-recorder.service.d/90-issue-134-current-cli.conf"
 
     def command(self, script, *args):
-        return subprocess.run(  # nosec B603 B607 # fixed offline installer/build commands and isolated environment.
+        return subprocess.run(  # noqa: S603 -- fixed offline installer/build commands and isolated environment.  # nosec B603 B607
             ["/bin/bash", str(script), *map(str, args)], env=self.env,
             capture_output=True, text=True, check=False, timeout=90,
         )
@@ -211,7 +211,7 @@ systemd_pid() { printf 7; }
 recorder_systemd_pid() { printf 8; }
 safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
 """ + urls + "\nhealth_readback() {\n" + function + "\n}\nhealth_readback 7 101 1.0.19 source manifest hash\n"
-        return subprocess.run(  # nosec B603 B607 # repository function and isolated fake HTTP environment.
+        return subprocess.run(  # noqa: S603 -- repository function and isolated fake HTTP environment.  # nosec B603 B607
             ["/bin/bash", "--noprofile", "--norc", "-c", shell], env=self.env,
             capture_output=True, text=True, check=False, timeout=5,
         )
@@ -294,7 +294,7 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]).touch()
         pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"]).touch()
         self.control("running")
-        result = subprocess.run(  # nosec B603 # this offline adapter updates fixture lock identity only.
+        result = subprocess.run(  # noqa: S603 -- this offline adapter updates fixture lock identity only.  # nosec B603
             ["/usr/bin/python3", str(self.bin / "systemctl"), "--user", "restart", "--no-block", "codex-info-recorder.service"],
             env=self.env, capture_output=True, text=True, check=False, timeout=5,
         )

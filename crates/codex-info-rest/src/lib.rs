@@ -1010,6 +1010,69 @@ impl AccountStore {
         }
     }
 
+    fn admit_independent_history(
+        &self,
+        mut candidate: PublishedSnapshot,
+        source: &ReaderIntent,
+    ) -> Result<(), &'static str> {
+        let mut issuer = self.issuer.lock().unwrap_or_else(|p| p.into_inner());
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.current.is_none()
+            || inner.reader_unavailable
+            || !same_history_owner(inner.admitted_source.as_ref(), Some(source))
+        {
+            return Err("intent_superseded");
+        }
+        let proof = candidate
+            .history_reprojection_witness
+            .as_ref()
+            .filter(|_| candidate.history_available)
+            .ok_or("history_authority_changed")?;
+        let window = proof
+            .publication_window()
+            .ok_or("history_authority_changed")?;
+        if let ReaderIntent::Recorder(notice) = source {
+            if proof.collection_commit() != Some(notice.commit)
+                || candidate.generation != notice.commit.generation
+            {
+                return Err("commit_not_acknowledged");
+            }
+        }
+        if let Some(previous) = &inner.last_verified_history {
+            if candidate.generation < previous.generation {
+                return Err("generation_superseded");
+            }
+            let old_window = previous
+                .history_reprojection_witness
+                .as_ref()
+                .and_then(|proof| proof.publication_window())
+                .ok_or("history_authority_changed")?;
+            if window.at < old_window.at {
+                return Err("publication_window_superseded");
+            }
+            if candidate.generation == previous.generation
+                && !same_commit_reprojection(previous, &candidate, Some(previous))
+            {
+                return Err("same_commit_reprojection_rejected");
+            }
+            if same_public_domain(previous, &candidate) {
+                candidate.pair.clone_from(&previous.pair);
+                candidate.directory_pages = Arc::clone(&previous.directory_pages);
+                if candidate == **previous {
+                    return Ok(());
+                }
+            } else {
+                candidate.pair = issuer.issue().ok_or("pair_issuance_failed")?;
+            }
+        } else {
+            candidate.pair = issuer.issue().ok_or("pair_issuance_failed")?;
+        }
+        // This read was authorized by its own captured ack. A newer Current
+        // must neither cancel it nor be replaced by its older current fields.
+        inner.last_verified_history = Some(Arc::new(candidate));
+        Ok(())
+    }
+
     fn snapshot(&self) -> Option<Arc<PublishedSnapshot>> {
         self.inner
             .read()
@@ -1860,11 +1923,21 @@ impl SnapshotStore {
         if pending.stopped {
             return;
         }
-        if !pending
-            .latest
-            .get(account_id)
-            .is_some_and(|latest| Arc::ptr_eq(latest, intent))
-        {
+        let latest_intent = pending.latest.get(account_id);
+        let intent_is_latest = latest_intent.is_some_and(|latest| Arc::ptr_eq(latest, intent));
+        let same_owner_history = lane == ReaderLane::History
+            && latest_intent.is_some_and(|latest| {
+                same_history_owner(Some(latest.as_ref()), Some(intent.as_ref()))
+                    && match (latest.as_ref(), intent.as_ref()) {
+                        (ReaderIntent::Recorder(new), ReaderIntent::Recorder(old)) => {
+                            new.commit.generation > old.commit.generation
+                                || new.commit == old.commit
+                        }
+                        (ReaderIntent::Independent, ReaderIntent::Independent) => true,
+                        _ => false,
+                    }
+            });
+        if !intent_is_latest && !same_owner_history {
             if lane == ReaderLane::History {
                 self.diagnostics.record(
                     "reader_reconcile",
@@ -1896,6 +1969,25 @@ impl SnapshotStore {
                 }
                 return;
             }
+        }
+        if lane == ReaderLane::History
+            && (!intent_is_latest
+                || candidate.as_ref().is_ok_and(|(next, _)| {
+                    account
+                        .snapshot()
+                        .is_some_and(|current| next.generation < current.generation)
+                }))
+        {
+            let reason = match candidate {
+                Ok((next, _)) => match account.admit_independent_history(next, intent) {
+                    Ok(()) => "verified_history_advanced",
+                    Err(reason) => reason,
+                },
+                Err(_) => "history_unavailable",
+            };
+            self.diagnostics
+                .record("reader_reconcile", "history_admission", reason, None);
+            return;
         }
         if lane == ReaderLane::Recordings {
             let Ok((next, commit)) = candidate else {
@@ -4795,7 +4887,9 @@ mod tests {
 
     #[test]
     fn issue604_health_does_not_wait_for_snapshot_publication_lock() {
-        let store = Arc::new(SnapshotStore::new_without_account(PublicState::Initializing));
+        let store = Arc::new(SnapshotStore::new_without_account(
+            PublicState::Initializing,
+        ));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -5122,8 +5216,9 @@ mod tests {
         assert_eq!(current.models_v3[0].total_tokens, 20);
         let counter = store.issuer.lock().unwrap().counter;
 
-        // A successful history read can still be discarded at three distinct
-        // boundaries. Diagnose that boundary without changing its authority.
+        // A successful history read can still be discarded by its own
+        // published window or missing commit authority. A newer same-owner
+        // Current intent alone no longer invalidates qualified History.
         let history = store
             .prepare_reader_candidate_at("account-7", 1_800_000_300)
             .unwrap();
@@ -5204,7 +5299,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "publication_window_superseded",
-                "intent_superseded",
+                "publication_window_superseded",
                 "commit_not_acknowledged",
                 "current_history_available"
             ],
@@ -5557,6 +5652,181 @@ mod tests {
                 (3,1800000360,'observation-2','{"kind":"codex-info-usage-observation-v1","timestamp":1800000360,"reset_at":1800604800,"remaining_percent":null,"model_source":"confirmed"}');
         "#).unwrap();
         DbReader::open(path).unwrap()
+    }
+
+    #[test]
+    fn issue604_acknowledged_history_advances_while_current_keeps_committing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("history-progress.sqlite3");
+        let reader = issue604_time_projection_fixture(&path);
+        let db = Connection::open(&path).unwrap();
+        let store = Arc::new(
+            SnapshotStore::new_with_accounts(
+                vec![AccountReader::new("account-7", 7, true, None, None, reader)
+                    .with_recorder_commit(Some(issue604_commit_notice(1)))],
+                "account-7",
+            )
+            .unwrap(),
+        );
+        let intent =
+            || Arc::clone(&store.reader_control.pending.lock().unwrap().latest["account-7"]);
+        let original_intent = intent();
+        let original = store
+            .prepare_reader_candidate_at("account-7", 1_800_000_300)
+            .unwrap();
+        store.complete_reader_lane(
+            "account-7",
+            &original_intent,
+            Ok(original.clone()),
+            ReaderLane::History,
+        );
+        let account = store.account_store("account-7").unwrap();
+        let initial_pair = account
+            .capture_resource(Route::HistoryV3)
+            .0
+            .unwrap()
+            .pair
+            .clone();
+
+        db.execute_batch(
+            "BEGIN;
+            INSERT INTO quota_receipts VALUES('second',2,1800000360,1800604800,604800,49,'2');
+            UPDATE collection_generation SET data_generation='2',cycle_seq='2'; COMMIT;",
+        )
+        .unwrap();
+        assert!(store.notify_recorder_commit("account-7", issue604_commit_notice(2)));
+        let second_intent = intent();
+        store.complete_reader_lane(
+            "account-7",
+            &second_intent,
+            Ok(store
+                .prepare_current_candidate_at("account-7", 1_800_000_360)
+                .unwrap()
+                .unwrap()),
+            ReaderLane::Current,
+        );
+        let second_history = store
+            .prepare_reader_candidate_at("account-7", 1_800_000_360)
+            .unwrap();
+        assert_eq!(second_history.1, Some(issue604_commit_notice(2).commit));
+
+        // The slow read has a complete, acknowledged commit 2. The live
+        // writer independently commits 3 before that read is admitted.
+        db.execute_batch(
+            "BEGIN;
+            INSERT INTO quota_receipts VALUES('third',3,1800000420,1800604800,604800,48,'3');
+            UPDATE collection_generation SET data_generation='3',cycle_seq='3'; COMMIT;",
+        )
+        .unwrap();
+        assert!(store.notify_recorder_commit("account-7", issue604_commit_notice(3)));
+        store.complete_reader_lane(
+            "account-7",
+            &intent(),
+            Ok(store
+                .prepare_current_candidate_at("account-7", 1_800_000_420)
+                .unwrap()
+                .unwrap()),
+            ReaderLane::Current,
+        );
+        let current = account.snapshot().unwrap();
+        assert_eq!(current.generation, 3);
+        assert_eq!(
+            current.details.quota.as_ref().unwrap().remaining_percent,
+            48.0
+        );
+        store.complete_reader_lane(
+            "account-7",
+            &second_intent,
+            Ok(second_history.clone()),
+            ReaderLane::History,
+        );
+        let (history, unavailable, freshness) = account.capture_resource(Route::HistoryV3);
+        let history = history.unwrap();
+        assert_eq!(
+            history.generation, 2,
+            "an acknowledged History must progress despite a newer Current commit"
+        );
+        assert!(!unavailable);
+        assert_eq!(freshness.unwrap().verified_at, 1_800_000_360);
+        assert!(!freshness.unwrap().current);
+        assert_ne!(history.pair, initial_pair);
+        assert_ne!(history.pair, current.pair);
+        assert!(Arc::ptr_eq(&current, &account.snapshot().unwrap()));
+
+        // The actual consumer receives the History revision, not commit 3's
+        // pair or its newer quota. Its exact model values remain 10 and 20.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::clone(&store);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_connection(&mut stream, &captured);
+        });
+        let response = request(
+            address,
+            "GET /v3/history?period=1800604800 HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        server.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert_eq!(published_pair(&response), history.pair);
+        assert!(response.contains("Codex-Info-History-State: refreshing\r\n"));
+        assert!(response.contains("Codex-Info-History-Verified-At: 1800000360\r\n"));
+        let body: Value = serde_json::from_str(body(&response)).unwrap();
+        let samples = body["history_samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["models"][0]["total_tokens"], 10);
+        assert_eq!(samples[1]["models"][0]["total_tokens"], 20);
+
+        let counter = store.issuer.lock().unwrap().counter;
+        store.complete_reader_lane(
+            "account-7",
+            &original_intent,
+            Ok(original),
+            ReaderLane::History,
+        );
+        let mut wrong_commit = second_history.clone();
+        wrong_commit.1 = Some(issue604_commit_notice(1).commit);
+        store.complete_reader_lane(
+            "account-7",
+            &second_intent,
+            Ok(wrong_commit),
+            ReaderLane::History,
+        );
+        let mut rewritten = second_history.clone();
+        rewritten.0.retained_history.samples[1]
+            .models
+            .as_mut()
+            .unwrap()[0]
+            .total_tokens = 99;
+        store.complete_reader_lane(
+            "account-7",
+            &second_intent,
+            Ok(rewritten),
+            ReaderLane::History,
+        );
+        assert_eq!(store.issuer.lock().unwrap().counter, counter);
+        assert!(Arc::ptr_eq(
+            &history,
+            &account.capture_resource(Route::HistoryV3).0.unwrap()
+        ));
+        assert!(Arc::ptr_eq(&current, &account.snapshot().unwrap()));
+
+        let mut other_owner = issue604_commit_notice(3);
+        other_owner.owner_nonce = "33333333333333333333333333333333".into();
+        assert!(store.notify_recorder_commit("account-7", other_owner));
+        store.complete_reader_lane(
+            "account-7",
+            &second_intent,
+            Ok(second_history),
+            ReaderLane::History,
+        );
+        assert!(account
+            .inner
+            .read()
+            .unwrap()
+            .last_verified_history
+            .is_none());
+        assert_eq!(store.issuer.lock().unwrap().counter, counter);
     }
 
     #[test]

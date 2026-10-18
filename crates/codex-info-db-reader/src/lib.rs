@@ -3220,7 +3220,12 @@ fn read_history_projection_for_intervals(
             HistoryModelSource::Unavailable
         } else if model_source == HistoryModelSource::ReconstructedFromSession {
             HistoryModelSource::ReconstructedFromSession
-        } else if model_source == HistoryModelSource::Confirmed {
+        } else if model_source == HistoryModelSource::Confirmed
+            && (empty_set == Some(true) || group.is_some_and(|group| !group.totals.is_empty()))
+        {
+            // A qualified nonempty prefix keeps its provenance independently
+            // of completeness. Only an explicit complete empty set confirms
+            // zero cardinality; legacy fixed columns do not prove that claim.
             HistoryModelSource::Confirmed
         } else {
             HistoryModelSource::LegacyUnknown

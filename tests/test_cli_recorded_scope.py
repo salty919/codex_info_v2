@@ -5,6 +5,7 @@ import pathlib
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -23,8 +24,10 @@ def python_consumer(arguments):
 
 class RecordedScopeCliConsumers(unittest.TestCase):
     def run_consumer(self, arguments, values):
-        result = subprocess.run(["python3", "-c", python_consumer(arguments), *values],
-                                capture_output=True, text=True, check=False, timeout=5)
+        result = subprocess.run(  # noqa: S603 -- fixed repository consumer; fixture values stay separate argv entries.
+            [sys.executable, "-c", python_consumer(arguments), *values],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_readiness_reads_the_recorded_current_resource(self):
@@ -35,9 +38,11 @@ class RecordedScopeCliConsumers(unittest.TestCase):
 }
 wait_for_ready_details() {
 """ + function + "\n}\nwait_for_ready_details 12345\n"
-        result = subprocess.run(["bash", "-c", shell], env={"PATH": "/usr/bin:/bin",
-                                "FIXTURE_CURRENT": json.dumps(FIXTURE["current"])},
-                                capture_output=True, text=True, check=False, timeout=8)
+        result = subprocess.run(  # noqa: S603 -- fixed repository function and offline fixture, no external shell input.
+            ["/bin/bash", "-c", shell],
+            env={"PATH": "/usr/bin:/bin", "FIXTURE_CURRENT": json.dumps(FIXTURE["current"])},
+            capture_output=True, text=True, check=False, timeout=8,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["models"][0]["total_tokens"], 15)
 

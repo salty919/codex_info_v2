@@ -12,6 +12,14 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained transitive Slint image dependency; RustSec reports no vulnerability and no safe upgrade" },
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz is an unmaintained transitive Slint SVG dependency; RustSec reports no vulnerability and no safe upgrade" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser is an unmaintained transitive Slint SVG dependency; RustSec reports no vulnerability and no safe upgrade" },
+    # Refs #604: reviewed 2026-10-18. These informational advisories announce
+    # the standalone crates' merger into zbus 6, not a reported vulnerability.
+    # Slint 1.17.1 and upstream winit still require zbus 5. Remove these exact
+    # exceptions when Slint migrates; do not suppress other zbus advisories.
+    # Authority: https://github.com/z-galaxy/zbus/issues/2043
+    { id = "RUSTSEC-2026-0370", reason = "zvariant is a Slint/winit -> zbus 5 transitive dependency; INFO unmaintained, merged into zbus 6, no compatible patched version; pending upstream Slint migration" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names is a Slint/winit -> zbus 5 transitive dependency; INFO unmaintained, merged into zbus 6, no compatible patched version; pending upstream Slint migration" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is a Slint/winit -> zbus 5 transitive dependency; INFO unmaintained, merged into zbus 6, no compatible patched version; pending upstream Slint migration" },
 ]
 
 [licenses]

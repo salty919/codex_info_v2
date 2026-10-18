@@ -163,7 +163,9 @@ public sealed class SetupWindowInteractionTests
                 Assert.Equal(1, settings.SaveCalls);
                 window.RaiseEvent(new KeyEventArgs
                 {
-                    RoutedEvent = InputElement.KeyDownEvent, Key = Key.Escape, Handled = true,
+                    RoutedEvent = InputElement.KeyDownEvent,
+                    Key = Key.Escape,
+                    Handled = true,
                 });
                 Assert.True(window.IsVisible);
                 Assert.Equal(0, setup.Step);
