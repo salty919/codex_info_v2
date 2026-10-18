@@ -31,12 +31,12 @@ fail() {
 }
 
 # A listening health endpoint is not a ready account snapshot. Both initial
-# startup and REST-only restart use the recorded current readiness rule.
+# startup and REST-only restart use the same bounded details readiness rule.
 wait_for_ready_details() {
     local port="$1" details_body='' details_state='unavailable'
     for _ in $(seq 1 40); do
         details_body="$(curl --fail --silent --max-time 1 \
-            "http://127.0.0.1:$port/v5/current" 2>/dev/null || true)"
+            "http://127.0.0.1:$port/v1/details" 2>/dev/null || true)"
         details_state="$(python3 - "$details_body" <<'PY_READY'
 import json
 import sys
@@ -301,8 +301,22 @@ done
 curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health" >/dev/null \
     || fail 'REST health did not become ready'
 health_body="$(curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health")"
-details_body="$(wait_for_ready_details "$port")" \
-    || fail 'recorded current did not become ready/authenticated'
+details_body=''
+for _ in $(seq 1 40); do
+    details_body="$(curl --fail --silent --max-time 1 \
+        "http://127.0.0.1:$port/v1/details" 2>/dev/null || true)"
+    if python3 - "$details_body" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+details = json.loads(sys.argv[1])
+raise SystemExit(0 if details.get("state") == "ready" and details.get("authenticated") is True else 1)
+PY
+    then
+        break
+    fi
+    sleep 0.1
+done
 python3 - "$health_body" "$details_body" "$ROOT_VERSION" <<'PY'
 import json
 import sys
@@ -316,13 +330,13 @@ if (health["api_version"] != "v1" or health["service"] != "codex-info"
 details = json.loads(sys.argv[2])
 expected = {
     "api_version", "state", "observed_at", "authenticated", "plan_label", "quota",
-    "models", "models_status", "active_thread_count", "open_session_thread_count",
-    "period_identity", "usage_scope",
+    "models", "active_thread_count", "history_periods", "history_samples",
+    "history_gaps", "threads", "estimated_cost_label",
 }
 if set(details) != expected:
     raise SystemExit("details wire key set changed")
-if details["api_version"] != "v5":
-    raise SystemExit("recorded current wire identity changed")
+if details["api_version"] != "v1":
+    raise SystemExit("details wire identity changed")
 PY
 ss -ltnH "sport = :$port" | rg -q "127[.]0[.]0[.]1:$port" \
     || fail 'listener is not bound to 127.0.0.1'
@@ -470,8 +484,8 @@ details_body="$(wait_for_ready_details "$port")" \
     || fail 'initial REST details did not become ready/authenticated'
 printf '%s\n' "$details_body" >"$details_before"
 
-# The recorded current must equal admitted facts in its explicit time scope.
-# Old R-keyed totals/history are saved observations, not this numeric oracle.
+# REST details must be backed by recorder-produced UsageStore values. Empty
+# quota/history/models are a failure, never a successful fixture shortcut.
 python3 - "$details_body" "$database" <<'PY'
 import json
 import sqlite3
@@ -483,27 +497,24 @@ if details["state"] != "ready" or details["authenticated"] is not True:
 quota = details["quota"]
 if not isinstance(quota, dict) or quota["reset_at"] <= 0:
     raise SystemExit("REST details quota is empty")
+history = details["history_samples"]
+if not history or not any(sample.get("remaining_percent") is not None for sample in history):
+    raise SystemExit("REST details history is empty or has no quota sample")
 models = details["models"]
-if not models or not any(model["total_tokens"] > 0 for model in models):
-    raise SystemExit("recorded models are empty")
-scope = details["usage_scope"]
-if scope["kind"] != "recorded-time" or details["period_identity"] != {"state":"unknown","reason":"provider-period-identity-unavailable"}:
-    raise SystemExit("recorded scope identity changed")
+if not models or not any(
+    model.get("name") and int(model.get("input_tokens", 0)) + int(model.get("output_tokens", 0)) > 0
+    for model in models
+):
+    raise SystemExit("REST details models are empty")
 with sqlite3.connect(sys.argv[2]) as connection:
-    quota_rows = connection.execute("SELECT COUNT(*) FROM quota_receipts WHERE observed_at=? AND reset_at=? AND window_seconds=? AND remaining_percent=?",
-        (details["observed_at"],quota["reset_at"],quota["window_seconds"],quota["remaining_percent"])).fetchone()[0]
-    facts = connection.execute("SELECT model,tokens_json FROM recorded_usage_facts WHERE eligible=1 AND timestamp>=? AND timestamp<? ORDER BY model,timestamp,fact_id",
-        (scope["start_at"],scope["end_at"])).fetchall()
-if quota_rows <= 0 or not facts:
-    raise SystemExit("recorded source projection is empty")
-groups = {}
-for model, encoded in facts:
-    groups.setdefault(model,[]).append(json.loads(encoded))
-fields = {"total_tokens":"total","input_tokens":"input","cached_input_tokens":"cached_input","cache_write_input_tokens":"cache_write_input","output_tokens":"output"}
-expected = {name:{field:(None if any(item[source] is None for item in items) else sum(item[source] for item in items)) for field,source in fields.items()} for name,items in groups.items()}
-actual = {model["model"]:{field:model[field] for field in fields} for model in models}
-if actual != expected:
-    raise SystemExit("recorded current differs from the admitted scoped facts")
+    quota_rows = connection.execute(
+        "SELECT COUNT(*) FROM usage_history WHERE remaining_percent IS NOT NULL"
+    ).fetchone()[0]
+    model_rows = connection.execute(
+        "SELECT COALESCE(SUM(CAST(total_tokens AS INTEGER)), 0) FROM session_model_totals"
+    ).fetchone()[0]
+if quota_rows <= 0 or model_rows <= 0:
+    raise SystemExit("SQLite recorder projection is empty")
 PY
 
 source_before="$(sha256sum "$session_file" | awk '{print $1}')"
@@ -596,14 +607,14 @@ before = json.load(open(sys.argv[1], encoding="utf-8"))
 after = json.loads(sys.argv[2])
 if after["state"] != "ready" or after["authenticated"] is not True:
     raise SystemExit("REST restart details are not ready/authenticated")
-if after["api_version"] != "v5" or not after["models"]:
-    raise SystemExit("REST restart lost recorded models")
+if not after["history_samples"] or not after["models"]:
+    raise SystemExit("REST restart details lost history/models")
 old_models = {
-    item["model"]: item["total_tokens"]
+    item["name"]: int(item.get("input_tokens", 0)) + int(item.get("output_tokens", 0))
     for item in before["models"]
 }
 new_models = {
-    item["model"]: item["total_tokens"]
+    item["name"]: int(item.get("input_tokens", 0)) + int(item.get("output_tokens", 0))
     for item in after["models"]
 }
 if not any(name in old_models and total > old_models[name] for name, total in new_models.items()):

@@ -28,7 +28,7 @@
 | CUM-138-01 | DATA | `src/main.rs`、`src/usage_store.rs` | durable baseline＋2GiB overflow＋verified tail固定caseでbaseline保持とtail 1回加算 | implemented |
 | CUM-138-02 | DATA | `src/main.rs`、`src/usage_store.rs` | 同じrangeのrepeat/restart、変更prefix、stale generation固定caseで非重複・非mutation | implemented |
 | CUM-138-03 | DATA | recorder quota原本、writer/readerの報告枠保存key、recorded fact/index | 同じexact reset keyへの原本保存、異なるreset keyの独立保存と重複再適用0を照合する。raw Rの同値/差/Remaining回復から実期間・週数・未使用を生成しない。R31/R32切替でも同じqualified fact集合の記録分は変わらず、元R別の旧観測値は独立保持する。 | implemented |
-| CUM-138-04 | PRODUCT | writer recorded fact/prefix、reader/current v5/history v4、Linux/Windows | 同じ明示scope・qualified fact集合のtoken/nullable成分はcurrentとrecordings prefixで一致し、保存observationsの元値と同値化しない。取得・公開失敗のlast-good、部分成分でも既知T保持、未知価格0化0を照合する。v2 source equivalenceは旧numeric/USD REALbits/durable/CPを保持し、v1の明示数値補正だけを資格済み範囲に分離する。 | implemented |
+| CUM-138-04 | PRODUCT | recorder source、writer recorded fact/prefix、SQLite source repair | source-bound factとprefixは元event identity・exact model key・nullable token成分を保持し、replay/restartで二重加算しない。既知値と不明値を分け、既存v4 current・v3 history・v5 period directoryの資格を変更しない。 | implemented |
 | CUM-138-05 | DATA | product data path、実Linux daemon/API、Linux/Windows UI | 修正前後sentinel digest、selected byte count、同一candidateの実API/UI read-back | implemented |
 | CUM-138-06 | UX | Linux/Windows Graph期間・metric・系列・月・hover、実操作 | 既存週期間と日付group内の個別選択、24h/週/月、前後移動、選択timezone暦月、token/USD、元観測hover、失敗保持を照合する。新記録範囲UIを置換しない。月合計は系列ON/OFFに依存せず、未知を既知0にしない | implemented |
 | G137-GRAPH-01 | PRODUCT | 既存G137条件、Linux/Windows Graphing/Control | 原本回復後の正常な同period・metric runを既存連続線/PCHIPで描く。全保存観測点化・階段強制を採用しない。真の欠測/非所有/reset/数値異常の線種、先頭値の根拠、idle、保存USD、月合計を元要求と原本から照合する | implemented |

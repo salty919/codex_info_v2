@@ -2600,9 +2600,6 @@ public sealed class LoopbackStatusClientTests
             CancellationToken cancellationToken)
         {
             LastRequest = request;
-            // Existing fixtures explicitly model servers without the newer routes.
-            if (request.RequestUri!.AbsolutePath == "/v5/current")
-                return Task.FromResult(NotFoundResponse());
             if (!pagedPeriods && request.RequestUri!.AbsolutePath.StartsWith("/v5/history/periods", StringComparison.Ordinal))
                 return Task.FromResult(NotFoundResponse());
             if (!versionedPeriods && request.RequestUri!.AbsolutePath.StartsWith("/v4/history/periods", StringComparison.Ordinal))

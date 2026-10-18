@@ -438,7 +438,7 @@ health候補がmalformed、oversize、foreign listener、schema/header不一致�
 
 ### 8.3 DP-REST-002 / RC-140 — server faultとatomic pair
 
-HTTP要求が公開済みrootを取得できない場合の503、応答生成の500/切断はWIRE ownerへ従う。その要求でDBやpublished pairを変更せず、clientは該当surfaceのlast-goodを保持する。一方、publisherが受理済みquota・有効model・threadと、真正の履歴projection失敗を一つの新generationとして構成できる場合は、`QUOTA-DURABLE-604`に従って旧v1〜v3のcurrent/detailsをerror、履歴resourceを利用不能として公開する。独立したv4 currentのstate・models_statusは履歴失敗だけで変更しない。recorderがadmissionした取得状態の失敗と、REST reader/publisher自身がcommit済みdomainを読めない失敗の区別はPRODUCT `REST-172`とWIREのHTTP失敗境界へ従い、後者からError generationを作らない。旧status/detailsのS1+D0禁止は版を混ぜる採用の禁止であり、独立surfaceの正常更新を止める規則ではない。
+HTTP要求が公開済みrootを取得できない場合の503、応答生成の500/切断はWIRE ownerへ従う。その要求でDBやpublished pairを変更せず、clientは該当surfaceのlast-goodを保持する。一方、publisherが受理済みquota・有効model・threadと、真正の履歴projection失敗を一つの新generationとして構成できる場合は、`QUOTA-DURABLE-604`に従って旧v1〜v3のcurrent/detailsをerror、履歴resourceを利用不能として公開する。独立したv4 currentのstate・models_statusは履歴失敗だけで変更しない。recorderがadmissionした取得状態の失敗と、REST reader/publisher自身がcommit済みdomainを読めない失敗の区別はPRODUCT `REST-172`とWIREのHTTP失敗境界へ従い、後者からrecorderのError generationを作らない。同じ所有資格のlast-goodを保持できる通常のDB I/O失敗では、PRODUCT `REST-172`のHTTP 200・degraded pair・回復時の通常pairを維持する。未構築frame、所有資格の失効、domain/source拒否は同条の503境界に従う。旧status/detailsのS1+D0禁止は版を混ぜる採用の禁止であり、独立surfaceの正常更新を止める規則ではない。
 logout/account境界のstrict emptyはPRODUCTとWIREのsecurity visibility transitionに従い、旧accountを一括で消去する。新しい境界generationの公開と、clientで旧accountを不可視にする処理を区別し、HTTP要求からDBやpublicationを書き換えない。
 
 ### 8.4 DP-REST-003 / RC-141 — request resource owner

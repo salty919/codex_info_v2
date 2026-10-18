@@ -970,12 +970,6 @@ internal static class GraphPlotProjection
     {
         ArgumentNullException.ThrowIfNull(scene);
         ArgumentNullException.ThrowIfNull(values);
-        if (scene.IsRecordedScope)
-        {
-            var empty = new GraphLineProjection([], []);
-            var measured = scene.IsSavedObservation ? empty : RecordedStepLine(scene, values);
-            return new(empty, empty, measured, empty);
-        }
         if (values.Count != scene.Timestamps.Count)
         {
             throw new ArgumentException("A model series must match the graph timestamp count.", nameof(values));
@@ -1164,31 +1158,6 @@ internal static class GraphPlotProjection
     {
         ArgumentNullException.ThrowIfNull(scene);
         return scene.IdleIntervals.ToArray();
-    }
-
-    internal static GraphLineProjection RecordedStepLine(GraphScene scene, IReadOnlyList<double> values)
-    {
-        var indices = Enumerable.Range(0, values.Count).Where(index => double.IsFinite(values[index])).ToArray();
-        if (indices.Length == 0) return new([], []);
-        var x = new List<double> { scene.Timestamps[indices[0]] };
-        var y = new List<double> { values[indices[0]] };
-        for (var index = 1; index < indices.Length; index++)
-        {
-            var at = scene.Timestamps[indices[index]];
-            x.Add(at);
-            y.Add(values[indices[index - 1]]);
-            if (values[indices[index]] != values[indices[index - 1]])
-            {
-                x.Add(at);
-                y.Add(values[indices[index]]);
-            }
-        }
-        if (x[^1] < scene.PeriodEndAt)
-        {
-            x.Add(scene.PeriodEndAt);
-            y.Add(values[indices[^1]]);
-        }
-        return new(x.AsReadOnly(), y.AsReadOnly());
     }
 
     public static IReadOnlyList<GraphUnusedInterval> BuildVisibleUnusedIntervals(GraphScene scene)

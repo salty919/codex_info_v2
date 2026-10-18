@@ -14,7 +14,7 @@ namespace CodexInfo.WindowsClient.Core;
 /// an isolated loopback port for its child process; normal startup always uses port 8787.
 /// A handler constructor is provided solely to make the transport boundary testable.
 /// </remarks>
-public sealed partial class LoopbackStatusClient :
+public sealed class LoopbackStatusClient :
     ILoopbackHealthClient,
     ILoopbackRuntimeVersionsClient,
     ILoopbackDetailsClient,
@@ -2115,7 +2115,6 @@ public sealed partial class LoopbackStatusClient :
         PublishedPairIdentity publishedPair,
         string expectedApiVersion)
     {
-        if (expectedApiVersion == "v5") return ParseRecordedCurrent(body, publishedPair);
         try
         {
             using var document = JsonDocument.Parse(

@@ -3,8 +3,6 @@
 
 using System.Net;
 using System.Net.Http.Headers;
-using System.Text.Json;
-using System.Text.Json.Nodes;
 using CodexInfo.WindowsClient.Core;
 using Xunit;
 
@@ -39,90 +37,6 @@ public sealed class RecordedScopeClientTests
         Assert.Equal(13UL, model.TotalTokens);
         Assert.Equal(10d, model.EstimatedTotalDollars);
         Assert.Equal(ApiCurrentModelsStatus.Partial, result.Snapshot.ModelsStatus);
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task CompleteScopedPagesPreserveFifteenAndRejectAnEmptyNonterminalDirectory(bool emptyNonterminal)
-    {
-        var fixture = JsonNode.Parse(File.ReadAllText(FixturePath()))!;
-        var paths = new List<string>();
-        using var client = new LoopbackStatusClient(new Handler(request =>
-        {
-            var uri = request.RequestUri!;
-            paths.Add(uri.PathAndQuery);
-            Assert.Contains("account=account-1", uri.Query);
-            var continuation = uri.Query.Contains("cursor=", StringComparison.Ordinal);
-            var key = uri.AbsolutePath switch
-            {
-                "/v6/history/scopes" => "scopes",
-                "/v4/history/recordings" => "recordings",
-                "/v4/history/observations" => "observations",
-                _ => throw new InvalidOperationException("Unexpected fallback"),
-            };
-            var body = fixture[key]!.DeepClone();
-            if (key == "scopes")
-            {
-                var all = body["scopes"]!.AsArray();
-                body["scopes"] = !continuation && emptyNonterminal ? new JsonArray() :
-                    continuation && emptyNonterminal ? all.DeepClone() :
-                    new JsonArray(all[continuation ? 1 : 0]!.DeepClone());
-            }
-            else if (key == "recordings")
-            {
-                var all = body["samples"]!.AsArray();
-                body["samples"] = new JsonArray(all[continuation ? 1 : 0]!.DeepClone());
-                if (!continuation) body["quota_observations"] = new JsonArray();
-            }
-            else
-            {
-                var all = body["observations"]!.AsArray();
-                body["observations"] = new JsonArray(all[continuation ? 1 : 0]!.DeepClone());
-            }
-            body["next_cursor"] = continuation ? null : key + ".next";
-            return Json(body.ToJsonString());
-        }));
-
-        var result = await ((ILoopbackRecordedScopeClient)client).FetchRecordedGraphAsync("account-1");
-        if (emptyNonterminal) Assert.False(result.IsSuccess);
-        else
-        {
-            Assert.True(result.IsSuccess);
-            Assert.Equal(2, result.Bundle!.Scopes.Count);
-            Assert.Equal(new ulong[] { 10, 15 }, result.Bundle.Samples.Select(sample => sample.Models.Single().TotalTokens));
-            Assert.Equal(new ulong?[] { 66123101, 3763895 }, result.Bundle.Observations.Select(row => row.Models.Single().TotalTokens));
-            Assert.Equal(6, paths.Count);
-        }
-    }
-
-    [Fact]
-    public async Task CursorlessRejectionDoesNotRestartTheSameRecordedBundle()
-    {
-        var requests = 0;
-        using var client = new LoopbackStatusClient(new Handler(_ =>
-        {
-            requests++;
-            var response = Json("""{"api_version":"v1","error":"stale_cursor"}""");
-            response.StatusCode = HttpStatusCode.BadRequest;
-            response.Headers.Remove("Codex-Info-Published-Pair");
-            return response;
-        }));
-        var result = await ((ILoopbackRecordedScopeClient)client).FetchRecordedGraphAsync("account-1");
-        Assert.False(result.IsSuccess);
-        Assert.Equal(1, requests);
-    }
-
-    internal static string FixturePath()
-    {
-        var root = new DirectoryInfo(AppContext.BaseDirectory);
-        while (root is not null)
-        {
-            var path = Path.Combine(root.FullName, "tests", "fixtures", "recorded_scope_contract.json");
-            if (File.Exists(path)) return path;
-            root = root.Parent;
-        }
-        throw new FileNotFoundException("Independent recorded scope fixture was not found.");
     }
 
     internal static HttpResponseMessage Json(string body)

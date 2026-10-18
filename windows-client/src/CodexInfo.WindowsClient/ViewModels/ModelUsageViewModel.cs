@@ -26,17 +26,6 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
     {
     }
 
-    internal ModelUsageViewModel(ApiRecordedModelUsage usage, string displayName, bool isOther)
-        : this(usage.Name, displayName, isOther,
-            usage.InputTokens is { } input && usage.CachedInputTokens is { } cached ? input - cached : null,
-            usage.CachedInputTokens, usage.OutputTokens, usage.TotalTokens, usage.CacheWriteInputTokens,
-            usage.Cost is { } cost ? cost.OrdinaryInputDollars + cost.CacheWriteInputDollars : null,
-            usage.Cost?.CachedInputDollars, usage.Cost?.OutputDollars,
-            usage.Cost?.CacheWriteInputDollars ?? double.NaN, usage.Cost?.TotalDollars)
-    {
-        isRecorded = true;
-    }
-
     internal ModelUsageViewModel(ApiDetailsModelUsage usage, string displayName, bool isOther)
         : this(
             usage.Name,
@@ -98,7 +87,6 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
     private double? totalDollars;
     private readonly string displayName;
     private readonly bool isOther;
-    private bool isRecorded;
     private bool disposed;
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -127,10 +115,8 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
 
     public string TotalDollarsText => RecordedDollars(totalDollars);
 
-    private string RecordedTokens(ulong? value) => isRecorded && value is null
-        ? RecordedUsageText.Unknown : FormatTokens(value);
-    private string RecordedDollars(double? value) => isRecorded && (value is null || !double.IsFinite(value.Value))
-        ? RecordedUsageText.PriceUnknown : FormatDollars(value);
+    private string RecordedTokens(ulong? value) => FormatTokens(value);
+    private string RecordedDollars(double? value) => FormatDollars(value);
 
     public string InputLabel => LocalizationService.Current.Input;
     public string CachedInputLabel => LocalizationService.Current.CachedInput;
@@ -151,12 +137,10 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
             throw new ArgumentException("A model row cannot change identity.", nameof(usage));
         }
 
-        var wasRecorded = isRecorded;
-        isRecorded = false;
         var nextTotalDollars = usage.HasEstimatedCost
             ? usage.EstimatedTotalDollars
             : usage.TotalDollars;
-        if (!wasRecorded && inputTokens == usage.InputTokens &&
+        if (inputTokens == usage.InputTokens &&
             cachedInputTokens == usage.CachedInputTokens &&
             outputTokens == usage.OutputTokens &&
             totalTokens == usage.TotalTokens &&
@@ -191,26 +175,6 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(OutputDollarsText));
         Notify(nameof(CacheWriteInputDollarsText));
         Notify(nameof(TotalDollarsText));
-    }
-
-    internal void Update(ApiRecordedModelUsage usage)
-    {
-        if (!string.Equals(Name, usage.Name, StringComparison.Ordinal))
-            throw new ArgumentException("A model row cannot change identity.", nameof(usage));
-        isRecorded = true;
-        inputTokens = usage.InputTokens is { } input && usage.CachedInputTokens is { } cached ? input - cached : null;
-        cachedInputTokens = usage.CachedInputTokens;
-        cacheWriteInputTokens = usage.CacheWriteInputTokens;
-        outputTokens = usage.OutputTokens;
-        totalTokens = usage.TotalTokens;
-        inputDollars = usage.Cost is { } cost ? cost.OrdinaryInputDollars + cost.CacheWriteInputDollars : null;
-        cachedInputDollars = usage.Cost?.CachedInputDollars;
-        cacheWriteInputDollars = usage.Cost?.CacheWriteInputDollars ?? double.NaN;
-        outputDollars = usage.Cost?.OutputDollars;
-        totalDollars = usage.Cost?.TotalDollars;
-        foreach (var property in new[] { nameof(InputTokensText), nameof(CachedInputTokensText), nameof(CacheWriteInputTokensText),
-            nameof(OutputTokensText), nameof(TotalTokensText), nameof(InputDollarsText), nameof(CachedInputDollarsText),
-            nameof(CacheWriteInputDollarsText), nameof(OutputDollarsText), nameof(TotalDollarsText) }) Notify(property);
     }
 
     private void OnLanguageChanged(object? sender, EventArgs eventArgs)

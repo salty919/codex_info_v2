@@ -15,7 +15,6 @@ internal readonly record struct GraphDailyUsageValue(
     double? Dollars,
     bool IsPartial)
 {
-    internal ApiRecordedCoverage? Coverage { get; init; }
 }
 
 /// <summary>Read-only daily attribution from accepted canonical-period raw observations.</summary>

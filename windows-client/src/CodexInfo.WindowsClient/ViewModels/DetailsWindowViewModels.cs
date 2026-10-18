@@ -95,7 +95,7 @@ public sealed class GraphPointViewModel
             : "—";
 }
 
-public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
+public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 {
     private readonly record struct MainQuotaBoundary(long ResetAt, long WindowSeconds);
     private sealed record PendingGraphRequest(
@@ -201,7 +201,6 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
         main.PropertyChanged += OnMainPropertyChanged;
         resourceClient = main.SplitResourceClient;
         accountResourceClient = main.AccountResourceClient;
-        recordedScopeClient = resourceClient as ILoopbackRecordedScopeClient;
         if (resourceClient is null)
         {
             Rebuild();
@@ -223,15 +222,13 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
     public GraphScene Scene => scene;
 
     public IReadOnlyList<GraphCalendarDay> CalendarDays => GraphCalendarProjection.Create(
-        scene, recordedBundle is null ? LocalizationService.DisplayTimeZone : recordedDisplayTimeZone,
-        System.Globalization.CultureInfo.CurrentCulture, getUnixTimeSeconds());
+        scene, LocalizationService.DisplayTimeZone, System.Globalization.CultureInfo.CurrentCulture, getUnixTimeSeconds());
 
     public IReadOnlyList<string> CalendarWeekdays => Enumerable.Range(0, 7)
         .Select(index => System.Globalization.CultureInfo.CurrentCulture.DateTimeFormat.AbbreviatedDayNames[
             ((int)System.Globalization.CultureInfo.CurrentCulture.DateTimeFormat.FirstDayOfWeek + index) % 7]).ToArray();
 
-    public bool HasLinePlot => HasPlot && (!IsMonthView || ShowSavedObservations);
-    public bool HasCalendar => IsMonthView && !ShowSavedObservations && recordedBundle is not { Scope: null };
+    public bool HasLinePlot => HasPlot && !IsMonthView;
 
     public GraphTimeRange SelectedTimeRange
     {
@@ -276,9 +273,7 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
                 return selectedIndex >= 0 && selectedIndex < periods.Count - 1;
             }
 
-            return recordedBundle is not null
-                ? recordedBundle.Scopes.Any(scope => scope.Kind == "utc-month" && scope.StartAt < scene.PeriodStartAt)
-                : windowPeriodDirectory.Any(period => period.StartAt < scene.PeriodStartAt);
+            return windowPeriodDirectory.Any(period => period.StartAt < scene.PeriodStartAt);
         }
     }
 
@@ -317,8 +312,6 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
                 : scene.PeriodEndAt;
             if (range == GraphTimeRange.CalendarMonth && startAt > 0 && endAt > startAt)
             {
-                if (recordedBundle is not null)
-                    return $"{DateTimeOffset.FromUnixTimeSeconds(startAt).UtcDateTime:yyyy/MM} · UTC · {recordedDisplayTimeZone.Id}";
                 var firstDate = GraphTimeWindow.LocalDate(startAt, LocalizationService.DisplayTimeZone);
                 return $"{firstDate:yyyy/MM}";
             }
@@ -434,10 +427,9 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
         }
     }
 
-    public bool HasPoints => scene.IsRecordedScope || scene.IsViewport ? scene.HasPoints : points.Count > 0;
+    public bool HasPoints => scene.IsViewport ? scene.HasPoints : points.Count > 0;
 
-    public bool HasNoPoints => (!IsMonthView || ShowSavedObservations || recordedBundle is { Scope: null }) &&
-        !IsLoading && !HasLoadError && !HasPoints;
+    public bool HasNoPoints => !IsMonthView && !IsLoading && !HasLoadError && !HasPoints;
 
     public bool HasBlockingLoadError => !IsLoading && HasLoadError && !HasPoints;
 
@@ -446,8 +438,8 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
     public bool HasPeriods => periods.Count > 0;
 
     public string SelectedPeriodText => selectedPeriod is { } period
-        ? $"{RecordingScopeHeading}｜{period.Label}"
-        : $"{RecordingScopeHeading}｜{Texts.UnavailableValue}";
+        ? $"{Texts.PeriodSelectorHeading}｜{period.Label}"
+        : $"{Texts.PeriodSelectorHeading}｜{Texts.UnavailableValue}";
 
     public string SelectedPeriodValueText => selectedPeriod?.Label ?? Texts.UnavailableValue;
 
@@ -795,12 +787,6 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
     {
         get
         {
-            if (recordedBundle is { Scope: null }) return RecordedUsageText.NoScope;
-            if (recordedBundle is not null || legacyRecordedScopeFallback)
-                return ShowSavedObservations && IsMonthView ? RecordedUsageText.SavedMonthUnavailable :
-                    $"{(legacyRecordedScopeFallback ? RecordedUsageText.LegacySaved : ShowSavedObservations ? RecordedUsageText.Saved : RecordedUsageText.Recorded)} · " +
-                    (recordedBundle?.Scope is { } scope ? $"UTC {RecordedUsageText.Range(scope.StartAt, scope.EndAt, TimeZoneInfo.Utc)} · {recordedDisplayTimeZone.Id} · " : "") +
-                    $"{RecordedUsageText.PeriodUnknown} · {RecordedUsageText.ForecastUnavailable}";
             var first = Enumerable.Range(0, scene.Timestamps.Count)
                 .FirstOrDefault(index => scene.RemainingObserved[index] &&
                     double.IsFinite(scene.ObservedRemainingValues[index]), -1);
@@ -935,12 +921,6 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
             return;
         }
 
-        if (recordedBundle?.Scope is { } recordedScope && range == GraphTimeRange.CalendarMonth)
-        {
-            RequestTimeRange(range, recordedScope.StartAt, getUnixTimeSeconds());
-            return;
-        }
-
         var now = getUnixTimeSeconds();
         long? pinnedEndAt = pinnedWindowEndAt == long.MinValue ? null : pinnedWindowEndAt;
         var navigationOriginAt = range == GraphTimeRange.CalendarMonth
@@ -958,13 +938,6 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
     public void GoForward()
     {
         var range = SelectedTimeRange;
-        if (recordedBundle?.Scope is { } recordedScope && range == GraphTimeRange.CalendarMonth && CanGoForward)
-        {
-            var next = DateTimeOffset.FromUnixTimeSeconds(recordedScope.EndAt);
-            var end = next.AddMonths(1).ToUnixTimeSeconds();
-            RequestTimeRange(range, end < getUnixTimeSeconds() ? end : null, getUnixTimeSeconds());
-            return;
-        }
         if (range == GraphTimeRange.ResetPeriod)
         {
             if (CanGoForward)
@@ -1116,8 +1089,6 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
 
     private void ClearAccountResourceState()
     {
-        recordedBundle = null;
-        legacyRecordedScopeFallback = false;
         if (disposed)
         {
             return;
@@ -2151,7 +2122,6 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
         Notify(nameof(Is24HourView));
         Notify(nameof(IsWeekView));
         Notify(nameof(IsMonthView));
-        Notify(nameof(HasCalendar));
         Notify(nameof(HasLinePlot));
         Notify(nameof(CanGoBack));
         Notify(nameof(CanGoForward));
@@ -3161,11 +3131,6 @@ public sealed partial class GraphWindowViewModel : INotifyPropertyChanged, IDisp
 
     private void RebuildPoints()
     {
-        if (recordedBundle is not null)
-        {
-            RebuildRecordedProjection();
-            return;
-        }
         var resetRangePending = resetRangeCommitRevision == Interlocked.Read(ref timeWindowRevision);
         if (SelectedTimeRange != GraphTimeRange.ResetPeriod && !resetRangePending)
         {

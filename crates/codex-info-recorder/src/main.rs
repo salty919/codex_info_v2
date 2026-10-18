@@ -1185,13 +1185,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(worker) = inactive_history.as_mut() {
                 worker.request();
             }
-            if pending_current_history.is_none() {
-                if current_history
+            if pending_current_history.is_none()
+                && current_history
                     .as_mut()
                     .is_some_and(|worker| worker.request())
-                {
-                    eprintln!("codex-info-recorder diagnostic history_prepare requested");
-                }
+            {
+                eprintln!("codex-info-recorder diagnostic history_prepare requested");
             }
         }
         let mut after_publication = |recorder: &mut Recorder,
@@ -1238,7 +1237,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut epoch_matches,
             &mut after_publication,
         )? {
-            drop(after_publication);
             // A one-shot process owns the auxiliary jobs it already started.
             // Publish the collection first, then finish this bounded round;
             // never exit merely because its result was not immediately ready.

@@ -7,7 +7,6 @@
 
 mod diagnostics;
 mod history;
-mod recordings;
 
 use codex_info_db_reader::{
     CollectionCommit, CurrentPublication, DbReader, DbSnapshot, HistoryArchive, ReaderError,
@@ -20,6 +19,7 @@ use diagnostics::FailureLog;
 use history::{HistoryIndex, PeriodIndex};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -103,7 +103,6 @@ struct ReaderPending {
     latest: BTreeMap<String, Arc<ReaderIntent>>,
     accounts: BTreeSet<String>,
     history: BTreeMap<String, (Arc<ReaderIntent>, i64)>,
-    recordings: BTreeMap<String, (Arc<ReaderIntent>, i64)>,
     freshness: bool,
     stopped: bool,
 }
@@ -113,14 +112,12 @@ struct ReaderControl {
     pending: Mutex<ReaderPending>,
     changed: Condvar,
     history_changed: Condvar,
-    recordings_changed: Condvar,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum ReaderLane {
     Current,
     History,
-    Recordings,
     #[cfg(test)]
     Direct,
 }
@@ -215,8 +212,6 @@ pub struct PublishedSnapshot {
     pub history_samples_v3: Vec<codex_info_rest_contract::PublicHistoryObservationV3>,
     pub history_samples_v2: Vec<codex_info_rest_contract::PublicHistoryObservation>,
     pub retained_history: HistoryArchive,
-    pub recordings: Option<Arc<codex_info_db_reader::RecordedArchive>>,
-    recorded_scope_account: u64,
     history_index: HistoryIndex,
     directory_indices: [Vec<usize>; 2],
     directory_pages: Arc<DirectoryPages>,
@@ -225,6 +220,19 @@ pub struct PublishedSnapshot {
 }
 
 impl PublishedSnapshot {
+    fn response_pair(&self, read_failed: bool) -> Cow<'_, str> {
+        if !read_failed {
+            return Cow::Borrowed(&self.pair);
+        }
+        // The publisher's captured health changes the representation, not
+        // the saved facts or their healthy identity. Recovery must miss the
+        // degraded ETag even when no database generation has changed.
+        let mut hash = Sha256::new();
+        hash.update(b"codex-info-rest-degraded-v1\0");
+        hash.update(self.pair.as_bytes());
+        Cow::Owned(format!("v1:{:x}", hash.finalize()))
+    }
+
     fn with_history(mut self, history: &Self) -> Result<Self, ReaderError> {
         self.history_available = history.history_available;
         self.details
@@ -265,20 +273,6 @@ impl PublishedSnapshot {
         Ok(self)
     }
 
-    fn with_recordings(
-        mut self,
-        archive: Arc<codex_info_db_reader::RecordedArchive>,
-    ) -> Result<Self, ReaderError> {
-        let mut hash = Sha256::new();
-        hash.update(self.data_hash.as_bytes());
-        hash.update(serde_json::to_vec(archive.as_ref()).map_err(|_| {
-            ReaderError::InvalidValue("recorded archive serialization failed".into())
-        })?);
-        self.data_hash = format!("{:x}", hash.finalize());
-        self.recordings = Some(archive);
-        Ok(self)
-    }
-
     fn candidate_from_db_for_account(snapshot: DbSnapshot, storage_epoch: u64) -> Self {
         let history_index = HistoryIndex::build(&snapshot, storage_epoch);
         let directory_indices = directory_indices(&snapshot.retained_history, &history_index);
@@ -300,8 +294,6 @@ impl PublishedSnapshot {
             history_samples_v3: snapshot.history_samples_v3,
             history_samples_v2: snapshot.history_samples_v2,
             retained_history: snapshot.retained_history,
-            recordings: snapshot.recordings,
-            recorded_scope_account: storage_epoch,
             history_index,
             directory_indices,
             directory_pages: Arc::default(),
@@ -353,8 +345,6 @@ impl PublishedSnapshot {
             history_samples_v3: Vec::new(),
             history_samples_v2: Vec::new(),
             retained_history: HistoryArchive::default(),
-            recordings: Some(Arc::default()),
-            recorded_scope_account: 0,
             history_index: HistoryIndex::default(),
             directory_indices: Default::default(),
             directory_pages: Arc::default(),
@@ -396,8 +386,7 @@ fn common_facts_equal<T: serde::Serialize>(
 }
 
 fn same_public_domain(previous: &PublishedSnapshot, candidate: &PublishedSnapshot) -> bool {
-    if previous.recordings != candidate.recordings
-        || previous.history_available != candidate.history_available
+    if previous.history_available != candidate.history_available
         || previous.current.models_status != candidate.current.models_status
         || (if previous.acquisition_degraded {
             PublicState::Error
@@ -698,6 +687,7 @@ struct StoreInner {
     last_verified_history: Option<Arc<PublishedSnapshot>>,
     degraded: bool,
     reader_unavailable: bool,
+    retained_read_failure: bool,
     admitted_source: Option<ReaderIntent>,
 }
 
@@ -710,8 +700,20 @@ struct HistoryFreshness {
 type ResourceCapture = (
     Option<Arc<PublishedSnapshot>>,
     bool,
+    bool,
     Option<HistoryFreshness>,
 );
+
+fn retain_read_failure(inner: &mut StoreInner, error: &ReaderError) {
+    // An ordinary I/O failure cannot revoke previously verified facts. It
+    // also cannot restore a frame already rejected at an ownership/domain
+    // boundary. Schema, value and publication guards remain unavailable.
+    inner.retained_read_failure = inner.current.is_some()
+        && (!inner.reader_unavailable || inner.retained_read_failure)
+        && matches!(error, ReaderError::Io(_) | ReaderError::Sqlite(_));
+    inner.reader_unavailable = true;
+    inner.degraded = true;
+}
 
 fn same_history_owner(left: Option<&ReaderIntent>, right: Option<&ReaderIntent>) -> bool {
     match (left, right) {
@@ -747,6 +749,7 @@ impl AccountStore {
                 last_verified_history: None,
                 degraded: false,
                 reader_unavailable: false,
+                retained_read_failure: false,
                 admitted_source: None,
             }),
         }
@@ -803,6 +806,7 @@ impl AccountStore {
                     let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
                     inner.degraded = true;
                     inner.reader_unavailable = true;
+                    inner.retained_read_failure = false;
                     return RefreshStatus::RetainedLastGood {
                         generation: current_generation,
                     };
@@ -816,8 +820,7 @@ impl AccountStore {
                         None,
                     );
                     let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
-                    inner.degraded = true;
-                    inner.reader_unavailable = true;
+                    retain_read_failure(&mut inner, &error);
                     return RefreshStatus::RetainedLastGood {
                         generation: current_generation,
                     };
@@ -882,6 +885,7 @@ impl AccountStore {
                         let generation = previous.generation;
                         inner.degraded = true;
                         inner.reader_unavailable = true;
+                        inner.retained_read_failure = false;
                         return RefreshStatus::RetainedLastGood { generation };
                     }
                 }
@@ -895,6 +899,7 @@ impl AccountStore {
                             log.record(route, "publication_guard", "pair_issuance_failed", None);
                             inner.degraded = true;
                             inner.reader_unavailable = true;
+                            inner.retained_read_failure = false;
                             return RefreshStatus::Unavailable;
                         };
                         candidate.pair = pair;
@@ -903,12 +908,14 @@ impl AccountStore {
                         inner.current = Some(Arc::new(candidate));
                         inner.degraded = degraded;
                         inner.reader_unavailable = false;
+                        inner.retained_read_failure = false;
                         RefreshStatus::Updated { generation }
                     }
                     Some((current_generation, _)) if candidate.generation < current_generation => {
                         log.record(route, "publication_guard", "generation_regressed", None);
                         inner.degraded = true;
                         inner.reader_unavailable = true;
+                        inner.retained_read_failure = false;
                         RefreshStatus::RetainedLastGood {
                             generation: current_generation,
                         }
@@ -927,6 +934,7 @@ impl AccountStore {
                         };
                         inner.degraded = frame.acquisition_degraded;
                         inner.reader_unavailable = false;
+                        inner.retained_read_failure = false;
                         inner.current = Some(frame);
                         RefreshStatus::Unchanged { generation }
                     }
@@ -935,6 +943,7 @@ impl AccountStore {
                             log.record(route, "publication_guard", "pair_issuance_failed", None);
                             inner.degraded = true;
                             inner.reader_unavailable = true;
+                            inner.retained_read_failure = false;
                             return RefreshStatus::RetainedLastGood {
                                 generation: current_generation,
                             };
@@ -945,13 +954,14 @@ impl AccountStore {
                         inner.current = Some(Arc::new(candidate));
                         inner.degraded = degraded;
                         inner.reader_unavailable = false;
+                        inner.retained_read_failure = false;
                         RefreshStatus::Updated { generation }
                     }
                 }
             }
             Err(error) => {
                 log.record(route, "snapshot_read", &reader_failure_reason(&error), None);
-                inner.reader_unavailable = true;
+                retain_read_failure(&mut inner, &error);
                 if let Some(current_generation) =
                     inner.current.as_ref().map(|current| current.generation)
                 {
@@ -1123,13 +1133,19 @@ impl AccountStore {
                 })
             })
             .flatten();
-        (frame.cloned(), inner.reader_unavailable, freshness)
+        (
+            frame.cloned(),
+            inner.reader_unavailable && !inner.retained_read_failure,
+            inner.retained_read_failure,
+            freshness,
+        )
     }
 
     fn retire_history(&self) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.last_verified_history = None;
         inner.reader_unavailable = true;
+        inner.retained_read_failure = false;
     }
 
     fn history_owner_matches(&self, intent: &ReaderIntent) -> bool {
@@ -1140,6 +1156,7 @@ impl AccountStore {
     fn mark_unavailable(&self) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.reader_unavailable = true;
+        inner.retained_read_failure = false;
         inner.degraded = true;
     }
 }
@@ -1225,8 +1242,6 @@ pub struct SnapshotStore {
     publication_clock: PublicationClock,
     #[cfg(test)]
     history_candidate_ready: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(test)]
-    recording_candidate_ready: Option<Arc<dyn Fn() + Send + Sync>>,
     diagnostics: FailureLog,
 }
 
@@ -1330,7 +1345,6 @@ impl SnapshotStore {
                 }),
                 changed: Condvar::new(),
                 history_changed: Condvar::new(),
-                recordings_changed: Condvar::new(),
             },
             boundary: RwLock::new(BoundaryPublication {
                 generation: 0,
@@ -1349,8 +1363,6 @@ impl SnapshotStore {
             publication_clock: Arc::new(utc_unix_seconds),
             #[cfg(test)]
             history_candidate_ready: None,
-            #[cfg(test)]
-            recording_candidate_ready: None,
             diagnostics: FailureLog::default(),
         })
     }
@@ -1400,8 +1412,6 @@ impl SnapshotStore {
             publication_clock: Arc::new(utc_unix_seconds),
             #[cfg(test)]
             history_candidate_ready: None,
-            #[cfg(test)]
-            recording_candidate_ready: None,
             diagnostics: FailureLog::default(),
         })
     }
@@ -1610,11 +1620,11 @@ impl SnapshotStore {
             return self
                 .account_store(account_id)
                 .map(|account| account.capture_resource(route))
-                .unwrap_or((None, true, None));
+                .unwrap_or((None, true, false, None));
         }
         let global = self.boundary.read().unwrap_or_else(|p| p.into_inner());
         if let Some(boundary) = global.snapshot.as_ref() {
-            return (Some(Arc::clone(boundary)), false, None);
+            return (Some(Arc::clone(boundary)), false, false, None);
         }
         let Some(account) = global
             .accounts
@@ -1622,13 +1632,13 @@ impl SnapshotStore {
             .as_deref()
             .and_then(|id| global.stores.get(id))
         else {
-            return (None, true, None);
+            return (None, true, false, None);
         };
-        let (frame, unavailable, history) = account.capture_resource(route);
+        let (frame, unavailable, read_failed, history) = account.capture_resource(route);
         if frame.is_none() && !unavailable {
-            (Some(Arc::clone(&global.initializing)), false, None)
+            (Some(Arc::clone(&global.initializing)), false, false, None)
         } else {
-            (frame, unavailable, history)
+            (frame, unavailable, read_failed, history)
         }
     }
 
@@ -1866,36 +1876,6 @@ impl SnapshotStore {
             }))
     }
 
-    fn prepare_recordings_candidate_at(
-        &self,
-        account_id: &str,
-        at: i64,
-    ) -> Result<(PublishedSnapshot, Option<CollectionCommit>), ReaderError> {
-        let account = self
-            .account_store(account_id)
-            .ok_or_else(|| ReaderError::InvalidValue("account catalog changed".into()))?;
-        let previous_key = account.snapshot().and_then(|frame| {
-            frame
-                .reprojection_witness
-                .as_ref()
-                .and_then(|proof| proof.current_observation())
-        });
-        let candidate = account
-            .reader
-            .read_committed_recordings_for_reprojection_at(at, previous_key)?;
-        #[cfg(test)]
-        if let Some(ready) = &self.recording_candidate_ready {
-            ready();
-        }
-        Ok((
-            PublishedSnapshot::candidate_from_db_for_account(
-                candidate.snapshot,
-                account.storage_epoch,
-            ),
-            candidate.commit,
-        ))
-    }
-
     #[cfg(test)]
     fn complete_reader_candidate(
         &self,
@@ -1989,50 +1969,7 @@ impl SnapshotStore {
                 .record("reader_reconcile", "history_admission", reason, None);
             return;
         }
-        if lane == ReaderLane::Recordings {
-            let Ok((next, commit)) = candidate else {
-                self.diagnostics.record(
-                    "reader_reconcile",
-                    "recordings_read",
-                    "archive_unavailable",
-                    None,
-                );
-                return;
-            };
-            let Some(current) = account.snapshot() else {
-                return;
-            };
-            let Some(archive) = next.recordings else {
-                return;
-            };
-            if next.generation != current.generation
-                || !matches!((&current.reprojection_witness, &next.reprojection_witness),
-                    (Some(old), Some(new)) if old.collection_commit() == commit
-                        && old.same_commit_authority(new)
-                        && old.same_common_quota_receipts(new)
-                        && new.preserves_previous_current_observation(old))
-            {
-                return;
-            }
-            if let Some(known) = &current.recordings {
-                if known.as_ref() != archive.as_ref() {
-                    self.diagnostics.record(
-                        "reader_reconcile",
-                        "recordings_read",
-                        "same_generation_source_rewrite",
-                        None,
-                    );
-                }
-                return;
-            }
-            // The read-only archive adds one independently qualified resource
-            // to this exact commit. Keep every current/history field from the
-            // latest frame, including its newer publication-time projection.
-            candidate = (*current)
-                .clone()
-                .with_recordings(archive)
-                .map(|frame| (frame, commit));
-        } else if matches!(lane, ReaderLane::Current | ReaderLane::History) {
+        if matches!(lane, ReaderLane::Current | ReaderLane::History) {
             if let Ok((next, _)) = &mut candidate {
                 if lane == ReaderLane::Current
                     && !next.history_available
@@ -2053,19 +1990,6 @@ impl SnapshotStore {
                                 "history_reprojection_invalid",
                                 None,
                             ),
-                        }
-                    }
-                }
-                if next.recordings.is_none() {
-                    if let Some(current) = account.snapshot().filter(|current| {
-                        current.generation == next.generation
-                            && same_commit_reprojection(current, next, None)
-                    }) {
-                        if let Some(archive) = &current.recordings {
-                            match next.clone().with_recordings(Arc::clone(archive)) {
-                                Ok(merged) => *next = merged,
-                                Err(_) => return,
-                            }
                         }
                     }
                 }
@@ -2159,6 +2083,7 @@ impl SnapshotStore {
                     // history for this same commit and unchanged current view.
                     inner.admitted_source = Some((**intent).clone());
                     inner.reader_unavailable = false;
+                    inner.retained_read_failure = false;
                     inner.degraded = next.acquisition_degraded;
                     return;
                 }
@@ -2202,11 +2127,9 @@ impl SnapshotStore {
         pending.stopped = true;
         pending.accounts.clear();
         pending.history.clear();
-        pending.recordings.clear();
         pending.freshness = false;
         self.reader_control.changed.notify_all();
         self.reader_control.history_changed.notify_all();
-        self.reader_control.recordings_changed.notify_all();
     }
 
     pub fn publish_account_boundary(&self, state: PublicState) {
@@ -2437,7 +2360,7 @@ fn start_reader_worker(store: Arc<SnapshotStore>) -> Result<JoinHandle<()>, Rest
         .name("codex-info-rest-history".to_owned())
         .spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_auxiliary_reader_worker(&history_store, ReaderLane::History);
+                run_auxiliary_reader_worker(&history_store);
             }));
             if outcome.is_err() {
                 history_store.diagnostics.record(
@@ -2456,38 +2379,13 @@ fn start_reader_worker(store: Arc<SnapshotStore>) -> Result<JoinHandle<()>, Rest
             None,
         );
     }
-    let recordings_store = Arc::clone(&store);
-    let recordings_worker = thread::Builder::new()
-        .name("codex-info-rest-recordings".to_owned())
-        .spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_auxiliary_reader_worker(&recordings_store, ReaderLane::Recordings);
-            }));
-            if outcome.is_err() {
-                recordings_store.diagnostics.record(
-                    "reader_reconcile",
-                    "recordings_read",
-                    "worker_terminated",
-                    None,
-                );
-            }
-        });
-    if recordings_worker.is_err() {
-        store.diagnostics.record(
-            "reader_reconcile",
-            "recordings_read",
-            "worker_unavailable",
-            None,
-        );
-    }
     let cleanup = Arc::clone(&store);
     let started = thread::Builder::new()
         .name("codex-info-rest-reader".to_owned())
         .spawn(move || {
             // The auxiliary worker is read-only. Shutdown revokes its result
-            // authority; current publication never joins a long archive read.
+            // authority; current publication never joins a long history read.
             let _history_worker = history_worker;
-            let _recordings_worker = recordings_worker;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_reader_worker(&store);
             }));
@@ -2503,7 +2401,7 @@ fn start_reader_worker(store: Arc<SnapshotStore>) -> Result<JoinHandle<()>, Rest
     started
 }
 
-fn run_auxiliary_reader_worker(store: &SnapshotStore, lane: ReaderLane) {
+fn run_auxiliary_reader_worker(store: &SnapshotStore) {
     let mut last_account: Option<String> = None;
     loop {
         let (id, intent, at) = {
@@ -2512,37 +2410,26 @@ fn run_auxiliary_reader_worker(store: &SnapshotStore, lane: ReaderLane) {
                 .pending
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            while !pending.stopped
-                && match lane {
-                    ReaderLane::History => pending.history.is_empty(),
-                    ReaderLane::Recordings => pending.recordings.is_empty(),
-                    _ => unreachable!("auxiliary reader lane"),
-                }
-            {
-                let changed = if lane == ReaderLane::History {
-                    &store.reader_control.history_changed
-                } else {
-                    &store.reader_control.recordings_changed
-                };
-                pending = changed.wait(pending).unwrap_or_else(|p| p.into_inner());
+            while !pending.stopped && pending.history.is_empty() {
+                pending = store
+                    .reader_control
+                    .history_changed
+                    .wait(pending)
+                    .unwrap_or_else(|p| p.into_inner());
             }
             if pending.stopped || store.publication_failed() {
                 return;
             }
             // Round robin keeps an active account from starving another
             // account's history. Each queued account holds only its newest job.
-            let queue = if lane == ReaderLane::History {
-                &mut pending.history
-            } else {
-                &mut pending.recordings
-            };
-            let id = queue
+            let id = pending
+                .history
                 .keys()
                 .find(|id| last_account.as_ref().is_none_or(|last| *id > last))
-                .or_else(|| queue.keys().next())
+                .or_else(|| pending.history.keys().next())
                 .cloned()
                 .unwrap();
-            let (intent, at) = queue.remove(&id).unwrap();
+            let (intent, at) = pending.history.remove(&id).unwrap();
             last_account = Some(id.clone());
             if !pending
                 .latest
@@ -2557,15 +2444,11 @@ fn run_auxiliary_reader_worker(store: &SnapshotStore, lane: ReaderLane) {
             continue;
         };
         let started = Instant::now();
-        let candidate = if lane == ReaderLane::History {
-            let _refresh_guard = account
-                .refresh_lock
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            store.prepare_reader_candidate_at(&id, at)
-        } else {
-            store.prepare_recordings_candidate_at(&id, at)
-        };
+        let _refresh_guard = account
+            .refresh_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let candidate = store.prepare_reader_candidate_at(&id, at);
         let elapsed = started.elapsed();
         if elapsed >= Duration::from_secs(1) {
             // Fixed stage and duration only; no account, SQL, source or value.
@@ -2573,12 +2456,12 @@ fn run_auxiliary_reader_worker(store: &SnapshotStore, lane: ReaderLane) {
                 "{}",
                 json!({
                     "schema": "codex-info-reader-duration-v1",
-                    "stage": if lane == ReaderLane::History { "period_history" } else { "recorded_archive" },
+                    "stage": "period_history",
                     "elapsed_ms": elapsed.as_millis(),
                 })
             );
         }
-        store.complete_reader_lane(&id, &intent, candidate, lane);
+        store.complete_reader_lane(&id, &intent, candidate, ReaderLane::History);
     }
 }
 
@@ -2677,13 +2560,6 @@ fn run_reader_worker(store: &SnapshotStore) {
                         .history
                         .insert(id.clone(), (Arc::clone(&intent), at));
                     store.reader_control.history_changed.notify_one();
-                    if account
-                        .snapshot()
-                        .is_none_or(|frame| frame.recordings.is_none())
-                    {
-                        pending.recordings.insert(id, (intent, at));
-                        store.reader_control.recordings_changed.notify_one();
-                    }
                 }
             }
         }
@@ -2700,10 +2576,6 @@ enum Route {
     AccountsV3,
     CurrentV3,
     CurrentV4,
-    CurrentV5,
-    HistoryScopesV6,
-    HistoryRecordingsV4,
-    HistoryObservationsV4,
     HistoryPeriodsV3,
     SelectableHistoryPeriodsV3,
     HistoryPeriodsV4,
@@ -2741,10 +2613,6 @@ impl Route {
             Self::AccountsV3 => "/v3/accounts",
             Self::CurrentV3 => "/v3/current",
             Self::CurrentV4 => "/v4/current",
-            Self::CurrentV5 => "/v5/current",
-            Self::HistoryScopesV6 => "/v6/history/scopes",
-            Self::HistoryRecordingsV4 => "/v4/history/recordings",
-            Self::HistoryObservationsV4 => "/v4/history/observations",
             Self::HistoryPeriodsV3 => "/v3/history/periods",
             Self::SelectableHistoryPeriodsV3 => "/v3/history/periods/selectable",
             Self::HistoryPeriodsV4 => "/v4/history/periods",
@@ -2762,10 +2630,6 @@ impl Route {
                 | Self::AccountsV3
                 | Self::CurrentV3
                 | Self::CurrentV4
-                | Self::CurrentV5
-                | Self::HistoryScopesV6
-                | Self::HistoryRecordingsV4
-                | Self::HistoryObservationsV4
                 | Self::HistoryPeriodsV3
                 | Self::SelectableHistoryPeriodsV3
                 | Self::HistoryPeriodsV4
@@ -2961,7 +2825,7 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
             return;
         }
     }
-    let (snapshot, reader_unavailable, history_freshness) =
+    let (snapshot, reader_unavailable, read_failed, history_freshness) =
         store.capture_resource(request.account.as_deref(), route);
     if reader_unavailable || store.publication_failed() {
         if !reader_unavailable {
@@ -2995,19 +2859,17 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
         );
         return;
     };
-    let degraded = snapshot.acquisition_degraded;
-    let response_pair = snapshot.pair.as_str();
+    let degraded = read_failed || snapshot.acquisition_degraded;
+    let response_pair = snapshot.response_pair(read_failed);
     // Qualification belongs to this captured route/query even when the pair
     // matches. A conditional response cannot hide a failed history resource,
     // an invalid cursor or a transport boundary. This reads no database.
-    let body = match serialize_route_with_diagnostics(
+    let body = match serialize_route(
         &snapshot,
         route,
         request.period.as_deref(),
         request.cursor,
         degraded,
-        &store.diagnostics,
-        route_label,
     ) {
         Ok(body) => body,
         Err(error) => {
@@ -3015,11 +2877,12 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
             return;
         }
     };
-    if route.v3()
+    if !read_failed
+        && route.v3()
         && request
             .if_none_match
             .as_deref()
-            .is_some_and(|pair| pair == response_pair)
+            .is_some_and(|pair| pair == response_pair.as_ref())
     {
         write_json_response_with_history(
             stream,
@@ -3027,7 +2890,7 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
             route_label,
             304,
             Vec::new(),
-            (Some(response_pair), history_freshness),
+            (Some(response_pair.as_ref()), history_freshness),
             true,
         );
         return;
@@ -3047,7 +2910,9 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
                 snapshot.details.state == PublicState::Error
             })
         {
-            let reason = if degraded && snapshot.acquisition_degraded {
+            let reason = if read_failed {
+                "last_good_after_refresh_failure"
+            } else if degraded && snapshot.acquisition_degraded {
                 "acquisition_failed"
             } else if degraded {
                 "last_good_after_refresh_failure"
@@ -3066,7 +2931,7 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
             route_label,
             200,
             body,
-            (Some(response_pair), history_freshness),
+            (Some(response_pair.as_ref()), history_freshness),
             false,
         )
     }
@@ -3074,15 +2939,6 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
 
 fn write_route_error(stream: &mut TcpStream, log: &FailureLog, route: &str, error: RouteError) {
     match error {
-        RouteError::SnapshotUnavailable => write_json_response(
-            stream,
-            log,
-            route,
-            503,
-            error_body("snapshot_unavailable"),
-            None,
-            false,
-        ),
         RouteError::StaleCursor => write_json_response(
             stream,
             log,
@@ -3291,10 +3147,6 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
         "/v3/accounts" => Some(Route::AccountsV3),
         "/v3/current" => Some(Route::CurrentV3),
         "/v4/current" => Some(Route::CurrentV4),
-        "/v5/current" => Some(Route::CurrentV5),
-        "/v6/history/scopes" => Some(Route::HistoryScopesV6),
-        "/v4/history/recordings" => Some(Route::HistoryRecordingsV4),
-        "/v4/history/observations" => Some(Route::HistoryObservationsV4),
         "/v3/history/periods" => Some(Route::HistoryPeriodsV3),
         "/v3/history/periods/selectable" => Some(Route::SelectableHistoryPeriodsV3),
         "/v4/history/periods" => Some(Route::HistoryPeriodsV4),
@@ -3305,13 +3157,12 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
         "/v3/threads" => Some(Route::ThreadsV3),
         _ => None,
     };
-    if route.is_some_and(Route::directory_v5) || route == Some(Route::HistoryScopesV6) {
+    if route.is_some_and(Route::directory_v5) {
         if (target.contains('?') && query.is_empty()) || query.contains('%') {
             return Err(ParseError::BadRequest);
         }
         let mut account = None;
         let mut cursor = None;
-        let mut unknown = false;
         for pair in query.split('&').filter(|_| !query.is_empty()) {
             let (name, value) = pair.split_once('=').ok_or(ParseError::BadRequest)?;
             if value.is_empty() || value.contains('=') {
@@ -3322,53 +3173,10 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
                     account = Some(value.to_owned());
                 }
                 "cursor" if cursor.is_none() => cursor = Some(value.to_owned()),
-                "account" | "cursor" => return Err(ParseError::BadRequest),
-                _ => unknown = true,
-            }
-        }
-        if unknown && route == Some(Route::HistoryScopesV6) {
-            return Err(ParseError::BadRequest);
-        }
-        return Ok((if unknown { None } else { route }, account, None, cursor));
-    }
-    if matches!(
-        route,
-        Some(Route::HistoryRecordingsV4 | Route::HistoryObservationsV4)
-    ) {
-        if query.is_empty() || query.contains('%') {
-            return Err(ParseError::BadRequest);
-        }
-        let mut account = None;
-        let mut cursor = None;
-        let mut start = None;
-        let mut end = None;
-        for pair in query.split('&') {
-            let (key, value) = pair.split_once('=').ok_or(ParseError::BadRequest)?;
-            if value.is_empty() || value.contains('=') {
-                return Err(ParseError::BadRequest);
-            }
-            let time = || {
-                value.parse::<i64>().ok().filter(|v| {
-                    *v > 0
-                        && v.to_string() == value
-                        && *v <= codex_info_rest_contract::recorded_usage::MAX_END_EXCLUSIVE
-                })
-            };
-            match key {
-                "account" if account.is_none() && valid_account_selector(value) => {
-                    account = Some(value.to_owned())
-                }
-                "cursor" if cursor.is_none() => cursor = Some(value.to_owned()),
-                "start" if start.is_none() => start = Some(time().ok_or(ParseError::BadRequest)?),
-                "end" if end.is_none() => end = Some(time().ok_or(ParseError::BadRequest)?),
                 _ => return Err(ParseError::BadRequest),
             }
         }
-        let (start, end) = start
-            .zip(end)
-            .filter(|(start, end)| start < end)
-            .ok_or(ParseError::BadRequest)?;
-        return Ok((route, account, Some(format!("{start}:{end}")), cursor));
+        return Ok((route, account, None, cursor));
     }
     if route != Some(Route::HistoryV3) {
         if route.is_some_and(Route::v3) {
@@ -3434,7 +3242,6 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteError {
     Serialization,
-    SnapshotUnavailable,
     HistoryUnavailable,
     UnknownPeriod,
     StaleCursor,
@@ -3449,27 +3256,6 @@ fn serialize_route(
     degraded: bool,
 ) -> Result<Vec<u8>, RouteError> {
     serialize_route_with_budget(snapshot, route, period, cursor, degraded, MAX_BODY_BYTES)
-}
-
-fn serialize_route_with_diagnostics(
-    snapshot: &PublishedSnapshot,
-    route: Route,
-    period: Option<&str>,
-    cursor: Option<String>,
-    degraded: bool,
-    log: &FailureLog,
-    route_label: &str,
-) -> Result<Vec<u8>, RouteError> {
-    let result = serialize_route(snapshot, route, period, cursor, degraded);
-    if matches!(&result, Err(RouteError::SnapshotUnavailable)) {
-        log.record(
-            route_label,
-            "recorded_projection",
-            "recorded_archive_unavailable",
-            None,
-        );
-    }
-    result
 }
 
 fn serialize_route_with_budget(
@@ -3496,17 +3282,6 @@ fn serialize_route_with_budget(
     }
     let details = &snapshot.details;
     match route {
-        Route::CurrentV5
-        | Route::HistoryScopesV6
-        | Route::HistoryRecordingsV4
-        | Route::HistoryObservationsV4 => recordings::serialize(
-            snapshot,
-            route,
-            period,
-            cursor.as_deref(),
-            degraded,
-            directory_body_budget,
-        ),
         Route::Health => Ok(health_body()),
         Route::Runtime => unreachable!("runtime versions do not use a database snapshot"),
         Route::Details => {
@@ -4086,19 +3861,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn issue604_recorded_scope_resources_preserve_unknown_period_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("recorded-scope.sqlite3");
-        fixture(&path, 1);
-        let store = Arc::new(SnapshotStore::new(DbReader::open(&path).unwrap()));
-        let snapshot = history_test_fixture(1, 1, 1, false, false, "1802678400");
-        store
-            .account_store("account-1")
-            .unwrap()
-            .inner
-            .write()
-            .unwrap()
-            .current = Some(Arc::new(snapshot));
+    fn issue604_unapproved_recorded_routes_are_not_exposed() {
+        let store = Arc::new(SnapshotStore::new_without_account(
+            PublicState::Initializing,
+        ));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let captured = Arc::clone(&store);
@@ -4117,276 +3883,61 @@ mod tests {
         let responses = routes
             .map(|route| request(address, &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n")));
         worker.join().unwrap();
-        let mut pair = None;
         for (route, response) in routes.into_iter().zip(responses) {
             assert!(
-                response.starts_with("HTTP/1.1 200"),
-                "{route} must expose the scope contract: {}",
+                response.starts_with("HTTP/1.1 404"),
+                "unapproved route {route} must be unavailable: {}",
                 response.lines().next().unwrap()
             );
-            let actual_pair = published_pair(&response).to_owned();
-            assert!(pair
-                .as_ref()
-                .is_none_or(|previous| previous == &actual_pair));
-            pair = Some(actual_pair);
-            let value: Value = serde_json::from_str(body(&response)).unwrap();
-            assert_eq!(value["period_identity"]["state"], "unknown");
-            assert_eq!(
-                value["period_identity"]["reason"],
-                "provider-period-identity-unavailable"
-            );
-            if route == "/v5/current" {
-                assert!(value["models"].as_array().unwrap().is_empty());
-                assert_eq!(value["models_status"], "unavailable");
-            }
         }
-    }
-
-    fn recorded_literal_snapshot() -> (PublishedSnapshot, Value) {
-        use codex_info_rest_contract::recorded_usage::*;
-        let literal: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/recorded_scope_contract.json"
-        ))
-        .unwrap();
-        let mut archive = codex_info_db_reader::RecordedArchive {
-            coverage: RecordingCoverage::Partial,
-            ..Default::default()
-        };
-        let mut prefix = RecordedTokenPrefix::default();
-        // Independent source A and B. Their original R values differ. The
-        // literal replay is checked by the writer identity consumer, not
-        // promoted into another prefix event here.
-        for input in literal["independent_inputs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .take(2)
-        {
-            prefix
-                .add(codex_info_rest_contract::token_facts::TokenFacts {
-                    total: input["total"].as_u64().unwrap(),
-                    input: input["input"].as_u64(),
-                    cached_input: input["cached_input"].as_u64(),
-                    cache_write_input: input["cache_write_input"].as_u64(),
-                    output: input["output"].as_u64(),
-                })
-                .unwrap();
-            archive
-                .prefixes
-                .entry("gpt-6.1-sol".into())
-                .or_default()
-                .push((input["timestamp"].as_i64().unwrap(), prefix.clone()));
-        }
-        archive.quota_observations =
-            serde_json::from_value(literal["recordings"]["quota_observations"].clone()).unwrap();
-        archive.observations =
-            serde_json::from_value(literal["observations"]["observations"].clone()).unwrap();
-        let mut snapshot = history_test_fixture(1, 1, 1, false, false, "1802678400");
-        snapshot.recordings = Some(Arc::new(archive));
-        snapshot.details.authenticated = true;
-        snapshot.details.plan_label = Some("Plus".into());
-        snapshot.details.quota =
-            Some(serde_json::from_value(literal["current"]["quota"].clone()).unwrap());
-        snapshot.acquisition_degraded = false;
-        snapshot.models_v3 = vec![codex_info_rest_contract::PublicModelUsageV3 {
-            model: "gpt-6.1-sol".into(),
-            total_tokens: 66123101,
-            input_tokens: 65862746,
-            cached_input_tokens: 65275264,
-            cache_write_input_tokens: Some(0),
-            output_tokens: 260355,
-            estimated_cost: None,
-        }];
-        (snapshot, literal)
-    }
-
-    #[test]
-    fn issue604_recorded_literal_survives_reset_switch_and_page_boundaries() {
-        let (snapshot, literal) = recorded_literal_snapshot();
-        let current: Value = serde_json::from_slice(
-            &serialize_route(&snapshot, Route::CurrentV5, None, None, false).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(current["models"], literal["current"]["models"]);
-        assert_eq!(current["usage_scope"], literal["current"]["usage_scope"]);
-        assert_eq!(current["state"], "ready");
-        let mut alternate = snapshot.clone();
-        alternate.details.quota.as_mut().unwrap().reset_at = 1792823931;
-        let after: Value = serde_json::from_slice(
-            &serialize_route(&alternate, Route::CurrentV5, None, None, false).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(after["models"], current["models"]);
-        assert_eq!(after["usage_scope"], current["usage_scope"]);
-        let directory: Value = serde_json::from_slice(
-            &serialize_route(&snapshot, Route::HistoryScopesV6, None, None, false).unwrap(),
-        )
-        .unwrap();
-        let other: Value = serde_json::from_slice(
-            &serialize_route(&alternate, Route::HistoryScopesV6, None, None, false).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(directory["scopes"], other["scopes"]);
-        assert_eq!(
-            directory["scopes"].as_array().unwrap().len(),
-            2,
-            "R-only change cannot add an actual-week selector"
-        );
-        let range = "1791623262:1792228062";
-        let mut cursor = None;
-        let mut samples = Vec::new();
-        let mut quota = Vec::new();
-        let mut cursors = Vec::new();
-        loop {
-            let page: Value = serde_json::from_slice(
-                &serialize_route_with_budget(
-                    &snapshot,
-                    Route::HistoryRecordingsV4,
-                    Some(range),
-                    cursor.clone(),
-                    false,
-                    800,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            samples.extend(page["samples"].as_array().unwrap().iter().cloned());
-            quota.extend(
-                page["quota_observations"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .cloned(),
-            );
-            assert_eq!(page["scope"], literal["recordings"]["scope"]);
-            cursor = page["next_cursor"].as_str().map(str::to_owned);
-            if let Some(cursor) = &cursor {
-                cursors.push(cursor.clone());
-            } else {
-                break;
-            }
-            assert!(cursors.len() < 10);
-        }
-        assert!(
-            !cursors.is_empty(),
-            "finite budget must exercise a real page boundary"
-        );
-        assert_eq!(
-            samples,
-            literal["recordings"]["samples"]
-                .as_array()
-                .unwrap()
-                .as_slice()
-        );
-        assert_eq!(
-            quota,
-            literal["recordings"]["quota_observations"]
-                .as_array()
-                .unwrap()
-                .as_slice()
-        );
-        let stale = &cursors[0];
-        assert_eq!(
-            serialize_route(
-                &snapshot,
-                Route::HistoryObservationsV4,
-                Some(range),
-                Some(stale.clone()),
-                false
-            ),
-            Err(RouteError::StaleCursor)
-        );
-        assert_eq!(
-            serialize_route(
-                &snapshot,
-                Route::HistoryRecordingsV4,
-                Some("1791623263:1792228062"),
-                Some(stale.clone()),
-                false
-            ),
-            Err(RouteError::StaleCursor)
-        );
-        let mut peer = snapshot.clone();
-        peer.recorded_scope_account += 1;
-        assert_eq!(
-            serialize_route(
-                &peer,
-                Route::HistoryRecordingsV4,
-                Some(range),
-                Some(stale.clone()),
-                false
-            ),
-            Err(RouteError::StaleCursor)
-        );
-        let saved: Value = serde_json::from_slice(
-            &serialize_route(
-                &snapshot,
-                Route::HistoryObservationsV4,
-                Some(range),
-                None,
-                false,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            saved["observations"],
-            literal["observations"]["observations"]
-        );
-        for bad in [
-            "/v4/history/recordings?start=01&end=2",
-            "/v4/history/recordings?start=1&end=1",
-            "/v4/history/observations?start=1&end=2&limit=1",
-            "/v4/history/recordings?start=1&start=2&end=3",
-        ] {
-            assert_eq!(parse_target(bad), Err(ParseError::BadRequest));
-        }
-    }
-
-    #[test]
-    fn issue604_recorded_projection_failure_never_becomes_successful_empty_current() {
-        let (mut snapshot, _) = recorded_literal_snapshot();
-        snapshot.recordings = None;
-        assert!(serialize_route(&snapshot,Route::CurrentV5,None,None,false).is_err(),"failed recorded projection must retain client last good through HTTP failure, never publish empty success");
     }
 
     #[test]
     fn issue604_existing_ui_routes_keep_saved_models_and_periods() {
-        let (mut snapshot, _) = recorded_literal_snapshot();
+        let mut snapshot = history_test_fixture(1, 1, 1, false, false, "1802678400");
+        snapshot.details.quota = Some(codex_info_rest_contract::PublicQuota {
+            remaining_percent: 88.0,
+            reset_at: 1_802_678_400,
+            window_seconds: 604_800,
+            monthly: false,
+        });
         snapshot.current.models_status = codex_info_db_reader::CurrentModelsStatus::Partial;
-        for auxiliary_archive in [true, false] {
-            if !auxiliary_archive {
-                snapshot.recordings = None;
-            }
-            let current: Value = serde_json::from_slice(
-                &serialize_route(&snapshot, Route::CurrentV4, None, None, false).unwrap(),
+        snapshot.models_v3 = vec![codex_info_rest_contract::PublicModelUsageV3 {
+            model: "gpt-6.1-sol".into(),
+            total_tokens: 66_123_101,
+            input_tokens: 65_862_746,
+            cached_input_tokens: 65_275_264,
+            cache_write_input_tokens: Some(0),
+            output_tokens: 260_355,
+            estimated_cost: None,
+        }];
+        let current: Value = serde_json::from_slice(
+            &serialize_route(&snapshot, Route::CurrentV4, None, None, false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(current["models"][0]["total_tokens"], 66_123_101);
+        assert_eq!(current["models_status"], "partial");
+        assert!(current["quota"].is_object());
+        for route in [
+            Route::HistoryPeriodsV3,
+            Route::SelectableHistoryPeriodsV3,
+            Route::HistoryPeriodsV4,
+            Route::SelectableHistoryPeriodsV4,
+            Route::HistoryPeriodsV5,
+            Route::SelectableHistoryPeriodsV5,
+        ] {
+            let directory: Value = serde_json::from_slice(
+                &serialize_route(&snapshot, route, None, None, false).unwrap(),
             )
             .unwrap();
-            assert_eq!(current["models"][0]["total_tokens"], 66123101);
-            assert_eq!(current["models_status"], "partial");
-            assert!(current["quota"].is_object());
-            for route in [
-                Route::HistoryPeriodsV3,
-                Route::SelectableHistoryPeriodsV3,
-                Route::HistoryPeriodsV4,
-                Route::SelectableHistoryPeriodsV4,
-                Route::HistoryPeriodsV5,
-                Route::SelectableHistoryPeriodsV5,
-            ] {
-                let directory: Value = serde_json::from_slice(
-                    &serialize_route(&snapshot, route, None, None, false).unwrap(),
-                )
-                .unwrap();
-                assert_eq!(directory["history_periods"][0]["id"], "1802678400");
-            }
-            let history: Value = serde_json::from_slice(
-                &serialize_route(&snapshot, Route::HistoryV3, Some("1802678400"), None, false)
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(history["history_samples"].as_array().unwrap().len(), 1);
-            assert_eq!(history["history_samples"][0]["timestamp"], 1800000000);
+            assert_eq!(directory["history_periods"][0]["id"], "1802678400");
         }
+        let history: Value = serde_json::from_slice(
+            &serialize_route(&snapshot, Route::HistoryV3, Some("1802678400"), None, false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(history["history_samples"].as_array().unwrap().len(), 1);
+        assert_eq!(history["history_samples"][0]["timestamp"], 1_800_000_000);
     }
 
     #[test]
@@ -4647,8 +4198,6 @@ mod tests {
             ..PublicDetails::default()
         };
         let snapshot = PublishedSnapshot {
-            recordings: Some(Arc::default()),
-            recorded_scope_account: 0,
             generation: 1,
             data_hash: "hash".to_owned(),
             pair: "pair".to_owned(),
@@ -4717,8 +4266,6 @@ mod tests {
             ..PublicDetails::default()
         };
         let snapshot = PublishedSnapshot {
-            recordings: Some(Arc::default()),
-            recorded_scope_account: 0,
             generation: 1,
             data_hash: "hash".to_owned(),
             pair: "pair".to_owned(),
@@ -5434,58 +4981,6 @@ mod tests {
                 "source values must not enter diagnostics"
             );
         }
-
-        // This serialization failure is later than source/cache admission.
-        // Preserve its result while identifying the missing recorded archive.
-        let projection_root = tempfile::tempdir().unwrap();
-        let projection_log = FailureLog::default();
-        projection_log.set_data_root(projection_root.path());
-        let mut without_archive = (*before).clone();
-        without_archive.recordings = None;
-        assert_eq!(
-            serialize_route_with_diagnostics(
-                &without_archive,
-                Route::CurrentV5,
-                None,
-                None,
-                false,
-                &projection_log,
-                "/v5/current"
-            ),
-            Err(RouteError::SnapshotUnavailable)
-        );
-        let directory = projection_root.path().join("logs/rest");
-        let mut projection_rows = Vec::new();
-        if directory.exists() {
-            for entry in fs::read_dir(directory).unwrap() {
-                for line in fs::read_to_string(entry.unwrap().path()).unwrap().lines() {
-                    projection_rows.push(serde_json::from_str::<Value>(line).unwrap());
-                }
-            }
-        }
-        assert_eq!(
-            projection_rows.len(),
-            1,
-            "one archive serialization diagnostic"
-        );
-        let row = &projection_rows[0];
-        assert_eq!(row["route"], "/v5/current");
-        assert_eq!(row["stage"], "recorded_projection");
-        assert_eq!(row["reason"], "recorded_archive_unavailable");
-        assert_eq!(row["http_status"], Value::Null);
-        assert!(row["timestamp"].as_i64().is_some());
-        assert_eq!(
-            row.as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["timestamp", "route", "stage", "reason", "http_status"])
-        );
-        let logged = row.to_string();
-        for private in ["account-7", "SOL", &before.data_hash, &pair] {
-            assert!(!logged.contains(private));
-        }
     }
 
     fn issue604_commit_notice(generation: u64) -> RecorderCommitNotice {
@@ -5511,7 +5006,7 @@ mod tests {
         let second_path = directory.path().join("second.sqlite3");
         fixture(&first_path, 10);
         fixture(&second_path, 20);
-        let server = RestServer::start_with_accounts(
+        let mut configured_store = SnapshotStore::new_with_accounts(
             vec![
                 AccountReader::new(
                     "account-7",
@@ -5531,31 +5026,127 @@ mod tests {
                 ),
             ],
             "account-7",
-            "127.0.0.1:0".parse().unwrap(),
         )
         .unwrap();
+        // The independent fixture observations are at this fixed time. Keep
+        // their eligibility independent of the wall clock and test duration.
+        configured_store.publication_clock = Arc::new(|| Some(1_800_000_000));
+        let server =
+            RestServer::start_with_store(configured_store, "127.0.0.1:0".parse().unwrap()).unwrap();
         let store = server.store();
+        let failure_diagnostics = || {
+            let frames = ["account-7", "account-13"].map(|id| {
+                store.snapshot_account(id).map(|frame| {
+                    (
+                        frame.generation,
+                        u128::from_str_radix(&frame.pair[35..], 16),
+                        frame.history_available,
+                    )
+                })
+            });
+            let pending = {
+                let pending = store.reader_control.pending.lock().unwrap();
+                (
+                    pending.stopped,
+                    pending.freshness,
+                    pending.accounts.len(),
+                    pending.history.len(),
+                )
+            };
+            format!(
+                "live frames [account-7,account-13] (generation,counter,history)={frames:?}; \
+                 status={:?}; publisher_failed={}; issuer_counter={}; \
+                 reader_finished={}; listener_finished={}; \
+                 pending (stopped,freshness,accounts,history)={pending:?}",
+                store.status(),
+                store.publication_failed(),
+                store.issuer.lock().unwrap().counter,
+                server
+                    .reader_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished()),
+                server
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_finished()),
+            )
+        };
         // Bound fixture synchronization, not production startup latency. These
         // observations touch only the captured cache and issue no HTTP or DB
         // request that could initialize an account on the reader's behalf.
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline
-            && (store.snapshot_account("account-7").is_none()
-                || store.snapshot_account("account-13").is_none())
+            && (store
+                .snapshot_account("account-7")
+                .is_none_or(|frame| !frame.history_available)
+                || store
+                    .snapshot_account("account-13")
+                    .is_none_or(|frame| !frame.history_available))
         {
             thread::sleep(Duration::from_millis(5));
         }
-        let first = store
-            .snapshot_account("account-7")
-            .expect("the startup reader must publish the current account without HTTP");
-        let second = store
-            .snapshot_account("account-13")
-            .expect("the startup reader must also publish the historical account without HTTP");
-        assert_eq!(&first.pair[3..35], &second.pair[3..35]);
-        // The worker uses account-selector byte order, independently of the
-        // catalog's current-first presentation order: account-13 precedes -7.
-        assert_eq!(u128::from_str_radix(&second.pair[35..], 16).unwrap(), 2);
-        assert_eq!(u128::from_str_radix(&first.pair[35..], 16).unwrap(), 3);
+        let first = store.snapshot_account("account-7").unwrap_or_else(|| {
+            panic!(
+                "the startup reader must publish the current account without HTTP; {}",
+                failure_diagnostics()
+            )
+        });
+        let second = store.snapshot_account("account-13").unwrap_or_else(|| {
+            panic!(
+                "the startup reader must also publish the historical account without HTTP; {}",
+                failure_diagnostics()
+            )
+        });
+        assert!(
+            first.history_available && second.history_available,
+            "startup History lanes must finish within the fixture deadline; {}",
+            failure_diagnostics()
+        );
+        assert!(first.models_v3.is_empty(), "{}", failure_diagnostics());
+        assert!(second.models_v3.is_empty(), "{}", failure_diagnostics());
+        assert_eq!(
+            &first.pair[3..35],
+            &second.pair[3..35],
+            "{}",
+            failure_diagnostics()
+        );
+        // Each reader must publish the fixture's committed DB generation.
+        // Auxiliary publications share the issuer, so an account's opaque
+        // pair has no fixed position in that process-wide counter sequence.
+        assert_eq!(first.generation, 1, "{}", failure_diagnostics());
+        assert_eq!(second.generation, 1, "{}", failure_diagnostics());
+        assert_eq!(
+            first
+                .history_samples_v3
+                .iter()
+                .find(|sample| sample.timestamp == 1_800_000_000 && sample.reset_at == 1_800_000_060)
+                .and_then(|sample| sample.models.as_ref())
+                .and_then(|models| models.iter().find(|model| model.model == "SOL"))
+                .map(|model| model.total_tokens),
+            Some(10),
+            "{}",
+            failure_diagnostics()
+        );
+        assert_eq!(
+            second
+                .history_samples_v3
+                .iter()
+                .find(|sample| sample.timestamp == 1_800_000_000 && sample.reset_at == 1_800_000_060)
+                .and_then(|sample| sample.models.as_ref())
+                .and_then(|models| models.iter().find(|model| model.model == "SOL"))
+                .map(|model| model.total_tokens),
+            Some(20),
+            "{}",
+            failure_diagnostics()
+        );
+        let first_counter = u128::from_str_radix(&first.pair[35..], 16).unwrap();
+        let second_counter = u128::from_str_radix(&second.pair[35..], 16).unwrap();
+        assert!(
+            first_counter > 1 && second_counter > 1,
+            "{}",
+            failure_diagnostics()
+        );
+        assert_ne!(first_counter, second_counter, "{}", failure_diagnostics());
     }
 
     fn temp_db(name: &str) -> PathBuf {
@@ -5608,6 +5199,36 @@ mod tests {
                 ],
             )
             .expect("row");
+    }
+
+    // Serialization fixtures own publication explicitly. Only tests of the
+    // reader workers start asynchronous publishers; HTTP never drives them.
+    fn serialization_listener(store: SnapshotStore) -> RestServer {
+        let store = Arc::new(store);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_store = Arc::clone(&store);
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || serve(listener, worker_store, worker_stop));
+        RestServer {
+            local_addr,
+            stop,
+            worker: Some(worker),
+            reader_worker: None,
+            store,
+        }
+    }
+
+    fn unpublished_serialization_fixture(reader: DbReader) -> RestServer {
+        serialization_listener(SnapshotStore::new(reader))
+    }
+
+    fn serialization_fixture(reader: DbReader) -> RestServer {
+        let server = unpublished_serialization_fixture(reader);
+        refresh_serialization_fixture(&server);
+        server
     }
 
     fn ready_fixture_server_at(reader: DbReader, at: i64) -> RestServer {
@@ -5740,7 +5361,7 @@ mod tests {
             Ok(second_history.clone()),
             ReaderLane::History,
         );
-        let (history, unavailable, freshness) = account.capture_resource(Route::HistoryV3);
+        let (history, unavailable, _, freshness) = account.capture_resource(Route::HistoryV3);
         let history = history.unwrap();
         assert_eq!(
             history.generation, 2,
@@ -6353,172 +5974,6 @@ mod tests {
     }
 
     #[test]
-    fn issue604_period_history_does_not_wait_for_recorded_archive() {
-        use std::sync::atomic::{AtomicI64, AtomicUsize};
-        use std::sync::mpsc;
-
-        let root = tempfile::tempdir().unwrap();
-        let first_path = root.path().join("current.sqlite3");
-        let second_path = root.path().join("archived.sqlite3");
-        let first_reader = issue604_time_projection_fixture(&first_path);
-        let second_reader = issue604_time_projection_fixture(&second_path);
-        for path in [&first_path, &second_path] {
-            Connection::open(path)
-                .unwrap()
-                .execute_batch(
-                    "ALTER TABLE usage_model_history ADD COLUMN total_dollars REAL;
-                 UPDATE usage_model_history SET total_dollars=CASE total_tokens
-                     WHEN '10' THEN 0.00005 ELSE 0.00010 END;",
-                )
-                .unwrap();
-        }
-        let mut store = SnapshotStore::new_with_accounts(
-            vec![
-                AccountReader::new("account-7", 7, true, None, None, first_reader),
-                AccountReader::new("account-8", 8, false, None, None, second_reader),
-            ],
-            "account-7",
-        )
-        .unwrap();
-        let clock = Arc::new(AtomicI64::new(1_800_000_300));
-        let time = Arc::clone(&clock);
-        store.publication_clock = Arc::new(move || Some(time.load(Ordering::SeqCst)));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed_calls = Arc::clone(&calls);
-        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
-        let (release_tx, release_rx) = mpsc::sync_channel(2);
-        let release_rx = Mutex::new(release_rx);
-        store.recording_candidate_ready = Some(Arc::new(move || {
-            let call = observed_calls.fetch_add(1, Ordering::SeqCst);
-            if call < 2 {
-                entered_tx.send(call).unwrap();
-                let _ = release_rx.lock().unwrap().recv();
-            }
-        }));
-        let mut server =
-            RestServer::start_with_store(store, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let store = server.store();
-        let wait_frame = |account: &str, generation: u64, recordings: bool| {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Some(frame) = store.snapshot_account(account) {
-                    if frame.generation == generation
-                        && frame.history_available
-                        && (!recordings || frame.recordings.is_some())
-                    {
-                        return frame;
-                    }
-                }
-                assert!(Instant::now() < deadline,
-                    "period history for {account} commit {generation} must publish while recorded archive is blocked");
-                thread::sleep(Duration::from_millis(1));
-            }
-        };
-        let http = |route: &str| {
-            request(
-                server.local_addr(),
-                &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n"),
-            )
-        };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert_eq!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
-            for account in ["account-7", "account-8"] {
-                let frame = wait_frame(account, 1, false);
-                assert!(
-                    frame.recordings.is_none(),
-                    "unread archive must remain unavailable"
-                );
-                assert_eq!(frame.models_v3[0].total_tokens, 10);
-                assert_eq!(
-                    frame.models_v3[0]
-                        .estimated_cost
-                        .as_ref()
-                        .unwrap()
-                        .total_dollars,
-                    0.00005
-                );
-                let current = http(&format!("/v4/current?account={account}"));
-                let periods = http(&format!("/v3/history/periods?account={account}"));
-                let history = http(&format!("/v3/history?account={account}&period=1800604800"));
-                for response in [&current, &periods, &history] {
-                    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-                    assert_eq!(published_pair(response), frame.pair);
-                }
-                let history: Value = serde_json::from_str(body(&history)).unwrap();
-                assert_eq!(
-                    history["history_samples"][0]["models"][0]["total_tokens"],
-                    10
-                );
-                assert!(http(&format!(
-                    "/v4/history/observations?account={account}&start=1800000000&end=1800000301"
-                ))
-                .starts_with("HTTP/1.1 503"));
-            }
-            Connection::open(&first_path)
-                .unwrap()
-                .execute_batch(
-                    "BEGIN;
-                INSERT INTO quota_receipts VALUES('next',2,1800000360,1800604800,604800,49,'2');
-                UPDATE collection_generation SET data_generation='2',cycle_seq='2';
-                COMMIT;",
-                )
-                .unwrap();
-            clock.store(1_800_000_360, Ordering::SeqCst);
-            store.reader_control.pending.lock().unwrap().freshness = true;
-            store.reader_control.changed.notify_all();
-            let second = wait_frame("account-7", 2, false);
-            assert_eq!(second.models_v3[0].total_tokens, 20);
-            assert_eq!(
-                second.details.quota.as_ref().unwrap().remaining_percent,
-                49.0
-            );
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                1,
-                "one auxiliary read in flight"
-            );
-            release_tx.send(()).unwrap();
-            assert_eq!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
-            assert!(
-                store
-                    .snapshot_account("account-7")
-                    .unwrap()
-                    .recordings
-                    .is_none(),
-                "an archive read from commit 1 cannot attach to commit 2"
-            );
-            release_tx.send(()).unwrap();
-            let complete = wait_frame("account-7", 2, true);
-            assert_eq!(complete.models_v3[0].total_tokens, 20);
-            assert_eq!(
-                complete
-                    .recordings
-                    .as_ref()
-                    .unwrap()
-                    .quota_observations
-                    .last()
-                    .unwrap()
-                    .remaining_percent,
-                49.0
-            );
-            let current = http("/v4/current?account=account-7");
-            let history = http("/v3/history/periods?account=account-7");
-            let recordings =
-                http("/v4/history/observations?account=account-7&start=1800000000&end=1800000361");
-            for response in [&current, &history, &recordings] {
-                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-                assert_eq!(published_pair(response), complete.pair);
-            }
-        }));
-        let _ = release_tx.try_send(());
-        let _ = release_tx.try_send(());
-        server.shutdown();
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
-    }
-
-    #[test]
     fn issue604_reader_worker_panic_preserves_the_last_frame_and_closes_the_listener() {
         let root = tempfile::tempdir().unwrap();
         let reader = issue604_time_projection_fixture(&root.path().join("reader-panic.sqlite3"));
@@ -6541,8 +5996,16 @@ mod tests {
         let store = server.store();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            while store.snapshot_account("account-7").is_none() {
-                assert!(Instant::now() < deadline, "initial frame did not publish");
+            while !store.snapshot_account("account-7").is_some_and(|frame| {
+                // Its real History lane must finish before capturing the last frame.
+                frame.history_available
+                    && frame
+                        .history_reprojection_witness
+                        .as_ref()
+                        .and_then(|proof| proof.publication_window())
+                        .is_some_and(|window| window.at == 1_800_000_300)
+            }) {
+                assert!(Instant::now() < deadline, "initial lanes did not publish");
                 thread::sleep(Duration::from_millis(1));
             }
             let old = store.snapshot_account("account-7").unwrap();
@@ -6626,6 +6089,11 @@ mod tests {
                         frame.history_available
                             && frame
                                 .reprojection_witness
+                                .as_ref()
+                                .and_then(|proof| proof.publication_window())
+                                .is_some_and(|window| window.at == at)
+                            && frame
+                                .history_reprojection_witness
                                 .as_ref()
                                 .and_then(|proof| proof.publication_window())
                                 .is_some_and(|window| window.at == at)
@@ -7143,7 +6611,7 @@ mod tests {
         let mut store = SnapshotStore::new(reader);
         store.publication_clock = Arc::new(move || Some(at));
         publish_serialization_fixture_at(&store, at);
-        RestServer::start_with_store(store, "127.0.0.1:0".parse().unwrap()).unwrap()
+        serialization_listener(store)
     }
 
     fn history_test_page(
@@ -7283,17 +6751,13 @@ mod tests {
                 "?account=account-10&account=account-10",
                 "?cursor=%31",
                 "#fragment",
+                "?unknown=value",
+                "?period=1802678400",
             ] {
                 assert!(matches!(
                     parse_target(&format!("{path}{suffix}")),
                     Err(ParseError::BadRequest)
                 ));
-            }
-            for suffix in ["?unknown=value", "?period=1802678400"] {
-                assert!(parse_target(&format!("{path}{suffix}"))
-                    .unwrap()
-                    .0
-                    .is_none());
             }
         }
     }
@@ -7468,7 +6932,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("issue604-v5-etag.sqlite3");
         fixture(&path, 1);
-        let mut server = ready_fixture_server_at(DbReader::open(&path).unwrap(), 1_800_000_060);
+        let mut server =
+            fixed_time_serialization_fixture(DbReader::open(&path).unwrap(), 1_800_000_060);
         refresh_serialization_fixture(&server);
         // A matching ETag cannot bypass an invalid directory cursor.
         let first = request(
@@ -7780,6 +7245,13 @@ mod tests {
         let root = tempfile::tempdir().expect("anonymous idle fixture");
         let sessions = root.path().join("sessions");
         fs::create_dir(&sessions).expect("empty Session directory");
+        // The unknown source exists during the first inventory, rather than
+        // changing a previously confirmed empty inventory into an unknown one.
+        let partial = sessions.join("incomplete.jsonl");
+        const PARTIAL_BYTES: &[u8] = br#"{"type":"response_item","payload":"#;
+        if pending_history {
+            fs::write(&partial, PARTIAL_BYTES).unwrap();
+        }
         let database = root.path().join("usage_history.sqlite3");
         let identity = StoragePartitionIdentity {
             schema_version: "codex-info-account-db-v1".to_owned(),
@@ -7817,8 +7289,8 @@ mod tests {
             .expect("old quota cycle")
             .expect("quota-only commit");
         assert_eq!(first.accepted_ranges, 0);
-        assert_eq!(first.pending_ranges, 0);
-        assert_eq!(first.sources_seen, 0);
+        assert_eq!(first.pending_ranges, usize::from(pending_history));
+        assert_eq!(first.sources_seen, usize::from(pending_history));
 
         let reader_identity = codex_info_db_reader::StoragePartitionIdentity {
             schema_version: identity.schema_version.clone(),
@@ -7829,8 +7301,8 @@ mod tests {
         };
         let reader =
             DbReader::open_partitioned(&database, &reader_identity).expect("fixture reader");
-        // Async and explicit fixture publication use the same production
-        // candidate entry and the same fixed anonymous observation horizon.
+        // Explicit fixture publication uses the production candidate entry
+        // with the fixed anonymous observation horizon.
         let mut store = SnapshotStore::new(reader);
         store.publication_clock = Arc::new(|| Some(REPEAT_OBSERVED_AT));
         let publish_fixture = |store: &SnapshotStore| {
@@ -7851,8 +7323,7 @@ mod tests {
             );
         };
         publish_fixture(&store);
-        let mut server =
-            RestServer::start_with_store(store, "127.0.0.1:0".parse().unwrap()).expect("test REST");
+        let mut server = serialization_listener(store);
         let current_request = format!(
             "GET /{}/current HTTP/1.1\r\nHost:x\r\n\r\n",
             if pending_history { "v4" } else { "v3" }
@@ -7869,11 +7340,6 @@ mod tests {
         );
         assert_eq!(before_value["quota"]["window_seconds"], WINDOW);
 
-        let partial = sessions.join("incomplete.jsonl");
-        const PARTIAL_BYTES: &[u8] = br#"{"type":"response_item","payload":"#;
-        if pending_history {
-            fs::write(&partial, PARTIAL_BYTES).unwrap();
-        }
         let rolled = recorder
             .run_cycle_with_quota(Some(QuotaSnapshot {
                 observed_at: next_observed_at,
@@ -8031,7 +7497,7 @@ mod tests {
             .expect("remove post-legacy provenance");
 
         let reader = DbReader::open(&path).expect("reader");
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("server");
+        let mut server = serialization_fixture(reader);
         refresh_serialization_fixture(&server);
         let response = request(
             server.local_addr(),
@@ -8065,7 +7531,7 @@ mod tests {
         let path = temp_db("host-authority");
         fixture(&path, 10);
         let reader = DbReader::open(&path).expect("reader");
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("server");
+        let mut server = unpublished_serialization_fixture(reader);
         let address = server.local_addr();
         let duplicate = format!("Host: {address}\r\nHost: {address}\r\n");
         for headers in ["", "Host: example.invalid\r\n", duplicate.as_str()] {
@@ -8077,6 +7543,7 @@ mod tests {
             assert!(!response.contains("Codex-Info-Published-Pair:"));
             assert_eq!(server.store().status().generation, None);
         }
+        refresh_serialization_fixture(&server);
         let valid = request(
             address,
             &format!("GET /v1/details HTTP/1.1\r\nHost: {address}\r\n\r\n"),
@@ -8092,13 +7559,14 @@ mod tests {
         let path = temp_db("malformed-http");
         fixture(&path, 10);
         let reader = DbReader::open(&path).expect("reader");
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("server");
+        let mut server = unpublished_serialization_fixture(reader);
         let malformed = request(
             server.local_addr(),
             "GET /v1/details?bad=1 HTTP/1.1\r\nHost:x\r\n\r\n",
         );
         assert!(malformed.starts_with("HTTP/1.1 404"));
         assert_eq!(server.store().status().generation, None);
+        refresh_serialization_fixture(&server);
         let valid = request(
             server.local_addr(),
             "GET /v1/details HTTP/1.1\r\nHost:x\r\n\r\n",
@@ -8149,7 +7617,7 @@ mod tests {
         drop(connection);
 
         let reader = DbReader::open(&path).expect("reader");
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("server");
+        let mut server = serialization_fixture(reader);
         let v1_response = request(
             server.local_addr(),
             "GET /v1/details HTTP/1.1\r\nHost:x\r\n\r\n",
@@ -8284,7 +7752,7 @@ mod tests {
         let path = temp_db("last-good-legacy-wire");
         fixture(&path, 10);
         let reader = DbReader::open(&path).expect("reader");
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("server");
+        let mut server = serialization_fixture(reader);
         refresh_serialization_fixture(&server);
 
         let initial_v1 = request(
@@ -8342,7 +7810,7 @@ mod tests {
         let path = temp_db("last-good-v3-wire");
         fixture(&path, 10);
         let reader = DbReader::open(&path).expect("reader");
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("server");
+        let mut server = serialization_fixture(reader);
         refresh_serialization_fixture(&server);
 
         let initial = request(
@@ -8433,11 +7901,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("v4-current.sqlite3");
         fixture(&path, 10);
-        let mut server = RestServer::start(
-            DbReader::open(&path).unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let mut server = serialization_fixture(DbReader::open(&path).unwrap());
         let get = |pair: Option<&str>| {
             let conditional = pair.map_or(String::new(), |pair| {
                 format!("If-None-Match: \"{pair}\"\r\n")
@@ -8456,6 +7920,10 @@ mod tests {
         assert!(get(Some(pair)).starts_with("HTTP/1.1 304"));
         let moved = path.with_extension("unavailable");
         fs::rename(&path, &moved).unwrap();
+        assert!(matches!(
+            server.store().refresh(),
+            RefreshStatus::RetainedLastGood { generation: 1 }
+        ));
         let failure = get(Some(pair));
         assert!(failure.starts_with("HTTP/1.1 200"));
         let error_json: Value = serde_json::from_str(body(&failure)).unwrap();
@@ -8466,6 +7934,7 @@ mod tests {
         let failed_pair = published_pair(&failure);
         assert_ne!(failed_pair, pair);
         fs::rename(moved, path).unwrap();
+        refresh_serialization_fixture(&server);
         let recovered = get(Some(failed_pair));
         assert!(recovered.starts_with("HTTP/1.1 200"));
         assert_eq!(
@@ -8481,11 +7950,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("usage.sqlite3");
         fixture(&path, 10);
-        let mut server = RestServer::start(
-            DbReader::open(&path).unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let mut server = serialization_fixture(DbReader::open(&path).unwrap());
         let routes = [
             "/v3/current",
             "/v3/details",
@@ -8501,6 +7966,10 @@ mod tests {
         let ready_pair = published_pair(&initial).to_owned();
         let moved = path.with_extension("moved");
         fs::rename(&path, &moved).unwrap();
+        assert!(matches!(
+            server.store().refresh(),
+            RefreshStatus::RetainedLastGood { generation: 1 }
+        ));
         let mut error_pair = None;
         for route in routes {
             let response = request(
@@ -8523,6 +7992,7 @@ mod tests {
             }
         }
         fs::rename(&moved, &path).unwrap();
+        refresh_serialization_fixture(&server);
         let error_pair = error_pair.unwrap();
         let recovered = request(
             server.local_addr(),
@@ -8619,8 +8089,7 @@ mod tests {
                 .models_v3
                 .iter()
                 .any(|m| m.model == "SOL" && m.total_tokens == 755374));
-            let mut server = ready_fixture_server_at(reader, NOW);
-            refresh_serialization_fixture(&server);
+            let mut server = fixed_time_serialization_fixture(reader, NOW);
             let response = request(
                 server.local_addr(),
                 "GET /v4/current HTTP/1.1\r\nHost:x\r\n\r\n",
@@ -8686,6 +8155,19 @@ mod tests {
         );
         // A corrupt historical percentage, not legitimate reset cardinality,
         // is the failure authority. The latest receipt remains valid.
+        let history_routes = ["/v3/history/periods", "/v3/history?period=1800000060"];
+        let verified_history = history_routes.map(|route| {
+            let response = request(
+                server.local_addr(),
+                &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            (
+                published_pair(&response).to_owned(),
+                serde_json::from_str::<Value>(body(&response)).unwrap(),
+            )
+        });
+
         let db = Connection::open(&path).unwrap();
         db.execute_batch(
             "CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,
@@ -8710,16 +8192,22 @@ mod tests {
         assert_eq!(current["state"], "error");
         assert!(current["authenticated"].as_bool().unwrap());
         assert_ne!(published_pair(&previous), published_pair(&response));
-        for route in ["/v3/history/periods", "/v3/history?period=1800612480"] {
-            let response = request(
+        // A failed new History does not revoke its verified predecessor or
+        // borrow the new Current pair. The old facts remain byte-for-byte true.
+        for (route, (old_pair, old_body)) in history_routes.into_iter().zip(verified_history) {
+            let history = request(
                 server.local_addr(),
                 &format!("GET {route} HTTP/1.1\r\nHost:x\r\n\r\n"),
             );
-            assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+            assert!(history.starts_with("HTTP/1.1 200"), "{history}");
+            assert_eq!(published_pair(&history), old_pair);
+            assert_ne!(published_pair(&history), published_pair(&response));
             assert_eq!(
-                serde_json::from_str::<Value>(body(&response)).unwrap()["error"],
-                "history_unavailable"
+                serde_json::from_str::<Value>(body(&history)).unwrap(),
+                old_body
             );
+            assert!(history.contains("Codex-Info-History-State: refreshing\r\n"));
+            assert!(history.contains("Codex-Info-History-Verified-At: 1800007680\r\n"));
         }
         assert_eq!(
             db.query_row("SELECT count(*) FROM quota_receipts", [], |r| r
@@ -8749,11 +8237,7 @@ mod tests {
              UPDATE collection_generation SET data_generation='10';",
             )
             .unwrap();
-        let mut server = RestServer::start(
-            DbReader::open(&path).unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let mut server = serialization_fixture(DbReader::open(&path).unwrap());
         refresh_serialization_fixture(&server);
         let response = request(
             server.local_addr(),
@@ -8796,11 +8280,7 @@ mod tests {
              CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,sequence INTEGER,observed_at INTEGER,reset_at INTEGER,window_seconds INTEGER,remaining_percent REAL,applied_generation TEXT);
              INSERT INTO quota_receipts VALUES('receipt',1,1800000000,1800000060,3600,50,'1');"
         ).unwrap();
-        let mut server = RestServer::start(
-            DbReader::open(&path).unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let mut server = serialization_fixture(DbReader::open(&path).unwrap());
         refresh_serialization_fixture(&server);
         let snapshot = server.store().snapshot().unwrap();
         assert_eq!(snapshot.retained_history.periods.len(), 2);
@@ -9211,7 +8691,7 @@ mod tests {
                 if index == 2 { 28_924 } else { 0 }
             );
         }
-        let mut server = RestServer::start(reader.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut server = serialization_fixture(reader.clone());
         refresh_serialization_fixture(&server);
         let directory = request(
             server.local_addr(),
@@ -9369,7 +8849,7 @@ mod tests {
         let reader = DbReader::open(&path).unwrap();
         let before = reader.read_snapshot().unwrap();
         assert_eq!(before.retained_history.periods.len(), 9);
-        let mut server = RestServer::start(reader.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut server = serialization_fixture(reader.clone());
         refresh_serialization_fixture(&server);
         let response = request(
             server.local_addr(),
@@ -9513,7 +8993,7 @@ mod tests {
         .unwrap();
         let reader = DbReader::open(&path).unwrap();
         let initial_hash = reader.read_snapshot().unwrap().data_hash;
-        let mut server = RestServer::start(reader.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut server = serialization_fixture(reader.clone());
         refresh_serialization_fixture(&server);
         let catalog = request(
             server.local_addr(),
@@ -9667,16 +9147,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("private-db-name.sqlite3");
         fixture(&path, 10);
-        let mut server = RestServer::start(
-            DbReader::open(&path).unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let mut server = serialization_fixture(DbReader::open(&path).unwrap());
         server.store().set_log_data_root(root.path());
         let wire = "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n";
         let _ = request(server.local_addr(), wire);
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch("CREATE TABLE session_pending_ranges(source_id TEXT, range_start INTEGER, complete INTEGER); INSERT INTO session_pending_ranges VALUES('private-source-name',0,0); CREATE TABLE quota_acquisition_state(singleton INTEGER PRIMARY KEY, degraded INTEGER); INSERT INTO quota_acquisition_state VALUES(1,1); UPDATE collection_generation SET data_generation='2';").unwrap();
+        refresh_serialization_fixture(&server);
         let pending = request(server.local_addr(), wire);
         assert_eq!(
             serde_json::from_str::<Value>(body(&pending)).unwrap()["state"],
@@ -9686,9 +9163,14 @@ mod tests {
             .execute_batch("UPDATE quota_acquisition_state SET degraded=0; UPDATE collection_generation SET data_generation='3';")
             .unwrap();
         drop(connection);
+        refresh_serialization_fixture(&server);
         let _ = request(server.local_addr(), wire);
         let moved = path.with_extension("moved");
         fs::rename(&path, &moved).unwrap();
+        assert!(matches!(
+            server.store().refresh(),
+            RefreshStatus::RetainedLastGood { .. }
+        ));
         let _ = request(server.local_addr(), wire);
         fs::rename(&moved, &path).unwrap();
         server.store().publish_account_boundary(PublicState::Error);
@@ -10028,10 +9510,18 @@ mod tests {
                 })
             )
         };
-        let model = "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6-astra\"}}\n";
+        let model = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "turn_context",
+                "timestamp": chrono::DateTime::<chrono::Utc>::from_timestamp(NOW - 60, 0)
+                    .unwrap().to_rfc3339(),
+                "payload": {"model": "gpt-6-astra"}
+            })
+        );
         fs::write(
             &source,
-            format!("{model}{}{}", token(10, NOW - 20), token(20, NOW - 10)),
+            format!("{model}{}{}", token(0, NOW - 20), token(10, NOW - 10)),
         )
         .unwrap();
         let open = || {
@@ -10054,11 +9544,29 @@ mod tests {
             })
         };
         let mut recorder = open();
-        recorder.run_cycle_with_quota(quota(NOW)).unwrap().unwrap();
-        // A physical replacement lacks the old 20-token anchor. Preserve the
+        // A real zero in the fixture establishes the whole initial prefix;
+        // a positive first raw counter would leave that prefix unknown.
+        let initial_cycle = recorder.run_cycle_with_quota(quota(NOW)).unwrap().unwrap();
+        assert_eq!(initial_cycle.pending_ranges, 0);
+        let baseline: (i64, i64, String, i64) = Connection::open(&database).unwrap()
+            .query_row(
+                "SELECT fully_attributed_from_zero,token_baseline_known,previous_total,committed_offset
+                 FROM session_checkpoints WHERE relative_path='one.jsonl'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+        assert_eq!(
+            baseline,
+            (
+                1,
+                1,
+                "10".into(),
+                i64::try_from(fs::metadata(&source).unwrap().len()).unwrap()
+            )
+        );
+        // A physical replacement lacks the old 10-token anchor. Preserve the
         // old inode checkpoint, just as the affected saved profiles do.
         fs::rename(&source, root.path().join("original.jsonl")).unwrap();
-        fs::write(&source, format!("{model}{}", token(30, NOW + 30))).unwrap();
+        fs::write(&source, format!("{model}{}", token(20, NOW + 30))).unwrap();
         assert_eq!(
             recorder
                 .run_cycle_with_quota(quota(NOW + 60))
@@ -10081,7 +9589,7 @@ mod tests {
             partition_id: identity.partition_id.clone(),
         };
         let reader = DbReader::open_partitioned(&database, &reader_identity).unwrap();
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut server = serialization_fixture(reader);
         let get = |route: &str| {
             request(
                 server.local_addr(),
@@ -10096,7 +9604,7 @@ mod tests {
             .append(true)
             .open(&source)
             .unwrap()
-            .write_all(format!("{}{}", token(20, NOW + 80), token(25, NOW + 90)).as_bytes())
+            .write_all(format!("{}{}", token(10, NOW + 80), token(15, NOW + 90)).as_bytes())
             .unwrap();
         let mut recorder = open();
         recorder
@@ -10110,7 +9618,7 @@ mod tests {
         server.store().refresh();
         let after = get("/v3/current");
         let value: Value = serde_json::from_str(body(&after)).unwrap();
-        // Independent arithmetic: initial 20-10 plus restored 25-20 = 15.
+        // Independent arithmetic: initial 10-0 plus restored 15-10 = 15.
         assert_eq!(value["state"], "ready");
         assert_eq!(value["models"][0]["total_tokens"], 15);
         assert_eq!(value["quota"]["remaining_percent"], 72.0);
@@ -10179,10 +9687,18 @@ mod tests {
                 })
             )
         };
-        let model = "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6-astra\"}}\n";
+        let model = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "turn_context",
+                "timestamp": chrono::DateTime::<chrono::Utc>::from_timestamp(NOW - 180, 0)
+                    .unwrap().to_rfc3339(),
+                "payload": {"model": "gpt-6-astra"}
+            })
+        );
         fs::write(
             &source,
-            format!("{model}{}{}", token(10, NOW - 120), token(20, NOW - 60)),
+            format!("{model}{}{}", token(0, NOW - 120), token(10, NOW - 60)),
         )
         .unwrap();
         let initial_source_len = fs::metadata(&source).unwrap().len();
@@ -10207,11 +9723,29 @@ mod tests {
         };
 
         let mut initial = open(4096);
-        initial.run_cycle_with_quota(quota(NOW)).unwrap().unwrap();
+        // A complete inventory starts from an explicit source zero. The
+        // increments are 10, 10 and 10; their published totals stay 20/30.
+        let initial_cycle = initial.run_cycle_with_quota(quota(NOW)).unwrap().unwrap();
+        assert_eq!(initial_cycle.pending_ranges, 0);
+        let baseline: (i64, i64, String, i64) = Connection::open(&database).unwrap()
+            .query_row(
+                "SELECT fully_attributed_from_zero,token_baseline_known,previous_total,committed_offset
+                 FROM session_checkpoints WHERE relative_path='one.jsonl'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+        assert_eq!(
+            baseline,
+            (
+                1,
+                1,
+                "10".into(),
+                i64::try_from(fs::metadata(&source).unwrap().len()).unwrap()
+            )
+        );
         drop(initial);
 
-        let first_append = token(30, NOW + 60);
-        let second_append = token(40, NOW + 120);
+        let first_append = token(20, NOW + 60);
+        let second_append = token(30, NOW + 120);
         fs::OpenOptions::new()
             .append(true)
             .open(&source)
@@ -10249,7 +9783,7 @@ mod tests {
             partition_id: identity.partition_id.clone(),
         };
         let reader = DbReader::open_partitioned(&database, &reader_identity).unwrap();
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut server = serialization_fixture(reader);
         let get = |route: &str| {
             request(
                 server.local_addr(),
@@ -10455,7 +9989,7 @@ mod tests {
             )
             .unwrap();
         let reader = DbReader::open_partitioned(&path, &identity).unwrap();
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut server = serialization_fixture(reader);
         server.store().set_log_data_root(log_root.path());
         let get = |route: &str| {
             request(
@@ -10479,6 +10013,7 @@ mod tests {
              INSERT INTO session_pending_ranges VALUES('anchor-evidence',0,1);
              UPDATE collection_generation SET data_generation='2';"
         ).unwrap();
+        refresh_serialization_fixture(&server);
         let mut error_pair = String::new();
         for route in ["/v1/details", "/v2/details", "/v3/details", "/v3/current"] {
             let response = get(route);
@@ -10536,6 +10071,7 @@ mod tests {
              UPDATE collection_generation SET data_generation='3';",
             )
             .unwrap();
+        refresh_serialization_fixture(&server);
         let recovered = request(
             server.local_addr(),
             &format!(
@@ -10557,6 +10093,7 @@ mod tests {
              INSERT INTO durable_state VALUES(4,1800000120,'new-period',
                 '{\"kind\":\"codex-info-usage-observation-v1\",\"timestamp\":1800000120,\"reset_at\":1800003660,\"remaining_percent\":98,\"model_source\":\"confirmed\"}');"
         ).unwrap();
+        refresh_serialization_fixture(&server);
         let next = get("/v3/current");
         let next_value: Value = serde_json::from_str(body(&next)).unwrap();
         assert_eq!(next_value["state"], "ready");
@@ -10587,6 +10124,7 @@ mod tests {
              UPDATE collection_generation SET data_generation='5';",
             )
             .unwrap();
+        refresh_serialization_fixture(&server);
         let invalid: Value = serde_json::from_str(body(&get("/v4/current"))).unwrap();
         assert_eq!(invalid["state"], "error");
         assert_eq!(invalid["models_status"], "unavailable");
@@ -10598,6 +10136,7 @@ mod tests {
              UPDATE collection_generation SET data_generation='6';",
             )
             .unwrap();
+        refresh_serialization_fixture(&server);
         let repaired: Value = serde_json::from_str(body(&get("/v4/current"))).unwrap();
         assert_eq!(repaired["state"], "ready");
         assert_eq!(repaired["models_status"], "complete");
@@ -10616,11 +10155,7 @@ mod tests {
              INSERT INTO session_pending_ranges VALUES('incomplete',0,0);
              CREATE TABLE quota_acquisition_state(singleton INTEGER PRIMARY KEY, degraded INTEGER);
              INSERT INTO quota_acquisition_state VALUES(1,1);").unwrap();
-        let mut server = RestServer::start(
-            DbReader::open(&path).unwrap(),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .unwrap();
+        let mut server = serialization_fixture(DbReader::open(&path).unwrap());
         let routes = ["/v1/details", "/v2/details", "/v3/details", "/v3/current"];
         let failures = routes.map(|route| {
             let response = request(
@@ -10638,6 +10173,7 @@ mod tests {
         connection
             .execute("UPDATE quota_acquisition_state SET degraded=0", [])
             .unwrap();
+        refresh_serialization_fixture(&server);
         for (route, failure) in routes.into_iter().zip(failures) {
             let response = request(
                 server.local_addr(),
@@ -10671,7 +10207,7 @@ mod tests {
         let path = temp_db("pending-ranges-wire");
         fixture(&path, 10);
         let reader = DbReader::open(&path).expect("reader");
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("server");
+        let mut server = serialization_fixture(reader);
 
         let initial = ["v1", "v2", "v3"].map(|version| {
             let wire_request = format!("GET /{version}/details HTTP/1.1\r\nHost:x\r\n\r\n");
@@ -10693,6 +10229,7 @@ mod tests {
                 INSERT INTO session_pending_ranges VALUES('complete', 0, 1);",
             )
             .expect("pending fixture");
+        refresh_serialization_fixture(&server);
         for version in ["v1", "v2", "v3"] {
             let wire_request = format!("GET /{version}/details HTTP/1.1\r\nHost:x\r\n\r\n");
             let response = request(server.local_addr(), &wire_request);
@@ -10706,6 +10243,7 @@ mod tests {
                 [],
             )
             .expect("incomplete fixture");
+        refresh_serialization_fixture(&server);
         for (version, previous) in ["v1", "v2", "v3"].into_iter().zip(initial.iter()) {
             let wire_request = format!("GET /{version}/details HTTP/1.1\r\nHost:x\r\n\r\n");
             let response = request(server.local_addr(), &wire_request);
@@ -10739,6 +10277,7 @@ mod tests {
         connection
             .execute("DELETE FROM session_pending_ranges", [])
             .expect("clear pending fixture");
+        refresh_serialization_fixture(&server);
         let recovered = request(
             server.local_addr(),
             "GET /v3/details HTTP/1.1\r\nHost:x\r\n\r\n",

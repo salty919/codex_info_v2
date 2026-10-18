@@ -12,105 +12,7 @@ API-V3-MODELS-01
 API-DEPRECATION-01
 -->
 
-# Loopback REST API v1 / v2 / v3 / v4 / v5 / v6
-
-## RECORDED-USAGE-SCOPE-604 — scopeを持つ現在値と記録履歴
-
-意味の正本はPRODUCTの同IDである。新しいresourceは`GET /v5/current`、`GET /v6/history/scopes`、
-`GET /v4/history/recordings`、`GET /v4/history/observations`とする。全てread-onlyであり、既存と同じ
-`account` selector、同accountのimmutable published pair、ETag、no-store、UTF-8 JSONを使う。
-この節が新しいscopeのwireを所有する。既存versionのfield集合・型・意味を別のscopeへ黙って変更しない。
-
-### current v5
-
-top-levelのkey集合は`api_version,state,observed_at,authenticated,plan_label,quota,period_identity,usage_scope,models_status,models,active_thread_count,open_session_thread_count`の12個とする。
-`api_version="v5"`。state、auth、plan、quota、Thread件数はcurrent v4と同じ独立したauthorityを持つ。
-`period_identity`は`{"state":"unknown","reason":"provider-period-identity-unavailable"}`である。
-認識済み0.159.2 producerはこの状態だけを生成し、`known`を推測しない。
-
-`usage_scope`はnull、またはkeyが`kind,start_at,end_at,coverage`のobjectである。
-`kind="recorded-time"`、`start_at`はinclusive、`end_at`はexclusiveなUTC整数秒であり、
-`1<=start_at<end_at<=253402300800`を必要とする。端の表示には`end_at-1`を使い、年10000を日時へ変換しない。
-`coverage`は`complete|partial|unknown`である。completeはこの範囲のlocal記録対象の完全な検証資格を表し、
-provider全端末の完全性や実利用期間の同一性を表さない。partialは既知の未確認部分がある場合、unknownは記録対象の
-coverage自体が未確認の場合である。scopeの生成式とT/WのauthorityはPRODUCTに従う。
-
-`models`はUTF-8 unsigned byteのmodel key昇順で、各objectのkey集合は
-`model,total_tokens,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,estimated_cost`である。
-modelと必須totalは既存のexact model/UInt64規則、I/C/W/OはUInt64またはnullとする。
-欠落成分を0にしない。既知成分の算術はDATA TokenFactsと一致し、必要な等式・大小関係を検証する。
-`estimated_cost`はnullまたはv3の完全な価格objectであり、同じfact集合への価格資格を必要とする。
-補助resourceで保存価格の根拠を返せない対象額はnullのまま保持する。この補助resourceの価格有無を、既存currentの独立した参考額計算・表示の条件にしない。
-`models_status`はcoverage completeならcomplete、未完備で既知modelがあればpartial、それ以外はunavailableとする。
-completeな空集合と未完備な空集合を区別し、いずれもproviderの利用0を意味しない。
-
-未認証・account境界・initializingのstrict emptyではquota/scope/observed_atをnull、modelsを空、
-models_statusをunavailable、Thread件数を0とする。取得laneの失敗とscopeの不明は別であり、
-period identity unknownだけでstate errorへ変更しない。current生成失敗は従来のsnapshot_unavailableで隔離する。
-
-literal oracle: T=1792228061、W=604800ならscopeは`[1791623262,1792228062)`である。
-同じmodelの独立したqualified fact A=`T10/I8/C2/W0/O2`とB=`T5/I4/C1/W0/O1`がこの範囲にあり、
-両者の保存報告Rが異なっていても、公開記録分は`T15/I12/C3/W0/O3`である。
-Aの同5 ID再掲は増分0。Rだけを31から32、32から31へ変えても、この範囲とfact集合が同じなら15を保持する。
-R別の保存累計66123101と3763895だけでは、この15も両値の和も生成できない。
-
-### scopes v6
-
-`/v6/history/scopes`は`api_version="v6",observed_at,period_identity,scopes,next_cursor`を返す。
-period_identityはcurrent v5と同じである。scope要素は
-`id,kind,start_at,end_at,current,recordings_available,saved_observations_available,coverage`の完全なkey集合を持つ。
-idはclientが解釈しない一意の非秘密参照、kindは`rolling|utc-month`、境界は上記のhalf-open範囲である。
-current rollingを先頭、次にUTC monthを開始秒の降順で並べる。月は保持内にqualified fact、保存model観測、
-検証済みquota観測または明示gapがある範囲だけとする。quotaのR変更だけで項目を増やさない。
-重なった記録範囲の合計を足さない。これは実週directoryではない。
-32MiBのencoded byte境界で連続prefixをpage化し、cursor以外の任意limit queryを追加しない。
-
-### recordings / observations v4
-
-両routeは必須の`start`、`end`、任意の`account`、`cursor`だけを各1件受理する。
-start/endは先頭0・符号なしのcanonical正整数十進文字列で、上記half-open範囲を満たす。
-未知query、重複、schema外値は既存のroute/query拒否規則に従う。範囲を保持窓へ黙って狭めない。
-保存のない部分はcoverageに反映し、返却scopeの端は要求どおりに保持する。
-
-recordingsのtop-levelは`api_version="v4",scope,period_identity,coverage_intervals,samples,quota_observations,next_cursor`である。
-coverage_intervalsの要素は`start_at,end_at,coverage`であり、scope全体を穴・重なりなく覆うhalf-open範囲を開始順に持つ。
-各codeの意味はusage_scopeと同じで、隣接する同じcoverageは統合する。元証拠でより狭く分けられないpartial/unknownを
-任意の日の外へ追い出さない。全pageで同じ配列を保持し、metadataだけでbyte境界を超えれば413とする。
-samplesはtimestamp昇順で秒ごとに一つとし、要素は`timestamp,models`、modelsはcurrent v5と同じ型である。
-各値は要求範囲の開始からその秒までの一意なqualified fact和であり、最後のsampleだけでなく全prefixを同じ集合から作る。
-初期基準は「この範囲でまだ加算したrecorded factがない」という数学的な0であり、raw観測としてsampleを生成しない。
-未確認成分を含むprefixはその成分だけnullとし、token totalまで失わせない。
-quota_observationsの要素は`sequence,observed_at,reset_at,window_seconds,remaining_percent`である。
-sequenceはcanonical UInt64十進文字列で、元のdurable取得順に一意である。元observed_atが要求範囲にある
-受理済みreceiptだけを返し、RやRemainingが同じという理由でreceiptを新しい利用eventへ変換しない。
-quota点はmodel和の加算項ではない。
-
-observationsのtop-levelは`api_version="v4",scope,period_identity,observations,next_cursor`である。
-各observationのkeyは`observation_id,timestamp,raw_reset_at,storage_kind,models,unresolved_reasons`とする。
-observation_idは保存元keyへ結合したopaque ASCII参照であり、path/原IDを含めない。
-raw_reset_atは元の正Unix秒またはnullとし、未所属source eventへquota Rを補わない。
-storage_kindは`legacy-fixed|model-sidecar|source-event`。同時刻・同Rでも別の保存元を混合せず、順序は
-`(timestamp,raw_reset_at,storage_kind,observation_id)`の昇順、null Rを先頭とする。同じ数値だけでrowを削除しない。
-modelsの各要素は`stored_model_key,total_tokens,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,total_dollars`で、
-keyは非秘密の保存model名、各数値は既存の保存値またはnullである。新しい公式model資格や消費eventを表さない。
-UNATTRIBUTED等の内部保存keyも保存観測の区分としてのみ扱い、公式model一覧へ加えない。
-非有限値・値域不正は数値を生成せずnullと理由で保持する。保存USDを最新価格で置き換えない。
-unresolved_reasonsは重複なし・ASCII昇順の固定code配列であり、少なくとも`period-identity-unknown`を持つ。
-追加codeは`source-recovery-pending|source-evidence-unavailable|duplicate-unresolved|invalid-saved-value`だけを許す。
-原本不足と未実装・未処理を同じcodeへ縮めない。保存観測は描画・確認に使え、月合計・記録分への加算authorityにはしない。
-
-全pageは同じscope・period_identity・account・published pairへ結合する。samples、quota_observations、observationsを
-それぞれ完全な連続prefixとして送る。recordingsはsamples全体、次にquota_observations全体という固定順に
-32MiBへ詰め、二つの位置を一つのopaque cursorへ結ぶ。一要素がbyte境界を超える場合は413とし、切詰めない。
-clientはnull終端まで全pageを同一pairで受理してからatomic表示する。cursorはresource・account・start/end・pairへ結合し、
-別の範囲、変更済みprefix、別pairの不成立は400 stale_cursorとする。同cycleの回復は既存G137-9の一度だけを維持する。
-HTTP要求を契機にSession/DBの再収集やwriterを起動せず、immutable snapshotの索引済み範囲から返す。
-
-### 既存consumerと補助resourceの境界
-
-Mainは既存のv4 current、Graphは既存期間directoryとv3 historyを使う。これらの承認済み期間・価格・描画仕様を補助resourceの時間範囲へ置換しない。exact404だけの版別互換取得と同account・同pair admissionを維持する。
-
-v5 current、v6 scopes、v4 recordings/observationsは明示時間範囲の補助resourceであり、既存routeの可用性や数値資格を上書きしない。period identity metadataが不明であることだけを理由に、既存currentの全modelを空へ変更したり、既存directory/historyを一律503にしない。各値・resourceに実在する表現不能、source資格不足、保存欠損、投影失敗は本書の既存の対象別規則に従う。元のexact ID・保存履歴・価格・既知性を保持し、新しいmetadataから完全な実利用週を捏造しない。
+# Loopback REST API v1 / v2 / v3 / v4 / v5
 
 ## API世代と廃止境界
 
@@ -687,9 +589,9 @@ registry所有条件を確認して独立に読める。nullや`degraded`からD
 
 reconciliationは処理中に来た通知をpartitionごとの最新tuple一つと全体のfreshness pending一つへまとめる。通知列や60秒tickの数だけworkをqueueせず、取りこぼした周期を後でまとめて再実行しない。cycle開始時にその時点のpending集合を取り出し、Tをその構築開始時刻に一度固定する（DATAの公開窓契約）。待機中の通知時刻や前cycleのTを使わない。freshness pendingがあれば全初期化済みpartition、なければ通知のあったpartitionだけを照合する。両入力が同じpartitionを指定してもそのcycleでは一回である。partition順は非秘密account selectorのUTF-8 unsigned byte昇順とする。
 
-current/Threads、既存period履歴、recorded-scope archiveは、それぞれ同一partitionの一つのread transactionで資格を得る。currentは履歴を待たず、既存period履歴はrecorded-scopeのprefix・復旧proofを待たずに公開できる。各補助読取りは全accountで一つだけ進行させ、accountごとの未実行要求は最新一つにまとめる。新しい補助結果は同じpartition・所有資格・受理済みの完全commit組を照合してから公開し、既に公開した別resourceの値・公開窓を古い候補で戻さない。period履歴は読取り開始時に捕捉したackと同じcommitの候補を、同ownerの最新currentが先行していても独立history frameへ公開できる。履歴の世代と確認時刻Tは既公開history以上とし、同一世代の保存値・共通quota・既観測値の不変を確認する。Current/Threadsのframe・pair・可用性はこの公開で置換しない。現在値が先行する間の確認済み履歴は上記の独立history frameとして保持する。同一commitで確認済みのarchiveを書き換える候補は拒否する。未取得のrecorded archiveを空の成功へ変換せず、その可用性だけを当該routeへ反映する。別accountまたは補助読取りの遅延・失敗は、確認済みcurrent/Threads/period履歴を失効させる理由にしない。
+current/Threadsと既存period履歴は、それぞれ同一partitionの一つのread transactionで資格を得る。currentは履歴を待たず公開できる。補助読取りは全accountで一つだけ進行させ、accountごとの未実行要求は最新一つにまとめる。新しい補助結果は同じpartition・所有資格・受理済みの完全commit組を照合してから公開し、既に公開した別resourceの値・公開窓を古い候補で戻さない。period履歴は読取り開始時に捕捉したackと同じcommitの候補を、同ownerの最新currentが先行していても独立history frameへ公開できる。履歴の世代と確認時刻Tは既公開history以上とし、同一世代の保存値・共通quota・既観測値の不変を確認する。Current/Threadsのframe・pair・可用性はこの公開で置換しない。現在値が先行する間の確認済み履歴は上記の独立history frameとして保持する。別accountまたは補助読取りの遅延・失敗は、確認済みcurrent/Threads/period履歴を失効させる理由にしない。
 
-読取り中に新tupleや境界を受理したpartitionでは、current/Threadsとrecorded archiveの旧candidateをpublishせず、次のpendingへ最新tupleだけを残す。period履歴だけは上記の元ack・同owner・非後退条件を満たす候補を独立公開し、新tupleの履歴要求も最新一つだけ保持する。所有境界または元ack不一致による旧候補の取消しをreader障害や取得状態errorへ変換しない。境界でidentity/ownerの資格を失ったcandidateも破棄する。独立した歴史accountのcandidateは、そのaccountのpartition identityとregistry所有条件が同じなら有効である。読取り後のadmissionでは捕捉したscope/identity/markerが依然有効なことを再確認し、失効した値をcounter更新より先に拒否する。marker整合は同一read transaction内のgenerationとdomainの一致、およびworkerが受理した所有境界によって失効していないことで判定する。period履歴以外では最新tuple一致も必須とする。HTTP要求やheartbeat tickから追加SQLを行う規則ではない。DB commitとstrict state更新の間でまだ一致を確認できない候補は成功にもreader障害にもせず旧frameを保持し、新tupleまたは次の通常freshness入力を待つ。同じ旧tupleを直ちに再読取りしてloopしない。次cycleはpendingがあれば直ちに開始し、その開始時点で新たなTを固定する。通常の60秒deadlineはmonotonicな固定周期を維持し、通知や処理終了から毎回60秒へ延期しない。
+読取り中に新tupleや境界を受理したpartitionでは、current/Threadsの旧candidateをpublishせず、次のpendingへ最新tupleだけを残す。period履歴は上記の元ack・同owner・非後退条件を満たす候補を独立公開し、新tupleの履歴要求も最新一つだけ保持する。所有境界または元ack不一致による旧候補の取消しをreader障害や取得状態errorへ変換しない。境界でidentity/ownerの資格を失ったcandidateも破棄する。独立した歴史accountのcandidateは、そのaccountのpartition identityとregistry所有条件が同じなら有効である。読取り後のadmissionでは捕捉したscope/identity/markerが依然有効なことを再確認し、失効した値をcounter更新より先に拒否する。marker整合は同一read transaction内のgenerationとdomainの一致、およびworkerが受理した所有境界によって失効していないことで判定する。period履歴以外では最新tuple一致も必須とする。HTTP要求やheartbeat tickから追加SQLを行う規則ではない。DB commitとstrict state更新の間でまだ一致を確認できない候補は成功にもreader障害にもせず旧frameを保持し、新tupleまたは次の通常freshness入力を待つ。同じ旧tupleを直ちに再読取りしてloopしない。次cycleはpendingがあれば直ちに開始し、その開始時点で新たなTを固定する。通常の60秒deadlineはmonotonicな固定周期を維持し、通知や処理終了から毎回60秒へ延期しない。
 
 marker不変かつ公開窓不変なら前回frameを再利用し、再読取りを成功publishとして数えない。schema/domain/identity不正、実際のI/O timeout、取消しでは新candidateを公開せず旧root/pairを保持する。可用性もframe参照と同じcapture単位で取得し、次表に従う。単にworker処理が長いことを新たなdata異常・空結果・根拠のない通常応答時間保証へ変換しない。
 
@@ -750,14 +652,15 @@ current等の既知事実を書き換えた候補、またはその不変を証�
 
 | 状況 | 応答と保持 |
 | --- | --- |
-| 明示指定accountのframeをまだ構築できない、またはそのreader domainの読取り不良 | そのaccountのsnapshot routeを503 `snapshot_unavailable`。別accountや検証済みglobal catalogは維持し、default initializingを明示accountの値へ代用しない |
+| 明示指定accountのframeをまだ構築できない、または所有資格/domain/sourceの検証拒否 | そのaccountのsnapshot routeを503 `snapshot_unavailable`。別accountや検証済みglobal catalogは維持し、default initializingを明示accountの値へ代用しない |
 | history固有の投影失敗または更新待ちだけを有効なdomainとして隔離できる | 同じ所有資格の確認済みhistory frameがあれば元pair・確認時刻・`refreshing`で返す。なければhistory/directoryは503 `history_unavailable`。v4 currentと独立したthreadsを維持する。互換detailsは確認済み完全frameだけを使う |
 | global catalog自体が未検証・読取り不能 | `/v3/accounts`は503 `snapshot_unavailable`。旧catalogを新しい確認済み一覧として返さない。identityを維持できる明示accountの読出しは独立に継続する |
 | DATAが確認したlogout/account/identity hard boundary | 同ownerの旧default可視値を消すstrict boundary frameを公開する。単なる同accountのDB再読取り失敗とは区別する。境界に必要なglobal/account frameの交換は一つのatomic visibility transitionとする |
-| 通常のreader回復 | 同じ有効domain・公開窓なら旧pairのまま可用性だけ回復できる。以前の503を新pairへ変換するためだけにpublishしない |
+| 同じ所有資格の確認済みframeを保持できる通常のDB I/O失敗 | 既知のquota/model/履歴を保持したHTTP 200・degraded表示。同じframeでは全snapshot resourceが正常pairと別の同じdegraded pairを使う。DBやrecorder generation、正常pairは変更しない |
+| 通常のreader回復 | 同じ有効domain・公開窓なら通常pairへ戻す。degraded ETagにはHTTP 200を返し、通常pairと同じETagにだけ304を返す。回復だけを理由にDB generationやcounterを進めない |
 | recorderのschema-validなError generationを新たに受理 | その完全candidateを別pairで公開できる。reader/HTTPの失敗から生成しない |
 
-health/runtimeは上記snapshot不良へ巻き込まない。HTTP handlerはcaptured immutable frameと可用性だけを読み、要求中にmarker、SQLite、Session、canonicalizationへ戻らず、`state`やpublished pairを読取り成否から派生させない。lazy history/directory pageは同じframeからheap内だけで生成・再利用する。serialize失敗は500、source/frame取得不能は503とし、拒否・timeout・page生成によってroot/counterを更新しない。
+health/runtimeは上記snapshot不良へ巻き込まない。HTTP handlerはcaptured immutable frameとpublisherが固定した可用性だけを読み、要求中にmarker、SQLite、Session、canonicalizationへ戻らない。保持可能なread failureの表示とdegraded pairはこの捕捉済みhealthから投影し、要求内のDB読取り成否から生成しない。lazy history/directory pageは同じframeからheap内だけで生成・再利用する。serialize失敗は500、確認済みframeなし・所有資格/source拒否は503とし、拒否・timeout・page生成によってroot/counterを更新しない。
 
 shutdownは新cycleとrequest admissionを止め、未実行pendingを破棄し、進行中candidateをpublish前に取り消す。既存requestは下記の最大3秒drainを使い、current readerをjoinする。補助readerの長いread-only transactionは終了時に閉じ、process終了をその完了待ちにしない。取消し後に遅れて終了したreadからのpublishは0件である。counter exhaustionと初期epoch/default root構築失敗の終了条件は上記から変更しない。複数frameを一つの境界として交換する場合も必要counter数を先にchecked検証し、途中のframeだけを公開しない。
 
@@ -775,7 +678,7 @@ OSのUTC時刻を有効範囲のUnix秒として得られないcycleは、新し
 | --- | --- |
 | 上記4回の成功publish | global initializing=1、A=2、B=3、catalog=4。epochは同じ、4 tokenは全て別 |
 | Aのv4 current・directory・history・threadsを読む | 全てAのcounter=2のpair。Bの3またはcatalogの4へjoinしない。読取りによるcounter増加は0 |
-| Aのreader失敗、Bとcatalogは有効 | Aのsnapshot routeだけ503、Bは3、catalogは4のpairで200。失敗からError frameやcounter=5を作らない |
+| Aの通常のDB I/O失敗、Bとcatalogは有効 | Aの確認済みsnapshotは2と別の決定的degraded pairで200、Bは3、catalogは4のpairで200。正常frame/pairとcounterを変更しない。Aの所有資格/source失効ならAだけ503 |
 | Aのreaderが同じdomain・公開窓で回復 | Aのpairは2。条件headerなしなら200、Aの有効な同route/query条件が一致したときだけ304 |
 | M1読取り中に新M2とfreshnessを受理 | M1のpublishは0回。次cycle開始時のTで全初期化済みpartitionを各1回照合し、M2候補を通常admission。待機tickの数だけcycleを反復しない |
 | current counter=u128::MAX-1、境界交換に2 frameが必要 | 片側だけをMAXへpublishせず、旧root/pair/counterを保持したままpermanent-failedで終了 |
@@ -808,7 +711,7 @@ transfer-decoded bodyは1 KiB以下とする。
 | 429 | `too_many_requests` | connection admission上限超過 |
 | 431 | `request_headers_too_large` | header count/field/aggregate上限超過 |
 | 500 | `internal_error` | response commit前のserialization/invariant failure |
-| 503 | `snapshot_unavailable` | publisher/DB root/stale owner/internal read timeout、またはshutdown中 |
+| 503 | `snapshot_unavailable` | 確認済みframeなし、所有資格/domain/source拒否、publisher継続不能、またはshutdown中。保持可能なDB I/O失敗は上記degraded 200 |
 | 503 | `history_unavailable` | 現在quotaは読取り可能だが、履歴projectionの読取り・公開検証に失敗した場合のv3/v4/v5 directory、各selectable、および`/v3/history` |
 
 route/publisher faultを200や`state=error`へ丸めない。valid details generation自身の`state=error`だけはschema-valid

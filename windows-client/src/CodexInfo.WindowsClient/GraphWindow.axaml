@@ -282,7 +282,7 @@
                                    AutomationProperties.AutomationId="Graph.Plot"
                                    IsVisible="{Binding HasLinePlot}" />
             <Grid Grid.Row="1" Margin="10" RowDefinitions="Auto,*" RowSpacing="6"
-                  IsVisible="{Binding HasCalendar}" AutomationProperties.AutomationId="Graph.Calendar"
+                  IsVisible="{Binding IsMonthView}" AutomationProperties.AutomationId="Graph.Calendar"
                   AutomationProperties.AccessibilityView="Control">
               <ItemsControl ItemsSource="{Binding CalendarWeekdays}" Margin="3,0">
                 <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Columns="7" /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
@@ -300,7 +300,7 @@
                     <DataTemplate x:DataType="graph:GraphCalendarDay">
                       <Border Classes="calendar-day" Classes.today="{Binding IsToday}" Classes.future="{Binding IsFuture}"
                               Classes.quiet="{Binding IsQuiet}"
-                              IsVisible="{Binding IsVisible}" Margin="3" Padding="3,6" MinHeight="64"
+                              IsVisible="{Binding IsInMonth}" Margin="3" Padding="3,6" MinHeight="64"
                               ToolTip.Tip="{Binding AccessibleText}" AutomationProperties.Name="{Binding AccessibleText}"
                               AutomationProperties.AccessibilityView="Content">
                         <Grid RowDefinitions="Auto,*,Auto" RowSpacing="2">
@@ -326,7 +326,7 @@
                        Foreground="{DynamicResource ThemeF0A35B}" Text="{Binding LoadErrorText}" />
             <TextBlock Grid.Row="1" Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
                        IsVisible="{Binding HasNoPoints}" IsHitTestVisible="False"
-                       Text="{Binding EmptyGraphText}" />
+                       Text="{Binding Texts.UnavailableDetails}" />
           </Grid>
         </Border>
         <Border x:Name="GraphFrameOutline" BorderBrush="{DynamicResource Theme3B506F}"

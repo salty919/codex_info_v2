@@ -27,8 +27,6 @@ public sealed record ApiDetailsSnapshot(
     IReadOnlyList<ApiThreadDetails> Threads,
     string EstimatedCostLabel)
 {
-    public ApiRecordedUsageScope? UsageScope { get; init; }
-    public IReadOnlyList<ApiRecordedModelUsage> RecordedModels { get; init; } = [];
     /// <summary>Distinct threads whose canonical Session is currently open.</summary>
     public ulong OpenSessionThreadCount { get; init; } = ActiveThreadCount;
 
@@ -494,8 +492,6 @@ public sealed record ApiCurrentSnapshot(
     ulong ActiveThreadCount,
     PublishedPairIdentity PublishedPair)
 {
-    public ApiRecordedUsageScope? UsageScope { get; init; }
-    public IReadOnlyList<ApiRecordedModelUsage> RecordedModels { get; init; } = [];
     public ulong OpenSessionThreadCount { get; init; } = ActiveThreadCount;
 
     /// <summary>Null for older API generations that do not report model completeness.</summary>

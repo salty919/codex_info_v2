@@ -107,18 +107,6 @@ if url.endswith("/v4/current") and "FAKE_CURRENT_STATUS" in os.environ:
     if "--write-out" in args:
         sys.stdout.write(args[args.index("--write-out") + 1].replace("%{http_code}", status))
     raise SystemExit(22 if "--fail" in args and int(status) >= 400 else 0)
-if url.endswith("/v5/current") and "FAKE_RECORDED_STATUS" in os.environ:
-    status = os.environ["FAKE_RECORDED_STATUS"]
-    body = os.environ.get("FAKE_RECORDED_BODY", "{}")
-    with pathlib.Path(os.environ["FAKE_LOG"]).open("a") as stream:
-        stream.write("recorded-current " + status + "\n")
-    if "--output" in args:
-        pathlib.Path(args[args.index("--output") + 1]).write_text(body)
-    else:
-        sys.stdout.write(body)
-    if "--write-out" in args:
-        sys.stdout.write(args[args.index("--write-out") + 1].replace("%{http_code}", status))
-    raise SystemExit(22 if "--fail" in args and int(status) >= 400 else 0)
 if url.endswith("/v1/details") and os.environ.get("FAKE_REJECT_LEGACY_DETAILS") == "1":
     with pathlib.Path(os.environ["FAKE_LOG"]).open("a") as stream:
         stream.write("rejected-legacy-details\n")
@@ -335,7 +323,7 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         self.preserved_profile()
 
 
-    def test_current_readiness_does_not_require_recorded_archive(self):
+    def test_current_readiness_accepts_v4_schema(self):
         current = {
             "api_version": "v4", "state": "ready", "observed_at": 1792228061,
             "authenticated": True, "plan_label": None,
@@ -349,13 +337,11 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
             "active_thread_count": 0, "open_session_thread_count": 0,
         }
         self.env.update(FAKE_CURRENT_STATUS="200", FAKE_CURRENT_BODY=json.dumps(current),
-                        FAKE_RECORDED_STATUS="503", FAKE_RECORDED_BODY='{"error":"snapshot_unavailable"}',
                         FAKE_REJECT_LEGACY_DETAILS="1")
         result = self.current_readiness()
         log = pathlib.Path(self.env["FAKE_LOG"]).read_text()
         self.assertIn("current-v4 200", log, result.stdout + result.stderr + log)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("recorded-current", log)
         self.assertNotIn("rejected-legacy-details", log)
         self.preserved_profile()
 

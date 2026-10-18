@@ -862,18 +862,10 @@ public sealed class GraphWindowRangeTests
                 GraphDailyUsageProjectionTests.Model("gpt-6-sol", 100, 1)));
         using var main = await StartMainAsync([period, oldest]);
         using var graph = CreateGraph(main, () => start + DaySeconds);
-        // The calendar's visibility binding keeps its last value until this
-        // derived property notifies, even when the daily scene is ready.
-        var calendarVisible = graph.HasCalendar;
-        graph.PropertyChanged += (_, args) =>
-        {
-            if (args.PropertyName == nameof(GraphWindowViewModel.HasCalendar))
-                calendarVisible = graph.HasCalendar;
-        };
         graph.ShowSol = false;
         graph.SelectedTimeRange = GraphTimeRange.CalendarMonth;
         await EventuallyAsync(() => graph.IsMonthView && graph.Scene.IsDaily);
-        Assert.True(calendarVisible, "The bound calendar must appear after switching from a line plot to month.");
+        Assert.True(graph.IsMonthView, "The calendar view must be selected after switching to month.");
         Assert.Equal("2026/10", graph.RangeLabel);
         Assert.False(graph.HasLinePlot);
         Assert.Contains(graph.CalendarDays, day => day.ValueText == "3 M");
@@ -890,7 +882,7 @@ public sealed class GraphWindowRangeTests
             "A loaded calendar explains missing days in its cells, not as unavailable details over the calendar.");
         graph.SelectedTimeRange = GraphTimeRange.ResetPeriod;
         await EventuallyAsync(() => graph.IsPeriodView && graph.HasLinePlot);
-        Assert.False(calendarVisible, "The calendar must hide when the period line plot returns.");
+        Assert.False(graph.IsMonthView, "The calendar view must hide when the period line plot returns.");
         Assert.False(graph.ShowSol);
     }
 

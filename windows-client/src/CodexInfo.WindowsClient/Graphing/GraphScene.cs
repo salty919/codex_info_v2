@@ -78,7 +78,7 @@ internal readonly record struct GraphObservedSample(
 /// data semantics; XAML owns layout and the ScottPlot adapter only paints the
 /// arrays and fixed axes exposed here.
 /// </summary>
-public sealed partial class GraphScene
+public sealed class GraphScene
 {
     // A gray band denotes a sustained session-level break. Two adjacent exact
     // flat intervals establish a candidate, but ordinary short publication
