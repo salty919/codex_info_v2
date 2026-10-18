@@ -164,6 +164,7 @@ pub enum RecorderError {
     Io(io::Error),
     Writer(UsageStoreError),
     Invalid(String),
+    StaleHistoricalRepair(&'static str),
     AccountBoundaryChanged,
 }
 
@@ -173,6 +174,9 @@ impl fmt::Display for RecorderError {
             Self::Io(error) => write!(formatter, "recorder I/O error: {error}"),
             Self::Writer(error) => write!(formatter, "recorder writer error: {error}"),
             Self::Invalid(error) => formatter.write_str(error),
+            Self::StaleHistoricalRepair(reason) => {
+                write!(formatter, "historical repair candidate is stale: {reason}")
+            }
             Self::AccountBoundaryChanged => {
                 formatter.write_str("Codex account authority changed before recorder commit")
             }
@@ -7209,7 +7213,7 @@ impl Recorder {
         let Some(prepared) = self.prepare_saved_sources(include_same_physical)? else {
             return Ok(None);
         };
-        self.commit_prepared_historical_repair(prepared, commit_guard)
+        self.commit_prepared_historical_repair(&prepared, commit_guard)
     }
 
     fn prepare_saved_sources(
@@ -7637,7 +7641,7 @@ impl Recorder {
     /// original Session prefix is read on this recording/publication path.
     pub fn commit_prepared_historical_repair<F>(
         &mut self,
-        prepared: PreparedHistoricalRepair,
+        prepared: &PreparedHistoricalRepair,
         commit_guard: F,
     ) -> Result<Option<u64>, RecorderError>
     where
@@ -7647,21 +7651,45 @@ impl Recorder {
             return Ok(None);
         }
         for (source, fingerprint) in &prepared.sources {
-            if source_fingerprint(source)?.as_ref() != Some(fingerprint) {
-                return Err(RecorderError::Invalid(
-                    "historical repair source changed after preparation".into(),
-                ));
+            match source_fingerprint(source) {
+                Ok(actual) if actual.as_ref() == Some(fingerprint) => {}
+                Ok(_) => {
+                    return Err(RecorderError::StaleHistoricalRepair(
+                        "source changed after preparation",
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(RecorderError::StaleHistoricalRepair(
+                        "source removed after preparation",
+                    ));
+                }
+                Err(error) => return Err(error.into()),
             }
         }
-        let batch = prepared.batch;
         let _fence = account_epoch_commit_fence()?;
         if account_boundary_changed() || !commit_guard() {
             self.historical_pending = None;
             return Err(RecorderError::AccountBoundaryChanged);
         }
+        let batch = &prepared.batch;
+        eprintln!(
+            "codex-info-recorder diagnostic history_fixed_input revision={}",
+            batch.period.input_revision()
+        );
+        let repairs = batch
+            .repairs
+            .iter()
+            .map(|repair| {
+                self.writer
+                    .rebase_source_qualification_repair(repair)?
+                    .ok_or(RecorderError::StaleHistoricalRepair(
+                        "saved source facts changed",
+                    ))
+            })
+            .collect::<Result<Vec<_>, RecorderError>>()?;
         let result = self
             .writer
-            .commit_historical_source_repairs(&batch.period, &batch.repairs)?;
+            .commit_historical_source_repairs(&batch.period, &repairs)?;
         for repair in &batch.repairs {
             let key = source_verification_key(repair.checkpoint());
             self.source_event_repair_candidates.remove(&key);
@@ -16655,8 +16683,10 @@ mod tests {
             .unwrap();
         assert!(
             matches!(
-                recorder.commit_prepared_historical_repair(prepared, ||true),
-                Err(RecorderError::Invalid(message)) if message == "historical repair source changed after preparation"
+                recorder.commit_prepared_historical_repair(&prepared, || true),
+                Err(RecorderError::StaleHistoricalRepair(
+                    "source changed after preparation"
+                ))
             ),
             "a prepared background result cannot commit after its original changes"
         );

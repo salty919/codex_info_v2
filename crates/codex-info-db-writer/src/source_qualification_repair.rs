@@ -399,6 +399,14 @@ fn events(
 }
 
 fn fingerprint(connection: &Connection, checkpoint: &SessionCheckpoint) -> Result<String> {
+    fingerprint_with_owner(connection, checkpoint, true)
+}
+
+fn fingerprint_with_owner(
+    connection: &Connection,
+    checkpoint: &SessionCheckpoint,
+    include_collection_owner: bool,
+) -> Result<String> {
     let mut digest = Sha256::new();
     for table in [
         "session_checkpoints",
@@ -413,7 +421,11 @@ fn fingerprint(connection: &Connection, checkpoint: &SessionCheckpoint) -> Resul
             _ => "root_identity",
         };
         let mut query = connection.prepare(&format!("SELECT * FROM {table} WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3 AND file_inode=?4 AND prefix_generation=?5 ORDER BY {order}"))?;
-        let columns = query.column_count();
+        let columns = query
+            .column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
         let mut rows = query.query(params![
             checkpoint.root_identity,
             checkpoint.relative_path,
@@ -423,7 +435,15 @@ fn fingerprint(connection: &Connection, checkpoint: &SessionCheckpoint) -> Resul
         ])?;
         while let Some(row) = rows.next()? {
             digest.update([0xff]);
-            for column in 0..columns {
+            for (column, name) in columns.iter().enumerate() {
+                // Scheduled collection can acknowledge the same accepted bytes
+                // again. These stamps are not source/parser/numeric evidence.
+                if !include_collection_owner
+                    && table != "session_events"
+                    && matches!(name.as_str(), "collector_epoch" | "cycle_seq")
+                {
+                    continue;
+                }
                 match row.get::<_, Value>(column)? {
                     Value::Null => digest.update([0]),
                     Value::Integer(value) => {
@@ -452,6 +472,47 @@ fn fingerprint(connection: &Connection, checkpoint: &SessionCheckpoint) -> Resul
 }
 
 impl UsageStore {
+    /// Reseal an already verified source intent after an ordinary collection
+    /// acknowledgement. Every source/parser/range/event/pending value remains
+    /// identical; only the collection stamps may advance. The fixed period
+    /// evidence and all proposed facts are retained. `None` means the source
+    /// facts changed and the caller must prepare a fresh candidate.
+    pub fn rebase_source_qualification_repair(
+        &self,
+        repair: &PreparedSourceQualificationRepair,
+    ) -> Result<Option<PreparedSourceQualificationRepair>> {
+        if repair.equivalence.is_some()
+            || self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM source_prefix_repairs WHERE repair_id=?1)",
+                [&repair.repair_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            // The transactional acknowledgement path verifies the saved proof
+            // and exact qualified facts, including retries after success.
+            return Ok(Some(repair.clone()));
+        }
+        let current = fingerprint(&self.connection, &repair.checkpoint)?;
+        if current == repair.input_fingerprint {
+            return Ok(Some(repair.clone()));
+        }
+        let provenance: serde_json::Value =
+            serde_json::from_str(&repair.provenance).map_err(|_| {
+                UsageStoreError::InvalidImport("invalid source repair provenance".into())
+            })?;
+        if provenance["input_facts_fingerprint"].as_str()
+            != Some(fingerprint_with_owner(&self.connection, &repair.checkpoint, false)?.as_str())
+            || events(&self.connection, &repair.checkpoint)? != repair.original_events
+        {
+            return Ok(None);
+        }
+        let mut rebased = repair.clone();
+        rebased.input_fingerprint = current;
+        // Collection stamps do not change the verified source intent or its
+        // acknowledgement identity. Its original provenance stays immutable.
+        Ok(Some(rebased))
+    }
+
     pub fn load_unqualified_session_event_facts(&self) -> Result<Vec<LosslessSessionEvent>> {
         source_events::read_matching(&self.connection, "WHERE admission_json IS NULL", [])
     }
@@ -651,7 +712,7 @@ impl UsageStore {
         let input_fingerprint = fingerprint(&self.connection, checkpoint)?;
         let original_pending=self.load_session_pending_ranges()?.into_iter().filter(|pending|pending.root_identity==checkpoint.root_identity && pending.relative_path==checkpoint.relative_path && pending.file_device==checkpoint.file_device && pending.file_inode==checkpoint.file_inode && pending.prefix_generation==checkpoint.prefix_generation)
             .map(|pending|serde_json::json!({"start":pending.start_offset,"end":pending.end_offset,"record_sha256":pending.record_sha256,"reason":pending.reason,"parser_version":pending.parser_version,"complete":pending.complete,"collector_epoch":format!("{:032x}",pending.collector_epoch),"cycle_seq":pending.cycle_seq})).collect::<Vec<_>>();
-        let provenance=serde_json::to_string(&serde_json::json!({"version":1,"checkpoint":{"root_identity":checkpoint.root_identity,"relative_path":checkpoint.relative_path,"file_device":checkpoint.file_device,"file_inode":checkpoint.file_inode,"prefix_generation":format!("{:032x}",checkpoint.prefix_generation),"accepted_end":checkpoint.committed_offset,"prefix_sha256":checkpoint.prefix_sha256},"input_fingerprint":input_fingerprint,
+        let provenance=serde_json::to_string(&serde_json::json!({"version":1,"checkpoint":{"root_identity":checkpoint.root_identity,"relative_path":checkpoint.relative_path,"file_device":checkpoint.file_device,"file_inode":checkpoint.file_inode,"prefix_generation":format!("{:032x}",checkpoint.prefix_generation),"accepted_end":checkpoint.committed_offset,"prefix_sha256":checkpoint.prefix_sha256},"input_fingerprint":input_fingerprint,"input_facts_fingerprint":fingerprint_with_owner(&self.connection,checkpoint,false)?,
             "original_pending":original_pending,
             "original_parser":{"last_model":checkpoint.last_model,"last_model_context_kind":checkpoint.last_model_context_kind.map(SessionModelContextKind::as_str),"last_model_interval":checkpoint.last_model_interval.as_ref().map(SessionModelInterval::to_storage),"source_admission":checkpoint.source_admission},
             "qualified_parser":{"last_model":verification_checkpoint.last_model,"last_model_context_kind":verification_checkpoint.last_model_context_kind.map(SessionModelContextKind::as_str),"last_model_interval":verification_checkpoint.last_model_interval.as_ref().map(SessionModelInterval::to_storage),"source_admission":verification_checkpoint.source_admission},

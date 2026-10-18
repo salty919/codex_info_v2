@@ -157,6 +157,9 @@ fn digest(bytes: &str) -> String {
 }
 
 impl PreparedPeriodAttribution {
+    pub fn input_revision(&self) -> i64 {
+        self.payload.input_revision
+    }
     pub(crate) fn candidate_period_at(&self, timestamp: i64) -> Option<SessionEventPeriod> {
         let owners = self
             .payload
@@ -683,6 +686,19 @@ pub(super) fn commit_snapshot(
     crate::validate_storage_partition_identity(tx, &prepared.payload.partition)?;
     let current = head(tx)?.map(|(r, _)| r);
     if current.as_ref() == Some(&prepared.reference) {
+        if read_payload(tx, &prepared.reference)?.1 != prepared.bytes {
+            return Err(invalid("period evidence replay changed"));
+        }
+        return Ok(());
+    }
+    // A completed source batch can still reference its already committed
+    // immutable snapshot after the independent quota lane advances the head.
+    // Reuse that exact proof without rewinding the current evidence owner.
+    if !prepared.changed
+        && current
+            .as_ref()
+            .is_some_and(|head| head.generation > prepared.reference.generation)
+    {
         if read_payload(tx, &prepared.reference)?.1 != prepared.bytes {
             return Err(invalid("period evidence replay changed"));
         }

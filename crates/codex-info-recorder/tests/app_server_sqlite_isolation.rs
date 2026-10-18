@@ -91,7 +91,7 @@ impl QuotaJournalFixture {
         }
         let expected = json!({"rateLimits":{"primary":{
             "usedPercent": if malformed { json!("future-format") } else { json!(1) },
-            "resetsAt":1792295861_i64,"windowDurationMins":10080
+            "resetsAt":chrono::Utc::now().timestamp() + 604800,"windowDurationMins":10080
         }},"futureField":{"retained":true}});
         let payload = root.path().join("quota.json");
         fs::write(&payload, expected.to_string()).unwrap();
@@ -815,7 +815,7 @@ fn assert_inactive_original_repair(
         fs::write(&auth, br#"{"tokens":{"account_id":"current-account"}}"#).unwrap();
         confirmed_fixture(&home, &data, start + 180)
     };
-    let run = || {
+    let run = |expected_rejection: Option<&str>| {
         let mut child = ChildGuard(
             Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"))
                 .args(["--once", "--sessions-root"])
@@ -845,11 +845,25 @@ fn assert_inactive_original_repair(
             );
             thread::sleep(Duration::from_millis(20));
         };
-        assert!(
-            status.success(),
-            "{}",
-            fs::read_to_string(root.path().join("startup.log")).unwrap()
-        );
+        let log = fs::read_to_string(root.path().join("startup.log")).unwrap();
+        if let Some(rejection) = expected_rejection {
+            assert!(
+                log.contains(rejection),
+                "expected injected SQL rejection: {log}"
+            );
+        }
+        if selected_account && expected_rejection.is_some() {
+            assert!(
+                !status.success(),
+                "an uncommitted one-shot repair must fail: {log}"
+            );
+            assert!(
+                log.contains("one-shot historical repair remains uncommitted"),
+                "{log}"
+            );
+        } else {
+            assert!(status.success(), "{log}");
+        }
     };
     if let Some(mode) = equivalence {
         let snapshot = || {
@@ -895,7 +909,7 @@ fn assert_inactive_original_repair(
             rejected.execute("UPDATE session_events SET cache_write_input_tokens='0' WHERE event_index=(SELECT min(event_index) FROM session_events)",[]).unwrap();
         }
         drop(rejected);
-        run();
+        run(None);
         let unchanged = snapshot();
         assert_eq!(unchanged.0, original.0);
         for saved in &original.1 {
@@ -930,7 +944,7 @@ fn assert_inactive_original_repair(
                 .unwrap();
             rejected.execute("INSERT INTO session_events SELECT root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,999,timestamp+500,model,'77','77',cached_input_tokens,output_tokens,cache_write_input_tokens,NULL,NULL,NULL FROM session_events LIMIT 1",[]).unwrap();
             drop(rejected);
-            run();
+            run(None);
             let rejected = Connection::open(&old.database_path).unwrap();
             assert_eq!(rejected.query_row("SELECT count(*) FROM source_prefix_repairs",[],|r|r.get::<_,i64>(0)).unwrap(),0,"bijection must include the entire old event inventory, including unmatched suffixes");
             rejected
@@ -942,7 +956,7 @@ fn assert_inactive_original_repair(
         let rejected = Connection::open(&old.database_path).unwrap();
         rejected.execute_batch("CREATE TRIGGER reject_equivalence BEFORE INSERT ON source_prefix_repairs BEGIN SELECT RAISE(ABORT,'equivalence rollback fixture'); END;").unwrap();
         drop(rejected);
-        run();
+        run(None);
         let unchanged = snapshot();
         assert_eq!(unchanged.0, original.0);
         for saved in &original.1 {
@@ -1020,7 +1034,7 @@ fn assert_inactive_original_repair(
         );
 
         drop(rejected);
-        run();
+        run(None);
         let db = Connection::open(&old.database_path).unwrap();
         let values = db.prepare("SELECT tokens_json FROM recorded_usage_facts WHERE eligible=1 ORDER BY timestamp,fact_id").unwrap().query_map([], |r|r.get::<_,String>(0)).unwrap().map(|r|serde_json::from_str::<Value>(&r.unwrap()).unwrap()).collect::<Vec<_>>();
         let total = values
@@ -1231,7 +1245,7 @@ fn assert_inactive_original_repair(
         );
         drop(mutation);
         drop(fixed_reader);
-        run();
+        run(None);
         let db = Connection::open(&old.database_path).unwrap();
         let after:(String,String)=db.query_row("SELECT fact_revision,(SELECT group_concat(prefix_json,'|') FROM recorded_usage_prefixes) FROM recorded_usage_state",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(
@@ -1255,7 +1269,7 @@ fn assert_inactive_original_repair(
         fs::write(&auth, br#"{"tokens":{"account_id":"old-account"}}"#).unwrap();
         let reactivated = confirmed_fixture(&home, &data, start + 200);
         assert_eq!(reactivated.database_path, old.database_path);
-        run();
+        run(None);
         let db = Connection::open(&old.database_path).unwrap();
         let normal:(String,String)=db.query_row("SELECT fact_revision,(SELECT group_concat(prefix_json,'|') FROM recorded_usage_prefixes) FROM recorded_usage_state",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(
@@ -1336,7 +1350,7 @@ fn assert_inactive_original_repair(
                 }
             }
             drop(db);
-            run();
+            run(None);
             let db = Connection::open(&old.database_path).unwrap();
             let qualified: i64 = db
                 .query_row(
@@ -1381,7 +1395,11 @@ fn assert_inactive_original_repair(
     let failed = Connection::open(&old.database_path).unwrap();
     failed.execute_batch("CREATE TRIGGER reject_parser_repair BEFORE INSERT ON source_prefix_repairs BEGIN SELECT RAISE(ABORT,'sealed parser test rejection'); END;").unwrap();
     drop(failed);
-    run();
+    run(if selected_account {
+        Some("sealed parser test rejection")
+    } else {
+        None
+    });
     let failed = Connection::open(&old.database_path).unwrap();
     let untouched: (i64,i64,i64) = failed.query_row("SELECT (SELECT count(*) FROM session_events WHERE admission_json IS NOT NULL),(SELECT count(*) FROM session_checkpoints WHERE source_admission IS NOT NULL),(SELECT count(*) FROM source_prefix_repairs)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
     assert_eq!(
@@ -1407,7 +1425,7 @@ fn assert_inactive_original_repair(
         .execute_batch("DROP TRIGGER reject_parser_repair")
         .unwrap();
     drop(failed);
-    run();
+    run(None);
     assert!(
         current.database_path.is_file(),
         "main must initialize authenticated account B"
@@ -1589,7 +1607,7 @@ fn assert_inactive_original_repair(
     drop(proof);
     let fixed_generation = repaired_state.data_generation;
     drop(writer);
-    run();
+    run(None);
     let writer = UsageStore::open_read_only_partitioned(&old.database_path, &identity).unwrap();
     if !selected_account {
         assert_eq!(
@@ -2007,14 +2025,38 @@ for line in sys.stdin:
                     let text = fs::read_to_string(&log).unwrap();
                     if failed_at.is_none() && text.contains("forced pending qualification rollback")
                     {
-                        let revision: i64 = db
-                            .query_row(
-                                "SELECT max(revision) FROM official_period_inputs",
-                                [],
-                                |r| r.get(0),
-                            )
-                            .unwrap();
+                        // The next scheduled quota cycle can commit before
+                        // this poll sees the failed transaction. Freeze the
+                        // actual candidate input, not a later DB maximum.
+                        let failed = text.find("forced pending qualification rollback").unwrap();
+                        let revision: i64 = text[..failed]
+                            .lines()
+                            .rev()
+                            .find_map(|line| {
+                                line.strip_prefix(
+                                    "codex-info-recorder diagnostic history_fixed_input revision=",
+                                )
+                                .and_then(|revision| revision.parse().ok())
+                            })
+                            .expect("failed repair must identify its fixed official input");
                         failed_at = Some((receipts, revision));
+                        if label == "restore-after-source-change" {
+                            use std::io::Write;
+                            // A legitimate non-usage append invalidates the
+                            // prepared file fingerprint while quota keeps running.
+                            let timestamp = chrono::Utc::now().to_rfc3339();
+                            let marker = format!(
+                                "{}\n",
+                                json!({"type":"event_msg","timestamp":timestamp,
+                                "payload":{"type":"context_compacted"}})
+                            );
+                            fs::OpenOptions::new()
+                                .append(true)
+                                .open(root.join("home/sessions/one.jsonl"))
+                                .unwrap()
+                                .write_all(marker.as_bytes())
+                                .unwrap();
+                        }
                     }
                     if let Some((count, revision)) =
                         failed_at.filter(|(count, _)| receipts >= count + 2)
@@ -3003,7 +3045,7 @@ for line in sys.stdin:
         assert_eq!(
             fixed_revision,
             pending["fixed_revision"].as_i64().unwrap(),
-            "new quota cannot alter a fixed pending evidence snapshot"
+            "new quota cannot alter a fixed pending evidence snapshot: {log}"
         );
         let newest_revision: i64 = db
             .query_row(
@@ -3121,6 +3163,54 @@ for line in sys.stdin:
             checkpoint_state(&db).0,
             saved.0,
             "recovery cannot advance the accepted source prefix"
+        );
+        drop(db);
+
+        // A failed SQL transaction retains its fixed candidate. A later real
+        // source append must retire that candidate and allow a fresh worker
+        // preparation, without changing any of the original usage facts.
+        let writable = Connection::open(&accepted_database_path).unwrap();
+        assert_eq!(writable.execute("UPDATE session_events SET reset_at=NULL,window_seconds=NULL,admission_json=NULL WHERE record_sha256=?1",[&before_source.1]).unwrap(),1);
+        writable.execute_batch("CREATE TRIGGER reject_pending_qualification BEFORE UPDATE OF admission_json ON session_events WHEN OLD.admission_json IS NULL AND NEW.admission_json IS NOT NULL BEGIN SELECT RAISE(ABORT,'forced pending qualification rollback'); END;").unwrap();
+        drop(writable);
+        let (success, log) = run(
+            root.path(),
+            "repair-live",
+            "restore-after-source-change",
+            true,
+        );
+        assert!(success, "{log}");
+        let retired = log
+            .find("historical repair candidate retired")
+            .expect("changed source must retire its stale candidate");
+        assert!(
+            log[retired..].contains("history_prepare requested"),
+            "fresh preparation must follow retirement: {log}"
+        );
+        assert!(
+            log[retired..].contains("history_commit finish")
+                && log[retired..].contains("success=true"),
+            "a fresh candidate must actually commit: {log}"
+        );
+        let (db, _) = database(root.path());
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM session_events WHERE admission_json IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            ledger(&db),
+            saved_ledger,
+            "fresh preparation preserves all original numeric/source facts"
+        );
+        assert_eq!(
+            u64::try_from(checkpoint_state(&db).0).unwrap(),
+            fs::metadata(&source).unwrap().len(),
+            "the new accepted prefix contains the legitimate marker"
         );
         drop(db);
     }
@@ -3619,7 +3709,10 @@ fn quota_replay_restores_period_after_restart_without_new_api_response() {
         "SELECT reset_at, latest_quota_reset_at, window_seconds FROM collection_generation WHERE singleton=1",
         [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     ).unwrap();
-    assert_eq!(period, (1_792_295_861, 1_792_295_861, 604_800), "{log}");
+    let expected_reset = fixture.expected["rateLimits"]["primary"]["resetsAt"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(period, (expected_reset, expected_reset, 604_800), "{log}");
     let quota: (i64, f64) = db
         .query_row(
             "SELECT reset_at, remaining_percent FROM usage_history ORDER BY timestamp DESC LIMIT 1",
@@ -3627,7 +3720,7 @@ fn quota_replay_restores_period_after_restart_without_new_api_response() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(quota, (1_792_295_861, 99.0));
+    assert_eq!(quota, (expected_reset, 99.0));
     let state_path = fixture
         ._root
         .path()

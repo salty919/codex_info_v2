@@ -62,6 +62,10 @@ impl<T: Send + 'static> BackgroundWork<T> {
         }
     }
 
+    pub fn is_in_flight(&self) -> bool {
+        self.in_flight
+    }
+
     pub fn is_unavailable(&self) -> bool {
         self.unavailable
     }

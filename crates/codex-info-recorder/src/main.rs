@@ -212,6 +212,7 @@ type CurrentHistoryWorker = BackgroundWork<Result<Option<PreparedHistoricalRepai
 
 fn service_current_history<F>(
     current_history: &mut Option<CurrentHistoryWorker>,
+    pending: &mut Option<PreparedHistoricalRepair>,
     recorder: &mut Recorder,
     state_writer: &mut RecorderStateWriter,
     mut epoch_matches: F,
@@ -222,45 +223,60 @@ where
     let Some(worker) = current_history.as_mut() else {
         return Ok(());
     };
-    let completed = worker.try_result();
+    if pending.is_none() {
+        match worker.try_result() {
+            Some(Ok(prepared)) => *pending = prepared,
+            Some(Err(RecorderError::AccountBoundaryChanged)) => {
+                return Err(RecorderError::AccountBoundaryChanged.into())
+            }
+            Some(Err(error)) => {
+                eprintln!("codex-info-recorder current accepted-prefix repair unavailable: {error}")
+            }
+            None => {}
+        }
+    }
     if worker.is_unavailable() {
         eprintln!("codex-info-recorder historical preparation worker disconnected; recording continues independently");
         *current_history = None;
         return Ok(());
     }
-    let result = match completed {
-        Some(Ok(Some(prepared))) => {
-            let began = Instant::now();
-            eprintln!("codex-info-recorder diagnostic history_commit start");
-            let result = recorder.commit_prepared_historical_repair(prepared, &mut epoch_matches);
-            eprintln!(
-                "codex-info-recorder diagnostic history_commit finish elapsed_ms={} success={}",
-                began.elapsed().as_millis(),
-                result.is_ok()
-            );
-            result
-        }
-        Some(Err(error)) => Err(error),
-        Some(Ok(None)) | None => Ok(None),
+    let Some(prepared) = pending.as_ref() else {
+        return Ok(());
     };
+    let began = Instant::now();
+    eprintln!("codex-info-recorder diagnostic history_commit start");
+    let result = recorder.commit_prepared_historical_repair(prepared, &mut epoch_matches);
+    eprintln!(
+        "codex-info-recorder diagnostic history_commit finish elapsed_ms={} success={}",
+        began.elapsed().as_millis(),
+        result.is_ok()
+    );
     match result {
-        Ok(Some(generation)) => {
-            if !epoch_matches() {
-                return Err(RecorderError::AccountBoundaryChanged.into());
+        Ok(generation) => {
+            *pending = None;
+            if let Some(generation) = generation {
+                if !epoch_matches() {
+                    return Err(RecorderError::AccountBoundaryChanged.into());
+                }
+                state_writer.write_committed(&recorder.state()?, true)?;
+                eprintln!("codex-info-recorder current accepted-prefix generation={generation}");
             }
-            state_writer.write_committed(&recorder.state()?, true)?;
-            eprintln!("codex-info-recorder current accepted-prefix generation={generation}");
         }
-        Ok(None) => {}
         Err(RecorderError::AccountBoundaryChanged) => {
-            return Err(RecorderError::AccountBoundaryChanged.into())
+            *pending = None;
+            return Err(RecorderError::AccountBoundaryChanged.into());
+        }
+        Err(error @ RecorderError::StaleHistoricalRepair(_)) => {
+            // The old source proof no longer applies. Retire only this in-memory
+            // candidate; the next scheduled cycle can request a fresh one.
+            *pending = None;
+            eprintln!("codex-info-recorder historical repair candidate retired: {error}");
         }
         Err(error) => {
-            eprintln!("codex-info-recorder current accepted-prefix repair unavailable: {error}")
+            // Keep the same prepared source/period proof until its transaction
+            // commits. New quota inputs cannot replace this uncommitted batch.
+            eprintln!("codex-info-recorder current accepted-prefix repair unavailable: {error}");
         }
-    }
-    if worker.request() {
-        eprintln!("codex-info-recorder diagnostic history_prepare requested");
     }
     Ok(())
 }
@@ -929,6 +945,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("codex-info-recorder historical preparation unavailable: {error}");
         })
         .ok();
+    let mut pending_current_history = None;
     let mut inactive_history = start_inactive_history(
         options.clone(),
         startup_epoch.clone(),
@@ -1138,6 +1155,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut clock = || Instant::now();
         let mut epoch_matches =
             |epoch: &AccountEpochProof| recorder_epoch_matches(&options, epoch, &_profile_lease);
+        if !early_recollection && !shutdown_requested() {
+            if let Some(worker) = inactive_history.as_mut() {
+                worker.request();
+            }
+            if pending_current_history.is_none() {
+                if current_history
+                    .as_mut()
+                    .is_some_and(|worker| worker.request())
+                {
+                    eprintln!("codex-info-recorder diagnostic history_prepare requested");
+                }
+            }
+        }
         let mut after_publication = |recorder: &mut Recorder,
                                      state_writer: &mut RecorderStateWriter|
          -> Result<(), Box<dyn std::error::Error>> {
@@ -1154,13 +1184,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if worker.is_unavailable() {
                     eprintln!("codex-info-recorder inactive history worker disconnected; recording continues independently");
                     inactive_history = None;
-                } else {
-                    worker.request();
                 }
             }
-            service_current_history(&mut current_history, recorder, state_writer, || {
-                recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease)
-            })
+            service_current_history(
+                &mut current_history,
+                &mut pending_current_history,
+                recorder,
+                state_writer,
+                || recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease),
+            )
         };
         if !complete_cycle_publication_and_wait(
             publication,
@@ -1180,6 +1212,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut epoch_matches,
             &mut after_publication,
         )? {
+            drop(after_publication);
+            // A one-shot process owns the auxiliary jobs it already started.
+            // Publish the collection first, then finish this bounded round;
+            // never exit merely because its result was not immediately ready.
+            if options.once {
+                while !shutdown_requested()
+                    && (current_history
+                        .as_ref()
+                        .is_some_and(|worker| worker.is_in_flight())
+                        || inactive_history
+                            .as_ref()
+                            .is_some_and(|worker| worker.is_in_flight()))
+                {
+                    service_current_history(
+                        &mut current_history,
+                        &mut pending_current_history,
+                        &mut recorder,
+                        &mut state_writer,
+                        || recorder_epoch_matches(&options, &cycle_epoch, &_profile_lease),
+                    )?;
+                    if let Some(worker) = inactive_history.as_mut() {
+                        if let Some(Err(error)) = worker.try_result() {
+                            if matches!(error, RecorderError::AccountBoundaryChanged) {
+                                return Err(error.into());
+                            }
+                            eprintln!("codex-info-recorder inactive history unavailable: {error}");
+                        }
+                    }
+                    if !shutdown_requested() {
+                        std::thread::park_timeout(Duration::from_millis(20));
+                    }
+                }
+                if pending_current_history.is_some() && !shutdown_requested() {
+                    return Err(RecorderError::Invalid(
+                        "one-shot historical repair remains uncommitted".into(),
+                    )
+                    .into());
+                }
+            }
             return Ok(());
         }
     }
@@ -2212,6 +2283,7 @@ mod tests {
             })
             .unwrap(),
         );
+        let mut pending_history = None;
         assert!(worker.as_mut().unwrap().request());
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         let anchor = Instant::now();
@@ -2273,7 +2345,13 @@ mod tests {
                 &mut || now.get(),
                 &mut |_| true,
                 &mut |recorder, state_writer| {
-                    service_current_history(&mut worker, recorder, state_writer, || true)
+                    service_current_history(
+                        &mut worker,
+                        &mut pending_history,
+                        recorder,
+                        state_writer,
+                        || true,
+                    )
                 },
             )
             .unwrap();
