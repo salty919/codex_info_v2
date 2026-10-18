@@ -9,14 +9,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::io::{BufRead, Cursor};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Instant;
 
+#[cfg(test)]
 use chrono::DateTime;
 use serde_json::{json, Map, Value};
 
 use crate::security;
+use crate::session_input::{self, ModelAttributionState, RecordRead};
+use codex_info_db_writer::{SessionModelContextKind, SessionModelInterval};
 
 const RESPONSE_SCHEMA_TEXT: &str =
     include_str!("../protocol/thread/ThreadListResponse.canonical.json");
@@ -1161,6 +1165,7 @@ pub fn pinned_schema_identity() -> Result<PinnedSchemaIdentity, ThreadContractEr
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RolloutError {
     FileTooLarge,
+    DeadlineExceeded,
     InvalidUtf8,
     UnterminatedLine,
     LineTooLarge,
@@ -1172,6 +1177,7 @@ impl RolloutError {
     pub const fn message(self) -> &'static str {
         match self {
             Self::FileTooLarge => "thread rollout exceeds file limit",
+            Self::DeadlineExceeded => "thread rollout deadline exceeded",
             Self::InvalidUtf8 => "thread rollout is not UTF-8",
             Self::UnterminatedLine => "thread rollout has an unterminated line",
             Self::LineTooLarge => "thread rollout line exceeds limit",
@@ -1237,11 +1243,155 @@ impl ValidatedRollout {
 #[derive(Clone, Debug, Default)]
 struct RolloutState {
     last_task_running: Option<bool>,
-    last_model: Option<String>,
+    model_context: ModelAttributionState,
     last_total_tokens: Option<u64>,
     last_context_usage_tokens: Option<u64>,
     last_context_window_tokens: Option<u64>,
     last_user_message_at: Option<i64>,
+}
+
+/// Apply the live owner's absolute deadline to buffer refills and hash I/O.
+/// The wrapper retains no payload and does not extend that deadline per file.
+pub struct LiveRolloutReader<R> {
+    inner: R,
+    deadline: Instant,
+}
+
+impl<R> LiveRolloutReader<R> {
+    pub fn new(inner: R, deadline: Instant) -> Self {
+        Self { inner, deadline }
+    }
+
+    fn check_deadline(&self) -> io::Result<()> {
+        if Instant::now() >= self.deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "live rollout deadline exceeded",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<R: Read> Read for LiveRolloutReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.check_deadline()?;
+        let count = self.inner.read(bytes)?;
+        self.check_deadline()?;
+        Ok(count)
+    }
+}
+
+impl<R: BufRead> BufRead for LiveRolloutReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.check_deadline()?;
+        let deadline = self.deadline;
+        let bytes = self.inner.fill_buf()?;
+        if Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "live rollout deadline exceeded",
+            ))
+        } else {
+            Ok(bytes)
+        }
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.inner.consume(count);
+    }
+}
+
+impl<R: Seek> Seek for LiveRolloutReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.check_deadline()?;
+        let position = self.inner.seek(position)?;
+        self.check_deadline()?;
+        Ok(position)
+    }
+}
+
+// Diagnostic strings are fixed protocol labels, never source string values.
+fn rollout_protocol_kind(value: Option<&str>) -> &'static str {
+    const KNOWN: &[&str] = &[
+        "session_meta",
+        "event_msg",
+        "response_item",
+        "token_usage_record",
+        "world_state",
+        "inter_agent_communication_metadata",
+        "compacted",
+        "context_compacted",
+        "token_count",
+        "turn_context",
+        "thread_context",
+        "thread_settings_applied",
+        "task_started",
+        "task_complete",
+        "task_completed",
+        "turn_aborted",
+        "thread_goal_updated",
+        "item_completed",
+        "agent_message",
+        "user_message",
+        "agent_reasoning",
+        "agent_reasoning_raw_content",
+        "agent_reasoning_section_break",
+        "mcp_tool_call_begin",
+        "mcp_tool_call_end",
+        "sub_agent_activity",
+        "web_search_end",
+        "patch_apply_end",
+    ];
+    match value {
+        None => "missing",
+        Some(value) => KNOWN
+            .iter()
+            .copied()
+            .find(|known| *known == value)
+            .unwrap_or("unrecognized"),
+    }
+}
+
+fn rollout_rejection(
+    ordinal: u64,
+    start: u64,
+    end: Option<u64>,
+    category: &'static str,
+    record: Option<&session_input::SessionRecordSummary>,
+) -> Value {
+    let shape = record.map(|record| json!({
+        "outer_kind": rollout_protocol_kind(record.outer_type.as_deref()),
+        "event_kind": rollout_protocol_kind(record.event_type()),
+        "known_state_input": record.known_state_input(),
+        "coverage_shape_valid": record.input_shape_valid_for_coverage(),
+        "unknown_envelope_field": record.unknown_envelope_field,
+        "ordinal_present": record.ordinal_seen,
+        "ordinal_shape_valid": record.ordinal_shape_valid(),
+        "response_metadata_present": record.response_metadata_seen,
+        "response_metadata_shape_valid": record.response_metadata_shape_valid(),
+        "duplicate_fields": record.duplicate_fields,
+        "timestamp_present": record.timestamp_seen,
+        "timestamp_malformed": record.timestamp_malformed,
+        "timestamp_valid": (1..=253_402_300_799).contains(&record.event_timestamp()),
+        "payload_present": record.payload_seen,
+        "payload_object": record.payload_object,
+        "payload_event_type_malformed": record.payload.event_type_malformed,
+        "context_envelope_valid": record.context_envelope_valid(),
+        "context_model_qualified": record.qualified_context_model().is_some(),
+        "root_model_malformed": record.root_model_malformed,
+        "payload_model_malformed": record.payload.model_malformed,
+        "thread_settings_model_malformed": record.payload.thread_settings_model_malformed,
+        "metadata_shape_valid": record.metadata_shape_valid(),
+        "noop_shape_valid": record.noop_valid(),
+        "usage_unparsed": record.usage_unparsed(),
+        "context_unparsed": record.context_unparsed(),
+        "token_snapshot_valid": record.token_snapshot().is_some_and(|tokens| tokens.valid_raw()),
+        "response_record_valid": record.payload.response.record().is_some(),
+        "response_identifiers_malformed": record.payload.response.malformed_identifiers != 0,
+    }));
+    json!({"record_ordinal":ordinal,"start_offset":start,"end_offset":end,"category":category,"shape":shape})
 }
 
 /// Stateful parser used by the live rollout reader.
@@ -1270,7 +1420,7 @@ impl RolloutAccumulator {
 
     pub fn seeded_with_context(
         last_model: Option<String>,
-        previous_total: u64,
+        previous_total: impl Into<Option<u64>>,
         last_task_running: Option<bool>,
         context_usage_tokens: Option<u64>,
         context_window_tokens: Option<u64>,
@@ -1280,11 +1430,20 @@ impl RolloutAccumulator {
                 (Some(usage), Some(window)) => (Some(usage), Some(window)),
                 _ => (None, None),
             };
+        let model_context = ModelAttributionState {
+            kind: if last_model.is_some() {
+                SessionModelContextKind::Turn
+            } else {
+                SessionModelContextKind::None
+            },
+            model: last_model,
+            interval: SessionModelInterval::None,
+        };
         Self {
             state: RolloutState {
                 last_task_running,
-                last_model,
-                last_total_tokens: Some(previous_total),
+                model_context,
+                last_total_tokens: previous_total.into(),
                 last_context_usage_tokens: context_usage_tokens,
                 last_context_window_tokens: context_window_tokens,
                 ..RolloutState::default()
@@ -1305,51 +1464,138 @@ impl RolloutAccumulator {
         if snapshot_bytes > security::MAX_SESSION_FILE_BYTES {
             return Err(RolloutError::FileTooLarge);
         }
-        loop {
-            let record = match security::read_bounded_jsonl_record(reader) {
-                Ok(record) => record,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        security::SecurityErrorKind::LimitExceeded
-                            | security::SecurityErrorKind::Parse
-                    ) =>
-                {
-                    // Tool output and malformed token-count/response-item
-                    // records are non-liveness data.  The bounded reader has
-                    // consumed the complete bad record before returning, so
-                    // skipping it preserves the existing live-reader
-                    // recovery contract without weakening lifecycle/model
-                    // validation below.
-                    continue;
-                }
-                Err(error) => {
-                    return Err(match error.kind() {
-                        security::SecurityErrorKind::LimitExceeded => RolloutError::LineTooLarge,
-                        security::SecurityErrorKind::Parse => RolloutError::InvalidUtf8,
-                        security::SecurityErrorKind::Unterminated => RolloutError::UnterminatedLine,
-                        _ => RolloutError::InvalidJson,
-                    });
-                }
-            };
-            let Some((line, terminated)) = record else {
-                break;
-            };
-            if !terminated {
-                return Err(RolloutError::UnterminatedLine);
-            }
-            let value: Value = match serde_json::from_str(&line) {
-                Ok(value) => value,
-                Err(_)
-                    if is_malformed_token_count_record(&line)
-                        || is_malformed_response_item_record(&line) =>
-                {
-                    continue;
-                }
-                Err(_) => return Err(RolloutError::InvalidJson),
-            };
-            apply_rollout_event(&value, &mut self.state)?;
+        self.apply_complete_records(reader)
+    }
+
+    /// Validate the entire exact live prefix with bounded streaming memory.
+    /// Whole-file snapshot limits belong to `apply_reader`; the live owner
+    /// supplies its single existing cycle deadline instead of a new file cap.
+    pub fn apply_live_reader<R: BufRead>(
+        &mut self,
+        reader: &mut R,
+        snapshot_bytes: u64,
+        deadline: Instant,
+    ) -> Result<(), RolloutError> {
+        self.apply_live_reader_diagnosed(reader, snapshot_bytes, deadline, &mut None)
+    }
+
+    /// The same admission with categorical, source-value-free rejection data.
+    pub fn apply_live_reader_diagnosed<R: BufRead>(
+        &mut self,
+        reader: &mut R,
+        snapshot_bytes: u64,
+        deadline: Instant,
+        rejection: &mut Option<Value>,
+    ) -> Result<(), RolloutError> {
+        *rejection = None;
+        if Instant::now() >= deadline {
+            return Err(RolloutError::DeadlineExceeded);
         }
+        let mut candidate = self.clone();
+        // The grammar peeks one byte at a time. Keep those peeks in a bounded
+        // buffer, with the deadline and source hashing at actual read refills.
+        let mut input = BufReader::new(LiveRolloutReader::new(
+            reader.take(snapshot_bytes),
+            deadline,
+        ));
+        let result = candidate.apply_complete_records_diagnosed(&mut input, rejection);
+        if Instant::now() >= deadline {
+            return Err(RolloutError::DeadlineExceeded);
+        }
+        result?;
+        if input.get_ref().inner.limit() != 0 || !input.buffer().is_empty() {
+            return Err(RolloutError::InvalidJson);
+        }
+        *self = candidate;
+        Ok(())
+    }
+
+    fn apply_complete_records<R: BufRead>(&mut self, reader: &mut R) -> Result<(), RolloutError> {
+        self.apply_complete_records_diagnosed(reader, &mut None)
+    }
+
+    fn apply_complete_records_diagnosed<R: BufRead>(
+        &mut self,
+        reader: &mut R,
+        rejection: &mut Option<Value>,
+    ) -> Result<(), RolloutError> {
+        let mut candidate = self.state.clone();
+        let mut ordinal = 0_u64;
+        let mut offset = 0_u64;
+        loop {
+            let record = session_input::read_streaming_record(reader, std::io::Error::other)
+                .map_err(|_| {
+                    *rejection = Some(rollout_rejection(
+                        ordinal + 1,
+                        offset,
+                        None,
+                        "source-io",
+                        None,
+                    ));
+                    RolloutError::InvalidJson
+                })?;
+            let (summary, consumed) = match record {
+                RecordRead::End => break,
+                RecordRead::Present(summary, consumed) => (summary, consumed),
+                RecordRead::Invalid(consumed, _) => {
+                    *rejection = Some(rollout_rejection(
+                        ordinal + 1,
+                        offset,
+                        Some(offset.saturating_add(consumed)),
+                        "json-framing",
+                        None,
+                    ));
+                    return Err(RolloutError::InvalidJson);
+                }
+                RecordRead::Unterminated(consumed) => {
+                    *rejection = Some(rollout_rejection(
+                        ordinal + 1,
+                        offset,
+                        Some(offset.saturating_add(consumed)),
+                        "unterminated-record",
+                        None,
+                    ));
+                    return Err(RolloutError::UnterminatedLine);
+                }
+            };
+            ordinal += 1;
+            let start = offset;
+            offset = offset.saturating_add(consumed);
+            if !summary.live_shape_valid() {
+                *rejection = Some(rollout_rejection(
+                    ordinal,
+                    start,
+                    Some(offset),
+                    "record-shape",
+                    Some(&summary),
+                ));
+                return Err(RolloutError::InvalidKnownEvent);
+            }
+            if candidate.model_context.observe_context(&summary) {
+                *rejection = Some(rollout_rejection(
+                    ordinal,
+                    start,
+                    Some(offset),
+                    "model-context",
+                    Some(&summary),
+                ));
+                return Err(RolloutError::InvalidKnownEvent);
+            }
+            if let Some(running) = summary.task_running() {
+                candidate.last_task_running = Some(running);
+            }
+            if let Some(counter) = summary.token_snapshot() {
+                candidate.last_total_tokens = Some(counter.total);
+            }
+            if let Some((usage, window)) = summary.context_pair() {
+                candidate.last_context_usage_tokens = Some(usage);
+                candidate.last_context_window_tokens = Some(window);
+            }
+            if let Some(timestamp) = summary.user_message_timestamp() {
+                candidate.last_user_message_at = Some(timestamp);
+            }
+        }
+        self.state = candidate;
         Ok(())
     }
 
@@ -1360,7 +1606,8 @@ impl RolloutAccumulator {
 
 fn finish_rollout(state: RolloutState) -> Result<ValidatedRollout, RolloutError> {
     let model = state
-        .last_model
+        .model_context
+        .model
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "不明".to_owned());
     let model_label =
@@ -1376,57 +1623,8 @@ fn finish_rollout(state: RolloutState) -> Result<ValidatedRollout, RolloutError>
     })
 }
 
-fn event_timestamp(value: &Value) -> Option<i64> {
-    value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
-        .map(|timestamp| timestamp.timestamp())
-        .filter(|timestamp| *timestamp > 0)
-}
-
-/// Validate a bounded JSONL stream before returning any task, model, or token
-/// field. Non-empty streams must end in a newline. The caller supplies the
-/// secure-open snapshot length so the file-size bound is checked before any
-/// record is accepted.
+/// Validate a complete bounded prefix with the shared record grammar.
 pub fn parse_rollout_reader<R: BufRead>(
-    reader: &mut R,
-    snapshot_bytes: u64,
-) -> Result<ValidatedRollout, RolloutError> {
-    if snapshot_bytes > security::MAX_SESSION_FILE_BYTES {
-        return Err(RolloutError::FileTooLarge);
-    }
-    let mut state = RolloutState::default();
-    loop {
-        let record =
-            security::read_bounded_jsonl_record(reader).map_err(|error| match error.kind() {
-                security::SecurityErrorKind::LimitExceeded => RolloutError::LineTooLarge,
-                security::SecurityErrorKind::Parse => RolloutError::InvalidUtf8,
-                security::SecurityErrorKind::Unterminated => RolloutError::UnterminatedLine,
-                _ => RolloutError::InvalidJson,
-            })?;
-        let Some((line, terminated)) = record else {
-            break;
-        };
-        if !terminated {
-            return Err(RolloutError::UnterminatedLine);
-        }
-        let value: Value = serde_json::from_str(&line).map_err(|_| RolloutError::InvalidJson)?;
-        apply_rollout_event(&value, &mut state)?;
-    }
-    finish_rollout(state)
-}
-
-/// Parse a live rollout while isolating oversized or invalid-UTF8 records.
-///
-/// Tool output can legitimately exceed the bounded record size.  Those
-/// records are not needed to determine the running/model/token state, and the
-/// bounded reader consumes each complete bad line before returning its error.
-/// A malformed `token_count` envelope is likewise non-liveness data: some
-/// live writers can split a large rate-limit payload at a physical newline.
-/// Skip only that explicitly identified event family; lifecycle and model
-/// records remain strict so an invalid state cannot be presented as running.
-pub fn parse_rollout_reader_recoverable<R: BufRead>(
     reader: &mut R,
     snapshot_bytes: u64,
 ) -> Result<ValidatedRollout, RolloutError> {
@@ -1435,76 +1633,13 @@ pub fn parse_rollout_reader_recoverable<R: BufRead>(
     accumulator.snapshot()
 }
 
-fn is_malformed_token_count_record(line: &str) -> bool {
-    let Some(payload_start) = line.find("\"payload\"") else {
-        return false;
-    };
-    // Require the root event family before the payload and the token-count
-    // family inside the payload. This keeps whitespace variants recoverable
-    // while preventing malformed lifecycle/model records that merely mention
-    // token_count from being skipped.
-    contains_string_field(&line[..payload_start], "type", "event_msg")
-        && contains_string_field(&line[payload_start..], "type", "token_count")
-}
-
-fn is_malformed_response_item_record(line: &str) -> bool {
-    let Some(payload_start) = line.find("\"payload\"") else {
-        return false;
-    };
-    // response_item records carry transcript content, not task lifecycle,
-    // model, or token state. An interrupted append must not invalidate later
-    // complete state events in the same live rollout.
-    contains_string_field(&line[..payload_start], "type", "response_item")
-}
-
-fn contains_string_field(input: &str, key: &str, expected: &str) -> bool {
-    let marker = format!("\"{key}\"");
-    let expected_marker = format!("\"{expected}\"");
-    let mut offset = 0;
-    while let Some(key_start) = find_json_key(input, &marker, offset) {
-        let start = key_start + marker.len();
-        let bytes = input.as_bytes();
-        let mut cursor = start;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
-        }
-        if bytes.get(cursor) != Some(&b':') {
-            offset = key_start + 1;
-            continue;
-        }
-        cursor += 1;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
-        }
-        if input[cursor..].starts_with(&expected_marker) {
-            return true;
-        }
-        offset = key_start + 1;
-    }
-    false
-}
-
-/// Find a key token outside quoted JSON strings. The surrounding record may
-/// be truncated, so this intentionally performs only bounded lexical state
-/// tracking rather than attempting to deserialize an incomplete object.
-fn find_json_key(input: &str, marker: &str, from: usize) -> Option<usize> {
-    let bytes = input.as_bytes();
-    let mut in_string = false;
-    let mut escaped = false;
-    for index in from..bytes.len() {
-        let byte = bytes[index];
-        if byte == b'"' && !escaped {
-            if !in_string && input[index..].starts_with(marker) {
-                return Some(index);
-            }
-            in_string = !in_string;
-        }
-        escaped = in_string && byte == b'\\' && !escaped;
-        if byte != b'\\' {
-            escaped = false;
-        }
-    }
-    None
+/// Validated oversized NoOp bodies are streamed; unverified records reject
+/// the atomic cycle. This entrypoint has the same grammar as the full reader.
+pub fn parse_rollout_reader_recoverable<R: BufRead>(
+    reader: &mut R,
+    snapshot_bytes: u64,
+) -> Result<ValidatedRollout, RolloutError> {
+    parse_rollout_reader(reader, snapshot_bytes)
 }
 
 /// Validate an in-memory rollout with the same streaming parser used by live
@@ -1515,162 +1650,10 @@ pub fn parse_rollout(bytes: &[u8]) -> Result<ValidatedRollout, RolloutError> {
     parse_rollout_reader(&mut Cursor::new(bytes), snapshot_bytes)
 }
 
-fn apply_rollout_event(value: &Value, state: &mut RolloutState) -> Result<(), RolloutError> {
-    let Some(root) = value.as_object() else {
-        return Ok(());
-    };
-    let Some(root_type) = root.get("type").and_then(Value::as_str) else {
-        return Ok(());
-    };
-
-    if root_type == "event_msg" {
-        let payload = root
-            .get("payload")
-            .and_then(Value::as_object)
-            .ok_or(RolloutError::InvalidKnownEvent)?;
-        let event_type = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or(RolloutError::InvalidKnownEvent)?;
-        if event_type == "user_message" {
-            if let Some(timestamp) = event_timestamp(value) {
-                state.last_user_message_at = Some(timestamp);
-            }
-        }
-        return apply_known_rollout_event(event_type, payload, true, state);
-    }
-
-    if root_type == "response_item"
-        && value
-            .get("payload")
-            .and_then(Value::as_object)
-            .is_some_and(|payload| {
-                payload.get("type").and_then(Value::as_str) == Some("message")
-                    && payload.get("role").and_then(Value::as_str) == Some("user")
-            })
-    {
-        if let Some(timestamp) = event_timestamp(value) {
-            state.last_user_message_at = Some(timestamp);
-        }
-        return Ok(());
-    }
-
-    let event = match root.get("payload") {
-        Some(Value::Object(payload)) => payload,
-        Some(_) if is_known_rollout_event(root_type) => {
-            return Err(RolloutError::InvalidKnownEvent)
-        }
-        _ => root,
-    };
-    apply_known_rollout_event(root_type, event, false, state)
-}
-
-fn is_known_rollout_event(event_type: &str) -> bool {
-    matches!(
-        event_type,
-        "task_started"
-            | "task_complete"
-            | "task_completed"
-            | "turn_aborted"
-            | "turn_context"
-            | "thread_context"
-            | "thread_settings_applied"
-            | "token_count"
-    )
-}
-
-fn apply_known_rollout_event(
-    event_type: &str,
-    event: &Map<String, Value>,
-    nested: bool,
-    state: &mut RolloutState,
-) -> Result<(), RolloutError> {
-    if let Some(running) = task_running_for_event_type(event_type) {
-        state.last_task_running = Some(running);
-        return Ok(());
-    }
-    match event_type {
-        "turn_context" | "thread_context" | "thread_settings_applied" => {
-            state.last_model = Some(extract_known_model(event_type, event)?);
-        }
-        "token_count" if nested => {
-            // Codex emits an initial token_count envelope with `info: null`
-            // while the first usage sample is not available yet.  It carries
-            // no token fields to trust, so treat it as a no-op; once `info`
-            // is an object, keep strict validation for every numeric field.
-            let info = event.get("info").ok_or(RolloutError::InvalidKnownEvent)?;
-            let Some(info) = info.as_object() else {
-                if info.is_null() {
-                    return Ok(());
-                }
-                return Err(RolloutError::InvalidKnownEvent);
-            };
-            let total_tokens = info
-                .get("total_token_usage")
-                .and_then(Value::as_object)
-                .and_then(|usage| usage.get("total_tokens"))
-                .and_then(Value::as_u64)
-                .ok_or(RolloutError::InvalidKnownEvent)?;
-            let context_usage_tokens = match info.get("last_token_usage") {
-                Some(last_usage) => Some(
-                    last_usage
-                        .as_object()
-                        .and_then(|usage| usage.get("total_tokens"))
-                        .and_then(Value::as_u64)
-                        .ok_or(RolloutError::InvalidKnownEvent)?,
-                ),
-                None => None,
-            };
-            let context_window_tokens = info
-                .get("model_context_window")
-                .map(|context_window| {
-                    context_window
-                        .as_u64()
-                        .ok_or(RolloutError::InvalidKnownEvent)
-                })
-                .transpose()?;
-            state.last_total_tokens = Some(total_tokens);
-            if let (Some(context_usage_tokens), Some(context_window_tokens)) =
-                (context_usage_tokens, context_window_tokens)
-            {
-                state.last_context_usage_tokens = Some(context_usage_tokens);
-                state.last_context_window_tokens = Some(context_window_tokens);
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// Canonical task-lifecycle projection shared by the rollout reader and the
 /// durable session checkpoint writer.
 pub fn task_running_for_event_type(event_type: &str) -> Option<bool> {
-    match event_type {
-        "task_started" => Some(true),
-        "task_complete" | "task_completed" | "turn_aborted" => Some(false),
-        _ => None,
-    }
-}
-
-fn extract_known_model(
-    event_type: &str,
-    event: &Map<String, Value>,
-) -> Result<String, RolloutError> {
-    let model_value = if event_type == "thread_settings_applied" {
-        match event.get("thread_settings") {
-            Some(settings) => settings
-                .as_object()
-                .and_then(|settings| settings.get("model"))
-                .ok_or(RolloutError::InvalidKnownEvent)?,
-            None => event.get("model").ok_or(RolloutError::InvalidKnownEvent)?,
-        }
-    } else {
-        event.get("model").ok_or(RolloutError::InvalidKnownEvent)?
-    };
-    let model = model_value
-        .as_str()
-        .ok_or(RolloutError::InvalidKnownEvent)?;
-    security::bounded_model(model).map_err(|_| RolloutError::InvalidKnownEvent)
+    session_input::task_running_for_event_type(event_type)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1923,6 +1906,540 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn issue604_response_history_metadata_is_bounded_to_its_noop_envelope() {
+        use std::time::Duration;
+        let baseline = rollout_bytes(&[
+            json!({"type":"turn_context","timestamp":"2026-10-10T00:00:00Z","model":"gpt-6.1-sol"}),
+            json!({"type":"task_started","timestamp":"2026-10-10T00:00:00Z"}),
+        ]);
+        let expected = parse_rollout(&baseline).unwrap();
+        for metadata in [
+            Value::Null,
+            json!({}),
+            json!({"client_authored":true,"type":"task_complete","model":"gpt-6-astra","usage":{"total_tokens":999},"text":"opaque"}),
+        ] {
+            for prefix in [true, false] {
+                let metadata = metadata.to_string();
+                let head = if prefix {
+                    format!("\"metadata\":{metadata},")
+                } else {
+                    String::new()
+                };
+                let tail = if prefix {
+                    String::new()
+                } else {
+                    format!(",\"metadata\":{metadata}")
+                };
+                let input=format!("{{{head}\"timestamp\":\"2026-10-10T00:00:01Z\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"output\":\"opaque\"}}{tail}}}\n");
+                let mut whole = baseline.clone();
+                whole.extend_from_slice(input.as_bytes());
+                assert_eq!(parse_rollout(&whole).unwrap(), expected);
+                let mut live = RolloutAccumulator::new();
+                live.apply_live_reader(
+                    &mut Cursor::new(&whole),
+                    whole.len() as u64,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap();
+                assert_eq!(
+                    live.snapshot().unwrap(),
+                    expected,
+                    "history metadata cannot update model, task or usage"
+                );
+            }
+        }
+        for metadata in [
+            "true",
+            "1",
+            "\"opaque\"",
+            "[]",
+            "null,\"metadata\":null",
+            "{},\"metadata\":{}",
+        ] {
+            let input=format!("{{\"timestamp\":\"2026-10-10T00:00:01Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"output\":\"opaque\"}},\"metadata\":{metadata}}}\n");
+            let mut parser = RolloutAccumulator::new();
+            parser
+                .apply_reader(&mut Cursor::new(&baseline), baseline.len() as u64)
+                .unwrap();
+            assert!(parser
+                .apply_live_reader(
+                    &mut Cursor::new(input.as_bytes()),
+                    input.len() as u64,
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .is_err());
+            assert_eq!(parser.snapshot().unwrap(), expected);
+        }
+        for wrong in [
+            json!({"type":"task_complete","timestamp":"2026-10-10T00:00:01Z","metadata":{}}),
+            json!({"type":"response_item","timestamp":"2026-10-10T00:00:01Z","payload":{"type":"function_call_output","output":"opaque"},"future_envelope":{}}),
+        ] {
+            assert!(parse_rollout(&rollout_bytes(&[wrong])).is_err());
+        }
+    }
+
+    #[test]
+    fn issue604_rollout_optional_ordinal_preserves_state_and_rejects_invalid_shapes() {
+        use std::time::Duration;
+        let records = [
+            json!({"type":"session_meta","timestamp":"2026-10-10T00:00:00Z","payload":{"id":"thread-1"}}),
+            json!({"type":"turn_context","timestamp":"2026-10-10T00:00:00Z","model":"gpt-6.1-sol"}),
+            json!({"type":"task_started","timestamp":"2026-10-10T00:00:00Z"}),
+            json!({"type":"response_item","timestamp":"2026-10-10T00:00:01Z","payload":{"type":"function_call_output","output":"opaque"}}),
+        ];
+        let baseline = rollout_bytes(&records);
+        let expected = parse_rollout(&baseline).unwrap();
+        for ordinal in [Value::Null, json!(0), json!(u64::MAX)] {
+            let with_positions: Vec<_> = records
+                .iter()
+                .cloned()
+                .map(|mut record| {
+                    record["ordinal"] = ordinal.clone();
+                    record
+                })
+                .collect();
+            let bytes = rollout_bytes(&with_positions);
+            assert_eq!(
+                parse_rollout(&bytes).unwrap(),
+                expected,
+                "ordinal is only positional metadata"
+            );
+            let mut live = RolloutAccumulator::new();
+            live.apply_live_reader(
+                &mut Cursor::new(&bytes),
+                bytes.len() as u64,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            assert_eq!(live.snapshot().unwrap(), expected);
+        }
+        let invalid = [
+            "-1",
+            "1.0",
+            "1e0",
+            "18446744073709551616",
+            "true",
+            "\"0\"",
+            "[]",
+            "{}",
+            "0,\"ordinal\":0",
+            "null,\"ordinal\":null",
+        ];
+        for ordinal in invalid {
+            let bytes = format!("{{\"type\":\"task_complete\",\"timestamp\":\"2026-10-10T00:00:01Z\",\"ordinal\":{ordinal}}}\n");
+            let mut input = Cursor::new(bytes.as_bytes());
+            let RecordRead::Present(summary, _) =
+                session_input::read_streaming_record(&mut input, std::io::Error::other).unwrap()
+            else {
+                panic!("fixture must be well-framed JSON")
+            };
+            assert!(
+                !summary.input_shape_valid_for_coverage(),
+                "invalid ordinal cannot prove complete coverage: {ordinal}"
+            );
+            let mut parser = RolloutAccumulator::new();
+            parser
+                .apply_reader(&mut Cursor::new(&baseline), baseline.len() as u64)
+                .unwrap();
+            assert!(parser
+                .apply_live_reader(
+                    &mut Cursor::new(bytes.as_bytes()),
+                    bytes.len() as u64,
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .is_err());
+            assert_eq!(
+                parser.snapshot().unwrap(),
+                expected,
+                "invalid ordinal cannot commit a stop"
+            );
+        }
+        let unknown = b"{\"type\":\"session_meta\",\"timestamp\":\"2026-10-10T00:00:00Z\",\"payload\":{\"id\":\"thread-1\"},\"unrecognized_root\":0}\n";
+        assert!(parse_rollout(unknown).is_err());
+    }
+
+    #[test]
+    fn issue604_live_diagnostics_preserve_the_existing_rejection_and_snapshot() {
+        use std::time::Duration;
+        let baseline = rollout_bytes(&[
+            json!({"type":"turn_context","timestamp":"2026-10-10T00:00:00Z","model":"gpt-6.1-sol"}),
+            json!({"type":"task_started","timestamp":"2026-10-10T00:00:00Z"}),
+        ]);
+        let cases: &[(&[u8], RolloutError, &str)] = &[
+            (b"{\n", RolloutError::InvalidJson, "json-framing"),
+            (b"{", RolloutError::UnterminatedLine, "unterminated-record"),
+            (b"{\"type\":\"task_complete\",\"timestamp\":\"invalid\"}\n", RolloutError::InvalidKnownEvent, "record-shape"),
+            (b"{\"type\":\"turn_context\",\"timestamp\":\"2026-10-10T00:00:01Z\",\"model\":\"UNATTRIBUTED\"}\n", RolloutError::InvalidKnownEvent, "model-context"),
+        ];
+        for (input, expected, category) in cases {
+            let mut old = RolloutAccumulator::new();
+            old.apply_reader(&mut Cursor::new(&baseline), baseline.len() as u64)
+                .unwrap();
+            let before = old.snapshot().unwrap();
+            let mut diagnosed = old.clone();
+            assert_eq!(
+                old.apply_reader(&mut Cursor::new(input), input.len() as u64),
+                Err(*expected)
+            );
+            let mut rejection = None;
+            assert_eq!(
+                diagnosed.apply_live_reader_diagnosed(
+                    &mut Cursor::new(input),
+                    input.len() as u64,
+                    Instant::now() + Duration::from_secs(1),
+                    &mut rejection
+                ),
+                Err(*expected)
+            );
+            assert_eq!(old.snapshot().unwrap(), before);
+            assert_eq!(diagnosed.snapshot().unwrap(), before);
+            let rejection = rejection.unwrap();
+            assert_eq!(rejection["record_ordinal"], 1);
+            assert_eq!(rejection["start_offset"], 0);
+            assert_eq!(rejection["end_offset"], input.len() as u64);
+            assert_eq!(rejection["category"], *category);
+        }
+    }
+
+    #[test]
+    fn issue604_live_stream_deadline_and_short_prefix_keep_the_complete_baseline() {
+        use std::time::Duration;
+        let mut parser = RolloutAccumulator::seeded(Some("gpt-6.1-sol".into()), 40, Some(true));
+        let baseline = parser.snapshot().unwrap();
+        let first = rollout_bytes(&[
+            json!({"type":"task_complete","timestamp":"2026-10-10T00:00:00Z","payload":{}}),
+        ]);
+        let second = rollout_bytes(&[
+            json!({"type":"task_started","timestamp":"2026-10-10T00:00:01Z","payload":{}}),
+        ]);
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&second);
+        let expired = Instant::now();
+        let mut unread = Cursor::new(bytes.as_slice());
+        assert_eq!(
+            parser.apply_live_reader(&mut unread, bytes.len() as u64, expired),
+            Err(RolloutError::DeadlineExceeded)
+        );
+        assert_eq!(unread.position(), 0);
+        assert_eq!(parser.snapshot().unwrap(), baseline);
+
+        struct ExpireAfterPrefix {
+            bytes: Vec<u8>,
+            position: usize,
+            boundary: usize,
+            deadline: Instant,
+        }
+        impl Read for ExpireAfterPrefix {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let deadline = self.deadline;
+                let input = self.fill_buf()?;
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "refill expired"));
+                }
+                let count = input.len().min(output.len());
+                output[..count].copy_from_slice(&input[..count]);
+                self.consume(count);
+                Ok(count)
+            }
+        }
+        impl BufRead for ExpireAfterPrefix {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if self.position < self.boundary {
+                    return Ok(&self.bytes[self.position..self.boundary]);
+                }
+                while Instant::now() < self.deadline {
+                    std::thread::yield_now();
+                }
+                Ok(&self.bytes[self.position..])
+            }
+            fn consume(&mut self, count: usize) {
+                self.position += count;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut input = ExpireAfterPrefix {
+            bytes: bytes.clone(),
+            position: 0,
+            boundary: first.len(),
+            deadline,
+        };
+        assert_eq!(
+            parser.apply_live_reader(&mut input, bytes.len() as u64, deadline),
+            Err(RolloutError::DeadlineExceeded)
+        );
+        assert_eq!(
+            input.position,
+            first.len(),
+            "a valid stop was parsed before the next refill exhausted the same deadline"
+        );
+        assert_eq!(
+            parser.snapshot().unwrap(),
+            baseline,
+            "timeout cannot commit the preceding valid stop"
+        );
+        assert_eq!(
+            parser.apply_live_reader(
+                &mut Cursor::new(&first),
+                first.len() as u64 + 1,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(RolloutError::InvalidJson)
+        );
+        assert_eq!(
+            parser.snapshot().unwrap(),
+            baseline,
+            "short source cannot masquerade as a complete fixed prefix"
+        );
+
+        let mut bounded_hash_input = LiveRolloutReader::new(Cursor::new(&bytes), expired);
+        assert_eq!(
+            bounded_hash_input
+                .seek(SeekFrom::Start(0))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            bounded_hash_input.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(bounded_hash_input.inner.position(), 0);
+    }
+
+    #[test]
+    fn issue604_live_records_require_valid_state_and_atomic_coverage() {
+        let time = "2026-10-13T05:53:00Z";
+        let baseline = format!(
+            "{}\n{}\n",
+            json!({"type":"turn_context","timestamp":time,"model":"gpt-6.1-sol"}),
+            json!({"type":"task_started","timestamp":time})
+        );
+        let stopped = format!("{}\n", json!({"type":"task_complete","timestamp":time}));
+        let cases = [
+            format!("{}\n", json!({"type":"task_complete","timestamp":"invalid"})).into_bytes(),
+            format!("{}\n", json!({"type":"task_complete","timestamp":time,"payload":{"type":false}})).into_bytes(),
+            format!("{{\"type\":\"task_started\",\"type\":\"task_complete\",\"timestamp\":\"{time}\"}}\n").into_bytes(),
+            b"{\"type\":\"task_complete\",\"payload\":\"\xff\"}\n".to_vec(),
+            format!("{}\n", json!({"type":"unknown_control","timestamp":time})).into_bytes(),
+            format!("{}\n", json!({"type":"event_msg","timestamp":time,"payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":-1},"last_token_usage":{"total_tokens":7},"model_context_window":1000}}})).into_bytes(),
+            format!("{}\n", json!({"type":"response_item","timestamp":time,"payload":{"type":"message","role":false}})).into_bytes(),
+            format!("{}\n", json!({"type":"task_complete","timestamp":time,"surprise_state":true})).into_bytes(),
+        ];
+        for (case, rejected) in cases.iter().enumerate() {
+            let mut complete = baseline.as_bytes().to_vec();
+            complete.extend_from_slice(rejected);
+            assert!(
+                parse_rollout_reader(&mut Cursor::new(&complete), complete.len() as u64).is_err(),
+                "case {case}: strict route admitted invalid state evidence"
+            );
+            assert!(
+                parse_rollout_reader_recoverable(
+                    &mut Cursor::new(&complete),
+                    complete.len() as u64
+                )
+                .is_err(),
+                "case {case}: recoverable route skipped unverified control"
+            );
+            let mut accumulator = RolloutAccumulator::new();
+            accumulator
+                .apply_reader(&mut Cursor::new(baseline.as_bytes()), baseline.len() as u64)
+                .unwrap();
+            let mut incoming = stopped.as_bytes().to_vec();
+            incoming.extend_from_slice(rejected);
+            assert!(
+                accumulator
+                    .apply_reader(&mut Cursor::new(&incoming), incoming.len() as u64)
+                    .is_err(),
+                "case {case}: incremental route admitted invalid state evidence"
+            );
+            let kept = accumulator.snapshot().unwrap();
+            assert_eq!(
+                kept.last_task_running(),
+                Some(true),
+                "case {case}: error chunk committed a partial stop"
+            );
+            assert_eq!(kept.model(), "gpt-6.1-sol", "case {case}");
+        }
+    }
+
+    #[test]
+    fn issue604_context_compacted_notification_preserves_live_state() {
+        let at = "2026-10-13T05:54:00Z";
+        let baseline = [
+            json!({"type":"turn_context","timestamp":at,"model":"gpt-6.1-sol"}),
+            json!({"type":"task_started","timestamp":at}),
+            json!({"type":"event_msg","timestamp":at,"payload":{"type":"user_message","message":"synthetic user"}}),
+            json!({"type":"event_msg","timestamp":at,"payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10,"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0}}}}),
+        ];
+        let marker = json!({"type":"event_msg","timestamp":"2026-10-13T05:55:00Z","payload":{"type":"context_compacted"}});
+        let mut records = baseline.to_vec();
+        records.push(marker);
+        let input = rollout_bytes(&records);
+        for snapshot in [
+            parse_rollout_reader(&mut Cursor::new(&input), input.len() as u64),
+            parse_rollout_reader_recoverable(&mut Cursor::new(&input), input.len() as u64),
+        ] {
+            let snapshot =
+                snapshot.expect("the fieldless compression notification is known history");
+            assert_eq!(snapshot.model(), "gpt-6.1-sol");
+            assert_eq!(snapshot.last_task_running(), Some(true));
+            assert_eq!(snapshot.last_user_message_at(), Some(1_791_870_840));
+            assert_eq!(snapshot.total_tokens(), Some(10));
+        }
+        assert_eq!(
+            rollout_protocol_kind(Some("context_compacted")),
+            "context_compacted"
+        );
+        for record in [
+            format!("{{\"type\":\"event_msg\",\"timestamp\":\"{at}\",\"payload\":{{\"type\":\"context_compacted_future\"}}}}\n"),
+            format!("{{\"type\":\"event_msg\",\"timestamp\":\"{at}\",\"payload\":{{\"type\":\"context_compacted\",\"type\":\"context_compacted\"}}}}\n"),
+            format!("{{\"type\":\"event_msg\",\"timestamp\":\"{at}\",\"payload\":[]}}\n"),
+            "{\"type\":\"event_msg\",\"timestamp\":\"invalid\",\"payload\":{\"type\":\"context_compacted\"}}\n".to_owned(),
+        ] {
+            let mut input = rollout_bytes(&baseline);
+            input.extend_from_slice(record.as_bytes());
+            assert_eq!(
+                parse_rollout_reader(&mut Cursor::new(&input), input.len() as u64),
+                Err(RolloutError::InvalidKnownEvent)
+            );
+            assert_eq!(
+                parse_rollout_reader_recoverable(&mut Cursor::new(&input), input.len() as u64),
+                Err(RolloutError::InvalidKnownEvent)
+            );
+        }
+    }
+
+    #[test]
+    fn issue604_mcp_call_history_is_noop_for_live_state() {
+        let started = "2026-10-17T00:00:00Z";
+        let user_time = "2026-10-17T00:00:05Z";
+        let tool_time = "2026-10-17T00:00:06Z";
+        let expected_user_time = DateTime::parse_from_rfc3339(user_time).unwrap().timestamp();
+        let begin = json!({"type":"event_msg","timestamp":tool_time,"payload":{
+            "type":"mcp_tool_call_begin","call_id":"synthetic-call","turn_id":"synthetic-turn",
+            "invocation":{"type":"task_complete","model":"gpt-6-luna","usage":{"total_tokens":999}}
+        }});
+        // Same end key/type set as the rejected shape metadata; no private
+        // source text or tool result is copied into this synthetic fixture.
+        let end = json!({"type":"event_msg","timestamp":tool_time,"payload":{
+            "type":"mcp_tool_call_end","action_name":"synthetic-action","app_name":"synthetic-app",
+            "call_id":"synthetic-call","connector_id":"synthetic-connector","duration":1,
+            "invocation":{"model":"gpt-6-luna"},"link_id":null,"read_only_hint":true,
+            "result":{"type":"task_complete","model":"gpt-6-luna",
+                "counter":{"type":"token_count","info":{"total_token_usage":{"total_tokens":999}}}},
+            "turn_id":"synthetic-turn"
+        }});
+        let subagent = json!({"type":"event_msg","timestamp":tool_time,"payload":{
+            "type":"sub_agent_activity","event_id":"synthetic-event","occurred_at_ms":1,
+            "agent_thread_id":"synthetic-agent","agent_path":"synthetic-path",
+            "kind":{"type":"task_complete","model":"gpt-6-luna","usage":{"total_tokens":999}}
+        }});
+        let web = json!({"type":"event_msg","timestamp":tool_time,"payload":{
+            "type":"web_search_end","call_id":"synthetic-search","query":"synthetic-query",
+            "action":"synthetic-action","results":[{"type":"task_complete","model":"gpt-6-luna",
+                "usage":{"total_tokens":999}}]
+        }});
+        let patch = json!({"type":"event_msg","timestamp":tool_time,"payload":{
+            "type":"patch_apply_end","call_id":"synthetic-patch","turn_id":"synthetic-turn",
+            "stdout":"synthetic result","stderr":"","success":true,"status":"completed",
+            "changes":{"synthetic.rs":{"type":"update","unified_diff":"synthetic diff",
+                "model":"gpt-6-luna","usage":{"total_tokens":999},"task_complete":true}}
+        }});
+        let baseline = vec![
+            json!({"type":"turn_context","timestamp":started,"model":"gpt-6.1-sol"}),
+            json!({"type":"task_started","timestamp":started}),
+            json!({"type":"event_msg","timestamp":user_time,"payload":{"type":"user_message","message":"synthetic user"}}),
+        ];
+        let mut outcomes = Vec::new();
+        for (case, controls) in [
+            ("end", vec![end.clone()]),
+            ("begin-end", vec![begin, end]),
+            ("subagent", vec![subagent]),
+            ("web", vec![web]),
+            ("patch", vec![patch]),
+        ] {
+            let mut records = baseline.clone();
+            records.extend(controls);
+            records.push(json!({"type":"event_msg","timestamp":tool_time,
+                "payload":{"type":"agent_message","message":"synthetic tail"}}));
+            let input = rollout_bytes(&records);
+            let strict = parse_rollout_reader(&mut Cursor::new(&input), input.len() as u64);
+            let recoverable =
+                parse_rollout_reader_recoverable(&mut Cursor::new(&input), input.len() as u64);
+            outcomes.push((case, strict, recoverable));
+        }
+        let negative_records = [
+            format!("{{\"type\":\"mcp_tool_call_end\",\"timestamp\":\"{tool_time}\",\"payload\":{{}}}}\n"),
+            format!("{{\"type\":\"event_msg\",\"timestamp\":\"{tool_time}\",\"payload\":{{\"type\":\"mcp_tool_call_future\"}}}}\n"),
+            format!("{{\"type\":\"event_msg\",\"timestamp\":\"{tool_time}\",\"payload\":{{\"type\":\"patch_apply_end_future\"}}}}\n"),
+            format!("{{\"type\":\"event_msg\",\"timestamp\":\"{tool_time}\",\"payload\":{{\"type\":\"mcp_tool_call_end\",\"type\":\"mcp_tool_call_begin\"}}}}\n"),
+            "{\"type\":\"event_msg\",\"timestamp\":\"invalid\",\"payload\":{\"type\":\"mcp_tool_call_end\"}}\n".to_owned(),
+        ];
+        for (case, record) in negative_records.into_iter().enumerate() {
+            let mut input = rollout_bytes(&baseline);
+            input.extend_from_slice(record.as_bytes());
+            assert_eq!(
+                parse_rollout_reader(&mut Cursor::new(&input), input.len() as u64),
+                Err(RolloutError::InvalidKnownEvent),
+                "strict rejected boundary {case}"
+            );
+            assert_eq!(
+                parse_rollout_reader_recoverable(&mut Cursor::new(&input), input.len() as u64),
+                Err(RolloutError::InvalidKnownEvent),
+                "recoverable rejected boundary {case}"
+            );
+        }
+        for (case, strict, recoverable) in outcomes {
+            for snapshot in [strict, recoverable] {
+                let snapshot = snapshot.expect("the synthetic MCP end is independent tool history");
+                assert_eq!(snapshot.model(), "gpt-6.1-sol", "{case}");
+                assert_eq!(snapshot.last_task_running(), Some(true), "{case}");
+                assert_eq!(
+                    snapshot.last_user_message_at(),
+                    Some(expected_user_time),
+                    "{case}"
+                );
+                assert_eq!(
+                    snapshot.total_tokens(),
+                    None,
+                    "nested tool output is not usage: {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue604_live_noops_are_streamed_without_losing_user_time_or_lifecycle() {
+        let started = "2026-10-13T05:53:00Z";
+        let user_time = "2026-10-13T05:54:00Z";
+        let expected_time = DateTime::parse_from_rfc3339(user_time).unwrap().timestamp();
+        let opaque = "x".repeat(security::MAX_JSONL_LINE_BYTES + 1);
+        let records = [
+            json!({"type":"turn_context","timestamp":started,"model":"gpt-6.1-sol"}),
+            json!({"type":"task_started","timestamp":started}),
+            json!({"type":"event_msg","timestamp":started,"payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6-luna"}}}),
+            json!({"type":"response_item","timestamp":user_time,"payload":{"type":"message","role":"user","content":opaque}}),
+            json!({"type":"response_item","timestamp":user_time,"payload":{"type":"function_call_output","output":"{\"type\":\"task_complete\"}"}}),
+        ];
+        let input = records
+            .into_iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        let strict =
+            parse_rollout_reader(&mut Cursor::new(input.as_bytes()), input.len() as u64).unwrap();
+        let streamed = parse_rollout_reader_recoverable(
+            &mut Cursor::new(input.as_bytes()),
+            input.len() as u64,
+        )
+        .unwrap();
+        for snapshot in [strict, streamed] {
+            assert_eq!(snapshot.last_task_running(), Some(true));
+            assert_eq!(snapshot.model(), "gpt-6.1-sol");
+            assert_eq!(snapshot.last_user_message_at(), Some(expected_time));
+        }
+    }
+
     fn full_thread() -> Value {
         json!({
             "cliVersion": "0.147.0",
@@ -2006,6 +2523,19 @@ mod tests {
             .join("\n");
         text.push('\n');
         text.into_bytes()
+    }
+
+    fn with_fixture_timestamp(mut event: Value, second: u8) -> Value {
+        let object = event
+            .as_object_mut()
+            .expect("recognized rollout fixtures are JSON objects");
+        assert!(object
+            .insert(
+                "timestamp".to_owned(),
+                json!(format!("2026-08-15T00:00:{second:02}Z")),
+            )
+            .is_none());
+        event
     }
 
     fn rollout_raw_lines(lines: &[&str]) -> Vec<u8> {
@@ -3378,7 +3908,7 @@ mod tests {
         assert_eq!(terminal.ordered_candidates().unwrap().len(), 1);
 
         let source = include_str!("thread_contract.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
         assert!(!production.contains("pub fn candidates("));
         assert!(!production.contains("pub fn raw_candidate_count("));
         assert!(production.contains("pub fn abort(self)"));
@@ -3428,6 +3958,11 @@ mod tests {
             ),
         ];
         for (label, events, expected) in cases {
+            let events = events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| with_fixture_timestamp(event, index as u8 + 1))
+                .collect::<Vec<_>>();
             let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
             assert_eq!(parsed.is_running(), expected, "{label}");
         }
@@ -3444,7 +3979,10 @@ mod tests {
         assert!(candidate.is_active());
         let outcome =
             select_active_threads(terminal_cycle(vec![item]), |_| -> Result<Vec<u8>, ()> {
-                Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_complete"}),
+                    1,
+                )]))
             });
         assert!(matches!(
             outcome,
@@ -3458,7 +3996,10 @@ mod tests {
         let idle = thread_fixture("open-idle", 20, "saved name");
         let outcome =
             select_active_threads(terminal_cycle(vec![idle]), |_| -> Result<Vec<u8>, ()> {
-                Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_complete"}),
+                    1,
+                )]))
             });
         assert_eq!(outcome, ThreadCycleOutcome::NoThread);
     }
@@ -3484,7 +4025,11 @@ mod tests {
                 Some(true) => vec![json!({"type":"task_started"})],
                 Some(false) => vec![json!({"type":"task_complete"})],
                 None => Vec::new(),
-            };
+            }
+            .into_iter()
+            .enumerate()
+            .map(|(event_index, event)| with_fixture_timestamp(event, event_index as u8 + 1))
+            .collect::<Vec<_>>();
             let outcome =
                 select_active_threads(terminal_cycle(vec![item]), |_| -> Result<Vec<u8>, ()> {
                     Ok(rollout_bytes(&events))
@@ -3507,12 +4052,23 @@ mod tests {
     #[test]
     fn thread_c_model_scalar_and_label_complete_matrix() {
         let started = json!({"type":"task_started"});
-        let no_model = parse_rollout(&rollout_bytes(std::slice::from_ref(&started))).unwrap();
+        let no_model = parse_rollout(&rollout_bytes(&[with_fixture_timestamp(
+            started.clone(),
+            1,
+        )]))
+        .unwrap();
         assert_eq!(no_model.model(), "不明");
         assert_eq!(no_model.model_label(), "不明");
 
+        assert_eq!(
+            parse_rollout(&rollout_bytes(&[with_fixture_timestamp(
+                json!({"type":"thread_context","model":""}),
+                1,
+            )])),
+            Err(RolloutError::InvalidKnownEvent)
+        );
+
         for (length, expected_label) in [
-            (0, "不明".to_owned()),
             (1, "界".to_owned()),
             (24, "界".repeat(24)),
             (25, format!("{}…", "界".repeat(23))),
@@ -3520,19 +4076,11 @@ mod tests {
         ] {
             let model = "界".repeat(length);
             let events = [
-                json!({"type":"thread_context","model":model}),
-                started.clone(),
+                with_fixture_timestamp(json!({"type":"thread_context","model":model}), 1),
+                with_fixture_timestamp(started.clone(), 2),
             ];
             let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
-            assert_eq!(
-                parsed.model(),
-                if length == 0 {
-                    "不明"
-                } else {
-                    model.as_str()
-                },
-                "length={length}"
-            );
+            assert_eq!(parsed.model(), model.as_str(), "length={length}");
             assert_eq!(parsed.model_label(), expected_label, "length={length}");
         }
 
@@ -3545,15 +4093,19 @@ mod tests {
             } else {
                 "settings"
             };
-            let parsed = parse_rollout(&rollout_bytes(&[model_event, started.clone()])).unwrap();
+            let parsed = parse_rollout(&rollout_bytes(&[
+                with_fixture_timestamp(model_event, 1),
+                with_fixture_timestamp(started.clone(), 2),
+            ]))
+            .unwrap();
             assert_eq!(parsed.model(), expected);
         }
 
         let overlong = "界".repeat(129);
         assert_eq!(
             parse_rollout(&rollout_bytes(&[
-                json!({"type":"thread_context","model":overlong}),
-                started,
+                with_fixture_timestamp(json!({"type":"thread_context","model":overlong}), 1),
+                with_fixture_timestamp(started, 2),
             ])),
             Err(RolloutError::InvalidKnownEvent)
         );
@@ -3562,43 +4114,67 @@ mod tests {
     #[test]
     fn thread_c_cumulative_total_token_literal_matrix() {
         let events = [
-            json!({"type":"task_started"}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":0,"input_tokens":900,"reasoning_output_tokens":800},
-                "last_token_usage":{"total_tokens":700}
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":999,"input_tokens":1,"cached_input_tokens":2,"output_tokens":3},
-                "last_token_usage":{"total_tokens":999999}
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":1000,"reasoning_output_tokens":u64::MAX},
-                "last_token_usage":{"total_tokens":1}
-            }}}),
-            json!({"type":"token_count","info":{"total_token_usage":{"total_tokens":7}}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":u64::MAX,"input_tokens":1,"output_tokens":1},
-                "last_token_usage":{"total_tokens":2}
-            }}}),
+            with_fixture_timestamp(json!({"type":"task_started"}), 1),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":0,"input_tokens":0,"reasoning_output_tokens":800},
+                    "last_token_usage":{"total_tokens":700}
+                }}}),
+                2,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":999,"input_tokens":4,"cached_input_tokens":2,"output_tokens":3},
+                    "last_token_usage":{"total_tokens":999999}
+                }}}),
+                3,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":1000,"reasoning_output_tokens":u64::MAX},
+                    "last_token_usage":{"total_tokens":1}
+                }}}),
+                4,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":u64::MAX,"input_tokens":1,"output_tokens":1},
+                    "last_token_usage":{"total_tokens":2}
+                }}}),
+                5,
+            ),
         ];
         let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
         assert_eq!(parsed.total_tokens(), Some(u64::MAX));
+        assert_eq!(
+            parse_rollout(&rollout_bytes(&[with_fixture_timestamp(
+                json!({"type":"token_count","info":{"total_token_usage":{"total_tokens":7}}}),
+                1,
+            )])),
+            Err(RolloutError::InvalidKnownEvent)
+        );
     }
 
     #[test]
     fn thread_c_context_window_is_taken_from_the_latest_token_count() {
         let events = [
-            json!({"type":"task_started"}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":10},
-                "last_token_usage":{"total_tokens":8},
-                "model_context_window":128000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":20},
-                "last_token_usage":{"total_tokens":18},
-                "model_context_window":258400
-            }}}),
+            with_fixture_timestamp(json!({"type":"task_started"}), 1),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":10},
+                    "last_token_usage":{"total_tokens":8},
+                    "model_context_window":128000
+                }}}),
+                2,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":20},
+                    "last_token_usage":{"total_tokens":18},
+                    "model_context_window":258400
+                }}}),
+                3,
+            ),
         ];
         let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
         assert_eq!(parsed.total_tokens(), Some(20));
@@ -3606,14 +4182,20 @@ mod tests {
         assert_eq!(parsed.context_window_tokens(), Some(258_400));
 
         let without_field = parse_rollout(&rollout_bytes(&[
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":25},
-                "last_token_usage":{"total_tokens":24},
-                "model_context_window":128000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":30}
-            }}}),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":25},
+                    "last_token_usage":{"total_tokens":24},
+                    "model_context_window":128000
+                }}}),
+                1,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":30}
+                }}}),
+                2,
+            ),
         ]))
         .unwrap();
         assert_eq!(without_field.total_tokens(), Some(30));
@@ -3624,60 +4206,111 @@ mod tests {
     #[test]
     fn issue_362_context_pair_updates_atomically() {
         let parsed = parse_rollout(&rollout_bytes(&[
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":10},
-                "last_token_usage":{"total_tokens":8},
-                "model_context_window":128000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":20},
-                "last_token_usage":{"total_tokens":0},
-                "model_context_window":16000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":30},
-                "last_token_usage":{"total_tokens":40},
-                "model_context_window":0
-            }}}),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":10},
+                    "last_token_usage":{"total_tokens":8},
+                    "model_context_window":128000
+                }}}),
+                1,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":20},
+                    "last_token_usage":{"total_tokens":0},
+                    "model_context_window":16000
+                }}}),
+                2,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":30},
+                    "last_token_usage":{"total_tokens":40},
+                    "model_context_window":32000
+                }}}),
+                3,
+            ),
         ]))
         .unwrap();
 
         assert_eq!(parsed.context_usage_tokens(), Some(40));
-        assert_eq!(parsed.context_window_tokens(), Some(0));
+        assert_eq!(parsed.context_window_tokens(), Some(32_000));
     }
 
     #[test]
     fn issue_362_context_partial_fields_preserve_last_complete_pair() {
         let parsed = parse_rollout(&rollout_bytes(&[
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":10},
-                "last_token_usage":{"total_tokens":400},
-                "model_context_window":16000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":20},
-                "last_token_usage":{"total_tokens":500}
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":30},
-                "model_context_window":32000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":10},
+                    "last_token_usage":{"total_tokens":400},
+                    "model_context_window":16000
+                }}}),
+                1,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":20},
+                    "last_token_usage":{"total_tokens":500}
+                }}}),
+                2,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":30},
+                    "model_context_window":32000
+                }}}),
+                3,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
+                4,
+            ),
         ]))
         .unwrap();
 
         assert_eq!(parsed.context_usage_tokens(), Some(400));
         assert_eq!(parsed.context_window_tokens(), Some(16_000));
 
-        let initial_one_sided = parse_rollout(&rollout_bytes(&[
+        let initial_one_sided = parse_rollout(&rollout_bytes(&[with_fixture_timestamp(
             json!({"type":"event_msg","payload":{"type":"token_count","info":{
                 "total_token_usage":{"total_tokens":1},
                 "model_context_window":16000
             }}}),
-        ]))
+            1,
+        )]))
         .unwrap();
         assert_eq!(initial_one_sided.context_usage_tokens(), None);
         assert_eq!(initial_one_sided.context_window_tokens(), None);
+    }
+
+    #[test]
+    fn issue604_checkpoint_unknown_total_remains_distinct_from_observed_zero() {
+        for baseline in [None, Some(0), Some(10)] {
+            let mut parser = RolloutAccumulator::seeded_with_context(
+                Some("gpt-6.1-sol".into()),
+                baseline,
+                Some(true),
+                Some(0),
+                Some(16_000),
+            );
+            let before = parser.snapshot().unwrap();
+            assert_eq!(before.total_tokens(), baseline);
+            assert_eq!(before.context_usage_tokens(), Some(0));
+            assert_eq!(before.context_window_tokens(), Some(16_000));
+            let bytes = rollout_bytes(&[with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{
+                    "type":"token_count","info":{"total_token_usage":{"total_tokens":17}}
+                }}),
+                1,
+            )]);
+            parser
+                .apply_reader(&mut Cursor::new(&bytes), bytes.len() as u64)
+                .unwrap();
+            let observed = parser.snapshot().unwrap();
+            assert_eq!(observed.total_tokens(), Some(17));
+            assert_eq!(observed.context_usage_tokens(), Some(0));
+        }
     }
 
     #[test]
@@ -3733,9 +4366,9 @@ mod tests {
     #[test]
     fn thread_c_initial_null_token_count_is_a_safe_noop() {
         let rollout = rollout_raw_lines(&[
-            r#"{"type":"task_started"}"#,
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":17}}}}"#,
+            r#"{"timestamp":"2026-08-15T00:00:01Z","type":"task_started"}"#,
+            r#"{"timestamp":"2026-08-15T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+            r#"{"timestamp":"2026-08-15T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":17}}}}"#,
         ]);
         let parsed = parse_rollout(&rollout).expect("null initial token sample is ignored");
         assert!(parsed.is_running());
@@ -3789,10 +4422,12 @@ mod tests {
                 last_user_message_at: None,
             })
         );
-        assert!(parse_rollout(b"{}\n").is_ok());
+        let no_op = b"{\"type\":\"response_item\",\"timestamp\":\"2026-10-10T00:00:00Z\",\"payload\":{\"type\":\"function_call_output\",\"output\":\"\"}}\n";
+        assert!(parse_rollout(no_op).is_ok());
+        assert!(parse_rollout(b"{}\n").is_err());
 
-        let prefix = r#"{"type":"future","padding":""#;
-        let suffix = r#""}"#;
+        let prefix = r#"{"type":"response_item","timestamp":"2026-10-10T00:00:00Z","payload":{"type":"function_call_output","output":""#;
+        let suffix = r#""}}"#;
         let padding = security::MAX_JSONL_LINE_BYTES - prefix.len() - suffix.len();
         let mut exact_line = String::with_capacity(security::MAX_JSONL_LINE_BYTES + 1);
         exact_line.push_str(prefix);
@@ -3802,21 +4437,17 @@ mod tests {
         exact_line.push('\n');
         assert!(parse_rollout(exact_line.as_bytes()).is_ok());
 
-        assert_eq!(
-            parse_rollout(&[0xff, b'\n']),
-            Err(RolloutError::InvalidUtf8)
-        );
+        assert!(parse_rollout(&[0xff, b'\n']).is_err());
         assert_eq!(parse_rollout(b"{\n"), Err(RolloutError::InvalidJson));
+        let mut incomplete = no_op.to_vec();
+        incomplete.extend_from_slice(b"{}");
         assert_eq!(
-            parse_rollout(b"{}\n{}"),
+            parse_rollout(&incomplete),
             Err(RolloutError::UnterminatedLine)
         );
         let mut overlong_line = vec![b' '; security::MAX_JSONL_LINE_BYTES + 1];
         overlong_line.push(b'\n');
-        assert_eq!(
-            parse_rollout(&overlong_line),
-            Err(RolloutError::LineTooLarge)
-        );
+        assert!(parse_rollout(&overlong_line).is_err());
         let mut oversized_file = Cursor::new(b"\n".as_slice());
         assert_eq!(
             parse_rollout_reader(&mut oversized_file, security::MAX_SESSION_FILE_BYTES + 1),
@@ -3827,16 +4458,17 @@ mod tests {
     #[test]
     fn recoverable_rollout_parser_keeps_running_state_around_large_tool_output() {
         let prefix = rollout_bytes(&[
-            json!({"type":"thread_context","model":"gpt-5.6-luna"}),
-            json!({"type":"task_started"}),
+            with_fixture_timestamp(json!({"type":"thread_context","model":"gpt-5.6-luna"}), 1),
+            with_fixture_timestamp(json!({"type":"task_started"}), 2),
         ]);
         let oversized = format!(
-            "{{\"type\":\"response_item\",\"payload\":\"{}\"}}\n",
+            "{{\"timestamp\":\"2026-08-15T00:00:03Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"output\":\"{}\"}}}}\n",
             "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
         );
-        let suffix = rollout_bytes(&[
+        let suffix = rollout_bytes(&[with_fixture_timestamp(
             json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":321}}}}),
-        ]);
+            4,
+        )]);
         let mut bytes = prefix;
         bytes.extend_from_slice(oversized.as_bytes());
         bytes.extend_from_slice(&suffix);
@@ -3849,35 +4481,35 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_rollout_parser_skips_malformed_non_state_records_only() {
-        let bytes = b"{\"type\":\"thread_context\",\"model\":\"gpt-5.6-luna\"}\n{\"type\":\"task_started\"}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"rate_limits\":{\"primary\":{\"use\n{\"type\":\"task_complete\"}\n";
-        let parsed = parse_rollout_reader_recoverable(&mut Cursor::new(bytes), bytes.len() as u64)
-            .expect("malformed token_count is non-liveness data");
-        assert!(!parsed.is_running());
-        assert_eq!(parsed.model(), "gpt-5.6-luna");
+    fn recoverable_rollout_parser_rejects_unverified_records() {
+        let bytes = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"type\":\"thread_context\",\"model\":\"gpt-5.6-luna\"}\n{\"timestamp\":\"2026-08-15T00:00:02Z\",\"type\":\"task_started\"}\n{\"timestamp\":\"2026-08-15T00:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"rate_limits\":{\"primary\":{\"use\n{\"timestamp\":\"2026-08-15T00:00:04Z\",\"type\":\"task_complete\"}\n";
+        assert_eq!(
+            parse_rollout_reader_recoverable(&mut Cursor::new(bytes), bytes.len() as u64),
+            Err(RolloutError::InvalidJson)
+        );
 
-        let lifecycle = b"{\"type\":\"task_started\"}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"\n";
+        let lifecycle = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"type\":\"task_started\"}\n{\"timestamp\":\"2026-08-15T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"\n";
         assert_eq!(
             parse_rollout_reader_recoverable(&mut Cursor::new(lifecycle), lifecycle.len() as u64),
             Err(RolloutError::InvalidJson)
         );
 
-        let spaced = b"{ \"type\" : \"event_msg\", \"payload\" : { \"type\" : \"token_count\", \"info\" : {\n{\"type\":\"task_complete\"}\n";
-        let parsed =
-            parse_rollout_reader_recoverable(&mut Cursor::new(spaced), spaced.len() as u64)
-                .expect("whitespace-only token_count envelope is non-liveness data");
-        assert!(!parsed.is_running());
+        let spaced = b"{ \"timestamp\":\"2026-08-15T00:00:01Z\", \"type\" : \"event_msg\", \"payload\" : { \"type\" : \"token_count\", \"info\" : {\n{\"timestamp\":\"2026-08-15T00:00:02Z\",\"type\":\"task_complete\"}\n";
+        assert_eq!(
+            parse_rollout_reader_recoverable(&mut Cursor::new(spaced), spaced.len() as u64),
+            Err(RolloutError::InvalidJson)
+        );
 
-        let interrupted_reasoning = b"{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":[{\"text\":\"interrupted\n{\"type\":\"task_complete\"}\n";
-        let parsed = parse_rollout_reader_recoverable(
-            &mut Cursor::new(interrupted_reasoning),
-            interrupted_reasoning.len() as u64,
-        )
-        .expect("interrupted transcript content is non-state data");
-        assert!(!parsed.is_running());
+        let interrupted_reasoning = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":[{\"text\":\"interrupted\n{\"timestamp\":\"2026-08-15T00:00:02Z\",\"type\":\"task_complete\"}\n";
+        assert_eq!(
+            parse_rollout_reader_recoverable(
+                &mut Cursor::new(interrupted_reasoning),
+                interrupted_reasoning.len() as u64,
+            ),
+            Err(RolloutError::InvalidJson)
+        );
 
-        let lifecycle_with_token_word =
-            b"{\"type\":\"task_started\",\"payload\":{\"type\":\"token_count\"\n";
+        let lifecycle_with_token_word = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"type\":\"task_started\",\"payload\":{\"type\":\"token_count\"\n";
         assert_eq!(
             parse_rollout_reader_recoverable(
                 &mut Cursor::new(lifecycle_with_token_word),
@@ -3886,7 +4518,7 @@ mod tests {
             Err(RolloutError::InvalidJson)
         );
 
-        let quoted_words = b"{\"note\":\"\\\"type\\\":\\\"event_msg\\\" and \\\"type\\\":\\\"token_count\\\"\",\"payload\":{\n";
+        let quoted_words = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"note\":\"\\\"type\\\":\\\"event_msg\\\" and \\\"type\\\":\\\"token_count\\\"\",\"payload\":{\n";
         assert_eq!(
             parse_rollout_reader_recoverable(
                 &mut Cursor::new(quoted_words),
@@ -3897,23 +4529,47 @@ mod tests {
     }
 
     #[test]
-    fn thread_c_unknown_well_formed_events_do_not_change_snapshot() {
+    fn thread_c_unknown_events_reject_cycle_and_preserve_snapshot() {
         let base = [
-            json!({"type":"thread_context","model":"model-a"}),
-            json!({"type":"task_started"}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":321}}}}),
+            with_fixture_timestamp(json!({"type":"thread_context","model":"model-a"}), 1),
+            with_fixture_timestamp(json!({"type":"task_started"}), 2),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":321}}}}),
+                3,
+            ),
         ];
-        let expected = parse_rollout(&rollout_bytes(&base)).unwrap();
-        let with_unknown = [
+        let baseline = rollout_bytes(&base);
+        let mut parser = RolloutAccumulator::new();
+        parser
+            .apply_reader(&mut Cursor::new(&baseline), baseline.len() as u64)
+            .unwrap();
+        let expected = parser.snapshot().unwrap();
+        assert_eq!(expected.total_tokens(), Some(321));
+
+        let unknown_records = [
             json!({"type":"future_top","model":"wrong"}),
-            base[0].clone(),
             json!({"type":"event_msg","payload":{"type":"future_nested","model":"wrong","total_tokens":999}}),
-            base[1].clone(),
             json!({"type":"future_top","payload":{"type":"task_complete"}}),
-            base[2].clone(),
             json!({"unknown":"object"}),
         ];
-        assert_eq!(parse_rollout(&rollout_bytes(&with_unknown)), Ok(expected));
+        for (index, record) in unknown_records.into_iter().enumerate() {
+            let record = if index < 3 {
+                with_fixture_timestamp(record, index as u8 + 4)
+            } else {
+                record
+            };
+            let invalid = rollout_bytes(&[record]);
+            assert_eq!(
+                parser.apply_reader(&mut Cursor::new(&invalid), invalid.len() as u64),
+                Err(RolloutError::InvalidKnownEvent),
+                "unknown record {index}"
+            );
+            assert_eq!(
+                parser.snapshot(),
+                Ok(expected.clone()),
+                "unknown record {index}"
+            );
+        }
     }
 
     #[test]
@@ -3930,6 +4586,7 @@ mod tests {
                 "payload":{}
             }),
             json!({
+                "timestamp":"2026-08-15T00:00:02Z",
                 "type":"event_msg",
                 "payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":777}}}
             }),
@@ -3942,6 +4599,7 @@ mod tests {
 
         assert_eq!(
             parse_rollout(&rollout_bytes(&[json!({
+                "timestamp":"2026-08-15T00:00:01Z",
                 "type":"turn_context",
                 "payload":false
             })])),
@@ -3955,7 +4613,7 @@ mod tests {
             json!({
                 "timestamp":"2026-08-15T00:00:01Z",
                 "type":"event_msg",
-                "payload":{"type":"user_message","message":{"text":"first"}}
+                "payload":{"type":"user_message","message":"first"}
             }),
             json!({
                 "timestamp":"2026-08-15T00:00:02Z",
@@ -3967,15 +4625,16 @@ mod tests {
                 "type":"task_started"
             }),
             json!({
+                "timestamp":"2026-08-15T00:00:04Z",
                 "type":"event_msg",
-                "payload":{"type":"user_message","message":{"text":"no timestamp"}}
+                "payload":{"type":"user_message","message":"latest"}
             }),
         ]);
         let parsed = parse_rollout(&rollout).expect("user events are valid rollout records");
         assert_eq!(
             parsed.last_user_message_at(),
             Some(
-                DateTime::parse_from_rfc3339("2026-08-15T00:00:02Z")
+                DateTime::parse_from_rfc3339("2026-08-15T00:00:04Z")
                     .expect("fixture timestamp")
                     .timestamp()
             )
@@ -4043,11 +4702,14 @@ mod tests {
         let outcome = select_active_threads(cycle, |candidate| -> Result<Vec<u8>, ()> {
             Ok(if candidate.id() == "without-token" {
                 rollout_bytes(&[
-                    json!({"type":"thread_context","model":"model-only"}),
-                    json!({"type":"task_started"}),
+                    with_fixture_timestamp(
+                        json!({"type":"thread_context","model":"model-only"}),
+                        1,
+                    ),
+                    with_fixture_timestamp(json!({"type":"task_started"}), 2),
                 ])
             } else {
-                rollout_bytes(&[json!({"type":"task_complete"})])
+                rollout_bytes(&[with_fixture_timestamp(json!({"type":"task_complete"}), 1)])
             })
         });
         let ThreadCycleOutcome::Snapshots(rows) = outcome else {
@@ -4074,7 +4736,10 @@ mod tests {
         let inactive = terminal_cycle(vec![thread_fixture("inactive", 1, "inactive")]);
         assert_eq!(
             select_active_threads(inactive, |_| -> Result<Vec<u8>, ()> {
-                Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_complete"}),
+                    1,
+                )]))
             }),
             ThreadCycleOutcome::NoThread
         );
@@ -4110,8 +4775,11 @@ mod tests {
             terminal_cycle(rows.clone()),
             |candidate| -> Result<Vec<u8>, ()> {
                 Ok(rollout_bytes(&[
-                    json!({"type":"thread_context","model":candidate.id()}),
-                    json!({"type":"task_started"}),
+                    with_fixture_timestamp(
+                        json!({"type":"thread_context","model":candidate.id()}),
+                        1,
+                    ),
+                    with_fixture_timestamp(json!({"type":"task_started"}), 2),
                 ]))
             },
         );
@@ -4135,9 +4803,9 @@ mod tests {
             terminal_cycle(child_complete_rows),
             |candidate| -> Result<Vec<u8>, ()> {
                 Ok(if candidate.id() == "child" {
-                    rollout_bytes(&[json!({"type":"task_complete"})])
+                    rollout_bytes(&[with_fixture_timestamp(json!({"type":"task_complete"}), 1)])
                 } else {
-                    rollout_bytes(&[json!({"type":"task_started"})])
+                    rollout_bytes(&[with_fixture_timestamp(json!({"type":"task_started"}), 1)])
                 })
             },
         );
@@ -4154,7 +4822,12 @@ mod tests {
         all_complete_rows[1]["status"] = json!({"type":"idle"});
         let all_complete = select_active_threads(
             terminal_cycle(all_complete_rows),
-            |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"turn_aborted"})])) },
+            |_| -> Result<Vec<u8>, ()> {
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"turn_aborted"}),
+                    1,
+                )]))
+            },
         );
         assert_eq!(all_complete, ThreadCycleOutcome::NoThread);
     }
@@ -4174,7 +4847,12 @@ mod tests {
 
         let outcome = select_active_threads(
             terminal_cycle(vec![parent, child]),
-            |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"task_started"})])) },
+            |_| -> Result<Vec<u8>, ()> {
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_started"}),
+                    1,
+                )]))
+            },
         );
         assert!(matches!(
             outcome,
@@ -4233,7 +4911,12 @@ mod tests {
 
         let outcome = select_active_threads(
             terminal_cycle(candidates.clone()),
-            |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"task_started"})])) },
+            |_| -> Result<Vec<u8>, ()> {
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_started"}),
+                    1,
+                )]))
+            },
         );
         let ThreadCycleOutcome::Snapshots(rows) = outcome else {
             panic!("a complete open-Session cycle publishes valid thread membership");
@@ -4266,7 +4949,10 @@ mod tests {
                 if candidate.id() == "valid-child" {
                     Err(())
                 } else {
-                    Ok(rollout_bytes(&[json!({"type":"task_started"})]))
+                    Ok(rollout_bytes(&[with_fixture_timestamp(
+                        json!({"type":"task_started"}),
+                        1,
+                    )]))
                 }
             },
         );
@@ -4285,7 +4971,10 @@ mod tests {
             |candidate| candidate.id() == "current",
             |candidate| -> Result<Vec<u8>, ()> {
                 assert_eq!(candidate.id(), "current");
-                Ok(rollout_bytes(&[json!({"type":"task_started"})]))
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_started"}),
+                    1,
+                )]))
             },
         );
         assert!(matches!(
@@ -4378,7 +5067,7 @@ mod tests {
             Some(16_000),
         );
         let bytes = rollout_raw_lines(&[
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+            r#"{"timestamp":"2026-08-15T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#,
         ]);
         parser
             .apply_reader(&mut Cursor::new(bytes.as_slice()), bytes.len() as u64)

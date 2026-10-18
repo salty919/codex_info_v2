@@ -270,6 +270,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
     private string selectedConnectionSelector;
     private int step;
     private bool isConnectionSettings;
+    private bool disposed;
 
     public SetupViewModel(MainWindowViewModel main)
         : this(main, App.SettingsSession, new WindowsSetupConnectionEnvironment())
@@ -376,7 +377,12 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
     };
     public bool HasConnectionSelector => selectedConnectionProfile != ConnectionProfiles.None;
     public IReadOnlyList<string> WslDistributions { get; }
-    public int Step { get => step; private set { step = value; Notify(); Notify(nameof(IsConnectionStep)); Notify(nameof(IsAuthStep)); Notify(nameof(IsDoneStep)); Notify(nameof(CanContinue)); Notify(nameof(ContinueText)); Notify(nameof(CanAuthenticate)); } }
+    public int Step { get => step; private set { step = value; Notify(); Notify(nameof(IsConnectionStep)); Notify(nameof(IsAuthStep)); Notify(nameof(IsDoneStep)); Notify(nameof(CanContinue)); Notify(nameof(ContinueText)); Notify(nameof(CanAuthenticate)); Notify(nameof(CanGoBack)); } }
+    public bool CanGoBack => Step > 0 && !disposed && CanRefresh;
+    public void GoBack()
+    {
+        if (CanGoBack) Step--;
+    }
     public bool IsConnectionStep => Step == 0;
     public bool IsAuthStep => Step == 1;
     public bool CanAuthenticate => IsAuthStep && main.IsAuthRequired;
@@ -433,7 +439,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
                 ? Texts.SshReadyStatus
                 : Texts.SshNotReady;
     public bool SettingsSaveFailed => settingsSaveFailed;
-    public bool CanContinue => Step switch
+    public bool CanContinue => !disposed && (Step switch
     {
         0 => IsConnectionSelectionValid && (main.HasQuota || main.IsAuthRequired || main.HasDetails),
         // Starting `wsl.exe codex login` is not authentication completion.
@@ -441,7 +447,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
         // status snapshot before the setup flow can be marked complete.
         1 => main.IsAuthenticated,
         _ => true,
-    };
+    });
     public string SshCommand => CanStartSsh
         ? $"ssh -N -L 8787:127.0.0.1:8787 {(string.IsNullOrWhiteSpace(SshUser) ? (SelectedConnectionSelector == ConnectionSelectors.None ? SshHost : SelectedConnectionSelector) : $"{SshUser}@{(SelectedConnectionSelector == ConnectionSelectors.None ? SshHost : SelectedConnectionSelector)}")}"
         : Texts.SshCommand;
@@ -450,10 +456,17 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
     public string StatusDetail => settingsSaveFailed ? Texts.SettingsSaveFailed : main.ConnectionStatusDetail;
     public string ContinueText => Step == 2 ? Texts.Close : Texts.Continue;
 
-    public void Refresh() => main.RefreshCommand.Execute(null);
-    public void StartAuthentication() => main.AuthCommand.Execute(null);
+    public void Refresh()
+    {
+        if (!disposed) main.RefreshCommand.Execute(null);
+    }
+    public void StartAuthentication()
+    {
+        if (!disposed) main.AuthCommand.Execute(null);
+    }
     public void StartOrStopSsh()
     {
+        if (disposed) return;
         if (SshRunning)
         {
             try { sshProcess?.Kill(); } catch { /* process may have exited */ }
@@ -513,6 +526,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
     public SetupAdvanceOutcome Advance()
     {
+        if (disposed) return SetupAdvanceOutcome.StayOpen;
         if (IsConnectionStep && !CanContinue)
         {
             return SetupAdvanceOutcome.StayOpen;
@@ -548,6 +562,7 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
     public void Continue()
     {
+        if (disposed) return;
         if (!CanContinue)
         {
             if (IsAuthStep)
@@ -598,6 +613,10 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
     public void Dispose()
     {
+        if (disposed) return;
+        disposed = true;
+        Notify(nameof(CanGoBack));
+        Notify(nameof(CanContinue));
         main.PropertyChanged -= OnMainPropertyChanged;
         LocalizationService.LanguageChanged -= OnLanguageChanged;
         sshProcess?.Dispose();
@@ -605,9 +624,11 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
     {
+        if (disposed) return;
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.CanRefresh) or nameof(MainWindowViewModel.RefreshButtonText))
         {
             Notify(nameof(CanRefresh));
+            Notify(nameof(CanGoBack));
             Notify(nameof(RefreshButtonText));
         }
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.StatusTitle)

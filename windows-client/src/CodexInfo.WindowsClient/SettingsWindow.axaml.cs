@@ -75,6 +75,8 @@ public partial class SettingsWindow : Window
         }
     }
 
+    private void OnMinimizeWindow(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => WindowState = WindowState.Minimized;
+
     private void OnClose(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => Close();
 
     private void OnOpenSetup(object? sender, Avalonia.Interactivity.RoutedEventArgs e)

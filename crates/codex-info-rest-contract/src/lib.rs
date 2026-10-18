@@ -8,9 +8,48 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+pub mod model_names;
+pub mod recorded_usage;
+pub mod token_facts;
+
 pub const API_VERSION: &str = "v1";
 pub const API_VERSION_V2: &str = "v2";
 pub const API_VERSION_V3: &str = "v3";
+
+/// Opaque generation identity encoded by every resident publisher.
+///
+/// The owner validates its OS-random epoch and reserves a successful-publish
+/// counter before using this pure encoder. Neither component comes from
+/// account identity, database metadata, or response content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedPair {
+    identity: String,
+}
+
+impl PublishedPair {
+    pub fn as_str(&self) -> &str {
+        &self.identity
+    }
+
+    pub fn identity(&self) -> &str {
+        self.as_str()
+    }
+
+    pub fn from_epoch_counter(epoch: [u8; 16], counter: u128) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut identity = String::with_capacity(67);
+        identity.push_str("v1:");
+        for byte in epoch {
+            identity.push(HEX[(byte >> 4) as usize] as char);
+            identity.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        for shift in (0..32).rev() {
+            let nibble = ((counter >> (shift * 4)) & 0x0f) as usize;
+            identity.push(HEX[nibble] as char);
+        }
+        Self { identity }
+    }
+}
 
 /// Process versions are independent of account and database readiness.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -82,7 +121,6 @@ pub fn valid_runtime_version(version: &str) -> bool {
 }
 pub const MAX_PUBLIC_MODELS: usize = 3;
 pub const MAX_PUBLIC_MODELS_V3: usize = 1_024;
-pub const MAX_PUBLIC_HISTORY_PERIODS: usize = 128;
 pub const MAX_PUBLIC_HISTORY_SAMPLES: usize = 31 * 24 * 60;
 pub const MAX_PUBLIC_HISTORY_GAPS: usize = 4_096;
 pub const MAX_PUBLIC_THREADS: usize = 256;
@@ -199,6 +237,27 @@ pub struct PublicHistoryObservation {
     pub terra_tokens: Option<u64>,
     pub luna_tokens: Option<u64>,
     pub model_source: String,
+}
+
+impl PublicHistoryObservation {
+    /// The fixed v1 shape can represent only an entirely known legacy
+    /// vector. Callers must reject the resource if any row is unrepresentable.
+    pub fn as_legacy_sample(&self) -> Option<PublicHistorySample> {
+        if !matches!(self.model_source.as_str(), "confirmed" | "legacy-unknown") {
+            return None;
+        }
+        Some(PublicHistorySample {
+            timestamp: self.timestamp,
+            reset_at: self.reset_at,
+            remaining_percent: self.remaining_percent,
+            sol_dollars: self.sol_dollars?,
+            terra_dollars: self.terra_dollars?,
+            luna_dollars: self.luna_dollars?,
+            sol_tokens: self.sol_tokens?,
+            terra_tokens: self.terra_tokens?,
+            luna_tokens: self.luna_tokens?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -329,19 +388,24 @@ impl PublicAccountsV3 {
             {
                 return Err(ContractError::InvalidModel);
             }
-            for (index, interval) in account.ownership_intervals.iter().enumerate() {
+            let mut previous_end = None;
+            for interval in &account.ownership_intervals {
                 if interval
                     .start_at
                     .is_some_and(|value| !valid_timestamp(value))
                     || interval.end_at.is_some_and(|value| !valid_timestamp(value))
-                    || matches!((interval.start_at, interval.end_at), (Some(start), Some(end)) if start >= end)
-                    || index > 0
-                        && (account.ownership_intervals[index - 1].end_at.is_none()
-                            || interval.start_at.is_none()
-                            || account.ownership_intervals[index - 1].end_at > interval.start_at)
+                    || matches!((interval.start_at, interval.end_at), (Some(start), Some(end)) if start > end)
                 {
                     return Err(ContractError::InvalidModel);
                 }
+                if matches!((interval.start_at, interval.end_at), (Some(start), Some(end)) if start == end)
+                {
+                    continue;
+                }
+                if previous_end.is_some_and(|end| interval.start_at.unwrap_or(i64::MIN) < end) {
+                    return Err(ContractError::InvalidModel);
+                }
+                previous_end = Some(interval.end_at.unwrap_or(i64::MAX));
             }
             if self.default_account_id.as_deref() == Some(account.id.as_str()) {
                 default_found = true;
@@ -476,6 +540,17 @@ impl PublicDetails {
     /// This is deliberately a pure bounded check.  It never reads the
     /// filesystem or tries to repair a malformed database row.
     pub fn validate(&self) -> Result<(), ContractError> {
+        self.validate_with_history_limit(MAX_PUBLIC_HISTORY_SAMPLES)
+    }
+
+    /// Validate the complete internal history projection. The old details
+    /// transport's sample ceiling is applied only by its response adapter;
+    /// every value, key, ordering and membership check still covers all rows.
+    pub fn validate_history_domain(&self) -> Result<(), ContractError> {
+        self.validate_with_history_limit(usize::MAX)
+    }
+
+    fn validate_with_history_limit(&self, history_limit: usize) -> Result<(), ContractError> {
         if self
             .observed_at
             .is_some_and(|value| !valid_timestamp(value))
@@ -492,8 +567,7 @@ impl PublicDetails {
             }
         }
         if self.models.len() > MAX_PUBLIC_MODELS
-            || self.history_periods.len() > MAX_PUBLIC_HISTORY_PERIODS
-            || self.history_samples.len() > MAX_PUBLIC_HISTORY_SAMPLES
+            || self.history_samples.len() > history_limit
             || self.history_gaps.len() > MAX_PUBLIC_HISTORY_GAPS
             || self.threads.len() > MAX_PUBLIC_THREADS
         {
@@ -570,9 +644,6 @@ impl PublicDetails {
             if !valid_timestamp(sample.timestamp)
                 || !valid_timestamp(sample.reset_at)
                 || sample.timestamp.rem_euclid(60) != 0
-                || self
-                    .observed_at
-                    .is_some_and(|observed| sample.timestamp > observed)
                 || sample
                     .remaining_percent
                     .is_some_and(|value| !valid_rate(value) || value > 100.0)
@@ -1096,6 +1167,57 @@ mod tests {
     }
 
     #[test]
+    fn issue604_other_period_history_is_not_bounded_by_the_current_observation_clock() {
+        let details = PublicDetails {
+            state: PublicState::Ready,
+            observed_at: Some(1200),
+            authenticated: true,
+            quota: Some(PublicQuota {
+                remaining_percent: 50.0,
+                reset_at: 1800,
+                window_seconds: 1200,
+                monthly: false,
+            }),
+            history_periods: vec![
+                PublicHistoryPeriod {
+                    id: "2400".into(),
+                    start_at: 1260,
+                    end_at: 1260,
+                    reset_at: 2400,
+                    label: "past".into(),
+                    current: false,
+                },
+                PublicHistoryPeriod {
+                    id: "1800".into(),
+                    start_at: 600,
+                    end_at: 1200,
+                    reset_at: 1800,
+                    label: "current".into(),
+                    current: true,
+                },
+            ],
+            history_samples: vec![PublicHistorySample {
+                timestamp: 1260,
+                reset_at: 2400,
+                remaining_percent: Some(40.0),
+                sol_dollars: 1.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 1,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            }],
+            ..PublicDetails::default()
+        };
+        details.validate().expect(
+            "a retained historical point uses its own exact period, not the current quota clock",
+        );
+        assert_eq!(details.observed_at, Some(1200));
+        assert_eq!(details.history_periods[1].end_at, 1200);
+        assert_eq!(details.history_samples[0].timestamp, 1260);
+    }
+
+    #[test]
     fn default_details_are_bounded_and_serializable() {
         let details = PublicDetails::default();
         details.validate().expect("default contract");
@@ -1214,6 +1336,56 @@ mod tests {
         assert!(v3.history_samples[0].models.is_none());
         assert!(!v3.history_samples[0].models_complete);
         assert_eq!(v3.history_samples[0].remaining_percent, Some(50.0));
+    }
+
+    #[test]
+    fn issue604_account_contract_keeps_empty_interval_markers() {
+        let intervals = vec![
+            PublicAccountOwnershipInterval {
+                start_at: Some(100),
+                end_at: Some(300),
+            },
+            PublicAccountOwnershipInterval {
+                start_at: Some(150),
+                end_at: Some(150),
+            },
+            PublicAccountOwnershipInterval {
+                start_at: Some(300),
+                end_at: Some(300),
+            },
+        ];
+        let mut accounts = PublicAccountsV3 {
+            default_account_id: None,
+            accounts: vec![PublicAccountV3 {
+                id: "account-7".into(),
+                is_current: false,
+                activation_at: Some(300),
+                deactivation_at: Some(300),
+                ownership_intervals: intervals,
+                login_id: None,
+            }],
+        };
+        accounts
+            .validate()
+            .expect("zero markers do not overlap positive ownership");
+        let encoded = serde_json::to_value(&accounts).unwrap();
+        assert_eq!(
+            encoded["accounts"][0]["ownership_intervals"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        accounts.accounts[0]
+            .ownership_intervals
+            .push(PublicAccountOwnershipInterval {
+                start_at: Some(200),
+                end_at: Some(400),
+            });
+        assert!(
+            accounts.validate().is_err(),
+            "empty markers cannot hide a positive overlap"
+        );
     }
 
     #[test]

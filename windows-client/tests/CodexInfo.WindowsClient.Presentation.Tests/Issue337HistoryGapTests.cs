@@ -12,7 +12,7 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class Issue337HistoryGapTests
 {
     [Fact]
-    public void Delayed_first_observation_renders_quota_baseline_without_model_backfill()
+    public void Delayed_first_observation_keeps_quota_and_model_origins_unknown()
     {
         var jst = TimeSpan.FromHours(9);
         var periodStart = new DateTimeOffset(2026, 9, 20, 7, 24, 36, jst).ToUnixTimeSeconds();
@@ -53,10 +53,10 @@ public sealed class Issue337HistoryGapTests
             timestamp => timestamp < firstObservation);
 
         var displayRemaining = GraphPlotProjection.BuildCanonicalRemainingLines(
-            scene,
-            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
-        Assert.Equal((double)periodStart, displayRemaining.Solid.Line.X[0]);
-        Assert.Equal(100d, displayRemaining.Solid.Line.Y[0]);
+            scene);
+        Assert.DoesNotContain((double)periodStart, displayRemaining.Solid.Line.X);
+        Assert.InRange(displayRemaining.Solid.Line.X[0], firstObservation - 4d, firstObservation + 4d);
+        Assert.Equal(89d, displayRemaining.Solid.Line.Y[0]);
         Assert.Contains(89d, displayRemaining.Solid.Line.Y);
         Assert.Contains(displayRemaining.Solid.Line.X, timestamp =>
             timestamp >= firstObservation - 4d && timestamp <= firstObservation + 4d);
@@ -66,17 +66,21 @@ public sealed class Issue337HistoryGapTests
         Assert.Equal(0d, scene.ModelSeries["SOL"][0]);
 
         var displaySol = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.ModelSeries["SOL"]);
-        Assert.Equal((double)periodStart, displaySol.Flat.Line.X[0]);
-        Assert.Equal(0d, displaySol.Flat.Line.Y[0]);
-        Assert.InRange(displaySol.Flat.Line.X[1], firstObservation - 4d, firstObservation + 4d);
-        Assert.Equal(0d, displaySol.Flat.Line.Y[1]);
+        Assert.Empty(displaySol.Flat.Line.X);
+        Assert.InRange(displaySol.Rising.Line.X[0], firstObservation - 4d, firstObservation + 4d);
+        Assert.Equal(0d, displaySol.Rising.Line.Y[0]);
 
         var control = new GraphPlotControl { Scene = scene };
         Assert.Contains(
             control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>(),
             line => line.Axes.YAxis == control.Plot.Axes.Right &&
                 line.LineWidth == GraphPlotControl.MeasuredRemainingLineWidth &&
-                line.Data.GetScatterPoints().Any(point => point.X == periodStart && point.Y == 100));
+                line.Data.GetScatterPoints().Any(point => Math.Abs(point.X - firstObservation) <= 4 && point.Y == 89));
+        Assert.DoesNotContain(
+            control.Plot.GetPlottables<ScottPlot.Plottables.Scatter>(),
+            line => line.Axes.YAxis == control.Plot.Axes.Right &&
+                line.LineWidth == GraphPlotControl.MeasuredRemainingLineWidth &&
+                line.Data.GetScatterPoints().Any(point => point.X == periodStart));
     }
 
     private static ApiHistorySample Sample(

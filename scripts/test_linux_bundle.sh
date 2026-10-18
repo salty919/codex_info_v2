@@ -396,6 +396,13 @@ if [[ "$url" == */releases/latest ]]; then
     payload_file="$FAKE_RELEASE_JSON"
 elif [[ "$url" == */releases/download/*/* ]]; then
     payload_file="$FAKE_RELEASE_ASSETS/${url##*/}"
+elif [[ "$url" == http://127.0.0.1:8787/v4/current ]]; then
+    # This fixture models an older installed generation. Only exact 404
+    # permits the installer to verify its legacy details representation.
+    if [[ "$write_out" == *'%{http_code}'* ]]; then
+        printf '%s' "${write_out//\%\{http_code\}/404}"
+    fi
+    exit 0
 elif [[ "$url" == http://127.0.0.1:8787/v1/details ]]; then
     details_padding=''
     printf -v details_padding '%*s' "${FAKE_DETAILS_PADDING_BYTES:-0}" ''

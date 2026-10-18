@@ -3,7 +3,10 @@
 
 namespace CodexInfo.WindowsClient.Graphing;
 
-internal sealed record GraphHoverSnapshot(long Timestamp, IReadOnlyList<GraphHoverRow> Rows);
+internal sealed record GraphHoverSnapshot(long Timestamp, IReadOnlyList<GraphHoverRow> Rows)
+{
+    internal IReadOnlyList<string> Details { get; init; } = [];
+}
 
 internal readonly record struct GraphHoverRow(
     GraphSeries Series,

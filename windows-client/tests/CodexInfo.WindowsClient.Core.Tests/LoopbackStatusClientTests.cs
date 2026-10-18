@@ -12,6 +12,262 @@ namespace CodexInfo.WindowsClient.Core.Tests;
 
 public sealed class LoopbackStatusClientTests
 {
+    [Fact]
+    public async Task Issue604HistoryKeepsKnownTotalsWithOptionalComponentsAndIndependentCoverage()
+    {
+        static string Page(string models) => """
+            {"api_version":"v3","history_samples":[{"timestamp":1800000000,"reset_at":1800604800,
+            "remaining_percent":31,"task_active_since_previous":null,"models_complete":false,
+            "model_source":"confirmed","models":MODELS}],"history_gaps":[],
+            "next_cursor":null,"resume_cursor":"saved-prefix"}
+            """.Replace("MODELS", models, StringComparison.Ordinal);
+        const string known = """
+            [{"model":"gpt-6.1-sol","total_tokens":10,"input_tokens":8,"cached_input_tokens":2,
+              "cache_write_input_tokens":0,"output_tokens":2,"total_dollars":0.125},
+             {"model":"TERRA","total_tokens":7,"total_dollars":0.5},
+             {"model":"gpt-6-astra","total_tokens":20,"cached_input_tokens":4}]
+            """;
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            Assert.Equal("/v3/history", request.RequestUri!.AbsolutePath);
+            return JsonResponse(Page(known), includePublishedPair: true);
+        }));
+        var result = await client.FetchHistoryPageAsync("account-7", "1800604800", null, CancellationToken.None);
+        Assert.True(result.IsSuccess, "known history totals must survive optional component gaps");
+        var sample = Assert.Single(result.Page!.Samples);
+        Assert.Equal(ApiHistorySample.ConfirmedModelSource, sample.ModelSource);
+        Assert.False(sample.ModelsComplete);
+        Assert.Equal(31, sample.RemainingPercent);
+        var models = sample.ModelSamples!;
+        Assert.Equal(3, models.Count);
+        Assert.Equal(10UL, models[0].TotalTokens);
+        Assert.Equal(8UL, models[0].InputTokens);
+        Assert.Equal(2UL, models[0].CachedInputTokens);
+        Assert.Equal(2UL, models[0].OutputTokens);
+        Assert.Equal(BitConverter.DoubleToInt64Bits(0.125), BitConverter.DoubleToInt64Bits(models[0].TotalDollars!.Value));
+        Assert.Equal(7UL, models[1].TotalTokens);
+        Assert.Equal(0.5, models[1].TotalDollars);
+        Assert.Null(models[1].InputTokens);
+        Assert.Null(models[1].CachedInputTokens);
+        Assert.Null(models[1].OutputTokens);
+        Assert.Null(models[1].CacheWriteInputTokens);
+        Assert.Equal(20UL, models[2].TotalTokens);
+        Assert.Equal(4UL, models[2].CachedInputTokens);
+        Assert.Null(models[2].InputTokens);
+        Assert.Null(models[2].OutputTokens);
+        Assert.Null(models[2].TotalDollars);
+
+        foreach (var invalid in new[]
+        {
+            "{\"model\":\"SOL\",\"total_tokens\":10,\"input_tokens\":11}",
+            "{\"model\":\"SOL\",\"total_tokens\":10,\"input_tokens\":8,\"output_tokens\":3}",
+            "{\"model\":\"SOL\",\"total_tokens\":10,\"input_tokens\":8,\"cached_input_tokens\":8,\"cache_write_input_tokens\":1}",
+            "{\"model\":\"SOL\",\"total_tokens\":10,\"cached_input_tokens\":11}",
+        })
+        {
+            using var rejected = new LoopbackStatusClient(new StubHandler(_ =>
+                JsonResponse(Page($"[{invalid}]"), includePublishedPair: true)));
+            Assert.False((await rejected.FetchHistoryPageAsync("account-7", "1800604800", null, CancellationToken.None)).IsSuccess);
+        }
+    }
+
+    [Fact]
+    public async Task Issue604V5DirectoryCommitsAllPagesAndReusesOnlyTheCompleteCache()
+    {
+        var paths = new List<string>();
+        var cursor = "server.opaque-next";
+        var cycle = 0;
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            paths.Add(request.RequestUri!.PathAndQuery);
+            Assert.Equal("/v5/history/periods/selectable", request.RequestUri.AbsolutePath);
+            if (cycle == 1)
+            {
+                Assert.Equal("?account=account-7", request.RequestUri.Query);
+                Assert.Equal($"\"{CanonicalPublishedPair}\"", Assert.Single(request.Headers.IfNoneMatch).Tag);
+                return Issue604NotModified(CanonicalPublishedPair);
+            }
+            Assert.Empty(request.Headers.IfNoneMatch);
+            return request.RequestUri.Query.Contains("cursor=", StringComparison.Ordinal)
+                ? JsonResponse(Issue604DirectoryPage([2, 3], next: null), includePublishedPair: true)
+                : JsonResponse(Issue604DirectoryPage([0, 1], cursor), includePublishedPair: true);
+        }, versionedPeriods: true, pagedPeriods: true));
+        var first = await client.FetchSelectableHistoryPeriodsAsync("account-7");
+        Assert.True(first.IsSuccess);
+        Assert.Equal("v5", first.Snapshot!.ApiVersion);
+        Assert.Equal("account-7", first.Snapshot.AccountId);
+        Assert.Equal(["1800604980", "1800604920", "1800604860", "1800604800"], first.Snapshot.Periods.Select(p => p.Id));
+        Assert.Equal(1800000180L, Assert.Single(first.Snapshot.Periods, p => p.Current).OriginAt);
+        cycle = 1;
+        var second = await client.FetchSelectableHistoryPeriodsAsync("account-7");
+        Assert.True(second.IsSuccess);
+        Assert.Same(first.Snapshot, second.Snapshot);
+        Assert.Equal(new[]
+        {
+            "/v5/history/periods/selectable?account=account-7",
+            "/v5/history/periods/selectable?account=account-7&cursor=server.opaque-next",
+            "/v5/history/periods/selectable?account=account-7",
+        }, paths);
+    }
+
+    [Theory]
+    [InlineData("pair")]
+    [InlineData("duplicate")]
+    [InlineData("order")]
+    [InlineData("empty")]
+    [InlineData("repeat")]
+    [InlineData("current")]
+    [InlineData("missing-cursor")]
+    [InlineData("extra-key")]
+    [InlineData("404")]
+    [InlineData("503")]
+    public async Task Issue604V5DirectoryRejectsAnIncompleteCandidateAndKeepsLastGood(string defect)
+    {
+        var phase = 0;
+        var calls = new List<string>();
+        var changedPair = $"v1:{new string('b', 64)}";
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            calls.Add(request.RequestUri!.PathAndQuery);
+            Assert.Equal("/v5/history/periods", request.RequestUri.AbsolutePath);
+            if (phase == 0)
+                return JsonResponse(Issue604DirectoryPage([0], null), includePublishedPair: true);
+            if (phase == 2)
+            {
+                Assert.Equal($"\"{CanonicalPublishedPair}\"", Assert.Single(request.Headers.IfNoneMatch).Tag);
+                return Issue604NotModified(CanonicalPublishedPair);
+            }
+            var continuation = request.RequestUri.Query.Contains("cursor=", StringComparison.Ordinal);
+            if (continuation && defect == "404") return NotFoundResponse();
+            if (continuation && defect == "503") return new(HttpStatusCode.ServiceUnavailable);
+            var json = continuation
+                ? defect switch
+                {
+                    "duplicate" => Issue604DirectoryPage([1], null),
+                    "order" => Issue604DirectoryPage([0], null),
+                    "empty" => Issue604DirectoryPage([], "different.cursor"),
+                    "repeat" => Issue604DirectoryPage([2], "next.cursor"),
+                    "current" => Issue604DirectoryPage([3], null),
+                    "missing-cursor" => Issue604DirectoryPage([2], null).Replace(",\"next_cursor\":null", "", StringComparison.Ordinal),
+                    "extra-key" => Issue604DirectoryPage([2], null).Replace("\"api_version\":\"v5\"", "\"api_version\":\"v5\",\"extra\":0", StringComparison.Ordinal),
+                    _ => Issue604DirectoryPage([2], null),
+                }
+                : Issue604DirectoryPage([1], "next.cursor", currentIndex: defect == "current" ? 1 : 3);
+            var response = JsonResponse(json, includePublishedPair: true);
+            response.Headers.Remove(PublishedPairHeader);
+            response.Headers.TryAddWithoutValidation(PublishedPairHeader,
+                continuation && defect == "pair" ? CanonicalPublishedPair : changedPair);
+            return response;
+        }, versionedPeriods: true, pagedPeriods: true));
+        var accepted = await client.FetchHistoryPeriodsAsync("account-7");
+        Assert.True(accepted.IsSuccess);
+        phase = 1;
+        var rejected = await client.FetchHistoryPeriodsAsync("account-7");
+        Assert.False(rejected.IsSuccess);
+        Assert.Equal(3, calls.Count); // no fallback or same-callback restart
+        phase = 2;
+        var retained = await client.FetchHistoryPeriodsAsync("account-7");
+        Assert.True(retained.IsSuccess);
+        Assert.Same(accepted.Snapshot, retained.Snapshot);
+    }
+
+    [Theory]
+    [InlineData(false, "404")]
+    [InlineData(true, "404")]
+    [InlineData(false, "503")]
+    [InlineData(true, "malformed")]
+    [InlineData(true, "timeout")]
+    public async Task Issue604V5DirectoryFallsBackOnlyForTheFirstExact404(bool selectable, string state)
+    {
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            paths.Add(path);
+            Assert.Equal("?account=account-7", request.RequestUri.Query);
+            if (path.StartsWith("/v5/", StringComparison.Ordinal))
+                return state switch
+                {
+                    "404" => NotFoundResponse(),
+                    "503" => new(HttpStatusCode.ServiceUnavailable),
+                    "malformed" => JsonResponse("{}", includePublishedPair: true),
+                    _ => throw new TaskCanceledException(),
+                };
+            if (path.StartsWith("/v4/", StringComparison.Ordinal) || path.EndsWith("/selectable", StringComparison.Ordinal))
+                return NotFoundResponse();
+            return JsonResponse(Issue646PeriodsJson("archive"), includePublishedPair: true);
+        }, versionedPeriods: true, pagedPeriods: true));
+        var result = selectable
+            ? await client.FetchSelectableHistoryPeriodsAsync("account-7")
+            : await client.FetchHistoryPeriodsAsync("account-7");
+        Assert.Equal(state == "404", result.IsSuccess);
+        var suffix = selectable ? "/selectable" : "";
+        Assert.Equal(state == "404"
+            ? selectable
+                ? new[] { $"/v5/history/periods{suffix}", $"/v4/history/periods{suffix}", $"/v3/history/periods{suffix}", "/v3/history/periods" }
+                : new[] { "/v5/history/periods", "/v4/history/periods", "/v3/history/periods" }
+            : new[] { $"/v5/history/periods{suffix}" }, paths);
+    }
+
+    private static string Issue604DirectoryPage(int[] rows, string? next, int currentIndex = 3) =>
+        System.Text.Json.JsonSerializer.Serialize(new
+        {
+            api_version = "v5",
+            history_periods = rows.Select(index => new
+            {
+                id = (1800604800L + index * 60).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                start_at = 1800000000L + index * 60,
+                end_at = 1800000059L + index * 60,
+                reset_at = 1800604800L + index * 60,
+                label = $"2027/01/15 17:{index:00}:00 +09:00 ～ 2027/01/15 17:{index:00}:59 +09:00",
+                current = index == currentIndex,
+                origin_at = 1800000000L + index * 60,
+            }).ToArray(),
+            next_cursor = next,
+        });
+
+    private static HttpResponseMessage Issue604NotModified(string pair)
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.NotModified) { Content = new ByteArrayContent([]) };
+        response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
+        response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+        response.Headers.TryAddWithoutValidation(PublishedPairHeader, pair);
+        return response;
+    }
+
+    [Fact]
+    public async Task Issue604NormalResetCountKeepsAllExactPeriods()
+    {
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            Assert.Equal("/v4/history/periods", request.RequestUri!.AbsolutePath);
+            var rows = Enumerable.Range(0, 188).Reverse().Select(index =>
+            {
+                var start = 1800000000L + index * 60;
+                return new
+                {
+                    id = (start + 604800).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    start_at = start,
+                    end_at = start + 59,
+                    reset_at = start + 604800,
+                    current = index == 187,
+                    label = "official",
+                    origin_at = start,
+                };
+            }).ToArray();
+            return JsonResponse(System.Text.Json.JsonSerializer.Serialize(new
+            {
+                api_version = "v4",
+                history_periods = rows,
+            }), includePublishedPair: true);
+        }, versionedPeriods: true));
+        var result = await client.FetchHistoryPeriodsAsync("account-7");
+        Assert.True(result.IsSuccess);
+        Assert.Equal(188, result.Snapshot!.Periods.Count);
+        Assert.Equal(188, result.Snapshot.Periods.Select(period => period.ResetAt).Distinct().Count());
+        Assert.Equal("account-7", result.Snapshot.AccountId);
+    }
+
     private const string PublishedPairHeader = "Codex-Info-Published-Pair";
     private const string CanonicalPublishedPair =
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
@@ -587,6 +843,23 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal("アカウント 13 · ID未復元", result.Snapshot.Accounts[1].DisplayLabel);
         Assert.DoesNotContain("email", result.Snapshot.Accounts[0].DisplayLabel, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("account-7", result.Snapshot.Accounts[0].DisplayLabel, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AccountsKeepEmptyOwnershipMarkersWithoutTreatingThemAsCoverage()
+    {
+        const string json =
+            "{\"api_version\":\"v3\",\"default_account_id\":null,\"accounts\":[" +
+            "{\"id\":\"account-7\",\"is_current\":false,\"activation_at\":300,\"deactivation_at\":300," +
+            "\"ownership_intervals\":[{\"start_at\":100,\"end_at\":300},{\"start_at\":150,\"end_at\":150},{\"start_at\":300,\"end_at\":300}]}]}";
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+
+        var result = await client.FetchAccountsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(
+            [new ApiAccountOwnershipInterval(100, 300), new ApiAccountOwnershipInterval(150, 150), new ApiAccountOwnershipInterval(300, 300)],
+            result.Snapshot!.Accounts.Single().OwnershipIntervals);
     }
 
     [Fact]
@@ -2318,7 +2591,7 @@ public sealed class LoopbackStatusClientTests
     private static string ValidHistoryPageJson() =>
         $"{{\"api_version\":\"v3\",\"history_samples\":[{{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"models\":[{{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}}],\"models_complete\":true,\"model_source\":\"confirmed\"}}],\"history_gaps\":[],\"next_cursor\":null,\"resume_cursor\":\"resume-opaque\"}}";
 
-    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder, bool versionedPeriods = false) : HttpMessageHandler
+    private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder, bool versionedPeriods = false, bool pagedPeriods = false) : HttpMessageHandler
     {
         public HttpRequestMessage? LastRequest { get; private set; }
 
@@ -2327,8 +2600,8 @@ public sealed class LoopbackStatusClientTests
             CancellationToken cancellationToken)
         {
             LastRequest = request;
-            // Existing fixtures describe a v3 server. Model its absent v4
-            // routes explicitly; the origin test exercises the v4 responder.
+            if (!pagedPeriods && request.RequestUri!.AbsolutePath.StartsWith("/v5/history/periods", StringComparison.Ordinal))
+                return Task.FromResult(NotFoundResponse());
             if (!versionedPeriods && request.RequestUri!.AbsolutePath.StartsWith("/v4/history/periods", StringComparison.Ordinal))
                 return Task.FromResult(NotFoundResponse());
             return Task.FromResult(responder(request));

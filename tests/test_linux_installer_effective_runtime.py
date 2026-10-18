@@ -94,6 +94,23 @@ raise SystemExit(subprocess.run(["/bin/bash", os.environ["FAKE_SYSTEMCTL_BASE"],
 CURL_ADAPTER = r'''#!/usr/bin/python3
 import json, os, pathlib, subprocess, sys
 args = sys.argv[1:]
+url = args[-1] if args else ""
+if url.endswith("/v4/current") and "FAKE_CURRENT_STATUS" in os.environ:
+    status = os.environ["FAKE_CURRENT_STATUS"]
+    body = os.environ.get("FAKE_CURRENT_BODY", "{}")
+    with pathlib.Path(os.environ["FAKE_LOG"]).open("a") as stream:
+        stream.write("current-v4 " + status + "\n")
+    if "--output" in args:
+        pathlib.Path(args[args.index("--output") + 1]).write_text(body)
+    else:
+        sys.stdout.write(body)
+    if "--write-out" in args:
+        sys.stdout.write(args[args.index("--write-out") + 1].replace("%{http_code}", status))
+    raise SystemExit(22 if "--fail" in args and int(status) >= 400 else 0)
+if url.endswith("/v1/details") and os.environ.get("FAKE_REJECT_LEGACY_DETAILS") == "1":
+    with pathlib.Path(os.environ["FAKE_LOG"]).open("a") as stream:
+        stream.write("rejected-legacy-details\n")
+    raise SystemExit(22)
 if "http://127.0.0.1:8787/v1/health" in args:
     target = (pathlib.Path(os.environ["HOME"]) / ".local/share/codex-info/current").resolve(strict=True)
     os.environ["FAKE_HEALTH_VERSION"] = json.loads((target / "manifest.json").read_text())["version"]
@@ -158,9 +175,33 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         self.override = self.unit_dir / "codex-info-recorder.service.d/90-issue-134-current-cli.conf"
 
     def command(self, script, *args):
-        return subprocess.run(  # nosec B603 B607 # fixed offline installer/build commands and isolated environment.
+        return subprocess.run(  # noqa: S603 -- fixed offline installer/build commands and isolated environment.  # nosec B603 B607
             ["/bin/bash", str(script), *map(str, args)], env=self.env,
             capture_output=True, text=True, check=False, timeout=90,
+        )
+
+    def current_readiness(self):
+        # Exercise the real route/schema consumer without an update or its
+        # rollback loop. Process identity has its own existing fixture owner.
+        source = INSTALLER.read_text()
+        function = source.split("health_readback() {\n", 1)[1].split("\n}\n", 1)[0]
+        urls = "\n".join(re.findall(r"^(?:HEALTH|CURRENT|DETAILS)_URL=.*$", source, re.M))
+        shell = """set -euo pipefail
+generations_dir=/unused
+HEALTH_TIMEOUT=30
+readiness_deadline=0
+CURL_BIN=curl
+proc_identity_check() { :; }
+recorder_identity_check() { :; }
+now_unix() { printf 1000; }
+proc_starttime() { printf 101; }
+systemd_pid() { printf 7; }
+recorder_systemd_pid() { printf 8; }
+safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
+""" + urls + "\nhealth_readback() {\n" + function + "\n}\nhealth_readback 7 101 1.0.19 source manifest hash\n"
+        return subprocess.run(  # noqa: S603 -- repository function and isolated fake HTTP environment.  # nosec B603 B607
+            ["/bin/bash", "--noprofile", "--norc", "-c", shell], env=self.env,
+            capture_output=True, text=True, check=False, timeout=5,
         )
 
     def current(self):
@@ -169,6 +210,7 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
     def control(self, state):
         path = self.home / ".local/share/codex-info/control-state.json"
         path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
         value = {"schema": "codex-info-control-state-v1", "desired_state": state,
                  "boot_id": self.boot_id, "operation_id": "isolated-fixture", "generation_id": "",
                  "updated_at_unix": int(time.time())}
@@ -240,7 +282,7 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]).touch()
         pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"]).touch()
         self.control("running")
-        result = subprocess.run(  # nosec B603 # this offline adapter updates fixture lock identity only.
+        result = subprocess.run(  # noqa: S603 -- this offline adapter updates fixture lock identity only.  # nosec B603
             ["/usr/bin/python3", str(self.bin / "systemctl"), "--user", "restart", "--no-block", "codex-info-recorder.service"],
             env=self.env, capture_output=True, text=True, check=False, timeout=5,
         )
@@ -268,6 +310,7 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
                         "migration must preserve the exact old drop-in bytes")
         self.assertEqual(self.hotfix.read_bytes(), self.hotfix_bytes)
         self.preserved_profile()
+
         # A second normal update proves migration did not pin another version.
         for path in self.assets.iterdir():
             path.unlink()
@@ -277,6 +320,39 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         self.assertEqual((self.proc / str(RECORDER_PID) / "exe").resolve(strict=True),
                          self.current().resolve(strict=True) / "codex_info_recorder")
         self.assertFalse(list(self.override.parent.glob("*.conf")), "no new fixed-version ExecStart override")
+        self.preserved_profile()
+
+
+    def test_current_readiness_accepts_v4_schema(self):
+        current = {
+            "api_version": "v4", "state": "ready", "observed_at": 1792228061,
+            "authenticated": True, "plan_label": None,
+            "quota": {"remaining_percent": 88.0, "reset_at": 1792823932,
+                      "window_seconds": 604800, "monthly": False},
+            "models_status": "partial",
+            "models": [{"model": "gpt-6.1-sol", "total_tokens": 15,
+                        "input_tokens": 12, "cached_input_tokens": 3,
+                        "cache_write_input_tokens": 0, "output_tokens": 3,
+                        "estimated_cost": None}],
+            "active_thread_count": 0, "open_session_thread_count": 0,
+        }
+        self.env.update(FAKE_CURRENT_STATUS="200", FAKE_CURRENT_BODY=json.dumps(current),
+                        FAKE_REJECT_LEGACY_DETAILS="1")
+        result = self.current_readiness()
+        log = pathlib.Path(self.env["FAKE_LOG"]).read_text()
+        self.assertIn("current-v4 200", log, result.stdout + result.stderr + log)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("rejected-legacy-details", log)
+        self.preserved_profile()
+
+    def test_current_failure_does_not_fall_back_to_legacy_details(self):
+        self.env.update(FAKE_CURRENT_STATUS="503", FAKE_CURRENT_BODY='{"error":"snapshot_unavailable"}')
+        before = pathlib.Path(self.env["FAKE_LOG"]).read_text()
+        result = self.current_readiness()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        log = pathlib.Path(self.env["FAKE_LOG"]).read_text()[len(before):]
+        self.assertIn("current-v4 503", log)
+        self.assertNotIn("/v1/details", log)
         self.preserved_profile()
 
     def test_regular_update_preserves_unknown_override_and_reports_conflict(self):

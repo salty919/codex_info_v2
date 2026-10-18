@@ -3051,6 +3051,77 @@ function Assert-E2EGraphIdleBandBitmap {
     }
 }
 
+function Assert-E2EGraphNoIdleBandBitmap {
+    param(
+        [Parameter(Mandatory = $true)][System.Drawing.Bitmap]$Bitmap,
+        [Parameter(Mandatory = $true)][int]$Left,
+        [Parameter(Mandatory = $true)][int]$Top,
+        [Parameter(Mandatory = $true)][int]$Right,
+        [Parameter(Mandatory = $true)][int]$Bottom,
+        [int]$VerticalInset = 20
+    )
+
+    Assert-E2E ($Left -ge 0 -and $Top -ge 0 -and $Right -le $Bitmap.Width -and $Bottom -le $Bitmap.Height) `
+        'Stored-observation bitmap bounds are outside the captured bitmap.'
+    Assert-E2E ($Right -gt $Left -and $Bottom -gt $Top) 'Stored-observation bitmap bounds are empty.'
+    [int]$scanTop = $Top + $VerticalInset
+    [int]$scanBottom = $Bottom - $VerticalInset
+    [int]$scanHeight = $scanBottom - $scanTop
+    Assert-E2E ($VerticalInset -ge 0 -and $scanHeight -gt 0) 'Stored-observation vertical scan corridor is empty.'
+    # This 80% pixel threshold only distinguishes a captured full-height band
+    # from short stored points, allowing grid/series overpaint. It provides no
+    # product idle classification, unused-time evidence or guaranteed duration.
+    [int]$minimumBandHits = [int][Math]::Ceiling($scanHeight * 0.80)
+    $idle = [System.Drawing.ColorTranslator]::FromHtml('#162232')
+    for ($x = $Left; $x -lt $Right; $x++) {
+        [int]$hits = 0
+        for ($y = $scanTop; $y -lt $scanBottom; $y++) {
+            $pixel = $Bitmap.GetPixel($x, $y)
+            if ($pixel.A -eq 255 -and
+                [Math]::Abs([int]$pixel.R - [int]$idle.R) -le 2 -and
+                [Math]::Abs([int]$pixel.G - [int]$idle.G) -le 2 -and
+                [Math]::Abs([int]$pixel.B - [int]$idle.B) -le 2) {
+                $hits++
+            }
+        }
+        Assert-E2E ($hits -lt $minimumBandHits) `
+            "Legacy stored observations contain an unsupported opaque full-height idle band at x=$x (hits=$hits threshold=$minimumBandHits)."
+    }
+    return [pscustomobject]@{
+        ScannedColumns = $Right - $Left
+        ScanHeight = $scanHeight
+    }
+}
+
+function Assert-E2EGraphHasNoIdleBand {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
+        [Parameter(Mandatory = $true)][IntPtr]$Handle,
+        [Parameter(Mandatory = $true)][psobject]$Capture,
+        [Parameter(Mandatory = $true)][psobject]$Measurement
+    )
+
+    # Exact-404 fallback history consists of independent stored observations;
+    # its gaps establish neither idle time nor a forecast. Scan only the plot
+    # interior, excluding the endpoint-label gutter, without inventing a gap.
+    $window = Get-E2EWindowBounds $Handle
+    $plotBounds = $Plot.Current.BoundingRectangle
+    $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
+    try {
+        [int]$plotLeft = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
+        [int]$top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
+        [int]$left = $plotLeft + [int]$Measurement.Pixels.PeriodStartX
+        [int]$right = $plotLeft + [int]$Measurement.Pixels.PeriodEndX
+        [int]$bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
+        $result = Assert-E2EGraphNoIdleBandBitmap -Bitmap $bitmap -Left $left -Top $top -Right $right -Bottom $bottom
+    }
+    finally {
+        $bitmap.Dispose()
+    }
+    Write-E2E ("graph-past-stored-observations: PASS no opaque full-height idle band columns={0} height={1}" -f
+        $result.ScannedColumns, $result.ScanHeight)
+}
+
 function Assert-E2EGraphHasIdleBand {
     param(
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
@@ -3515,6 +3586,9 @@ function Assert-E2EFixtureV3PreflightResponses {
     return $true
 }
 
+# This old-server preflight validates only strict legacy HTTP compatibility
+# inputs after exact-404 fallback. It is not evidence that the new recorded
+# scope/current/recordings resources or their consumers have succeeded.
 function Invoke-E2EFixturePreflight {
     $responses = [ordered]@{}
     foreach ($requestSpec in @(
@@ -6617,9 +6691,7 @@ try {
     $graphPast = Capture-E2EWindow $graph.Handle '03-graph-past'
     Assert-E2EImageChanged $graphCurrent $graphPast 'Current-to-past period selection'
     if ($Fixture) {
-        Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast $pastMeasurement `
-            -ExpectedStartFraction $script:e2eFixturePastIdleStartFraction `
-            -ExpectedEndFraction $script:e2eFixturePastIdleEndFraction
+        Assert-E2EGraphHasNoIdleBand $plot $graph.Handle $graphPast $pastMeasurement
         Invoke-E2EGraphHover -Graph $graph -ProcessId $clientPid -Measurement $pastMeasurement
         if ($GraphHoverOnly) {
             Write-E2E 'windows-client-e2e: PASS focused native graph hover capture and lifecycle'

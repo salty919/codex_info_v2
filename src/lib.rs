@@ -7,11 +7,15 @@
 /// Distribution version compiled into each process that uses this crate.
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub use codex_info_rest_contract::valid_runtime_version as valid_product_version;
+
 pub mod app_server_sqlite;
 pub mod i18n;
 pub mod protocol_contract;
 pub mod security;
 pub mod server;
+#[doc(hidden)]
+pub mod session_input;
 pub mod thread_contract;
 pub mod thread_state;
 pub mod usage_store;

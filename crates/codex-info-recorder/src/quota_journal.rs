@@ -3,6 +3,7 @@
 
 use rusqlite::{params, Connection};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -27,20 +28,68 @@ pub(super) struct QuotaReceipt {
 #[derive(Default)]
 pub(super) struct ReplayBatch {
     pub receipts: Vec<codex_info_db_writer::QuotaReceipt>,
+    pub official_inputs: Vec<codex_info_db_writer::period_evidence::OfficialQuotaInput>,
     pub unresolved: usize,
     /// Failure of the latest settled input, not the historical backlog size.
     pub latest_input_unresolved: Option<bool>,
 }
 
+#[derive(Clone, Default)]
+pub(super) struct ReplayCursor {
+    scope: Option<String>,
+    sequence: i64,
+    verifying: BTreeSet<String>,
+    unresolved: BTreeSet<i64>,
+    latest: Option<(i64, bool)>,
+}
+
+impl ReplayCursor {
+    fn settle(&mut self, sequence: i64, failed: bool) {
+        if failed {
+            self.unresolved.insert(sequence);
+        } else {
+            self.unresolved.remove(&sequence);
+        }
+        if self.latest.is_none_or(|(latest, _)| sequence >= latest) {
+            self.latest = Some((sequence, failed));
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) fn read_unapplied(
     data_root: &Path,
     account_scope: &str,
     applied: &BTreeSet<String>,
 ) -> Result<ReplayBatch, String> {
+    read_since(data_root, account_scope, applied, &ReplayCursor::default()).map(|(batch, _)| batch)
+}
+
+pub(super) fn read_incremental(
+    data_root: &Path,
+    account_scope: &str,
+    cursor: &ReplayCursor,
+) -> Result<(ReplayBatch, ReplayCursor), String> {
+    read_since(data_root, account_scope, &BTreeSet::new(), cursor)
+}
+
+fn read_since(
+    data_root: &Path,
+    account_scope: &str,
+    applied: &BTreeSet<String>,
+    cursor: &ReplayCursor,
+) -> Result<(ReplayBatch, ReplayCursor), String> {
+    if cursor
+        .scope
+        .as_deref()
+        .is_some_and(|scope| scope != account_scope)
+    {
+        return Err("quota cursor scope changed".into());
+    }
     let path = data_root.join("history/quota/observations.sqlite3");
     match fs::metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ReplayBatch::default())
+            return Ok((ReplayBatch::default(), cursor.clone()));
         }
         Err(_) => return Err("quota acquisition journal could not be read".into()),
         Ok(_) => {}
@@ -53,56 +102,80 @@ pub(super) fn read_unapplied(
         let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         db.busy_timeout(Duration::from_secs(1))?;
         db.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
+        let mut next = cursor.clone();
+        next.scope = Some(account_scope.to_owned());
+        let verifying = serde_json::to_string(&cursor.verifying)?;
         let mut statement = db.prepare(
             "SELECT receipt_id, sequence, observed_at, plan_type, payload, account_verified
-             FROM quota_observations WHERE account_scope=?1
+             FROM quota_observations WHERE account_scope=?1 AND sequence>?2
+             UNION
+             SELECT q.receipt_id,q.sequence,q.observed_at,q.plan_type,q.payload,q.account_verified
+             FROM json_each(?3) wanted JOIN quota_observations q ON q.receipt_id=wanted.value
+             WHERE q.account_scope=?1
              ORDER BY sequence",
         )?;
-        let mut rows = statement.query([account_scope])?;
+        let mut rows = statement.query(params![account_scope, cursor.sequence, verifying])?;
         let mut pending = ReplayBatch::default();
         while let Some(row) = rows.next()? {
             let receipt_id: String = row.get(0)?;
-            if applied.contains(&receipt_id) {
-                pending.latest_input_unresolved = Some(false);
-                continue;
-            }
+            let sequence: i64 = row.get(1)?;
+            next.sequence = next.sequence.max(sequence);
+            next.verifying.remove(&receipt_id);
             if row.get::<_, i64>(5)? != 1 {
                 if !active.contains(&receipt_id) {
-                    pending.unresolved += 1;
-                    pending.latest_input_unresolved = Some(true);
+                    next.settle(sequence, true);
+                } else {
+                    next.verifying.insert(receipt_id);
                 }
                 continue;
             }
             let plan: String = row.get(3)?;
             let payload: String = row.get(4)?;
-            let Ok(value) = serde_json::from_str::<Value>(&payload) else {
-                pending.unresolved += 1;
-                pending.latest_input_unresolved = Some(true);
+            let observed_at: i64 = row.get(2)?;
+            let sequence: i64 = row.get(1)?;
+            let snapshot = serde_json::from_str::<Value>(&payload)
+                .ok()
+                .and_then(|value| super::interpret_official_quota(&value, &plan, observed_at).ok())
+                .filter(|snapshot| snapshot.remaining_percent.is_some());
+            // Only account-confirmed originals reach this projection. The raw
+            // bytes and acquisition position identify a barrier too; no reset
+            // is invented for an uninterpretable response.
+            if (1..=253_402_300_799).contains(&observed_at) && sequence > 0 {
+                pending.official_inputs.push(
+                    codex_info_db_writer::period_evidence::OfficialQuotaInput {
+                        input_id: receipt_id.clone(),
+                        account_scope: account_scope.to_owned(),
+                        sequence: sequence as u64,
+                        observed_at,
+                        content_sha256: format!("{:x}", Sha256::digest(payload.as_bytes())),
+                        reset_at: snapshot.as_ref().map(|value| value.reset_at),
+                        window_seconds: snapshot.as_ref().map(|value| value.window_seconds),
+                        reason: snapshot
+                            .is_none()
+                            .then(|| "interpretation-unavailable".into()),
+                    },
+                );
+            }
+            let Some(snapshot) = snapshot else {
+                next.settle(sequence, true);
                 continue;
             };
-            let Ok(snapshot) = super::parse_app_server_quota(&value, &plan) else {
-                pending.unresolved += 1;
-                pending.latest_input_unresolved = Some(true);
-                // This record remains unapplied and is retried by a later
-                // parser. It cannot prevent subsequent valid inputs advancing.
+            next.settle(sequence, false);
+            if applied.contains(&receipt_id) {
                 continue;
-            };
-            let Some(remaining_percent) = snapshot.remaining_percent else {
-                pending.unresolved += 1;
-                pending.latest_input_unresolved = Some(true);
-                continue;
-            };
-            pending.latest_input_unresolved = Some(false);
+            }
             pending.receipts.push(codex_info_db_writer::QuotaReceipt {
                 receipt_id,
-                sequence: row.get(1)?,
-                observed_at: row.get(2)?,
+                sequence,
+                observed_at,
                 reset_at: snapshot.reset_at,
                 window_seconds: snapshot.window_seconds,
-                remaining_percent,
+                remaining_percent: snapshot.remaining_percent.expect("selected value"),
             });
         }
-        Ok(pending)
+        pending.unresolved = next.unresolved.len();
+        pending.latest_input_unresolved = next.latest.map(|(_, failed)| failed);
+        Ok((pending, next))
     };
     read().map_err(|_| "quota acquisition journal could not be read".into())
 }

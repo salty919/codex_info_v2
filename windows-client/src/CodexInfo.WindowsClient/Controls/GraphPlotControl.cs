@@ -782,6 +782,7 @@ public sealed class GraphPlotControl : Control
         };
         panel.SetValue(Avalonia.Automation.AutomationProperties.AutomationIdProperty, "Graph.Hover");
         AddHoverRow(panel, "Graph.Hover.Timestamp", displayedTimestamp);
+        foreach (var detail in snapshot.Details) AddHoverRow(panel, "Graph.Hover.RecordedDetail", detail);
         foreach (var row in snapshot.Rows)
         {
             var name = row.Series switch

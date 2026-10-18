@@ -18,6 +18,13 @@ public partial class SetupWindow : Window
         InitializeComponent();
         DataContext = viewModel;
         Closed += (_, _) => viewModel.Dispose();
+        KeyDown += (_, e) =>
+        {
+            if (e.Handled || e.Key != Key.Escape) return;
+            if (viewModel.CanGoBack) viewModel.GoBack();
+            else Close();
+            e.Handled = true;
+        };
     }
 
     private void OnTitlePointerPressed(object? sender, PointerPressedEventArgs e)
@@ -54,6 +61,10 @@ public partial class SetupWindow : Window
     {
         if (!string.IsNullOrEmpty(text) && Clipboard is { } clipboard) await clipboard.SetTextAsync(text);
     }
+
+    private void OnMinimizeWindow(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => WindowState = WindowState.Minimized;
+
+    private void OnBack(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => (DataContext as SetupViewModel)?.GoBack();
 
     private void OnClose(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => Close();
 

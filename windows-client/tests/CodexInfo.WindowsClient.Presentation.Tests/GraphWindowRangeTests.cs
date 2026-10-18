@@ -865,6 +865,7 @@ public sealed class GraphWindowRangeTests
         graph.ShowSol = false;
         graph.SelectedTimeRange = GraphTimeRange.CalendarMonth;
         await EventuallyAsync(() => graph.IsMonthView && graph.Scene.IsDaily);
+        Assert.True(graph.IsMonthView, "The calendar view must be selected after switching to month.");
         Assert.Equal("2026/10", graph.RangeLabel);
         Assert.False(graph.HasLinePlot);
         Assert.Contains(graph.CalendarDays, day => day.ValueText == "3 M");
@@ -881,6 +882,7 @@ public sealed class GraphWindowRangeTests
             "A loaded calendar explains missing days in its cells, not as unavailable details over the calendar.");
         graph.SelectedTimeRange = GraphTimeRange.ResetPeriod;
         await EventuallyAsync(() => graph.IsPeriodView && graph.HasLinePlot);
+        Assert.False(graph.IsMonthView, "The calendar view must hide when the period line plot returns.");
         Assert.False(graph.ShowSol);
     }
 

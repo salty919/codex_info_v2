@@ -1,11 +1,10 @@
-//! Recover historical quota observations from already attributed Session bytes.
+//! Recover cached window metadata from already accepted Session bytes.
 
 use super::*;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 type SourceKey = (String, String, i64, i64, String);
 type ObservationKey = (i64, i64);
-type QuotaCandidates = BTreeMap<ObservationKey, (i64, Option<f64>)>;
 type EventSourceRanges = BTreeMap<(String, String), BTreeMap<i64, BTreeSet<(i64, i64, String)>>>;
 
 pub(super) const WINDOW_SCHEMA: &str = "
@@ -23,18 +22,9 @@ CREATE TABLE IF NOT EXISTS session_quota_windows (
     PRIMARY KEY (reset_at, window_seconds)
 ) WITHOUT ROWID;";
 
-#[derive(Eq, PartialEq, Ord, PartialOrd)]
-struct RelocatedQuotaEvent {
-    timestamp: i64,
-    model: String,
-    tokens: [u64; 4],
-    cache_write_input_tokens: Option<u64>,
-}
-
 impl UsageStore {
-    /// Fill missing historical percentages from exact, account-attributed
-    /// Session records. This does not create current-quota receipts or change
-    /// model facts. Unavailable originals remain missing and can be retried.
+    /// Preserve only cached window metadata from accepted Session records.
+    /// Cached percentages never restore an official observation or receipt.
     pub fn recover_session_quota_history(
         &mut self,
         sessions_root: &Path,
@@ -227,9 +217,7 @@ pub(super) fn recover_session_quota_history_in_transaction(
         return Ok((0, 0));
     }
     let root = fs::canonicalize(sessions_root)?;
-    let mut observations = BTreeMap::<ObservationKey, (i64, Option<f64>)>::new();
     let mut windows = BTreeMap::new();
-    let mut relocated_paths = BTreeSet::new();
     for (key, mut admitted) in sources {
         let accepted_range = accepted_ranges.contains(&key);
         let (root_identity, relative_path, start, end, expected_hash) = key;
@@ -295,11 +283,9 @@ pub(super) fn recover_session_quota_history_in_transaction(
             continue;
         };
         if actual_hash != expected_hash {
-            relocated_paths.insert(relative_path);
             continue;
         }
-        for (key, observed_at, remaining, seconds) in candidates {
-            retain_quota_candidate(&mut observations, key, observed_at, remaining);
+        for (key, observed_at, _cached_remaining, seconds) in candidates {
             windows.entry((key.0, seconds)).or_insert((
                 observed_at.div_euclid(1000),
                 root_identity.clone(),
@@ -310,19 +296,6 @@ pub(super) fn recover_session_quota_history_in_transaction(
             ));
         }
     }
-    if committed_ranges.is_none() {
-        recover_relocated_quota(
-            tx,
-            &root,
-            since,
-            &relocated_paths,
-            &known_resets,
-            &known_windows,
-            &mut observations,
-        )?;
-    }
-    observations.retain(|_, (at, _)| lifecycle_contains(&intervals, at.div_euclid(1000)));
-    let mut restored = 0;
     let mut restored_windows = 0;
     let invalid_windows = {
         let mut statement =
@@ -357,246 +330,7 @@ pub(super) fn recover_session_quota_history_in_transaction(
     }
     // Different exact resets in one missing minute cannot both own its
     // canonical row. Leave that minute unknown instead of choosing an ID.
-    let mut minute_counts = BTreeMap::<i64, usize>::new();
-    for (_, timestamp) in observations.keys() {
-        *minute_counts.entry(*timestamp).or_default() += 1;
-    }
-    for ((reset_at, timestamp), (_, remaining)) in observations {
-        let Some(remaining) = remaining else {
-            continue;
-        };
-        if minute_counts[&timestamp] > 1 {
-            continue;
-        }
-        let durable_remaining: Option<f64> = tx.query_row(
-            "SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state
-             WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2",
-            params![timestamp, reset_at], |row| row.get(0),
-        ).optional()?.flatten();
-        if durable_remaining.is_some() {
-            continue;
-        }
-        let mut changed = tx.execute(
-            "UPDATE usage_history SET remaining_percent=?1
-                 WHERE reset_at=?2 AND timestamp=?3 AND remaining_percent IS NULL",
-            params![remaining, reset_at, timestamp],
-        )?;
-        if changed == 0 {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM usage_history WHERE timestamp=?1)",
-                [timestamp],
-                |row| row.get(0),
-            )?;
-            if exists {
-                continue;
-            }
-            changed = 1;
-            upsert_observations_with_sources(
-                tx,
-                &[UsageHistoryObservation::unavailable(
-                    timestamp,
-                    reset_at,
-                    Some(remaining),
-                )],
-                &BTreeMap::new(),
-            )?;
-        }
-        tx.execute(
-                "UPDATE durable_state SET snapshot_json=json_set(snapshot_json,'$.remaining_percent',?1)
-                 WHERE singleton>=2 AND data_generation=?3
-                   AND json_extract(snapshot_json,'$.reset_at')=?2
-                   AND json_extract(snapshot_json,'$.remaining_percent') IS NULL",
-                params![remaining, reset_at, timestamp],
-            )?;
-        restored += changed;
-    }
-    Ok((restored, restored_windows))
-}
-
-fn retain_quota_candidate(
-    observations: &mut QuotaCandidates,
-    key: ObservationKey,
-    at: i64,
-    remaining: f64,
-) {
-    let candidate = observations.entry(key).or_insert((at, Some(remaining)));
-    if at > candidate.0 {
-        *candidate = (at, Some(remaining));
-    } else if at == candidate.0 && candidate.1 != Some(remaining) {
-        candidate.1 = None;
-    }
-}
-
-fn recover_relocated_quota(
-    connection: &Connection,
-    root: &Path,
-    since: i64,
-    paths: &BTreeSet<String>,
-    known_resets: &BTreeSet<i64>,
-    known_windows: &BTreeMap<i64, BTreeSet<i64>>,
-    observations: &mut QuotaCandidates,
-) -> Result<()> {
-    for relative_path in paths {
-        let mut events = BTreeSet::new();
-        let mut authorities = BTreeMap::<i64, BTreeSet<Option<i64>>>::new();
-        let mut roots = BTreeSet::new();
-        let mut statement = connection.prepare(
-            "SELECT e.root_identity,e.timestamp,e.model,e.total_tokens,e.input_tokens,e.cached_input_tokens,e.output_tokens,e.cache_write_input_tokens,
-             COALESCE(h.reset_at,json_extract(d.snapshot_json,'$.reset_at'))
-             FROM session_events e LEFT JOIN usage_history h ON h.timestamp=e.timestamp-e.timestamp%60
-             LEFT JOIN durable_state d ON d.singleton>=2 AND d.data_generation=e.timestamp-e.timestamp%60
-             WHERE e.relative_path=?1 AND e.timestamp-e.timestamp%60>=?2
-               AND h.remaining_percent IS NULL AND json_extract(d.snapshot_json,'$.remaining_percent') IS NULL",
-        )?;
-        let mut rows = statement.query(params![relative_path, since])?;
-        while let Some(row) = rows.next()? {
-            let timestamp = row.get(1)?;
-            roots.insert(row.get::<_, String>(0)?);
-            authorities
-                .entry(timestamp)
-                .or_default()
-                .insert(row.get(8)?);
-            events.insert(RelocatedQuotaEvent {
-                timestamp,
-                model: row.get(2)?,
-                tokens: [
-                    canonical_u64_text(&row.get::<_, String>(3)?, "total_tokens")?,
-                    canonical_u64_text(&row.get::<_, String>(4)?, "input_tokens")?,
-                    canonical_u64_text(&row.get::<_, String>(5)?, "cached_input_tokens")?,
-                    canonical_u64_text(&row.get::<_, String>(6)?, "output_tokens")?,
-                ],
-                cache_write_input_tokens: row
-                    .get::<_, Option<String>>(7)?
-                    .map(|value| canonical_u64_text(&value, "cache_write_input_tokens"))
-                    .transpose()?,
-            });
-        }
-        drop(rows);
-        drop(statement);
-        let Ok(path) = fs::canonicalize(root.join(relative_path)) else {
-            continue;
-        };
-        if !path.starts_with(root) {
-            continue;
-        }
-        for root_identity in roots {
-            let mut statement = connection.prepare(
-                "SELECT file_device,file_inode,prefix_generation,start_offset,end_offset,record_sha256
-                 FROM session_ranges WHERE root_identity=?1 AND relative_path=?2
-                 ORDER BY file_device,file_inode,prefix_generation,start_offset,end_offset",
-            )?;
-            let ranges = statement
-                .query_map(params![root_identity, relative_path], |row| {
-                    Ok((
-                        (
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ),
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let mut previous = None;
-            let mut model = None;
-            for (identity, start, end, hash) in ranges {
-                if start < 0 || end <= start {
-                    continue;
-                }
-                if previous.as_ref() != Some(&(identity.clone(), start)) {
-                    model = None;
-                }
-                let read = || -> std::io::Result<_> {
-                    let mut file = fs::File::open(&path)?;
-                    file.seek(SeekFrom::Start(start as u64))?;
-                    let mut reader = BufReader::new(file.take((end - start) as u64));
-                    let mut digest = Sha256::new();
-                    let mut line = Vec::new();
-                    let mut current_model = model.clone();
-                    let mut candidates = Vec::new();
-                    while reader.read_until(b'\n', &mut line)? != 0 {
-                        digest.update(&line);
-                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) {
-                            if value.get("type").and_then(serde_json::Value::as_str)
-                                == Some("turn_context")
-                            {
-                                current_model = value
-                                    .pointer("/payload/model")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_owned);
-                            }
-                            if let Some(event) =
-                                relocated_quota_event(&value, current_model.as_deref())
-                            {
-                                if events.contains(&event) {
-                                    let admitted = BTreeMap::from([(
-                                        event.timestamp,
-                                        authorities[&event.timestamp].clone(),
-                                    )]);
-                                    if let Some(candidate) = session_quota(
-                                        &value,
-                                        &admitted,
-                                        known_resets,
-                                        known_windows,
-                                    ) {
-                                        candidates.push(candidate);
-                                    }
-                                }
-                            }
-                        }
-                        line.clear();
-                    }
-                    Ok((
-                        format!("{:x}", Sha256::digest(digest.finalize())),
-                        candidates,
-                        current_model,
-                    ))
-                };
-                match read() {
-                    Ok((actual, candidates, current_model)) if actual == hash => {
-                        model = current_model;
-                        previous = Some((identity, end));
-                        for (key, at, remaining, _) in candidates {
-                            retain_quota_candidate(observations, key, at, remaining);
-                        }
-                    }
-                    _ => {
-                        model = None;
-                        previous = None;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn relocated_quota_event(
-    value: &serde_json::Value,
-    model: Option<&str>,
-) -> Option<RelocatedQuotaEvent> {
-    let payload = value.get("payload")?;
-    if payload.get("type")?.as_str()? != "token_count" {
-        return None;
-    }
-    let usage = payload.pointer("/info/last_token_usage")?;
-    Some(RelocatedQuotaEvent {
-        timestamp: DateTime::parse_from_rfc3339(value.get("timestamp")?.as_str()?)
-            .ok()?
-            .timestamp(),
-        model: model?.to_owned(),
-        tokens: [
-            usage.get("total_tokens")?.as_u64()?,
-            usage.get("input_tokens")?.as_u64()?,
-            usage.get("cached_input_tokens")?.as_u64()?,
-            usage.get("output_tokens")?.as_u64()?,
-        ],
-        cache_write_input_tokens: usage
-            .get("cache_write_input_tokens")
-            .and_then(serde_json::Value::as_u64),
-    })
+    Ok((0, restored_windows))
 }
 
 fn session_quota(
@@ -782,13 +516,20 @@ mod tests {
             let restored = store
                 .recover_session_quota_history_for_intervals(&root, MINUTE, &intervals)
                 .unwrap();
-            assert_eq!(
-                restored,
-                usize::from(fault == "none"),
-                "range-only case={fault}"
-            );
+            assert_eq!(restored, 0, "range-only case={fault}");
             let remaining:Option<f64>=store.connection.query_row("SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE singleton>=2 AND data_generation=?1 AND json_extract(snapshot_json,'$.reset_at')=?2",params![MINUTE+60,RESET],|r|r.get(0)).optional().unwrap().flatten();
-            assert_eq!(remaining, (fault == "none").then_some(88.0));
+            assert_eq!(remaining, None);
+            let metadata: i64 = store
+                .connection
+                .query_row("SELECT count(*) FROM session_quota_windows", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                metadata,
+                i64::from(fault == "none"),
+                "window metadata still requires hash, ownership and a unique authority"
+            );
             assert!(store.load_session_events().unwrap().is_empty());
             if fault == "none" {
                 assert_eq!(
@@ -818,6 +559,7 @@ mod tests {
         let (root, mut store) = fixture();
         add_history(&mut store, MINUTE, Some(90.0));
         let original = store.load_all().unwrap();
+        crate::tests::downgrade_qualification_fixture(&store.connection);
         store
             .connection
             .execute_batch("DROP TABLE IF EXISTS session_quota_windows; PRAGMA user_version=14;")
@@ -930,13 +672,13 @@ mod tests {
     }
 
     #[test]
-    fn relocated_quota_requires_a_verified_accepted_range_and_the_same_normalized_event() {
-        for (accepted, hash_matches, model_matches, tokens_match, expected) in [
-            (true, true, true, true, 1),
-            (false, true, true, true, 0),
-            (true, false, true, true, 0),
-            (true, true, false, true, 0),
-            (true, true, true, false, 0),
+    fn rewritten_cached_quota_never_reconstructs_a_measurement() {
+        for (accepted, hash_matches, model_matches, tokens_match) in [
+            (true, true, true, true),
+            (false, true, true, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, false),
         ] {
             let (root, mut store) = fixture();
             add_history(&mut store, MINUTE, Some(90.0));
@@ -973,18 +715,26 @@ mod tests {
             }
             assert_eq!(
                 store.recover_session_quota_history(&root, MINUTE).unwrap(),
-                expected
+                0
             );
             assert_eq!(store.load_session_events().unwrap(), original_events);
+            let windows: i64 = store
+                .connection
+                .query_row("SELECT COUNT(*) FROM session_quota_windows", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                windows,
+                0,
+                "the changed old prefix and a similar legacy event do not prove an independently qualified source"
+            );
             let rows = store.load_all().unwrap();
             let row = rows
                 .iter()
                 .find(|row| row.timestamp == MINUTE + 60)
                 .unwrap();
-            assert_eq!(
-                row.remaining_percent,
-                if expected == 1 { Some(88.0) } else { None }
-            );
+            assert_eq!(row.remaining_percent, None);
             assert_eq!(
                 store.recover_session_quota_history(&root, MINUTE).unwrap(),
                 0
@@ -1025,29 +775,31 @@ mod tests {
             ).unwrap();
             assert_eq!(
                 store.recover_session_quota_history(&root, MINUTE).unwrap(),
-                expected,
+                0,
                 "recorded_seconds={seconds}, source_minutes={source_minutes:?}"
             );
             assert_eq!(store.latest_quota_receipt().unwrap(), receipt);
             let observations = store
                 .load_recent_observations(Utc.timestamp_opt(MINUTE + 240, 0).unwrap())
                 .unwrap();
-            assert_eq!(observations.len(), expected);
-            if expected == 1 {
-                assert_eq!(
-                    (observations[0].reset_at, observations[0].remaining_percent),
-                    (reset, Some(88.0))
-                );
-                assert_eq!(observations[0].model_source, ModelSource::Unavailable);
-                assert_eq!(observations[0].model_totals, None);
-            }
+            assert!(
+                observations.is_empty(),
+                "cached window metadata never adds a quota observation"
+            );
+            let windows: i64 = store
+                .connection
+                .query_row("SELECT COUNT(*) FROM session_quota_windows", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(windows, expected);
             drop(store);
             fs::remove_dir_all(root).unwrap();
         }
     }
 
     #[test]
-    fn session_quota_recovery_restores_missing_rows_only_for_proven_exact_periods() {
+    fn cached_window_metadata_keeps_missing_quota_rows_missing() {
         let (root, mut store) = fixture();
         add_history(&mut store, MINUTE, Some(90.0));
         add_source(&store, &root, "missing.jsonl", MINUTE + 70, RESET, 12.0);
@@ -1066,33 +818,32 @@ mod tests {
 
         assert_eq!(
             store.recover_session_quota_history(&root, MINUTE).unwrap(),
-            1
+            0
         );
         let rows = store.load_all().unwrap();
         assert_eq!(rows, original); // Quota-only observations never fabricate model rows.
         let observations = store
             .load_recent_observations(Utc.timestamp_opt(MINUTE + 240, 0).unwrap())
             .unwrap();
-        let restored = observations
-            .iter()
-            .find(|row| row.timestamp == MINUTE + 60)
+        assert_eq!(observations.len(), 1);
+        assert!(observations.iter().all(|row| row.timestamp != MINUTE + 60));
+        let windows: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM session_quota_windows", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(restored.model_source, ModelSource::Unavailable);
-        assert_eq!(restored.model_totals, None);
-        assert!(!restored.model_totals_complete);
-        assert_eq!(restored.sol_tokens, None);
         assert_eq!(
-            (restored.reset_at, restored.remaining_percent),
-            (RESET, Some(88.0))
+            windows, 1,
+            "only the original known reset's verified metadata is retained"
         );
-        assert_eq!(observations.len(), 2);
         assert!(store.latest_quota_receipt().unwrap().is_none());
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn session_quota_recovery_accepts_receipt_and_durable_only_known_resets() {
+    fn cached_window_metadata_accepts_known_resets_without_fabricating_new_observations() {
         for durable_only in [false, true] {
             let (root, mut store) = fixture();
             add_history(&mut store, MINUTE, Some(90.0));
@@ -1122,21 +873,22 @@ mod tests {
             add_source(&store, &root, "known.jsonl", MINUTE + 70, reset, 12.0);
             assert_eq!(
                 store.recover_session_quota_history(&root, MINUTE).unwrap(),
-                1,
+                0,
                 "durable_only={durable_only}"
             );
             let observations = store
                 .load_recent_observations(Utc.timestamp_opt(MINUTE + 240, 0).unwrap())
                 .unwrap();
-            let restored = observations
-                .iter()
-                .find(|row| row.timestamp == MINUTE + 60)
+            assert!(observations.iter().all(|row| row.timestamp != MINUTE + 60));
+            let window: (i64, i64) = store
+                .connection
+                .query_row(
+                    "SELECT reset_at,window_seconds FROM session_quota_windows",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
                 .unwrap();
-            assert_eq!(
-                (restored.reset_at, restored.remaining_percent),
-                (reset, Some(88.0))
-            );
-            assert_eq!(restored.model_source, ModelSource::Unavailable);
+            assert_eq!(window, (reset, 604800));
             assert_eq!(store.latest_quota_receipt().unwrap(), receipt);
             drop(store);
             fs::remove_dir_all(root).unwrap();
@@ -1188,12 +940,12 @@ mod tests {
     }
 
     #[test]
-    fn session_quota_recovery_missing_rows_are_atomic_and_idempotent() {
+    fn cached_window_metadata_is_atomic_and_idempotent() {
         let (root, mut store) = fixture();
         add_history(&mut store, MINUTE, Some(90.0));
         add_source(&store, &root, "missing.jsonl", MINUTE + 70, RESET, 12.0);
         let before = store.load_all().unwrap();
-        store.connection.execute_batch("CREATE TRIGGER fail_missing_recovery BEFORE INSERT ON durable_state BEGIN SELECT RAISE(ABORT,'save failure'); END;").unwrap();
+        store.connection.execute_batch("CREATE TRIGGER fail_missing_recovery BEFORE INSERT ON session_quota_windows BEGIN SELECT RAISE(ABORT,'save failure'); END;").unwrap();
         assert!(store.recover_session_quota_history(&root, MINUTE).is_err());
         assert_eq!(store.load_all().unwrap(), before);
         store
@@ -1202,20 +954,73 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.recover_session_quota_history(&root, MINUTE).unwrap(),
-            1
+            0
         );
         let restored = store.load_all().unwrap();
+        assert_eq!(restored, before);
+        let generation = store
+            .load_session_collection_state()
+            .unwrap()
+            .data_generation;
         assert_eq!(
             store.recover_session_quota_history(&root, MINUTE).unwrap(),
             0
         );
         assert_eq!(store.load_all().unwrap(), restored);
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            generation
+        );
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn session_quota_recovery_fills_only_missing_exact_minutes_and_survives_replay() {
+    fn issue604_cached_session_snapshot_never_materializes_official_quota() {
+        let (root, mut store) = fixture();
+        add_history(&mut store, MINUTE, None);
+        add_source(
+            &store,
+            &root,
+            "cached-existing.jsonl",
+            MINUTE + 10,
+            RESET,
+            12.0,
+        );
+        add_source(
+            &store,
+            &root,
+            "cached-missing.jsonl",
+            MINUTE + 70,
+            RESET,
+            13.0,
+        );
+        let original = store.load_all().unwrap();
+        let receipts = store.latest_quota_receipt().unwrap();
+        assert_eq!(
+            store.recover_session_quota_history(&root, MINUTE).unwrap(),
+            0,
+            "a cached snapshot cannot become an official Remaining observation"
+        );
+        assert_eq!(
+            store.load_all().unwrap(),
+            original,
+            "preserve the existing NULL and do not manufacture a missing quota minute"
+        );
+        assert_eq!(store.latest_quota_receipt().unwrap(), receipts);
+        assert_eq!(
+            store.recover_session_quota_history(&root, MINUTE).unwrap(),
+            0
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_window_metadata_preserves_known_and_missing_exact_minutes_on_replay() {
         let (root, mut store) = fixture();
         add_history(&mut store, MINUTE, None);
         add_history(&mut store, MINUTE + 60, Some(70.0));
@@ -1234,17 +1039,16 @@ mod tests {
         let before = store.load_all().unwrap();
         assert_eq!(
             store.recover_session_quota_history(&root, MINUTE).unwrap(),
-            1
+            0
         );
-        let mut expected = before;
-        expected[0].remaining_percent = Some(88.0);
+        let expected = before;
         assert_eq!(store.load_all().unwrap(), expected);
         assert_eq!(
             store
                 .load_recent_observations(Utc.timestamp_opt(MINUTE + 180, 0).unwrap())
                 .unwrap()[0]
                 .remaining_percent,
-            Some(88.0)
+            None
         );
         assert_eq!(
             store.recover_session_quota_history(&root, MINUTE).unwrap(),
@@ -1260,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn session_quota_recovery_requires_original_bytes_and_rolls_back_on_save_failure() {
+    fn cached_window_metadata_requires_original_bytes_and_rolls_back_on_save_failure() {
         let (root, mut store) = fixture();
         add_history(&mut store, MINUTE, None);
         add_source(&store, &root, "source.jsonl", MINUTE + 10, RESET, 10.0);
@@ -1271,7 +1075,7 @@ mod tests {
             0
         );
         fs::write(root.join("source.jsonl"), original).unwrap();
-        store.connection.execute_batch("CREATE TRIGGER fail_recovery BEFORE UPDATE ON durable_state BEGIN SELECT RAISE(ABORT,'save failure'); END;").unwrap();
+        store.connection.execute_batch("CREATE TRIGGER fail_recovery BEFORE INSERT ON session_quota_windows BEGIN SELECT RAISE(ABORT,'save failure'); END;").unwrap();
         assert!(store.recover_session_quota_history(&root, MINUTE).is_err());
         assert_eq!(store.load_all().unwrap()[0].remaining_percent, None);
         store
@@ -1280,8 +1084,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.recover_session_quota_history(&root, MINUTE).unwrap(),
-            1
+            0
         );
+        let windows: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM session_quota_windows", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(windows, 1);
+        assert_eq!(store.load_all().unwrap()[0].remaining_percent, None);
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

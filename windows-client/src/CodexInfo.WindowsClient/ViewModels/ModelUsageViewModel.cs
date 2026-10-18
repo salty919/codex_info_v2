@@ -48,9 +48,9 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
         string name,
         string displayName,
         bool isOther,
-        ulong inputTokens,
-        ulong cachedInputTokens,
-        ulong outputTokens,
+        ulong? inputTokens,
+        ulong? cachedInputTokens,
+        ulong? outputTokens,
         ulong totalTokens,
         ulong? cacheWriteInputTokens,
         double? inputDollars,
@@ -75,9 +75,9 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
         LocalizationService.LanguageChanged += OnLanguageChanged;
     }
 
-    private ulong inputTokens;
-    private ulong cachedInputTokens;
-    private ulong outputTokens;
+    private ulong? inputTokens;
+    private ulong? cachedInputTokens;
+    private ulong? outputTokens;
     private ulong totalTokens;
     private ulong? cacheWriteInputTokens;
     private double? inputDollars;
@@ -95,25 +95,28 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
 
     public string DisplayName => isOther ? LocalizationService.Current.Other : displayName;
 
-    public string InputTokensText => FormatTokens(inputTokens);
+    public string InputTokensText => RecordedTokens(inputTokens);
 
-    public string CachedInputTokensText => FormatTokens(cachedInputTokens);
+    public string CachedInputTokensText => RecordedTokens(cachedInputTokens);
 
-    public string OutputTokensText => FormatTokens(outputTokens);
+    public string OutputTokensText => RecordedTokens(outputTokens);
 
     public string TotalTokensText => FormatTokens(totalTokens);
 
-    public string CacheWriteInputTokensText => FormatTokens(cacheWriteInputTokens);
+    public string CacheWriteInputTokensText => RecordedTokens(cacheWriteInputTokens);
 
-    public string InputDollarsText => FormatDollars(inputDollars);
+    public string InputDollarsText => RecordedDollars(inputDollars);
 
-    public string CachedInputDollarsText => FormatDollars(cachedInputDollars);
+    public string CachedInputDollarsText => RecordedDollars(cachedInputDollars);
 
-    public string OutputDollarsText => FormatDollars(outputDollars);
+    public string OutputDollarsText => RecordedDollars(outputDollars);
 
-    public string CacheWriteInputDollarsText => FormatDollars(cacheWriteInputDollars);
+    public string CacheWriteInputDollarsText => RecordedDollars(cacheWriteInputDollars);
 
-    public string TotalDollarsText => FormatDollars(totalDollars);
+    public string TotalDollarsText => RecordedDollars(totalDollars);
+
+    private string RecordedTokens(ulong? value) => FormatTokens(value);
+    private string RecordedDollars(double? value) => FormatDollars(value);
 
     public string InputLabel => LocalizationService.Current.Input;
     public string CachedInputLabel => LocalizationService.Current.CachedInput;

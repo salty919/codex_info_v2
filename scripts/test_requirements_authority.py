@@ -1,20 +1,18 @@
-#!/usr/bin/env python3
 """Fixture-focused tests for requirements_authority.py."""
 
 from __future__ import annotations
 
 import contextlib
 import io
-from pathlib import Path
 import sys
 import tempfile
 import unittest
-
+from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-import requirements_authority as authority  # noqa: E402
+import requirements_authority as authority
 
 
 class RequirementAuthorityFixtures(unittest.TestCase):
@@ -111,6 +109,32 @@ class RequirementAuthorityFixtures(unittest.TestCase):
     def test_final_mode_requires_verified(self) -> None:
         message = self._assert_fail(final=True)
         self.assertIn("final validation", message)
+
+    def test_in_progress_is_structurally_valid_but_cannot_pass_final_acceptance(self) -> None:
+        self._write_fixture(
+            ledger=[
+                ("PROD-1", "PRODUCT", "product code", "unit test", "in-progress"),
+                ("WIRE-1", "WIRE", "wire code", "fixture", "verified"),
+            ]
+        )
+        report = authority.validate(self.root)
+        self.assertEqual((report.owners, report.requirements, report.final), (2, 2, False))
+        self.assertIn(
+            "final validation requires verified status for PROD-1",
+            self._assert_fail(final=True),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = authority.main(["--root", str(self.root)])
+        self.assertEqual(code, 0)
+        self.assertIn("PASS", output.getvalue())
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            code = authority.main(["--root", str(self.root), "--final"])
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "final validation requires verified status for PROD-1", errors.getvalue()
+        )
 
     def test_final_mode_passes_all_verified(self) -> None:
         self._write_fixture(
