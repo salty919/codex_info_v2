@@ -2251,9 +2251,7 @@ fn read_active_thread_rollout_cached_with_checkpoints(
                 thread_contract::RolloutAccumulator::seeded_with_context(
                     checkpoint.last_model.clone(),
                     checkpoint.previous_total,
-                    checkpoint
-                        .last_task_running
-                        .or_else(|| (complete_len > parse_start).then_some(true)),
+                    checkpoint.last_task_running,
                     checkpoint.context_usage_tokens,
                     checkpoint.context_window_tokens,
                 )
@@ -30481,7 +30479,8 @@ mod tests {
         );
         assert_eq!(
             correction_starts.iter().copied().collect::<Vec<_>>(),
-            serde_json::from_value::<Vec<i64>>(expected["corrections"].clone()).unwrap()
+            serde_json::from_value::<Vec<i64>>(fixture["expected_correction_starts"].clone())
+                .unwrap()
         );
         let expected_sol = serde_json::from_value::<Vec<f64>>(expected["accepted_sol"].clone())
             .expect("accepted SOL values");
@@ -30577,7 +30576,7 @@ mod tests {
             &sample_references,
             &minute,
             &[],
-            &correction_starts,
+            &BTreeSet::new(),
             Some((&model_timelines, false)),
         );
         let actual_remaining = |kind| {
@@ -36676,7 +36675,7 @@ mod tests {
             &newest_path,
             [
                 json!({"type":"session_meta","payload":{"id":"newest"}}).to_string(),
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}".to_owned(),
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"payload\":{\"type\":\"token_count\"}}".to_owned(),
             ]
             .join("\n")
                 + "\n",
@@ -36686,9 +36685,9 @@ mod tests {
             &fallback_path,
             [
                 json!({"type":"session_meta","payload":{"id":"fallback"}}),
-                json!({"type":"event_msg","payload":{"type":"task_started"}}),
-                json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-5.6-sol"}}),
-                json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":12345}}}}),
+                json!({"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"task_started"}}),
+                json!({"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"turn_context","model":"gpt-5.6-sol"}}),
+                json!({"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":12345}}}}),
             ]
             .into_iter()
             .map(|value| value.to_string())
@@ -36760,8 +36759,8 @@ mod tests {
             &completed_path,
             [
                 json!({"type":"session_meta","payload":{"id":"completed"}}),
-                json!({"type":"task_started"}),
-                json!({"type":"task_complete"}),
+                json!({"type":"task_started","timestamp":"2026-01-01T00:00:00Z"}),
+                json!({"type":"task_complete","timestamp":"2026-01-01T00:00:01Z"}),
             ]
             .into_iter()
             .map(|value| value.to_string())
@@ -36778,9 +36777,9 @@ mod tests {
                 path,
                 [
                     json!({"type":"session_meta","payload":{"id":path.file_stem().unwrap().to_str().unwrap()}}),
-                    json!({"type":"thread_context","model":model}),
-                    json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":total_tokens}}}}),
-                    json!({"type":"task_started"}),
+                    json!({"type":"thread_context","timestamp":"2026-01-01T00:00:00Z","model":model}),
+                    json!({"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":total_tokens}}}}),
+                    json!({"type":"task_started","timestamp":"2026-01-01T00:00:00Z"}),
                 ]
                 .into_iter()
                 .map(|value| value.to_string())
@@ -36885,14 +36884,15 @@ mod tests {
                 "type":"session_meta",
                 "payload":{"id":path.file_stem().unwrap().to_str().unwrap()}
             }),
-            json!({"type":"thread_context","model":model}),
+            json!({"type":"thread_context","timestamp":user_timestamp,"model":model}),
             json!({
                 "type":"event_msg",
                 "timestamp":user_timestamp,
-                "payload":{"type":"user_message"}
+                "payload":{"type":"user_message","message":"synthetic user"}
             }),
             json!({
                 "type":"event_msg",
+                "timestamp":user_timestamp,
                 "payload":{
                     "type":"token_count",
                     "info":{
@@ -36902,10 +36902,10 @@ mod tests {
                     }
                 }
             }),
-            json!({"type":"task_started"}),
+            json!({"type":"task_started","timestamp":user_timestamp}),
         ];
         if completed {
-            records.push(json!({"type":"task_complete"}));
+            records.push(json!({"type":"task_complete","timestamp":user_timestamp}));
         }
         fs::write(
             path,
@@ -37055,8 +37055,8 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("active.jsonl");
         let complete = concat!(
-            "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
-            "{\"type\":\"task_started\"}\n"
+            "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
+            "{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n"
         );
         let partial = "{\"type\":\"event_msg\"";
         fs::write(&path, format!("{complete}{partial}")).unwrap();
@@ -37076,7 +37076,7 @@ mod tests {
         assert_eq!(rollout.total_tokens(), None);
 
         let remainder = concat!(
-            ",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            ",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{",
             "\"total_token_usage\":{\"total_tokens\":77}}}}\n"
         );
         let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -37118,8 +37118,8 @@ mod tests {
         let path = root.join("cached.jsonl");
         let initial = concat!(
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"cache-thread\"}}\n",
-            "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
-            "{\"type\":\"task_started\"}\n"
+            "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
+            "{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n"
         );
         fs::write(&path, initial).unwrap();
         let canonical = fs::canonicalize(&path).unwrap();
@@ -37157,7 +37157,7 @@ mod tests {
         assert_eq!(entry.complete_offset, initial_len);
 
         let remainder = concat!(
-            ",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            ",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{",
             "\"total_token_usage\":{\"total_tokens\":77}}}}\n"
         );
         let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -37193,7 +37193,7 @@ mod tests {
         let path = root.join("seeded.jsonl");
         let prefix = concat!(
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"seeded-thread\"}}\n",
-            "{\"type\":\"thread_context\",\"model\":\"wrong-prefix-model\"}\n"
+            "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"wrong-prefix-model\"}\n"
         );
         fs::write(&path, prefix).unwrap();
         fs::OpenOptions::new()
@@ -37202,7 +37202,7 @@ mod tests {
             .unwrap()
             .set_len(security::MAX_SESSION_FILE_BYTES + 1)
             .unwrap();
-        let tail = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":123}}}}\n";
+        let tail = "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":123}}}}\n";
         let checkpoint_metadata = fs::metadata(&path).unwrap();
         #[cfg(unix)]
         let (file_device, file_inode) = {
@@ -37264,14 +37264,31 @@ mod tests {
             fs::metadata(&path).unwrap().len()
         );
         checkpoint.last_task_running = None;
+        let mut legacy_cache = ThreadRolloutCache::default();
         let (_, legacy_rollout) = super::read_active_thread_rollout_cached_with_checkpoints(
             &root,
             &path,
-            &mut ThreadRolloutCache::default(),
+            &mut legacy_cache,
             std::slice::from_ref(&checkpoint),
         )
-        .expect("legacy checkpoint bridges a verified appended turn");
-        assert!(legacy_rollout.is_running());
+        .expect("legacy checkpoint preserves an unknown task state after token-only append");
+        assert_eq!(legacy_rollout.last_task_running(), None);
+        assert_eq!(legacy_rollout.total_tokens(), Some(123));
+
+        let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        append
+            .write_all(b"{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:02Z\"}\n")
+            .unwrap();
+        drop(append);
+        let (_, started) = super::read_active_thread_rollout_cached_with_checkpoints(
+            &root,
+            &path,
+            &mut legacy_cache,
+            std::slice::from_ref(&checkpoint),
+        )
+        .expect("only an explicit lifecycle event establishes a running task");
+        assert!(started.is_running());
+        assert_eq!(started.total_tokens(), Some(123));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -37311,34 +37328,45 @@ mod tests {
 
         let recoverable = root.join("recoverable.jsonl");
         let prefix = concat!(
-            "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
-            "{\"type\":\"task_started\"}\n"
+            "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
+            "{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n"
         );
         let oversized = format!(
-            "{{\"type\":\"response_item\",\"payload\":\"{}\"}}\n",
+            "{{\"type\":\"response_item\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{{\"text\":\"{}\"}}}}\n",
             "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
         );
         let suffix = concat!(
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"payload\":{\"type\":\"token_count\",",
             "\"info\":{\"total_token_usage\":{\"total_tokens\":321}}}}\n"
         );
         let mut bytes = prefix.as_bytes().to_vec();
         bytes.extend_from_slice(oversized.as_bytes());
-        bytes.extend_from_slice(&[b'{', 0xff, b'}', b'\n']);
         bytes.extend_from_slice(suffix.as_bytes());
         fs::write(&recoverable, bytes).unwrap();
         let rollout = read_thread_rollout_path(&root, &recoverable)
-            .expect("oversized/invalid-UTF8 records are isolated by the production reader");
+            .expect("a completely validated oversized NoOp preserves the live state");
         assert!(rollout.is_running());
         assert_eq!(rollout.total_tokens(), Some(321));
+
+        let invalid_utf8 = root.join("invalid-utf8.jsonl");
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.extend_from_slice(b"{\"type\":\"response_item\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"text\":\"");
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"\"}}\n");
+        bytes.extend_from_slice(suffix.as_bytes());
+        fs::write(&invalid_utf8, bytes).unwrap();
+        assert!(
+            read_thread_rollout_path(&root, &invalid_utf8).is_err(),
+            "invalid UTF-8 cannot prove that a live record is harmless"
+        );
 
         let malformed = root.join("malformed.jsonl");
         fs::write(
             &malformed,
             concat!(
-                "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
+                "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
                 "{not-json}\n",
-                "{\"type\":\"task_started\"}\n"
+                "{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:01Z\"}\n"
             ),
         )
         .unwrap();
@@ -37348,8 +37376,8 @@ mod tests {
         fs::write(
             &known_event_error,
             concat!(
-                "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
-                "{\"type\":\"event_msg\",\"payload\":{}}\n"
+                "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{}}\n"
             ),
         )
         .unwrap();
@@ -47542,16 +47570,17 @@ mod tests {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 0.0, ModelDollarTotals::default()),
-            // A transient upward reread must not move the line endpoint back
-            // above the last monotonic value.
+            // Valid raw quota values are independent of cumulative model
+            // anomaly filtering, including a subsequent upward reread.
             UsageHistorySample::new(120, 1_000, 10.0, ModelDollarTotals::default()),
         ];
         let references = samples.iter().collect::<Vec<_>>();
         let paths = graph_paths(&references, 0, 120);
         assert_eq!(paths.current_remaining_label, "10%");
         let remaining = remaining_graph_points(&references, 0, 120);
-        assert_eq!(remaining, [(0, 100.0), (60, 100.0), (120, 10.0)]);
-        assert!(paths.remaining.matches('M').count() > 2);
+        assert_eq!(remaining, [(0, 100.0), (60, 0.0), (120, 10.0)]);
+        assert!(!paths.remaining_solid.is_empty());
+        assert!(paths.remaining_inferred.is_empty());
     }
 
     #[test]
@@ -48703,7 +48732,10 @@ mod tests {
     #[test]
     fn final_render_evidence_is_the_single_idle_authority() {
         let sample = |timestamp, remaining| {
-            UsageHistorySample::new(timestamp, 1_000, remaining, ModelDollarTotals::default())
+            let mut sample =
+                UsageHistorySample::new(timestamp, 1_000, remaining, ModelDollarTotals::default());
+            sample.remaining_percent = remaining;
+            sample
         };
         let samples = [
             sample(0, 17.0),
@@ -48811,9 +48843,9 @@ mod tests {
         assert!(!missing_graph.remaining_inferred.is_empty());
         assert!(missing_graph.unused_intervals.is_empty());
 
-        // Dollars are derived from tokens and cannot become a usage
-        // authority. This run is shorter than the idle threshold, so its
-        // token-proven correction remains an ordinary horizontal 3px line.
+        // Saved dollars remain an independent display metric. Token equality
+        // does not flatten their increase, and this run is below the idle
+        // threshold regardless of task activity metadata.
         let mut dollar_change = complete_flat.clone();
         dollar_change
             .get_mut("SOL")
@@ -48855,7 +48887,9 @@ mod tests {
                 Some(&inactive_activity),
             );
         assert!(!changing_graph.sol_flat.is_empty());
-        assert!(changing_graph.sol_rising.is_empty());
+        assert!(!changing_graph.sol_rising.is_empty());
+        assert!(changing_graph.sol_inferred.is_empty());
+        assert_eq!(changing_graph.current_sol_label, "$1.00");
         assert!(changing_graph.unused_intervals.is_empty());
 
         let mut legacy = complete_flat.clone();
@@ -51898,14 +51932,11 @@ mod tests {
         let observed_at = Utc::now().timestamp().div_euclid(60) * 60;
         let current_reset = producer.reset_at.expect("preview reset");
         let historical_reset = current_reset - WEEK_SECONDS;
-        let first = producer
+        let first = historical_reset.div_euclid(60) * 60 - 240;
+        producer
             .history
             .samples
-            .iter()
-            .map(|sample| sample.timestamp)
-            .min()
-            .expect("preview history")
-            - WEEK_SECONDS;
+            .retain(|sample| sample.reset_at != historical_reset);
         for (timestamp, tokens, source, complete, sol, luna) in [
             (
                 first,
@@ -52062,8 +52093,19 @@ mod tests {
             })
             .count();
         assert_eq!(
-            astra_observations, 2,
-            "legacy generic models stay on the lossless service graph path and do not enter the fixed-column compatibility store"
+            astra_observations, 4,
+            "the generic observation carrier preserves every published ASTRA row"
+        );
+        assert_eq!(
+            client
+                .history
+                .samples
+                .iter()
+                .filter(|sample| sample.reset_at == historical.reset_at)
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            [first + 120, first + 180],
+            "only complete confirmed fixed-column rows enter the compatibility samples"
         );
         let astra_points = client.graph_model_points_for_selection(
             historical.reset_at,
@@ -52094,6 +52136,7 @@ mod tests {
         );
         assert!(paths.astra_flat.is_empty());
         assert!(!paths.astra_rising.is_empty());
+        assert!(historical.end_at.div_euclid(60) > (first + 180).div_euclid(60));
         assert!(!paths.astra_inferred.is_empty());
         assert_eq!(paths.current_astra_label, "$40.00");
         let luna_points = client.graph_model_points_for_selection(
@@ -52135,11 +52178,11 @@ mod tests {
                 .values()
                 .next_back()
                 .map(|point| (point.dollar, point.origin)),
-            Some((30.0, super::GraphModelOrigin::Held)),
+            Some((30.0, super::GraphModelOrigin::Direct)),
         );
         assert_eq!(
             paths.current_luna_label, "$30.00",
-            "the later lower unconfirmed values remain hidden until recovery; raw={luna_points:?}"
+            "the latest directly observed LUNA value is preserved; raw={luna_points:?}"
         );
         assert_eq!(
             paths.current_sol_label,
@@ -52529,7 +52572,14 @@ mod tests {
             graph.unused_intervals.is_empty(),
             "a token increase is usage"
         );
-        assert!(!graph.sol_idle.is_empty(), "SOL is unchanged throughout");
+        assert!(
+            graph.sol_idle.is_empty(),
+            "a model-specific flat is not session-wide idle while LUNA increases"
+        );
+        assert!(
+            !graph.sol_flat.is_empty(),
+            "SOL's unchanged observations remain an ordinary measured line"
+        );
         assert!(
             !graph.luna_rising.is_empty(),
             "LUNA's directly recorded increase remains a rising line"
@@ -52703,9 +52753,10 @@ mod tests {
             super::split_metric_line_paths_with_evidence_and_idle(&repriced_context, |point| {
                 point.sol
             });
-        assert_eq!(idle, "M0.00 50.00 L100.00 50.00");
+        assert!(idle.is_empty());
         assert!(flat.is_empty());
-        assert!(rising.is_empty());
+        assert!(rising.starts_with("M0.00 50.00"));
+        assert!(rising.ends_with("L100.00 49.51"));
         assert!(inferred.is_empty());
     }
 
