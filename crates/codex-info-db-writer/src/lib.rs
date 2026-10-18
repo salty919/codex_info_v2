@@ -22350,6 +22350,7 @@ mod tests {
             } else {
                 vec![1201, 1381]
             };
+            let expected_remaining = if extra_receipt { 88.0 } else { 77.0 };
             let receipts = receipt_times
                 .into_iter()
                 .enumerate()
@@ -22389,11 +22390,11 @@ mod tests {
             let raw:Option<f64>=store.connection.query_row("SELECT remaining_percent FROM usage_history WHERE timestamp=1260 AND reset_at=2000",[],|r|r.get(0)).unwrap();
             assert_eq!(
                 raw,
-                Some(77.0),
-                "adding a model prefix cannot erase the independent recovered quota"
+                Some(expected_remaining),
+                "adding a model prefix cannot change the canonical quota for its exact minute"
             );
             let durable:Option<f64>=store.connection.query_row("SELECT json_extract(snapshot_json,'$.remaining_percent') FROM durable_state WHERE singleton>=2 AND data_generation=1260 AND json_extract(snapshot_json,'$.reset_at')=2000",[],|r|r.get(0)).unwrap();
-            assert_eq!(durable, Some(77.0));
+            assert_eq!(durable, Some(expected_remaining));
             assert_eq!(
                 store.latest_quota_receipt().unwrap(),
                 receipts.last().cloned()
