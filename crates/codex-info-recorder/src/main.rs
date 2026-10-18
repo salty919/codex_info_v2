@@ -27,8 +27,34 @@ use std::time::{Duration, Instant};
 const RECORDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+std::thread_local! {
+    // Simulated stop belongs to its fixture; without an override every
+    // thread still observes the real process-wide signal state.
+    static TEST_SHUTDOWN_REQUESTED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 fn shutdown_requested() -> bool {
+    #[cfg(test)]
+    if let Some(requested) = TEST_SHUTDOWN_REQUESTED.get() {
+        return requested;
+    }
     SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+struct TestShutdownOverride(Option<bool>);
+
+#[cfg(test)]
+impl Drop for TestShutdownOverride {
+    fn drop(&mut self) {
+        TEST_SHUTDOWN_REQUESTED.set(self.0);
+    }
+}
+
+#[cfg(test)]
+fn set_test_shutdown_requested(requested: bool) -> TestShutdownOverride {
+    TestShutdownOverride(TEST_SHUTDOWN_REQUESTED.replace(Some(requested)))
 }
 
 fn shutdown_sleep(duration: Duration) {
@@ -1526,7 +1552,6 @@ mod tests {
             "boundary",
             "stop",
         ] {
-            SHUTDOWN_REQUESTED.store(false, Ordering::Release);
             let mut fixture = issue_362_fixture(&format!("history-after-publication-{case}"));
             fixture.seed_state(false, false);
             fixture
@@ -1599,7 +1624,7 @@ mod tests {
                 trace.borrow_mut().push("history");
                 Ok(())
             };
-            SHUTDOWN_REQUESTED.store(case == "stop", Ordering::Release);
+            let stop = set_test_shutdown_requested(case == "stop");
             let result = complete_cycle_publication_and_wait(
                 publication,
                 &fixture.options,
@@ -1618,7 +1643,7 @@ mod tests {
                 &mut epoch_matches,
                 &mut history,
             );
-            SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+            drop(stop);
             if case == "boundary" {
                 assert!(matches!(
                     result.unwrap_err().downcast_ref::<RecorderError>(),
@@ -3154,6 +3179,53 @@ mod tests {
         assert_eq!(submit_calls, 1);
         assert_eq!(drain_calls, 1);
         assert_eq!(wait_calls, 1);
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn issue604_simulated_shutdown_does_not_stop_another_test_cycle() {
+        let mut fixture = issue_362_fixture("parallel-simulated-stop");
+        fixture.seed_state(false, false);
+        fixture.recorder.run_cycle().expect("normal collection");
+        let anchor = Instant::now();
+        let now = Cell::new(anchor);
+        let mut schedule = FixedRateSchedule::anchored(anchor, Duration::from_secs(60));
+        let result = fixture.poll_result("parallel-async", 2);
+        let (mut submits, mut drains, mut waits) = (0, 0, 0);
+        std::thread::scope(|scope| {
+            let (entered, ready) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let stopping_fixture = scope.spawn(move || {
+                let _stop = set_test_shutdown_requested(true);
+                entered.send(shutdown_requested()).unwrap();
+                let _ = released.recv();
+            });
+            assert!(
+                ready.recv().unwrap(),
+                "the stop fixture must observe its own stop"
+            );
+            let continued = issue_362_drive_cycle(
+                &mut fixture,
+                CyclePublication::NoCommit,
+                LaneHealth::Ready,
+                &mut schedule,
+                &now,
+                Some(result),
+                vec![true; 8],
+                None,
+                &mut submits,
+                &mut drains,
+                &mut waits,
+            );
+            release.send(()).unwrap();
+            stopping_fixture.join().unwrap();
+            assert!(
+                continued.expect("independent shared cycle path"),
+                "another test's simulated stop must not stop this cycle"
+            );
+        });
+        assert_eq!((submits, drains, waits), (1, 1, 1));
+        assert_eq!(now.get(), anchor + Duration::from_secs(60));
         fixture.cleanup();
     }
 
