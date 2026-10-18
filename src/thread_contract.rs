@@ -2525,6 +2525,19 @@ mod tests {
         text.into_bytes()
     }
 
+    fn with_fixture_timestamp(mut event: Value, second: u8) -> Value {
+        let object = event
+            .as_object_mut()
+            .expect("recognized rollout fixtures are JSON objects");
+        assert!(object
+            .insert(
+                "timestamp".to_owned(),
+                json!(format!("2026-08-15T00:00:{second:02}Z")),
+            )
+            .is_none());
+        event
+    }
+
     fn rollout_raw_lines(lines: &[&str]) -> Vec<u8> {
         if lines.is_empty() {
             return Vec::new();
@@ -3895,7 +3908,7 @@ mod tests {
         assert_eq!(terminal.ordered_candidates().unwrap().len(), 1);
 
         let source = include_str!("thread_contract.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
         assert!(!production.contains("pub fn candidates("));
         assert!(!production.contains("pub fn raw_candidate_count("));
         assert!(production.contains("pub fn abort(self)"));
@@ -3945,6 +3958,11 @@ mod tests {
             ),
         ];
         for (label, events, expected) in cases {
+            let events = events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| with_fixture_timestamp(event, index as u8 + 1))
+                .collect::<Vec<_>>();
             let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
             assert_eq!(parsed.is_running(), expected, "{label}");
         }
@@ -3961,7 +3979,10 @@ mod tests {
         assert!(candidate.is_active());
         let outcome =
             select_active_threads(terminal_cycle(vec![item]), |_| -> Result<Vec<u8>, ()> {
-                Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_complete"}),
+                    1,
+                )]))
             });
         assert!(matches!(
             outcome,
@@ -3975,7 +3996,10 @@ mod tests {
         let idle = thread_fixture("open-idle", 20, "saved name");
         let outcome =
             select_active_threads(terminal_cycle(vec![idle]), |_| -> Result<Vec<u8>, ()> {
-                Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_complete"}),
+                    1,
+                )]))
             });
         assert_eq!(outcome, ThreadCycleOutcome::NoThread);
     }
@@ -4001,7 +4025,11 @@ mod tests {
                 Some(true) => vec![json!({"type":"task_started"})],
                 Some(false) => vec![json!({"type":"task_complete"})],
                 None => Vec::new(),
-            };
+            }
+            .into_iter()
+            .enumerate()
+            .map(|(event_index, event)| with_fixture_timestamp(event, event_index as u8 + 1))
+            .collect::<Vec<_>>();
             let outcome =
                 select_active_threads(terminal_cycle(vec![item]), |_| -> Result<Vec<u8>, ()> {
                     Ok(rollout_bytes(&events))
@@ -4024,12 +4052,23 @@ mod tests {
     #[test]
     fn thread_c_model_scalar_and_label_complete_matrix() {
         let started = json!({"type":"task_started"});
-        let no_model = parse_rollout(&rollout_bytes(std::slice::from_ref(&started))).unwrap();
+        let no_model = parse_rollout(&rollout_bytes(&[with_fixture_timestamp(
+            started.clone(),
+            1,
+        )]))
+        .unwrap();
         assert_eq!(no_model.model(), "不明");
         assert_eq!(no_model.model_label(), "不明");
 
+        assert_eq!(
+            parse_rollout(&rollout_bytes(&[with_fixture_timestamp(
+                json!({"type":"thread_context","model":""}),
+                1,
+            )])),
+            Err(RolloutError::InvalidKnownEvent)
+        );
+
         for (length, expected_label) in [
-            (0, "不明".to_owned()),
             (1, "界".to_owned()),
             (24, "界".repeat(24)),
             (25, format!("{}…", "界".repeat(23))),
@@ -4037,19 +4076,11 @@ mod tests {
         ] {
             let model = "界".repeat(length);
             let events = [
-                json!({"type":"thread_context","model":model}),
-                started.clone(),
+                with_fixture_timestamp(json!({"type":"thread_context","model":model}), 1),
+                with_fixture_timestamp(started.clone(), 2),
             ];
             let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
-            assert_eq!(
-                parsed.model(),
-                if length == 0 {
-                    "不明"
-                } else {
-                    model.as_str()
-                },
-                "length={length}"
-            );
+            assert_eq!(parsed.model(), model.as_str(), "length={length}");
             assert_eq!(parsed.model_label(), expected_label, "length={length}");
         }
 
@@ -4062,15 +4093,19 @@ mod tests {
             } else {
                 "settings"
             };
-            let parsed = parse_rollout(&rollout_bytes(&[model_event, started.clone()])).unwrap();
+            let parsed = parse_rollout(&rollout_bytes(&[
+                with_fixture_timestamp(model_event, 1),
+                with_fixture_timestamp(started.clone(), 2),
+            ]))
+            .unwrap();
             assert_eq!(parsed.model(), expected);
         }
 
         let overlong = "界".repeat(129);
         assert_eq!(
             parse_rollout(&rollout_bytes(&[
-                json!({"type":"thread_context","model":overlong}),
-                started,
+                with_fixture_timestamp(json!({"type":"thread_context","model":overlong}), 1),
+                with_fixture_timestamp(started, 2),
             ])),
             Err(RolloutError::InvalidKnownEvent)
         );
@@ -4079,43 +4114,67 @@ mod tests {
     #[test]
     fn thread_c_cumulative_total_token_literal_matrix() {
         let events = [
-            json!({"type":"task_started"}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":0,"input_tokens":900,"reasoning_output_tokens":800},
-                "last_token_usage":{"total_tokens":700}
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":999,"input_tokens":1,"cached_input_tokens":2,"output_tokens":3},
-                "last_token_usage":{"total_tokens":999999}
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":1000,"reasoning_output_tokens":u64::MAX},
-                "last_token_usage":{"total_tokens":1}
-            }}}),
-            json!({"type":"token_count","info":{"total_token_usage":{"total_tokens":7}}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":u64::MAX,"input_tokens":1,"output_tokens":1},
-                "last_token_usage":{"total_tokens":2}
-            }}}),
+            with_fixture_timestamp(json!({"type":"task_started"}), 1),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":0,"input_tokens":0,"reasoning_output_tokens":800},
+                    "last_token_usage":{"total_tokens":700}
+                }}}),
+                2,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":999,"input_tokens":4,"cached_input_tokens":2,"output_tokens":3},
+                    "last_token_usage":{"total_tokens":999999}
+                }}}),
+                3,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":1000,"reasoning_output_tokens":u64::MAX},
+                    "last_token_usage":{"total_tokens":1}
+                }}}),
+                4,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":u64::MAX,"input_tokens":1,"output_tokens":1},
+                    "last_token_usage":{"total_tokens":2}
+                }}}),
+                5,
+            ),
         ];
         let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
         assert_eq!(parsed.total_tokens(), Some(u64::MAX));
+        assert_eq!(
+            parse_rollout(&rollout_bytes(&[with_fixture_timestamp(
+                json!({"type":"token_count","info":{"total_token_usage":{"total_tokens":7}}}),
+                1,
+            )])),
+            Err(RolloutError::InvalidKnownEvent)
+        );
     }
 
     #[test]
     fn thread_c_context_window_is_taken_from_the_latest_token_count() {
         let events = [
-            json!({"type":"task_started"}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":10},
-                "last_token_usage":{"total_tokens":8},
-                "model_context_window":128000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":20},
-                "last_token_usage":{"total_tokens":18},
-                "model_context_window":258400
-            }}}),
+            with_fixture_timestamp(json!({"type":"task_started"}), 1),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":10},
+                    "last_token_usage":{"total_tokens":8},
+                    "model_context_window":128000
+                }}}),
+                2,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":20},
+                    "last_token_usage":{"total_tokens":18},
+                    "model_context_window":258400
+                }}}),
+                3,
+            ),
         ];
         let parsed = parse_rollout(&rollout_bytes(&events)).unwrap();
         assert_eq!(parsed.total_tokens(), Some(20));
@@ -4123,14 +4182,20 @@ mod tests {
         assert_eq!(parsed.context_window_tokens(), Some(258_400));
 
         let without_field = parse_rollout(&rollout_bytes(&[
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":25},
-                "last_token_usage":{"total_tokens":24},
-                "model_context_window":128000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":30}
-            }}}),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":25},
+                    "last_token_usage":{"total_tokens":24},
+                    "model_context_window":128000
+                }}}),
+                1,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":30}
+                }}}),
+                2,
+            ),
         ]))
         .unwrap();
         assert_eq!(without_field.total_tokens(), Some(30));
@@ -4141,57 +4206,79 @@ mod tests {
     #[test]
     fn issue_362_context_pair_updates_atomically() {
         let parsed = parse_rollout(&rollout_bytes(&[
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":10},
-                "last_token_usage":{"total_tokens":8},
-                "model_context_window":128000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":20},
-                "last_token_usage":{"total_tokens":0},
-                "model_context_window":16000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":30},
-                "last_token_usage":{"total_tokens":40},
-                "model_context_window":0
-            }}}),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":10},
+                    "last_token_usage":{"total_tokens":8},
+                    "model_context_window":128000
+                }}}),
+                1,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":20},
+                    "last_token_usage":{"total_tokens":0},
+                    "model_context_window":16000
+                }}}),
+                2,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":30},
+                    "last_token_usage":{"total_tokens":40},
+                    "model_context_window":32000
+                }}}),
+                3,
+            ),
         ]))
         .unwrap();
 
         assert_eq!(parsed.context_usage_tokens(), Some(40));
-        assert_eq!(parsed.context_window_tokens(), Some(0));
+        assert_eq!(parsed.context_window_tokens(), Some(32_000));
     }
 
     #[test]
     fn issue_362_context_partial_fields_preserve_last_complete_pair() {
         let parsed = parse_rollout(&rollout_bytes(&[
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":10},
-                "last_token_usage":{"total_tokens":400},
-                "model_context_window":16000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":20},
-                "last_token_usage":{"total_tokens":500}
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{
-                "total_token_usage":{"total_tokens":30},
-                "model_context_window":32000
-            }}}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":10},
+                    "last_token_usage":{"total_tokens":400},
+                    "model_context_window":16000
+                }}}),
+                1,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":20},
+                    "last_token_usage":{"total_tokens":500}
+                }}}),
+                2,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"total_tokens":30},
+                    "model_context_window":32000
+                }}}),
+                3,
+            ),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":null}}),
+                4,
+            ),
         ]))
         .unwrap();
 
         assert_eq!(parsed.context_usage_tokens(), Some(400));
         assert_eq!(parsed.context_window_tokens(), Some(16_000));
 
-        let initial_one_sided = parse_rollout(&rollout_bytes(&[
+        let initial_one_sided = parse_rollout(&rollout_bytes(&[with_fixture_timestamp(
             json!({"type":"event_msg","payload":{"type":"token_count","info":{
                 "total_token_usage":{"total_tokens":1},
                 "model_context_window":16000
             }}}),
-        ]))
+            1,
+        )]))
         .unwrap();
         assert_eq!(initial_one_sided.context_usage_tokens(), None);
         assert_eq!(initial_one_sided.context_window_tokens(), None);
@@ -4211,9 +4298,12 @@ mod tests {
             assert_eq!(before.total_tokens(), baseline);
             assert_eq!(before.context_usage_tokens(), Some(0));
             assert_eq!(before.context_window_tokens(), Some(16_000));
-            let bytes = rollout_bytes(&[json!({"type":"event_msg","payload":{
-                "type":"token_count","info":{"total_token_usage":{"total_tokens":17}}
-            }})]);
+            let bytes = rollout_bytes(&[with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{
+                    "type":"token_count","info":{"total_token_usage":{"total_tokens":17}}
+                }}),
+                1,
+            )]);
             parser
                 .apply_reader(&mut Cursor::new(&bytes), bytes.len() as u64)
                 .unwrap();
@@ -4276,9 +4366,9 @@ mod tests {
     #[test]
     fn thread_c_initial_null_token_count_is_a_safe_noop() {
         let rollout = rollout_raw_lines(&[
-            r#"{"type":"task_started"}"#,
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":17}}}}"#,
+            r#"{"timestamp":"2026-08-15T00:00:01Z","type":"task_started"}"#,
+            r#"{"timestamp":"2026-08-15T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+            r#"{"timestamp":"2026-08-15T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":17}}}}"#,
         ]);
         let parsed = parse_rollout(&rollout).expect("null initial token sample is ignored");
         assert!(parsed.is_running());
@@ -4368,16 +4458,17 @@ mod tests {
     #[test]
     fn recoverable_rollout_parser_keeps_running_state_around_large_tool_output() {
         let prefix = rollout_bytes(&[
-            json!({"type":"thread_context","model":"gpt-5.6-luna"}),
-            json!({"type":"task_started"}),
+            with_fixture_timestamp(json!({"type":"thread_context","model":"gpt-5.6-luna"}), 1),
+            with_fixture_timestamp(json!({"type":"task_started"}), 2),
         ]);
         let oversized = format!(
-            "{{\"type\":\"response_item\",\"payload\":\"{}\"}}\n",
+            "{{\"timestamp\":\"2026-08-15T00:00:03Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call_output\",\"output\":\"{}\"}}}}\n",
             "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
         );
-        let suffix = rollout_bytes(&[
+        let suffix = rollout_bytes(&[with_fixture_timestamp(
             json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":321}}}}),
-        ]);
+            4,
+        )]);
         let mut bytes = prefix;
         bytes.extend_from_slice(oversized.as_bytes());
         bytes.extend_from_slice(&suffix);
@@ -4390,35 +4481,35 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_rollout_parser_skips_malformed_non_state_records_only() {
-        let bytes = b"{\"type\":\"thread_context\",\"model\":\"gpt-5.6-luna\"}\n{\"type\":\"task_started\"}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"rate_limits\":{\"primary\":{\"use\n{\"type\":\"task_complete\"}\n";
-        let parsed = parse_rollout_reader_recoverable(&mut Cursor::new(bytes), bytes.len() as u64)
-            .expect("malformed token_count is non-liveness data");
-        assert!(!parsed.is_running());
-        assert_eq!(parsed.model(), "gpt-5.6-luna");
+    fn recoverable_rollout_parser_rejects_unverified_records() {
+        let bytes = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"type\":\"thread_context\",\"model\":\"gpt-5.6-luna\"}\n{\"timestamp\":\"2026-08-15T00:00:02Z\",\"type\":\"task_started\"}\n{\"timestamp\":\"2026-08-15T00:00:03Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"rate_limits\":{\"primary\":{\"use\n{\"timestamp\":\"2026-08-15T00:00:04Z\",\"type\":\"task_complete\"}\n";
+        assert_eq!(
+            parse_rollout_reader_recoverable(&mut Cursor::new(bytes), bytes.len() as u64),
+            Err(RolloutError::InvalidJson)
+        );
 
-        let lifecycle = b"{\"type\":\"task_started\"}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"\n";
+        let lifecycle = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"type\":\"task_started\"}\n{\"timestamp\":\"2026-08-15T00:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"\n";
         assert_eq!(
             parse_rollout_reader_recoverable(&mut Cursor::new(lifecycle), lifecycle.len() as u64),
             Err(RolloutError::InvalidJson)
         );
 
-        let spaced = b"{ \"type\" : \"event_msg\", \"payload\" : { \"type\" : \"token_count\", \"info\" : {\n{\"type\":\"task_complete\"}\n";
-        let parsed =
-            parse_rollout_reader_recoverable(&mut Cursor::new(spaced), spaced.len() as u64)
-                .expect("whitespace-only token_count envelope is non-liveness data");
-        assert!(!parsed.is_running());
+        let spaced = b"{ \"timestamp\":\"2026-08-15T00:00:01Z\", \"type\" : \"event_msg\", \"payload\" : { \"type\" : \"token_count\", \"info\" : {\n{\"timestamp\":\"2026-08-15T00:00:02Z\",\"type\":\"task_complete\"}\n";
+        assert_eq!(
+            parse_rollout_reader_recoverable(&mut Cursor::new(spaced), spaced.len() as u64),
+            Err(RolloutError::InvalidJson)
+        );
 
-        let interrupted_reasoning = b"{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":[{\"text\":\"interrupted\n{\"type\":\"task_complete\"}\n";
-        let parsed = parse_rollout_reader_recoverable(
-            &mut Cursor::new(interrupted_reasoning),
-            interrupted_reasoning.len() as u64,
-        )
-        .expect("interrupted transcript content is non-state data");
-        assert!(!parsed.is_running());
+        let interrupted_reasoning = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":[{\"text\":\"interrupted\n{\"timestamp\":\"2026-08-15T00:00:02Z\",\"type\":\"task_complete\"}\n";
+        assert_eq!(
+            parse_rollout_reader_recoverable(
+                &mut Cursor::new(interrupted_reasoning),
+                interrupted_reasoning.len() as u64,
+            ),
+            Err(RolloutError::InvalidJson)
+        );
 
-        let lifecycle_with_token_word =
-            b"{\"type\":\"task_started\",\"payload\":{\"type\":\"token_count\"\n";
+        let lifecycle_with_token_word = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"type\":\"task_started\",\"payload\":{\"type\":\"token_count\"\n";
         assert_eq!(
             parse_rollout_reader_recoverable(
                 &mut Cursor::new(lifecycle_with_token_word),
@@ -4427,7 +4518,7 @@ mod tests {
             Err(RolloutError::InvalidJson)
         );
 
-        let quoted_words = b"{\"note\":\"\\\"type\\\":\\\"event_msg\\\" and \\\"type\\\":\\\"token_count\\\"\",\"payload\":{\n";
+        let quoted_words = b"{\"timestamp\":\"2026-08-15T00:00:01Z\",\"note\":\"\\\"type\\\":\\\"event_msg\\\" and \\\"type\\\":\\\"token_count\\\"\",\"payload\":{\n";
         assert_eq!(
             parse_rollout_reader_recoverable(
                 &mut Cursor::new(quoted_words),
@@ -4438,23 +4529,47 @@ mod tests {
     }
 
     #[test]
-    fn thread_c_unknown_well_formed_events_do_not_change_snapshot() {
+    fn thread_c_unknown_events_reject_cycle_and_preserve_snapshot() {
         let base = [
-            json!({"type":"thread_context","model":"model-a"}),
-            json!({"type":"task_started"}),
-            json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":321}}}}),
+            with_fixture_timestamp(json!({"type":"thread_context","model":"model-a"}), 1),
+            with_fixture_timestamp(json!({"type":"task_started"}), 2),
+            with_fixture_timestamp(
+                json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":321}}}}),
+                3,
+            ),
         ];
-        let expected = parse_rollout(&rollout_bytes(&base)).unwrap();
-        let with_unknown = [
+        let baseline = rollout_bytes(&base);
+        let mut parser = RolloutAccumulator::new();
+        parser
+            .apply_reader(&mut Cursor::new(&baseline), baseline.len() as u64)
+            .unwrap();
+        let expected = parser.snapshot().unwrap();
+        assert_eq!(expected.total_tokens(), Some(321));
+
+        let unknown_records = [
             json!({"type":"future_top","model":"wrong"}),
-            base[0].clone(),
             json!({"type":"event_msg","payload":{"type":"future_nested","model":"wrong","total_tokens":999}}),
-            base[1].clone(),
             json!({"type":"future_top","payload":{"type":"task_complete"}}),
-            base[2].clone(),
             json!({"unknown":"object"}),
         ];
-        assert_eq!(parse_rollout(&rollout_bytes(&with_unknown)), Ok(expected));
+        for (index, record) in unknown_records.into_iter().enumerate() {
+            let record = if index < 3 {
+                with_fixture_timestamp(record, index as u8 + 4)
+            } else {
+                record
+            };
+            let invalid = rollout_bytes(&[record]);
+            assert_eq!(
+                parser.apply_reader(&mut Cursor::new(&invalid), invalid.len() as u64),
+                Err(RolloutError::InvalidKnownEvent),
+                "unknown record {index}"
+            );
+            assert_eq!(
+                parser.snapshot(),
+                Ok(expected.clone()),
+                "unknown record {index}"
+            );
+        }
     }
 
     #[test]
@@ -4471,6 +4586,7 @@ mod tests {
                 "payload":{}
             }),
             json!({
+                "timestamp":"2026-08-15T00:00:02Z",
                 "type":"event_msg",
                 "payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":777}}}
             }),
@@ -4483,6 +4599,7 @@ mod tests {
 
         assert_eq!(
             parse_rollout(&rollout_bytes(&[json!({
+                "timestamp":"2026-08-15T00:00:01Z",
                 "type":"turn_context",
                 "payload":false
             })])),
@@ -4496,7 +4613,7 @@ mod tests {
             json!({
                 "timestamp":"2026-08-15T00:00:01Z",
                 "type":"event_msg",
-                "payload":{"type":"user_message","message":{"text":"first"}}
+                "payload":{"type":"user_message","message":"first"}
             }),
             json!({
                 "timestamp":"2026-08-15T00:00:02Z",
@@ -4508,15 +4625,16 @@ mod tests {
                 "type":"task_started"
             }),
             json!({
+                "timestamp":"2026-08-15T00:00:04Z",
                 "type":"event_msg",
-                "payload":{"type":"user_message","message":{"text":"no timestamp"}}
+                "payload":{"type":"user_message","message":"latest"}
             }),
         ]);
         let parsed = parse_rollout(&rollout).expect("user events are valid rollout records");
         assert_eq!(
             parsed.last_user_message_at(),
             Some(
-                DateTime::parse_from_rfc3339("2026-08-15T00:00:02Z")
+                DateTime::parse_from_rfc3339("2026-08-15T00:00:04Z")
                     .expect("fixture timestamp")
                     .timestamp()
             )
@@ -4584,11 +4702,14 @@ mod tests {
         let outcome = select_active_threads(cycle, |candidate| -> Result<Vec<u8>, ()> {
             Ok(if candidate.id() == "without-token" {
                 rollout_bytes(&[
-                    json!({"type":"thread_context","model":"model-only"}),
-                    json!({"type":"task_started"}),
+                    with_fixture_timestamp(
+                        json!({"type":"thread_context","model":"model-only"}),
+                        1,
+                    ),
+                    with_fixture_timestamp(json!({"type":"task_started"}), 2),
                 ])
             } else {
-                rollout_bytes(&[json!({"type":"task_complete"})])
+                rollout_bytes(&[with_fixture_timestamp(json!({"type":"task_complete"}), 1)])
             })
         });
         let ThreadCycleOutcome::Snapshots(rows) = outcome else {
@@ -4615,7 +4736,10 @@ mod tests {
         let inactive = terminal_cycle(vec![thread_fixture("inactive", 1, "inactive")]);
         assert_eq!(
             select_active_threads(inactive, |_| -> Result<Vec<u8>, ()> {
-                Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_complete"}),
+                    1,
+                )]))
             }),
             ThreadCycleOutcome::NoThread
         );
@@ -4651,8 +4775,11 @@ mod tests {
             terminal_cycle(rows.clone()),
             |candidate| -> Result<Vec<u8>, ()> {
                 Ok(rollout_bytes(&[
-                    json!({"type":"thread_context","model":candidate.id()}),
-                    json!({"type":"task_started"}),
+                    with_fixture_timestamp(
+                        json!({"type":"thread_context","model":candidate.id()}),
+                        1,
+                    ),
+                    with_fixture_timestamp(json!({"type":"task_started"}), 2),
                 ]))
             },
         );
@@ -4676,9 +4803,9 @@ mod tests {
             terminal_cycle(child_complete_rows),
             |candidate| -> Result<Vec<u8>, ()> {
                 Ok(if candidate.id() == "child" {
-                    rollout_bytes(&[json!({"type":"task_complete"})])
+                    rollout_bytes(&[with_fixture_timestamp(json!({"type":"task_complete"}), 1)])
                 } else {
-                    rollout_bytes(&[json!({"type":"task_started"})])
+                    rollout_bytes(&[with_fixture_timestamp(json!({"type":"task_started"}), 1)])
                 })
             },
         );
@@ -4695,7 +4822,12 @@ mod tests {
         all_complete_rows[1]["status"] = json!({"type":"idle"});
         let all_complete = select_active_threads(
             terminal_cycle(all_complete_rows),
-            |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"turn_aborted"})])) },
+            |_| -> Result<Vec<u8>, ()> {
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"turn_aborted"}),
+                    1,
+                )]))
+            },
         );
         assert_eq!(all_complete, ThreadCycleOutcome::NoThread);
     }
@@ -4715,7 +4847,12 @@ mod tests {
 
         let outcome = select_active_threads(
             terminal_cycle(vec![parent, child]),
-            |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"task_started"})])) },
+            |_| -> Result<Vec<u8>, ()> {
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_started"}),
+                    1,
+                )]))
+            },
         );
         assert!(matches!(
             outcome,
@@ -4774,7 +4911,12 @@ mod tests {
 
         let outcome = select_active_threads(
             terminal_cycle(candidates.clone()),
-            |_| -> Result<Vec<u8>, ()> { Ok(rollout_bytes(&[json!({"type":"task_started"})])) },
+            |_| -> Result<Vec<u8>, ()> {
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_started"}),
+                    1,
+                )]))
+            },
         );
         let ThreadCycleOutcome::Snapshots(rows) = outcome else {
             panic!("a complete open-Session cycle publishes valid thread membership");
@@ -4807,7 +4949,10 @@ mod tests {
                 if candidate.id() == "valid-child" {
                     Err(())
                 } else {
-                    Ok(rollout_bytes(&[json!({"type":"task_started"})]))
+                    Ok(rollout_bytes(&[with_fixture_timestamp(
+                        json!({"type":"task_started"}),
+                        1,
+                    )]))
                 }
             },
         );
@@ -4826,7 +4971,10 @@ mod tests {
             |candidate| candidate.id() == "current",
             |candidate| -> Result<Vec<u8>, ()> {
                 assert_eq!(candidate.id(), "current");
-                Ok(rollout_bytes(&[json!({"type":"task_started"})]))
+                Ok(rollout_bytes(&[with_fixture_timestamp(
+                    json!({"type":"task_started"}),
+                    1,
+                )]))
             },
         );
         assert!(matches!(
@@ -4919,7 +5067,7 @@ mod tests {
             Some(16_000),
         );
         let bytes = rollout_raw_lines(&[
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+            r#"{"timestamp":"2026-08-15T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#,
         ]);
         parser
             .apply_reader(&mut Cursor::new(bytes.as_slice()), bytes.len() as u64)

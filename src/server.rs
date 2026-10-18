@@ -308,6 +308,12 @@ impl PublicDetails {
             if !valid_timestamp(sample.timestamp)
                 || sample.timestamp.rem_euclid(60) != 0
                 || !valid_timestamp(sample.reset_at)
+                || current_reset_sample_exceeds_observation(
+                    sample.reset_at,
+                    sample.timestamp,
+                    self.observed_at,
+                    self.quota.as_ref().map(|quota| quota.reset_at),
+                )
                 || sample
                     .remaining_percent
                     .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
@@ -632,6 +638,12 @@ impl PublicDetailsV2 {
             if !valid_timestamp(sample.timestamp)
                 || sample.timestamp.rem_euclid(60) != 0
                 || !valid_timestamp(sample.reset_at)
+                || current_reset_sample_exceeds_observation(
+                    sample.reset_at,
+                    sample.timestamp,
+                    self.observed_at,
+                    self.quota.as_ref().map(|quota| quota.reset_at),
+                )
                 || !observation_ids.insert((sample.reset_at, sample.timestamp))
                 || previous_key
                     .is_some_and(|previous| previous > (sample.reset_at, sample.timestamp))
@@ -849,6 +861,12 @@ impl PublicDetailsV3 {
             if !valid_timestamp(sample.timestamp)
                 || sample.timestamp.rem_euclid(60) != 0
                 || !valid_timestamp(sample.reset_at)
+                || current_reset_sample_exceeds_observation(
+                    sample.reset_at,
+                    sample.timestamp,
+                    self.observed_at,
+                    self.quota.as_ref().map(|quota| quota.reset_at),
+                )
                 || !keys.insert(key)
                 || previous.is_some_and(|previous| previous > key)
                 || !matches!(
@@ -972,6 +990,16 @@ pub fn validate_public_threads(threads: &[PublicThread]) -> Result<(), ApiSnapsh
 
 fn valid_timestamp(value: i64) -> bool {
     (1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value)
+}
+
+fn current_reset_sample_exceeds_observation(
+    sample_reset_at: i64,
+    sample_timestamp: i64,
+    observed_at: Option<i64>,
+    current_reset_at: Option<i64>,
+) -> bool {
+    current_reset_at == Some(sample_reset_at)
+        && observed_at.is_none_or(|observed_at| sample_timestamp > observed_at)
 }
 
 fn valid_non_negative_rate(value: f64) -> bool {
@@ -4245,6 +4273,17 @@ mod tests {
         no_observed_at.history_periods[0].current = false;
         assert_eq!(
             no_observed_at.validate(),
+            Err(ApiSnapshotError::InvalidHistoryObservation)
+        );
+
+        let mut v3_future_current_reset =
+            PublicDetailsV3::from_v2_compat(&PublicDetailsV2::from(detailed_fixture()));
+        let observed_at = v3_future_current_reset.observed_at.unwrap();
+        v3_future_current_reset.history_periods[0].current = false;
+        v3_future_current_reset.history_periods[0].end_at = observed_at + 60;
+        v3_future_current_reset.history_samples[0].timestamp = observed_at + 60;
+        assert_eq!(
+            v3_future_current_reset.validate(),
             Err(ApiSnapshotError::InvalidHistoryObservation)
         );
     }
