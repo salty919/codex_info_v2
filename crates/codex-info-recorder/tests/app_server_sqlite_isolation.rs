@@ -2141,6 +2141,53 @@ for line in sys.stdin:
         db.execute_batch("PRAGMA query_only=ON").unwrap();
         (db, entry["canonical_confirmation"].clone())
     }
+    type JournalReceipt = (i64, String, i64, bool, String);
+    fn read_journal_receipt(
+        root: &Path,
+        sql: &str,
+        values: &[&dyn rusqlite::ToSql],
+    ) -> Option<JournalReceipt> {
+        let path = root.join("data/history/quota/observations.sqlite3");
+        if !path.is_file() {
+            return None;
+        }
+        let db =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        db.busy_timeout(Duration::from_secs(1)).unwrap();
+        db.execute_batch("PRAGMA query_only=ON").unwrap();
+        db.query_row(sql, values, |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .optional()
+        .unwrap()
+    }
+    fn latest_journal_receipt(root: &Path) -> Option<JournalReceipt> {
+        read_journal_receipt(
+            root,
+            "SELECT sequence,receipt_id,observed_at,account_verified,account_scope
+             FROM quota_observations ORDER BY sequence DESC LIMIT 1",
+            &[],
+        )
+    }
+    fn first_verified_journal_receipt_after(
+        root: &Path,
+        previous_sequence: Option<i64>,
+    ) -> Option<JournalReceipt> {
+        read_journal_receipt(
+            root,
+            "SELECT sequence,receipt_id,observed_at,account_verified,account_scope
+             FROM quota_observations
+             WHERE sequence>?1 AND account_verified=1
+             ORDER BY sequence LIMIT 1",
+            &[&previous_sequence.unwrap_or(0)],
+        )
+    }
     fn checkpoint_state(db: &Connection) -> (i64, String, Value) {
         let (offset, generation, state): (i64, String, String) = db.query_row(
             "SELECT committed_offset,prefix_generation,source_admission FROM session_checkpoints",
@@ -2274,21 +2321,113 @@ for line in sys.stdin:
         "an unproved initial source baseline cannot publish a confirmed empty period"
     );
     drop(db);
+    let previous_journal_sequence = latest_journal_receipt(root.path()).map(|receipt| receipt.0);
 
-    // A second real acquisition occurs after the RPC source binding. Both
-    // counter endpoints are at this accepted receipt's point, with no clock
-    // interpolation or fabricated acquisition observation.
-    let (success, log) = run(root.path(), "success", "period-evidence", false);
-    assert!(success, "official evidence startup failed\n{log}");
+    // Keep the production owner resident until its asynchronous quota fetch
+    // has durably completed. A one-shot owner can finish its collection before
+    // the poller thread begins, so process exit alone is not acquisition proof.
+    let log = root.path().join("binding-period-evidence-resident.log");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codex_info_recorder"));
+    command
+        .args(["--interval-secs", "60"])
+        .env("CODEX_HOME", root.path().join("home"))
+        .env("CODEX_INFO_DATA_DIR", root.path().join("data"))
+        .env("CODEX_INFO_CODEX_BIN", root.path().join("server.py"))
+        .env("BINDING_FIXTURE_ROOT", root.path())
+        .env("BINDING_FIXTURE_MODE", "success")
+        .env_remove("CODEX_INFO_RECORDER_DB")
+        .env_remove("CODEX_INFO_ACCOUNT_DB")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(File::create(&log).unwrap());
+    command.process_group(0);
+    let mut resident = ChildGuard(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let acquired = loop {
+        assert!(
+            resident.0.try_wait().unwrap().is_none(),
+            "period-evidence resident exited before a verified receipt was saved\n{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        if let Some(receipt) =
+            first_verified_journal_receipt_after(root.path(), previous_journal_sequence)
+        {
+            break receipt;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resident did not durably save a verified post-binding quota receipt\n{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        previous_journal_sequence.is_none_or(|previous| acquired.0 > previous),
+        "the post-binding acquisition must have a new durable journal sequence: previous={previous_journal_sequence:?}, acquired={acquired:?}"
+    );
+    assert!(
+        acquired.3,
+        "the post-binding receipt must be verified against the same account: {acquired:?}"
+    );
+    assert!(
+        acquired.2 >= proof_begin,
+        "the post-binding durable receipt must be observed at or after source binding: observed_at={}, proof_begin={proof_begin}",
+        acquired.2
+    );
+    assert!(
+        !acquired.4.is_empty(),
+        "verified receipt has no account scope"
+    );
+    assert!(Command::new("kill")
+        .args(["-TERM", "--", &format!("-{}", resident.id())])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let status = loop {
+        if let Some(status) = resident.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resident did not finish after the verified journal commit\n{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "resident did not exit through normal shutdown: {status}\n{}",
+        fs::read_to_string(&log).unwrap()
+    );
+
+    // Replay offline after the acquisition owner has stopped. This exercises
+    // the journal-to-account-DB restart path without allowing another fetch.
+    let (success, replay_log) = run(root.path(), "offline", "period-evidence-replay", false);
+    assert!(success, "official evidence replay failed\n{replay_log}");
     let (db, _) = database(root.path());
-    let now: i64 = db
+    let (receipt_sequence, now): (i64, i64) = db
         .query_row(
-            "SELECT observed_at FROM quota_receipts ORDER BY sequence DESC LIMIT 1",
-            [],
-            |r| r.get(0),
+            "SELECT sequence,observed_at FROM quota_receipts WHERE receipt_id=?1",
+            [acquired.1.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert!(now >= proof_begin);
+    let account_scope: String = db
+        .query_row(
+            "SELECT account_scope_id FROM storage_partition",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        receipt_sequence == acquired.0 && now == acquired.2,
+        "account DB must replay the exact durable post-binding receipt: journal={acquired:?}, account_db=({receipt_sequence},{now})"
+    );
+    assert_eq!(
+        account_scope, acquired.4,
+        "account DB receipt must retain the journal's confirmed account ownership"
+    );
     let expected_reset: i64 = fs::read_to_string(root.path().join("reset-at"))
         .unwrap()
         .parse()
