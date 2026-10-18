@@ -857,22 +857,40 @@ public sealed class DetailsPresentationCoverageTests
         var geometry = GraphPlotProjection.PrepareGeometry(graph.Scene);
         var model = geometry.ModelLines[GraphSeries.Astra].Rising.Line;
         var quota = geometry.RemainingLines;
-        Assert.Contains((double)start, model.X);
-        Assert.Equal(0d, model.Y[Array.IndexOf(model.X.ToArray(), start)]);
-        Assert.InRange(model.X.Max(), firstObservation - 4d, firstObservation + 4d);
-        Assert.InRange(model.Y[^1], 256d, 258d);
-        Assert.Contains((double)start, quota.Solid.Line.X);
-        Assert.Equal(100d, quota.Solid.Line.Y[Array.IndexOf(quota.Solid.Line.X.ToArray(), start)]);
-        Assert.InRange(quota.Solid.Line.X.Max(), firstObservation - 4d, firstObservation + 4d);
-        Assert.InRange(quota.Solid.Line.Y[^1], 94.9d, 95.1d);
-        Assert.DoesNotContain((double)start, quota.Dashed.Line.X);
-        Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
+        var sourceModel = GraphPlotProjection.BuildModelLines(graph.Scene, graph.Scene.Astra);
+        var sourceQuota = GraphPlotProjection.BuildRemainingLines(graph.Scene);
+        var sourceLineTimestamps = new[]
+        {
+            sourceModel.Idle, sourceModel.Flat, sourceModel.Rising, sourceModel.Dashed,
+            sourceQuota.Idle, sourceQuota.Solid, sourceQuota.Dashed,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(sourceLineTimestamps, timestamp => Assert.True(timestamp >= firstObservation));
+
+        var firstRenderedObservation = start +
+            Math.Round((firstObservation - start) / (double)(end - start) * 100, 2, MidpointRounding.ToEven) *
+            (end - start) / 100d;
+        var renderedLineTimestamps = new[]
+        {
+            geometry.ModelLines[GraphSeries.Astra].Idle.Line,
+            geometry.ModelLines[GraphSeries.Astra].Flat.Line,
+            model,
+            geometry.ModelLines[GraphSeries.Astra].Dashed.Line,
+            quota.Idle.Line,
+            quota.Solid.Line,
+            quota.Dashed.Line,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(renderedLineTimestamps, timestamp => Assert.True(timestamp >= firstRenderedObservation));
+        Assert.DoesNotContain((double)start, renderedLineTimestamps);
+        Assert.Empty(quota.Solid.Line.X);
+        var quotaStartIndex = Array.FindIndex(quota.Dashed.Line.X.ToArray(),
+            timestamp => Math.Abs(timestamp - firstRenderedObservation) < 0.000001);
+        Assert.True(quotaStartIndex >= 0);
+        Assert.Equal(95d, quota.Dashed.Line.Y[quotaStartIndex], precision: 2);
+        Assert.Equal([firstObservation, end], graph.Scene.Timestamps.Select(timestamp => (long)timestamp));
         Assert.Single(graph.Scene.HoverObservations);
         Assert.Equal(firstObservation, graph.Scene.HoverObservations[0].Timestamp);
-        Assert.Contains(95d, graph.Scene.ObservedRemainingValues);
-        Assert.DoesNotContain(100d, graph.Scene.ObservedRemainingValues);
-        Assert.Contains(257d, graph.Scene.Astra);
-        Assert.DoesNotContain(0d, graph.Scene.Astra);
+        Assert.Equal([95d, double.NaN], graph.Scene.ObservedRemainingValues);
+        Assert.Equal([257d, 257d], graph.Scene.Astra);
     }
 
     [Fact]
@@ -895,19 +913,37 @@ public sealed class DetailsPresentationCoverageTests
         await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
 
         var geometry = GraphPlotProjection.PrepareGeometry(graph.Scene);
-        var model = geometry.ModelLines[GraphSeries.Astra].Flat.Line;
-        var quota = geometry.RemainingLines.Solid.Line;
-        Assert.Contains((double)start, model.X);
-        Assert.All(model.Y.Where(double.IsFinite), value => Assert.Equal(0d, value));
-        Assert.InRange(model.X.Max(), firstObservation - 4d, firstObservation + 4d);
-        Assert.Contains((double)start, quota.X);
-        Assert.All(quota.Y.Where(double.IsFinite), value => Assert.Equal(100d, value));
-        Assert.InRange(quota.X.Max(), firstObservation - 4d, firstObservation + 4d);
-        Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
+        var sourceModel = GraphPlotProjection.BuildModelLines(graph.Scene, graph.Scene.Astra);
+        var sourceQuota = GraphPlotProjection.BuildRemainingLines(graph.Scene);
+        var sourceLineTimestamps = new[]
+        {
+            sourceModel.Idle, sourceModel.Flat, sourceModel.Rising, sourceModel.Dashed,
+            sourceQuota.Idle, sourceQuota.Solid, sourceQuota.Dashed,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(sourceLineTimestamps, timestamp => Assert.True(timestamp >= firstObservation));
+
+        var firstRenderedObservation = start +
+            Math.Round((firstObservation - start) / (double)(end - start) * 100, 2, MidpointRounding.ToEven) *
+            (end - start) / 100d;
+        var model = geometry.ModelLines[GraphSeries.Astra];
+        var quota = geometry.RemainingLines;
+        var renderedLineTimestamps = new[]
+        {
+            model.Idle.Line, model.Flat.Line, model.Rising.Line, model.Dashed.Line,
+            quota.Idle.Line, quota.Solid.Line, quota.Dashed.Line,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(renderedLineTimestamps, timestamp => Assert.True(timestamp >= firstRenderedObservation));
+        Assert.DoesNotContain((double)start, renderedLineTimestamps);
+        Assert.Empty(quota.Solid.Line.X);
+        var quotaStartIndex = Array.FindIndex(quota.Dashed.Line.X.ToArray(),
+            timestamp => Math.Abs(timestamp - firstRenderedObservation) < 0.000001);
+        Assert.True(quotaStartIndex >= 0);
+        Assert.Equal(100d, quota.Dashed.Line.Y[quotaStartIndex], precision: 2);
+        Assert.Equal([firstObservation, end], graph.Scene.Timestamps.Select(timestamp => (long)timestamp));
         Assert.Single(graph.Scene.HoverObservations);
         Assert.Equal(firstObservation, graph.Scene.HoverObservations[0].Timestamp);
-        Assert.Contains(0d, graph.Scene.Astra);
-        Assert.Contains(100d, graph.Scene.ObservedRemainingValues);
+        Assert.Equal([0d, 0d], graph.Scene.Astra);
+        Assert.Equal([100d, double.NaN], graph.Scene.ObservedRemainingValues);
     }
 
     [Fact]
@@ -930,17 +966,37 @@ public sealed class DetailsPresentationCoverageTests
         await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
 
         var geometry = GraphPlotProjection.PrepareGeometry(graph.Scene);
-        var model = geometry.ModelLines[GraphSeries.Astra].Rising.Line;
-        var quota = geometry.RemainingLines.Solid.Line;
-        Assert.Contains((double)start, model.X);
-        Assert.InRange(model.X.Max(), firstObservation - 4d, firstObservation + 4d);
-        Assert.Contains((double)start, quota.X);
-        Assert.InRange(quota.X.Max(), firstObservation - 4d, firstObservation + 4d);
-        Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
+        var sourceModel = GraphPlotProjection.BuildModelLines(graph.Scene, graph.Scene.Astra);
+        var sourceQuota = GraphPlotProjection.BuildRemainingLines(graph.Scene);
+        var sourceLineTimestamps = new[]
+        {
+            sourceModel.Idle, sourceModel.Flat, sourceModel.Rising, sourceModel.Dashed,
+            sourceQuota.Idle, sourceQuota.Solid, sourceQuota.Dashed,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(sourceLineTimestamps, timestamp => Assert.True(timestamp >= firstObservation));
+
+        var firstRenderedObservation = start +
+            Math.Round((firstObservation - start) / (double)(end - start) * 100, 2, MidpointRounding.ToEven) *
+            (end - start) / 100d;
+        var model = geometry.ModelLines[GraphSeries.Astra];
+        var quota = geometry.RemainingLines;
+        var renderedLineTimestamps = new[]
+        {
+            model.Idle.Line, model.Flat.Line, model.Rising.Line, model.Dashed.Line,
+            quota.Idle.Line, quota.Solid.Line, quota.Dashed.Line,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(renderedLineTimestamps, timestamp => Assert.True(timestamp >= firstRenderedObservation));
+        Assert.DoesNotContain((double)start, renderedLineTimestamps);
+        Assert.Empty(quota.Solid.Line.X);
+        var quotaStartIndex = Array.FindIndex(quota.Dashed.Line.X.ToArray(),
+            timestamp => Math.Abs(timestamp - firstRenderedObservation) < 0.000001);
+        Assert.True(quotaStartIndex >= 0);
+        Assert.Equal(95d, quota.Dashed.Line.Y[quotaStartIndex], precision: 2);
+        Assert.Equal([firstObservation, end], graph.Scene.Timestamps.Select(timestamp => (long)timestamp));
         Assert.Single(graph.Scene.HoverObservations);
         Assert.Equal(firstObservation, graph.Scene.HoverObservations[0].Timestamp);
-        Assert.DoesNotContain(0d, graph.Scene.Astra);
-        Assert.DoesNotContain(100d, graph.Scene.ObservedRemainingValues);
+        Assert.Equal([257d, 257d], graph.Scene.Astra);
+        Assert.Equal([95d, double.NaN], graph.Scene.ObservedRemainingValues);
     }
 
     [Fact]
@@ -960,24 +1016,39 @@ public sealed class DetailsPresentationCoverageTests
         await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
 
         var geometry = GraphPlotProjection.PrepareGeometry(graph.Scene);
-        var quota = geometry.RemainingLines.Solid.Line;
+        var quota = geometry.RemainingLines;
         Assert.Contains(start, graph.Scene.PublishedPeriodStarts);
         Assert.False(graph.Scene.IsVerifiedCurrentResetStart);
-        Assert.Equal((double)start, quota.X[0]);
-        Assert.Equal(100d, quota.Y[0]);
-        Assert.InRange(quota.X[^1], firstObservation - 4d, firstObservation + 4d);
-        Assert.Equal(95d, quota.Y[^1], precision: 8);
-        var model = geometry.ModelLines[GraphSeries.Astra].Rising.Line;
-        var modelOrigin = Array.IndexOf(model.X.ToArray(), (double)start);
-        Assert.True(modelOrigin >= 0);
-        Assert.Equal(0d, model.Y[modelOrigin]);
+        var sourceModel = GraphPlotProjection.BuildModelLines(graph.Scene, graph.Scene.Astra);
+        var sourceQuota = GraphPlotProjection.BuildRemainingLines(graph.Scene);
+        var sourceLineTimestamps = new[]
+        {
+            sourceModel.Idle, sourceModel.Flat, sourceModel.Rising, sourceModel.Dashed,
+            sourceQuota.Idle, sourceQuota.Solid, sourceQuota.Dashed,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(sourceLineTimestamps, timestamp => Assert.True(timestamp >= firstObservation));
+
+        var firstRenderedObservation = start +
+            Math.Round((firstObservation - start) / (double)(end - start) * 100, 2, MidpointRounding.ToEven) *
+            (end - start) / 100d;
+        var model = geometry.ModelLines[GraphSeries.Astra];
+        var renderedLineTimestamps = new[]
+        {
+            model.Idle.Line, model.Flat.Line, model.Rising.Line, model.Dashed.Line,
+            quota.Idle.Line, quota.Solid.Line, quota.Dashed.Line,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(renderedLineTimestamps, timestamp => Assert.True(timestamp >= firstRenderedObservation));
+        Assert.DoesNotContain((double)start, renderedLineTimestamps);
+        Assert.Empty(quota.Solid.Line.X);
+        var quotaStartIndex = Array.FindIndex(quota.Dashed.Line.X.ToArray(),
+            timestamp => Math.Abs(timestamp - firstRenderedObservation) < 0.000001);
+        Assert.True(quotaStartIndex >= 0);
+        Assert.Equal(95d, quota.Dashed.Line.Y[quotaStartIndex], precision: 2);
         Assert.Equal(GraphMetric.Tokens, graph.Scene.Metric);
-        Assert.Equal(257d, graph.Scene.Astra[0]);
-        Assert.DoesNotContain(0d, graph.Scene.Astra);
-        Assert.DoesNotContain((double)start, geometry.RemainingLines.Dashed.Line.X);
+        Assert.Equal([firstObservation, end], graph.Scene.Timestamps.Select(timestamp => (long)timestamp));
+        Assert.Equal([257d, 257d], graph.Scene.Astra);
         Assert.DoesNotContain((double)start, graph.Scene.Timestamps);
-        Assert.Equal(95d, graph.Scene.ObservedRemainingValues[0]);
-        Assert.DoesNotContain(100d, graph.Scene.ObservedRemainingValues);
+        Assert.Equal([95d, double.NaN], graph.Scene.ObservedRemainingValues);
         Assert.Single(graph.Scene.HoverObservations);
         Assert.Equal(firstObservation, graph.Scene.HoverObservations[0].Timestamp);
     }
@@ -1001,17 +1072,39 @@ public sealed class DetailsPresentationCoverageTests
 
         var viewport = GraphScene.CreateViewport(viewportStart, end, GraphMetric.Tokens, [graph.Scene]);
         var model = GraphPlotProjection.BuildViewportModelLines(viewport, GraphSeries.Astra).Rising.Line;
-        var remaining = GraphPlotProjection.BuildViewportRemainingLines(viewport).Solid.Line;
+        var viewportModel = GraphPlotProjection.BuildViewportModelLines(viewport, GraphSeries.Astra);
+        var remaining = GraphPlotProjection.BuildViewportRemainingLines(viewport);
+        var sourceModel = GraphPlotProjection.BuildModelLines(graph.Scene, graph.Scene.Astra);
+        var sourceQuota = GraphPlotProjection.BuildRemainingLines(graph.Scene);
+        var sourceLineTimestamps = new[]
+        {
+            sourceModel.Idle, sourceModel.Flat, sourceModel.Rising, sourceModel.Dashed,
+            sourceQuota.Idle, sourceQuota.Solid, sourceQuota.Dashed,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(sourceLineTimestamps, timestamp => Assert.True(timestamp >= firstObservation));
 
-        Assert.Contains((double)viewportStart, model.X);
-        var modelStartIndex = model.X.ToList().IndexOf(viewportStart);
-        Assert.True(model.Y[modelStartIndex] > 0d);
-        Assert.Contains((double)viewportStart, remaining.X);
-        var remainingStartIndex = remaining.X.ToList().IndexOf(viewportStart);
-        Assert.InRange(remaining.Y[remainingStartIndex], 95d, 100d);
-        Assert.True(remaining.Y[remainingStartIndex] < 100d);
+        var firstRenderedObservation = start +
+            Math.Round((firstObservation - start) / (double)(end - start) * 100, 2, MidpointRounding.ToEven) *
+            (end - start) / 100d;
+        var renderedLineTimestamps = new[]
+        {
+            viewportModel.Idle.Line, viewportModel.Flat.Line, model, viewportModel.Dashed.Line,
+            remaining.Idle.Line, remaining.Solid.Line, remaining.Dashed.Line,
+        }.SelectMany(line => line.X).Where(double.IsFinite).ToArray();
+        Assert.All(renderedLineTimestamps, timestamp => Assert.True(timestamp >= firstRenderedObservation));
+        Assert.DoesNotContain((double)viewportStart, renderedLineTimestamps);
+        Assert.DoesNotContain((double)start, renderedLineTimestamps);
+        Assert.Empty(remaining.Solid.Line.X);
+        var quotaStartIndex = Array.FindIndex(remaining.Dashed.Line.X.ToArray(),
+            timestamp => Math.Abs(timestamp - firstRenderedObservation) < 0.000001);
+        Assert.True(quotaStartIndex >= 0);
+        Assert.Equal(95d, remaining.Dashed.Line.Y[quotaStartIndex], precision: 2);
+        Assert.Equal([firstObservation, end], graph.Scene.Timestamps.Select(timestamp => (long)timestamp));
         Assert.DoesNotContain((double)viewportStart, graph.Scene.Timestamps);
-        Assert.DoesNotContain(100d, graph.Scene.ObservedRemainingValues);
+        Assert.Equal([257d, 257d], graph.Scene.Astra);
+        Assert.Equal([95d, double.NaN], graph.Scene.ObservedRemainingValues);
+        Assert.Single(graph.Scene.HoverObservations);
+        Assert.Equal(firstObservation, graph.Scene.HoverObservations[0].Timestamp);
     }
 
     [Fact]
