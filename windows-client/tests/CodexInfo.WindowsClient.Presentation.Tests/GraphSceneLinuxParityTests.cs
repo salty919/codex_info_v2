@@ -201,12 +201,12 @@ public sealed class GraphSceneLinuxParityTests
             };
         }).ToArray();
         var scene = GraphScene.Create(samples, metric, 1_000, 2_080);
-        // The missing model observation at 1780 breaks measured idle even
-        // though task metadata still reports a stop (PRODUCT G137-3).
-        Assert.Equal([new GraphUnusedInterval(1_060, 1_720)],
-            GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+        // Task metadata and saved model values do not establish account
+        // ownership, so this fixture cannot assert an idle interval.
+        Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
         var expected = metric == GraphMetric.Tokens ? 2_411_449 : exactModelIds ? 0.7218804 : 2.443581;
         var lines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
+        Assert.Empty(lines.Idle.Line.X);
         var stoppedPoints = new[] { lines.Idle.Line, lines.Flat.Line, lines.Rising.Line, lines.Dashed.Line }
             .SelectMany(line => line.X.Zip(line.Y))
             .Where(point => point.First > 1_061 && point.First < 1_959)
@@ -230,8 +230,10 @@ public sealed class GraphSceneLinuxParityTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void Issue621SlowerRecordedUsageDoesNotExtendTaskIdle(bool exactModelIds)
+    public void Issue621RecordedHistoryWithoutOwnershipDoesNotEstablishIdle(bool exactModelIds)
     {
+        // Former name: Issue621SlowerRecordedUsageDoesNotExtendTaskIdle.
+        // Saved token totals lack ownership evidence, so they cannot confirm an idle interval.
         // Minutes are relative to 06:03. Actual cumulative SOL values from
         // 10/13: the increase at 06:09 precedes the 06:09–06:24 stop.
         var values = new Dictionary<int, ulong>
@@ -265,14 +267,14 @@ public sealed class GraphSceneLinuxParityTests
             .ToArray();
         var scene = GraphScene.Create(samples, GraphMetric.Tokens, 1_000, 2_320);
 
-        // The unavailable observation at 2080 cannot extend a measured band.
-        Assert.Equal([new GraphUnusedInterval(1_360, 2_020)],
-            GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+        Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
         Assert.Equal(2_097_645d, scene.Sol[Array.IndexOf(samples.Select(s => s.Timestamp).ToArray(), 1_300)]);
         Assert.Equal(2_411_449d, scene.Sol[Array.IndexOf(samples.Select(s => s.Timestamp).ToArray(), 1_360)]);
         var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
-        Assert.Contains(1_360d, lines.Idle.X);
-        Assert.All(lines.Idle.Y.Where(double.IsFinite), y => Assert.Equal(2_411_449d, y));
+        Assert.Empty(lines.Idle.X);
+        Assert.Contains(
+            lines.Flat.X.Zip(lines.Flat.Y),
+            point => point.First == 1_360d && point.Second == 2_411_449d);
     }
 
     [Theory]
@@ -515,7 +517,14 @@ public sealed class GraphSceneLinuxParityTests
                 Model("TERRA", 0, 0)))
             .ToArray();
         var expected = new[] { new GraphIdleInterval(1_000, 2_800, false) };
-        Assert.Equal(expected, GraphScene.Create(direct, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+        Assert.Equal(expected, GraphScene.Create(
+            direct,
+            GraphMetric.Dollars,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
 
         var withEstimatedRow = direct
             .Take(15)
@@ -532,7 +541,14 @@ public sealed class GraphSceneLinuxParityTests
                 new GraphIdleInterval(1_000, 1_840, false),
                 new GraphIdleInterval(1_900, 2_800, false),
             ],
-            GraphScene.Create(withEstimatedRow, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+            GraphScene.Create(
+                withEstimatedRow,
+                GraphMetric.Dollars,
+                1_000,
+                2_800,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
 
         var dollarOnlyChange = direct
             .Select((sample, index) => index == 15
@@ -548,7 +564,14 @@ public sealed class GraphSceneLinuxParityTests
             .ToArray();
         Assert.Equal(
             expected,
-            GraphScene.Create(dollarOnlyChange, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+            GraphScene.Create(
+                dollarOnlyChange,
+                GraphMetric.Dollars,
+                1_000,
+                2_800,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
@@ -603,7 +626,14 @@ public sealed class GraphSceneLinuxParityTests
 
         Assert.Equal(
             [new GraphIdleInterval(1_000, 1_600, false)],
-            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
+            GraphScene.Create(
+                samples,
+                GraphMetric.Dollars,
+                1_000,
+                1_600,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
@@ -657,7 +687,14 @@ public sealed class GraphSceneLinuxParityTests
 
         Assert.Equal(
             [new GraphIdleInterval(1_000, 3_040, false)],
-            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 3_040).IdleIntervals);
+            GraphScene.Create(
+                samples,
+                GraphMetric.Dollars,
+                1_000,
+                3_040,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
@@ -672,7 +709,14 @@ public sealed class GraphSceneLinuxParityTests
 
         Assert.Equal(
             [new GraphIdleInterval(1_000, 2_260, false)],
-            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_260).IdleIntervals);
+            GraphScene.Create(
+                samples,
+                GraphMetric.Dollars,
+                1_000,
+                2_260,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]

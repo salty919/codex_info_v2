@@ -453,10 +453,30 @@ public sealed class DetailsWindowViewModelTests
             [current, old], current.Samples.Concat(old.Samples).ToArray(), [], "estimated")
         {
             PublishedPair = PublishedPairTestFixtures.Canonical,
+            AccountId = "account-1",
         };
         using var main = new MainWindowViewModel(
             new SingleCombinedClient(DetailsFetchResult.Success(details)),
             new SingleDetailsClient(DetailsFetchResult.Success(details)));
+        var applyAccounts = typeof(MainWindowViewModel).GetMethod(
+            "ApplyAccountsSnapshot",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.True(applyAccounts is not null, "Missing account-directory test seam.");
+        var applied = applyAccounts!.Invoke(main,
+        [
+            new ApiAccountsSnapshot(
+                "account-1",
+                [new ApiAccount("account-1", true, oldStart, null)
+                {
+                    OwnershipIntervals = [new ApiAccountOwnershipInterval(oldStart, null)],
+                }]),
+        ]);
+        Assert.True(Assert.IsType<bool>(applied));
+        var selectedAccount = Assert.IsType<ApiAccount>(main.SelectedAccount);
+        Assert.Equal("account-1", selectedAccount.Id);
+        var ownership = Assert.Single(selectedAccount.OwnershipIntervals!);
+        Assert.Equal(oldStart, ownership.StartAt);
+        Assert.Null(ownership.EndAt);
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
 
@@ -481,8 +501,8 @@ public sealed class DetailsWindowViewModelTests
         Assert.Equal(oldStart, graph.SelectedPeriodStartAt);
         Assert.Equal(GraphWindowViewModel.MaxRenderedGraphPoints, graph.Points.Count);
         Assert.Equal(5_001, graph.Scene.Timestamps.Count);
-        // Missing lifecycle metadata does not erase exact cumulative token and
-        // Remaining evidence. The synthetic period-end hold is not part of idle.
+        // Missing task-lifecycle metadata does not erase exact cumulative token
+        // and Remaining evidence. The synthetic period-end hold is not part of idle.
         var idle = Assert.Single(graph.Scene.IdleIntervals);
         Assert.Equal(oldStart, idle.StartAt);
         Assert.Equal(oldStart + 4_999L * 60, idle.EndAt);

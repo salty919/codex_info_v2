@@ -563,7 +563,8 @@ public sealed class GraphScene
             end,
             idleBoundaries,
             tokenProjection,
-            recoverableSamplingSlots);
+            recoverableSamplingSlots,
+            accountOwnershipIntervals);
         var semanticProjection = metric == GraphMetric.Dollars
             ? dollarProjection
             : tokenProjection;
@@ -1564,6 +1565,7 @@ public sealed class GraphScene
         IReadOnlyList<GraphConfirmedGap> confirmedGaps,
         ModelProjection tokenProjection,
         IReadOnlySet<int> recoverableSamplingSlots,
+        IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals,
         string? modelName = null)
     {
         if (periodEnd <= periodStart || samples.Count < 2)
@@ -1592,6 +1594,10 @@ public sealed class GraphScene
             if (right.Timestamp <= left.Timestamp ||
                 left.ResetAt != right.ResetAt ||
                 !TokenVectorsEqual(before.Vector, after.Vector) ||
+                !IsCoveredByOneOwnershipInterval(
+                    left.Timestamp,
+                    right.Timestamp,
+                    accountOwnershipIntervals) ||
                 modelName is null && !SameRecordedRemaining(left, right) ||
                 HasConfirmedGapBetween(
                     confirmedGaps,
@@ -1637,6 +1643,22 @@ public sealed class GraphScene
         return merged
             .Where(interval => interval.EndAt - interval.StartAt >= SustainedUnusedMinimumSeconds)
             .ToArray();
+    }
+
+    private static bool IsCoveredByOneOwnershipInterval(
+        long startAt,
+        long endAt,
+        IReadOnlyList<GraphAccountOwnershipInterval>? ownershipIntervals)
+    {
+        if (ownershipIntervals is null)
+        {
+            return false;
+        }
+
+        return ownershipIntervals.Any(interval =>
+            interval.StartAt is { } ownershipStartAt &&
+            ownershipStartAt <= startAt &&
+            (interval.EndAt is not { } ownershipEndAt || endAt < ownershipEndAt));
     }
 
     private static bool HasIdleContradiction(
