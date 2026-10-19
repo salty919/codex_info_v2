@@ -3545,6 +3545,19 @@ function Assert-E2EFixtureV3PreflightResponses {
     Assert-E2E ($pastPeriod.Count -eq 1) 'Fixture must contain exactly one e2e-past period.'
     [Int64]$pastStart = [Int64]$pastPeriod[0].start_at
     [Int64]$pastEnd = [Int64]$pastPeriod[0].end_at
+    if ($GraphThemes -or $ThemePresets) {
+        $fixtureAccounts = @($json['accounts'].accounts | Where-Object { $_.id -ceq 'account-7' })
+        Assert-E2E ($fixtureAccounts.Count -eq 1) 'Theme fixture must expose exactly one account-7 owner.'
+        $fixtureAccount = $fixtureAccounts[0]
+        $ownershipIntervals = @($fixtureAccount.ownership_intervals)
+        Assert-E2E ([Int64]$fixtureAccount.activation_at -le $pastStart -and
+            $ownershipIntervals.Count -eq 1 -and
+            [Int64]$ownershipIntervals[0].start_at -le $pastStart -and
+            ($null -eq $ownershipIntervals[0].end_at -or
+                [Int64]$ownershipIntervals[0].end_at -ge $pastEnd)) `
+            'Theme fixture account ownership does not cover the full past history interval.'
+        Write-E2E 'fixture-past-ownership: PASS account ownership covers full past history'
+    }
     [Int64]$pastSpan = $pastEnd - $pastStart
     [Int64]$expectedIdleStart = $pastStart + [Int64]($pastSpan * $script:e2eFixturePastIdleStartFraction)
     [Int64]$expectedIdleEnd = $pastStart + [Int64]($pastSpan * $script:e2eFixturePastIdleEndFraction)
@@ -3684,12 +3697,12 @@ function New-E2EFixtureDocuments {
     # compact, while the v3 UI fixture proves that real threshold explicitly.
     $v3PastReset = if ($GraphThemes) { $now - 259200 } else { $now - 3600 }
     $v3PastStart = $v3PastReset - $(if ($GraphThemes) { 345600 } else { 4 * $script:e2eFixtureUnusedMinimumSeconds })
-    $accountActivation = if ($GraphThemes) { $v3PastStart } else { $currentStart }
+    $accountActivation = if ($GraphThemes -or $ThemePresets) { $v3PastStart } else { $currentStart }
     $v3PastSpan = $v3PastReset - $v3PastStart
     $v3PastIdleStart = $v3PastStart + [Int64]($v3PastSpan * $script:e2eFixturePastIdleStartFraction)
     $v3PastIdleEnd = $v3PastStart + [Int64]($v3PastSpan * $script:e2eFixturePastIdleEndFraction)
     $publishedPair = 'v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-    $accountOwnership = if ($GraphThemes) {
+    $accountOwnership = if ($GraphThemes -or $ThemePresets) {
         ',"ownership_intervals":[{"start_at":' + $v3PastStart + ',"end_at":null}]'
     } else {
         ''

@@ -598,7 +598,14 @@ public sealed class GraphSceneLinuxParityTests
             V3Sample(2_800, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)),
         };
 
-        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+        Assert.Empty(GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
@@ -659,7 +666,14 @@ public sealed class GraphSceneLinuxParityTests
                 : V3Sample(1_000 + minute * 60, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)))
             .ToArray();
 
-        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
+        Assert.Empty(GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            1_000,
+            1_600,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
