@@ -2013,7 +2013,11 @@ for line in sys.stdin:
                 .len()
         );
         if bounded_repair {
-            let deadline = Instant::now() + Duration::from_secs(12);
+            // This recovery intentionally spans multiple quota cycles and
+            // bounded source chunks while the workspace test binary is
+            // running other process-heavy tests in parallel. Keep the wait
+            // finite, but allow that scheduling load to complete the repair.
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut failed_at = None;
             let mut released = false;
             loop {

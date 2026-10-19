@@ -413,22 +413,38 @@ public sealed class GraphPlotControlTests
             })
             .ToArray();
         var hidden = new HashSet<string>(StringComparer.Ordinal) { "TERRA" };
-        var dollars = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800);
+        var dollars = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
         var hiddenDollars = GraphScene.Create(
             samples,
             GraphMetric.Dollars,
             1_000,
             2_800,
             confirmedGaps: null,
-            hiddenModelNames: hidden);
-        var tokens = GraphScene.Create(samples, GraphMetric.Tokens, 1_000, 2_800);
+            hiddenModelNames: hidden,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
+        var tokens = GraphScene.Create(
+            samples,
+            GraphMetric.Tokens,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
         var hiddenTokens = GraphScene.Create(
             samples,
             GraphMetric.Tokens,
             1_000,
             2_800,
             confirmedGaps: null,
-            hiddenModelNames: hidden);
+            hiddenModelNames: hidden,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
 
         Assert.True(dollars.ModelMaximum > hiddenDollars.ModelMaximum);
         Assert.True(tokens.ModelMaximum > hiddenTokens.ModelMaximum);
@@ -978,7 +994,8 @@ public sealed class GraphPlotControlTests
                 Point(7_000, 90, 1, 0, 0),
             ],
             1_000,
-            87_400);
+            87_400,
+            [new GraphAccountOwnershipInterval(1_000, 87_401)]);
 
         var visible = GraphPlotProjection.BuildVisibleIdleIntervals(scene);
 
@@ -1024,7 +1041,8 @@ public sealed class GraphPlotControlTests
                 Point(1_000, 100, 1, 0, 0),
                 Point(2_800, 100, 1, 0, 0),
                 Point(2_860, 99, 2, 0, 0),
-            ]);
+            ],
+            ownership: [new GraphAccountOwnershipInterval(1_000, 2_861)]);
         Assert.Equal(
             [new GraphIdleInterval(1_000, 2_800, PreserveBoundary: false)],
             scene.IdleIntervals);
@@ -1057,7 +1075,8 @@ public sealed class GraphPlotControlTests
                 Point(1_000, 100, 1, 0, 0),
                 Point(2_800, 100, 1, 0, 0),
                 Point(2_860, 99, 2, 0, 0),
-            ]);
+            ],
+            ownership: [new GraphAccountOwnershipInterval(1_000, 2_861)]);
             Assert.Equal(
                 [new GraphIdleInterval(1_000, 2_800, PreserveBoundary: false)],
                 scene.IdleIntervals);
@@ -1150,7 +1169,14 @@ public sealed class GraphPlotControlTests
 
         foreach (var metric in new[] { GraphMetric.Dollars, GraphMetric.Tokens })
         {
-            var scene = GraphScene.Create(samples, metric, 0, 1_320);
+            var scene = GraphScene.Create(
+                samples,
+                metric,
+                0,
+                1_320,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 1_321)]);
             Assert.Equal([new GraphIdleInterval(0, 600, false)], scene.IdleIntervals);
             foreach (var values in scene.ModelSeries.Values)
             {
@@ -1180,7 +1206,14 @@ public sealed class GraphPlotControlTests
                     .ToArray(),
             },
         };
-        var repricedDollarScene = GraphScene.Create(dollarChange, GraphMetric.Dollars, 0, 600);
+        var repricedDollarScene = GraphScene.Create(
+            dollarChange,
+            GraphMetric.Dollars,
+            0,
+            600,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 601)]);
         Assert.Equal(
             [new GraphIdleInterval(0, 600, false)],
             repricedDollarScene.IdleIntervals);
@@ -1192,7 +1225,14 @@ public sealed class GraphPlotControlTests
         Assert.Equal([(0L, 600L)], SegmentPairs(repricedDollarLines.Rising));
         Assert.Equal([4d, 4.01d], repricedDollarLines.Rising.Y);
 
-        var repricedTokenScene = GraphScene.Create(dollarChange, GraphMetric.Tokens, 0, 600);
+        var repricedTokenScene = GraphScene.Create(
+            dollarChange,
+            GraphMetric.Tokens,
+            0,
+            600,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 601)]);
         Assert.Equal(
             [new GraphIdleInterval(0, 600, false)],
             repricedTokenScene.IdleIntervals);
@@ -1639,7 +1679,11 @@ public sealed class GraphPlotControlTests
             .Select(minute => Point(1_000 + minute * 60, 100, 0, 0, 0))
             .ToArray();
 
-        var intervals = Scene(points, 1_000, 1_600).IdleIntervals;
+        var intervals = Scene(
+            points,
+            1_000,
+            1_600,
+            [new GraphAccountOwnershipInterval(1_000, 1_601)]).IdleIntervals;
 
         Assert.Single(intervals);
         Assert.Equal((1_000L, 1_600L, false), (intervals[0].StartAt, intervals[0].EndAt, intervals[0].PreserveBoundary));
@@ -1649,7 +1693,11 @@ public sealed class GraphPlotControlTests
             Point(1_000, 100, 0, 0, 0),
             Point(1_600, 100, 0, 0, 0),
         };
-        var sparseIntervals = Scene(sparse, 1_000, 1_600).IdleIntervals;
+        var sparseIntervals = Scene(
+            sparse,
+            1_000,
+            1_600,
+            [new GraphAccountOwnershipInterval(1_000, 1_601)]).IdleIntervals;
 
         Assert.Equal(
             [new GraphIdleInterval(1_000, 1_600, false)],
@@ -2652,10 +2700,21 @@ public sealed class GraphPlotControlTests
                     interval[1].GetInt64(),
                     PreserveBoundary: false))
                 .ToArray();
+            // These generated observations all belong to the same synthetic account.
+            // Keep that input premise independent from the expected idle result.
+            IReadOnlyList<GraphAccountOwnershipInterval> ownership =
+                [new GraphAccountOwnershipInterval(start, end + 1)];
 
             foreach (var metric in new[] { GraphMetric.Dollars, GraphMetric.Tokens })
             {
-                var scene = GraphScene.Create(samples, metric, start, end, gaps);
+                var scene = GraphScene.Create(
+                    samples,
+                    metric,
+                    start,
+                    end,
+                    gaps,
+                    hiddenModelNames: null,
+                    accountOwnershipIntervals: ownership);
                 Assert.Equal(expectedIdle, scene.IdleIntervals);
                 var maximumProperty = metric == GraphMetric.Dollars
                     ? "dollar_maximum"
@@ -3080,7 +3139,9 @@ public sealed class GraphPlotControlTests
             Point(4_000, 98, 4, 0, 0),
         };
 
-        var scene = Scene(points);
+        var scene = Scene(
+            points,
+            ownership: [new GraphAccountOwnershipInterval(1_000, 4_001)]);
         var effective = scene.Remaining;
         var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
         var canonicalRemaining = GraphPlotProjection.BuildCanonicalRemainingLines(scene);
@@ -3179,7 +3240,9 @@ public sealed class GraphPlotControlTests
             Point(3_400, 96, 80, 4, 0),
             Point(4_000, 96, 80, 4, 0),
         };
-        var idleModelScene = Scene(idleModelPoints);
+        var idleModelScene = Scene(
+            idleModelPoints,
+            ownership: [new GraphAccountOwnershipInterval(1_000, 4_001)]);
         var idleModel = GraphPlotProjection.BuildCanonicalModelLines(
             idleModelScene,
             idleModelScene.Sol);
@@ -3436,7 +3499,14 @@ public sealed class GraphPlotControlTests
                 10))
             .ToArray();
 
-        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800);
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
 
         Assert.Equal(
@@ -3500,7 +3570,14 @@ public sealed class GraphPlotControlTests
         var singleSlot = Enumerable.Range(0, 11)
             .Select(minute => minute == 5 ? Unavailable(300) : Direct(minute * 60))
             .ToArray();
-        var recovered = GraphScene.Create(singleSlot, GraphMetric.Dollars, 0, 600);
+        var recovered = GraphScene.Create(
+            singleSlot,
+            GraphMetric.Dollars,
+            0,
+            600,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 601)]);
         var recoveredModel = GraphPlotProjection.BuildModelLines(recovered, recovered.Sol);
         var recoveredRemaining = GraphPlotProjection.BuildRemainingLines(recovered);
 
@@ -3520,7 +3597,14 @@ public sealed class GraphPlotControlTests
                 _ => Direct(minute * 60),
             })
             .ToArray();
-        var repricedScene = GraphScene.Create(repriced, GraphMetric.Dollars, 0, 600);
+        var repricedScene = GraphScene.Create(
+            repriced,
+            GraphMetric.Dollars,
+            0,
+            600,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 601)]);
         Assert.Equal([new GraphIdleInterval(0, 600, false)], repricedScene.IdleIntervals);
         var repricedModel = GraphPlotProjection.BuildModelLines(repricedScene, repricedScene.Sol);
         Assert.NotEmpty(repricedModel.Idle.X);
@@ -3555,7 +3639,14 @@ public sealed class GraphPlotControlTests
             .Select(minute => CompleteModelSample(1_000 + minute * 60, 90, 1, 10))
             .ToArray();
 
-        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800);
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
@@ -3569,8 +3660,10 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Saved_legacy_raw_flat_run_across_midnight_is_idle()
+    public void Saved_legacy_raw_flat_run_across_midnight_without_ownership_is_not_idle()
     {
+        // Former name: Saved_legacy_raw_flat_run_across_midnight_is_idle.
+        // Raw legacy values are preserved, but no ownership interval is recorded for this fixture.
         const long start = 1_788_879_300; // 2026-09-08 23:55 JST
         static ApiHistoryModelSample Model(string name, ulong tokens, double dollars) =>
             new(name, null, null, null, dollars) { TotalTokens = tokens };
@@ -3602,19 +3695,24 @@ public sealed class GraphPlotControlTests
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
-        Assert.Equal(
-            [new GraphIdleInterval(start, start + 1_800, false)],
-            scene.IdleIntervals);
+        Assert.Empty(scene.IdleIntervals);
         Assert.Equal([(start + 840, start + 960)], SegmentPairs(model.Dashed));
         Assert.Equal(119.86, scene.Sol[15]);
         Assert.False(scene.ModelLineReliability["SOL"][15]);
-        Assert.Empty(model.Flat.X);
+        Assert.Contains(start, model.Flat.X);
+        Assert.Contains(start + 1_800, model.Flat.X);
+        Assert.Equal(
+            Enumerable.Repeat(119.86, 15)
+                .Append(double.NaN)
+                .Concat(Enumerable.Repeat(119.86, 15)),
+            model.Flat.Y);
         Assert.Empty(model.Rising.X);
-        Assert.Equal(Enumerable.Repeat(119.86, 15).Append(double.NaN).Concat(Enumerable.Repeat(119.86, 15)), model.Idle.Y);
+        Assert.Empty(model.Idle.X);
         Assert.Equal(120.86, samples[15].ModelSamples!.Single(value => value.Name == "SOL").Dollars);
         Assert.All(scene.ModelReliability["SOL"], Assert.False);
-        Assert.Equal(31, remaining.Idle.X.Count);
-        Assert.Empty(remaining.Solid.X);
+        Assert.Empty(remaining.Idle.X);
+        Assert.Equal(31, remaining.Solid.X.Count);
+        Assert.All(remaining.Solid.Y, value => Assert.Equal(79d, value));
         Assert.Empty(remaining.Dashed.X);
     }
 
@@ -3652,7 +3750,14 @@ public sealed class GraphPlotControlTests
                 })
                 .ToArray();
 
-            var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 600);
+            var scene = GraphScene.Create(
+                samples,
+                GraphMetric.Dollars,
+                0,
+                600,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 601)]);
             var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
             var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
@@ -3732,7 +3837,14 @@ public sealed class GraphPlotControlTests
             .Concat(Enumerable.Range(1, 31).Select(minute => Direct(minute * 60)))
             .ToArray();
 
-        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 1_860);
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            0,
+            1_860,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 1_861)]);
 
         Assert.Equal([new GraphIdleInterval(60, 1_860, false)], scene.IdleIntervals);
     }
@@ -3769,7 +3881,14 @@ public sealed class GraphPlotControlTests
                 ? Direct(0, Model("SOL", 100), Model("LUNA", 200))
                 : Direct(minute * 60, Model("SOL", 100), Model("LUNA", 200), Model("TERRA", 300)))
             .ToArray();
-        var scene = GraphScene.Create(oneSided, GraphMetric.Dollars, 0, 1_800);
+        var scene = GraphScene.Create(
+            oneSided,
+            GraphMetric.Dollars,
+            0,
+            1_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 1_801)]);
         Assert.Equal([new GraphIdleInterval(60, 1_800, false)], scene.IdleIntervals);
 
         var disjoint = Enumerable.Range(0, 31)
@@ -3814,7 +3933,14 @@ public sealed class GraphPlotControlTests
                 : Direct(minute * 60, Model("SOL", 100), Model("LUNA", 200)))
             .ToArray();
 
-        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 3_480);
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            0,
+            3_480,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 3_481)]);
 
         Assert.Equal(
             [
@@ -4485,8 +4611,22 @@ public sealed class GraphPlotControlTests
                 : sample)
             .ToArray();
 
-        var unknownScene = GraphScene.Create(unknown, GraphMetric.Dollars, 1_000, 2_800);
-        var activeScene = GraphScene.Create(active, GraphMetric.Dollars, 1_000, 2_800);
+        var unknownScene = GraphScene.Create(
+            unknown,
+            GraphMetric.Dollars,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
+        var activeScene = GraphScene.Create(
+            active,
+            GraphMetric.Dollars,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
 
         Assert.Equal([new GraphIdleInterval(1_000, 2_800, false)], unknownScene.IdleIntervals);
         Assert.Equal([new GraphIdleInterval(1_000, 2_800, false)], activeScene.IdleIntervals);
@@ -4546,7 +4686,14 @@ public sealed class GraphPlotControlTests
                 ModelsComplete = false,
             };
         }).ToArray();
-        var scene = GraphScene.Create(samples, GraphMetric.Tokens, 1_000, 2_800);
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Tokens,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
 
         GraphIdleInterval[] expected = afterTokens < 100
             ? [new GraphIdleInterval(1_000, 1_600, false)]
@@ -4624,7 +4771,14 @@ public sealed class GraphPlotControlTests
             Complete(600, 89, 0, 100, 10, 0, 100, 10),
             Complete(1_200, 88, 0, 100, 20, 0, 100, 20),
         };
-        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 1_200);
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            0,
+            1_200,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 1_201)]);
 
         var luna = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
         var sol = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
@@ -4687,7 +4841,14 @@ public sealed class GraphPlotControlTests
             Complete(600, 90, 1, 100, 0, 1, 100, 0),
             Complete(1_200, 90, 1, 100, 0, 1, 100, 0),
         };
-        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 1_200);
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            0,
+            1_200,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(0, 1_201)]);
 
         var luna = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
         var sol = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
@@ -5768,6 +5929,17 @@ public sealed class GraphPlotControlTests
             $"{Average(Channel(first, 5), Channel(second, 5)):X2}";
     }
 
-    private static GraphScene Scene(IReadOnlyList<ApiHistorySample> points, long? start = null, long? end = null) =>
-        GraphScene.Create(points, GraphMetric.Dollars, start ?? points[0].Timestamp, end ?? points[^1].Timestamp);
+    private static GraphScene Scene(
+        IReadOnlyList<ApiHistorySample> points,
+        long? start = null,
+        long? end = null,
+        IReadOnlyList<GraphAccountOwnershipInterval>? ownership = null) =>
+        GraphScene.Create(
+            points,
+            GraphMetric.Dollars,
+            start ?? points[0].Timestamp,
+            end ?? points[^1].Timestamp,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: ownership);
 }

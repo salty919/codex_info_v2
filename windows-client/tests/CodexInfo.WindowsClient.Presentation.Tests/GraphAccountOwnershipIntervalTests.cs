@@ -181,6 +181,77 @@ public sealed class GraphAccountOwnershipIntervalTests
             timestamp => Assert.True(timestamp >= secondTimestamp));
     }
 
+    [Fact]
+    public void IdleRequiresOneConfirmedOwnershipInterval()
+    {
+        var samples = new[]
+        {
+            CreateSample(1_000),
+            CreateSample(1_600),
+        };
+        var cases = new (IReadOnlyList<GraphAccountOwnershipInterval>? Ownership, GraphIdleInterval[] Expected)[]
+        {
+            (null, []),
+            ([], []),
+            ([new GraphAccountOwnershipInterval(null, null)], []),
+            ([new GraphAccountOwnershipInterval(null, 1_700)], []),
+            ([new GraphAccountOwnershipInterval(900, null)], [new GraphIdleInterval(1_000, 1_600, false)]),
+            ([new GraphAccountOwnershipInterval(900, 1_700)], [new GraphIdleInterval(1_000, 1_600, false)]),
+            ([new GraphAccountOwnershipInterval(900, 1_600)], []),
+        };
+
+        foreach (var (ownership, expectedIdle) in cases)
+        {
+            var scene = GraphScene.Create(
+                samples,
+                GraphMetric.Dollars,
+                1_000,
+                1_600,
+                confirmedGaps: [],
+                hiddenModelNames: null,
+                accountOwnershipIntervals: ownership);
+
+            Assert.Equal(expectedIdle, scene.IdleIntervals);
+            Assert.Equal([94d, 94d], scene.Remaining);
+
+            var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+            var measuredModelX = model.Idle.X.Concat(model.Flat.X).Concat(model.Rising.X).ToArray();
+            Assert.Contains(1_000d, measuredModelX);
+            Assert.Contains(1_600d, measuredModelX);
+            Assert.Empty(model.Dashed.X);
+
+            var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+            var measuredRemainingX = remaining.Idle.X.Concat(remaining.Solid.X).ToArray();
+            Assert.Contains(1_000d, measuredRemainingX);
+            Assert.Contains(1_600d, measuredRemainingX);
+            Assert.Empty(remaining.Dashed.X);
+        }
+    }
+
+    private static ApiHistorySample CreateSample(long timestamp) =>
+        new(
+            timestamp,
+            2_000,
+            94,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            ApiHistorySample.ConfirmedModelSource)
+        {
+            ModelsComplete = true,
+            ModelSamples =
+            [
+                new ApiHistoryModelSample("SOL", 20, 0, 0, 1)
+                {
+                    TotalTokens = 20,
+                    CacheWriteInputTokens = 0,
+                },
+            ],
+        };
+
     private static void AssertOwnershipDashedSegments(
         GraphLineProjection line,
         long firstTimestamp,
