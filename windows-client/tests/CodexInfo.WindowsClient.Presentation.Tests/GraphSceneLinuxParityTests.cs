@@ -10,6 +10,168 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphSceneLinuxParityTests
 {
     [Theory]
+    [InlineData(false, 0)]
+    [InlineData(false, 1)]
+    [InlineData(false, 2)]
+    [InlineData(true, 0)]
+    [InlineData(true, 1)]
+    [InlineData(true, 2)]
+    public void Issue604IdleComparesSavedTokenComponentsAndKnownness(bool legacy, int change)
+    {
+        var source = legacy ? ApiHistorySample.LegacyUnknownModelSource : ApiHistorySample.ConfirmedModelSource;
+        var samples = new[] { 1_000L, 1_600L }.Select((at, index) => new ApiHistorySample(
+            at, 2_000, 90, null, null, null, null, null, null, source)
+        {
+            ModelsComplete = !legacy,
+            ModelSamples =
+            [
+                new ApiHistoryModelSample("gpt-6.1-sol",
+                    index == 1 && change == 0 ? 90ul : 100ul,
+                    index == 1 && change == 2 ? null : index == 1 && change == 1 ? 1ul : 0ul,
+                    index == 1 && change == 0 ? 10ul : 0ul, 1)
+                {
+                    TotalTokens = 100,
+                    CacheWriteInputTokens = 0,
+                },
+            ],
+        }).ToArray();
+        foreach (var metric in new[] { GraphMetric.Tokens, GraphMetric.Dollars })
+        {
+            var scene = GraphScene.Create(samples, metric, 1_000, 1_600);
+            var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+            Assert.Empty(scene.IdleIntervals);
+            Assert.Empty(lines.Idle.X);
+            Assert.Equal([1_000d, 1_600d], lines.Flat.X);
+            Assert.Empty(lines.Dashed.X);
+        }
+    }
+
+    [Theory]
+    [InlineData(ApiHistorySample.ConfirmedModelSource, true, true)]
+    [InlineData(ApiHistorySample.ConfirmedModelSource, false, true)]
+    [InlineData(ApiHistorySample.LegacyUnknownModelSource, false, true)]
+    [InlineData(ApiHistorySample.ConfirmedModelSource, true, false)]
+    [InlineData(ApiHistorySample.ConfirmedModelSource, false, false)]
+    [InlineData(ApiHistorySample.LegacyUnknownModelSource, false, false)]
+    public void Issue604TokenNumericAcceptanceRetainsUInt64Precision(string source, bool complete, bool pulse)
+    {
+        const ulong first = 9_007_199_254_740_992;
+        var raw = pulse ? new[] { first, first + 1, first } : new[] { first + 1, first };
+        var samples = raw.Select((tokens, index) => new ApiHistorySample(
+            1_000 + index * 60, 2_000, 90, null, null, null, null, null, null, source)
+        {
+            ModelsComplete = complete,
+            ModelSamples = [new ApiHistoryModelSample("SOL", tokens, 0, 0, 1)
+            {
+                TotalTokens = tokens,
+                CacheWriteInputTokens = 0,
+            }],
+        }).ToArray();
+        var scene = GraphScene.Create(samples, GraphMetric.Tokens, 1_000, samples[^1].Timestamp);
+        Assert.Equal([1_060L], scene.CorrectionStarts.Order());
+        Assert.False(scene.ModelLineReliability["SOL"][1]);
+        Assert.Equal(raw, samples.Select(sample => sample.ModelSamples![0].TotalTokens!.Value));
+        Assert.Empty(scene.IdleIntervals);
+    }
+
+    [Theory]
+    [InlineData(ApiHistorySample.ConfirmedModelSource, true)]
+    [InlineData(ApiHistorySample.ConfirmedModelSource, false)]
+    [InlineData(ApiHistorySample.LegacyUnknownModelSource, false)]
+    public void SavedUsdChangesAreNotReplacedFromUnchangedTokens(string source, bool complete)
+    {
+        var samples = new[] { (At: 1_000L, Dollars: 1d), (At: 1_600L, Dollars: 2d) }
+            .Select(row => new ApiHistorySample(
+                row.At, 2_000, 90, null, null, null, null, null, null, source)
+            {
+                ModelsComplete = complete,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("SOL", 20, 0, 0, row.Dollars)
+                    {
+                        TotalTokens = 20,
+                        CacheWriteInputTokens = 0,
+                    },
+                ],
+            }).ToArray();
+
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600);
+        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+
+        Assert.Equal([1d, 2d], scene.Sol);
+        Assert.Equal([1_000d, 1_600d], lines.Rising.X);
+        Assert.Equal([1d, 2d], lines.Rising.Y);
+        Assert.Empty(lines.Idle.X);
+        Assert.Empty(lines.Dashed.X);
+        Assert.Equal([1d, 2d], samples.Select(sample => sample.ModelSamples![0].Dollars));
+    }
+
+    [Theory]
+    [InlineData(ApiHistorySample.ConfirmedModelSource, false, 1d)]
+    [InlineData(ApiHistorySample.LegacyUnknownModelSource, false, 1d)]
+    [InlineData(ApiHistorySample.ConfirmedModelSource, true, 3d)]
+    [InlineData(ApiHistorySample.LegacyUnknownModelSource, true, 3d)]
+    public void ModelPulseUsesOriginalGapAndAppliesToLegacySavedValues(
+        string source, bool gap, double expectedMiddle)
+    {
+        var samples = new[] { 1d, 3d, 2d }.Select((dollars, index) => new ApiHistorySample(
+            1_000 + index * 60, 2_000, 90, null, null, null, null, null, null, source)
+        {
+            ModelsComplete = source == ApiHistorySample.ConfirmedModelSource,
+            ModelSamples = [new ApiHistoryModelSample("SOL", 20, 0, 0, dollars)
+            {
+                TotalTokens = 20,
+                CacheWriteInputTokens = 0,
+            }],
+        }).ToArray();
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_120,
+            confirmedGaps: gap ? [new GraphConfirmedGap(1_000, 1_060)] : []);
+
+        Assert.Equal(expectedMiddle, scene.Sol[1]);
+        Assert.Equal(3d, samples[1].ModelSamples![0].Dollars);
+        Assert.Equal(gap, scene.ModelLineReliability["SOL"][1]);
+    }
+
+    [Theory]
+    [InlineData(GraphMetric.Tokens)]
+    [InlineData(GraphMetric.Dollars)]
+    public void Issue604ActualConfirmedPartialValuesRemainMeasured(GraphMetric metric)
+    {
+        // Exact SOL sidecar values from the read-only 2026-10-15 DB snapshot.
+        // Only this model is projected here; the saved set is incomplete.
+        (long At, ulong Total, ulong Input, ulong Cached, ulong Output, double Dollars)[] recorded =
+        [
+            (1_792_060_020, 42_628_014, 42_391_371, 41_169_664, 236_643, 8.926810399999999),
+            (1_792_060_080, 43_329_949, 43_091_879, 41_856_640, 238_070, 9.036842),
+            (1_792_060_140, 43_329_949, 43_091_879, 41_856_640, 238_070, 9.036842),
+        ];
+        var samples = recorded.Select(row => new ApiHistorySample(
+            row.At, 1_792_655_864, null, null, null, null, null, null, null,
+            ApiHistorySample.ConfirmedModelSource)
+        {
+            ModelsComplete = false,
+            ModelSamples =
+            [
+                new ApiHistoryModelSample("gpt-6.1-sol", row.Input, row.Cached, row.Output, row.Dollars)
+                {
+                    TotalTokens = row.Total,
+                    CacheWriteInputTokens = 0,
+                },
+            ],
+        }).ToArray();
+
+        var scene = GraphScene.Create(samples, metric, 1_792_060_020, 1_792_060_140);
+        double[] expected = metric == GraphMetric.Tokens
+            ? [42_628_014, 43_329_949, 43_329_949]
+            : [8.926810399999999, 9.036842, 9.036842];
+
+        Assert.Equal(expected, scene.Sol);
+        Assert.All(scene.ModelLineReliability["SOL"], Assert.True);
+        Assert.Empty(scene.IdleIntervals);
+        Assert.All(samples, sample => Assert.False(sample.ModelsComplete));
+    }
+
+    [Theory]
     [InlineData(false, GraphMetric.Tokens)]
     [InlineData(false, GraphMetric.Dollars)]
     [InlineData(true, GraphMetric.Tokens)]
@@ -39,10 +201,12 @@ public sealed class GraphSceneLinuxParityTests
             };
         }).ToArray();
         var scene = GraphScene.Create(samples, metric, 1_000, 2_080);
-        Assert.Equal([new GraphUnusedInterval(1_060, 1_960)],
-            GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+        // Task metadata and saved model values do not establish account
+        // ownership, so this fixture cannot assert an idle interval.
+        Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
         var expected = metric == GraphMetric.Tokens ? 2_411_449 : exactModelIds ? 0.7218804 : 2.443581;
         var lines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
+        Assert.Empty(lines.Idle.Line.X);
         var stoppedPoints = new[] { lines.Idle.Line, lines.Flat.Line, lines.Rising.Line, lines.Dashed.Line }
             .SelectMany(line => line.X.Zip(line.Y))
             .Where(point => point.First > 1_061 && point.First < 1_959)
@@ -66,8 +230,10 @@ public sealed class GraphSceneLinuxParityTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void Issue621SlowerRecordedUsageDoesNotExtendTaskIdle(bool exactModelIds)
+    public void Issue621RecordedHistoryWithoutOwnershipDoesNotEstablishIdle(bool exactModelIds)
     {
+        // Former name: Issue621SlowerRecordedUsageDoesNotExtendTaskIdle.
+        // Saved token totals lack ownership evidence, so they cannot confirm an idle interval.
         // Minutes are relative to 06:03. Actual cumulative SOL values from
         // 10/13: the increase at 06:09 precedes the 06:09–06:24 stop.
         var values = new Dictionary<int, ulong>
@@ -101,13 +267,14 @@ public sealed class GraphSceneLinuxParityTests
             .ToArray();
         var scene = GraphScene.Create(samples, GraphMetric.Tokens, 1_000, 2_320);
 
-        Assert.Equal([new GraphUnusedInterval(1_360, 2_260)],
-            GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+        Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
         Assert.Equal(2_097_645d, scene.Sol[Array.IndexOf(samples.Select(s => s.Timestamp).ToArray(), 1_300)]);
         Assert.Equal(2_411_449d, scene.Sol[Array.IndexOf(samples.Select(s => s.Timestamp).ToArray(), 1_360)]);
         var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
-        Assert.Contains(1_360d, lines.Idle.X);
-        Assert.All(lines.Idle.Y.Where(double.IsFinite), y => Assert.Equal(2_411_449d, y));
+        Assert.Empty(lines.Idle.X);
+        Assert.Contains(
+            lines.Flat.X.Zip(lines.Flat.Y),
+            point => point.First == 1_360d && point.Second == 2_411_449d);
     }
 
     [Theory]
@@ -116,7 +283,7 @@ public sealed class GraphSceneLinuxParityTests
     [InlineData(false, false, false)]
     [InlineData(true, true, false)]
     [InlineData(null, true, false)]
-    public void Issue621StoppedTasksBoundMissingModelHistory(bool? active, bool resumed, bool legacyBoundary)
+    public void Issue621StoppedTasksDoNotEstablishMissingModelValues(bool? active, bool resumed, bool legacyBoundary)
     {
         var samples = Enumerable.Range(0, 29).Select(minute =>
             (minute == 0 || resumed && minute == 28
@@ -133,23 +300,16 @@ public sealed class GraphSceneLinuxParityTests
         foreach (var metric in new[] { GraphMetric.Tokens, GraphMetric.Dollars })
         {
             var scene = GraphScene.Create(samples, metric, 1_000, 2_680);
-            // Both measured endpoints are authoritative. A missing-model span
-            // containing their positive token delta cannot establish inactivity.
-            if (active != false || resumed)
-            {
-                Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
-                continue;
-            }
-            Assert.Equal([new GraphUnusedInterval(1_060, 2_620)], GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
+            // Task state cannot supply the missing model/quota vector, with
+            // or without a later measured endpoint. Presentation holds remain
+            // predictions and must not be rendered as confirmed idle.
+            Assert.Empty(GraphPlotProjection.BuildVisibleUnusedIntervals(scene));
             var line = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
-            Assert.Contains(1_060d, line.Idle.X);
-            Assert.Contains(2_620d, line.Idle.X);
-            Assert.All(line.Idle.Y.Where(double.IsFinite), y => Assert.Equal(metric == GraphMetric.Tokens ? 100 : 1, y));
-            Assert.DoesNotContain(line.Dashed.X, x => x > 1_060 && x < 2_620);
+            Assert.Empty(line.Idle.X);
+            Assert.NotEmpty(line.Dashed.X);
             var quota = GraphPlotProjection.BuildRemainingLines(scene);
-            Assert.Contains(1_060d, quota.Idle.X);
-            Assert.Contains(2_620d, quota.Idle.X);
-            Assert.All(quota.Idle.Y.Where(double.IsFinite), y => Assert.Equal(93, y));
+            Assert.Empty(quota.Idle.X);
+            Assert.NotEmpty(quota.Dashed.X);
             Assert.Null(samples[10].RemainingPercent);
             Assert.False(samples[10].ModelsComplete);
         }
@@ -320,7 +480,7 @@ public sealed class GraphSceneLinuxParityTests
     [Theory]
     [InlineData(GraphMetric.Dollars)]
     [InlineData(GraphMetric.Tokens)]
-    public void LegacyOutlierCannotRejectOrMoveLaterDirectObservation(GraphMetric metric)
+    public void LegacyIsolatedPulseUsesTheSameRejectionAndRecoveryRule(GraphMetric metric)
     {
         var samples = new[]
         {
@@ -335,12 +495,15 @@ public sealed class GraphSceneLinuxParityTests
 
         var scene = GraphScene.Create(samples, metric, 1_000, 1_120);
 
-        Assert.Equal([100d, 105d, 110d], scene.Sol);
+        Assert.Equal([100d, 100d, 110d], scene.Sol);
         Assert.True(scene.ModelReliability["SOL"][2]);
         Assert.True(scene.TokenReliability["SOL"][2]);
         Assert.False(scene.ModelReliability["SOL"][1]);
-        Assert.Empty(scene.ModelCorrectionStarts["SOL"]);
-        Assert.Empty(scene.TokenCorrectionStarts);
+        Assert.Equal([1_060L], scene.ModelCorrectionStarts["SOL"]);
+        Assert.Equal([1_060L], scene.TokenCorrectionStarts);
+        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        Assert.Equal([1_000d, 1_120d], lines.Dashed.X);
+        Assert.Equal([100d, 110d], lines.Dashed.Y);
     }
 
     [Fact]
@@ -354,7 +517,14 @@ public sealed class GraphSceneLinuxParityTests
                 Model("TERRA", 0, 0)))
             .ToArray();
         var expected = new[] { new GraphIdleInterval(1_000, 2_800, false) };
-        Assert.Equal(expected, GraphScene.Create(direct, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+        Assert.Equal(expected, GraphScene.Create(
+            direct,
+            GraphMetric.Dollars,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
 
         var withEstimatedRow = direct
             .Take(15)
@@ -371,7 +541,14 @@ public sealed class GraphSceneLinuxParityTests
                 new GraphIdleInterval(1_000, 1_840, false),
                 new GraphIdleInterval(1_900, 2_800, false),
             ],
-            GraphScene.Create(withEstimatedRow, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+            GraphScene.Create(
+                withEstimatedRow,
+                GraphMetric.Dollars,
+                1_000,
+                2_800,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
 
         var dollarOnlyChange = direct
             .Select((sample, index) => index == 15
@@ -387,7 +564,14 @@ public sealed class GraphSceneLinuxParityTests
             .ToArray();
         Assert.Equal(
             expected,
-            GraphScene.Create(dollarOnlyChange, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+            GraphScene.Create(
+                dollarOnlyChange,
+                GraphMetric.Dollars,
+                1_000,
+                2_800,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
@@ -414,7 +598,14 @@ public sealed class GraphSceneLinuxParityTests
             V3Sample(2_800, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)),
         };
 
-        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+        Assert.Empty(GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            1_000,
+            2_800,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
@@ -442,7 +633,14 @@ public sealed class GraphSceneLinuxParityTests
 
         Assert.Equal(
             [new GraphIdleInterval(1_000, 1_600, false)],
-            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
+            GraphScene.Create(
+                samples,
+                GraphMetric.Dollars,
+                1_000,
+                1_600,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
@@ -468,7 +666,14 @@ public sealed class GraphSceneLinuxParityTests
                 : V3Sample(1_000 + minute * 60, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)))
             .ToArray();
 
-        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
+        Assert.Empty(GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            1_000,
+            1_600,
+            confirmedGaps: null,
+            hiddenModelNames: null,
+            accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
@@ -496,7 +701,14 @@ public sealed class GraphSceneLinuxParityTests
 
         Assert.Equal(
             [new GraphIdleInterval(1_000, 3_040, false)],
-            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 3_040).IdleIntervals);
+            GraphScene.Create(
+                samples,
+                GraphMetric.Dollars,
+                1_000,
+                3_040,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]
@@ -511,7 +723,14 @@ public sealed class GraphSceneLinuxParityTests
 
         Assert.Equal(
             [new GraphIdleInterval(1_000, 2_260, false)],
-            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_260).IdleIntervals);
+            GraphScene.Create(
+                samples,
+                GraphMetric.Dollars,
+                1_000,
+                2_260,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, null)]).IdleIntervals);
     }
 
     [Fact]

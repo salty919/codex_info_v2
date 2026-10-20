@@ -37,6 +37,7 @@ const MAX_LOGIN_ID_SCALARS: usize = 254;
 const PROFILE_ID_BYTES: usize = 16;
 const INSTALL_KEY_BYTES: usize = 32;
 const SCOPE_ID_BYTES: usize = 32;
+const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -107,9 +108,13 @@ pub struct AccountLifecycleInterval {
 
 impl AccountLifecycleInterval {
     fn validate(self) -> Result<()> {
-        if self.start_at.is_some_and(|value| value <= 0)
-            || self.end_at.is_some_and(|value| value <= 0)
-            || matches!((self.start_at, self.end_at), (Some(start), Some(end)) if start >= end)
+        if self
+            .start_at
+            .is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+            || self
+                .end_at
+                .is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+            || matches!((self.start_at, self.end_at), (Some(start), Some(end)) if start > end)
         {
             return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
         }
@@ -213,6 +218,20 @@ enum RegistryState {
     Initialized,
 }
 
+/// This product's successful initial account-confirmation record. It carries
+/// no provider signature or retrospective billing-owner guarantee.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalAccountConfirmation {
+    rule_version: u32,
+    profile_scope_id: String,
+    account_scope_id: String,
+    storage_epoch: u64,
+    partition_id: String,
+    began_at: i64,
+    ended_at: i64,
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryEntry {
@@ -228,6 +247,8 @@ struct RegistryEntry {
     /// materializes that legacy form before it can be written again.
     #[serde(default, alias = "intervals")]
     lifecycle_intervals: Vec<AccountLifecycleInterval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_confirmation: Option<CanonicalAccountConfirmation>,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -722,14 +743,13 @@ fn validate_metadata(metadata: &ProfileMetadata) -> Result<()> {
     if metadata.schema_version != PROFILE_SCHEMA || metadata.next_storage_epoch == 0 {
         return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
     }
-    decode_fixed::<PROFILE_ID_BYTES>(&metadata.profile_scope_id)?;
-    decode_fixed::<INSTALL_KEY_BYTES>(&metadata.install_key)?;
+    let profile_scope_id = decode_fixed::<PROFILE_ID_BYTES>(&metadata.profile_scope_id)?;
+    let install_key = decode_fixed::<INSTALL_KEY_BYTES>(&metadata.install_key)?;
     let mut maximum_epoch = 0_u64;
     let mut storage_epochs = HashSet::with_capacity(metadata.accounts.len());
     let mut entries_with_intervals = 0_usize;
-    let mut entries_without_intervals = 0_usize;
     for (scope, entry) in &metadata.accounts {
-        decode_fixed::<SCOPE_ID_BYTES>(scope)?;
+        let account_scope_id = decode_fixed::<SCOPE_ID_BYTES>(scope)?;
         if entry.storage_epoch == 0 {
             return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
         }
@@ -739,7 +759,29 @@ fn validate_metadata(metadata: &ProfileMetadata) -> Result<()> {
             // same opaque ID and could cross-wire cache entries.
             return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
         }
-        if entry.activation_timestamp.is_some_and(|value| value <= 0) {
+        if let Some(proof) = &entry.canonical_confirmation {
+            let partition_id = hex::encode(partition_scope(
+                &install_key,
+                &profile_scope_id,
+                &account_scope_id,
+                entry.storage_epoch,
+            )?);
+            if proof.rule_version != 1
+                || proof.profile_scope_id != metadata.profile_scope_id
+                || proof.account_scope_id != *scope
+                || proof.storage_epoch != entry.storage_epoch
+                || proof.partition_id != partition_id
+                || !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&proof.began_at)
+                || !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&proof.ended_at)
+                || proof.began_at > proof.ended_at
+            {
+                return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
+            }
+        }
+        if entry
+            .activation_timestamp
+            .is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+        {
             return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
         }
         if entry
@@ -749,9 +791,7 @@ fn validate_metadata(metadata: &ProfileMetadata) -> Result<()> {
         {
             return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
         }
-        if entry.lifecycle_intervals.is_empty() {
-            entries_without_intervals = entries_without_intervals.saturating_add(1);
-        } else {
+        if !entry.lifecycle_intervals.is_empty() {
             entries_with_intervals = entries_with_intervals.saturating_add(1);
             for interval in &entry.lifecycle_intervals {
                 interval.validate()?;
@@ -764,12 +804,8 @@ fn validate_metadata(metadata: &ProfileMetadata) -> Result<()> {
         }
         maximum_epoch = maximum_epoch.max(entry.storage_epoch);
     }
-    // Empty lifecycle fields are the one explicitly supported legacy form.
-    // A mixture of legacy and migrated entries cannot be assigned a single
-    // authoritative timeline without guessing, so it is rejected.
-    if entries_with_intervals != 0 && entries_without_intervals != 0 {
-        return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
-    }
+    // Missing intervals retain their unknown boundary; they do not invalidate
+    // another account's recorded finite intervals or prove any new ownership.
     if entries_with_intervals != 0 {
         validate_lifecycle_timeline(metadata)?;
     }
@@ -786,11 +822,9 @@ fn lifecycle_sort_key(interval: &AccountLifecycleInterval) -> (i64, i64) {
     )
 }
 
-/// Validate the profile-wide lifecycle timeline.  The union of account
-/// intervals may begin at a finite first admission, but once it begins it
-/// must have exactly adjacent half-open intervals through one and only one
-/// open interval.  This rejects overlap, gaps, reversed ranges, and multiple
-/// current accounts before any database is selected.
+/// Validate recorded ownership without inventing continuity. Gaps and a
+/// closed-only timeline are valid. Empty markers and unknown starts do not
+/// establish positive ownership; known positive intervals cannot overlap.
 fn validate_lifecycle_timeline(metadata: &ProfileMetadata) -> Result<()> {
     let mut intervals = metadata
         .accounts
@@ -803,24 +837,21 @@ fn validate_lifecycle_timeline(metadata: &ProfileMetadata) -> Result<()> {
         })
         .collect::<Vec<_>>();
     intervals.sort_by_key(|(_, interval)| lifecycle_sort_key(interval));
-    if intervals.is_empty() {
-        return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
-    }
     let open_count = intervals
         .iter()
         .filter(|(_, interval)| interval.end_at.is_none())
         .count();
-    if open_count != 1 {
+    if open_count > 1 {
         return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
     }
+    intervals.retain(|(_, interval)| {
+        interval.start_at.is_some() && interval.start_at != interval.end_at
+    });
     for pair in intervals.windows(2) {
         let previous = pair[0].1;
         let next = pair[1].1;
         match (previous.end_at, next.start_at) {
-            (Some(end), Some(start)) if end == start => {}
-            // A finite interval followed by an unbounded-start interval has a
-            // gap at -infinity unless it is the first interval, and a
-            // differing finite boundary is a real gap or overlap.
+            (Some(end), Some(start)) if end <= start => {}
             _ => return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata)),
         }
     }
@@ -905,36 +936,32 @@ fn open_lifecycle_scope(metadata: &ProfileMetadata) -> Result<Option<String>> {
             }
         }
     }
-    if metadata.accounts.is_empty() {
-        Ok(None)
-    } else if open_scope.is_some() {
-        Ok(open_scope)
-    } else {
-        Err(LocatorError::new(LocatorErrorKind::RecoveryRequired))
-    }
+    Ok(open_scope)
 }
 
 fn close_open_lifecycle_interval(metadata: &mut ProfileMetadata, end_at: i64) -> Result<()> {
-    if end_at <= 0 {
+    if !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&end_at) {
         return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
     }
-    let mut closed = false;
+    validate_metadata(metadata)?;
+    let latest_boundary = metadata
+        .accounts
+        .values()
+        .flat_map(|entry| &entry.lifecycle_intervals)
+        .flat_map(|interval| [interval.start_at, interval.end_at])
+        .flatten()
+        .max();
+    if latest_boundary.is_some_and(|boundary| end_at < boundary) {
+        return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+    }
     for entry in metadata.accounts.values_mut() {
         for interval in &mut entry.lifecycle_intervals {
             if interval.end_at.is_none() {
-                if closed || interval.start_at.is_some_and(|start_at| end_at <= start_at) {
-                    return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
-                }
                 interval.end_at = Some(end_at);
-                closed = true;
             }
         }
     }
-    if closed {
-        Ok(())
-    } else {
-        Err(LocatorError::new(LocatorErrorKind::RecoveryRequired))
-    }
+    Ok(())
 }
 
 fn load_metadata(data_root: &Path) -> Result<ProfileMetadata> {
@@ -965,6 +992,16 @@ fn is_known_epoch_artifact(name: &str) -> bool {
 }
 
 fn validate_registry_artifacts(data_root: &Path, metadata: &ProfileMetadata) -> Result<()> {
+    validate_registry_artifacts_with_metadata(data_root, metadata, |path| {
+        fs::symlink_metadata(path)
+    })
+}
+
+fn validate_registry_artifacts_with_metadata(
+    data_root: &Path,
+    metadata: &ProfileMetadata,
+    mut artifact_metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>,
+) -> Result<()> {
     let root = accounts_root(data_root);
     let root_metadata = match fs::symlink_metadata(&root) {
         Ok(value) => value,
@@ -1060,9 +1097,25 @@ fn validate_registry_artifacts(data_root: &Path, metadata: &ProfileMetadata) -> 
                 .file_name()
                 .into_string()
                 .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-            let artifact = fs::symlink_metadata(entry.path())
-                .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-            if !is_known_epoch_artifact(&name) || !validate_artifact_file(&artifact) {
+            if !is_known_epoch_artifact(&name) {
+                return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+            }
+            let artifact = match artifact_metadata(&entry.path()) {
+                Ok(value) => value,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && matches!(
+                            name.as_str(),
+                            "usage_history.sqlite3-journal"
+                                | "usage_history.sqlite3-wal"
+                                | "usage_history.sqlite3-shm"
+                        ) =>
+                {
+                    continue;
+                }
+                Err(_) => return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired)),
+            };
+            if !validate_artifact_file(&artifact) {
                 return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
             }
             database_exists |= name == "usage_history.sqlite3";
@@ -1139,90 +1192,66 @@ pub fn ensure_partition(
     codex_home: impl AsRef<Path>,
     data_root: impl AsRef<Path>,
 ) -> Result<AccountPartition> {
-    ensure_partition_with_activation(codex_home, data_root, None)
+    reserve_partition_at(codex_home, data_root, unix_timestamp_now()?)
 }
 
-/// Select or allocate the current account partition and persist the exact
-/// first-admission boundary only when a new account entry is allocated.
-/// Reopening an existing account never moves its established boundary.
-pub fn ensure_partition_with_activation(
+/// Reserve the raw subject's tuple and record loss of a different subject.
+/// Reservation alone creates no new ownership, confirmation or database.
+pub fn reserve_partition_at(
     codex_home: impl AsRef<Path>,
     data_root: impl AsRef<Path>,
-    activation_timestamp: Option<i64>,
+    observed_at: i64,
 ) -> Result<AccountPartition> {
-    if activation_timestamp.is_some_and(|value| value <= 0) {
+    if !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&observed_at) {
         return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
     }
     let codex_home = validate_absolute_root(codex_home.as_ref())?;
     let data_root = validate_absolute_root(data_root.as_ref())?;
     let account_key = read_account_key(&codex_home)?;
-    let legacy_metadata = load_or_initialize_metadata(&data_root)?;
-    validate_registry_artifacts(&data_root, &legacy_metadata)?;
-
-    let install_key = decode_fixed::<INSTALL_KEY_BYTES>(&legacy_metadata.install_key)?;
+    let mut metadata = load_or_initialize_metadata(&data_root)?;
+    validate_registry_artifacts(&data_root, &metadata)?;
+    let install_key = decode_fixed::<INSTALL_KEY_BYTES>(&metadata.install_key)?;
     let account_scope_id = account_scope(&install_key, &account_key)?;
     let scope_hex = hex::encode(account_scope_id);
-    let mut metadata = project_legacy_lifecycle(&legacy_metadata, &scope_hex)?;
-    let mut metadata_changed = metadata != legacy_metadata;
-
+    let mut metadata_changed = false;
+    if open_lifecycle_scope(&metadata)?.is_some_and(|scope| scope != scope_hex) {
+        close_open_lifecycle_interval(&mut metadata, observed_at)?;
+        metadata_changed = true;
+    }
     let (storage_epoch, state) = if let Some(entry) = metadata.accounts.get(&scope_hex) {
-        let storage_epoch = entry.storage_epoch;
-        let state = entry.state;
-        let current_scope = open_lifecycle_scope(&metadata)?;
-        if current_scope.as_deref() != Some(scope_hex.as_str()) {
-            let transition_timestamp = activation_timestamp.unwrap_or(unix_timestamp_now()?);
-            close_open_lifecycle_interval(&mut metadata, transition_timestamp)?;
-            let entry = metadata
-                .accounts
-                .get_mut(&scope_hex)
-                .ok_or_else(|| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-            entry.lifecycle_intervals.push(AccountLifecycleInterval {
-                start_at: Some(transition_timestamp),
-                end_at: None,
-            });
-            entry.activation_timestamp = Some(transition_timestamp);
-            metadata_changed = true;
-        }
-        (storage_epoch, state)
+        (entry.storage_epoch, entry.state)
     } else {
         let account_directory = accounts_root(&data_root).join(&scope_hex);
-        if !directory_is_empty(&account_directory)? || account_directory.exists() {
+        if account_directory.exists() || !directory_is_empty(&account_directory)? {
             return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
         }
-        let transition_timestamp = if metadata.accounts.is_empty() {
-            activation_timestamp
-        } else {
-            let transition_timestamp = activation_timestamp.unwrap_or(unix_timestamp_now()?);
-            close_open_lifecycle_interval(&mut metadata, transition_timestamp)?;
-            Some(transition_timestamp)
-        };
-        let storage_epoch = metadata.next_storage_epoch;
-        metadata.next_storage_epoch = storage_epoch
+        let epoch = metadata.next_storage_epoch;
+        metadata.next_storage_epoch = epoch
             .checked_add(1)
             .ok_or_else(|| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-        let lifecycle_interval = AccountLifecycleInterval {
-            start_at: transition_timestamp,
-            end_at: None,
-        };
         metadata.accounts.insert(
-            scope_hex.clone(),
+            scope_hex,
             RegistryEntry {
-                storage_epoch,
+                storage_epoch: epoch,
                 state: RegistryState::Allocated,
-                activation_timestamp: lifecycle_interval.start_at,
+                activation_timestamp: None,
                 login_id: None,
-                lifecycle_intervals: vec![lifecycle_interval],
+                lifecycle_intervals: Vec::new(),
+                canonical_confirmation: None,
             },
         );
         metadata_changed = true;
-        (storage_epoch, RegistryState::Allocated)
+        (epoch, RegistryState::Allocated)
     };
-
-    if metadata_changed {
-        validate_metadata(&metadata)?;
-        write_metadata(&data_root, &metadata)?;
+    if read_account_key(&codex_home)? != account_key {
+        return Err(LocatorError::new(LocatorErrorKind::InvalidAuth));
     }
-
+    if metadata_changed {
+        write_metadata(&data_root, &metadata)?;
+        if load_metadata(&data_root)? != metadata {
+            return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+        }
+    }
     let partition =
         partition_from_metadata(&data_root, &metadata, &account_scope_id, storage_epoch)?;
     let epoch_directory = partition
@@ -1267,6 +1296,158 @@ pub fn ensure_partition_with_activation(
     Ok(partition)
 }
 
+/// Trusted producer evidence for this bounded admission group. InitialRpc
+/// requires the recorder's stable same-process RPC and raw-account checks.
+pub enum AccountConfirmation {
+    InitialRpc { began_at: i64 },
+    Saved { began_at: i64 },
+}
+
+fn checked_partition(
+    data_root: &Path,
+    metadata: &ProfileMetadata,
+    partition: &AccountPartition,
+) -> Result<[u8; SCOPE_ID_BYTES]> {
+    let scope = decode_fixed::<SCOPE_ID_BYTES>(&partition.account_scope_id)?;
+    let expected = partition_from_metadata(data_root, metadata, &scope, partition.storage_epoch)?;
+    if expected.storage_identity() != partition.storage_identity()
+        || expected.database_path != partition.database_path
+    {
+        return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+    }
+    Ok(scope)
+}
+
+pub fn partition_requires_confirmation(
+    data_root: impl AsRef<Path>,
+    partition: &AccountPartition,
+) -> Result<bool> {
+    let data_root = validate_absolute_root(data_root.as_ref())?;
+    let metadata = load_metadata(&data_root)?;
+    checked_partition(&data_root, &metadata, partition)?;
+    Ok(metadata.accounts[&partition.account_scope_id]
+        .canonical_confirmation
+        .is_none())
+}
+
+/// Save the successful group and ownership together, then verify the exact
+/// registry readback. The caller holds the profile lease and current epoch.
+pub fn admit_partition(
+    codex_home: impl AsRef<Path>,
+    data_root: impl AsRef<Path>,
+    partition: &AccountPartition,
+    confirmation: AccountConfirmation,
+    finish_group: impl FnOnce() -> Option<i64>,
+) -> Result<AccountPartition> {
+    let codex_home = validate_absolute_root(codex_home.as_ref())?;
+    let data_root = validate_absolute_root(data_root.as_ref())?;
+    let account_key = read_account_key(&codex_home)?;
+    let mut metadata = load_metadata(&data_root)?;
+    validate_registry_artifacts(&data_root, &metadata)?;
+    let scope = checked_partition(&data_root, &metadata, partition)?;
+    let install_key = decode_fixed::<INSTALL_KEY_BYTES>(&metadata.install_key)?;
+    if account_scope(&install_key, &account_key)? != scope {
+        return Err(LocatorError::new(LocatorErrorKind::InvalidAuth));
+    }
+    let (began_at, initial) = match confirmation {
+        AccountConfirmation::InitialRpc { began_at } => (began_at, true),
+        AccountConfirmation::Saved { began_at } => (began_at, false),
+    };
+    if !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&began_at) {
+        return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
+    }
+    let before = metadata.clone();
+    let entry = &metadata.accounts[&partition.account_scope_id];
+    let had_confirmation = entry.canonical_confirmation.is_some();
+    if !initial && !had_confirmation {
+        return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+    }
+    let same_open = had_confirmation
+        && open_lifecycle_scope(&metadata)?.as_deref() == Some(partition.account_scope_id.as_str())
+        && entry
+            .lifecycle_intervals
+            .last()
+            .is_some_and(|i| i.start_at.is_some() && i.end_at.is_none());
+    if !same_open {
+        close_open_lifecycle_interval(&mut metadata, began_at)?;
+        let entry = metadata
+            .accounts
+            .get_mut(&partition.account_scope_id)
+            .unwrap();
+        if entry.state == RegistryState::Initialized && entry.lifecycle_intervals.is_empty() {
+            entry.lifecycle_intervals.push(AccountLifecycleInterval {
+                start_at: entry.activation_timestamp,
+                end_at: Some(began_at),
+            });
+        }
+        entry.lifecycle_intervals.push(AccountLifecycleInterval {
+            start_at: Some(began_at),
+            end_at: None,
+        });
+        entry.activation_timestamp.get_or_insert(began_at);
+    } else if metadata
+        .accounts
+        .values()
+        .flat_map(|e| &e.lifecycle_intervals)
+        .flat_map(|i| [i.start_at, i.end_at])
+        .flatten()
+        .any(|t| t > began_at)
+    {
+        return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+    }
+    if read_account_key(&codex_home)? != account_key {
+        return Err(LocatorError::new(LocatorErrorKind::InvalidAuth));
+    }
+    // The producer performs its final epoch/lease admission and stamps the
+    // group end only after these storage identity and raw-account checks.
+    let ended_at =
+        finish_group().ok_or_else(|| LocatorError::new(LocatorErrorKind::InvalidAuth))?;
+    if !(began_at..=MAX_PUBLIC_UNIX_SECONDS).contains(&ended_at) {
+        return Err(LocatorError::new(LocatorErrorKind::InvalidMetadata));
+    }
+    if !had_confirmation {
+        metadata
+            .accounts
+            .get_mut(&partition.account_scope_id)
+            .unwrap()
+            .canonical_confirmation = Some(CanonicalAccountConfirmation {
+            rule_version: 1,
+            profile_scope_id: partition.profile_scope_id.clone(),
+            account_scope_id: partition.account_scope_id.clone(),
+            storage_epoch: partition.storage_epoch,
+            partition_id: partition.partition_id.clone(),
+            began_at,
+            ended_at,
+        });
+    }
+    validate_metadata(&metadata)?;
+    if metadata != before {
+        write_metadata(&data_root, &metadata)?;
+    }
+    if load_metadata(&data_root)? != metadata {
+        return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+    }
+    partition_from_metadata(&data_root, &metadata, &scope, partition.storage_epoch)
+}
+
+pub fn close_partition_ownership_at(data_root: impl AsRef<Path>, observed_at: i64) -> Result<()> {
+    let data_root = validate_absolute_root(data_root.as_ref())?;
+    match fs::symlink_metadata(metadata_path(&data_root)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        _ => {}
+    }
+    let mut metadata = load_metadata(&data_root)?;
+    let before = metadata.clone();
+    close_open_lifecycle_interval(&mut metadata, observed_at)?;
+    if metadata != before {
+        write_metadata(&data_root, &metadata)?;
+    }
+    if load_metadata(&data_root)? != metadata {
+        return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+    }
+    Ok(())
+}
+
 /// Derive the current auth authority's opaque account scope without
 /// allocating a registry entry or selecting another account's database.
 pub fn current_account_scope_id(
@@ -1306,6 +1487,9 @@ pub fn mark_partition_initialized(
         return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
     }
     if entry.state != RegistryState::Initialized {
+        if entry.canonical_confirmation.is_none() {
+            return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+        }
         entry.state = RegistryState::Initialized;
         write_metadata(&data_root, &metadata)?;
     }
@@ -1349,13 +1533,36 @@ pub fn set_partition_login_id(
     Ok(())
 }
 
+/// Validate only registry-derived paths used by a read-only partition lookup.
+/// Unreferenced siblings are neither authority nor recovery evidence here.
+fn validate_readonly_partition_path(data_root: &Path, partition: &AccountPartition) -> Result<()> {
+    inspect_no_symlink_components(&partition.database_path)
+        .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
+    let accounts = accounts_root(data_root);
+    let account = accounts.join(&partition.account_scope_id);
+    let epoch = account.join(format!("epoch-{}", partition.storage_epoch));
+    for directory in [&accounts, &account, &epoch] {
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
+        if !validate_private_directory(&metadata) {
+            return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+        }
+    }
+    let database_metadata = fs::symlink_metadata(&partition.database_path)
+        .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
+    if !validate_artifact_file(&database_metadata) {
+        return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+    }
+    Ok(())
+}
+
 /// Locate the initialized partition for the exact account in auth.json.
 ///
 /// codex_home contains auth.json; data_root contains
 /// history/account_profile_v1.json. Both roots and authority files are
-/// read-only. A missing registry entry, uninitialized entry, missing
-/// database, unknown artifact, or identity mismatch returns an error instead
-/// of selecting another account's database.
+/// read-only. A missing registry entry, uninitialized entry, unsafe required
+/// path, missing database, or identity mismatch returns an error instead of
+/// selecting another account's database. Unreferenced siblings are ignored.
 pub fn locate_existing_partition(
     codex_home: impl AsRef<Path>,
     data_root: impl AsRef<Path>,
@@ -1369,7 +1576,6 @@ pub fn locate_existing_partition(
     let account_scope_id = account_scope(&install_key, &account_key)?;
     let account_scope_hex = hex::encode(account_scope_id);
     let metadata = project_legacy_lifecycle(&legacy_metadata, &account_scope_hex)?;
-    validate_registry_artifacts(&data_root, &metadata)?;
     let registry = metadata
         .accounts
         .get(&account_scope_hex)
@@ -1391,11 +1597,7 @@ pub fn locate_existing_partition(
     if partition.current_interval_end.is_some() {
         return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
     }
-    let database_metadata = fs::symlink_metadata(&partition.database_path)
-        .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-    if !validate_artifact_file(&database_metadata) {
-        return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
-    }
+    validate_readonly_partition_path(&data_root, &partition)?;
     Ok(partition)
 }
 
@@ -1418,7 +1620,6 @@ pub fn locate_existing_partitions(
     let install_key = decode_fixed::<INSTALL_KEY_BYTES>(&legacy_metadata.install_key)?;
     let current_scope = hex::encode(account_scope(&install_key, &account_key)?);
     let metadata = project_legacy_lifecycle(&legacy_metadata, &current_scope)?;
-    validate_registry_artifacts(&data_root, &metadata)?;
 
     let current_registry = metadata
         .accounts
@@ -1450,14 +1651,7 @@ pub fn locate_existing_partitions(
             &account_scope_id,
             registry.storage_epoch,
         )?;
-        // validate_registry_artifacts checks this for initialized entries;
-        // retain the direct check here so the returned path is proven against
-        // the exact metadata entry even if that helper changes independently.
-        let database_metadata = fs::symlink_metadata(&partition.database_path)
-            .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-        if !validate_artifact_file(&database_metadata) {
-            return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
-        }
+        validate_readonly_partition_path(&data_root, &partition)?;
         // Exercise the install-key-derived identity while constructing every
         // entry; no caller can substitute an arbitrary scope/path pair.
         let expected_partition_id = partition_scope(
@@ -1630,6 +1824,196 @@ mod tests {
     }
 
     #[test]
+    fn issue604_recorded_interval_shapes_accept_empty_gaps_and_closed_states() {
+        let (codex_home, data_root, scope_a, scope_b, _) = fixture();
+        let original = load_metadata(&data_root).unwrap();
+        let interval = |start_at, end_at| AccountLifecycleInterval { start_at, end_at };
+        let cases = [
+            (
+                "empty-transition",
+                vec![interval(Some(100), Some(100))],
+                vec![interval(Some(100), None)],
+                true,
+            ),
+            (
+                "gap",
+                vec![interval(Some(100), Some(200))],
+                vec![interval(Some(230), None)],
+                true,
+            ),
+            (
+                "all-closed",
+                vec![interval(Some(100), Some(200))],
+                vec![interval(Some(230), Some(250))],
+                true,
+            ),
+            (
+                "unknown-and-known",
+                vec![],
+                vec![interval(Some(230), None)],
+                true,
+            ),
+            (
+                "empty-inside-positive",
+                vec![interval(Some(150), Some(150))],
+                vec![interval(Some(100), Some(300))],
+                true,
+            ),
+            (
+                "overlap",
+                vec![interval(Some(100), Some(200))],
+                vec![interval(Some(150), None)],
+                false,
+            ),
+            (
+                "two-open",
+                vec![interval(Some(100), None)],
+                vec![interval(Some(230), None)],
+                false,
+            ),
+            (
+                "upper-bound",
+                vec![interval(Some(1), Some(253_402_300_799))],
+                vec![],
+                true,
+            ),
+            (
+                "outside-bound",
+                vec![interval(Some(1), Some(253_402_300_800))],
+                vec![],
+                false,
+            ),
+            (
+                "reverse",
+                vec![interval(Some(200), Some(100))],
+                vec![],
+                false,
+            ),
+        ];
+        let mut results = Vec::new();
+        for (name, a, b, expected) in cases {
+            let mut metadata = original.clone();
+            for (scope, intervals) in [(&scope_a, a), (&scope_b, b)] {
+                let entry = metadata.accounts.get_mut(scope).unwrap();
+                entry.activation_timestamp = intervals.last().and_then(|i| i.start_at);
+                entry.lifecycle_intervals = intervals;
+            }
+            results.push((name, validate_metadata(&metadata).is_ok(), expected));
+        }
+        fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
+        for (name, actual, expected) in results {
+            assert_eq!(actual, expected, "recorded interval case {name}");
+        }
+    }
+
+    #[test]
+    fn issue604_readonly_partition_ignores_unreferenced_siblings() {
+        let mut outcomes = Vec::new();
+        {
+            let (codex_home, data_root, scope_a, _, _) = fixture();
+            let expected = locate_existing_partition(&codex_home, &data_root).unwrap();
+            let expected_catalog = locate_existing_partitions(&codex_home, &data_root).unwrap();
+            assert_eq!(expected.storage_epoch, 7);
+            assert_eq!(expected_catalog.len(), 2);
+            let accounts = accounts_root(&data_root);
+            let account = accounts.join(scope_a);
+            let epoch = account.join("epoch-7");
+            for name in [
+                "literal-unreferenced-artifact",
+                ".usage_history.sqlite3.backup.tmp-17-0",
+                ".usage_history.sqlite3.backup-rotate-17-0-1",
+                ".usage_history.sqlite3.candidate.tmp-17-0",
+            ] {
+                write_private_file(&epoch.join(name), b"unreferenced literal sibling");
+            }
+            make_private_directory(&accounts.join("literal-unregistered-scope"));
+            make_private_directory(&account.join("epoch-unreferenced"));
+            let before = (snapshot_tree(&codex_home), snapshot_tree(&data_root));
+            #[cfg(unix)]
+            let before_metadata =
+                [&accounts, &account, &epoch, &expected.database_path].map(|path| {
+                    let metadata = fs::symlink_metadata(path).unwrap();
+                    (metadata.ino(), metadata.uid(), metadata.mode())
+                });
+            let current = locate_existing_partition(&codex_home, &data_root).ok();
+            let catalog = locate_existing_partitions(&codex_home, &data_root).ok();
+            let unchanged = before == (snapshot_tree(&codex_home), snapshot_tree(&data_root));
+            #[cfg(unix)]
+            let unchanged = unchanged
+                && before_metadata
+                    == [&accounts, &account, &epoch, &expected.database_path].map(|path| {
+                        let metadata = fs::symlink_metadata(path).unwrap();
+                        (metadata.ino(), metadata.uid(), metadata.mode())
+                    });
+            outcomes.push((
+                "unreferenced-siblings-current-and-catalog",
+                current == Some(expected) && catalog == Some(expected_catalog) && unchanged,
+            ));
+            fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
+        }
+        for case in [
+            "database-missing",
+            #[cfg(unix)]
+            "database-symlink",
+            #[cfg(unix)]
+            "database-non-private",
+            #[cfg(unix)]
+            "account-symlink",
+            #[cfg(unix)]
+            "account-non-private",
+            #[cfg(unix)]
+            "epoch-symlink",
+            #[cfg(unix)]
+            "epoch-non-private",
+        ] {
+            let (codex_home, data_root, scope_a, _, _) = fixture();
+            let account = accounts_root(&data_root).join(scope_a);
+            let epoch = account.join("epoch-7");
+            let canonical = epoch.join("usage_history.sqlite3");
+            let required = if case.starts_with("account-") {
+                &account
+            } else if case.starts_with("epoch-") {
+                &epoch
+            } else {
+                &canonical
+            };
+            if case == "database-missing" {
+                fs::remove_file(required).unwrap();
+            } else if case.ends_with("-symlink") {
+                #[cfg(unix)]
+                {
+                    let target = required.with_file_name("literal-original-required-entry");
+                    fs::rename(required, &target).unwrap();
+                    std::os::unix::fs::symlink(&target, required).unwrap();
+                }
+            } else {
+                #[cfg(unix)]
+                fs::set_permissions(
+                    required,
+                    fs::Permissions::from_mode(if case.starts_with("database-") {
+                        0o644
+                    } else {
+                        0o755
+                    }),
+                )
+                .unwrap();
+            }
+            let current_rejected = locate_existing_partition(&codex_home, &data_root)
+                .err()
+                .map(LocatorError::kind)
+                == Some(LocatorErrorKind::RecoveryRequired);
+            let catalog_rejected = locate_existing_partitions(&codex_home, &data_root)
+                .err()
+                .map(LocatorError::kind)
+                == Some(LocatorErrorKind::RecoveryRequired);
+            outcomes.push((case, current_rejected && catalog_rejected));
+            fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
+        }
+        assert!(outcomes.iter().all(|(_, passed)| *passed),
+            "readonly authority uses exact required paths, never unreferenced siblings: {outcomes:?}");
+    }
+
+    #[test]
     fn selects_exact_current_account_partition_and_does_not_mutate_filesystem() {
         let (codex_home, data_root, scope_a, scope_b, partition_a) = fixture();
         let before = (snapshot_tree(&codex_home), snapshot_tree(&data_root));
@@ -1667,6 +2051,200 @@ mod tests {
     }
 
     #[test]
+    fn issue604_lifecycle_close_accepts_zero_open_and_same_second() {
+        let (codex_home, data_root, scope_a, scope_b, _) = fixture();
+        let mut metadata = load_metadata(&data_root).unwrap();
+        metadata
+            .accounts
+            .get_mut(&scope_a)
+            .unwrap()
+            .lifecycle_intervals = vec![AccountLifecycleInterval {
+            start_at: Some(100),
+            end_at: Some(200),
+        }];
+        metadata
+            .accounts
+            .get_mut(&scope_b)
+            .unwrap()
+            .lifecycle_intervals = vec![AccountLifecycleInterval {
+            start_at: Some(230),
+            end_at: Some(250),
+        }];
+        let before = metadata.clone();
+        let closed_scope = open_lifecycle_scope(&metadata);
+        let closed_result = close_open_lifecycle_interval(&mut metadata, 300);
+        let closed_unchanged = metadata == before;
+
+        let a = metadata.accounts.get_mut(&scope_a).unwrap();
+        a.activation_timestamp = Some(300);
+        a.lifecycle_intervals.push(AccountLifecycleInterval {
+            start_at: Some(300),
+            end_at: None,
+        });
+        let same_second = close_open_lifecycle_interval(&mut metadata, 300);
+        let final_interval = metadata.accounts[&scope_a]
+            .lifecycle_intervals
+            .last()
+            .copied();
+        let final_valid = validate_metadata(&metadata).is_ok();
+        fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
+        assert!(
+            matches!(closed_scope, Ok(None)),
+            "closed-only timeline has no current scope"
+        );
+        assert!(closed_result.is_ok());
+        assert!(
+            closed_unchanged,
+            "closing an already closed timeline cannot invent another boundary"
+        );
+        assert!(
+            same_second.is_ok(),
+            "same-second loss closes an empty interval"
+        );
+        assert_eq!(
+            final_interval,
+            Some(AccountLifecycleInterval {
+                start_at: Some(300),
+                end_at: Some(300)
+            })
+        );
+        assert!(final_valid);
+    }
+
+    #[test]
+    fn issue604_lifecycle_close_rejects_invalid_boundary_without_mutation() {
+        let (codex_home, data_root, scope_a, scope_b, _) = fixture();
+        let original = load_metadata(&data_root).unwrap();
+        let mut results = Vec::new();
+        for (label, second_open, at) in [
+            ("multiple-open", true, 300),
+            ("clock-before-start", false, 99),
+            ("UTC-upper-bound", false, 253_402_300_800_i64),
+        ] {
+            let mut metadata = original.clone();
+            metadata
+                .accounts
+                .get_mut(&scope_a)
+                .unwrap()
+                .lifecycle_intervals = vec![AccountLifecycleInterval {
+                start_at: Some(100),
+                end_at: None,
+            }];
+            metadata
+                .accounts
+                .get_mut(&scope_b)
+                .unwrap()
+                .lifecycle_intervals = if second_open {
+                vec![AccountLifecycleInterval {
+                    start_at: Some(230),
+                    end_at: None,
+                }]
+            } else {
+                vec![]
+            };
+            let before = metadata.clone();
+            let rejected = close_open_lifecycle_interval(&mut metadata, at).is_err();
+            results.push((label, rejected, metadata == before));
+        }
+        fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
+        for (label, rejected, unchanged) in results {
+            assert!(rejected, "invalid close boundary accepted: {label}");
+            assert!(unchanged, "invalid close changed metadata: {label}");
+        }
+    }
+
+    #[test]
+    fn issue604_canonical_confirmation_record_has_strict_tuple_and_time_qualification() {
+        let (codex_home, data_root, scope_a, _, partition_a) = fixture();
+        let original = serde_json::to_value(load_metadata(&data_root).unwrap()).unwrap();
+        let proof = serde_json::json!({
+            "rule_version": 1,
+            "profile_scope_id": original["profile_scope_id"],
+            "account_scope_id": scope_a,
+            "storage_epoch": 7,
+            "partition_id": partition_a,
+            "began_at": 100,
+            "ended_at": 120
+        });
+        let mut cases = vec![
+            ("valid", proof.clone(), true),
+            ("missing-equivalent-null", serde_json::Value::Null, true),
+        ];
+        for (name, field, replacement) in [
+            ("unknown-version", "rule_version", serde_json::json!(2)),
+            (
+                "other-profile",
+                "profile_scope_id",
+                serde_json::json!("00".repeat(16)),
+            ),
+            (
+                "other-account",
+                "account_scope_id",
+                serde_json::json!("00".repeat(32)),
+            ),
+            ("other-epoch", "storage_epoch", serde_json::json!(8)),
+            (
+                "other-partition",
+                "partition_id",
+                serde_json::json!("00".repeat(32)),
+            ),
+            ("zero-start", "began_at", serde_json::json!(0)),
+            ("after-end", "began_at", serde_json::json!(121)),
+            (
+                "end-outside-UTC",
+                "ended_at",
+                serde_json::json!(253_402_300_800_i64),
+            ),
+            ("null-start", "began_at", serde_json::Value::Null),
+            ("wrong-type", "storage_epoch", serde_json::json!("7")),
+            ("unknown-field", "guessed", serde_json::json!(true)),
+        ] {
+            let mut changed = proof.clone();
+            changed[field] = replacement;
+            cases.push((name, changed, false));
+        }
+        let mut upper = proof.clone();
+        upper["began_at"] = serde_json::json!(253_402_300_799_i64);
+        upper["ended_at"] = serde_json::json!(253_402_300_799_i64);
+        cases.push(("same-second-upper-bound", upper, true));
+        let mut missing = proof.clone();
+        missing.as_object_mut().unwrap().remove("ended_at");
+        cases.push(("partial-record", missing, false));
+        let mut results = Vec::new();
+        for (name, candidate, expected) in cases {
+            let mut metadata = original.clone();
+            metadata["accounts"][&scope_a]["canonical_confirmation"] = candidate.clone();
+            let parsed = serde_json::from_value::<ProfileMetadata>(metadata).ok();
+            let valid = parsed
+                .as_ref()
+                .is_some_and(|value| validate_metadata(value).is_ok());
+            let retained = !valid
+                || candidate.is_null()
+                || parsed.as_ref().is_some_and(|value| {
+                    serde_json::to_value(value).unwrap()["accounts"][&scope_a]
+                        ["canonical_confirmation"]
+                        == candidate
+                });
+            results.push((name, valid, expected, retained));
+        }
+        let missing_valid = serde_json::from_value::<ProfileMetadata>(original)
+            .ok()
+            .is_some_and(|value| validate_metadata(&value).is_ok());
+        fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
+        assert!(
+            missing_valid,
+            "legacy absence stays unconfirmed and readable"
+        );
+        for (name, valid, expected, retained) in results {
+            assert_eq!(valid, expected, "confirmation record case {name}");
+            assert!(
+                retained,
+                "confirmation facts changed during round-trip: {name}"
+            );
+        }
+    }
+
+    #[test]
     fn lists_only_registry_initialized_partitions_with_opaque_epoch_ids() {
         let (codex_home, data_root, scope_a, scope_b, _) = fixture();
 
@@ -1690,6 +2268,129 @@ mod tests {
         for partition in partitions {
             assert!(!partition.public_id().contains(&partition.account_scope_id));
         }
+    }
+
+    #[test]
+    fn issue604_sqlite_sidecar_disappearance_preserves_initialized_partitions() {
+        let mut outcomes = Vec::new();
+        for name in [
+            "usage_history.sqlite3-journal",
+            "usage_history.sqlite3-wal",
+            "usage_history.sqlite3-shm",
+        ] {
+            let (codex_home, data_root, scope_a, _, _) = fixture();
+            let metadata = load_metadata(&data_root).unwrap();
+            let artifact = accounts_root(&data_root)
+                .join(scope_a)
+                .join("epoch-7")
+                .join(name);
+            write_private_file(&artifact, b"SQLite transient sidecar");
+            let relative = artifact
+                .strip_prefix(&data_root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let before_home = snapshot_tree(&codex_home);
+            let mut before_data = snapshot_tree(&data_root);
+            before_data.remove(&relative);
+            let mut triggers = 0;
+            let result = validate_registry_artifacts_with_metadata(&data_root, &metadata, |path| {
+                if path == artifact {
+                    triggers += 1;
+                    fs::remove_file(path)?;
+                }
+                fs::symlink_metadata(path)
+            });
+            let current_epoch = locate_existing_partition(&codex_home, &data_root)
+                .map(|partition| partition.storage_epoch)
+                .ok();
+            let catalog_count = locate_existing_partitions(&codex_home, &data_root)
+                .map(|partitions| partitions.len())
+                .ok();
+            let mut after_data = snapshot_tree(&data_root);
+            after_data.remove(&relative);
+            let unchanged = before_home == snapshot_tree(&codex_home) && before_data == after_data;
+            outcomes.push((
+                name,
+                result.is_ok(),
+                triggers,
+                unchanged,
+                current_epoch,
+                catalog_count,
+            ));
+            fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, success, triggers, unchanged, epoch, count)| *success
+                    && *triggers == 1
+                    && *unchanged
+                    && *epoch == Some(7)
+                    && *count == Some(2)),
+            "only the three disappearing SQLite sidecars preserve the authority tree: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn issue604_disappearing_non_sidecar_and_unsafe_sidecars_remain_rejected() {
+        let mut outcomes = Vec::new();
+        for case in [
+            "database-disappearance",
+            "candidate-disappearance",
+            "unknown-disappearance",
+            "metadata-permission-denied",
+            #[cfg(unix)]
+            "symlink-sidecar",
+            #[cfg(unix)]
+            "non-private-sidecar",
+        ] {
+            let (codex_home, data_root, scope_a, _, _) = fixture();
+            let metadata = load_metadata(&data_root).unwrap();
+            let epoch = accounts_root(&data_root).join(scope_a).join("epoch-7");
+            let name = match case {
+                "database-disappearance" => "usage_history.sqlite3",
+                "candidate-disappearance" => "usage_history.sqlite3.candidate",
+                "unknown-disappearance" => "usage_history.sqlite3-wal.unowned",
+                _ => "usage_history.sqlite3-wal",
+            };
+            let artifact = epoch.join(name);
+            if case == "symlink-sidecar" {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(epoch.join("usage_history.sqlite3"), &artifact).unwrap();
+            } else if case != "database-disappearance" {
+                write_private_file(&artifact, b"literal artifact");
+                #[cfg(unix)]
+                if case == "non-private-sidecar" {
+                    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+            }
+            let mut triggers = 0;
+            let result = validate_registry_artifacts_with_metadata(&data_root, &metadata, |path| {
+                if path == artifact {
+                    triggers += 1;
+                    if case.ends_with("-disappearance") {
+                        fs::remove_file(path)?;
+                    } else if case == "metadata-permission-denied" {
+                        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                    }
+                }
+                fs::symlink_metadata(path)
+            });
+            let rejected =
+                result.err().map(LocatorError::kind) == Some(LocatorErrorKind::RecoveryRequired);
+            // Unknown names must be rejected independently of whether their
+            // metadata callback is reached; GREEN rejects that name earlier.
+            let reached = case == "unknown-disappearance" || triggers == 1;
+            outcomes.push((case, rejected, reached, triggers));
+            fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, rejected, reached, _)| *rejected && *reached),
+            "non-sidecars and unsafe extant sidecars stay fail-closed: {outcomes:?}"
+        );
     }
 
     #[test]
@@ -1722,11 +2423,16 @@ mod tests {
             &epoch_directory.join("usage_history.sqlite3-journal.unowned"),
             b"unknown artifact",
         );
+        let before = (snapshot_tree(&codex_home), snapshot_tree(&data_root));
         assert_eq!(
             locate_existing_partition(&codex_home, &data_root)
-                .expect_err("similar unknown names must remain rejected")
-                .kind(),
-            LocatorErrorKind::RecoveryRequired
+                .expect("unreferenced siblings do not change the canonical partition")
+                .storage_epoch,
+            7
+        );
+        assert_eq!(
+            (snapshot_tree(&codex_home), snapshot_tree(&data_root)),
+            before
         );
         let _ = fs::remove_dir_all(data_root.parent().unwrap());
     }
@@ -1761,11 +2467,16 @@ mod tests {
             scope_a
         );
         write_private_file(&epoch.join("usage_history.sqlite3-wal.unowned"), b"unknown");
+        let before = (snapshot_tree(&codex_home), snapshot_tree(&data_root));
         assert_eq!(
             locate_existing_partition(&codex_home, &data_root)
-                .unwrap_err()
-                .kind(),
-            LocatorErrorKind::RecoveryRequired
+                .expect("unreferenced siblings do not change the canonical partition")
+                .storage_epoch,
+            7
+        );
+        assert_eq!(
+            (snapshot_tree(&codex_home), snapshot_tree(&data_root)),
+            before
         );
         fs::remove_dir_all(data_root.parent().unwrap()).unwrap();
     }
@@ -1791,6 +2502,23 @@ mod tests {
             (snapshot_tree(&codex_home), snapshot_tree(&data_root))
         );
         assert!(!data_root.join("history").exists());
+    }
+
+    // Fixture producer: explicitly supply successful RPC evidence at the
+    // injected fixture clock. Production reservation never supplies it.
+    fn ensure_partition_with_activation(
+        home: &Path,
+        data: &Path,
+        at: Option<i64>,
+    ) -> Result<AccountPartition> {
+        let at = at.unwrap_or(unix_timestamp_now()?);
+        let partition = reserve_partition_at(home, data, at)?;
+        let confirmation = if partition_requires_confirmation(data, &partition)? {
+            AccountConfirmation::InitialRpc { began_at: at }
+        } else {
+            AccountConfirmation::Saved { began_at: at }
+        };
+        admit_partition(home, data, &partition, confirmation, || Some(at))
     }
 
     #[test]
@@ -1823,10 +2551,75 @@ mod tests {
             ensure_partition(&codex_home, &data_root).unwrap(),
             allocated
         );
-        mark_partition_initialized(&data_root, &allocated).unwrap();
+        let now = unix_timestamp_now().unwrap();
+        let admitted = admit_partition(
+            &codex_home,
+            &data_root,
+            &allocated,
+            AccountConfirmation::InitialRpc { began_at: now },
+            || Some(now),
+        )
+        .unwrap();
+        mark_partition_initialized(&data_root, &admitted).unwrap();
         let selected = locate_existing_partition(&codex_home, &data_root).unwrap();
-        assert_eq!(selected, allocated);
+        assert_eq!(selected, admitted);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn issue604_allocation_does_not_admit_unconfirmed_ownership() {
+        let root = temp_root("unconfirmed-reservation");
+        let home = root.join("home");
+        let data = root.join("data");
+        make_private_directory(&home);
+        make_private_directory(&data);
+        write_private_file(
+            &home.join(AUTH_FILE_NAME),
+            br#"{"tokens":{"account_id":"workspace-A"}}"#,
+        );
+        let first = ensure_partition(&home, &data).unwrap();
+        let again = ensure_partition(&home, &data).unwrap();
+        let metadata = load_metadata(&data).unwrap();
+        let entry = &metadata.accounts[&first.account_scope_id];
+        let facts = (
+            first.lifecycle_intervals.len(),
+            first.activation_timestamp,
+            first.database_path.exists(),
+            entry.canonical_confirmation.is_some(),
+            first.storage_epoch,
+            again.storage_epoch,
+            metadata.next_storage_epoch,
+        );
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            facts,
+            (0, None, false, false, 1, 1, 2),
+            "reservation cannot create ownership, a confirmation or an empty DB"
+        );
+    }
+
+    #[test]
+    fn issue604_unconfirmed_allocation_cannot_be_promoted() {
+        let root = temp_root("unconfirmed-promotion");
+        let home = root.join("home");
+        let data = root.join("data");
+        make_private_directory(&home);
+        make_private_directory(&data);
+        write_private_file(
+            &home.join(AUTH_FILE_NAME),
+            br#"{"tokens":{"account_id":"workspace-A"}}"#,
+        );
+        let partition = ensure_partition(&home, &data).unwrap();
+        write_private_file(&partition.database_path, b"private fixture database");
+        let before = fs::read(metadata_path(&data)).unwrap();
+        let rejected = mark_partition_initialized(&data, &partition).is_err();
+        let unchanged = before == fs::read(metadata_path(&data)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(rejected, "an allocated tuple is not a confirmed account");
+        assert!(
+            unchanged,
+            "failed promotion must retain the allocated registry"
+        );
     }
 
     #[test]
@@ -1890,10 +2683,9 @@ mod tests {
         let (codex_home, data_root, scope_a, scope_b, _) = fixture();
         let boundary = 1_789_167_600_i64;
 
-        // The fixture is legacy-shaped: only the current authority's
-        // activation_timestamp carries the migration proof.  A restart must
-        // materialize intervals from that value and ignore a new requested
-        // activation time for the same account.
+        // The old stored boundary remains a historical fact. It is not the
+        // new initial RPC confirmation and cannot supply another account's
+        // missing boundary.
         let current = ensure_partition_with_activation(
             &codex_home,
             &data_root,
@@ -1902,12 +2694,18 @@ mod tests {
         .unwrap();
         assert_eq!(
             current.lifecycle_intervals,
-            vec![AccountLifecycleInterval {
-                start_at: Some(boundary),
-                end_at: None,
-            }]
+            vec![
+                AccountLifecycleInterval {
+                    start_at: Some(boundary),
+                    end_at: Some(boundary + 10_000)
+                },
+                AccountLifecycleInterval {
+                    start_at: Some(boundary + 10_000),
+                    end_at: None
+                },
+            ]
         );
-        assert_eq!(current.current_interval_start, Some(boundary));
+        assert_eq!(current.current_interval_start, Some(boundary + 10_000));
         assert_eq!(current.current_interval_end, None);
 
         let partitions = locate_existing_partitions(&codex_home, &data_root).unwrap();
@@ -1921,17 +2719,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             current_a.lifecycle_intervals,
-            vec![AccountLifecycleInterval {
-                start_at: Some(boundary),
-                end_at: None,
-            }]
+            vec![
+                AccountLifecycleInterval {
+                    start_at: Some(boundary),
+                    end_at: Some(boundary + 10_000)
+                },
+                AccountLifecycleInterval {
+                    start_at: Some(boundary + 10_000),
+                    end_at: None
+                },
+            ]
         );
-        assert_eq!(
-            old_b.lifecycle_intervals,
-            vec![AccountLifecycleInterval {
-                start_at: None,
-                end_at: Some(boundary),
-            }]
+        assert!(
+            old_b.lifecycle_intervals.is_empty(),
+            "another account has no recorded boundary"
         );
 
         let metadata: serde_json::Value =
@@ -1942,8 +2743,8 @@ mod tests {
             serde_json::json!(boundary)
         );
         assert_eq!(
-            accounts[&scope_b]["lifecycle_intervals"][0]["end_at"],
-            serde_json::json!(boundary)
+            accounts[&scope_b]["lifecycle_intervals"],
+            serde_json::json!([])
         );
         let _ = fs::remove_dir_all(data_root.parent().unwrap());
     }

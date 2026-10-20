@@ -33,6 +33,8 @@ public sealed class LoopbackStatusClient :
     private static readonly string SelectableHistoryPeriodsEndpoint = $"{EndpointRoot}/v3/history/periods/selectable";
     private static readonly string HistoryPeriodsV4Endpoint = $"{EndpointRoot}/v4/history/periods";
     private static readonly string SelectableHistoryPeriodsV4Endpoint = $"{EndpointRoot}/v4/history/periods/selectable";
+    private static readonly string HistoryPeriodsV5Endpoint = $"{EndpointRoot}/v5/history/periods";
+    private static readonly string SelectableHistoryPeriodsV5Endpoint = $"{EndpointRoot}/v5/history/periods/selectable";
     private static readonly string HistoryEndpoint = $"{EndpointRoot}/v3/history";
     private static readonly string ThreadsEndpoint = $"{EndpointRoot}/v3/threads";
     private static readonly string DetailsV3Endpoint = $"{EndpointRoot}/v3/details";
@@ -47,7 +49,6 @@ public sealed class LoopbackStatusClient :
     // 31-day month of minute buckets. The byte envelope is independent.
     private const int MaxDetailsBodyBytes = 32 * 1024 * 1024;
     private const long MaxUnixSeconds = 253_402_300_799;
-    private const int MaxHistoryPeriods = 128;
     private const int MaxHistorySamples = 31 * 24 * 60;
     private const int MaxHistoryGaps = 4_096;
     private const int MaxAccounts = 256;
@@ -149,6 +150,9 @@ public sealed class LoopbackStatusClient :
     private static readonly HashSet<string> HistoryPeriodsTopLevelProperties = CreatePropertySet(
         "api_version",
         "history_periods");
+
+    private static readonly HashSet<string> DirectoryPageProperties =
+        new(HistoryPeriodsTopLevelProperties, StringComparer.Ordinal) { "next_cursor" };
 
     private static readonly HashSet<string> HistoryPageTopLevelProperties = CreatePropertySet(
         "api_version",
@@ -614,7 +618,7 @@ public sealed class LoopbackStatusClient :
         string? accountId,
         CancellationToken cancellationToken,
         bool selectable = false,
-        bool legacyVersion = false)
+        int versionNumber = 5)
     {
         var accountScope = BeginAccountScope(accountId);
         if (accountId is not null && !IsSafeAccountId(accountId))
@@ -628,6 +632,19 @@ public sealed class LoopbackStatusClient :
                 ApiHistoryPeriodsSnapshot.FromDetails(cachedLegacy));
         }
 
+        if (versionNumber == 5)
+        {
+            var paged = await FetchDirectoryV5Async(accountId, accountScope, selectable, cancellationToken)
+                .ConfigureAwait(false);
+            if (paged.NotFound)
+                return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken, selectable, versionNumber: 4)
+                    .ConfigureAwait(false);
+            return paged.Value is not null
+                ? HistoryPeriodsFetchResult.Success(paged.Value)
+                : HistoryPeriodsFetchResult.FromFailure(paged.Failure ?? DetailsFetchFailure.Response);
+        }
+
+        var legacyVersion = versionNumber == 3;
         var endpoint = AppendAccountQuery(legacyVersion
             ? selectable ? SelectableHistoryPeriodsEndpoint : HistoryPeriodsEndpoint
             : selectable ? SelectableHistoryPeriodsV4Endpoint : HistoryPeriodsV4Endpoint, accountId);
@@ -665,17 +682,104 @@ public sealed class LoopbackStatusClient :
             .ConfigureAwait(false);
         if (!legacyVersion && result.NotFound)
         {
-            return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken, selectable, legacyVersion: true).ConfigureAwait(false);
+            return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken, selectable, versionNumber: 3).ConfigureAwait(false);
         }
         if (selectable && result.NotFound)
         {
             // Older servers can supply their observed directory. Other
             // failures never become a successful empty selector.
-            return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken, legacyVersion: true).ConfigureAwait(false);
+            return await FetchHistoryPeriodsForAccountAsync(accountId, cancellationToken, versionNumber: 3).ConfigureAwait(false);
         }
         return result.Value is not null
             ? HistoryPeriodsFetchResult.Success(result.Value)
             : HistoryPeriodsFetchResult.FromFailure(result.Failure ?? DetailsFetchFailure.Response);
+    }
+
+    private sealed record DirectoryPage(
+        IReadOnlyList<ApiHistoryPeriod> Periods,
+        PublishedPairIdentity PublishedPair,
+        string? NextCursor);
+
+    private async Task<SplitFetchResult<ApiHistoryPeriodsSnapshot>> FetchDirectoryV5Async(
+        string? accountId,
+        long accountScope,
+        bool selectable,
+        CancellationToken cancellationToken)
+    {
+        var endpoint = AppendAccountQuery(selectable ? SelectableHistoryPeriodsV5Endpoint : HistoryPeriodsV5Endpoint, accountId);
+        var cached = GetHistoryPeriodsCache(selectable);
+        if (cached?.ApiVersion != "v5" || cached.AccountId != accountId) cached = null;
+        var periods = new List<ApiHistoryPeriod>();
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        var resets = new HashSet<long>();
+        var cursors = new HashSet<string>(StringComparer.Ordinal);
+        ApiHistoryPeriod? previous = null;
+        PublishedPairIdentity? pair = null;
+        var currentCount = 0;
+        string? cursor = null;
+        do
+        {
+            var pageEndpoint = cursor is null ? endpoint
+                : $"{endpoint}{(accountId is null ? "?" : "&")}cursor={Uri.EscapeDataString(cursor)}";
+            var page = await FetchSplitResourceAsync(
+                pageEndpoint,
+                cacheKey: pageEndpoint,
+                cached: cursor is null && cached is not null
+                    ? new DirectoryPage(cached.Periods, cached.PublishedPair, null) : null,
+                ParseDirectoryPage,
+                static value => value.PublishedPair,
+                static _ => { }, // Only a validated complete directory enters the cache.
+                static () => { },
+                cancellationToken,
+                scopeIsCurrent: () => IsAccountScopeCurrent(accountId, accountScope))
+                .ConfigureAwait(false);
+            if (page.NotFound && cursor is null)
+                return SplitFetchResult<ApiHistoryPeriodsSnapshot>.NotFoundResult();
+            if (page.Value is not { } value)
+                return SplitFetchResult<ApiHistoryPeriodsSnapshot>.FromFailure(page.Failure ?? DetailsFetchFailure.Response);
+            if (page.NotModified && cached is not null)
+                return SplitFetchResult<ApiHistoryPeriodsSnapshot>.Success(cached, notModified: true);
+            if (pair is not null && pair != value.PublishedPair ||
+                value.NextCursor is not null && (value.Periods.Count == 0 || !cursors.Add(value.NextCursor)))
+                return SplitFetchResult<ApiHistoryPeriodsSnapshot>.FromFailure(DetailsFetchFailure.Response);
+            pair = value.PublishedPair;
+            foreach (var period in value.Periods)
+            {
+                if (!ids.Add(period.Id) || !resets.Add(period.ResetAt) ||
+                    previous is not null && CompareDirectoryPeriods(previous, period) >= 0 ||
+                    period.Current && ++currentCount > 1)
+                    return SplitFetchResult<ApiHistoryPeriodsSnapshot>.FromFailure(DetailsFetchFailure.Response);
+                previous = period;
+                periods.Add(period);
+            }
+            cursor = value.NextCursor;
+        } while (cursor is not null);
+
+        if (!IsAccountScopeCurrent(accountId, accountScope) || pair is null)
+            return SplitFetchResult<ApiHistoryPeriodsSnapshot>.FromFailure(DetailsFetchFailure.Response);
+        // UI selectors keep the pre-v5 display order, independently of the wire order.
+        periods.Sort(static (left, right) =>
+        {
+            var comparison = right.StartAt.CompareTo(left.StartAt);
+            if (comparison == 0) comparison = right.ResetAt.CompareTo(left.ResetAt);
+            return comparison != 0 ? comparison : CompareUtf8(right.Id, left.Id);
+        });
+        var result = new ApiHistoryPeriodsSnapshot(periods.AsReadOnly(), pair.Value)
+        {
+            ApiVersion = "v5",
+            AccountId = accountId,
+        };
+        StoreHistoryPeriodsCache(result, accountScope, selectable);
+        return SplitFetchResult<ApiHistoryPeriodsSnapshot>.Success(result, notModified: false);
+    }
+
+    private static int CompareUtf8(string left, string right) =>
+        Encoding.UTF8.GetBytes(left).AsSpan().SequenceCompareTo(Encoding.UTF8.GetBytes(right));
+
+    private static int CompareDirectoryPeriods(ApiHistoryPeriod left, ApiHistoryPeriod right)
+    {
+        var comparison = left.ResetAt.CompareTo(right.ResetAt);
+        return comparison != 0 ? comparison : CompareUtf8(left.Id, right.Id);
     }
 
     public async Task<HistoryPageFetchResult> FetchHistoryPageAsync(
@@ -1888,17 +1992,23 @@ public sealed class LoopbackStatusClient :
         }
 
         var parsed = new List<ApiAccountOwnershipInterval>(property.GetArrayLength());
+        long? previousEnd = null;
         foreach (var item in property.EnumerateArray())
         {
             if (!HasExactlyProperties(item, AccountOwnershipIntervalProperties, 2) ||
                 !TryGetNullableUnixSeconds(item, "start_at", out var startAt) ||
                 !TryGetNullableUnixSeconds(item, "end_at", out var endAt) ||
-                startAt is { } start && endAt is { } end && start >= end ||
-                parsed.Count > 0 &&
-                    (parsed[^1].EndAt is null || startAt is null ||
-                        parsed[^1].EndAt > startAt))
+                startAt is { } start && endAt is { } end && start > end)
             {
                 return false;
+            }
+            if (startAt is not { } emptyStart || endAt != emptyStart)
+            {
+                if (previousEnd is { } previous && (startAt ?? long.MinValue) < previous)
+                {
+                    return false;
+                }
+                previousEnd = endAt ?? long.MaxValue;
             }
             parsed.Add(new ApiAccountOwnershipInterval(startAt, endAt));
         }
@@ -2080,6 +2190,39 @@ public sealed class LoopbackStatusClient :
                 OpenSessionThreadCount = openCount,
                 ModelsStatus = modelsStatus,
             };
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private static DirectoryPage? ParseDirectoryPage(byte[] body, PublishedPairIdentity pair)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(body, new JsonDocumentOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = 24,
+            });
+            var root = document.RootElement;
+            if (!HasExactlyProperties(root, DirectoryPageProperties, 3) ||
+                !TryGetString(root, "api_version", out var version) || version != "v5" ||
+                !TryGetHistoryPeriods(root, null, out var periods, requireCurrentObserved: false,
+                    hasOrigin: true, ascendingDirectory: true) ||
+                !root.TryGetProperty("next_cursor", out var next))
+                return null;
+            string? cursor = null;
+            if (next.ValueKind != JsonValueKind.Null)
+            {
+                if (next.ValueKind != JsonValueKind.String || next.GetString() is not { } text ||
+                    !IsSafeOpaqueParameter(text) || text.Any(character => character > 0x7f))
+                    return null;
+                cursor = text;
+            }
+            return new DirectoryPage(periods.AsReadOnly(), pair, cursor);
         }
         catch (Exception)
         {
@@ -2443,13 +2586,13 @@ public sealed class LoopbackStatusClient :
                 ApiHistorySample.ConfirmedModelSource when modelsComplete && modelSamples is not null =>
                     ApiHistorySample.ConfirmedModelSource,
                 ApiHistorySample.ConfirmedModelSource when modelSamples is { Count: > 0 } =>
-                    ApiHistorySample.LegacyUnknownModelSource,
+                    ApiHistorySample.ConfirmedModelSource,
                 ApiHistorySample.LegacyUnknownModelSource => ApiHistorySample.LegacyUnknownModelSource,
                 ApiHistorySample.ReconstructedFromSessionModelSource =>
                     ApiHistorySample.ReconstructedFromSessionModelSource,
                 _ => ApiHistorySample.UnavailableModelSource,
             };
-            modelsComplete = normalizedSource == ApiHistorySample.ConfirmedModelSource;
+            modelsComplete = modelsComplete && normalizedSource == ApiHistorySample.ConfirmedModelSource;
             modelSource = normalizedSource;
 
             if (!identities.Add((resetAt, timestamp)) ||
@@ -2543,25 +2686,20 @@ public sealed class LoopbackStatusClient :
                 return false;
             }
 
-            var anyComponents = inputTokens is not null || cachedInputTokens is not null || outputTokens is not null;
-            var allComponents = inputTokens is not null && cachedInputTokens is not null && outputTokens is not null;
-            if (anyComponents != allComponents ||
-                (!allComponents && cacheWriteInputTokens is not null) ||
-                (modelSource == ApiHistorySample.ConfirmedModelSource && !allComponents))
+            // History carries each known fact independently. Validate that
+            // unknown components can be nonnegative without filling them in.
+            if (inputTokens > totalTokens || outputTokens > totalTokens ||
+                (inputTokens is ulong input && outputTokens is ulong output &&
+                 input != totalTokens - output))
             {
                 return false;
             }
-
-            if (allComponents)
+            var inputUpperBound = inputTokens ?? (totalTokens - (outputTokens ?? 0));
+            if (cachedInputTokens > inputUpperBound || cacheWriteInputTokens > inputUpperBound ||
+                (cachedInputTokens is ulong cached && cacheWriteInputTokens is ulong cacheWrite &&
+                 cached > inputUpperBound - cacheWrite))
             {
-                var input = inputTokens!.Value;
-                var cached = cachedInputTokens!.Value;
-                if (cached > input ||
-                    (cacheWriteInputTokens is ulong cacheWrite &&
-                     (cacheWrite > input || input - cacheWrite < cached)))
-                {
-                    return false;
-                }
+                return false;
             }
 
             parsed.Add(new ApiHistoryModelSample(
@@ -2647,12 +2785,12 @@ public sealed class LoopbackStatusClient :
         long? observedAt,
         out List<ApiHistoryPeriod> periods,
         bool requireCurrentObserved = true,
-        bool hasOrigin = false)
+        bool hasOrigin = false,
+        bool ascendingDirectory = false)
     {
         periods = new List<ApiHistoryPeriod>();
         if (!parent.TryGetProperty("history_periods", out var property) ||
-            property.ValueKind != JsonValueKind.Array ||
-            property.GetArrayLength() > MaxHistoryPeriods)
+            property.ValueKind != JsonValueKind.Array)
         {
             return false;
         }
@@ -2698,10 +2836,11 @@ public sealed class LoopbackStatusClient :
                 OriginAt = originAt,
             };
             if (previous is not null &&
+                (ascendingDirectory ? CompareDirectoryPeriods(previous, candidate) >= 0 :
                 (candidate.StartAt > previous.StartAt ||
                  (candidate.StartAt == previous.StartAt && candidate.ResetAt > previous.ResetAt) ||
                  (candidate.StartAt == previous.StartAt && candidate.ResetAt == previous.ResetAt &&
-                  string.CompareOrdinal(candidate.Id, previous.Id) > 0)))
+                  string.CompareOrdinal(candidate.Id, previous.Id) > 0))))
             {
                 return false;
             }

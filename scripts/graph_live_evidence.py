@@ -25,7 +25,6 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-
 SUSTAINED_UNUSED_MIN_DURATION_SECONDS = 10 * 60
 LINUX_CANONICAL_CURVE_MAX_STEP = 0.25
 WINDOWS_CANONICAL_CURVE_MAX_STEP = 0.1
@@ -99,7 +98,7 @@ class EvidenceError(RuntimeError):
 
 @dataclass(frozen=True)
 class ModelEvidence:
-    value: float | None
+    value: int | float | None
     reliable: bool
     origin: str
     synthetic: bool = False
@@ -176,21 +175,21 @@ def _validate_fixture(fixture: dict[str, Any]) -> tuple[dict[str, Any], list[dic
     start = _integer(period["start_at"], "period.start_at")
     end = _integer(period["end_at"], "period.end_at")
     reset = _integer(period["reset_at"], "period.reset_at")
-    if end <= start or reset < end or not isinstance(period["id"], str) or not period["id"]:
+    if end < start or reset < end or not isinstance(period["id"], str) or not period["id"]:
         raise EvidenceError("invalid selected period bounds or identity")
     page = fixture["history_page"]
     if page.get("api_version") != "v3":
         raise EvidenceError("history page api_version is not v3")
     samples = page.get("history_samples")
     gaps = page.get("history_gaps")
-    if not isinstance(samples, list) or not isinstance(gaps, list) or not samples:
-        raise EvidenceError("history page must contain non-empty samples and a gap array")
+    if not isinstance(samples, list) or not isinstance(gaps, list):
+        raise EvidenceError("history page must contain sample and gap arrays")
     previous = None
     for index, sample in enumerate(samples):
         if not isinstance(sample, dict):
             raise EvidenceError(f"sample {index} is not an object")
         timestamp = _integer(sample.get("timestamp"), f"sample[{index}].timestamp")
-        if timestamp < start or timestamp > end or timestamp % 60 != 0:
+        if timestamp < start // 60 * 60 or timestamp > end or timestamp % 60 != 0:
             raise EvidenceError(f"sample {index} timestamp is outside the minute-aligned period")
         if previous is not None and timestamp <= previous:
             raise EvidenceError("history timestamps are not strictly increasing")
@@ -249,15 +248,23 @@ def _validate_fixture(fixture: dict[str, Any]) -> tuple[dict[str, Any], list[dic
                     f"sample[{index}].models[{model_index}].total_dollars",
                 )
             )
-            if tokens < 0 or dollars is not None and dollars < 0:
-                raise EvidenceError(f"sample {index} has a negative cumulative model value")
+            if not 0 <= tokens <= (1 << 64) - 1:
+                raise EvidenceError(f"sample {index} total_tokens is outside UInt64")
+            for field in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens"):
+                value = model.get(field)
+                if value is not None:
+                    component = _integer(value, f"sample[{index}].models[{model_index}].{field}")
+                    if not 0 <= component <= (1 << 64) - 1:
+                        raise EvidenceError(f"sample {index} {field} is outside UInt64")
+            if dollars is not None and dollars < 0:
+                raise EvidenceError(f"sample {index} has a negative cumulative dollar value")
         if complete and source != "confirmed":
             raise EvidenceError(f"sample {index} complete model set has no direct source")
     normalized_gaps: list[dict[str, Any]] = []
     for index, gap in enumerate(gaps):
         gap_start = _integer(gap.get("start_at"), f"gap[{index}].start_at")
         gap_end = _integer(gap.get("end_at"), f"gap[{index}].end_at")
-        if gap_end <= gap_start or gap_start < start or gap_end > end:
+        if gap_end < gap_start or gap_start < start or gap_end > end:
             raise EvidenceError(f"gap {index} is outside the selected period")
         normalized_gaps.append({"start_at": gap_start, "end_at": gap_end})
     return period, samples, normalized_gaps
@@ -265,7 +272,7 @@ def _validate_fixture(fixture: dict[str, Any]) -> tuple[dict[str, Any], list[dic
 
 def _rows_with_tail(period: dict[str, Any], samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = [dict(sample, synthetic=False) for sample in samples]
-    if rows[-1]["timestamp"] < period["end_at"]:
+    if rows and rows[-1]["timestamp"] < period["end_at"]:
         rows.append(
             {
                 "timestamp": period["end_at"],
@@ -284,6 +291,15 @@ def _float_bits(value: float) -> bytes:
     return struct.pack("!d", value)
 
 
+def _raw_token_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        (model["model"], *(model.get(field) for field in (
+            "total_tokens", "input_tokens", "cached_input_tokens",
+            "cache_write_input_tokens", "output_tokens")))
+        for model in sorted(row.get("models") or [], key=lambda item: item["model"].encode("utf-8"))
+    )
+
+
 def _direct_sampling_signature(row: dict[str, Any]) -> tuple[Any, ...] | None:
     remaining = row.get("remaining_percent")
     models = row.get("models")
@@ -298,24 +314,14 @@ def _direct_sampling_signature(row: dict[str, Any]) -> tuple[Any, ...] | None:
         or not models
     ):
         return None
-    model_signature = tuple(
-        (
-            model["model"],
-            model.get("total_tokens"),
-            model.get("input_tokens"),
-            model.get("cached_input_tokens"),
-            model.get("cache_write_input_tokens"),
-            model.get("output_tokens"),
-        )
-        for model in sorted(models, key=lambda item: item["model"].encode("utf-8"))
-    )
-    return row["reset_at"], _float_bits(float(remaining)), model_signature
+    return row["reset_at"], _float_bits(float(remaining)), _raw_token_signature(row)
 
 
-def _without_recoverable_sampling_jitter(
+def _recoverable_sampling_slots(
     rows: list[dict[str, Any]],
     gaps: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    token_models: dict[str, list[ModelEvidence]],
+) -> set[int]:
     recovered: set[int] = set()
     for index in range(1, len(rows) - 1):
         left, middle, right = rows[index - 1 : index + 2]
@@ -334,6 +340,15 @@ def _without_recoverable_sampling_jitter(
         right_signature = _direct_sampling_signature(right)
         if left_signature is None or left_signature != right_signature:
             continue
+        if any(
+            name not in token_models
+            or any(token_models[name][endpoint].origin != "direct"
+                   or not token_models[name][endpoint].reliable
+                   or token_models[name][endpoint].value != total
+                   for endpoint in (index - 1, index + 1))
+            for name, total, *_components in left_signature[2]
+        ):
+            continue
         middle_remaining = middle.get("remaining_percent")
         if middle_remaining is not None and (
             not isinstance(middle_remaining, (int, float))
@@ -343,12 +358,38 @@ def _without_recoverable_sampling_jitter(
         ):
             continue
         recovered.add(index)
-    return [row for index, row in enumerate(rows) if index not in recovered]
+    return recovered
+
+
+def _sampling_slot_bridges_model(
+    rows: list[dict[str, Any]], model: str, metric: str,
+    projection: list[ModelEvidence], left: int, right: int, slots: set[int],
+) -> bool:
+    if right != left + 2 or left + 1 not in slots:
+        return False
+    if any(projection[index].origin != "direct" or not projection[index].reliable
+           for index in (left, right)):
+        return False
+    if metric == "tokens":
+        return True
+    # A family bridge must preserve each member's saved dollar amount;
+    # equal family sums cannot hide offsetting changes or unknown amounts.
+    members = [
+        item for item in rows[left].get("models") or []
+        if item["model"] == model or _display_family_name(item["model"]) == model
+    ]
+    right_models = {item["model"]: item for item in rows[right].get("models") or []}
+    return bool(members) and all(
+        item.get("total_dollars") is not None
+        and right_models[item["model"]].get("total_dollars") is not None
+        and _float_bits(item["total_dollars"]) == _float_bits(right_models[item["model"]]["total_dollars"])
+        for item in members
+    )
 
 
 def _raw_model_values(
     rows: list[dict[str, Any]], model: str, metric: str
-) -> list[float | None]:
+) -> list[int | float | None]:
     """Resolve sparse cumulative rows without resetting a used model.
 
     A published row must carry the model explicitly.  Row completeness proves
@@ -356,7 +397,7 @@ def _raw_model_values(
     into a numeric zero for a model-specific cumulative series.
     """
 
-    raw: list[float | None] = []
+    raw: list[int | float | None] = []
     field = "total_tokens" if metric == "tokens" else "total_dollars"
     for row in rows:
         if row.get("synthetic", False) or row["model_source"] not in {
@@ -393,17 +434,17 @@ def _raw_model_values(
                     + write_tokens * write_rate
                     + output_tokens * output_rate
                 ) / 1_000_000.0
-        raw.append(None if value is None else float(value))
+        raw.append(None if value is None else value if metric == "tokens" else float(value))
     return raw
 
 
 def _model_projection(
-    rows: list[dict[str, Any]], model: str, metric: str
+    rows: list[dict[str, Any]], model: str, metric: str,
+    gaps: list[dict[str, Any]] | None = None,
 ) -> list[ModelEvidence]:
     raw = _raw_model_values(rows, model, metric)
     direct = [
         row["model_source"] == "confirmed"
-        and bool(row.get("models_complete"))
         and not row.get("synthetic", False)
         for row in rows
     ]
@@ -414,14 +455,13 @@ def _model_projection(
             left is not None
             and middle is not None
             and right is not None
-            and direct[index - 1]
-            and direct[index]
-            and direct[index + 1]
+            and not _hard_break(rows[index - 1]["timestamp"], rows[index]["timestamp"], gaps or [])
+            and not _hard_break(rows[index]["timestamp"], rows[index + 1]["timestamp"], gaps or [])
             and left <= right
             and (middle < left or middle > right)
         ):
             isolated.add(index)
-    baseline: float | None = None
+    baseline: int | float | None = None
     result: list[ModelEvidence] = []
     for index, row in enumerate(rows):
         value = raw[index]
@@ -429,41 +469,11 @@ def _model_projection(
             result.append(ModelEvidence(baseline, False, "held", True))
         elif value is None:
             result.append(ModelEvidence(None, False, "unknown"))
-        elif not direct[index]:
-            result.append(ModelEvidence(value, False, "legacy"))
         elif index in isolated or baseline is not None and value < baseline:
             result.append(ModelEvidence(baseline, False, "rejected"))
         else:
             baseline = value
-            result.append(ModelEvidence(value, True, "direct"))
-
-    # Legacy values are saved display evidence, never an arithmetic baseline.
-    # Keep only monotonic values bounded by surrounding direct observations.
-    direct_anchors = [
-        (index, point.value)
-        for index, point in enumerate(result)
-        if point.origin == "direct" and point.value is not None
-    ]
-    display_floor: float | None = None
-    for index, point in enumerate(result):
-        if point.origin == "direct":
-            display_floor = point.value
-            continue
-        if point.origin != "legacy" or point.value is None:
-            continue
-        upper = next(
-            (value for anchor, value in direct_anchors if anchor > index),
-            None,
-        )
-        if (
-            display_floor is not None
-            and point.value < display_floor
-            or upper is not None
-            and point.value > upper
-        ):
-            result[index] = ModelEvidence(None, False, "unknown")
-        else:
-            display_floor = point.value
+            result.append(ModelEvidence(value, direct[index], "direct" if direct[index] else "legacy"))
 
     # Complete every bounded hole on the row timebase without inventing a
     # measured point. Equal monotonic endpoints prove an exact flat value;
@@ -558,81 +568,6 @@ def _model_projection(
     return result
 
 
-def _normalize_dollars_from_token_identity(
-    rows: list[dict[str, Any]],
-    model: str,
-    dollars: list[ModelEvidence],
-    tokens: list[ModelEvidence],
-    idle_intervals: list[dict[str, int]],
-) -> list[ModelEvidence]:
-    """Correct only the presentation copy of a token-flat dollar run."""
-
-    normalized = list(dollars)
-    runs: list[list[int]] = []
-    run: list[int] = []
-    run_identity: int | None = None
-    for index, (row, token) in enumerate(zip(rows, tokens, strict=True)):
-        raw_model = next(
-            (item for item in row.get("models") or [] if item.get("model") == model),
-            None,
-        )
-        raw_tokens = None if raw_model is None else raw_model.get("total_tokens")
-        legacy_idle = token.origin == "legacy" and any(
-            interval["start_at"] <= row["timestamp"] <= interval["end_at"]
-            for interval in idle_intervals
-        )
-        token_origin = (
-            token.origin
-            if ((token.origin == "direct" and token.reliable) or legacy_idle)
-            and isinstance(raw_tokens, int)
-            and not isinstance(raw_tokens, bool)
-            and raw_tokens >= 0
-            else None
-        )
-        identity = raw_tokens if token_origin is not None else None
-        if identity is not None and identity == run_identity:
-            run.append(index)
-        elif identity is not None:
-            if run:
-                runs.append(run)
-            run = [index]
-            run_identity = identity
-        else:
-            if run:
-                runs.append(run)
-            run = []
-            run_identity = None
-    if run:
-        runs.append(run)
-
-    for run in (candidate for candidate in runs if len(candidate) >= 2):
-        baseline = next(
-            (
-                normalized[index].value
-                for index in run
-                if (
-                    normalized[index].origin == tokens[index].origin
-                    or tokens[index].origin == "legacy"
-                )
-                and normalized[index].value is not None
-                and math.isfinite(normalized[index].value)
-                and normalized[index].value >= 0
-            ),
-            None,
-        )
-        if baseline is None:
-            continue
-        for index in run:
-            token_origin = tokens[index].origin
-            normalized[index] = ModelEvidence(
-                baseline,
-                token_origin == "direct",
-                token_origin,
-                normalized[index].synthetic,
-            )
-    return normalized
-
-
 def _period_model_universe(
     samples: list[dict[str, Any]],
 ) -> tuple[str, ...]:
@@ -655,6 +590,7 @@ def _display_family_name(model_name: str) -> str | None:
 def _windows_family_model_projections(
     rows: list[dict[str, Any]],
     projections: dict[str, dict[str, list[ModelEvidence]]],
+    *, allow_omitted_zero: bool = True,
 ) -> dict[str, dict[str, list[ModelEvidence]]]:
     family_member_sets: dict[str, set[str]] = {}
     first_publications: dict[str, int] = {}
@@ -750,11 +686,11 @@ def _windows_family_model_projections(
                     family_points.append(ModelEvidence(None, False, "unknown"))
                     continue
 
-                total = 0.0
+                total = 0 if metric == "tokens" else 0.0
                 complete = True
                 line_reliable = True
                 for name in published:
-                    if name in eligible_missing_zero[index]:
+                    if allow_omitted_zero and name in eligible_missing_zero[index]:
                         continue
                     point = source[name][index]
                     if (
@@ -792,46 +728,31 @@ def _windows_model_projection_data(
     rows: list[dict[str, Any]],
     universe: tuple[str, ...],
     gaps: list[dict[str, Any]],
+    *, allow_omitted_zero: bool = True,
 ) -> tuple[
     dict[str, list[ModelEvidence]],
     dict[str, list[ModelEvidence]],
     list[dict[str, int]],
     dict[str, dict[str, list[ModelEvidence]]],
 ]:
-    # Confirmed partial rows remain available to raw/common Linux contracts,
-    # but cannot anchor a Windows family graph line. Their exact positive
-    # values still invalidate a previous zero in the family state above.
-    projection_rows = [
-        {
-            **row,
-            "models": []
-            if row["model_source"] == "confirmed" and not row["models_complete"]
-            else row.get("models"),
-        }
-        for row in rows
-    ]
+    # Completeness controls global idle authority, not known model values.
     authority_token_models = {
-        model: _model_projection(rows, model, "tokens")
+        model: _model_projection(rows, model, "tokens", gaps)
         for model in universe
     }
     idle = _idle_intervals(period, rows, authority_token_models, gaps)
     token_models = {
-        model: _model_projection(projection_rows, model, "tokens")
+        model: _model_projection(rows, model, "tokens", gaps)
         for model in universe
     }
     dollar_models = {
-        model: _normalize_dollars_from_token_identity(
-            projection_rows,
-            model,
-            _model_projection(projection_rows, model, "dollars"),
-            token_models[model],
-            idle,
-        )
+        model: _model_projection(rows, model, "dollars", gaps)
         for model in universe
     }
     grouped = _windows_family_model_projections(
         rows,
         {"tokens": token_models, "dollars": dollar_models},
+        allow_omitted_zero=allow_omitted_zero,
     )
     return token_models, dollar_models, idle, grouped
 
@@ -843,32 +764,8 @@ def _remaining_projection(
     _gaps: list[dict[str, Any]],
 ) -> list[RemainingEvidence]:
     raw = [None if row.get("synthetic", False) else row["remaining_percent"] for row in rows]
-    isolated: set[int] = set()
-    for index in range(1, len(rows) - 1):
-        left, middle, right = raw[index - 1], raw[index], raw[index + 1]
-        if (
-            left is not None
-            and middle is not None
-            and right is not None
-            and left >= right
-            and (middle > left or middle < right)
-        ):
-            isolated.add(index)
-    values: list[float | None] = [None] * len(rows)
-    origins: list[str | None] = [None] * len(rows)
-    raw_reliable = [False] * len(rows)
-    baseline: float | None = None
-    for index, value in enumerate(raw):
-        if value is None:
-            continue
-        if index in isolated or baseline is not None and value > baseline:
-            values[index] = baseline
-            origins[index] = "monotonic_hold"
-        else:
-            baseline = value
-            values[index] = value
-            origins[index] = "raw"
-            raw_reliable[index] = True
+    values: list[float | None] = list(raw)
+    origins: list[str | None] = ["raw" if value is not None else None for value in raw]
 
     run_start = 0
     while run_start < len(rows):
@@ -886,7 +783,6 @@ def _remaining_projection(
         interpolated = False
         if (
             bounded
-            and values[run_end] < values[left]
             and rows[run_end]["timestamp"] > rows[left]["timestamp"]
         ):
             elapsed = rows[run_end]["timestamp"] - rows[left]["timestamp"]
@@ -925,6 +821,7 @@ def _model_segments(
     projection: list[ModelEvidence],
     gaps: list[dict[str, Any]],
     idle_intervals: list[dict[str, int]],
+    sampling_slots: set[int],
 ) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
 
@@ -951,7 +848,9 @@ def _model_segments(
         causes: list[str] = []
         if _hard_break(start, end, gaps):
             causes.append("confirmed_gap")
-        predicted = list(range(previous + 1, index))
+        predicted = [] if _sampling_slot_bridges_model(
+            rows, model, metric, projection, previous, index, sampling_slots
+        ) else list(range(previous + 1, index))
         if predicted:
             causes.append("model_missing")
         interval_sources = {rows[offset]["model_source"] for offset in predicted}
@@ -969,7 +868,7 @@ def _model_segments(
             "dashed"
             if causes
             else "idle"
-            if confirmed_idle
+            if confirmed_idle and previous_value == current_value
             else "flat"
             if previous_value == current_value
             else "rising"
@@ -1021,11 +920,12 @@ def _remaining_segments(
     _samples: list[dict[str, Any]],
     rows: list[dict[str, Any]],
     evidence: list[RemainingEvidence],
-    _token_models: dict[str, list[ModelEvidence]],
+    token_models: dict[str, list[ModelEvidence]],
     gaps: list[dict[str, Any]],
     idle_intervals: list[dict[str, int]],
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
+    sampling_slots = _recoverable_sampling_slots(rows, gaps, token_models)
     anchors = [
         index
         for index, point in enumerate(evidence)
@@ -1038,14 +938,10 @@ def _remaining_segments(
         causes: list[str] = []
         if _hard_break(before.timestamp, after.timestamp, gaps):
             causes.append("confirmed_gap")
-        predicted = evidence[left + 1 : right]
+        predicted = [] if right == left + 2 and left + 1 in sampling_slots else evidence[left + 1 : right]
         measured = before.origin == "raw" and after.origin == "raw"
         if not measured or predicted:
             causes.append("remaining_missing")
-        if after.effective > before.effective or any(
-            point.origin == "monotonic_hold" for point in predicted
-        ):
-            causes.append("remaining_anomaly")
         result.append(
             {
                 "metric": "remaining",
@@ -1106,9 +1002,11 @@ def _idle_intervals(
         for point in _remaining_projection(period, rows, token_models, gaps)
     }
     intervals: list[tuple[int, int]] = []
-    for index in range(len(rows) - 1):
+    sampling_slots = _recoverable_sampling_slots(rows, gaps, token_models)
+    observed_indices = [index for index in range(len(rows)) if index not in sampling_slots]
+    for index, right_index in pairwise(observed_indices):
         left = rows[index]
-        right = rows[index + 1]
+        right = rows[right_index]
         start, end = left["timestamp"], right["timestamp"]
         if end <= start:
             continue
@@ -1123,12 +1021,14 @@ def _idle_intervals(
         if any(
             name not in token_models
             or index >= len(token_models[name])
-            or index + 1 >= len(token_models[name])
+            or right_index >= len(token_models[name])
             or not raw_idle_origin(left, token_models[name][index])
-            or not raw_idle_origin(right, token_models[name][index + 1])
-            or token_models[name][index].value != token_models[name][index + 1].value
+            or not raw_idle_origin(right, token_models[name][right_index])
+            or token_models[name][index].value != token_models[name][right_index].value
             for name in left_names
         ):
+            continue
+        if _raw_token_signature(left) != _raw_token_signature(right):
             continue
         left_models = {model["model"]: model for model in left.get("models") or []}
         right_models = {model["model"]: model for model in right.get("models") or []}
@@ -1185,24 +1085,13 @@ def _is_idle_interval(
 
 def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, int]]]:
     period, samples, gaps = _validate_fixture(fixture)
-    rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
+    rows = _rows_with_tail(period, samples)
     universe = _period_model_universe(samples)
-    renderable_universe = tuple(model for model in universe if model in RENDERABLE_MODELS)
-    token_models = {
-        model: _model_projection(rows, model, "tokens") for model in universe
-    }
-    idle = _idle_intervals(period, rows, token_models, gaps)
-    dollar_models = {
-        model: _normalize_dollars_from_token_identity(
-            rows,
-            model,
-            _model_projection(rows, model, "dollars"),
-            token_models[model],
-            idle,
-        )
-        for model in universe
-    }
-    projections = {"tokens": token_models, "dollars": dollar_models}
+    token_models, _dollar_models, idle, projections = _windows_model_projection_data(
+        period, rows, universe, gaps, allow_omitted_zero=False,
+    )
+    renderable_universe = tuple(sorted(projections["tokens"], key=lambda value: value.encode("utf-8")))
+    sampling_slots = _recoverable_sampling_slots(rows, gaps, token_models)
     segments: list[dict[str, Any]] = []
     remaining = _remaining_projection(period, rows, token_models, gaps)
     segments.extend(_remaining_segments(samples, rows, remaining, token_models, gaps, idle))
@@ -1216,6 +1105,7 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
                     projections[metric][model],
                     gaps,
                     idle,
+                    sampling_slots,
                 )
             )
     segments.sort(key=_segment_key)
@@ -1224,7 +1114,7 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
 
 def _build_windows_model_segments(fixture: dict[str, Any]) -> list[dict[str, Any]]:
     period, samples, gaps = _validate_fixture(fixture)
-    rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
+    rows = _rows_with_tail(period, samples)
     universe = _period_model_universe(samples)
     token_models, _dollar_models, idle, grouped = _windows_model_projection_data(
         period,
@@ -1233,12 +1123,13 @@ def _build_windows_model_segments(fixture: dict[str, Any]) -> list[dict[str, Any
         gaps,
     )
     remaining = _remaining_projection(period, rows, token_models, gaps)
+    sampling_slots = _recoverable_sampling_slots(rows, gaps, token_models)
     segments = _remaining_segments(samples, rows, remaining, token_models, gaps, idle)
     for metric in ("tokens", "dollars"):
         for family in sorted(grouped[metric], key=lambda value: value.encode("utf-8")):
             projection = grouped[metric][family]
             segments.extend(
-                _model_segments(rows, family, metric, projection, gaps, idle)
+                _model_segments(rows, family, metric, projection, gaps, idle, sampling_slots)
             )
     segments.sort(key=_segment_key)
     return segments
@@ -1352,7 +1243,7 @@ def _segment_is_smoothable(
     end = values.get(segment["end_at"])
     if start is None or end is None or not math.isfinite(start) or not math.isfinite(end):
         return False
-    return end <= start if remaining else end >= start
+    return True if remaining else end >= start
 
 
 def _canonical_curve_interval(
@@ -1821,38 +1712,14 @@ def build_expected_render_contracts(
     if platform not in {"linux", "windows"}:
         raise EvidenceError("render contract platform must be linux or windows")
     period, samples, gaps = _validate_fixture(fixture)
-    rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
+    rows = _rows_with_tail(period, samples)
     universe = _period_model_universe(samples)
-    if platform == "windows":
-        token_models, dollar_models, idle, renderable_projections_by_metric = (
-            _windows_model_projection_data(period, rows, universe, gaps)
-        )
-        renderable_universe = tuple(
-            sorted(
-                renderable_projections_by_metric["tokens"],
-                key=lambda value: value.encode("utf-8"),
-            )
-        )
-    else:
-        renderable_universe = tuple(model for model in universe if model in RENDERABLE_MODELS)
-        token_models = {
-            model: _model_projection(rows, model, "tokens") for model in universe
-        }
-        idle = _idle_intervals(period, rows, token_models, gaps)
-        dollar_models = {
-            model: _normalize_dollars_from_token_identity(
-                rows,
-                model,
-                _model_projection(rows, model, "dollars"),
-                token_models[model],
-                idle,
-            )
-            for model in universe
-        }
-        renderable_projections_by_metric = {
-            "tokens": {model: token_models[model] for model in renderable_universe},
-            "dollars": {model: dollar_models[model] for model in renderable_universe},
-        }
+    token_models, _dollar_models, idle, renderable_projections_by_metric = _windows_model_projection_data(
+        period, rows, universe, gaps, allow_omitted_zero=platform == "windows",
+    )
+    renderable_universe = tuple(sorted(
+        renderable_projections_by_metric["tokens"], key=lambda value: value.encode("utf-8")))
+    sampling_slots = _recoverable_sampling_slots(rows, gaps, token_models)
     remaining_evidence = _remaining_projection(period, rows, token_models, gaps)
     remaining_values = {
         point.timestamp: point.effective for point in remaining_evidence
@@ -1919,6 +1786,7 @@ def build_expected_render_contracts(
                 renderable_projections[model],
                 gaps,
                 idle,
+                sampling_slots,
             )
             values = {
                 row["timestamp"]: point.value

@@ -115,6 +115,10 @@ impl HistoryIndex {
 }
 
 impl PeriodIndex {
+    pub(crate) fn same_cursor_identity(&self, other: &Self) -> bool {
+        self.fingerprints == other.fingerprints
+    }
+
     pub(crate) fn resume(&self, rows: &[PublicHistoryObservationV3], position: usize) -> String {
         let sample = &rows[self.samples[position]];
         format!(

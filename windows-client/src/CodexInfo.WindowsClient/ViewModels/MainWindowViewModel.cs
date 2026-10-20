@@ -620,9 +620,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             if (IsHistoricalDetails && detailsFailure is null)
             {
-                return detailsSnapshot?.State == ApiState.Error
+                var historical = detailsSnapshot?.State == ApiState.Error
                     ? Texts.HistoricalAccountErrorDetail
                     : Texts.HistoricalAccountDetail;
+                return historical;
             }
 
             var detail = Texts.StatusDetailFor(

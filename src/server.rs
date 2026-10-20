@@ -9,7 +9,7 @@
 
 use crate::security;
 use codex_info_rest_contract::current_period_bounds;
-pub use codex_info_rest_contract::PublicThreadActivityStatus;
+pub use codex_info_rest_contract::{PublicThreadActivityStatus, PublishedPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -34,7 +34,6 @@ pub const MAX_PUBLIC_MODELS: usize = 3;
 pub const MAX_PUBLIC_MODELS_V3: usize = 1_024;
 /// SQLite retains three calendar months, while one REST details snapshot is
 /// limited to one calendar month of minute buckets.
-pub const MAX_PUBLIC_HISTORY_PERIODS: usize = 128;
 pub const MAX_PUBLIC_HISTORY_SAMPLES: usize = 31 * 24 * 60;
 pub const MAX_PUBLIC_HISTORY_GAPS: usize = 4_096;
 pub const MAX_PUBLIC_THREADS: usize = 256;
@@ -103,9 +102,8 @@ pub struct PublicHistoryPeriod {
     pub id: String,
     pub start_at: i64,
     pub end_at: i64,
-    /// Canonical quota-reset boundary. `end_at` may be clipped when a newer
-    /// reset period begins before this boundary, so clients must not infer
-    /// sample ownership from the graph end.
+    /// Exact quota-reset identity. The observed end belongs to this period;
+    /// a neighboring period cannot clip it or change sample ownership.
     pub reset_at: i64,
     pub label: String,
     pub current: bool,
@@ -236,9 +234,6 @@ impl PublicDetails {
         {
             return Err(ApiSnapshotError::InvalidLabel);
         }
-        if self.history_periods.len() > MAX_PUBLIC_HISTORY_PERIODS {
-            return Err(ApiSnapshotError::ListTooLong);
-        }
         if self.history_samples.len() > MAX_PUBLIC_HISTORY_SAMPLES {
             return Err(ApiSnapshotError::ListTooLong);
         }
@@ -313,9 +308,12 @@ impl PublicDetails {
             if !valid_timestamp(sample.timestamp)
                 || sample.timestamp.rem_euclid(60) != 0
                 || !valid_timestamp(sample.reset_at)
-                || self
-                    .observed_at
-                    .is_none_or(|observed_at| sample.timestamp > observed_at)
+                || current_reset_sample_exceeds_observation(
+                    sample.reset_at,
+                    sample.timestamp,
+                    self.observed_at,
+                    self.quota.as_ref().map(|quota| quota.reset_at),
+                )
                 || sample
                     .remaining_percent
                     .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
@@ -640,9 +638,12 @@ impl PublicDetailsV2 {
             if !valid_timestamp(sample.timestamp)
                 || sample.timestamp.rem_euclid(60) != 0
                 || !valid_timestamp(sample.reset_at)
-                || self
-                    .observed_at
-                    .is_none_or(|observed_at| sample.timestamp > observed_at)
+                || current_reset_sample_exceeds_observation(
+                    sample.reset_at,
+                    sample.timestamp,
+                    self.observed_at,
+                    self.quota.as_ref().map(|quota| quota.reset_at),
+                )
                 || !observation_ids.insert((sample.reset_at, sample.timestamp))
                 || previous_key
                     .is_some_and(|previous| previous > (sample.reset_at, sample.timestamp))
@@ -860,9 +861,12 @@ impl PublicDetailsV3 {
             if !valid_timestamp(sample.timestamp)
                 || sample.timestamp.rem_euclid(60) != 0
                 || !valid_timestamp(sample.reset_at)
-                || self
-                    .observed_at
-                    .is_none_or(|observed_at| sample.timestamp > observed_at)
+                || current_reset_sample_exceeds_observation(
+                    sample.reset_at,
+                    sample.timestamp,
+                    self.observed_at,
+                    self.quota.as_ref().map(|quota| quota.reset_at),
+                )
                 || !keys.insert(key)
                 || previous.is_some_and(|previous| previous > key)
                 || !matches!(
@@ -986,6 +990,16 @@ pub fn validate_public_threads(threads: &[PublicThread]) -> Result<(), ApiSnapsh
 
 fn valid_timestamp(value: i64) -> bool {
     (1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value)
+}
+
+fn current_reset_sample_exceeds_observation(
+    sample_reset_at: i64,
+    sample_timestamp: i64,
+    observed_at: Option<i64>,
+    current_reset_at: Option<i64>,
+) -> bool {
+    current_reset_at == Some(sample_reset_at)
+        && observed_at.is_none_or(|observed_at| sample_timestamp > observed_at)
 }
 
 fn valid_non_negative_rate(value: f64) -> bool {
@@ -1236,36 +1250,6 @@ impl PartialEq for HistoryHeadBodyCache {
 }
 
 impl Eq for HistoryHeadBodyCache {}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublishedPair {
-    identity: String,
-}
-
-impl PublishedPair {
-    pub fn as_str(&self) -> &str {
-        &self.identity
-    }
-
-    pub fn identity(&self) -> &str {
-        self.as_str()
-    }
-
-    fn from_epoch_counter(epoch: [u8; 16], counter: u128) -> Self {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut identity = String::with_capacity(67);
-        identity.push_str("v1:");
-        for byte in epoch {
-            identity.push(HEX[(byte >> 4) as usize] as char);
-            identity.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        for shift in (0..32).rev() {
-            let nibble = ((counter >> (shift * 4)) & 0x0f) as usize;
-            identity.push(HEX[nibble] as char);
-        }
-        Self { identity }
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PublishedPairGenerationState {
@@ -2990,6 +2974,65 @@ mod tests {
     }
 
     #[test]
+    fn issue604_other_period_history_is_not_bounded_by_the_current_observation_clock() {
+        let details = PublicDetails {
+            state: PublicState::Ready,
+            observed_at: Some(1200),
+            authenticated: true,
+            quota: Some(PublicQuota {
+                remaining_percent: 50.0,
+                reset_at: 1800,
+                window_seconds: 1200,
+                monthly: false,
+            }),
+            history_periods: vec![
+                PublicHistoryPeriod {
+                    id: "2400".into(),
+                    start_at: 1260,
+                    end_at: 1260,
+                    reset_at: 2400,
+                    label: "past".into(),
+                    current: false,
+                    origin_at: None,
+                },
+                PublicHistoryPeriod {
+                    id: "1800".into(),
+                    start_at: 600,
+                    end_at: 1200,
+                    reset_at: 1800,
+                    label: "current".into(),
+                    current: true,
+                    origin_at: Some(600),
+                },
+            ],
+            history_samples: vec![PublicHistorySample {
+                timestamp: 1260,
+                reset_at: 2400,
+                remaining_percent: Some(40.0),
+                sol_dollars: 1.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 1,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            }],
+            ..PublicDetails::default()
+        };
+        details.validate().expect(
+            "a retained historical point uses its own exact period, not the current quota clock",
+        );
+        let v2 = PublicDetailsV2::from(details.clone());
+        v2.validate()
+            .expect("v2 history uses the same independent period bounds");
+        PublicDetailsV3::from_v2_compat(&v2)
+            .validate()
+            .expect("v3 history uses the same independent period bounds");
+        assert_eq!(details.observed_at, Some(1200));
+        assert_eq!(details.history_periods[1].end_at, 1200);
+        assert_eq!(details.history_samples[0].timestamp, 1260);
+    }
+
+    #[test]
     fn published_pair_generation_matches_fixed_vectors() {
         let epoch = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
@@ -4230,6 +4273,17 @@ mod tests {
         no_observed_at.history_periods[0].current = false;
         assert_eq!(
             no_observed_at.validate(),
+            Err(ApiSnapshotError::InvalidHistoryObservation)
+        );
+
+        let mut v3_future_current_reset =
+            PublicDetailsV3::from_v2_compat(&PublicDetailsV2::from(detailed_fixture()));
+        let observed_at = v3_future_current_reset.observed_at.unwrap();
+        v3_future_current_reset.history_periods[0].current = false;
+        v3_future_current_reset.history_periods[0].end_at = observed_at + 60;
+        v3_future_current_reset.history_samples[0].timestamp = observed_at + 60;
+        assert_eq!(
+            v3_future_current_reset.validate(),
             Err(ApiSnapshotError::InvalidHistoryObservation)
         );
     }

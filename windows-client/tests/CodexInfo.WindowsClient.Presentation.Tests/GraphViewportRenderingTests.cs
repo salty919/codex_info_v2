@@ -155,7 +155,12 @@ public sealed class GraphViewportRenderingTests
         // The ordinary Scene fixture decreases quota at every point.
         static GraphScene FlatQuotaScene(long start, long end, params (long Timestamp, double Sol)[] points) =>
             GraphScene.Create(points.Select(point => Sample(point.Timestamp, end, point.Sol, taskActiveSincePrevious: false)).ToArray(),
-                GraphMetric.Dollars, start, end);
+                GraphMetric.Dollars,
+                start,
+                end,
+                confirmedGaps: null,
+                hiddenModelNames: null,
+                accountOwnershipIntervals: [new GraphAccountOwnershipInterval(start, end + 1)]);
         var second = FlatQuotaScene(
             5_000,
             6_200,
@@ -256,7 +261,11 @@ public sealed class GraphViewportRenderingTests
         ],
         GraphMetric.Dollars,
         start,
-        end);
+        end,
+        confirmedGaps: null,
+        hiddenModelNames: null,
+        accountOwnershipIntervals:
+        [new GraphAccountOwnershipInterval(expected[1] - 600, expected[1] + 601)]);
         Assert.Contains(idlePeriod.IdleIntervals, interval =>
             interval.StartAt <= expected[1] && interval.EndAt >= expected[1]);
 

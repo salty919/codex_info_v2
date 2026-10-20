@@ -50,13 +50,6 @@ internal readonly record struct GraphRemainingLineProjection(
     GraphLineProjection Solid,
     GraphLineProjection Dashed);
 
-/// <summary>A finite presentation policy for the leading quota interval.</summary>
-internal enum GraphRemainingBaselineMode
-{
-    None,
-    PeriodStartAtFullQuota,
-}
-
 /// <summary>
 /// A renderer-ready line whose coordinates are quantized through the same
 /// 0..100, two-decimal viewbox used by the native Slint graph.
@@ -246,14 +239,9 @@ internal static class GraphPlotProjection
     }
 
     internal static GraphCanonicalRemainingLineProjection BuildCanonicalRemainingLines(
-        GraphScene scene) =>
-        BuildCanonicalRemainingLines(scene, GraphRemainingBaselineMode.None);
-
-    internal static GraphCanonicalRemainingLineProjection BuildCanonicalRemainingLines(
-        GraphScene scene,
-        GraphRemainingBaselineMode baselineMode)
+        GraphScene scene)
     {
-        var semantic = BuildRemainingLines(scene, smooth: true, baselineMode);
+        var semantic = BuildRemainingLines(scene, smooth: true);
         return new GraphCanonicalRemainingLineProjection(
             CanonicalizeLine(scene, semantic.Idle, 100, remaining: true, dashed: false),
             CanonicalizeLine(scene, semantic.Solid, 100, remaining: true, dashed: false),
@@ -305,7 +293,7 @@ internal static class GraphPlotProjection
                 [GraphSeries.Sol] = BuildCanonicalModelLines(scene, scene.Sol),
                 [GraphSeries.Terra] = BuildCanonicalModelLines(scene, scene.Terra),
             },
-            BuildCanonicalRemainingLines(scene, GraphRemainingBaselineMode.PeriodStartAtFullQuota),
+            BuildCanonicalRemainingLines(scene),
             BuildCanonicalRemainingMarkers(scene));
 
     internal static GraphCanonicalModelLineProjection BuildViewportModelLines(
@@ -828,19 +816,13 @@ internal static class GraphPlotProjection
     /// are emitted into the dashed prediction path.
     /// </summary>
     public static GraphRemainingLineProjection BuildRemainingLines(GraphScene scene) =>
-        BuildRemainingLines(scene, smooth: false, GraphRemainingBaselineMode.None);
+        BuildRemainingLines(scene, smooth: false);
 
     private static GraphRemainingLineProjection BuildRemainingLines(
         GraphScene scene,
-        bool smooth,
-        GraphRemainingBaselineMode baselineMode)
+        bool smooth)
     {
         ArgumentNullException.ThrowIfNull(scene);
-        if (baselineMode is not GraphRemainingBaselineMode.None and
-            not GraphRemainingBaselineMode.PeriodStartAtFullQuota)
-        {
-            throw new ArgumentOutOfRangeException(nameof(baselineMode));
-        }
         if (!scene.HasPoints)
         {
             return new GraphRemainingLineProjection(
@@ -871,25 +853,6 @@ internal static class GraphPlotProjection
                 scene.RemainingOrigins[index] is GraphRemainingOrigin.Raw)
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
-        if (baselineMode is GraphRemainingBaselineMode.PeriodStartAtFullQuota &&
-            scene.HasVerifiedPeriodOrigin &&
-            anchors.Length > 0 &&
-            scene.RemainingObserved[anchors[0]] &&
-            scene.Timestamps[anchors[0]] > scene.PeriodStartAt &&
-            !scene.HasRemainingHardBreakBetween(scene.PeriodStartAt, scene.Timestamps[anchors[0]]) &&
-            !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[anchors[0]]))
-        {
-            // Verified published period origin is renderer-only, including past periods. Keep it out of
-            // GraphScene's raw/history arrays and connect only to the first
-            // accepted observation without crossing a confirmed break.
-            AppendSegment(
-                solidX,
-                solidY,
-                scene.PeriodStartAt,
-                100,
-                scene.Timestamps[anchors[0]],
-                scene.Remaining[anchors[0]]);
-        }
         for (var anchor = 1; anchor < anchors.Length; anchor++)
         {
             var left = anchors[anchor - 1];
@@ -908,46 +871,31 @@ internal static class GraphPlotProjection
             var before = RemainingValue(scene, left);
             var current = RemainingValue(scene, right);
             var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)
-                .Any(index => scene.RemainingOrigins[index] is not GraphRemainingOrigin.Raw);
+                .Any(index => scene.RemainingOrigins[index] is not GraphRemainingOrigin.Raw &&
+                    !scene.CanBridgeRemainingSamplingSlot(index));
             var measured = RemainingOriginHasMeasuredQuota(scene.RemainingOrigins[left]) &&
                 RemainingOriginHasMeasuredQuota(scene.RemainingOrigins[right]);
-            if (current > before)
+            var dashed = scene.HasRemainingHardBreakBetween(
+                    scene.Timestamps[left],
+                    scene.Timestamps[right]) ||
+                crossesPrediction ||
+                !measured;
+            if (!dashed && SameDoubleBits(current, before) && IsConfirmedIdleInterval(
+                    scene.IdleIntervals,
+                    scene.Timestamps[left],
+                    scene.Timestamps[right]))
             {
                 AppendSegment(
-                    dashedX,
-                    dashedY,
+                    idleX,
+                    idleY,
                     scene.Timestamps[left],
                     before,
                     scene.Timestamps[right],
-                    before);
+                    current);
             }
             else
             {
-                var dashed = scene.HasRemainingHardBreakBetween(
-                        scene.Timestamps[left],
-                        scene.Timestamps[right]) ||
-                    crossesPrediction ||
-                    !measured;
-                if (dashed && AppendStoppedBridge(scene, scene.Timestamps[left], before,
-                        scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
-                    continue;
-                if (!dashed && SameDoubleBits(current, before) && IsConfirmedIdleInterval(
-                        scene.IdleIntervals,
-                        scene.Timestamps[left],
-                        scene.Timestamps[right]))
-                {
-                    AppendSegment(
-                        idleX,
-                        idleY,
-                        scene.Timestamps[left],
-                        before,
-                        scene.Timestamps[right],
-                        current);
-                }
-                else
-                {
-                    smoothableIntervals.Add((left, right, dashed));
-                }
+                smoothableIntervals.Add((left, right, dashed));
             }
         }
         if (smooth)
@@ -985,9 +933,7 @@ internal static class GraphPlotProjection
             // never extend the local model vector to manufacture a current
             // observation or a consumption rate.
             var lastKnown = RemainingValue(scene, previous);
-            if (!AppendStoppedBridge(scene, scene.Timestamps[previous], lastKnown,
-                    scene.PeriodEndAt, lastKnown, idleX, idleY, dashedX, dashedY))
-                AppendSegment(
+            AppendSegment(
                 dashedX,
                 dashedY,
                 scene.Timestamps[previous],
@@ -1037,7 +983,7 @@ internal static class GraphPlotProjection
         var risingY = new List<double>();
         var dashedX = new List<double>();
         var dashedY = new List<double>();
-        var idleIntervals = scene.IdleIntervalsForModel(values);
+        var idleIntervals = scene.IdleIntervals;
         var anchors = Enumerable.Range(0, values.Count)
             .Where(index => double.IsFinite(values[index]) && values[index] >= 0 &&
                 !scene.ModelSynthetic[index] &&
@@ -1073,42 +1019,26 @@ internal static class GraphPlotProjection
                 // Partial family observations remain visible at their saved
                 // times. Keep uncertainty in the line style, not by replacing
                 // the recorded contribution with an older horizontal hold.
-                if (!AppendStoppedBridge(scene, scene.Timestamps[left], before,
-                        scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
-                    AppendSegment(dashedX, dashedY, scene.Timestamps[left], before,
-                        scene.Timestamps[right], current);
+                AppendSegment(dashedX, dashedY, scene.Timestamps[left], before,
+                    scene.Timestamps[right], current);
                 continue;
             }
             var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)
-                .Any(index => !scene.IsModelIntervalReliable(values, index, index));
+                .Any(index => !scene.IsModelIntervalReliable(values, index, index) &&
+                    !scene.CanBridgeModelSamplingSlot(values, index));
             var crossesCorrection = scene.HasModelCorrectionBetween(
                 values,
                 scene.Timestamps[left],
                 scene.Timestamps[right]);
-            if (confirmedIdle && !crossesPrediction)
+            if (confirmedIdle && !crossesPrediction && !crossesCorrection && current == before)
             {
-                if (scene.HasModelTokenCountChange(values, left, right))
-                {
-                    // Keep the measured endpoints connected, but show a
-                    // low-rate change as uncertain rather than active use.
-                    AppendSegment(
-                        dashedX,
-                        dashedY,
-                        scene.Timestamps[left],
-                        before,
-                        scene.Timestamps[right],
-                        current);
-                }
-                else
-                {
-                    AppendSegment(
-                        idleX,
-                        idleY,
-                        scene.Timestamps[left],
-                        before,
-                        scene.Timestamps[right],
-                        before);
-                }
+                AppendSegment(
+                    idleX,
+                    idleY,
+                    scene.Timestamps[left],
+                    before,
+                    scene.Timestamps[right],
+                    current);
             }
             else if (current < before)
             {
@@ -1122,9 +1052,7 @@ internal static class GraphPlotProjection
             }
             else if (crossesCorrection)
             {
-                if (!AppendStoppedBridge(scene, scene.Timestamps[left], before,
-                        scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
-                    AppendSegment(
+                AppendSegment(
                     dashedX,
                     dashedY,
                     scene.Timestamps[left],
@@ -1138,9 +1066,6 @@ internal static class GraphPlotProjection
                         scene.Timestamps[left],
                         scene.Timestamps[right]) ||
                     crossesPrediction;
-                if (dashed && AppendStoppedBridge(scene, scene.Timestamps[left], before,
-                        scene.Timestamps[right], current, idleX, idleY, dashedX, dashedY))
-                    continue;
                 smoothableIntervals.Add((
                     left,
                     right,
@@ -1185,39 +1110,6 @@ internal static class GraphPlotProjection
             }
         }
 
-        var firstAnchor = anchors.Length > 0 ? anchors[0] : -1;
-        var modelName = scene.ModelSeries
-            .FirstOrDefault(pair => ReferenceEquals(pair.Value, values))
-            .Key;
-        var firstAnchorIsRecorded = firstAnchor >= 0 &&
-            modelName is not null &&
-            ((scene.ModelReliability.TryGetValue(modelName, out var modelReliability) &&
-              firstAnchor < modelReliability.Count && modelReliability[firstAnchor]) ||
-             scene.HasRecordedModelContribution(values, firstAnchor));
-        if (scene.HasVerifiedPeriodOrigin &&
-            firstAnchorIsRecorded &&
-            scene.Timestamps[firstAnchor] > scene.PeriodStartAt &&
-            !scene.HasModelHardBreakBetween(
-                values,
-                scene.PeriodStartAt,
-                scene.Timestamps[firstAnchor]) &&
-            !scene.OverlapsNonOwnedInterval(scene.PeriodStartAt, scene.Timestamps[firstAnchor]))
-        {
-            // The zero origin is a presentation boundary supported by both
-            // the verified published period and this series' recorded first
-            // anchor. It never becomes a model sample or hover observation.
-            var (baselineX, baselineY) = values[firstAnchor] == 0
-                ? (flatX, flatY)
-                : (risingX, risingY);
-            AppendSegment(
-                baselineX,
-                baselineY,
-                scene.PeriodStartAt,
-                0,
-                scene.Timestamps[firstAnchor],
-                values[firstAnchor]);
-        }
-
         var previous = anchors.LastOrDefault(-1);
         if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous] &&
             !IsObservationMinuteRemainder(scene, scene.Timestamps[previous]) &&
@@ -1226,9 +1118,7 @@ internal static class GraphPlotProjection
                 !scene.HasModelHardBreakBetween(values, scene.Timestamps[previous], scene.PeriodEndAt)) &&
             !scene.OverlapsNonOwnedInterval(scene.Timestamps[previous], scene.PeriodEndAt))
         {
-            if (!AppendStoppedBridge(scene, scene.Timestamps[previous], values[previous],
-                    scene.PeriodEndAt, values[previous], idleX, idleY, dashedX, dashedY))
-                AppendSegment(
+            AppendSegment(
                     dashedX,
                     dashedY,
                     scene.Timestamps[previous],
@@ -1249,29 +1139,6 @@ internal static class GraphPlotProjection
     // endpoint without inventing a value or a prediction for those seconds.
     private static bool IsObservationMinuteRemainder(GraphScene scene, double observedAt) =>
         scene.PeriodEndAt / 60 == (long)observedAt / 60;
-
-    // Only missing-data bridges use this projection. Measured anchors and hover data stay intact.
-    private static bool AppendStoppedBridge(
-        GraphScene scene, double start, double before, double end, double after,
-        List<double> idleX, List<double> idleY, List<double> dashedX, List<double> dashedY)
-    {
-        var stops = scene.TaskIdleIntervals.Where(interval => interval.StartAt < end && interval.EndAt > start).ToArray();
-        if (stops.Length == 0)
-            return false;
-        var cursor = start;
-        foreach (var stop in stops)
-        {
-            var from = Math.Max(start, stop.StartAt);
-            var to = Math.Min(end, stop.EndAt);
-            if (from > cursor)
-                AppendSegment(dashedX, dashedY, cursor, before, from, before);
-            AppendSegment(idleX, idleY, from, before, to, before);
-            cursor = to;
-        }
-        if (cursor < end)
-            AppendSegment(dashedX, dashedY, cursor, before, end, after);
-        return true;
-    }
 
     private static bool IsConfirmedIdleInterval(
         IReadOnlyList<GraphIdleInterval> intervals,
@@ -1296,7 +1163,7 @@ internal static class GraphPlotProjection
     public static IReadOnlyList<GraphUnusedInterval> BuildVisibleUnusedIntervals(GraphScene scene)
     {
         ArgumentNullException.ThrowIfNull(scene);
-        var intervals = scene.IdleIntervals.Concat(scene.TaskIdleIntervals)
+        var intervals = scene.IdleIntervals
             .Select(interval => new GraphUnusedInterval(interval.StartAt, interval.EndAt))
             .OrderBy(interval => interval.StartAt);
         var merged = new List<GraphUnusedInterval>();
@@ -1794,9 +1661,6 @@ internal static class GraphPlotProjection
                 index == last ||
                 preservedIndices.Contains(index) ||
                 scene.IdleIntervals.Any(interval =>
-                    interval.StartAt == timestamps[index] ||
-                    interval.EndAt == timestamps[index]) ||
-                scene.TaskIdleIntervals.Any(interval =>
                     interval.StartAt == timestamps[index] ||
                     interval.EndAt == timestamps[index]) ||
                 (values[index] != values[index - 1] &&

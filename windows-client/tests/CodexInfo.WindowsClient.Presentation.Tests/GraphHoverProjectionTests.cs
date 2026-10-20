@@ -132,7 +132,7 @@ public sealed class GraphHoverProjectionTests
     }
 
     [Fact]
-    public void FindExcludesSyntheticTailAndRowsDroppedAsRecoverableSamplingJitter()
+    public void FindExcludesSyntheticTailAndRetainsUnavailableSamplingRows()
     {
         var synthetic = Sample(200, 1, 80, Model("SOL", 200, 2)) with { IsSyntheticTail = true };
         var syntheticScene = CreateScene(
@@ -158,7 +158,7 @@ public sealed class GraphHoverProjectionTests
         1_000,
         1_120);
 
-        Assert.Equal(1_000, Assert.IsType<GraphHoverSnapshot>(
+        Assert.Equal(1_060, Assert.IsType<GraphHoverSnapshot>(
             GraphHoverProjection.Find(jitterScene, 1_060, Visible(GraphSeries.Sol))).Timestamp);
     }
 
@@ -268,7 +268,9 @@ public sealed class GraphHoverProjectionTests
             200,
             Visible(GraphSeries.Sol))).Rows);
         Assert.Equal(dollarScene.ModelSeries["SOL"][1], dollar.NumericValue);
-        Assert.NotEqual(5, dollar.NumericValue);
+        // Saved USD has its own anchors; unchanged tokens cannot replace $5
+        // with a held price (PRODUCT G137-3).
+        Assert.Equal(5, dollar.NumericValue);
         Assert.Null(dollar.TokenValue);
 
         const ulong exactCount = 9_007_199_254_740_993;

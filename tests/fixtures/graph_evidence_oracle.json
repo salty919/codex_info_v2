@@ -46,7 +46,7 @@
         "SOL": [10.0,10.0,20.0,20.0,20.0,20.0,20.0,20.0,21.0,21.0],
         "TERRA": [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
       },
-      "correction_starts": [],
+      "correction_starts": [480],
       "idle_intervals": [],
       "model_segments": {
         "ASTRA": {"flat":[[0,60],[60,120]],"rising":[],"dashed":[[120,600]]},
@@ -102,7 +102,8 @@
         {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0,"task_active_since_previous":false}
       ],
       "idle_intervals": [],
-      "dollar_flat": [[0,60],[60,120]],
+      "dollar_flat": [],
+      "dollar_dashed": [[0,120]],
       "token_flat": [[0,60],[60,120]]
     },
     "dollar_only_high_pulse": {
@@ -112,7 +113,8 @@
         {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0,"task_active_since_previous":false}
       ],
       "idle_intervals": [],
-      "dollar_flat": [[0,60],[60,120]],
+      "dollar_flat": [],
+      "dollar_dashed": [[0,120]],
       "token_flat": [[0,60],[60,120]],
       "dollar_maximum": 1.0
     },
@@ -144,8 +146,8 @@
         {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0}
       ],
       "idle_intervals": [],
-      "remaining_values": [90.0,90.0,90.0],
-      "remaining_dashed": [[0,120]]
+      "remaining_values": [90.0,95.0,90.0],
+      "remaining_dashed": []
     },
     "remaining_isolated_low_pulse": {
       "samples": [
@@ -154,8 +156,8 @@
         {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0}
       ],
       "idle_intervals": [],
-      "remaining_values": [90.0,90.0,90.0],
-      "remaining_dashed": [[0,120]]
+      "remaining_values": [90.0,80.0,90.0],
+      "remaining_dashed": []
     },
     "remaining_high_pulse_with_token_activity": {
       "samples": [
@@ -164,8 +166,8 @@
         {"timestamp":120,"remaining_percent":89.0,"tokens":102,"dollars":3.0}
       ],
       "idle_intervals": [],
-      "remaining_values": [90.0,90.0,89.0],
-      "remaining_dashed": [[0,120]]
+      "remaining_values": [90.0,95.0,89.0],
+      "remaining_dashed": []
     },
     "remaining_low_pulse_with_token_activity": {
       "samples": [
@@ -174,8 +176,8 @@
         {"timestamp":120,"remaining_percent":89.0,"tokens":102,"dollars":3.0}
       ],
       "idle_intervals": [],
-      "remaining_values": [90.0,90.0,89.0],
-      "remaining_dashed": [[0,120]]
+      "remaining_values": [90.0,80.0,89.0],
+      "remaining_dashed": []
     },
     "confirmed_gap": {
       "samples": [
@@ -393,7 +395,7 @@
   "expected_period_end": 1788476340,
   "expected_reset_at": 1788993073,
   "expected_graph_timestamps": [1788441660, 1788441720, 1788441780, 1788445260, 1788445320, 1788476280, 1788476340],
-  "expected_correction_starts": [],
+  "expected_correction_starts": [1788441780,1788445260,1788445320,1788476280],
   "expected_latest_sample_timestamp": 1788476280,
   "expected_latest_remaining": 62.0,
   "expected_latest_sol_dollars": 127.284527,
@@ -551,7 +553,7 @@
       {"timestamp":3180,"remaining_percent":97.0,"models":[{"model":"SOL","total_tokens":11,"total_dollars":11.0},{"model":"TERRA","total_tokens":8,"total_dollars":8.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
       {"timestamp":3240,"remaining_percent":96.0,"models":[{"model":"SOL","total_tokens":13,"total_dollars":13.0},{"model":"TERRA","total_tokens":9,"total_dollars":9.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"}
     ],
-    "expected": {"accepted_sol":[10.0,12.0,null,null,13.0],"sol_solid":[[3000,3060]],"sol_dashed":[[3060,3240]],"corrections":[],"idle_intervals":[]}
+    "expected": {"accepted_sol":[10,12,12,12,13],"sol_solid":[[3000,3060]],"sol_dashed":[[3060,3240]],"corrections":[3120,3180],"idle_intervals":[]}
   },
   "mixed_confirmed_v3": {
     "samples": [
@@ -561,7 +563,7 @@
       {"timestamp":3180,"remaining_percent":97.0,"models":[{"model":"SOL","total_tokens":11,"total_dollars":11.0},{"model":"TERRA","total_tokens":8,"total_dollars":8.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
       {"timestamp":3240,"remaining_percent":96.0,"models":[{"model":"SOL","total_tokens":13,"total_dollars":13.0},{"model":"TERRA","total_tokens":9,"total_dollars":9.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"}
     ],
-    "expected": {"accepted_sol":[null,null,7.0,11.0,13.0],"sol_solid":[[3120,3180],[3180,3240]],"sol_dashed":[],"corrections":[],"idle_intervals":[]}
+    "expected": {"accepted_sol":[10,12,12,12,13],"sol_solid":[[3000,3060]],"sol_dashed":[[3060,3240]],"corrections":[3120,3180],"idle_intervals":[]}
   },
   "quota_raw_increase": {
     "period_start": 4000,
@@ -570,7 +572,7 @@
       {"timestamp":4000,"remaining_percent":90.0,"models":[{"model":"SOL","total_tokens":1,"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":1.0},{"model":"TERRA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.0},{"model":"LUNA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.0}],"models_complete":true,"model_source":"confirmed"},
       {"timestamp":4060,"remaining_percent":92.0,"models":[{"model":"SOL","total_tokens":2,"input_tokens":2,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":2.0},{"model":"TERRA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.0},{"model":"LUNA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.0}],"models_complete":true,"model_source":"confirmed"}
     ],
-    "expected": {"raw":[90.0,92.0],"effective":[90.0,90.0],"origins":["raw","monotonic_hold"],"remaining_dashed":[[4000,4120]],"latest_raw":92.0,"latest_effective":90.0,"latest_label":"90%","idle_intervals":[]}
+    "expected": {"raw":[90.0,92.0],"effective":[90.0,92.0],"origins":["raw","raw"],"remaining_dashed":[[4060,4120]],"latest_raw":92.0,"latest_effective":92.0,"latest_label":"92%","idle_intervals":[]}
   },
   "issue137_token_flat_quota_drop_v1": {
     "period_start": 0,
@@ -586,18 +588,16 @@
       "timestamps":[0,300,600,900,1200],
       "model_universe":["LUNA","SOL"],
       "token_series":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[100.0,100.0,100.0,100.0,100.0]},
-      "dollar_series":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[1.0,1.0,1.0,1.0,1.0]},
+      "dollar_series":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[1,1,1.01,1.01,1.01]},
       "remaining_input":[90.0,90.0,89.0,89.0,88.0],
       "remaining_effective":[90.0,90.0,89.0,89.0,88.0],
       "idle_intervals":[],
-      "model_segments":{
-        "LUNA":{"idle":[[0,300],[300,600],[600,900],[900,1200]],"flat":[],"rising":[],"dashed":[]},
-        "SOL":{"idle":[[0,300],[300,600],[600,900],[900,1200]],"flat":[],"rising":[],"dashed":[]}
-      },
-      "model_line_values":{"tokens":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[100.0,100.0,100.0,100.0,100.0]},"dollars":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[1.0,1.0,1.0,1.0,1.0]}},
+      "model_segments":{"LUNA":{"idle":[],"flat":[[0,300],[300,600],[600,900],[900,1200]],"rising":[],"dashed":[],"flat_values":[0,0,0,0,0],"rising_values":[]},"SOL":{"idle":[],"flat":[[0,300],[300,600],[600,900],[900,1200]],"rising":[],"dashed":[],"flat_values":[100,100,100,100,100],"rising_values":[]}},
+      "model_line_values":{"tokens":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[100.0,100.0,100.0,100.0,100.0]},"dollars":{"LUNA":[0.0,0.0,0.0,0.0,0.0],"SOL":[1,1,1.01,1.01,1.01]}},
       "remaining_segments":{"idle":[],"solid":[[0,300],[300,600],[600,900],[900,1200]],"dashed":[]},
-      "line_widths":{"model_idle":1.0,"remaining_idle":1.0,"remaining_solid":3.0},
-      "latest_labels":{"SOL":"$1.00","remaining":"88%"}
+      "line_widths":{"model_idle":1.0,"remaining_idle":1.0,"remaining_solid":3.0,"model_measured":3.0},
+      "latest_labels":{"SOL":"$1.01","remaining":"88%"},
+      "dollar_model_segments":{"LUNA":{"idle":[],"flat":[[0,300],[300,600],[600,900],[900,1200]],"rising":[],"dashed":[],"flat_values":[0,0,0,0,0],"rising_values":[]},"SOL":{"idle":[],"flat":[[0,300],[600,900],[900,1200]],"rising":[[300,600]],"dashed":[],"flat_values":[1,1,null,1.01,1.01,1.01],"rising_values":[1,1.01]}}
     }
   }
 }

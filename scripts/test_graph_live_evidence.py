@@ -68,6 +68,26 @@ class GraphLiveEvidenceTests(unittest.TestCase):
     def setUpClass(cls):
         cls.document = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
+    def test_official_origin_inside_first_minute_keeps_the_canonical_observation(self):
+        fixture = v3_fixture([
+            {"timestamp": 1_792_051_020, "tokens": 30, "remaining_percent": 99},
+            {"timestamp": 1_792_051_080, "tokens": 40, "remaining_percent": 98},
+        ])
+        fixture["period"]["start_at"] = 1_792_051_064
+        _, samples, _ = oracle._validate_fixture(fixture)
+        self.assertEqual(1_792_051_020, samples[0]["timestamp"])
+        self.assertEqual(30, samples[0]["models"][0]["total_tokens"])
+        invalid = copy.deepcopy(fixture)
+        invalid["history_page"]["history_samples"][0]["timestamp"] -= 60
+        with self.assertRaises(oracle.EvidenceError):
+            oracle._validate_fixture(invalid)
+
+    def test_zero_duration_and_empty_published_periods_do_not_invent_a_line(self):
+        fixture = v3_fixture([{"timestamp": 1_800_000_000, "tokens": 30, "remaining_percent": 99}])
+        self.assertEqual(([], []), oracle.build_expected(fixture))
+        fixture["history_page"]["history_samples"] = []
+        self.assertEqual(([], []), oracle.build_expected(fixture))
+
     def test_valid_anchor_projection_literal_cases_distinguish_measured_and_missing(self):
         for name, case in self.document["valid_anchor_projection_v5"].items():
             fixture = v3_fixture(
@@ -89,6 +109,116 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                 idle,
                 name,
             )
+
+    def test_model_numeric_retains_u64_precision_for_confirmed_partial_and_legacy(self):
+        base = 9_007_199_254_740_992
+        for source, complete in (("confirmed", True), ("confirmed", False), ("legacy-unknown", False)):
+            with self.subTest(source=source, complete=complete):
+                fixture = v3_fixture([
+                    {"timestamp": index * 60, "remaining_percent": 90,
+                     "tokens": total, "model_source": source, "models_complete": complete}
+                    for index, total in enumerate((base, base + 1, base))
+                ])
+                _, rows, _ = oracle._validate_fixture(fixture)
+                actual = oracle._model_projection(rows, "SOL", "tokens")
+                self.assertEqual([base, base, base], [point.value for point in actual])
+                saved_origin = "direct" if source == "confirmed" else "legacy"
+                self.assertEqual([saved_origin, "rejected", saved_origin], [point.origin for point in actual])
+                self.assertEqual(base + 1, rows[1]["models"][0]["total_tokens"])
+                increasing = copy.deepcopy(rows[:2])
+                accepted = oracle._model_projection(increasing, "SOL", "tokens")
+                self.assertEqual(1, accepted[1].value - accepted[0].value)
+                if source == "confirmed":
+                    grouped = oracle._windows_family_model_projections(
+                        increasing, {metric: {"SOL": accepted} for metric in ("tokens", "dollars")})
+                    self.assertEqual(1, grouped["tokens"]["SOL"][1].value - grouped["tokens"]["SOL"][0].value)
+
+    def test_legacy_numeric_baseline_does_not_use_future_confirmed_ceiling(self):
+        fixture = v3_fixture([
+            {"timestamp": 0, "tokens": 20, "remaining_percent": 90,
+             "model_source": "legacy-unknown", "models_complete": False},
+            {"timestamp": 60, "tokens": 15, "remaining_percent": 90},
+        ])
+        _, rows, _ = oracle._validate_fixture(fixture)
+        actual = oracle._model_projection(rows, "SOL", "tokens")
+        self.assertEqual([20, 20], [point.value for point in actual])
+        self.assertEqual(["legacy", "rejected"], [point.origin for point in actual])
+        self.assertTrue(all(not point.reliable for point in actual))
+
+    def test_original_gap_prevents_isolated_model_pulse_rejection(self):
+        fixture = v3_fixture([
+            {"timestamp": 0, "tokens": 1, "dollars": 10, "remaining_percent": 90},
+            {"timestamp": 60, "tokens": 2, "dollars": 20, "remaining_percent": 90},
+            {"timestamp": 120, "tokens": 3, "dollars": 11, "remaining_percent": 90},
+        ], gaps=[{"start_at": 0, "end_at": 60}])
+        for platform in ("linux", "windows"):
+            with self.subTest(platform=platform):
+                contracts = oracle.build_expected_render_contracts(fixture, platform=platform)
+                endpoint = next(point for point in contracts["dollars"]["endpoint_values"] if point["series"] == "SOL")
+                self.assertEqual(20, endpoint["value"])
+
+    def test_actual_confirmed_partial_values_remain_measured(self):
+        recorded = [
+            (1_792_060_020, 42_628_014, 42_391_371, 41_169_664, 236_643, 8.926810399999999),
+            (1_792_060_080, 43_329_949, 43_091_879, 41_856_640, 238_070, 9.036842),
+            (1_792_060_140, 43_329_949, 43_091_879, 41_856_640, 238_070, 9.036842),
+        ]
+        fixture = v3_fixture([
+            {"timestamp": at, "remaining_percent": None, "models_complete": False,
+             "models": [{"model": "gpt-6.1-sol", "total_tokens": total,
+                         "input_tokens": input_tokens, "cached_input_tokens": cached,
+                         "cache_write_input_tokens": 0, "output_tokens": output,
+                         "total_dollars": dollars}]}
+            for at, total, input_tokens, cached, output, dollars in recorded
+        ])
+        _, rows, _ = oracle._validate_fixture(fixture)
+        for metric, expected in (("tokens", [row[1] for row in recorded]),
+                                 ("dollars", [row[5] for row in recorded])):
+            with self.subTest(metric=metric):
+                projection = oracle._model_projection(rows, "gpt-6.1-sol", metric)
+                self.assertEqual(expected, [point.value for point in projection])
+                self.assertEqual(["direct"] * 3, [point.origin for point in projection])
+                for platform, segments in oracle.build_expected_segments_by_platform(fixture).items():
+                    with self.subTest(platform=platform):
+                        self.assertEqual([[recorded[0][0], recorded[1][0]]], pairs(segments, "rising", metric, "SOL"))
+                        self.assertEqual([[recorded[1][0], recorded[2][0]]], pairs(segments, "flat", metric, "SOL"))
+                        self.assertEqual([], pairs(segments, "dashed", metric, "SOL"))
+
+    def test_saved_usd_changes_without_tokens_remain_measured(self):
+        for source, complete in (("confirmed", True), ("legacy-unknown", False)):
+            fixture = v3_fixture([
+                {"timestamp": 0, "tokens": 100, "dollars": 1.0, "remaining_percent": 90,
+                 "model_source": source, "models_complete": complete},
+                {"timestamp": 600, "tokens": 100, "dollars": 2.0, "remaining_percent": 90,
+                 "model_source": source, "models_complete": complete},
+            ])
+            for platform in ("linux", "windows"):
+                with self.subTest(source=source, platform=platform):
+                    by_platform = oracle.build_expected_segments_by_platform(fixture)
+                    segments = by_platform[platform]
+                    self.assertEqual([[0, 600]], pairs(segments, "rising", "dollars", "SOL"))
+                    self.assertEqual([], pairs(segments, "idle", "dollars", "SOL"))
+                    contract = oracle.build_expected_render_contracts(fixture, platform=platform)["dollars"]
+                    value = next(point["value"] for point in contract["endpoint_values"] if point["series"] == "SOL")
+                    self.assertEqual(2, value)
+
+    def test_missing_usd_is_not_restored_from_token_identity(self):
+        for source, complete in (("confirmed", True), ("legacy-unknown", False)):
+            fixture = v3_fixture([
+                {"timestamp": index * 600, "tokens": 100, "dollars": dollars, "remaining_percent": 90,
+                 "model_source": source, "models_complete": complete}
+                for index, dollars in enumerate((1.0, None, 1.0))
+            ])
+            for platform in ("linux", "windows"):
+                with self.subTest(source=source, platform=platform):
+                    segments = oracle.build_expected_segments_by_platform(fixture)[platform]
+                    self.assertEqual([[0, 1200]], pairs(segments, "dashed", "dollars", "SOL"))
+                    self.assertEqual([], pairs(segments, "idle", "dollars", "SOL"))
+                    contract = oracle.build_expected_render_contracts(fixture, platform=platform)["dollars"]
+                    model = next(item for item in contract["models"] if item["series"] == "SOL")
+                    self.assertTrue(model["dashed"])
+                    self.assertFalse(model["idle"])
+            self.assertIsNone(fixture["history_page"]["history_samples"][1]["models"][0]["total_dollars"])
 
     def test_saved_legacy_raw_flat_run_across_midnight_is_idle(self):
         start = 1_788_879_300  # 2026-09-08 23:55 JST
@@ -113,7 +243,9 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         self.assertEqual([{"start_at": start, "end_at": start + 1_800}], idle)
         for metric in ("tokens", "dollars"):
             for series in ("LUNA", "SOL", "TERRA"):
-                self.assertEqual(30, len(pairs(segments, "idle", metric, series)))
+                expected_count = 28 if metric == "dollars" and series == "SOL" else 30
+                self.assertEqual(expected_count, len(pairs(segments, "idle", metric, series)))
+        self.assertEqual([[start + 840, start + 960]], pairs(segments, "dashed", "dollars", "SOL"))
         self.assertEqual(30, len(pairs(segments, "idle")))
         rendered = oracle.build_expected_render_contracts(fixture)["dollars"]
         sol_idle = next(
@@ -121,7 +253,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(1, len(set(sol_idle.split()[1::2])))
 
-    def test_lossless_source_transitions_do_not_split_idle_or_dollar_hold(self):
+    def test_lossless_source_transitions_keep_idle_and_independent_saved_usd(self):
         for legacy_first in (False, True):
             rows = []
             for minute in range(11):
@@ -151,18 +283,16 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             segments, idle = oracle.build_expected(fixture)
 
             self.assertEqual([{"start_at": 0, "end_at": 600}], idle)
-            for metric in ("tokens", "dollars"):
-                self.assertEqual(
-                    10,
-                    len(pairs(segments, "idle", metric, "SOL")),
-                )
+            self.assertEqual(10, len(pairs(segments, "idle", "tokens", "SOL")))
+            self.assertEqual(9, len(pairs(segments, "idle", "dollars", "SOL")))
+            self.assertEqual([[300, 360]], pairs(segments, "rising", "dollars", "SOL"))
             rendered = oracle.build_expected_render_contracts(fixture)["dollars"]
             sol_idle = next(
                 model["idle"]
                 for model in rendered["models"]
                 if model["series"] == "SOL"
             )
-            self.assertEqual(1, len(set(sol_idle.split()[1::2])))
+            self.assertEqual(2, len(set(sol_idle.split()[1::2])))
 
     def test_monotone_cubic_projection_matches_fixed_no_overshoot_oracle(self):
         self.assertEqual(
@@ -317,7 +447,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             ),
         )
 
-    def test_rejected_remaining_increase_does_not_erase_token_idle(self):
+    def test_official_remaining_increase_stays_measured_independently_of_flat_tokens(self):
         rows = [(0, 90.0, 100), (60, 95.0, 100), (120, 95.0, 100), (180, 89.0, 101)]
         fixture = {
             "period": {"id": "remaining-anomaly", "start_at": 0, "end_at": 180, "reset_at": 180},
@@ -347,7 +477,8 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         }
         segments, idle = oracle.build_expected(fixture)
         self.assertEqual([], idle)
-        self.assertEqual([[0, 180]], pairs(segments, "dashed"))
+        self.assertEqual([[0, 60], [60, 120], [120, 180]], pairs(segments, "solid"))
+        self.assertEqual([], pairs(segments, "dashed"))
 
     def test_idle_uses_exact_tokens_independently_of_lifecycle_activity(self):
         expected = [{"start_at": 0, "end_at": 1_800}]
@@ -504,6 +635,38 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         self.assertEqual("", contracts["remaining"]["solid"])
         self.assertEqual("", contracts["remaining"]["dashed"])
 
+    def test_issue604_official_remaining_reversals_preserve_raw_observations(self):
+        for middle in (95.0, 80.0):
+            fixture = v3_fixture([
+                {"timestamp": 0, "remaining_percent": 90.0, "tokens": 0},
+                {"timestamp": 60, "remaining_percent": middle, "tokens": 1},
+                {"timestamp": 120, "remaining_percent": 89.0, "tokens": 2},
+            ])
+            period, samples, gaps = oracle._validate_fixture(fixture)
+            rows = oracle._rows_with_tail(period, samples)
+            projection = oracle._remaining_projection(period, rows, {}, gaps)
+            self.assertEqual([90.0, middle, 89.0], [p.effective for p in projection])
+            self.assertEqual(["raw"] * 3, [p.origin for p in projection])
+            segments, _ = oracle.build_expected(fixture)
+            self.assertEqual([[0, 60], [60, 120]], pairs(segments, "solid"))
+            self.assertEqual([], pairs(segments, "dashed"))
+
+    def test_issue604_official_remaining_missing_interval_can_increase(self):
+        fixture = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90.0, "tokens": 0},
+            {"timestamp": 60, "remaining_percent": None, "tokens": 1},
+            {"timestamp": 120, "remaining_percent": 94.0, "tokens": 2},
+        ])
+        period, samples, gaps = oracle._validate_fixture(fixture)
+        rows = oracle._rows_with_tail(period, samples)
+        projection = oracle._remaining_projection(period, rows, {}, gaps)
+        self.assertEqual([90.0, 92.0, 94.0], [p.effective for p in projection])
+        self.assertEqual("interpolated", projection[1].origin)
+        self.assertIsNone(projection[1].raw)
+        segments, _ = oracle.build_expected(fixture)
+        self.assertEqual([], pairs(segments, "solid"))
+        self.assertEqual([[0, 120]], pairs(segments, "dashed"))
+
     def test_isolated_anomalies_are_detected_across_sampling_jitter(self):
         fixture = v3_fixture(
             [
@@ -525,7 +688,8 @@ class GraphLiveEvidenceTests(unittest.TestCase):
 
         self.assertEqual("rejected", model_projection[1].origin)
         self.assertEqual("direct", model_projection[2].origin)
-        self.assertEqual("monotonic_hold", remaining_projection[1].origin)
+        self.assertEqual("raw", remaining_projection[1].origin)
+        self.assertEqual(80.0, remaining_projection[1].effective)
         self.assertEqual("raw", remaining_projection[2].origin)
         self.assertEqual(89.0, remaining_projection[2].effective)
 
@@ -644,6 +808,122 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                 )
             )[1],
         )
+
+    def test_linux_does_not_inherit_windows_observed_zero_contribution(self):
+        fixture = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": [
+                {"model": "gpt-6-sol", "total_tokens": 0, "total_dollars": 0},
+                {"model": "gpt-5.6-sol", "total_tokens": 100, "total_dollars": 1},
+            ]},
+            {"timestamp": 60, "remaining_percent": 89, "models": [
+                {"model": "gpt-5.6-sol", "total_tokens": 101, "total_dollars": 2},
+            ]},
+        ])
+        segments = oracle.build_expected_segments_by_platform(fixture)
+        for metric in ("tokens", "dollars"):
+            self.assertEqual([[0, 60]], pairs(segments["windows"], "rising", metric, "SOL"))
+            self.assertEqual([[0, 60]], pairs(segments["linux"], "dashed", metric, "SOL"))
+            self.assertEqual([], pairs(segments["linux"], "rising", metric, "SOL"))
+
+    def test_family_slot_qualification_preserves_every_exact_member_on_both_platforms(self):
+        fixture = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": [
+                {"model": "SOL", "total_tokens": 100, "total_dollars": 1},
+                {"model": "gpt-6-sol", "total_tokens": 200, "total_dollars": 3},
+            ]},
+            {"timestamp": 60, "remaining_percent": None, "models": None,
+             "model_source": "unavailable", "models_complete": False},
+            {"timestamp": 120, "remaining_percent": 90, "models": [
+                {"model": "SOL", "total_tokens": 100, "total_dollars": 1},
+                {"model": "gpt-6-sol", "total_tokens": 200, "total_dollars": 4},
+            ]},
+        ])
+        for platform, segments in oracle.build_expected_segments_by_platform(fixture).items():
+            with self.subTest(platform=platform):
+                self.assertEqual([[0, 120]], pairs(segments, "flat", "tokens", "SOL"))
+                self.assertEqual([[0, 120]], pairs(segments, "dashed", "dollars", "SOL"))
+                contract = oracle.build_expected_render_contracts(fixture, platform=platform)
+                for metric, total in (("tokens", 300), ("dollars", 5)):
+                    value = next(point["value"] for point in contract[metric]["endpoint_values"] if point["series"] == "SOL")
+                    self.assertEqual(total, value)
+
+    def test_sampling_slot_preserves_original_usd_numeric_order(self):
+        fixture = v3_fixture([
+            {"timestamp": minute * 60, "tokens": 100, "dollars": dollars, "remaining_percent": 90}
+            for minute, dollars in enumerate((10.0, None, 20.0, 11.0))
+        ])
+        fixture["history_page"]["history_samples"][1].update(
+            models=None, models_complete=False, model_source="unavailable", remaining_percent=None)
+        for platform in ("linux", "windows"):
+            with self.subTest(platform=platform):
+                contract = oracle.build_expected_render_contracts(fixture, platform=platform)["dollars"]
+                endpoint = next(point for point in contract["endpoint_values"] if point["series"] == "SOL")
+                self.assertEqual(20, endpoint["value"])
+                segments = oracle.build_expected_segments_by_platform(fixture)[platform]
+                self.assertIn([0, 120], pairs(segments, "dashed", "dollars", "SOL"))
+        self.assertEqual(4, len(fixture["history_page"]["history_samples"]))
+        self.assertIsNone(fixture["history_page"]["history_samples"][1]["models"])
+
+    def test_sampling_slot_bridge_is_metric_specific_and_keeps_missing_row(self):
+        for same_usd in (False, True):
+            fixture = v3_fixture([
+                {"timestamp": minute * 60, "tokens": 100, "remaining_percent": 90,
+                 "dollars": 1.0 if same_usd or minute < 6 else 2.0}
+                for minute in range(11)
+            ])
+            fixture["history_page"]["history_samples"][5].update(
+                models=None, models_complete=False, model_source="unavailable", remaining_percent=None)
+            for platform in ("linux", "windows"):
+                with self.subTest(same_usd=same_usd, platform=platform):
+                    segments = oracle.build_expected_segments_by_platform(fixture)[platform]
+                    self.assertEqual([], pairs(segments, "dashed", "tokens", "SOL"))
+                    self.assertEqual([] if same_usd else [[240, 360]], pairs(segments, "dashed", "dollars", "SOL"))
+                    contract = oracle.build_expected_render_contracts(fixture, platform=platform)
+                    slot_origins = [point["origin"] for point in contract["tokens"]["remaining_points"] if point["timestamp"] == 300]
+                    self.assertEqual(["interpolated"], slot_origins)
+            self.assertEqual([{"start_at": 0, "end_at": 600}], oracle.build_expected(fixture)[1])
+
+    def test_rejected_token_endpoints_cannot_qualify_sampling_slot(self):
+        fixture = v3_fixture([
+            {"timestamp": minute * 60, "tokens": tokens, "dollars": 1, "remaining_percent": 90}
+            for minute, tokens in enumerate((200, 100, 100, 100))
+        ])
+        fixture["history_page"]["history_samples"][2].update(
+            models=None, models_complete=False, model_source="unavailable", remaining_percent=None)
+        for platform in ("linux", "windows"):
+            with self.subTest(platform=platform):
+                segments = oracle.build_expected_segments_by_platform(fixture)[platform]
+                self.assertEqual([[60, 180]], pairs(segments, "dashed"))
+
+    def test_model_component_domain_rejects_non_u64_values(self):
+        for field, invalid in (("total_tokens", 1 << 64), ("input_tokens", 1 << 64),
+                               ("cached_input_tokens", True), ("cache_write_input_tokens", "0"),
+                               ("output_tokens", -1)):
+            with self.subTest(field=field, invalid=invalid):
+                model = {"model": "SOL", "total_tokens": 100, "total_dollars": 1}
+                model[field] = invalid
+                fixture = v3_fixture([
+                    {"timestamp": at, "remaining_percent": 90, "models": [copy.deepcopy(model)]}
+                    for at in (0, 600)
+                ])
+                with self.assertRaises(oracle.EvidenceError):
+                    oracle._validate_fixture(fixture)
+
+    def test_idle_compares_all_saved_token_components_and_knownness(self):
+        def model(input_tokens, cached, output):
+            return {"model": "SOL", "total_tokens": 100, "total_dollars": 1,
+                    "input_tokens": input_tokens, "cached_input_tokens": cached,
+                    "cache_write_input_tokens": 0, "output_tokens": output}
+        for after, idle_allowed in ((model(90, 0, 10), False),
+                                    (model(100, 1, 0), False),
+                                    (model(100, None, 0), False),
+                                    (model(100, 0, 0), True)):
+            with self.subTest(after=after):
+                fixture = v3_fixture([
+                    {"timestamp": 0, "remaining_percent": 90, "models": [model(100, 0, 0)]},
+                    {"timestamp": 600, "remaining_percent": 90, "models": [after]},
+                ])
+                self.assertEqual([{"start_at": 0, "end_at": 600}] if idle_allowed else [], oracle.build_expected(fixture)[1])
 
     def test_idle_recovers_only_isolated_equal_sampling_jitter(self):
         rows = [
@@ -966,14 +1246,9 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             period_id="incomplete-positive-breaks-zero",
         )
         incomplete_segments = oracle.build_expected_segments_by_platform(incomplete_positive)["windows"]
-        self.assertFalse(
-            any(
-                segment["series"] == "SOL"
-                and segment["end_at"] >= 60
-                and segment["style"] != "dashed"
-                for segment in incomplete_segments
-            )
-        )
+        for metric in ("tokens", "dollars"):
+            self.assertEqual([[0, 60]], pairs(incomplete_segments, "rising", metric, "SOL"))
+            self.assertEqual([[60, 120]], pairs(incomplete_segments, "dashed", metric, "SOL"))
 
         previously_positive = v3_fixture(
             [
@@ -1682,19 +1957,19 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         ])
         changed_segments, changed_idle = oracle.build_expected(changed_dollar)
         self.assertEqual([{"start_at": 0, "end_at": 600}], changed_idle)
-        self.assertEqual(
-            [[0, 600]],
-            pairs(changed_segments, "idle", "dollars", "ASTRA"),
-        )
+        self.assertEqual([[0, 600]], pairs(changed_segments, "rising", "dollars", "ASTRA"))
+        self.assertEqual([], pairs(changed_segments, "idle", "dollars", "ASTRA"))
         changed_render = oracle.build_expected_render_contracts(changed_dollar)
-        astra_idle = next(
-            model["idle"]
-            for model in changed_render["dollars"]["models"]
+        astra = next(
+            model for model in changed_render["dollars"]["models"]
             if model["series"] == "ASTRA"
         )
-        self.assertTrue(astra_idle)
-        _, start_y, _, end_y = astra_idle.split()
-        self.assertEqual(start_y, end_y)
+        self.assertFalse(astra["idle"])
+        self.assertTrue(astra["rising"])
+        coordinates = astra["rising"].split()[1::2]
+        self.assertGreater(float(coordinates[0]), float(coordinates[-1]))
+        astra_value = next(point["value"] for point in changed_render["dollars"]["endpoint_values"] if point["series"] == "ASTRA")
+        self.assertEqual(4.01, astra_value)
 
         missing = v3_fixture([
             {"timestamp": 0, "remaining_percent": 90, "models": models(1)},

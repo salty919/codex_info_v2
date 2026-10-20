@@ -5,7 +5,10 @@
 //! Every connection is opened with `SQLITE_OPEN_READ_ONLY`, then `query_only`
 //! is enabled and read back before any product query is issued.
 
+use chrono::{DateTime, Months, Utc};
 use codex_info_pricing::{estimate as estimate_model_price, estimate_legacy, Usage as PriceUsage};
+pub use codex_info_rest_contract::model_names;
+pub use codex_info_rest_contract::token_facts::TokenFacts;
 use codex_info_rest_contract::{
     current_period_bounds, current_period_start_at, is_valid_public_model_name, ContractError,
     PublicDetailedModelUsage, PublicDetails, PublicHistoryGap, PublicHistoryModelUsageV3,
@@ -18,16 +21,36 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+pub use codex_info_rest_contract::recorded_usage;
 mod quota_history;
+mod recordings;
+pub use recordings::decode_source_repair_v2;
+pub use recordings::source_repair_is_v2_candidate;
+pub use recordings::RecordedArchive;
+pub use recordings::SOURCE_REPAIR_V2_CANDIDATE_QUERY;
 
-const MAX_HISTORY_ROWS: usize = 31 * 24 * 60;
+#[cfg(test)]
+thread_local! {
+    static HISTORY_INPUT_READS: std::cell::Cell<[usize;3]> = const {std::cell::Cell::new([0;3])};
+}
+
+#[cfg(test)]
+fn record_history_input_read(index: usize) {
+    HISTORY_INPUT_READS.with(|counts| {
+        let mut value = counts.get();
+        value[index] += 1;
+        counts.set(value);
+    });
+}
+
 const HISTORY_WINDOW_SECONDS: i64 = 31 * 24 * 60 * 60;
-const MAX_RETAINED_HISTORY_ROWS: usize = 3 * MAX_HISTORY_ROWS;
 
 #[derive(Clone, Copy)]
 enum HistoryWindow {
@@ -40,12 +63,6 @@ impl HistoryWindow {
         match self {
             Self::Recent => observed_at.saturating_sub(HISTORY_WINDOW_SECONDS),
             Self::Retained => 0,
-        }
-    }
-    fn max_rows(self) -> usize {
-        match self {
-            Self::Recent => MAX_HISTORY_ROWS,
-            Self::Retained => MAX_RETAINED_HISTORY_ROWS,
         }
     }
 }
@@ -61,7 +78,7 @@ pub struct HistoryArchive {
     pub origins: BTreeMap<i64, i64>,
 }
 pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 13;
-pub const ACCOUNT_DB_SCHEMA_VERSION: i64 = 15;
+pub const ACCOUNT_DB_SCHEMA_VERSION: i64 = 16;
 const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
 const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
@@ -97,6 +114,192 @@ pub struct DbSnapshot {
     /// provenance and unavailable observations.
     pub history_samples_v2: Vec<PublicHistoryObservation>,
     pub retained_history: HistoryArchive,
+    /// Qualified local facts and untouched saved observations, same read transaction.
+    pub recordings: Option<Arc<RecordedArchive>>,
+    /// Same-transaction, heap-only evidence. Never serialized into an API,
+    /// persisted, or included in the public domain fingerprint.
+    pub reprojection_witness: Option<ReprojectionWitness>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StoredRowsWitness {
+    columns: Vec<String>,
+    rows: Vec<Vec<rusqlite::types::Value>>,
+}
+
+/// Source identity retained for proving a time-only reprojection. Public
+/// accessors expose comparison results, not private DB values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReprojectionWitness {
+    window: Option<PublicationWindow>,
+    commit: Option<CollectionCommit>,
+    partition: Option<StoragePartitionIdentity>,
+    ownership: ReadIntervals,
+    quota: Option<StoredRowsWitness>,
+    retained_quota: Option<StoredRowsWitness>,
+    current_key: Option<(i64, i64)>,
+    current_sidecar: Option<StoredRowsWitness>,
+    current_metadata: Option<StoredRowsWitness>,
+    previous_current_key: Option<(i64, i64)>,
+    previous_current_sidecar: Option<StoredRowsWitness>,
+    previous_current_metadata: Option<StoredRowsWitness>,
+}
+
+impl ReprojectionWitness {
+    pub fn collection_commit(&self) -> Option<CollectionCommit> {
+        self.commit
+    }
+
+    pub fn same_authority_values(&self, other: &Self) -> bool {
+        self.partition == other.partition
+            && self.ownership == other.ownership
+            && self.quota == other.quota
+    }
+
+    pub fn publication_window(&self) -> Option<PublicationWindow> {
+        self.window
+    }
+
+    pub fn same_commit_authority(&self, other: &Self) -> bool {
+        self.commit.is_some()
+            && self.commit == other.commit
+            && self.partition == other.partition
+            && self.ownership == other.ownership
+            && self.quota == other.quota
+    }
+
+    pub fn current_observation(&self) -> Option<(i64, i64)> {
+        self.current_key
+    }
+
+    pub fn current_observation_is_eligible_at(
+        &self,
+        key: Option<(i64, i64)>,
+        window: PublicationWindow,
+        quota: &PublicQuota,
+    ) -> bool {
+        key.is_some_and(|(timestamp, reset)| {
+            reset == quota.reset_at
+                && current_model_time_bounds(
+                    reset,
+                    quota.window_seconds,
+                    Some(window),
+                    self.partition.is_some(),
+                )
+                .is_some_and(|(start, end)| timestamp >= start && timestamp <= end)
+        })
+    }
+
+    pub fn same_common_quota_receipts(&self, other: &Self) -> bool {
+        let (lower, upper) = match (self.window, other.window) {
+            (Some(left), Some(right)) => (
+                left.cutoff(HistoryWindow::Retained)
+                    .max(right.cutoff(HistoryWindow::Retained)),
+                left.raw_upper().min(right.raw_upper()),
+            ),
+            (None, None) => (i64::MIN, i64::MAX),
+            _ => return false,
+        };
+        match (&self.retained_quota, &other.retained_quota) {
+            (None, None) => true,
+            (Some(left), Some(right)) if left.columns == right.columns => {
+                let Some(index) = left.columns.iter().position(|name| name == "observed_at") else {
+                    return false;
+                };
+                let common =
+                    |rows: &StoredRowsWitness| -> Option<Vec<Vec<rusqlite::types::Value>>> {
+                        let mut common = Vec::new();
+                        for row in &rows.rows {
+                            let Some(rusqlite::types::Value::Integer(timestamp)) = row.get(index)
+                            else {
+                                return None;
+                            };
+                            if *timestamp > lower && *timestamp <= upper {
+                                common.push(row.clone());
+                            }
+                        }
+                        Some(common)
+                    };
+                matches!((common(left), common(right)), (Some(left), Some(right)) if left == right)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn same_current_observation(&self, other: &Self) -> bool {
+        self.current_key == other.current_key
+            && self.current_sidecar == other.current_sidecar
+            && self.current_metadata == other.current_metadata
+    }
+
+    pub fn preserves_previous_current_observation(&self, previous: &Self) -> bool {
+        if previous.current_key.is_none() {
+            return true;
+        }
+        if self.current_key == previous.current_key {
+            return self.same_current_observation(previous);
+        }
+        self.previous_current_key == previous.current_key
+            && self.previous_current_sidecar == previous.current_sidecar
+            && self.previous_current_metadata == previous.current_metadata
+    }
+}
+
+/// The acknowledged collection transaction, not a wall-clock observation or
+/// a failed collection attempt. Legacy files may have no collection table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectionCommit {
+    pub generation: u64,
+    pub collector_epoch: Option<u128>,
+    pub cycle_seq: u64,
+}
+
+/// Both fields were read and validated within the same SQLite transaction.
+pub struct CommittedSnapshot {
+    pub snapshot: DbSnapshot,
+    pub commit: Option<CollectionCommit>,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionScope {
+    Current,
+    History,
+    Recordings,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicationWindow {
+    pub at: i64,
+    pub retained_start: i64,
+}
+
+impl PublicationWindow {
+    pub fn at(at: i64) -> Result<Self, ReaderError> {
+        if !valid_public_timestamp(at) {
+            return Err(ReaderError::InvalidValue(
+                "publication time is invalid".to_owned(),
+            ));
+        }
+        let time = DateTime::<Utc>::from_timestamp(at, 0)
+            .ok_or_else(|| ReaderError::InvalidValue("publication time is invalid".to_owned()))?;
+        let retained_start = time
+            .checked_sub_months(Months::new(3))
+            .ok_or_else(|| ReaderError::InvalidValue("retention time is invalid".to_owned()))?
+            .timestamp();
+        Ok(Self { at, retained_start })
+    }
+
+    fn cutoff(self, history: HistoryWindow) -> i64 {
+        match history {
+            HistoryWindow::Recent => self.at.saturating_sub(HISTORY_WINDOW_SECONDS),
+            HistoryWindow::Retained => self.retained_start.div_euclid(60) * 60 - 1,
+        }
+    }
+
+    fn raw_upper(self) -> i64 {
+        self.at.div_euclid(60) * 60 + 59
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -178,12 +381,12 @@ pub struct ReadInterval {
 
 impl ReadInterval {
     pub fn new(start_at: Option<i64>, end_at: Option<i64>) -> Result<Self, ReaderError> {
-        if start_at.is_some_and(|value| value <= 0)
-            || end_at.is_some_and(|value| value <= 0)
-            || matches!((start_at, end_at), (Some(start), Some(end)) if start >= end)
+        if start_at.is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+            || end_at.is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+            || matches!((start_at, end_at), (Some(start), Some(end)) if start > end)
         {
             return Err(ReaderError::InvalidValue(
-                "read interval is not a non-empty positive half-open range".to_owned(),
+                "read interval has invalid UTC bounds".to_owned(),
             ));
         }
         Ok(Self { start_at, end_at })
@@ -192,6 +395,10 @@ impl ReadInterval {
     fn contains(self, timestamp: i64) -> bool {
         self.start_at.is_none_or(|start| timestamp >= start)
             && self.end_at.is_none_or(|end| timestamp < end)
+    }
+
+    fn is_empty(self) -> bool {
+        matches!((self.start_at, self.end_at), (Some(start), Some(end)) if start == end)
     }
 }
 
@@ -217,16 +424,20 @@ impl ReadIntervals {
     pub fn new(mut intervals: Vec<ReadInterval>) -> Result<Self, ReaderError> {
         if intervals.is_empty()
             || intervals.iter().any(|interval| {
-                interval.start_at.is_some_and(|value| value <= 0)
-                    || interval.end_at.is_some_and(|value| value <= 0)
+                interval
+                    .start_at
+                    .is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+                    || interval
+                        .end_at
+                        .is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
                     || matches!(
                         (interval.start_at, interval.end_at),
-                        (Some(start), Some(end)) if start >= end
+                        (Some(start), Some(end)) if start > end
                     )
             })
         {
             return Err(ReaderError::InvalidValue(
-                "read intervals must contain non-empty positive ranges".to_owned(),
+                "read intervals are missing or have invalid UTC bounds".to_owned(),
             ));
         }
         intervals.sort_by_key(|interval| {
@@ -235,14 +446,15 @@ impl ReadIntervals {
                 interval.end_at.unwrap_or(i64::MAX),
             )
         });
-        for pair in intervals.windows(2) {
-            let previous_end = pair[0].end_at.unwrap_or(i64::MAX);
-            let next_start = pair[1].start_at.unwrap_or(i64::MIN);
-            if next_start < previous_end {
+        let mut previous_end = None;
+        for interval in intervals.iter().filter(|interval| !interval.is_empty()) {
+            let next_start = interval.start_at.unwrap_or(i64::MIN);
+            if previous_end.is_some_and(|end| next_start < end) {
                 return Err(ReaderError::InvalidValue(
                     "read intervals overlap".to_owned(),
                 ));
             }
+            previous_end = Some(interval.end_at.unwrap_or(i64::MAX));
         }
         Ok(Self(intervals))
     }
@@ -270,7 +482,8 @@ impl ReadIntervals {
         let minute_start = timestamp.saturating_sub(timestamp.rem_euclid(60));
         let minute_end = minute_start.saturating_add(60);
         self.0.iter().any(|interval| {
-            interval.end_at.is_none_or(|end| end > minute_start)
+            !interval.is_empty()
+                && interval.end_at.is_none_or(|end| end > minute_start)
                 && interval.start_at.is_none_or(|start| start < minute_end)
         })
     }
@@ -287,6 +500,9 @@ impl ReadIntervals {
     fn quota_only_prefix_end(&self, quota_start: i64) -> Option<i64> {
         let mut first_start = None;
         for interval in &self.0 {
+            if interval.is_empty() {
+                continue;
+            }
             let starts_before_or_at_boundary =
                 interval.start_at.is_none_or(|start| start <= quota_start);
             let reaches_boundary = interval.end_at.is_none_or(|end| end > quota_start);
@@ -344,6 +560,33 @@ impl std::error::Error for ReaderError {
     }
 }
 
+fn history_projection_diagnostic(stage: &'static str, error: &ReaderError) {
+    let reason = match error {
+        ReaderError::Io(_) => "database_io_failure",
+        ReaderError::Sqlite(_) => "database_sqlite_failure",
+        ReaderError::Schema(_) => "database_schema_failure",
+        ReaderError::InvalidValue(_) => "history_value_invalid",
+        ReaderError::TooManyRows(_) => "history_row_limit",
+        ReaderError::Contract(error) => match error {
+            ContractError::InvalidTimestamp => "invalid_timestamp",
+            ContractError::InvalidNumber => "invalid_number",
+            ContractError::InvalidPeriod => "invalid_period",
+            ContractError::InvalidSample => "invalid_sample",
+            ContractError::InvalidGap => "invalid_gap",
+            ContractError::InvalidModel => "invalid_model",
+            ContractError::TooManyItems => "public_item_limit",
+        },
+    };
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "schema": "codex-info-history-projection-diagnostic-v1",
+            "stage": stage,
+            "reason": reason,
+        })
+    );
+}
+
 impl From<std::io::Error> for ReaderError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
@@ -362,7 +605,7 @@ impl From<ContractError> for ReaderError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DbReader {
     path: PathBuf,
     expected_partition_identity: Option<StoragePartitionIdentity>,
@@ -521,22 +764,72 @@ impl DbReader {
     /// Build a new snapshot. Separately accepted quota remains available when
     /// derived model/history projection fails, with an explicit error state.
     pub fn read_snapshot(&self) -> Result<DbSnapshot, ReaderError> {
+        self.read_committed_snapshot()
+            .map(|candidate| candidate.snapshot)
+    }
+
+    pub fn read_committed_snapshot(&self) -> Result<CommittedSnapshot, ReaderError> {
+        self.read_committed_snapshot_with_window(None, None, ProjectionScope::All)
+    }
+
+    fn read_committed_snapshot_with_window(
+        &self,
+        window: Option<PublicationWindow>,
+        previous_current_key: Option<(i64, i64)>,
+        scope: ProjectionScope,
+    ) -> Result<CommittedSnapshot, ReaderError> {
+        let include_history = matches!(scope, ProjectionScope::History | ProjectionScope::All);
+        let include_recordings =
+            matches!(scope, ProjectionScope::Recordings | ProjectionScope::All);
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
+        let commit = read_collection_commit(&transaction)?;
         let (threads, acquisition_degraded) = read_active_thread_snapshot_or_degraded_for_intervals(
             &transaction,
             &self.read_intervals,
         );
         let history_is_canonical = self.expected_partition_identity.is_some();
+        let quota = read_latest_quota_receipt(&transaction)?;
+        let current_models = quota.as_ref().map(|receipt| {
+            read_independent_current_models(
+                &transaction,
+                &self.read_intervals,
+                receipt,
+                window,
+                history_is_canonical,
+            )
+            .unwrap_or_default()
+        });
         let authority = ProjectionAuthority {
             history_is_canonical,
-            quota: read_latest_quota_receipt(&transaction)?,
+            quota,
+            window,
+            current_models,
         };
         let has_pending_ranges = read_pending_ranges(&transaction)?;
         let acquisition_degraded =
             acquisition_degraded || read_quota_acquisition_degraded(&transaction)?;
+        let shared_history = SharedHistoryRead::default();
         let projection = (|| -> Result<_, ReaderError> {
-            let all_history = read_history(&transaction, history_is_canonical)?;
+            if !include_history {
+                // The current authority is independently qualified above in
+                // this transaction. Historical scans and recorded-scope
+                // reconstruction have no veto or cost on this read path.
+                return Ok((
+                    authority
+                        .quota
+                        .as_ref()
+                        .map(|receipt| quota_only_details(receipt, &threads))
+                        .unwrap_or_default(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    read_generation(&transaction, std::iter::empty())?,
+                    CurrentPublication::unavailable(PublicState::Initializing),
+                    None,
+                ));
+            }
+            let all_history = read_history_for_window(&transaction, window)?;
             let raw = all_history
                 .iter()
                 .filter(|row| {
@@ -566,6 +859,7 @@ impl DbReader {
                     DetailsProjection {
                         authority: &authority,
                         history_window: HistoryWindow::Recent,
+                        shared_history: Some(&shared_history),
                     },
                 )?;
             let retained_history = (|| -> Result<HistoryArchive, ReaderError> {
@@ -580,45 +874,31 @@ impl DbReader {
                         DetailsProjection {
                             authority: &authority,
                             history_window: HistoryWindow::Retained,
+                            shared_history: Some(&shared_history),
                         },
                     )?;
-                let mut origins = BTreeMap::new();
+                let mut quota_origins = quota_history::OriginProjection::default();
                 if authority.quota.is_some() {
-                    origins = quota_history::project(
+                    quota_origins = quota_history::project(
                         &transaction,
                         &self.read_intervals,
                         &mut retained_details,
                         &mut retained_v2,
                         &mut retained_v3,
                         HistoryWindow::Retained,
+                        authority.window,
                     )?;
                 }
+                let mut origins = quota_origins.known;
                 quota_history::project_recovered_windows(
                     &transaction,
                     &self.read_intervals,
                     &mut retained_details,
                     &mut origins,
+                    &quota_origins.conflicting,
+                    authority.window,
                 )?;
-                if retained_v3.len() > MAX_RETAINED_HISTORY_ROWS {
-                    return Err(ReaderError::TooManyRows(retained_v3.len()));
-                }
-                let retained_v1 = std::mem::take(&mut retained_details.history_samples);
-                retained_details.validate()?;
-                // Validate stored values against the unchanged public contract in
-                // bounded chunks, rather than broadening the details DTO limit.
-                for chunk in retained_v1.chunks(MAX_HISTORY_ROWS) {
-                    let mut bounded = retained_details.clone();
-                    bounded.history_samples = chunk.to_vec();
-                    bounded.validate()?;
-                }
-                let mut counts = BTreeMap::<i64, usize>::new();
-                for row in &retained_v3 {
-                    let count = counts.entry(row.reset_at).or_default();
-                    *count += 1;
-                    if *count > MAX_HISTORY_ROWS {
-                        return Err(ReaderError::TooManyRows(*count));
-                    }
-                }
+                retained_details.validate_history_domain()?;
                 Ok(HistoryArchive {
                     periods: retained_details.history_periods,
                     samples: retained_v3,
@@ -626,6 +906,7 @@ impl DbReader {
                     origins,
                 })
             })()
+            .inspect_err(|error| history_projection_diagnostic("retained_history", error))
             .ok();
             Ok((
                 details,
@@ -637,7 +918,7 @@ impl DbReader {
                 retained_history,
             ))
         })();
-        let derived_history_available = projection.is_ok();
+        let derived_history_available = include_history && projection.is_ok();
         let (
             mut details,
             mut models_v3,
@@ -649,6 +930,7 @@ impl DbReader {
         ) = match projection {
             Ok(value) => value,
             Err(error) => {
+                history_projection_diagnostic("recent_history", &error);
                 let Some(receipt) = authority.quota.as_ref() else {
                     return Err(error);
                 };
@@ -667,6 +949,9 @@ impl DbReader {
             }
         };
         let publication = (|| -> Result<(), ReaderError> {
+            if !include_history {
+                return Ok(());
+            }
             if authority.quota.is_some() {
                 quota_history::project(
                     &transaction,
@@ -675,20 +960,22 @@ impl DbReader {
                     &mut history_samples_v2,
                     &mut history_samples_v3,
                     HistoryWindow::Recent,
+                    authority.window,
                 )?;
             }
-            details.validate()?;
+            details.validate_history_domain()?;
             Ok(())
         })();
         let history_available = match publication {
             Ok(()) => derived_history_available && retained_history.is_some(),
             Err(error) => {
+                history_projection_diagnostic("quota_history_publication", &error);
                 let Some(receipt) = authority.quota.as_ref() else {
                     return Err(error);
                 };
                 // Only the failed derived publication is unavailable. The
                 // accepted acquisition record remains the current authority.
-                details = quota_only_details(receipt, &[]);
+                details = quota_only_details(receipt, &threads);
                 current = CurrentPublication::unavailable(PublicState::Error);
                 details.validate()?;
                 models_v3.clear();
@@ -698,7 +985,22 @@ impl DbReader {
                 false
             }
         };
+        if let Some(lane) = authority.current_models.as_ref() {
+            // Current values have their own same-transaction qualification.
+            // A failed history projection cannot revoke or replace them.
+            details.models.clone_from(&lane.projection.v1);
+            models_v3.clone_from(&lane.projection.v3);
+            details.estimated_cost_label = format_estimated_cost_v3(&models_v3);
+            details.observed_at = details.observed_at.max(lane.observed_at);
+            current = CurrentPublication {
+                state: PublicState::Ready,
+                models_status: lane.status,
+            };
+        }
         let retained_history = retained_history.unwrap_or_default();
+        let recordings = include_recordings
+            .then(|| recordings::read(&transaction).map(Arc::new).ok())
+            .flatten();
         let mut hasher = Sha256::new();
         hasher.update(generation.to_be_bytes());
         hasher.update(
@@ -710,14 +1012,32 @@ impl DbReader {
                 &history_samples_v2,
                 &history_samples_v3,
                 &retained_history,
+                recordings.as_deref(),
             ))
             .map_err(|error| {
                 ReaderError::InvalidValue(format!("snapshot serialization failed: {error}"))
             })?,
         );
         let data_hash = hex_lower(&hasher.finalize());
+        let current_key = authority.current_models.as_ref().and_then(|lane| {
+            lane.observed_at.zip(
+                authority
+                    .quota
+                    .as_ref()
+                    .map(|receipt| receipt.quota.reset_at),
+            )
+        });
+        let reprojection_witness = self
+            .read_reprojection_witness(
+                &transaction,
+                window,
+                commit,
+                current_key,
+                previous_current_key,
+            )
+            .ok();
         transaction.commit()?;
-        Ok(DbSnapshot {
+        let snapshot = DbSnapshot {
             generation,
             data_hash,
             history_available,
@@ -729,7 +1049,193 @@ impl DbReader {
             history_samples_v2,
             history_samples_v3,
             retained_history,
+            recordings,
+            reprojection_witness,
+        };
+        Ok(CommittedSnapshot { snapshot, commit })
+    }
+
+    fn read_reprojection_witness(
+        &self,
+        connection: &Connection,
+        window: Option<PublicationWindow>,
+        commit: Option<CollectionCommit>,
+        current_key: Option<(i64, i64)>,
+        previous_current_key: Option<(i64, i64)>,
+    ) -> Result<ReprojectionWitness, ReaderError> {
+        fn rows(
+            connection: &Connection,
+            table: &str,
+            query: &str,
+            params: &[&dyn rusqlite::ToSql],
+        ) -> Result<Option<StoredRowsWitness>, ReaderError> {
+            if !table_exists(connection, table)? {
+                return Ok(None);
+            }
+            let mut statement = connection.prepare(query)?;
+            let columns = statement
+                .column_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let mut values = statement.query(params)?;
+            let mut result = Vec::new();
+            while let Some(row) = values.next()? {
+                result.push(
+                    (0..columns.len())
+                        .map(|index| row.get(index))
+                        .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()?,
+                );
+            }
+            Ok(Some(StoredRowsWitness {
+                columns,
+                rows: result,
+            }))
+        }
+        // Keep the stored order identity and optional source price_version,
+        // including their SQLite types. No display field is used as a stand-in.
+        let quota = rows(
+            connection,
+            "quota_receipts",
+            "SELECT * FROM quota_receipts ORDER BY sequence DESC LIMIT 1",
+            &[],
+        )?;
+        let (lower, upper) = window
+            .map(|window| (window.cutoff(HistoryWindow::Retained), window.raw_upper()))
+            .unwrap_or((i64::MIN, i64::MAX));
+        let retained_quota = rows(
+            connection,
+            "quota_receipts",
+            "SELECT * FROM quota_receipts WHERE observed_at>?1 AND observed_at<=?2 ORDER BY sequence",
+            &[&lower, &upper],
+        )?;
+        let (current_sidecar, current_metadata) = if let Some((timestamp, _)) = current_key {
+            (
+                rows(
+                    connection,
+                    "usage_model_history",
+                    "SELECT * FROM usage_model_history WHERE timestamp=?1 ORDER BY reset_at,model",
+                    &[&timestamp],
+                )?,
+                rows(
+                    connection,
+                    "durable_state",
+                    "SELECT * FROM durable_state WHERE singleton>=2 AND data_generation=?1 ORDER BY singleton",
+                    &[&timestamp],
+                )?,
+            )
+        } else {
+            (None, None)
+        };
+        let previous_current_key = previous_current_key.filter(|key| Some(*key) != current_key);
+        let (previous_current_sidecar, previous_current_metadata) = if let Some((timestamp, _)) =
+            previous_current_key
+        {
+            (
+                rows(
+                    connection,
+                    "usage_model_history",
+                    "SELECT * FROM usage_model_history WHERE timestamp=?1 ORDER BY reset_at,model",
+                    &[&timestamp],
+                )?,
+                rows(
+                    connection,
+                    "durable_state",
+                    "SELECT * FROM durable_state WHERE singleton>=2 AND data_generation=?1 ORDER BY singleton",
+                    &[&timestamp],
+                )?,
+            )
+        } else {
+            (None, None)
+        };
+        Ok(ReprojectionWitness {
+            window,
+            commit,
+            partition: self.expected_partition_identity.clone(),
+            ownership: self.read_intervals.clone(),
+            quota,
+            retained_quota,
+            current_key,
+            current_sidecar,
+            current_metadata,
+            previous_current_key,
+            previous_current_sidecar,
+            previous_current_metadata,
         })
+    }
+
+    pub fn read_committed_snapshot_at(
+        &self,
+        publication_at: i64,
+    ) -> Result<CommittedSnapshot, ReaderError> {
+        self.read_committed_snapshot_with_window(
+            Some(PublicationWindow::at(publication_at)?),
+            None,
+            ProjectionScope::All,
+        )
+    }
+
+    /// Also preserve the previous selected source in this same transaction,
+    /// even when the new time window selects a different current observation.
+    pub fn read_committed_snapshot_for_reprojection_at(
+        &self,
+        publication_at: i64,
+        previous_current_key: Option<(i64, i64)>,
+    ) -> Result<CommittedSnapshot, ReaderError> {
+        self.read_committed_snapshot_with_window(
+            Some(PublicationWindow::at(publication_at)?),
+            previous_current_key,
+            ProjectionScope::All,
+        )
+    }
+
+    /// Existing period history has no dependency on recorded-scope recovery
+    /// proofs. Its current values and source witness share this transaction.
+    pub fn read_committed_history_for_reprojection_at(
+        &self,
+        publication_at: i64,
+        previous_current_key: Option<(i64, i64)>,
+    ) -> Result<CommittedSnapshot, ReaderError> {
+        self.read_committed_snapshot_with_window(
+            Some(PublicationWindow::at(publication_at)?),
+            previous_current_key,
+            ProjectionScope::History,
+        )
+    }
+
+    /// The auxiliary archive supplies only its archive and commit witness to
+    /// publication. It cannot replace a newer current or period-history view.
+    pub fn read_committed_recordings_for_reprojection_at(
+        &self,
+        publication_at: i64,
+        previous_current_key: Option<(i64, i64)>,
+    ) -> Result<CommittedSnapshot, ReaderError> {
+        self.read_committed_snapshot_with_window(
+            Some(PublicationWindow::at(publication_at)?),
+            previous_current_key,
+            ProjectionScope::Recordings,
+        )
+    }
+
+    /// Read the independent current lanes without historical or recorded-
+    /// scope projection. Legacy databases with no accepted quota receipt have
+    /// no independent current authority and remain owned by the full reader.
+    pub fn read_committed_current_for_reprojection_at(
+        &self,
+        publication_at: i64,
+        previous_current_key: Option<(i64, i64)>,
+    ) -> Result<Option<CommittedSnapshot>, ReaderError> {
+        let candidate = self.read_committed_snapshot_with_window(
+            Some(PublicationWindow::at(publication_at)?),
+            previous_current_key,
+            ProjectionScope::Current,
+        )?;
+        Ok(candidate
+            .snapshot
+            .details
+            .quota
+            .is_some()
+            .then_some(candidate))
     }
 }
 
@@ -786,16 +1292,52 @@ fn validate_storage_partition_identity(
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RawSample {
+pub struct RawSample<D = f64, T = u64> {
     pub timestamp: i64,
     pub reset_at: i64,
     pub remaining_percent: Option<f64>,
-    pub sol_dollars: f64,
-    pub terra_dollars: f64,
-    pub luna_dollars: f64,
-    pub sol_tokens: u64,
-    pub terra_tokens: u64,
-    pub luna_tokens: u64,
+    pub sol_dollars: D,
+    pub terra_dollars: D,
+    pub luna_dollars: D,
+    pub sol_tokens: T,
+    pub terra_tokens: T,
+    pub luna_tokens: T,
+}
+
+/// One parent row from the read transaction. Compatibility encodings are
+/// derived from its knownness; missing fixed fields never become zero rows.
+type StoredHistorySample = RawSample<Option<f64>, Option<u64>>;
+
+impl StoredHistorySample {
+    fn legacy_raw(&self) -> Option<RawSample> {
+        Some(RawSample {
+            timestamp: self.timestamp,
+            reset_at: self.reset_at,
+            remaining_percent: self.remaining_percent,
+            sol_dollars: self.sol_dollars?,
+            terra_dollars: self.terra_dollars?,
+            luna_dollars: self.luna_dollars?,
+            sol_tokens: self.sol_tokens?,
+            terra_tokens: self.terra_tokens?,
+            luna_tokens: self.luna_tokens?,
+        })
+    }
+}
+
+impl From<&PublicHistorySample> for StoredHistorySample {
+    fn from(sample: &PublicHistorySample) -> Self {
+        Self {
+            timestamp: sample.timestamp,
+            reset_at: sample.reset_at,
+            remaining_percent: sample.remaining_percent,
+            sol_dollars: Some(sample.sol_dollars),
+            terra_dollars: Some(sample.terra_dollars),
+            luna_dollars: Some(sample.luna_dollars),
+            sol_tokens: Some(sample.sol_tokens),
+            terra_tokens: Some(sample.terra_tokens),
+            luna_tokens: Some(sample.luna_tokens),
+        }
+    }
 }
 
 /// One storage-canonical row together with the exact legacy row selected as
@@ -1183,10 +1725,10 @@ impl std::ops::DerefMut for SourcedRawSample {
     }
 }
 
-fn read_history(
+fn read_history_for_window(
     connection: &Connection,
-    _history_is_canonical: bool,
-) -> Result<Vec<RawSample>, ReaderError> {
+    window: Option<PublicationWindow>,
+) -> Result<Vec<StoredHistorySample>, ReaderError> {
     let table = "usage_history";
     if !table_exists(connection, table)? {
         return Err(ReaderError::Schema(format!("{table} table is missing")));
@@ -1194,10 +1736,18 @@ fn read_history(
     let query = format!(
         "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
                 terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
-         FROM {table} ORDER BY reset_at ASC, timestamp ASC"
+         FROM {table} WHERE timestamp >= ?1 AND timestamp <= ?2 ORDER BY reset_at ASC, timestamp ASC"
     );
     let mut statement = connection.prepare(&query)?;
-    let rows = statement.query_map([], raw_sample_from_row)?;
+    let (lower, upper) = window
+        .map(|window| {
+            (
+                window.cutoff(HistoryWindow::Retained) + 1,
+                window.raw_upper(),
+            )
+        })
+        .unwrap_or((i64::MIN, i64::MAX));
+    let rows = statement.query_map(params![lower, upper], raw_sample_from_row)?;
     let mut values = Vec::new();
     for row in rows {
         let Some(value) = row? else {
@@ -1211,7 +1761,8 @@ fn read_history(
     Ok(values)
 }
 
-fn validate_canonical_history_tables(connection: &Connection) -> Result<(), ReaderError> {
+/// Checks versioned canonical keys and guards without reading or changing model data.
+pub fn validate_canonical_history_tables(connection: &Connection) -> Result<(), ReaderError> {
     let schema_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if !(HISTORY_CANONICAL_SCHEMA_VERSION..=ACCOUNT_DB_SCHEMA_VERSION).contains(&schema_version) {
         return Err(ReaderError::Schema(
@@ -1225,8 +1776,48 @@ fn validate_canonical_history_tables(connection: &Connection) -> Result<(), Read
             "account canonical history tables are missing".to_owned(),
         ));
     }
-    let unique_indexes: i64 = connection.query_row(
-        "SELECT
+    if schema_version >= 16 {
+        for (table, expected) in [
+            ("usage_history", &["reset_at", "timestamp"][..]),
+            (
+                "usage_model_history",
+                &["reset_at", "timestamp", "model"][..],
+            ),
+        ] {
+            let mut statement = connection
+                .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;
+            let primary = statement
+                .query_map([table], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if primary != expected {
+                return Err(ReaderError::Schema(
+                    "account canonical history primary key is invalid".to_owned(),
+                ));
+            }
+            let mut statement =
+                connection.prepare("SELECT name FROM pragma_index_list(?1) WHERE \"unique\"=1")?;
+            let indexes = statement
+                .query_map([table], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for index in indexes {
+                let mut statement =
+                    connection.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
+                let columns = statement
+                    .query_map([index], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                if expected
+                    .iter()
+                    .any(|name| !columns.iter().any(|column| column == name))
+                {
+                    return Err(ReaderError::Schema(
+                        "account history uniqueness discards an exact period".to_owned(),
+                    ));
+                }
+            }
+        }
+    } else {
+        let unique_indexes: i64 = connection.query_row(
+            "SELECT
              EXISTS(
                  SELECT 1 FROM pragma_index_list('usage_history')
                  WHERE name='usage_history_canonical_timestamp_idx' AND \"unique\"=1
@@ -1235,13 +1826,14 @@ fn validate_canonical_history_tables(connection: &Connection) -> Result<(), Read
                  SELECT 1 FROM pragma_index_list('usage_model_history')
                  WHERE name='usage_model_history_canonical_timestamp_model_idx' AND \"unique\"=1
              )",
-        [],
-        |row| row.get(0),
-    )?;
-    if unique_indexes != 2 {
-        return Err(ReaderError::Schema(
-            "account canonical history uniqueness constraints are missing".to_owned(),
-        ));
+            [],
+            |row| row.get(0),
+        )?;
+        if unique_indexes != 2 {
+            return Err(ReaderError::Schema(
+                "account canonical history uniqueness constraints are missing".to_owned(),
+            ));
+        }
     }
     let trigger_count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_schema
@@ -1266,20 +1858,18 @@ fn validate_canonical_history_tables(connection: &Connection) -> Result<(), Read
     Ok(())
 }
 
-fn raw_sample_from_row(row: &Row<'_>) -> rusqlite::Result<Option<RawSample>> {
+fn raw_sample_from_row(row: &Row<'_>) -> rusqlite::Result<Option<StoredHistorySample>> {
     let timestamp: i64 = row.get(0)?;
     let reset_at: i64 = row.get(1)?;
     let remaining_percent: Option<f64> = row.get(2)?;
-    let sol_dollars: f64 = row.get(3)?;
-    let terra_dollars: f64 = row.get(4)?;
-    let luna_dollars: f64 = row.get(5)?;
-    let Some(sol_tokens) = row.get::<_, i64>(6)?.try_into().ok() else {
-        return Ok(None);
-    };
-    let Some(terra_tokens) = row.get::<_, i64>(7)?.try_into().ok() else {
-        return Ok(None);
-    };
-    let Some(luna_tokens) = row.get::<_, i64>(8)?.try_into().ok() else {
+    let sol_dollars: Option<f64> = row.get(3)?;
+    let terra_dollars: Option<f64> = row.get(4)?;
+    let luna_dollars: Option<f64> = row.get(5)?;
+    let [Ok(sol_tokens), Ok(terra_tokens), Ok(luna_tokens)] = [
+        row.get::<_, Option<i64>>(6)?.map(u64::try_from).transpose(),
+        row.get::<_, Option<i64>>(7)?.map(u64::try_from).transpose(),
+        row.get::<_, Option<i64>>(8)?.map(u64::try_from).transpose(),
+    ] else {
         return Ok(None);
     };
     if !valid_public_timestamp(timestamp)
@@ -1288,7 +1878,10 @@ fn raw_sample_from_row(row: &Row<'_>) -> rusqlite::Result<Option<RawSample>> {
     {
         return Ok(None);
     }
-    for value in [sol_dollars, terra_dollars, luna_dollars] {
+    for value in [sol_dollars, terra_dollars, luna_dollars]
+        .into_iter()
+        .flatten()
+    {
         if !value.is_finite() || value < 0.0 {
             return Ok(None);
         }
@@ -1371,17 +1964,8 @@ where
 }
 
 fn read_explicit_generation(connection: &Connection) -> Result<Option<u64>, ReaderError> {
-    if table_exists(connection, "collection_generation")? {
-        let value: Option<String> = connection
-            .query_row(
-                "SELECT data_generation FROM collection_generation WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(value) = value {
-            return parse_u64(&value, "collection_generation.data_generation").map(Some);
-        }
+    if let Some(commit) = read_collection_commit(connection)? {
+        return Ok(Some(commit.generation));
     }
     if table_exists(connection, "durable_state")? {
         let value: Option<i64> = connection
@@ -1398,6 +1982,59 @@ fn read_explicit_generation(connection: &Connection) -> Result<Option<u64>, Read
         }
     }
     Ok(None)
+}
+
+fn read_collection_commit(
+    connection: &Connection,
+) -> Result<Option<CollectionCommit>, ReaderError> {
+    if !table_exists(connection, "collection_generation")? {
+        return Ok(None);
+    }
+    let (generation, epoch, sequence): (String, Option<String>, String) = connection.query_row(
+        "SELECT data_generation, collector_epoch, cycle_seq FROM collection_generation WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let decimal = |value: &str, name| {
+        let parsed = parse_u64(value, name)?;
+        if parsed.to_string() != value {
+            return Err(ReaderError::InvalidValue(format!(
+                "{name} is not a canonical u64"
+            )));
+        }
+        Ok(parsed)
+    };
+    let generation = decimal(&generation, "collection_generation.data_generation")?;
+    let cycle_seq = decimal(&sequence, "collection_generation.cycle_seq")?;
+    let collector_epoch = epoch
+        .as_deref()
+        .map(|value| {
+            if value.len() != 32
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ReaderError::InvalidValue(
+                    "collection_generation.collector_epoch is invalid".to_owned(),
+                ));
+            }
+            u128::from_str_radix(value, 16).map_err(|_| {
+                ReaderError::InvalidValue(
+                    "collection_generation.collector_epoch is invalid".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    if collector_epoch.is_none() != (cycle_seq == 0) {
+        return Err(ReaderError::InvalidValue(
+            "collection commit epoch/sequence is inconsistent".to_owned(),
+        ));
+    }
+    Ok(Some(CollectionCommit {
+        generation,
+        collector_epoch,
+        cycle_seq,
+    }))
 }
 
 fn parse_u64(value: &str, field: &str) -> Result<u64, ReaderError> {
@@ -1422,11 +2059,102 @@ struct AcceptedQuota {
 struct ProjectionAuthority {
     history_is_canonical: bool,
     quota: Option<AcceptedQuota>,
+    window: Option<PublicationWindow>,
+    current_models: Option<CurrentModelLane>,
+}
+
+struct CurrentModelLane {
+    projection: ModelProjection,
+    status: CurrentModelsStatus,
+    observed_at: Option<i64>,
+}
+
+impl Default for CurrentModelLane {
+    fn default() -> Self {
+        Self {
+            projection: ModelProjection::default(),
+            status: CurrentModelsStatus::Unavailable,
+            observed_at: None,
+        }
+    }
 }
 
 struct DetailsProjection<'a> {
     authority: &'a ProjectionAuthority,
     history_window: HistoryWindow,
+    shared_history: Option<&'a SharedHistoryRead>,
+}
+
+#[derive(Default)]
+struct SharedHistoryRead {
+    gaps: RefCell<Option<Vec<PublicHistoryGap>>>,
+    inputs: RefCell<Option<Arc<HistoryInputSuperset>>>,
+}
+
+struct HistoryInputSuperset {
+    cutoff: i64,
+    observed_at: i64,
+    intervals: ReadIntervals,
+    alias_reset: Option<i64>,
+    window_seconds: i64,
+    observations: Vec<StoredHistoryObservation>,
+    provenance_generations: BTreeSet<i64>,
+    model_groups: BTreeMap<(i64, i64), HistoryModelGroup>,
+}
+
+impl SharedHistoryRead {
+    fn inputs(
+        &self,
+        connection: &Connection,
+        cutoff: i64,
+        observed_at: i64,
+        intervals: &ReadIntervals,
+        alias_reset: Option<i64>,
+        window_seconds: i64,
+    ) -> Result<Arc<HistoryInputSuperset>, ReaderError> {
+        if let Some(saved) = self.inputs.borrow().as_ref() {
+            if saved.cutoff != cutoff
+                || saved.observed_at != observed_at
+                || saved.intervals != *intervals
+                || saved.alias_reset != alias_reset
+                || saved.window_seconds != window_seconds
+            {
+                return Err(ReaderError::InvalidValue(
+                    "shared history input ownership changed".into(),
+                ));
+            }
+            return Ok(Arc::clone(saved));
+        }
+        let (observations, provenance_generations) =
+            read_stored_history_observations_for_intervals(
+                connection,
+                cutoff,
+                observed_at,
+                intervals,
+                alias_reset,
+                window_seconds,
+            )?;
+        let model_groups = read_history_model_groups_for_intervals(
+            connection,
+            cutoff,
+            observed_at,
+            intervals,
+            alias_reset,
+            window_seconds,
+        )?;
+        let value = Arc::new(HistoryInputSuperset {
+            cutoff,
+            observed_at,
+            intervals: intervals.clone(),
+            alias_reset,
+            window_seconds,
+            observations,
+            provenance_generations,
+            model_groups,
+        });
+        *self.inputs.borrow_mut() = Some(Arc::clone(&value));
+        Ok(value)
+    }
 }
 
 fn read_quota_acquisition_degraded(connection: &Connection) -> Result<bool, ReaderError> {
@@ -1490,8 +2218,8 @@ fn quota_only_details(receipt: &AcceptedQuota, threads: &[PublicThread]) -> Publ
 
 fn build_details_for_intervals(
     connection: &Connection,
-    raw: &[RawSample],
-    all_history: &[RawSample],
+    raw: &[StoredHistorySample],
+    all_history: &[StoredHistorySample],
     threads: &[PublicThread],
     task_evidence: &TaskActivityEvidence,
     intervals: &ReadIntervals,
@@ -1500,6 +2228,7 @@ fn build_details_for_intervals(
     let DetailsProjection {
         authority,
         history_window,
+        shared_history,
     } = projection;
     let history_is_canonical = authority.history_is_canonical;
     if raw.is_empty() {
@@ -1530,13 +2259,6 @@ fn build_details_for_intervals(
             CurrentPublication::unavailable(PublicState::Initializing),
         ));
     }
-    // Acquisition sequence selected the receipt. Its wall clock is metadata,
-    // not an ordering check against older history rows.
-    let observed_at = authority
-        .quota
-        .as_ref()
-        .map(|receipt| receipt.observed_at)
-        .unwrap_or_else(|| raw.iter().map(|row| row.timestamp).max().unwrap_or(0));
     let (current_reset_at, latest_quota_reset_at, window_seconds) = match &authority.quota {
         Some(receipt) => (
             Some(receipt.quota.reset_at),
@@ -1545,47 +2267,107 @@ fn build_details_for_intervals(
         ),
         None => read_collection_config(connection)?,
     };
+    let confirmed_gaps = if let Some(shared) = shared_history {
+        let existing = shared.gaps.borrow().clone();
+        if let Some(gaps) = existing {
+            gaps
+        } else {
+            let gaps = read_confirmed_gaps_for_intervals(connection, intervals, authority.window)?;
+            *shared.gaps.borrow_mut() = Some(gaps.clone());
+            gaps
+        }
+    } else {
+        read_confirmed_gaps_for_intervals(connection, intervals, authority.window)?
+    };
+    // A quota receipt orders quota facts. It is not a cutoff for a later,
+    // independently accepted observation of the same current exact period.
+    // Both the recent and retained projections receive this same raw domain.
+    let observed_at = if let Some(receipt) = authority.quota.as_ref() {
+        let start = current_period_start_at(receipt.quota.reset_at, receipt.quota.window_seconds);
+        std::iter::once(receipt.observed_at)
+            .chain(
+                authority
+                    .current_models
+                    .as_ref()
+                    .and_then(|lane| lane.observed_at),
+            )
+            .chain(
+                raw.iter()
+                    .filter(|row| {
+                        row.reset_at == receipt.quota.reset_at
+                            && start
+                                .is_some_and(|start| row.timestamp >= start - start.rem_euclid(60))
+                            && row.timestamp <= receipt.quota.reset_at
+                    })
+                    .map(|row| row.timestamp),
+            )
+            .chain(
+                confirmed_gaps
+                    .iter()
+                    .filter(|gap| {
+                        gap.reset_at == receipt.quota.reset_at
+                            && start.is_some_and(|start| gap.end_at >= start)
+                            && gap.start_at <= receipt.quota.reset_at
+                    })
+                    .map(|gap| gap.end_at.min(receipt.quota.reset_at)),
+            )
+            .max()
+            .expect("a quota receipt supplies an observation")
+    } else {
+        raw.iter().map(|row| row.timestamp).max().unwrap_or(0)
+    };
     let current_window_reset_at = latest_quota_reset_at.or(current_reset_at);
-    let cutoff = history_window.cutoff(observed_at);
+    let (cutoff, history_upper) = authority
+        .window
+        .map(|window| (window.cutoff(history_window), window.raw_upper()))
+        .unwrap_or((history_window.cutoff(observed_at), observed_at));
     let recent = raw
         .iter()
-        .filter(|row| row.timestamp > cutoff && row.timestamp <= observed_at)
+        .filter(|row| row.timestamp > cutoff && row.timestamp <= history_upper)
         .cloned()
         .collect::<Vec<_>>();
-    if recent.len() > history_window.max_rows() {
-        return Err(ReaderError::TooManyRows(recent.len()));
-    }
     let samples = if history_is_canonical {
+        let start = current_window_reset_at
+            .and_then(|reset| quota_period_minute_start(reset, window_seconds));
         recent
-            .iter()
-            .map(public_sample_from_raw)
+            .into_iter()
+            .filter(|row| {
+                Some(row.reset_at) != current_reset_at
+                    || start.is_none_or(|start| row.timestamp >= start)
+            })
             .collect::<Vec<_>>()
     } else {
+        let recent = recent
+            .iter()
+            .map(|row| {
+                row.legacy_raw().ok_or_else(|| {
+                    ReaderError::InvalidValue(
+                        "nullable history requires canonical period identity".to_owned(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut samples = canonicalize_history_with_limit(
             &recent,
             current_reset_at,
             window_seconds,
             observed_at,
-            Some(history_window.max_rows()),
+            None,
         )?;
         normalize_current_period_samples(&mut samples, current_reset_at, window_seconds);
         if samples.is_empty() && !recent.is_empty() {
-            samples = canonicalize_history_with_limit(
-                &recent,
-                None,
-                0,
-                observed_at,
-                Some(history_window.max_rows()),
-            )?;
+            samples = canonicalize_history_with_limit(&recent, None, 0, observed_at, None)?;
         }
-        samples
+        authoritative_history_projection_samples(
+            samples,
+            current_reset_at,
+            current_window_reset_at,
+            window_seconds,
+        )
+        .iter()
+        .map(StoredHistorySample::from)
+        .collect::<Vec<_>>()
     };
-    let samples = authoritative_history_projection_samples(
-        samples,
-        current_reset_at,
-        current_window_reset_at,
-        window_seconds,
-    );
     let quota_only_samples = if history_is_canonical {
         quota_only_history_projection_samples(
             all_history,
@@ -1608,22 +2390,27 @@ fn build_details_for_intervals(
         // quota boundary; they must never cross an account-switch boundary or
         // duplicate an owned point.
         if samples.iter().any(|sample| {
-            sample.timestamp == quota_only.timestamp
-                && sample.reset_at.abs_diff(quota_only.reset_at)
-                    <= RESET_AT_TOLERANCE_SECONDS as u64
+            sample.timestamp == quota_only.timestamp && sample.reset_at == quota_only.reset_at
         }) {
             continue;
         }
         quota_only_keys.insert((quota_only.reset_at, quota_only.timestamp));
         samples.push(quota_only);
     }
+    if let Some(window) = authority.window {
+        samples.retain(|sample| sample.timestamp > cutoff && sample.timestamp <= window.at);
+    }
     samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
-    let mut periods = history_periods(
-        &samples,
+    let mut periods = history_periods_at(
+        samples
+            .iter()
+            .map(|sample| (sample.reset_at, sample.timestamp)),
         observed_at,
+        history_upper,
         current_reset_at,
         current_window_reset_at,
         window_seconds,
+        history_is_canonical,
     );
     clip_history_periods(&mut periods, intervals);
     let quota = authority
@@ -1659,12 +2446,20 @@ fn build_details_for_intervals(
         current_window_reset_at,
         window_seconds,
         history_is_canonical,
+        shared_history: shared_history.map(|shared| {
+            (
+                shared,
+                authority
+                    .window
+                    .map_or(0, |window| window.cutoff(HistoryWindow::Retained)),
+            )
+        }),
     };
     let history_samples_v3 = read_history_projection_for_intervals(
         connection,
         &samples,
         &mut periods,
-        observed_at,
+        history_upper,
         cutoff,
         history_projection_context,
     )?;
@@ -1676,16 +2471,22 @@ fn build_details_for_intervals(
         window_seconds,
         history_is_canonical,
     );
-    let model_projection = read_current_model_projection_for_observation(
-        connection,
-        intervals,
-        current_reset_at,
-        current_window_reset_at,
-        window_seconds,
-        history_is_canonical,
-        current_model_observation,
-    )?;
-    let models_status = if model_projection.incomplete {
+    let model_projection = if let Some(lane) = authority.current_models.as_ref() {
+        lane.projection.clone()
+    } else {
+        read_current_model_projection_for_observation(
+            connection,
+            intervals,
+            current_reset_at,
+            current_window_reset_at,
+            window_seconds,
+            history_is_canonical,
+            (current_model_observation, shared_history),
+        )?
+    };
+    let models_status = if let Some(lane) = authority.current_models.as_ref() {
+        lane.status
+    } else if model_projection.incomplete {
         if model_projection.v3.is_empty() {
             CurrentModelsStatus::Unavailable
         } else {
@@ -1711,10 +2512,10 @@ fn build_details_for_intervals(
     let models = model_projection.v1;
     clip_history_periods(&mut periods, intervals);
     assign_history_period_labels(&mut periods, current_window_reset_at);
-    let history_samples_v2 = history_observations_v2(&samples, &history_samples_v3);
+    let history_samples_v2 = history_observations_v2_from_stored(&samples, &history_samples_v3);
     let history_samples_v1 = history_samples_v1(&history_samples_v2);
     let estimated_cost_label = format_estimated_cost_v3(&model_projection.v3);
-    let mut gaps = read_confirmed_gaps_for_intervals(connection, intervals)?
+    let mut gaps = confirmed_gaps
         .into_iter()
         .filter_map(|gap| {
             let period = periods.iter().find(|period| {
@@ -1807,6 +2608,7 @@ struct StoredHistoryObservation {
     remaining_percent: Option<f64>,
     model_source: HistoryModelSource,
     empty_model_set_complete: Option<bool>,
+    quota_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1824,6 +2626,37 @@ struct TaskRangeKey {
     start_offset: u64,
     end_offset: u64,
     record_sha256: String,
+}
+
+#[derive(Default)]
+struct IndexedByteCoverage {
+    spans: Vec<(u64, u64)>,
+    farthest_ends: Vec<u64>,
+}
+
+impl IndexedByteCoverage {
+    fn finish(&mut self) {
+        self.spans.sort_unstable();
+        let mut farthest = 0;
+        self.farthest_ends = self
+            .spans
+            .iter()
+            .map(|(_, end)| {
+                farthest = farthest.max(*end);
+                farthest
+            })
+            .collect();
+    }
+
+    fn covers(&self, start: u64, end: u64) -> bool {
+        if end <= start {
+            return false;
+        }
+        self.spans
+            .partition_point(|(begin, _)| *begin <= start)
+            .checked_sub(1)
+            .is_some_and(|index| self.farthest_ends[index] >= end)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1889,7 +2722,7 @@ fn read_task_activity_evidence_inner(
     let mut source_complete = BTreeMap::<TaskSourceKey, bool>::new();
     let mut checkpoint_sources = BTreeSet::new();
     let mut indexed_ranges = BTreeSet::new();
-    let mut indexed_spans = BTreeMap::<TaskSourceKey, BTreeMap<String, Vec<(u64, u64)>>>::new();
+    let mut indexed_spans = BTreeMap::<TaskSourceKey, BTreeMap<String, IndexedByteCoverage>>::new();
     let mut statement = connection.prepare(
         "SELECT root_identity, relative_path, file_device, file_inode,
                 prefix_generation, start_offset, end_offset, record_sha256
@@ -1909,11 +2742,12 @@ fn read_task_activity_evidence_inner(
             .or_default()
             .entry(range.prefix_generation)
             .or_default()
+            .spans
             .push((range.start_offset, range.end_offset));
     }
     for spans_by_prefix in indexed_spans.values_mut() {
         for spans in spans_by_prefix.values_mut() {
-            spans.sort_unstable();
+            spans.finish();
         }
     }
 
@@ -1937,12 +2771,7 @@ fn read_task_activity_evidence_inner(
         let covered = indexed_spans
             .get(&range.source)
             .and_then(|spans| spans.get(&range.prefix_generation))
-            .is_some_and(|spans| {
-                spans
-                    .iter()
-                    .take_while(|(start, _)| *start <= range.start_offset)
-                    .any(|(_, end)| *end >= range.end_offset)
-            });
+            .is_some_and(|spans| spans.covers(range.start_offset, range.end_offset));
         if !covered {
             complete = false;
             source_complete.insert(range.source.clone(), false);
@@ -1977,7 +2806,7 @@ fn read_task_activity_evidence_inner(
             .get(&source)
             .and_then(|spans| spans.get(&prefix_generation))
         {
-            for &(start_offset, end_offset) in spans {
+            for &(start_offset, end_offset) in &spans.spans {
                 if start_offset >= committed_offset {
                     break;
                 }
@@ -2273,6 +3102,7 @@ struct HistoryProjectionContext<'a> {
     current_window_reset_at: Option<i64>,
     window_seconds: i64,
     history_is_canonical: bool,
+    shared_history: Option<(&'a SharedHistoryRead, i64)>,
 }
 
 /// Build the v3 graph rows from the durable observation JSON and model-history
@@ -2281,7 +3111,7 @@ struct HistoryProjectionContext<'a> {
 /// are isolated to their one timestamp/model group.
 fn read_history_projection_for_intervals(
     connection: &Connection,
-    samples: &[PublicHistorySample],
+    samples: &[StoredHistorySample],
     periods: &mut [PublicHistoryPeriod],
     observed_at: i64,
     cutoff: i64,
@@ -2292,22 +3122,51 @@ fn read_history_projection_for_intervals(
     let legacy_alias_reset_at = context
         .current_reset_at
         .filter(|_| !context.history_is_canonical);
-    let (observations, provenance_generations) = read_stored_history_observations_for_intervals(
-        connection,
-        cutoff,
-        observed_at,
-        context.intervals,
-        legacy_alias_reset_at,
-        context.window_seconds,
-    )?;
-    let model_groups = read_history_model_groups_for_intervals(
-        connection,
-        cutoff,
-        observed_at,
-        context.intervals,
-        legacy_alias_reset_at,
-        context.window_seconds,
-    )?;
+    let inputs = if let Some((shared, retained_cutoff)) = context.shared_history {
+        shared.inputs(
+            connection,
+            retained_cutoff,
+            observed_at,
+            context.intervals,
+            legacy_alias_reset_at,
+            context.window_seconds,
+        )?
+    } else {
+        let (observations, provenance_generations) =
+            read_stored_history_observations_for_intervals(
+                connection,
+                cutoff,
+                observed_at,
+                context.intervals,
+                legacy_alias_reset_at,
+                context.window_seconds,
+            )?;
+        let model_groups = read_history_model_groups_for_intervals(
+            connection,
+            cutoff,
+            observed_at,
+            context.intervals,
+            legacy_alias_reset_at,
+            context.window_seconds,
+        )?;
+        Arc::new(HistoryInputSuperset {
+            cutoff,
+            observed_at,
+            intervals: context.intervals.clone(),
+            alias_reset: legacy_alias_reset_at,
+            window_seconds: context.window_seconds,
+            observations,
+            provenance_generations,
+            model_groups,
+        })
+    };
+    let observations = inputs
+        .observations
+        .iter()
+        .filter(|value| value.timestamp > cutoff && value.timestamp <= observed_at)
+        .collect::<Vec<_>>();
+    let provenance_generations = &inputs.provenance_generations;
+    let model_groups = &inputs.model_groups;
 
     // A canonical row and its sidecars keep the same committed period key.
     // A later provider window must not move an old confirmed model vector
@@ -2332,12 +3191,12 @@ fn read_history_projection_for_intervals(
         // contradictory numerics in the other.
         let empty_conflict = empty_set.is_some()
             && (group.is_some()
-                || sample.sol_tokens != 0
-                || sample.terra_tokens != 0
-                || sample.luna_tokens != 0
-                || sample.sol_dollars != 0.0
-                || sample.terra_dollars != 0.0
-                || sample.luna_dollars != 0.0);
+                || sample.sol_tokens.is_some_and(|value| value != 0)
+                || sample.terra_tokens.is_some_and(|value| value != 0)
+                || sample.luna_tokens.is_some_and(|value| value != 0)
+                || sample.sol_dollars.is_some_and(|value| value != 0.0)
+                || sample.terra_dollars.is_some_and(|value| value != 0.0)
+                || sample.luna_dollars.is_some_and(|value| value != 0.0));
         let model_source = if quota_only || empty_conflict {
             HistoryModelSource::Unavailable
         } else {
@@ -2361,7 +3220,12 @@ fn read_history_projection_for_intervals(
             HistoryModelSource::Unavailable
         } else if model_source == HistoryModelSource::ReconstructedFromSession {
             HistoryModelSource::ReconstructedFromSession
-        } else if model_source == HistoryModelSource::Confirmed && group_models_complete {
+        } else if model_source == HistoryModelSource::Confirmed
+            && (empty_set == Some(true) || group.is_some_and(|group| !group.totals.is_empty()))
+        {
+            // A qualified nonempty prefix keeps its provenance independently
+            // of completeness. Only an explicit complete empty set confirms
+            // zero cardinality; legacy fixed columns do not prove that claim.
             HistoryModelSource::Confirmed
         } else {
             HistoryModelSource::LegacyUnknown
@@ -2848,6 +3712,17 @@ fn history_observations_v2(
     samples: &[PublicHistorySample],
     history_v3: &[PublicHistoryObservationV3],
 ) -> Vec<PublicHistoryObservation> {
+    let stored = samples
+        .iter()
+        .map(StoredHistorySample::from)
+        .collect::<Vec<_>>();
+    history_observations_v2_from_stored(&stored, history_v3)
+}
+
+fn history_observations_v2_from_stored(
+    samples: &[StoredHistorySample],
+    history_v3: &[PublicHistoryObservationV3],
+) -> Vec<PublicHistoryObservation> {
     let mut legacy_by_key = BTreeMap::new();
     for sample in samples {
         legacy_by_key
@@ -2857,27 +3732,34 @@ fn history_observations_v2(
     history_v3
         .iter()
         .map(|sample| {
+            let fixed = legacy_by_key
+                .get(&(sample.reset_at, sample.timestamp))
+                .copied();
             let legacy = (!matches!(
                 sample.model_source.as_str(),
                 "reconstructed-from-session" | "unavailable"
             ))
-            .then(|| {
-                legacy_by_key
-                    .get(&(sample.reset_at, sample.timestamp))
-                    .copied()
-            })
+            .then_some(fixed)
             .flatten();
+            let legacy = legacy.filter(|row| row.legacy_raw().is_some());
             PublicHistoryObservation {
                 timestamp: sample.timestamp,
                 reset_at: sample.reset_at,
                 remaining_percent: sample.remaining_percent,
-                sol_dollars: legacy.map(|legacy| legacy.sol_dollars),
-                terra_dollars: legacy.map(|legacy| legacy.terra_dollars),
-                luna_dollars: legacy.map(|legacy| legacy.luna_dollars),
-                sol_tokens: legacy.map(|legacy| legacy.sol_tokens),
-                terra_tokens: legacy.map(|legacy| legacy.terra_tokens),
-                luna_tokens: legacy.map(|legacy| legacy.luna_tokens),
-                model_source: sample.model_source.clone(),
+                sol_dollars: legacy.and_then(|legacy| legacy.sol_dollars),
+                terra_dollars: legacy.and_then(|legacy| legacy.terra_dollars),
+                luna_dollars: legacy.and_then(|legacy| legacy.luna_dollars),
+                sol_tokens: legacy.and_then(|legacy| legacy.sol_tokens),
+                terra_tokens: legacy.and_then(|legacy| legacy.terra_tokens),
+                luna_tokens: legacy.and_then(|legacy| legacy.luna_tokens),
+                model_source: if fixed.is_some_and(|row| row.legacy_raw().is_none())
+                    || (fixed.is_none()
+                        && matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown"))
+                {
+                    "unavailable".to_owned()
+                } else {
+                    sample.model_source.clone()
+                },
             }
         })
         .collect()
@@ -2886,20 +3768,7 @@ fn history_observations_v2(
 fn history_samples_v1(samples: &[PublicHistoryObservation]) -> Vec<PublicHistorySample> {
     samples
         .iter()
-        .filter(|sample| matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown"))
-        .filter_map(|sample| {
-            Some(PublicHistorySample {
-                timestamp: sample.timestamp,
-                reset_at: sample.reset_at,
-                remaining_percent: sample.remaining_percent,
-                sol_dollars: sample.sol_dollars?,
-                terra_dollars: sample.terra_dollars?,
-                luna_dollars: sample.luna_dollars?,
-                sol_tokens: sample.sol_tokens?,
-                terra_tokens: sample.terra_tokens?,
-                luna_tokens: sample.luna_tokens?,
-            })
-        })
+        .filter_map(PublicHistoryObservation::as_legacy_sample)
         .collect()
 }
 
@@ -2911,6 +3780,8 @@ fn read_stored_history_observations_for_intervals(
     current_reset_at: Option<i64>,
     window_seconds: i64,
 ) -> Result<(Vec<StoredHistoryObservation>, BTreeSet<i64>), ReaderError> {
+    #[cfg(test)]
+    record_history_input_read(0);
     if !table_exists(connection, "durable_state")? {
         return Ok((Vec::new(), BTreeSet::new()));
     }
@@ -3047,6 +3918,18 @@ fn parse_stored_history_observation(
         remaining_percent,
         model_source,
         empty_model_set_complete,
+        quota_only: model_source == HistoryModelSource::Unavailable
+            && remaining_percent.is_some()
+            && [
+                "sol_dollars",
+                "terra_dollars",
+                "luna_dollars",
+                "sol_tokens",
+                "terra_tokens",
+                "luna_tokens",
+            ]
+            .iter()
+            .all(|field| object.get(*field).is_some_and(serde_json::Value::is_null)),
     })
 }
 
@@ -3058,6 +3941,8 @@ fn read_history_model_groups_for_intervals(
     current_reset_at: Option<i64>,
     window_seconds: i64,
 ) -> Result<BTreeMap<(i64, i64), HistoryModelGroup>, ReaderError> {
+    #[cfg(test)]
+    record_history_input_read(1);
     if !table_exists(connection, "usage_model_history")? {
         return Ok(BTreeMap::new());
     }
@@ -3122,42 +4007,29 @@ fn read_history_model_groups_for_intervals(
             group.valid = false;
             continue;
         };
-        let Some(total_tokens) = sql_text(row, 3).and_then(|value| value.parse::<u64>().ok())
+        let Some(total_tokens) = sql_text(row, 3).and_then(|value| canonical_timeline_u64(&value))
         else {
             group.valid = false;
             continue;
         };
-        let Some(input_tokens) = sql_text(row, 4).and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(input_tokens) = sql_optional_token(row, 4) else {
             group.valid = false;
             continue;
         };
-        let Some(cached_input_tokens) =
-            sql_text(row, 5).and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(cached_input_tokens) = sql_optional_token(row, 5) else {
             group.valid = false;
             continue;
         };
-        let Some(output_tokens) = sql_text(row, 6).and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(output_tokens) = sql_optional_token(row, 6) else {
             group.valid = false;
             continue;
         };
         let cache_write_input_tokens = if has_cache_write {
-            match sql_text_option(row, 7) {
-                Some(None) => None,
-                Some(Some(value)) => match value.parse::<u64>() {
-                    Ok(value) => Some(value),
-                    Err(_) => {
-                        group.valid = false;
-                        continue;
-                    }
-                },
-                None => {
-                    group.valid = false;
-                    continue;
-                }
-            }
+            let Some(value) = sql_optional_token(row, 7) else {
+                group.valid = false;
+                continue;
+            };
+            value
         } else {
             None
         };
@@ -3176,12 +4048,7 @@ fn read_history_model_groups_for_intervals(
         if !valid_public_timestamp(reset_at)
             || !valid_public_timestamp(timestamp)
             || !is_valid_public_model_name(&row.model)
-            || row.cached_input_tokens > row.input_tokens
-            || row.cache_write_input_tokens.is_some_and(|writes| {
-                row.cached_input_tokens
-                    .checked_add(writes)
-                    .is_none_or(|discounted| discounted > row.input_tokens)
-            })
+            || !row.numeric_facts_are_consistent()
         {
             group.valid = false;
             continue;
@@ -3244,6 +4111,11 @@ fn sql_text_option(row: &Row<'_>, index: usize) -> Option<Option<String>> {
     }
 }
 
+fn sql_optional_token(row: &Row<'_>, index: usize) -> Option<Option<u64>> {
+    sql_text_option(row, index)?
+        .map_or(Some(None), |value| canonical_timeline_u64(&value).map(Some))
+}
+
 fn sql_nonnegative_f64(row: &Row<'_>, index: usize) -> Option<f64> {
     let value = match row.get_ref(index).ok()? {
         ValueRef::Integer(value) => value as f64,
@@ -3264,7 +4136,7 @@ fn sql_i64(row: &Row<'_>, index: usize) -> Option<i64> {
 
 fn history_models_v3(
     group: Option<&HistoryModelGroup>,
-    sample: &PublicHistorySample,
+    sample: &StoredHistorySample,
     models_complete: bool,
 ) -> Option<Vec<PublicHistoryModelUsageV3>> {
     let mut models = group
@@ -3304,24 +4176,24 @@ fn history_models_v3(
     (models_complete || !models.is_empty()).then_some(models)
 }
 
-fn legacy_history_models_v3(sample: &PublicHistorySample) -> Vec<PublicHistoryModelUsageV3> {
+fn legacy_history_models_v3(sample: &StoredHistorySample) -> Vec<PublicHistoryModelUsageV3> {
     [
         ("SOL", sample.sol_tokens, sample.sol_dollars),
         ("TERRA", sample.terra_tokens, sample.terra_dollars),
         ("LUNA", sample.luna_tokens, sample.luna_dollars),
     ]
     .into_iter()
-    .map(
-        |(model, total_tokens, total_dollars)| PublicHistoryModelUsageV3 {
+    .filter_map(|(model, total_tokens, total_dollars)| {
+        Some(PublicHistoryModelUsageV3 {
             model: model.to_owned(),
-            total_tokens,
+            total_tokens: total_tokens?,
             input_tokens: None,
             cached_input_tokens: None,
             cache_write_input_tokens: None,
             output_tokens: None,
-            total_dollars: Some(total_dollars),
-        },
-    )
+            total_dollars,
+        })
+    })
     .collect()
 }
 
@@ -3330,12 +4202,12 @@ fn history_model_usage_v3(
     total: &RawModelTotal,
     sample: &PublicHistorySample,
 ) -> PublicHistoryModelUsageV3 {
-    history_model_usage_v3_with_family_fallback(total, sample, true)
+    history_model_usage_v3_with_family_fallback(total, &StoredHistorySample::from(sample), true)
 }
 
 fn history_model_usage_v3_with_family_fallback(
     total: &RawModelTotal,
-    sample: &PublicHistorySample,
+    sample: &StoredHistorySample,
     family_fallback_allowed: bool,
 ) -> PublicHistoryModelUsageV3 {
     let total_dollars = total.total_dollars.or(if family_fallback_allowed {
@@ -3343,9 +4215,9 @@ fn history_model_usage_v3_with_family_fallback(
             // Old history rows have no sidecar amount. Preserve their family-only
             // SQL values if this group has no exact-ID peer in the same family,
             // but let any newly persisted row amount take precedence.
-            "SOL" => Some(sample.sol_dollars),
-            "TERRA" => Some(sample.terra_dollars),
-            "LUNA" => Some(sample.luna_dollars),
+            "SOL" => sample.sol_dollars,
+            "TERRA" => sample.terra_dollars,
+            "LUNA" => sample.luna_dollars,
             // Exact model IDs (and newer ASTRA rows) have no legacy SQL fallback.
             // Never reprice a historical row from today's catalog.
             _ => None,
@@ -3356,10 +4228,10 @@ fn history_model_usage_v3_with_family_fallback(
     PublicHistoryModelUsageV3 {
         model: total.model.clone(),
         total_tokens: total.total_tokens,
-        input_tokens: Some(total.input_tokens),
-        cached_input_tokens: Some(total.cached_input_tokens),
+        input_tokens: total.input_tokens,
+        cached_input_tokens: total.cached_input_tokens,
         cache_write_input_tokens: total.cache_write_input_tokens,
-        output_tokens: Some(total.output_tokens),
+        output_tokens: total.output_tokens,
         total_dollars,
     }
 }
@@ -3426,15 +4298,15 @@ fn normalize_current_period_samples(
 /// re-entry still exposes the provider-level observations up to re-entry.
 /// An interval that owns the quota-window start remains fail-closed because it
 /// cannot be distinguished from locally-owned history.
-fn quota_only_history_projection_samples(
-    all_history: &[RawSample],
-    owned_history: &[RawSample],
+fn quota_only_history_projection_samples<D, T>(
+    all_history: &[RawSample<D, T>],
+    owned_history: &[RawSample<D, T>],
     current_reset_at: Option<i64>,
     current_window_reset_at: Option<i64>,
     window_seconds: i64,
     observed_at: i64,
     intervals: &ReadIntervals,
-) -> Vec<PublicHistorySample> {
+) -> Vec<StoredHistorySample> {
     let Some(authority) = current_reset_at else {
         return Vec::new();
     };
@@ -3496,20 +4368,16 @@ fn quota_only_history_projection_samples(
         if conflicts.contains(&timestamp) {
             continue;
         }
-        samples.push(PublicHistorySample {
+        samples.push(StoredHistorySample {
             timestamp,
             reset_at: authority,
             remaining_percent: Some(remaining_percent),
-            // These values are deliberately zeroed because v1/v2 cannot
-            // represent an unavailable model vector.  The source-aware v2/v3
-            // projection strips them before publication; no zero is exposed
-            // as a model total.
-            sol_dollars: 0.0,
-            terra_dollars: 0.0,
-            luna_dollars: 0.0,
-            sol_tokens: 0,
-            terra_tokens: 0,
-            luna_tokens: 0,
+            sol_dollars: None,
+            terra_dollars: None,
+            luna_dollars: None,
+            sol_tokens: None,
+            terra_tokens: None,
+            luna_tokens: None,
         });
     }
     samples
@@ -3553,6 +4421,7 @@ fn authoritative_history_projection_samples(
         .collect()
 }
 
+#[cfg(test)]
 fn history_periods(
     samples: &[PublicHistorySample],
     observed_at: i64,
@@ -3560,28 +4429,60 @@ fn history_periods(
     current_window_reset_at: Option<i64>,
     window_seconds: i64,
 ) -> Vec<PublicHistoryPeriod> {
+    history_periods_at(
+        samples
+            .iter()
+            .map(|sample| (sample.reset_at, sample.timestamp)),
+        observed_at,
+        observed_at,
+        current_reset_at,
+        current_window_reset_at,
+        window_seconds,
+        false,
+    )
+}
+
+fn history_periods_at(
+    samples: impl IntoIterator<Item = (i64, i64)>,
+    observed_at: i64,
+    history_upper: i64,
+    current_reset_at: Option<i64>,
+    current_window_reset_at: Option<i64>,
+    window_seconds: i64,
+    history_is_canonical: bool,
+) -> Vec<PublicHistoryPeriod> {
     let mut ranges = BTreeMap::<i64, (i64, i64)>::new();
-    for sample in samples {
+    for (reset_at, timestamp) in samples {
         ranges
-            .entry(sample.reset_at)
+            .entry(reset_at)
             .and_modify(|range| {
-                range.0 = range.0.min(sample.timestamp);
-                range.1 = range.1.max(sample.timestamp);
+                range.0 = range.0.min(timestamp);
+                range.1 = range.1.max(timestamp);
             })
-            .or_insert((sample.timestamp, sample.timestamp));
+            .or_insert((timestamp, timestamp));
     }
     let current = current_reset_at.and_then(|authority| {
         ranges
             .keys()
             .copied()
-            .filter(|reset_at| reset_at.abs_diff(authority) <= RESET_AT_TOLERANCE_SECONDS as u64)
+            .filter(|reset_at| {
+                if history_is_canonical {
+                    *reset_at == authority
+                } else {
+                    reset_at.abs_diff(authority) <= RESET_AT_TOLERANCE_SECONDS as u64
+                }
+            })
             .min_by_key(|reset_at| reset_at.abs_diff(authority))
     });
     let fallback_current = current.or_else(|| {
-        samples
-            .iter()
-            .max_by_key(|sample| (sample.timestamp, sample.reset_at))
-            .map(|sample| sample.reset_at)
+        if history_is_canonical && current_reset_at.is_some() {
+            None
+        } else {
+            ranges
+                .iter()
+                .max_by_key(|(reset, (_, end))| (*end, **reset))
+                .map(|(reset, _)| *reset)
+        }
     });
     let current_bounds = current_window_reset_at
         .and_then(|reset_at| current_period_bounds(reset_at, window_seconds, observed_at));
@@ -3595,7 +4496,10 @@ fn history_periods(
                 // rewritten to manufacture these bounds.
                 current_bounds.unwrap_or((observed_start, observed_end.min(observed_at)))
             } else {
-                (observed_start, observed_end.min(observed_at).min(reset_at))
+                (
+                    observed_start,
+                    observed_end.min(history_upper).min(reset_at),
+                )
             };
             PublicHistoryPeriod {
                 // The root UI uses the canonical reset instant as its period
@@ -3747,12 +4651,12 @@ fn civil_date_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
 }
 
 fn latest_quota_row(
-    rows: &[RawSample],
+    rows: &[StoredHistorySample],
     current_reset_at: Option<i64>,
     current_window_reset_at: Option<i64>,
     window_seconds: i64,
     history_is_canonical: bool,
-) -> Option<&RawSample> {
+) -> Option<&StoredHistorySample> {
     if history_is_canonical {
         let authority = current_reset_at?;
         let window_reset = current_window_reset_at.unwrap_or(authority);
@@ -3935,13 +4839,7 @@ fn canonicalize_history(
     window_seconds: i64,
     observed_at: i64,
 ) -> Result<Vec<PublicHistorySample>, ReaderError> {
-    canonicalize_history_with_limit(
-        rows,
-        current_reset_at,
-        window_seconds,
-        observed_at,
-        Some(MAX_HISTORY_ROWS),
-    )
+    canonicalize_history_with_limit(rows, current_reset_at, window_seconds, observed_at, None)
 }
 
 fn canonicalize_history_with_limit(
@@ -4428,11 +5326,36 @@ fn quota_observations_agree(anchor: &RawSample, candidate: &RawSample) -> bool {
 struct RawModelTotal {
     model: String,
     total_tokens: u64,
+    input_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
+    total_dollars: Option<f64>,
+}
+
+impl RawModelTotal {
+    fn numeric_facts_are_consistent(&self) -> bool {
+        TokenFacts {
+            total: self.total_tokens,
+            input: self.input_tokens,
+            cached_input: self.cached_input_tokens,
+            cache_write_input: self.cache_write_input_tokens,
+            output: self.output_tokens,
+        }
+        .validate_fact()
+        .is_ok()
+    }
+}
+
+/// Current wire rows require these components. History retains the nullable
+/// raw row rather than manufacturing this representation for missing values.
+struct KnownModelTotal {
+    model: String,
+    total_tokens: u64,
     input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
     cache_write_input_tokens: Option<u64>,
-    total_dollars: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4536,27 +5459,23 @@ fn read_model_projection(connection: &Connection) -> Result<ModelProjection, Rea
         let Some(model) = sql_text(row, 0) else {
             return Ok(None);
         };
-        let Some(total_tokens) = sql_text(row, 1).and_then(|value| value.parse::<u64>().ok())
+        let Some(total_tokens) = sql_text(row, 1).and_then(|value| canonical_timeline_u64(&value))
         else {
             return Ok(None);
         };
-        let Some(input_tokens) = sql_text(row, 2).and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(input_tokens) = sql_optional_token(row, 2) else {
             return Ok(None);
         };
-        let Some(cached_input_tokens) =
-            sql_text(row, 3).and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(cached_input_tokens) = sql_optional_token(row, 3) else {
             return Ok(None);
         };
-        let Some(output_tokens) = sql_text(row, 4).and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(output_tokens) = sql_optional_token(row, 4) else {
             return Ok(None);
         };
         let cache_write_input_tokens = if has_cache_write {
             let parsed = match sql_text_option(row, 5) {
                 Some(None) => Some(None),
-                Some(Some(value)) => value.parse::<u64>().ok().map(Some),
+                Some(Some(value)) => canonical_timeline_u64(&value).map(Some),
                 None => None,
             };
             let Some(parsed) = parsed else {
@@ -4735,27 +5654,23 @@ fn read_model_projection_for_intervals(
             group_invalid = true;
             continue;
         };
-        let Some(total_tokens) = sql_text(row, 3).and_then(|value| value.parse::<u64>().ok())
+        let Some(total_tokens) = sql_text(row, 3).and_then(|value| canonical_timeline_u64(&value))
         else {
             group_complete = false;
             group_invalid = true;
             continue;
         };
-        let Some(input_tokens) = sql_text(row, 4).and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(input_tokens) = sql_optional_token(row, 4) else {
             group_complete = false;
             group_invalid = true;
             continue;
         };
-        let Some(cached_input_tokens) =
-            sql_text(row, 5).and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(cached_input_tokens) = sql_optional_token(row, 5) else {
             group_complete = false;
             group_invalid = true;
             continue;
         };
-        let Some(output_tokens) = sql_text(row, 6).and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(output_tokens) = sql_optional_token(row, 6) else {
             group_complete = false;
             group_invalid = true;
             continue;
@@ -4763,7 +5678,7 @@ fn read_model_projection_for_intervals(
         let cache_write_input_tokens = if has_cache_write {
             let parsed = match sql_text_option(row, 7) {
                 Some(None) => Some(None),
-                Some(Some(value)) => value.parse::<u64>().ok().map(Some),
+                Some(Some(value)) => canonical_timeline_u64(&value).map(Some),
                 None => None,
             };
             let Some(parsed) = parsed else {
@@ -4812,6 +5727,182 @@ fn read_model_projection_for_intervals(
     Ok(ModelProjection::default())
 }
 
+fn current_model_time_bounds(
+    reset_at: i64,
+    window_seconds: i64,
+    publication: Option<PublicationWindow>,
+    history_is_canonical: bool,
+) -> Option<(i64, i64)> {
+    let start = if history_is_canonical {
+        quota_period_minute_start(reset_at, window_seconds)
+    } else {
+        quota_period_start(reset_at, window_seconds)
+    }?;
+    Some(publication.map_or((start, reset_at), |window| {
+        if history_is_canonical {
+            (
+                start.max(window.retained_start.div_euclid(60) * 60),
+                reset_at.min(window.raw_upper()),
+            )
+        } else {
+            (start.max(window.retained_start), reset_at.min(window.at))
+        }
+    }))
+}
+
+fn read_independent_current_models(
+    connection: &Connection,
+    intervals: &ReadIntervals,
+    receipt: &AcceptedQuota,
+    window: Option<PublicationWindow>,
+    history_is_canonical: bool,
+) -> Result<CurrentModelLane, ReaderError> {
+    let reset_at = receipt.quota.reset_at;
+    let Some((start, upper)) = current_model_time_bounds(
+        reset_at,
+        receipt.quota.window_seconds,
+        window,
+        history_is_canonical,
+    ) else {
+        return Ok(CurrentModelLane::default());
+    };
+    let belongs = |timestamp, source_reset| {
+        timestamp >= start
+            && timestamp <= upper
+            && intervals.intersects_canonical_minute(timestamp)
+            && if history_is_canonical {
+                source_reset == reset_at
+            } else {
+                canonical_period_reset_at(
+                    source_reset,
+                    timestamp,
+                    Some(reset_at),
+                    receipt.quota.window_seconds,
+                ) == reset_at
+            }
+    };
+
+    // Find a key before reading its vector. Neither query depends on the
+    // legacy drawing columns, period metadata, or full-history projection.
+    let mut latest_model = None;
+    if table_exists(connection, "usage_model_history")? {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT timestamp, reset_at FROM usage_model_history
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY timestamp DESC, (reset_at = ?3) DESC, reset_at DESC",
+        )?;
+        let mut rows = statement.query(params![start, upper, reset_at])?;
+        while let Some(row) = rows.next()? {
+            let (Some(timestamp), Some(source_reset)) = (sql_i64(row, 0), sql_i64(row, 1)) else {
+                return Ok(CurrentModelLane::default());
+            };
+            if belongs(timestamp, source_reset) {
+                latest_model = Some(timestamp);
+                break;
+            }
+        }
+    }
+    let mut latest_stored = None;
+    if table_exists(connection, "durable_state")? {
+        let mut statement = connection.prepare(
+            "SELECT data_generation, snapshot_json FROM durable_state
+             WHERE singleton >= 2 AND data_generation >= ?1 AND data_generation <= ?2
+             ORDER BY data_generation DESC, singleton DESC",
+        )?;
+        let mut rows = statement.query(params![start, upper])?;
+        while let Some(row) = rows.next()? {
+            let Some(timestamp) = sql_i64(row, 0) else {
+                return Ok(CurrentModelLane::default());
+            };
+            if latest_model.is_some_and(|latest| timestamp < latest) {
+                break;
+            }
+            if !intervals.intersects_canonical_minute(timestamp) {
+                continue;
+            }
+            let Some(stored) = sql_text(row, 1)
+                .and_then(|json| parse_stored_history_observation(timestamp, &json))
+            else {
+                // Do not recover an older complete vector through a newer
+                // unqualified observation whose source cannot be established.
+                return Ok(CurrentModelLane::default());
+            };
+            if belongs(timestamp, stored.reset_at) {
+                if stored.quota_only && latest_model != Some(timestamp) {
+                    let official_quota_only: bool = connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM quota_receipts
+                         WHERE reset_at=?1 AND observed_at>=?2 AND observed_at<?2+60
+                             AND remaining_percent=?3)",
+                        params![stored.reset_at, timestamp, stored.remaining_percent],
+                        |row| row.get(0),
+                    )?;
+                    if official_quota_only {
+                        // A receipt creates a quota observation, never a new
+                        // model vector. Keep selecting the independently
+                        // stored model source within this exact period.
+                        continue;
+                    }
+                }
+                latest_stored = Some(stored);
+                break;
+            }
+        }
+    }
+    let Some(timestamp) = latest_model.max(latest_stored.as_ref().map(|stored| stored.timestamp))
+    else {
+        return Ok(CurrentModelLane::default());
+    };
+    let stored = latest_stored.filter(|stored| stored.timestamp == timestamp);
+    let observed_at = Some(timestamp);
+    if stored.as_ref().is_some_and(|stored| {
+        !matches!(
+            stored.model_source,
+            HistoryModelSource::Confirmed | HistoryModelSource::LegacyUnknown
+        ) || (stored.empty_model_set_complete.is_some() && latest_model == Some(timestamp))
+    }) {
+        return Ok(CurrentModelLane {
+            observed_at,
+            ..CurrentModelLane::default()
+        });
+    }
+    let alias = (!history_is_canonical).then_some(reset_at);
+    let mut groups = read_history_model_groups_for_intervals(
+        connection,
+        timestamp - 1,
+        timestamp,
+        intervals,
+        alias,
+        receipt.quota.window_seconds,
+    )?;
+    let group = groups.remove(&(reset_at, timestamp));
+    let complete = stored.as_ref().is_some_and(|stored| {
+        stored.model_source == HistoryModelSource::Confirmed
+            && stored.empty_model_set_complete.unwrap_or_else(|| {
+                group
+                    .as_ref()
+                    .is_some_and(HistoryModelGroup::model_set_complete)
+            })
+    });
+    let mut projection = project_model_totals(
+        group
+            .into_iter()
+            .flat_map(|group| group.totals.into_values()),
+    );
+    projection.incomplete |= !complete;
+    let status = if complete && !projection.incomplete {
+        CurrentModelsStatus::Complete
+    } else if projection.v3.is_empty() {
+        CurrentModelsStatus::Unavailable
+    } else {
+        CurrentModelsStatus::Partial
+    };
+    Ok(CurrentModelLane {
+        projection,
+        status,
+        observed_at,
+    })
+}
+
 fn read_current_model_projection_for_observation(
     connection: &Connection,
     intervals: &ReadIntervals,
@@ -4819,8 +5910,12 @@ fn read_current_model_projection_for_observation(
     current_window_reset_at: Option<i64>,
     window_seconds: i64,
     history_is_canonical: bool,
-    observation: Option<&PublicHistoryObservationV3>,
+    selected: (
+        Option<&PublicHistoryObservationV3>,
+        Option<&SharedHistoryRead>,
+    ),
 ) -> Result<ModelProjection, ReaderError> {
+    let (observation, shared_history) = selected;
     let Some(observation) = observation else {
         // Keep the timestamp-less compatibility source only for an unbounded
         // legacy database with no current quota authority. Otherwise no
@@ -4853,17 +5948,31 @@ fn read_current_model_projection_for_observation(
         history_is_canonical,
         Some((observation.timestamp, observation.reset_at)),
     )?;
-    let (stored_observations, _) = read_stored_history_observations_for_intervals(
-        connection,
-        observation.timestamp.saturating_sub(1),
-        observation.timestamp,
-        intervals,
-        current_reset_at.filter(|_| !history_is_canonical),
-        window_seconds,
-    )?;
-    let stored = stored_observations.into_iter().find(|stored| {
-        stored.timestamp == observation.timestamp && stored.reset_at == observation.reset_at
-    });
+    let stored = if let Some(shared) = shared_history {
+        shared
+            .inputs
+            .borrow()
+            .as_ref()
+            .and_then(|inputs| {
+                inputs.observations.iter().find(|stored| {
+                    stored.timestamp == observation.timestamp
+                        && stored.reset_at == observation.reset_at
+                })
+            })
+            .cloned()
+    } else {
+        let (stored_observations, _) = read_stored_history_observations_for_intervals(
+            connection,
+            observation.timestamp.saturating_sub(1),
+            observation.timestamp,
+            intervals,
+            current_reset_at.filter(|_| !history_is_canonical),
+            window_seconds,
+        )?;
+        stored_observations.into_iter().find(|stored| {
+            stored.timestamp == observation.timestamp && stored.reset_at == observation.reset_at
+        })
+    };
     projection.incomplete |= observation.model_source == "unavailable"
         || observation.model_source == "reconstructed-from-session"
         || stored.as_ref().is_some_and(|stored| {
@@ -4901,29 +6010,40 @@ fn project_model_totals(rows: impl IntoIterator<Item = RawModelTotal>) -> ModelP
     let mut names = std::collections::HashSet::new();
     let mut legacy_families = BTreeMap::<String, LegacyFamilyProjection>::new();
     let mut incomplete = false;
+    let mut invalid = false;
     for row in rows {
         if !is_valid_public_model_name(&row.model)
-            || (row.total_tokens == 0
-                && (row.input_tokens != 0
-                    || row.cached_input_tokens != 0
-                    || row.output_tokens != 0
-                    || row
-                        .cache_write_input_tokens
-                        .is_some_and(|writes| writes != 0)))
-            || row.cached_input_tokens > row.input_tokens
-            || row.cache_write_input_tokens.is_some_and(|writes| {
-                row.cached_input_tokens
-                    .checked_add(writes)
-                    .is_none_or(|discounted| discounted > row.input_tokens)
-            })
+            || !row.numeric_facts_are_consistent()
             || !names.insert(row.model.clone())
         {
             // A malformed model row is local to that model.  Continue with
             // all other durable totals so one bad/unknown row cannot cause a
             // complete details 503.
             incomplete = true;
+            invalid = true;
             continue;
         }
+        let (Some(input_tokens), Some(cached_input_tokens), Some(output_tokens)) =
+            (row.input_tokens, row.cached_input_tokens, row.output_tokens)
+        else {
+            incomplete = true;
+            if let Some(family @ ("SOL" | "TERRA" | "LUNA")) =
+                codex_info_pricing::family(&row.model)
+            {
+                let aggregate = legacy_families.entry(family.to_owned()).or_default();
+                aggregate.seen = true;
+                aggregate.unavailable = true;
+            }
+            continue;
+        };
+        let row = KnownModelTotal {
+            model: row.model,
+            total_tokens: row.total_tokens,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            cache_write_input_tokens: row.cache_write_input_tokens,
+        };
         let estimated_cost = model_v3_cost(&row);
         if let Some(family @ ("SOL" | "TERRA" | "LUNA")) = codex_info_pricing::family(&row.model) {
             let aggregate = legacy_families.entry(family.to_owned()).or_default();
@@ -5013,7 +6133,7 @@ fn project_model_totals(rows: impl IntoIterator<Item = RawModelTotal>) -> ModelP
     });
     projection.v3.truncate(MAX_PUBLIC_MODELS_V3);
     projection.incomplete = incomplete;
-    projection.invalid = incomplete;
+    projection.invalid = invalid;
     projection
 }
 
@@ -5027,7 +6147,7 @@ fn public_model_order(model: &str) -> u8 {
     }
 }
 
-fn model_v3_cost(row: &RawModelTotal) -> Option<PublicModelCostV3> {
+fn model_v3_cost(row: &KnownModelTotal) -> Option<PublicModelCostV3> {
     let usage = PriceUsage {
         input_tokens: row.input_tokens,
         cached_input_tokens: row.cached_input_tokens,
@@ -5046,7 +6166,7 @@ fn model_v3_cost(row: &RawModelTotal) -> Option<PublicModelCostV3> {
     })
 }
 
-fn model_legacy_family_cost(row: &RawModelTotal, family: &str) -> Option<PublicModelCostV3> {
+fn model_legacy_family_cost(row: &KnownModelTotal, family: &str) -> Option<PublicModelCostV3> {
     // v1 has no cache-write field, so known exact IDs are projected through
     // the frozen three-component family rates with writes folded into input.
     // This compatibility estimate is kept separate from the official exact
@@ -5115,7 +6235,10 @@ fn format_unsigned_count(value: u128) -> String {
     reversed.chars().rev().collect()
 }
 
-fn read_confirmed_gaps(connection: &Connection) -> Result<Vec<PublicHistoryGap>, ReaderError> {
+fn read_confirmed_gaps(
+    connection: &Connection,
+    window: Option<PublicationWindow>,
+) -> Result<Vec<PublicHistoryGap>, ReaderError> {
     if !table_exists(connection, "recorder_gap_ledger")? {
         return Ok(Vec::new());
     }
@@ -5123,9 +6246,13 @@ fn read_confirmed_gaps(connection: &Connection) -> Result<Vec<PublicHistoryGap>,
         "SELECT gap_id, reset_at, start_at, end_at, reason
          FROM recorder_gap_ledger
          WHERE state = 'confirmed' AND reset_at IS NOT NULL
+           AND end_at >= ?1 AND start_at <= ?2
          ORDER BY reset_at, start_at, end_at, gap_id",
     )?;
-    let rows = statement.query_map([], |row| {
+    let (lower, upper) = window
+        .map(|window| (window.retained_start, window.at))
+        .unwrap_or((i64::MIN, i64::MAX));
+    let rows = statement.query_map(params![lower, upper], |row| {
         Ok(PublicHistoryGap {
             gap_id: row.get(0)?,
             reset_at: row.get(1)?,
@@ -5159,10 +6286,20 @@ fn read_confirmed_gaps(connection: &Connection) -> Result<Vec<PublicHistoryGap>,
 fn read_confirmed_gaps_for_intervals(
     connection: &Connection,
     intervals: &ReadIntervals,
+    window: Option<PublicationWindow>,
 ) -> Result<Vec<PublicHistoryGap>, ReaderError> {
-    Ok(read_confirmed_gaps(connection)?
+    #[cfg(test)]
+    record_history_input_read(2);
+    Ok(read_confirmed_gaps(connection, window)?
         .into_iter()
         .filter(|gap| intervals.contains(gap.start_at) && intervals.contains(gap.end_at))
+        .map(|mut gap| {
+            if let Some(window) = window {
+                gap.start_at = gap.start_at.max(window.retained_start);
+                gap.end_at = gap.end_at.min(window.at);
+            }
+            gap
+        })
         .collect())
 }
 
@@ -5244,6 +6381,174 @@ mod tests {
                 ],
             )
             .expect("fixture row");
+    }
+
+    #[test]
+    fn issue604_task_range_index_preserves_single_span_coverage() {
+        let spans = vec![(8, 20), (0, 5), (3, 4), (0, 8), (12, 15), (20, 21)];
+        let mut index = IndexedByteCoverage {
+            spans: spans.clone(),
+            ..Default::default()
+        };
+        index.finish();
+        for start in 0..25 {
+            for end in 0..25 {
+                let expected = end > start
+                    && spans
+                        .iter()
+                        .any(|(left, right)| *left <= start && end <= *right);
+                assert_eq!(
+                    index.covers(start, end),
+                    expected,
+                    "single source span coverage {start}..{end}"
+                );
+            }
+        }
+        assert!(
+            !index.covers(4, 19),
+            "adjacent ranges must not fabricate a single authenticating super-range"
+        );
+    }
+
+    #[test]
+    fn issue604_one_snapshot_shares_history_inputs_across_recent_and_retained() {
+        let path = temp_db("shared-history-inputs");
+        make_db(&path);
+        let old = 1_800_000_000_i64 - 40 * 86_400;
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO usage_history VALUES(?1,?2,80,1,2,3,10,20,30)",
+                params![old, old + 60],
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        HISTORY_INPUT_READS.with(|counts| counts.set([0; 3]));
+        let snapshot = DbReader::open(&path)
+            .unwrap()
+            .read_committed_snapshot_at(1_800_000_060)
+            .unwrap()
+            .snapshot;
+        assert!(snapshot.history_available);
+        assert_eq!(
+            snapshot
+                .history_samples_v3
+                .iter()
+                .map(|point| (point.reset_at, point.timestamp, point.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![(1_800_000_060, 1_800_000_000, Some(50.0))]
+        );
+        assert_eq!(
+            snapshot
+                .retained_history
+                .samples
+                .iter()
+                .map(|point| (point.reset_at, point.timestamp, point.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![
+                (old + 60, old, Some(80.0)),
+                (1_800_000_060, 1_800_000_000, Some(50.0))
+            ]
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            HISTORY_INPUT_READS.with(std::cell::Cell::get),
+            [1, 1, 1],
+            "one read transaction must parse each retained input superset once"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_publication_time_limits_history_without_moving_source_observations() {
+        // Independent UTC calendar oracle: 2026-05-31 12:34:56 minus three
+        // calendar months is 2026-02-28 12:34:56 (not ninety days).
+        const T: i64 = 1_780_230_896;
+        const C_MINUTE: i64 = 1_772_282_040;
+        const T_MINUTE: i64 = 1_780_230_840;
+        let path = temp_db("issue604-publication-time-window");
+        make_db(&path);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DELETE FROM usage_history").unwrap();
+        db.execute(
+            "UPDATE collection_generation SET reset_at=?1,window_seconds=17280000",
+            [T + 3600],
+        )
+        .unwrap();
+        for timestamp in [
+            C_MINUTE - 60,
+            C_MINUTE,
+            C_MINUTE + 60,
+            T_MINUTE - 864000,
+            T_MINUTE,
+            T_MINUTE + 60,
+        ] {
+            db.execute(
+                "INSERT INTO usage_history VALUES(?1,?2,50.0,1.0,0.0,0.0,10,0,0)",
+                params![timestamp, T + 3600],
+            )
+            .unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        let candidate = DbReader::open(&path)
+            .unwrap()
+            .read_committed_snapshot_at(T)
+            .unwrap();
+        let times = candidate
+            .snapshot
+            .retained_history
+            .samples
+            .iter()
+            .map(|row| row.timestamp)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            times,
+            [C_MINUTE, C_MINUTE + 60, T_MINUTE - 864000, T_MINUTE],
+            "retained history must use the fixed T's calendar window, including its first minute and excluding future minutes"
+        );
+        let recent = candidate
+            .snapshot
+            .history_samples_v3
+            .iter()
+            .map(|row| row.timestamp)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recent,
+            [T_MINUTE - 864000, T_MINUTE],
+            "the compatibility window is thirty-one days relative to the same T"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "projection must not prune, rewrite, or shift the source rows"
+        );
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_snapshot_rejects_a_malformed_committed_collection_tuple() {
+        let path = temp_db("issue604-collection-tuple");
+        make_db(&path);
+        let reader = DbReader::open(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for (generation, epoch, sequence) in [
+            ("7", None, "1"),
+            ("7", Some("11111111111111111111111111111111"), "0"),
+            ("7", Some("1111111111111111111111111111111g"), "1"),
+            ("07", Some("11111111111111111111111111111111"), "1"),
+        ] {
+            connection.execute(
+                "UPDATE collection_generation SET data_generation=?1, collector_epoch=?2, cycle_seq=?3 WHERE singleton=1",
+                params![generation, epoch, sequence],
+            ).unwrap();
+            assert!(
+                reader.read_snapshot().is_err(),
+                "a malformed collection commit must not admit an otherwise readable snapshot: generation={generation}, epoch={epoch:?}, sequence={sequence}"
+            );
+        }
+        drop(connection);
+        fs::remove_file(path).unwrap();
     }
 
     #[derive(Clone, Copy)]
@@ -6123,6 +7428,57 @@ mod tests {
     }
 
     #[test]
+    fn issue604_read_interval_shape_accepts_empty_without_covering_rows() {
+        let empty = ReadInterval::new(Some(150), Some(150)).expect("valid empty interval");
+        let ranges = ReadIntervals::new(vec![
+            ReadInterval::new(Some(100), Some(300)).unwrap(),
+            empty,
+        ])
+        .expect("empty marker has no overlapping coverage");
+        assert!(!empty.contains(150));
+        assert!(ranges.contains(100));
+        assert!(ranges.contains(299));
+        assert!(!ranges.contains(300));
+        assert_eq!(
+            ranges.intervals().len(),
+            2,
+            "empty marker must be preserved"
+        );
+        let only_empty = ReadIntervals::new(vec![empty]).unwrap();
+        assert!(!only_empty.contains(149));
+        assert!(!only_empty.contains(150));
+        assert!(!only_empty.contains(151));
+        for (start_at, end_at) in [
+            (Some(0), None),
+            (Some(253_402_300_800), None),
+            (Some(1), Some(253_402_300_800)),
+            (Some(200), Some(100)),
+        ] {
+            assert!(ReadInterval::new(start_at, end_at).is_err());
+            assert!(ReadIntervals::new(vec![ReadInterval { start_at, end_at }]).is_err());
+        }
+        assert!(ReadInterval::new(Some(1), Some(253_402_300_799)).is_ok());
+    }
+
+    #[test]
+    fn issue604_empty_interval_cannot_qualify_minute_or_quota_prefix() {
+        // Exercise the consumers independently of constructor admission.
+        let empty = ReadIntervals(vec![ReadInterval {
+            start_at: Some(150),
+            end_at: Some(150),
+        }]);
+        assert!(
+            !empty.intersects_canonical_minute(120),
+            "an empty marker owns no second in the minute"
+        );
+        assert_eq!(
+            empty.quota_only_prefix_end(100),
+            None,
+            "an empty marker cannot anchor a provider prefix"
+        );
+    }
+
+    #[test]
     fn read_intervals_require_a_non_overlapping_non_empty_union() {
         assert!(ReadIntervals::new(Vec::new()).is_err());
         assert!(ReadIntervals::new(vec![
@@ -6570,6 +7926,421 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    fn issue604_independent_current_fixture(
+        name: &str,
+        complete: bool,
+    ) -> (PathBuf, StoragePartitionIdentity) {
+        let (path, identity) = quota_receipt_current_fixture(name);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DELETE FROM usage_history; DELETE FROM usage_model_history; DELETE FROM durable_state;",
+        )
+        .unwrap();
+        issue_575_observation(
+            &db,
+            1_800_000_060,
+            1_800_604_800,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "SOL",
+                total_tokens: 30,
+                input_tokens: 30,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                complete,
+            }],
+        );
+        drop(db);
+        add_active_thread_table(
+            &path,
+            &serde_json::to_string(&vec![active_thread_value(
+                "independently-confirmed-thread",
+                1_800_000_060,
+            )])
+            .unwrap(),
+            0,
+        );
+        (path, identity)
+    }
+
+    #[test]
+    fn issue604_later_quota_only_observation_keeps_independent_current_models() {
+        let (path, identity) = issue604_independent_current_fixture("quota-after-model", false);
+        let reader = DbReader::open_partitioned(&path, &identity).unwrap();
+        let before = reader
+            .read_committed_snapshot_at(1_800_000_180)
+            .unwrap()
+            .snapshot;
+        assert_eq!(before.models_v3.len(), 1);
+        assert_eq!(before.models_v3[0].total_tokens, 30);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "INSERT INTO quota_receipts VALUES('later',4,1800000120,1800604800,604800,80.0,'11');
+            UPDATE collection_generation SET data_generation='11';",
+        )
+        .unwrap();
+        let quota_only = serde_json::json!({
+            "kind":"codex-info-usage-observation-v1", "timestamp":1_800_000_120_i64,
+            "reset_at":1_800_604_800_i64, "remaining_percent":80.0, "model_source":"unavailable",
+            "sol_dollars":null,"terra_dollars":null,"luna_dollars":null,
+            "sol_tokens":null,"terra_tokens":null,"luna_tokens":null
+        });
+        db.execute("INSERT INTO durable_state(singleton,data_generation,snapshot_json) VALUES(1800000120,1800000120,?1)",
+            [quota_only.to_string()]).unwrap();
+        let after = reader
+            .read_committed_snapshot_at(1_800_000_180)
+            .unwrap()
+            .snapshot;
+        drop(db);
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            after.models_v3, before.models_v3,
+            "an independent quota receipt is not a new model observation"
+        );
+        assert_eq!(after.current.models_status, CurrentModelsStatus::Partial);
+        assert_eq!(after.current.state, PublicState::Ready);
+        assert_eq!(
+            after.details.quota.as_ref().unwrap().remaining_percent,
+            80.0
+        );
+        assert_eq!(after.details.threads, before.details.threads);
+        let point = after
+            .retained_history
+            .samples
+            .iter()
+            .find(|sample| sample.timestamp == 1_800_000_120 && sample.reset_at == 1_800_604_800)
+            .unwrap();
+        assert_eq!(point.remaining_percent, Some(80.0));
+        assert!(
+            point.models.is_none(),
+            "quota history must not duplicate the older model vector"
+        );
+    }
+
+    #[test]
+    fn issue604_current_model_retention_keeps_the_boundary_minute_without_extending_the_window() {
+        let (path, identity) = issue604_independent_current_fixture("current-retention", true);
+        let db = Connection::open(&path).unwrap();
+        // Literal UTC boundaries from DATA: October 16 minus three calendar
+        // months is July 16. This official window starts earlier, on June 16.
+        db.execute_batch(
+            "DELETE FROM usage_model_history; DELETE FROM usage_history; DELETE FROM durable_state;
+             UPDATE quota_receipts SET observed_at=1792108859,reset_at=1794787200,
+                 window_seconds=13219200 WHERE sequence=3;
+             UPDATE collection_generation SET reset_at=1794787200,window_seconds=13219200;",
+        )
+        .unwrap();
+        issue_575_observation(
+            &db,
+            1_784_160_000,
+            1_794_787_200,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "SOL",
+                total_tokens: 30,
+                input_tokens: 30,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                complete: true,
+            }],
+        );
+        drop(db);
+        let original_bytes = fs::read(&path).unwrap();
+        let reader = DbReader::open_partitioned(&path, &identity).unwrap();
+        let boundary = reader.read_committed_snapshot_at(1_792_108_859).unwrap();
+        assert_eq!(boundary.snapshot.models_v3[0].total_tokens, 30);
+        assert_eq!(
+            boundary.snapshot.current.models_status,
+            CurrentModelsStatus::Complete
+        );
+        let expired = reader.read_committed_snapshot_at(1_792_108_860).unwrap();
+        assert!(
+            expired.snapshot.models_v3.is_empty(),
+            "a long official window cannot resurrect a model observation outside retention"
+        );
+        assert_eq!(
+            expired.snapshot.current.models_status,
+            CurrentModelsStatus::Unavailable
+        );
+        assert_eq!(
+            expired.snapshot.details.quota,
+            boundary.snapshot.details.quota
+        );
+        assert_eq!(expired.snapshot.details.observed_at, Some(1_792_108_859));
+        assert_eq!(expired.commit, boundary.commit);
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_current_models_accept_the_canonical_minute_intersecting_the_official_origin() {
+        let (path, identity) = issue604_independent_current_fixture("current-first-minute", true);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DELETE FROM usage_model_history; DELETE FROM usage_history; DELETE FROM durable_state;
+            UPDATE quota_receipts SET observed_at=1800000054,reset_at=1800604853 WHERE sequence=3;
+            UPDATE collection_generation SET reset_at=1800604853,window_seconds=604800;",
+        )
+        .unwrap();
+        // Official origin is :53. The schema-14 row represents that same
+        // :00 minute, with exact reset/ownership and confirmed raw facts.
+        issue_575_observation(
+            &db,
+            1_800_000_000,
+            1_800_604_853,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "SOL",
+                total_tokens: 30,
+                input_tokens: 30,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                complete: true,
+            }],
+        );
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_committed_snapshot_at(1_800_000_054)
+            .unwrap()
+            .snapshot;
+        assert_eq!(
+            snapshot.details.quota.as_ref().unwrap().reset_at,
+            1_800_604_853
+        );
+        assert_eq!(
+            snapshot
+                .models_v3
+                .iter()
+                .map(|model| (model.model.as_str(), model.total_tokens))
+                .collect::<Vec<_>>(),
+            [("SOL", 30)],
+            "a canonical first minute must not become unavailable because its bucket starts before the exact-second origin"
+        );
+        assert_eq!(
+            snapshot.current.models_status,
+            CurrentModelsStatus::Complete
+        );
+        assert_eq!(snapshot.details.observed_at, Some(1_800_000_054));
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_reprojection_witness_keeps_source_identity_and_price_without_public_fields() {
+        const T: i64 = 1_800_000_300;
+        let (path, identity) = issue604_independent_current_fixture("reprojection-witness", true);
+        let db = Connection::open(&path).unwrap();
+        issue_575_observation(
+            &db,
+            1_800_000_360,
+            1_800_604_800,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "SOL",
+                total_tokens: 40,
+                input_tokens: 40,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+                complete: true,
+            }],
+        );
+        db.execute_batch(
+            "ALTER TABLE usage_model_history ADD COLUMN price_version TEXT;
+            UPDATE usage_model_history SET price_version='stored-revision-1';",
+        )
+        .unwrap();
+        let reader = DbReader::open_partitioned(&path, &identity).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let original = reader.read_committed_snapshot_at(T).unwrap().snapshot;
+        let repeated = reader.read_committed_snapshot_at(T + 1).unwrap().snapshot;
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "witness capture cannot write to its source"
+        );
+        let first = original.reprojection_witness.as_ref().unwrap();
+        let second = repeated.reprojection_witness.as_ref().unwrap();
+        assert_eq!(first.publication_window().unwrap().at, T);
+        assert_eq!(
+            first.current_observation(),
+            Some((1_800_000_060, 1_800_604_800))
+        );
+        assert!(first.same_commit_authority(second));
+        assert!(first.same_current_observation(second));
+        assert_eq!(
+            first.quota.as_ref().unwrap().rows[0][0],
+            rusqlite::types::Value::Text("third".into())
+        );
+        assert_eq!(
+            first.quota.as_ref().unwrap().rows[0][1],
+            rusqlite::types::Value::Integer(3)
+        );
+        let source = first.current_sidecar.as_ref().unwrap();
+        let price_column = source
+            .columns
+            .iter()
+            .position(|name| name == "price_version")
+            .unwrap();
+        assert_eq!(
+            source.rows[0][price_column],
+            rusqlite::types::Value::Text("stored-revision-1".into())
+        );
+        let advanced = reader
+            .read_committed_snapshot_for_reprojection_at(T + 60, first.current_observation())
+            .unwrap()
+            .snapshot;
+        let advanced_witness = advanced.reprojection_witness.as_ref().unwrap();
+        assert_eq!(
+            advanced_witness.current_observation(),
+            Some((1_800_000_360, 1_800_604_800))
+        );
+        assert!(advanced_witness.preserves_previous_current_observation(first));
+        assert!(first.same_common_quota_receipts(advanced_witness));
+
+        db.execute(
+            "UPDATE usage_model_history SET price_version='uncommitted-price-rewrite' WHERE timestamp=1800000060",
+            [],
+        )
+        .unwrap();
+        let changed = reader.read_committed_snapshot_at(T + 1).unwrap().snapshot;
+        let changed_witness = changed.reprojection_witness.as_ref().unwrap();
+        assert_eq!(
+            original.data_hash, changed.data_hash,
+            "stored source revision is not replaced by the current catalog's public projection"
+        );
+        assert!(first.same_commit_authority(changed_witness));
+        assert!(!first.same_current_observation(changed_witness));
+        let changed_advanced = reader
+            .read_committed_snapshot_for_reprojection_at(T + 60, first.current_observation())
+            .unwrap()
+            .snapshot;
+        assert!(!changed_advanced
+            .reprojection_witness
+            .as_ref()
+            .unwrap()
+            .preserves_previous_current_observation(first));
+
+        db.execute(
+            "UPDATE quota_receipts SET receipt_id='changed-receipt',sequence=4 WHERE sequence=3",
+            [],
+        )
+        .unwrap();
+        let changed_quota = reader.read_committed_snapshot_at(T + 60).unwrap().snapshot;
+        assert!(!first.same_commit_authority(changed_quota.reprojection_witness.as_ref().unwrap()));
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_current_models_and_threads_survive_history_sql_failure() {
+        let (path, identity) = issue604_independent_current_fixture("current-history-sql", true);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("ALTER TABLE usage_history RENAME COLUMN sol_dollars TO broken_dollars;")
+            .unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_committed_snapshot_at(1_800_000_300)
+            .unwrap()
+            .snapshot;
+        let quota = snapshot.details.quota.as_ref().unwrap();
+        assert_eq!(
+            (
+                quota.remaining_percent,
+                quota.reset_at,
+                quota.window_seconds
+            ),
+            (99.0, 1_800_604_800, 604_800)
+        );
+        assert_eq!(snapshot.generation, 10);
+        assert!(!snapshot.history_available);
+        assert_eq!(snapshot.current.state, PublicState::Ready);
+        assert_eq!(
+            snapshot.current.models_status,
+            CurrentModelsStatus::Complete
+        );
+        assert_eq!(
+            snapshot
+                .models_v3
+                .iter()
+                .map(|m| (m.model.as_str(), m.total_tokens))
+                .collect::<Vec<_>>(),
+            [("SOL", 30)]
+        );
+        assert_eq!(snapshot.details.observed_at, Some(1_800_000_060));
+        assert_eq!(snapshot.details.state, PublicState::Error);
+        assert_eq!(snapshot.details.active_thread_count, 1);
+        assert_eq!(
+            snapshot.details.threads[0].id,
+            "independently-confirmed-thread"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT observed_at FROM quota_receipts WHERE receipt_id='third'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1_800_000_000,
+            "the receipt's original timestamp must remain unchanged"
+        );
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_current_partial_models_survive_history_publication_failure() {
+        let (path, identity) =
+            issue604_independent_current_fixture("current-history-domain", false);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "UPDATE quota_receipts SET remaining_percent=-1.0 WHERE receipt_id='first';",
+            )
+            .unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_committed_snapshot_at(1_800_000_300)
+            .unwrap()
+            .snapshot;
+        let quota = snapshot.details.quota.as_ref().unwrap();
+        assert_eq!(
+            (
+                quota.remaining_percent,
+                quota.reset_at,
+                quota.window_seconds
+            ),
+            (99.0, 1_800_604_800, 604_800)
+        );
+        assert_eq!(snapshot.generation, 10);
+        assert!(!snapshot.history_available);
+        assert_eq!(snapshot.current.state, PublicState::Ready);
+        assert_eq!(snapshot.current.models_status, CurrentModelsStatus::Partial);
+        assert_eq!(
+            snapshot
+                .models_v3
+                .iter()
+                .map(|m| (m.model.as_str(), m.total_tokens))
+                .collect::<Vec<_>>(),
+            [("SOL", 30)]
+        );
+        assert_eq!(snapshot.details.observed_at, Some(1_800_000_060));
+        assert_eq!(snapshot.details.state, PublicState::Error);
+        assert_eq!(snapshot.details.active_thread_count, 1);
+        assert_eq!(
+            snapshot.details.threads[0].id,
+            "independently-confirmed-thread"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn quota_receipt_history_survives_without_session_rows() {
         let (path, identity) = quota_receipt_history_fixture("quota-history-no-session");
@@ -6616,6 +8387,70 @@ mod tests {
     }
 
     #[test]
+    fn issue604_current_model_after_quota_advances_the_data_observation_without_rewriting_the_receipt(
+    ) {
+        let (path, identity) =
+            quota_receipt_history_fixture("issue604-current-observation-watermark");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("INSERT INTO usage_history VALUES(1800000180,1800604801,NULL,3.0,0.0,0.0,30,0,0);
+            INSERT INTO usage_model_history VALUES(1800604801,1800000180,'SOL','30','30','0','0',NULL,1);").unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_snapshot()
+            .unwrap();
+        assert_eq!(
+            snapshot.details.observed_at,
+            Some(1_800_000_180),
+            "the quota source clock cannot hide a later accepted current-period observation"
+        );
+        let period = snapshot
+            .retained_history
+            .periods
+            .iter()
+            .find(|period| period.current)
+            .unwrap();
+        assert_eq!(period.end_at, 1_800_000_180);
+        let row = snapshot
+            .retained_history
+            .samples
+            .iter()
+            .find(|row| row.timestamp == 1_800_000_180)
+            .expect("later model observation must be retained");
+        assert_eq!(
+            row.models
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|model| model.model == "SOL")
+                .unwrap()
+                .total_tokens,
+            30
+        );
+        assert_eq!(
+            snapshot
+                .models_v3
+                .iter()
+                .find(|model| model.model == "SOL")
+                .unwrap()
+                .total_tokens,
+            30
+        );
+        let source_time: i64 = db
+            .query_row(
+                "SELECT observed_at FROM quota_receipts ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            source_time, 1_800_000_120,
+            "publication must preserve the quota receipt's original clock"
+        );
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn quota_receipt_history_preserves_exact_model_vector() {
         let (path, identity) = quota_receipt_history_fixture("quota-history-model-vector");
         let db = Connection::open(&path).unwrap();
@@ -6641,6 +8476,238 @@ mod tests {
         assert_eq!(model.model, "SOL");
         assert_eq!(model.total_tokens, 30);
         assert!(snapshot.history_samples_v3.last().unwrap().models.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_conflicting_historical_receipt_origins_cannot_be_overridden_by_one_session_window()
+    {
+        let (path, identity) =
+            quota_receipt_current_fixture("issue604-conflicting-receipt-origins");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA user_version=15;
+            DELETE FROM usage_history; DELETE FROM usage_model_history;
+            DELETE FROM quota_receipts WHERE sequence=2;
+            INSERT INTO quota_receipts VALUES('conflicting-window',2,1800000220,1800003600,604800,9,'10');
+            CREATE TABLE session_events(root_identity TEXT,relative_path TEXT,range_start INTEGER,range_end INTEGER,record_sha256 TEXT,timestamp INTEGER);
+            CREATE TABLE session_ranges(root_identity TEXT,relative_path TEXT,start_offset INTEGER,end_offset INTEGER,record_sha256 TEXT);
+            CREATE TABLE session_quota_windows(reset_at INTEGER,window_seconds INTEGER,observed_at INTEGER,root_identity TEXT,relative_path TEXT,range_start INTEGER,range_end INTEGER,record_sha256 TEXT,PRIMARY KEY(reset_at,window_seconds));
+            INSERT INTO session_ranges VALUES('root','source.jsonl',0,100,'1111111111111111111111111111111111111111111111111111111111111111');
+            INSERT INTO session_quota_windows VALUES(1800003600,604800,1800000210,'root','source.jsonl',0,100,'1111111111111111111111111111111111111111111111111111111111111111');").unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_committed_snapshot_at(1_800_000_300)
+            .unwrap()
+            .snapshot;
+        assert!(snapshot.history_available);
+        assert_eq!(snapshot.retained_history.origins.get(&1_800_003_600), None);
+        let period = snapshot
+            .retained_history
+            .periods
+            .iter()
+            .find(|period| period.reset_at == 1_800_003_600)
+            .unwrap();
+        assert_eq!(period.start_at, 1_800_000_180);
+        assert_eq!(period.end_at, 1_800_000_220);
+        assert_eq!(
+            snapshot.retained_history.origins.get(&1_800_604_800),
+            Some(&1_800_000_000)
+        );
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_historical_period_end_keeps_its_own_original_receipt_second() {
+        let (path, identity) = quota_receipt_current_fixture("issue604-original-receipt-end");
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_committed_snapshot_at(1_800_000_300)
+            .unwrap()
+            .snapshot;
+        assert!(snapshot.history_available);
+        let period = snapshot
+            .retained_history
+            .periods
+            .iter()
+            .find(|period| period.reset_at == 1_800_003_600)
+            .unwrap();
+        assert_eq!(
+            period.end_at, 1_800_000_200,
+            "the stored receipt second is an observation, not a fabricated minute tail"
+        );
+        assert_eq!(
+            snapshot.details.quota.as_ref().unwrap().remaining_percent,
+            99.0
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_recovered_origin_uses_its_own_time_qualification_after_current_clock_rollback() {
+        let (path, identity) = quota_receipt_current_fixture("issue604-recovered-window-own-time");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA user_version=15;
+            DELETE FROM quota_receipts WHERE sequence<3;
+            INSERT INTO usage_history VALUES(1800000120,1800300000,80,1,0,0,100,0,0);
+            CREATE TABLE session_events(root_identity TEXT,relative_path TEXT,range_start INTEGER,range_end INTEGER,record_sha256 TEXT,timestamp INTEGER);
+            CREATE TABLE session_ranges(root_identity TEXT,relative_path TEXT,start_offset INTEGER,end_offset INTEGER,record_sha256 TEXT);
+            CREATE TABLE session_quota_windows(reset_at INTEGER,window_seconds INTEGER,observed_at INTEGER,root_identity TEXT,relative_path TEXT,range_start INTEGER,range_end INTEGER,record_sha256 TEXT,PRIMARY KEY(reset_at,window_seconds));
+            INSERT INTO session_ranges VALUES('root','source.jsonl',0,100,'1111111111111111111111111111111111111111111111111111111111111111');
+            INSERT INTO session_quota_windows VALUES(1800300000,604800,1800000120,'root','source.jsonl',0,100,'1111111111111111111111111111111111111111111111111111111111111111');").unwrap();
+        let reader = DbReader::open_partitioned(&path, &identity).unwrap();
+        let before = reader
+            .read_committed_snapshot_at(1_800_000_060)
+            .unwrap()
+            .snapshot;
+        assert_eq!(before.retained_history.origins.get(&1_800_300_000), None);
+        let after = reader
+            .read_committed_snapshot_at(1_800_000_180)
+            .unwrap()
+            .snapshot;
+        assert!(after.history_available);
+        assert_eq!(
+            after.retained_history.origins.get(&1_800_300_000),
+            Some(&1_799_695_200),
+            "a historical source after the current receipt clock is still independently qualified"
+        );
+        assert_eq!(
+            after.details.quota.as_ref().unwrap().reset_at,
+            1_800_604_800
+        );
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_later_quota_in_the_same_minute_cannot_erase_another_exact_periods_model() {
+        let (path, identity) =
+            quota_receipt_history_fixture("issue604-same-minute-independent-resets");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("INSERT INTO usage_history VALUES(1800000060,1800604800,NULL,0.00015,0.0,0.0,30,0,0);
+            INSERT INTO usage_model_history VALUES(1800604800,1800000060,'SOL','30','30','0','0',NULL,1);").unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_committed_snapshot_at(1_800_000_180)
+            .unwrap()
+            .snapshot;
+        assert!(snapshot.history_available);
+        let past = snapshot
+            .retained_history
+            .samples
+            .iter()
+            .find(|row| row.reset_at == 1_800_604_800 && row.timestamp == 1_800_000_060)
+            .expect("the model must remain under its original exact period");
+        assert_eq!(
+            past.models
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|model| model.model == "SOL")
+                .unwrap()
+                .total_tokens,
+            30
+        );
+        let quota = snapshot
+            .retained_history
+            .samples
+            .iter()
+            .find(|row| row.reset_at == 1_800_604_801 && row.timestamp == 1_800_000_060)
+            .unwrap();
+        assert_eq!(quota.remaining_percent, Some(99.0));
+        assert!(quota.models.is_none());
+        let recent = snapshot
+            .history_samples_v3
+            .iter()
+            .filter(|row| row.timestamp == 1_800_000_060)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recent.len(),
+            2,
+            "each proven exact period keeps its own same-minute observation"
+        );
+        assert_eq!(recent[0].reset_at, 1_800_604_800);
+        assert_eq!(recent[1].reset_at, 1_800_604_801);
+        assert_eq!(
+            recent[0]
+                .models
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|model| model.model == "SOL")
+                .unwrap()
+                .total_tokens,
+            30
+        );
+        assert_eq!(recent[1].remaining_percent, Some(99.0));
+        drop(db);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_overlapping_exact_periods_keep_historical_points_after_the_current_clock() {
+        let (path, identity) = quota_receipt_history_fixture("issue604-overlap-independent-ends");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DELETE FROM quota_receipts;
+            INSERT INTO quota_receipts VALUES
+                ('old-first',1,1800000000,1800604800,604800,80.0,'10'),
+                ('old-last',2,1800000120,1800604800,604800,70.0,'10'),
+                ('current',3,1800000060,1800604801,604800,100.0,'10');
+            INSERT INTO usage_history VALUES(1800000120,1800604800,NULL,3.0,0.0,0.0,30,0,0);
+            INSERT INTO usage_model_history VALUES(1800604800,1800000120,'SOL','30','30','0','0',NULL,1);").unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_committed_snapshot_at(1_800_000_180)
+            .unwrap()
+            .snapshot;
+        assert!(
+            snapshot.history_available,
+            "valid overlapping exact periods cannot make history unavailable"
+        );
+        assert_eq!(
+            snapshot.details.observed_at,
+            Some(1_800_000_060),
+            "a past period cannot move the current data clock"
+        );
+        let past = snapshot
+            .retained_history
+            .periods
+            .iter()
+            .find(|period| period.reset_at == 1_800_604_800)
+            .expect("past exact ID must remain in the directory");
+        assert_eq!(
+            past.end_at, 1_800_000_120,
+            "a successor's earlier origin cannot clip this period's real observation"
+        );
+        assert!(!past.current);
+        let current = snapshot
+            .retained_history
+            .periods
+            .iter()
+            .find(|period| period.current)
+            .unwrap();
+        assert_eq!(
+            (current.reset_at, current.start_at, current.end_at),
+            (1_800_604_801, 1_800_000_001, 1_800_000_060)
+        );
+        let point = snapshot
+            .retained_history
+            .samples
+            .iter()
+            .find(|point| point.reset_at == 1_800_604_800 && point.timestamp == 1_800_000_120)
+            .expect("the late historical point remains in its own period");
+        assert_eq!(
+            point
+                .models
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|model| model.model == "SOL")
+                .unwrap()
+                .total_tokens,
+            30
+        );
+        drop(db);
         fs::remove_file(path).unwrap();
     }
 
@@ -7817,6 +9884,64 @@ mod tests {
     }
 
     #[test]
+    fn issue604_confirmed_partial_model_keeps_saved_history_values() {
+        let path = temp_db("issue604-confirmed-partial-model");
+        make_db(&path);
+        let connection = Connection::open(&path).expect("fixture db");
+        issue_575_model_schema(&connection);
+        issue_575_set_current_reset(&connection);
+        issue_575_observation(
+            &connection,
+            1_800_000_060,
+            ISSUE_575_RESET_AT,
+            "confirmed",
+            None,
+            &[Issue575ModelFact {
+                model: "gpt-6.1-sol",
+                total_tokens: 125,
+                input_tokens: 100,
+                cached_input_tokens: 25,
+                output_tokens: 25,
+                cache_write_input_tokens: Some(0),
+                complete: false,
+            }],
+        );
+        connection
+            .execute_batch(
+                "ALTER TABLE usage_model_history ADD COLUMN total_dollars REAL;
+                 ALTER TABLE usage_model_history ADD COLUMN price_version TEXT;
+                 UPDATE usage_model_history
+                 SET total_dollars=0.654321, price_version='saved-price-v1'
+                 WHERE timestamp=1800000060;",
+            )
+            .expect("saved model price");
+
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("partial confirmed history");
+        let history = snapshot
+            .history_samples_v3
+            .iter()
+            .find(|sample| sample.timestamp == 1_800_000_060)
+            .expect("saved history minute");
+        assert_eq!(history.model_source, "confirmed");
+        assert!(!history.models_complete);
+        let model = history
+            .models
+            .as_ref()
+            .and_then(|models| models.iter().find(|model| model.model == "gpt-6.1-sol"))
+            .expect("saved exact model");
+        assert_eq!(model.total_tokens, 125);
+        assert_eq!(model.input_tokens, Some(100));
+        assert_eq!(model.cached_input_tokens, Some(25));
+        assert_eq!(model.output_tokens, Some(25));
+        assert_eq!(model.total_dollars, Some(0.654321));
+        drop(connection);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
     fn issue_575_current_confirmed_zero_token_model_is_valid() {
         let path = temp_db("issue-575-confirmed-zero-model");
         make_db(&path);
@@ -8106,7 +10231,7 @@ mod tests {
                     output_tokens TEXT NOT NULL, cache_write_input_tokens TEXT
                 );
                 INSERT INTO session_model_totals VALUES
-                    ('gpt-6.1-sol','1400000','1000000','200000','100000','100000'),
+                    ('gpt-6.1-sol','1100000','1000000','200000','100000','100000'),
                     ('gpt-6-sol','1000000','1000000','0','0','0');",
             )
             .expect("model schema");
@@ -8204,6 +10329,328 @@ mod tests {
         assert_eq!(mixed.v1[0].cached_input_dollars, 0.1);
         assert_eq!(mixed.v1[0].output_dollars, 3.0);
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn issue604_transport_sample_limit_cannot_revoke_the_history_domain() {
+        let path = temp_db("issue604-transport-limit-domain");
+        make_boundary_db(&path, 1_800_000_000);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DROP TABLE usage_history; DROP TABLE usage_model_history;
+             CREATE TABLE usage_history(timestamp INTEGER, reset_at INTEGER,
+                remaining_percent REAL, sol_dollars REAL, terra_dollars REAL, luna_dollars REAL,
+                sol_tokens INTEGER, terra_tokens INTEGER, luna_tokens INTEGER,
+                PRIMARY KEY(reset_at,timestamp));
+             CREATE TABLE usage_model_history(reset_at INTEGER,timestamp INTEGER,model TEXT,
+                total_tokens TEXT,input_tokens TEXT,cached_input_tokens TEXT,output_tokens TEXT,
+                cache_write_input_tokens TEXT,total_dollars REAL,model_set_complete INTEGER,
+                PRIMARY KEY(reset_at,timestamp,model));
+             CREATE TABLE quota_receipts(receipt_id TEXT PRIMARY KEY,sequence INTEGER UNIQUE,
+                observed_at INTEGER,reset_at INTEGER,window_seconds INTEGER,
+                remaining_percent REAL,applied_generation TEXT);
+             UPDATE collection_generation SET reset_at=1802678940,window_seconds=2679000;
+             WITH RECURSIVE minutes(n) AS (
+                SELECT 0 UNION ALL SELECT n+1 FROM minutes WHERE n<44639
+             ) INSERT INTO usage_history
+                SELECT 1800000000+n*60,1802678940,100,0,0,0,0,0,0 FROM minutes;",
+        )
+        .unwrap();
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 13,
+            partition_id: "33".repeat(32),
+        };
+        // Shared read-only fixture helpers install the required guard names.
+        // The v16 canonical identity permits both exact reset keys per minute.
+        // Replace only the old fixture's global timestamp indexes.
+        drop(db);
+        add_partition_identity(&path, &identity);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DROP INDEX usage_history_canonical_timestamp_idx;
+             DROP INDEX usage_model_history_canonical_timestamp_model_idx;
+             PRAGMA user_version=16;
+             INSERT INTO usage_history VALUES(1800000000,1802678941,100,0,0,0,0,0,0);",
+        )
+        .unwrap();
+        drop(db);
+        let before = fs::read(&path).unwrap();
+        let snapshot = DbReader::open_partitioned(&path, &identity)
+            .unwrap()
+            .read_snapshot()
+            .expect("44641 exact samples are valid domain data");
+        assert!(snapshot.history_available);
+        assert_eq!(snapshot.history_samples_v2.len(), 44_641);
+        assert_eq!(snapshot.history_samples_v3.len(), 44_641);
+        assert_eq!(snapshot.retained_history.samples.len(), 44_641);
+        assert_eq!(snapshot.retained_history.periods.len(), 2);
+        let first_minute_resets = snapshot
+            .history_samples_v3
+            .iter()
+            .filter(|row| row.timestamp == 1_800_000_000)
+            .map(|row| row.reset_at)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            first_minute_resets,
+            BTreeSet::from([1_802_678_940, 1_802_678_941])
+        );
+        assert_eq!(
+            snapshot.details.validate(),
+            Err(ContractError::TooManyItems)
+        );
+        snapshot.details.validate_history_domain().unwrap();
+        let mut duplicate = snapshot.details.clone();
+        duplicate
+            .history_samples
+            .push(duplicate.history_samples[0].clone());
+        assert_eq!(
+            duplicate.validate_history_domain(),
+            Err(ContractError::InvalidSample)
+        );
+        let mut unordered = snapshot.details;
+        unordered.history_samples.swap(0, 44_640);
+        assert_eq!(
+            unordered.validate_history_domain(),
+            Err(ContractError::InvalidSample)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn issue604_nullable_legacy_columns_preserve_exact_model_facts() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            r#"CREATE TABLE usage_history(timestamp INTEGER,reset_at INTEGER,
+                remaining_percent REAL,sol_dollars REAL,terra_dollars REAL,luna_dollars REAL,
+                sol_tokens INTEGER,terra_tokens INTEGER,luna_tokens INTEGER,
+                PRIMARY KEY(reset_at,timestamp));
+             CREATE TABLE usage_model_history(reset_at INTEGER,timestamp INTEGER,model TEXT,
+                total_tokens TEXT,input_tokens TEXT,cached_input_tokens TEXT,output_tokens TEXT,
+                cache_write_input_tokens TEXT,total_dollars REAL,model_set_complete INTEGER,
+                PRIMARY KEY(reset_at,timestamp,model));
+             CREATE TABLE durable_state(singleton INTEGER PRIMARY KEY,data_generation INTEGER,snapshot_json TEXT);
+             INSERT INTO usage_history VALUES
+                (1800000000,1800000600,80,NULL,0,0,10,0,0),
+                (1800000060,1800000600,70,NULL,0,0,NULL,0,0);
+             INSERT INTO usage_model_history VALUES
+                (1800000600,1800000000,'gpt-6.1-sol','10',NULL,NULL,NULL,NULL,NULL,1),
+                (1800000600,1800000060,'gpt-6.1-sol','18446744073709551615',NULL,NULL,NULL,NULL,NULL,1);
+             INSERT INTO durable_state VALUES
+                (2,1800000000,'{"kind":"codex-info-usage-observation-v1","timestamp":1800000000,"reset_at":1800000600,"remaining_percent":80,"model_source":"confirmed"}'),
+                (3,1800000060,'{"kind":"codex-info-usage-observation-v1","timestamp":1800000060,"reset_at":1800000600,"remaining_percent":70,"model_source":"confirmed"}');"#,
+        ).unwrap();
+        let raw = read_history_for_window(&connection, None)
+            .expect("unknown fixed columns must not revoke quota or exact model history");
+        assert_eq!(raw.len(), 2);
+        let authority = ProjectionAuthority {
+            history_is_canonical: true,
+            quota: None,
+            window: None,
+            current_models: None,
+        };
+        let (details, current_models, v2, v3, current) = build_details_for_intervals(
+            &connection,
+            &raw,
+            &raw,
+            &[],
+            &TaskActivityEvidence::default(),
+            &ReadIntervals::unbounded(),
+            DetailsProjection {
+                authority: &authority,
+                history_window: HistoryWindow::Retained,
+                shared_history: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(details.history_periods.len(), 1);
+        assert_eq!(
+            v3.iter()
+                .map(|point| (
+                    point.timestamp,
+                    point.remaining_percent,
+                    point.model_source.as_str(),
+                    point.models_complete,
+                    point.models.as_ref().unwrap()[0].total_tokens,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (1_800_000_000, Some(80.0), "confirmed", true, 10),
+                (1_800_000_060, Some(70.0), "confirmed", true, u64::MAX),
+            ]
+        );
+        assert!(v3
+            .iter()
+            .all(|point| point.models.as_ref().unwrap()[0].input_tokens.is_none()));
+        assert_eq!(v2.len(), 2);
+        assert!(v2.iter().all(|point| point.model_source == "unavailable"
+            && point.sol_tokens.is_none()
+            && point.terra_tokens.is_none()
+            && point.luna_tokens.is_none()
+            && point.sol_dollars.is_none()
+            && point.terra_dollars.is_none()
+            && point.luna_dollars.is_none()));
+        assert!(details.history_samples.is_empty());
+        assert!(current_models.is_empty());
+        assert_eq!(current.state, PublicState::Ready);
+        assert_eq!(current.models_status, CurrentModelsStatus::Unavailable);
+    }
+
+    #[test]
+    fn issue604_source_rejection_is_not_missing_fixed_columns() {
+        let sample = PublicHistorySample {
+            timestamp: 1_800_000_000,
+            reset_at: 1_800_000_600,
+            remaining_percent: Some(80.0),
+            sol_tokens: 10,
+            terra_tokens: 0,
+            luna_tokens: 0,
+            sol_dollars: 0.5,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+        };
+        for source in ["reconstructed-from-session", "unavailable"] {
+            let model = PublicHistoryObservationV3 {
+                timestamp: sample.timestamp,
+                reset_at: sample.reset_at,
+                remaining_percent: sample.remaining_percent,
+                task_active_since_previous: None,
+                models: None,
+                models_complete: false,
+                model_source: source.to_owned(),
+            };
+            let v2 = history_observations_v2(std::slice::from_ref(&sample), &[model]);
+            assert_eq!(v2[0].model_source, source);
+            assert!(v2[0].sol_tokens.is_none());
+            assert!(v2[0].sol_dollars.is_none());
+        }
+    }
+
+    #[test]
+    fn issue604_history_keeps_known_totals_with_unknown_components() {
+        let connection = Connection::open_in_memory().expect("nullable source fixture");
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_model_history(
+                reset_at INTEGER, timestamp INTEGER, model TEXT, total_tokens TEXT,
+                input_tokens TEXT, cached_input_tokens TEXT, output_tokens TEXT,
+                cache_write_input_tokens TEXT, total_dollars REAL, model_set_complete INTEGER
+             );
+             INSERT INTO usage_model_history VALUES
+                (1800000600,1800000000,'alpha','40',NULL,'3','8',NULL,NULL,1),
+                (1800000600,1800000000,'beta','50','45',NULL,'5',NULL,0.25,1),
+                (1800000600,1800000000,'gamma','60','59','7',NULL,'2',NULL,1),
+                (1800000600,1800000000,'known','30','20','2','10',NULL,NULL,1);",
+            )
+            .expect("literal NULL source facts");
+        let groups = read_history_model_groups_for_intervals(
+            &connection,
+            1_799_999_999,
+            1_800_000_000,
+            &ReadIntervals::unbounded(),
+            None,
+            0,
+        )
+        .expect("read nullable model source");
+        let group = &groups[&(1_800_000_600, 1_800_000_000)];
+        assert!(
+            group.model_set_complete(),
+            "known membership does not assert known components"
+        );
+        assert_eq!(
+            group.totals.len(),
+            4,
+            "unknown components must not erase known totals"
+        );
+        let sample = PublicHistorySample {
+            timestamp: 1_800_000_000,
+            reset_at: 1_800_000_600,
+            remaining_percent: Some(70.0),
+            sol_dollars: 0.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 0,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let models =
+            history_models_v3(Some(group), &StoredHistorySample::from(&sample), true).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| (
+                    model.model.as_str(),
+                    model.total_tokens,
+                    model.input_tokens,
+                    model.cached_input_tokens,
+                    model.cache_write_input_tokens,
+                    model.output_tokens,
+                    model.total_dollars,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha", 40, None, Some(3), None, Some(8), None),
+                ("beta", 50, Some(45), None, None, Some(5), Some(0.25)),
+                ("gamma", 60, Some(59), Some(7), Some(2), None, None),
+                ("known", 30, Some(20), Some(2), None, Some(10), None),
+            ]
+        );
+        let current = project_model_totals(group.totals.values().cloned());
+        assert_eq!(
+            current
+                .v3
+                .iter()
+                .map(|row| row.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["known"]
+        );
+        assert!(current.incomplete);
+        assert!(
+            !current.invalid,
+            "unknown source components are not invalid numeric facts"
+        );
+        assert!(current.v1.is_empty());
+    }
+
+    #[test]
+    fn issue604_partial_components_cannot_hide_numeric_contradictions() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE usage_model_history(
+                reset_at INTEGER, timestamp INTEGER, model TEXT, total_tokens TEXT,
+                input_tokens TEXT, cached_input_tokens TEXT, output_tokens TEXT,
+                cache_write_input_tokens TEXT, model_set_complete INTEGER
+             );
+             INSERT INTO usage_model_history VALUES
+                (1800000600,1800000000,'output-exceeds-total','40',NULL,NULL,'41',NULL,1),
+                (1800000600,1800000000,'discounts-exceed-total','40',NULL,'30',NULL,'11',1),
+                (1800000600,1800000000,'discounts-and-output-exceed-total','40',NULL,'30','11',NULL,1),
+                (1800000600,1800000000,'input-exceeds-total','40','41',NULL,NULL,NULL,1),
+                (1800000600,1800000000,'wrong-sum','40','30','1','11',NULL,1),
+                (1800000600,1800000000,'noncanonical','040',NULL,NULL,NULL,NULL,1),
+                (1800000600,1800000000,'overflow','18446744073709551615',NULL,
+                    '18446744073709551615',NULL,'1',1),
+                (1800000600,1800000000,'possible','40',NULL,'29','11',NULL,1);",
+        ).unwrap();
+        let groups = read_history_model_groups_for_intervals(
+            &connection,
+            1_799_999_999,
+            1_800_000_000,
+            &ReadIntervals::unbounded(),
+            None,
+            0,
+        )
+        .unwrap();
+        let group = &groups[&(1_800_000_600, 1_800_000_000)];
+        assert!(!group.valid);
+        assert!(!group.model_set_complete());
+        assert_eq!(
+            group.totals.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["possible"]
+        );
     }
 
     #[test]
@@ -8325,16 +10772,17 @@ mod tests {
             RawModelTotal {
                 model: "gpt-6.1-sol".to_owned(),
                 total_tokens: 120,
-                input_tokens: 100,
-                cached_input_tokens: 10,
-                output_tokens: 20,
+                input_tokens: Some(100),
+                cached_input_tokens: Some(10),
+                output_tokens: Some(20),
                 cache_write_input_tokens: Some(5),
                 total_dollars: Some(1.25),
             },
         );
         assert!(!group.model_set_complete());
 
-        let models = history_models_v3(Some(&group), &sample, false).expect("incomplete models");
+        let models = history_models_v3(Some(&group), &StoredHistorySample::from(&sample), false)
+            .expect("incomplete models");
         let sol = models
             .iter()
             .filter(|model| codex_info_pricing::family(&model.model) == Some("SOL"))
@@ -8369,9 +10817,9 @@ mod tests {
             RawModelTotal {
                 model: "SOL".to_owned(),
                 total_tokens: 100,
-                input_tokens: 100,
-                cached_input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: Some(100),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
                 cache_write_input_tokens: None,
                 total_dollars: None,
             },
@@ -8381,15 +10829,16 @@ mod tests {
             RawModelTotal {
                 model: "gpt-6-sol".to_owned(),
                 total_tokens: 200,
-                input_tokens: 200,
-                cached_input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: Some(200),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
                 cache_write_input_tokens: None,
                 total_dollars: Some(0.654321),
             },
         );
 
-        let models = history_models_v3(Some(&group), &sample, true).expect("complete models");
+        let models = history_models_v3(Some(&group), &StoredHistorySample::from(&sample), true)
+            .expect("complete models");
         let legacy = models
             .iter()
             .find(|model| model.model == "SOL")
@@ -8512,7 +10961,7 @@ mod tests {
         }
         connection
             .execute(
-                "INSERT INTO usage_model_history VALUES(1800000604,1800000120,'SOL','30','20','5','5',NULL,1)",
+                "INSERT INTO usage_model_history VALUES(1800000604,1800000120,'SOL','30','25','5','5',NULL,1)",
                 [],
             )
             .expect("model row");
@@ -8533,10 +10982,12 @@ mod tests {
             .history_samples_v3
             .iter()
             .all(|sample| !sample.models_complete));
-        assert!(snapshot.history_samples_v3.iter().all(|sample| sample
-            .models
-            .as_ref()
-            .is_some_and(|models| models.len() == 3)));
+        assert!(snapshot.history_samples_v3.iter().all(|sample| {
+            sample
+                .models
+                .as_ref()
+                .is_some_and(|models| models.len() == 3)
+        }));
         assert!(snapshot
             .history_samples_v2
             .iter()

@@ -39,6 +39,8 @@ jobs:
           env-vars: ImageOS
           cache-workspace-crates: 'false'
           cache-bin: 'false'
+      - name: Run service recovery fixture regression
+        run: python3 -B scripts/test_x11_service_recovery_fixture.py
       - name: Build native release for UI evaluation
         run: cargo build --release --locked -p codex_info
       - name: Run graph UI image acceptance

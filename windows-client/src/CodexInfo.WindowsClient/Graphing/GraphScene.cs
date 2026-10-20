@@ -35,7 +35,6 @@ internal enum GraphRemainingOrigin
     BoundedNullHold,
     TerminalNullHold,
     SyntheticTailHold,
-    MonotonicHold,
 }
 
 /// <summary>The provenance of one accepted cumulative model value.</summary>
@@ -87,6 +86,9 @@ public sealed class GraphScene
     internal const long SustainedUnusedMinimumSeconds = 10 * 60;
     private const long RecoverableSamplingJitterSeconds = 60;
 
+    private IReadOnlyList<ApiHistorySample> RawSamples { get; set; } = [];
+    private IReadOnlySet<int> RecoverableSamplingSlots { get; init; } = new HashSet<int>();
+
     private GraphScene(
         long periodStartAt,
         long periodEndAt,
@@ -114,7 +116,6 @@ public sealed class GraphScene
         IReadOnlyDictionary<string, IReadOnlySet<long>> modelCorrectionStarts,
         IReadOnlySet<long> correctionStarts,
         IReadOnlySet<long> tokenCorrectionStarts,
-        IReadOnlyDictionary<string, IReadOnlyList<GraphIdleInterval>> modelIdleIntervals,
         IReadOnlyList<GraphIdleInterval> idleIntervals,
         double modelMaximum,
         bool isViewport = false,
@@ -125,10 +126,8 @@ public sealed class GraphScene
         IReadOnlyList<GraphObservedSample>? hoverObservations = null,
         bool isVerifiedCurrentResetStart = false,
         GraphPeriodCostSummary periodCost = default,
-        IReadOnlyList<GraphIdleInterval>? taskIdleIntervals = null,
         long? verifiedPeriodOriginAt = null)
     {
-        TaskIdleIntervals = taskIdleIntervals ?? [];
         PeriodStartAt = periodStartAt;
         PeriodEndAt = periodEndAt;
         ResetAt = resetAt;
@@ -159,7 +158,6 @@ public sealed class GraphScene
         ModelCorrectionStarts = modelCorrectionStarts;
         CorrectionStarts = correctionStarts;
         TokenCorrectionStarts = tokenCorrectionStarts;
-        ModelIdleIntervals = modelIdleIntervals;
         IdleIntervals = idleIntervals;
         ModelMaximum = modelMaximum;
         IsViewport = isViewport;
@@ -172,7 +170,6 @@ public sealed class GraphScene
             HoverObservations.All(observation => observation.ResetAt == HoverResetAt);
     }
 
-    internal IReadOnlyList<GraphIdleInterval> TaskIdleIntervals { get; }
 
     public long PeriodStartAt { get; }
 
@@ -258,8 +255,6 @@ public sealed class GraphScene
 
     internal IReadOnlySet<long> TokenCorrectionStarts { get; }
 
-    internal IReadOnlyDictionary<string, IReadOnlyList<GraphIdleInterval>> ModelIdleIntervals { get; }
-
     public IReadOnlyList<GraphIdleInterval> IdleIntervals { get; }
 
     public double ModelMaximum { get; private set; }
@@ -302,6 +297,7 @@ public sealed class GraphScene
         var daily = GraphDailyUsageProjection.Create(periods, startAt, endAt, displayTimeZone, gaps, ownershipIntervals)
             .Where(day => hiddenModelNames is null || !hiddenModelNames.Contains(day.ModelName)).ToArray();
         scene.IsDaily = true;
+        scene.RawSamples = periods.SelectMany(period => period.Samples).ToArray();
         scene.DailyUsage = Array.AsReadOnly(daily);
         var values = daily.Select(day => metric == GraphMetric.Tokens
             ? day.Tokens is { } tokens ? (double?)tokens : null
@@ -341,7 +337,6 @@ public sealed class GraphScene
             new Dictionary<string, IReadOnlySet<long>>(StringComparer.Ordinal),
             new HashSet<long>(),
             new HashSet<long>(),
-            new Dictionary<string, IReadOnlyList<GraphIdleInterval>>(StringComparer.Ordinal),
             [],
             1,
             publishedPeriodStarts: publishedPeriodStartAt is { } startAt ? [startAt] : [],
@@ -452,7 +447,6 @@ public sealed class GraphScene
             new Dictionary<string, IReadOnlySet<long>>(StringComparer.Ordinal),
             new HashSet<long>(),
             new HashSet<long>(),
-            new Dictionary<string, IReadOnlyList<GraphIdleInterval>>(StringComparer.Ordinal),
             idleIntervals,
             visibleModelMaximum,
             isViewport: true,
@@ -539,8 +533,6 @@ public sealed class GraphScene
              sample.ModelsComplete && sample.ModelSamples is { Count: 0 }));
         var idleBoundaries = normalizedGaps.Concat(nonOwnedIntervals
             .Select(interval => new GraphConfirmedGap(interval.StartAt, interval.EndAt))).ToArray();
-        var taskIdleIntervals = BuildTaskIdleIntervals(samples, start, end, idleBoundaries);
-        samples = WithoutRecoverableSamplingJitter(samples, normalizedGaps);
         var allModelNames = samples
             .SelectMany(PublishedModels)
             .Select(model => model.Name)
@@ -560,8 +552,9 @@ public sealed class GraphScene
         // Semantic evidence is derived from the complete published model
         // universe. A visibility toggle is a rendering concern only: hidden
         // models still participate in exact token and idle evidence.
-        var dollarProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Dollars);
-        var tokenProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Tokens);
+        var dollarProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Dollars, normalizedGaps);
+        var tokenProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Tokens, normalizedGaps);
+        var recoverableSamplingSlots = FindRecoverableSamplingSlots(samples, normalizedGaps, tokenProjection);
         var firstModelPublications = FirstModelPublications(samples);
         var periodCost = BuildPeriodCost(samples, latestCostObservation, firstModelPublications, dollarProjection);
         var idleIntervals = BuildConfirmedIdleIntervals(
@@ -569,22 +562,9 @@ public sealed class GraphScene
             start,
             end,
             idleBoundaries,
-            tokenProjection);
-        var modelIdleIntervals = allModelNames.ToDictionary(
-            name => name,
-            name => BuildConfirmedIdleIntervals(
-                samples,
-                start,
-                end,
-                normalizedGaps,
-                tokenProjection,
-                name),
-            StringComparer.Ordinal);
-        dollarProjection = NormalizeDollarProjectionFromTokenIdentity(
-            samples,
-            dollarProjection,
             tokenProjection,
-            modelIdleIntervals);
+            recoverableSamplingSlots,
+            accountOwnershipIntervals);
         var semanticProjection = metric == GraphMetric.Dollars
             ? dollarProjection
             : tokenProjection;
@@ -711,7 +691,6 @@ public sealed class GraphScene
             displayProjection.CorrectionStartsByModel,
             correctionStarts,
             tokenCorrectionStarts,
-            modelIdleIntervals,
             idleIntervals,
             maximum,
             publishedPeriodStarts: publishedPeriodStartAt is { } publishedStartAt ? [publishedStartAt] : [],
@@ -723,12 +702,13 @@ public sealed class GraphScene
                 eligibleMissingTokenZeros),
             isVerifiedCurrentResetStart: isVerifiedCurrentResetStart,
             periodCost: periodCost,
-            taskIdleIntervals: taskIdleIntervals,
             verifiedPeriodOriginAt: verifiedPeriodOriginAt)
         {
             RecordedPeriodTokens = BuildRecordedPeriodTokens(latestCostObservation, firstModelPublications.Count),
             ModelMemberLineReliability = rawDisplayProjection.LineReliability,
             IsCurrentPeriod = isCurrentPeriod,
+            RawSamples = samples.ToArray(),
+            RecoverableSamplingSlots = recoverableSamplingSlots,
         };
     }
 
@@ -1092,7 +1072,11 @@ public sealed class GraphScene
         {
             var ownedStart = interval.StartAt ?? long.MinValue;
             var ownedEnd = interval.EndAt ?? long.MaxValue;
-            if (ownedStart >= ownedEnd ||
+            if (ownedStart == ownedEnd)
+            {
+                continue;
+            }
+            if (ownedStart > ownedEnd ||
                 priorEnd is { } previous && ownedStart < previous)
             {
                 throw new ArgumentException("Account ownership intervals must be ordered and disjoint.", nameof(ownershipIntervals));
@@ -1122,22 +1106,25 @@ public sealed class GraphScene
     internal bool IsNonOwnedAt(double timestamp) =>
         NonOwnedIntervals.Any(interval => timestamp >= interval.StartAt && timestamp < interval.EndAt);
 
-    private static IReadOnlyList<ApiHistorySample> WithoutRecoverableSamplingJitter(
+    private static IReadOnlySet<int> FindRecoverableSamplingSlots(
         IReadOnlyList<ApiHistorySample> samples,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps)
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        ModelProjection tokenProjection)
     {
+        var recovered = new HashSet<int>();
         if (samples.Count < 3)
         {
-            return samples;
+            return recovered;
         }
 
-        var recovered = new HashSet<int>();
         for (var index = 1; index + 1 < samples.Count; index++)
         {
             var left = samples[index - 1];
             var middle = samples[index];
             var right = samples[index + 1];
-            if (middle.IsSyntheticTail ||
+            if (left.IsSyntheticTail || middle.IsSyntheticTail || right.IsSyntheticTail ||
+                left.ModelSource != ApiHistorySample.ConfirmedModelSource || !left.ModelsComplete ||
+                right.ModelSource != ApiHistorySample.ConfirmedModelSource || !right.ModelsComplete ||
                 middle.ModelSource != ApiHistorySample.UnavailableModelSource ||
                 middle.ModelsComplete ||
                 middle.Timestamp - left.Timestamp != RecoverableSamplingJitterSeconds ||
@@ -1146,8 +1133,8 @@ public sealed class GraphScene
                 left.ResetAt != right.ResetAt ||
                 left.RemainingPercent is not double leftRemaining ||
                 right.RemainingPercent is not double rightRemaining ||
-                !double.IsFinite(leftRemaining) ||
-                !double.IsFinite(rightRemaining) ||
+                !double.IsFinite(leftRemaining) || leftRemaining is < 0 or > 100 ||
+                !double.IsFinite(rightRemaining) || rightRemaining is < 0 or > 100 ||
                 !RemainingBitsEqual(leftRemaining, rightRemaining) ||
                 middle.RemainingPercent is double middleRemaining &&
                     (!double.IsFinite(middleRemaining) ||
@@ -1157,12 +1144,42 @@ public sealed class GraphScene
             {
                 continue;
             }
+            if (!TryGetDirectModelVector(left, out var vector) ||
+                !AcceptedIdleVectorAt(index - 1, vector, tokenProjection) ||
+                !AcceptedIdleVectorAt(index + 1, vector, tokenProjection))
+            {
+                continue;
+            }
             recovered.Add(index);
         }
 
-        return recovered.Count == 0
-            ? samples
-            : samples.Where((_, index) => !recovered.Contains(index)).ToArray();
+        return recovered;
+    }
+
+    internal bool CanBridgeRemainingSamplingSlot(int index) =>
+        RecoverableSamplingSlots.Contains(index) &&
+        RemainingOrigins[index - 1] is GraphRemainingOrigin.Raw &&
+        RemainingOrigins[index + 1] is GraphRemainingOrigin.Raw;
+
+    internal bool CanBridgeModelSamplingSlot(IReadOnlyList<double> values, int index)
+    {
+        if (!RecoverableSamplingSlots.Contains(index)) return false;
+        var displayName = ModelSeries.FirstOrDefault(pair => ReferenceEquals(pair.Value, values)).Key;
+        if (displayName is null) return false;
+        if (Metric == GraphMetric.Tokens) return true;
+
+        var members = PublishedModels(RawSamples[index - 1])
+            .Where(model => (ModelUsageViewModel.DisplayFamilyName(model.Name) ?? model.Name) == displayName)
+            .ToArray();
+        return members.Length > 0 && members.All(model =>
+        {
+            if (!ModelMemberLineReliability.TryGetValue(model.Name, out var reliable) ||
+                !reliable[index - 1] || !reliable[index + 1]) return false;
+            var left = RawModelValue(RawSamples[index - 1], model.Name, GraphMetric.Dollars);
+            var right = RawModelValue(RawSamples[index + 1], model.Name, GraphMetric.Dollars);
+            return double.IsFinite(left) && left >= 0 && double.IsFinite(right) && right >= 0 &&
+                BitConverter.DoubleToInt64Bits(left) == BitConverter.DoubleToInt64Bits(right);
+        });
     }
 
     private static bool DirectSamplingEndpointsEqual(
@@ -1220,71 +1237,11 @@ public sealed class GraphScene
                 reliability[before] && reliability[after]);
     }
 
-    internal bool HasModelTokenCountChange(
-        IReadOnlyList<double> values,
-        int before,
-        int after)
-    {
-        var name = ModelSeries
-            .FirstOrDefault(pair => ReferenceEquals(pair.Value, values))
-            .Key;
-        if (name is null || before < 0 || after < 0)
-        {
-            return false;
-        }
-
-        var familyMembers = TokenModelSeries.Keys
-            .Where(modelName => ModelUsageViewModel.DisplayFamilyName(modelName) == name)
-            .ToArray();
-        if (familyMembers.Length == 0)
-        {
-            return TokenModelSeries.TryGetValue(name, out var tokens) &&
-                before < tokens.Count && after < tokens.Count &&
-                double.IsFinite(tokens[before]) && double.IsFinite(tokens[after]) &&
-                tokens[before] != tokens[after];
-        }
-
-        var beforeTotal = 0d;
-        var afterTotal = 0d;
-        foreach (var member in familyMembers)
-        {
-            if (!TokenModelSeries.TryGetValue(member, out var tokens) ||
-                !TokenReliability.TryGetValue(member, out var reliable) ||
-                before >= tokens.Count || after >= tokens.Count ||
-                before >= reliable.Count || after >= reliable.Count ||
-                !reliable[before] || !reliable[after] ||
-                !double.IsFinite(tokens[before]) || !double.IsFinite(tokens[after]))
-            {
-                return false;
-            }
-
-            beforeTotal += tokens[before];
-            afterTotal += tokens[after];
-            if (!double.IsFinite(beforeTotal) || !double.IsFinite(afterTotal))
-            {
-                return false;
-            }
-        }
-
-        // Cumulative token counts are integral; a real change is at least one token.
-        return Math.Abs(afterTotal - beforeTotal) >= 1d;
-    }
-
-    internal IReadOnlyList<GraphIdleInterval> IdleIntervalsForModel(
-        IReadOnlyList<double> values)
-    {
-        var name = ModelSeries
-            .FirstOrDefault(pair => ReferenceEquals(pair.Value, values))
-            .Key;
-        return name is not null && ModelIdleIntervals.TryGetValue(name, out var intervals)
-            ? intervals
-            : IdleIntervals;
-    }
-
     private static ModelProjection BuildAcceptedModelProjection(
         IReadOnlyList<ApiHistorySample> samples,
         IReadOnlyList<string> modelNames,
-        GraphMetric metric)
+        GraphMetric metric,
+        IReadOnlyList<GraphConfirmedGap> originalGaps)
     {
         var values = new Dictionary<string, IReadOnlyList<double>>(StringComparer.Ordinal);
         var reliability = new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal);
@@ -1298,10 +1255,19 @@ public sealed class GraphScene
             var raw = samples
                 .Select(sample => RawModelValue(sample, name, metric))
                 .ToArray();
+            var exactTokens = metric == GraphMetric.Tokens
+                ? samples.Select(sample => PublishedModels(sample)
+                    .FirstOrDefault(model => model.Name == name)?.TotalTokens).ToArray()
+                : null;
+            bool IsKnown(int index) => double.IsFinite(raw[index]) && raw[index] >= 0 &&
+                (exactTokens is null || exactTokens[index] is not null);
+            int CompareRawValues(int left, int right) => exactTokens is null
+                ? raw[left].CompareTo(raw[right])
+                : exactTokens[left]!.Value.CompareTo(exactTokens[right]!.Value);
             var sourceOrigins = samples
                 .Select(sample => sample.ModelSource switch
                 {
-                    ApiHistorySample.ConfirmedModelSource when sample.ModelsComplete =>
+                    ApiHistorySample.ConfirmedModelSource =>
                         GraphModelOrigin.Direct,
                     ApiHistorySample.LegacyUnknownModelSource =>
                         GraphModelOrigin.LegacyUnknown,
@@ -1311,93 +1277,47 @@ public sealed class GraphScene
             var isolated = new bool[samples.Count];
             for (var index = 1; index + 1 < samples.Count; index++)
             {
-                var left = raw[index - 1];
-                var middle = raw[index];
-                var right = raw[index + 1];
+                var left = index - 1;
+                var middle = index;
+                var right = index + 1;
                 isolated[index] =
                     !samples[index - 1].IsSyntheticTail &&
                     !samples[index].IsSyntheticTail &&
                     !samples[index + 1].IsSyntheticTail &&
-                    sourceOrigins[index - 1] is GraphModelOrigin.Direct &&
-                    sourceOrigins[index] is GraphModelOrigin.Direct &&
-                    sourceOrigins[index + 1] is GraphModelOrigin.Direct &&
-                    double.IsFinite(left) && left >= 0 &&
-                    double.IsFinite(middle) && middle >= 0 &&
-                    double.IsFinite(right) && right >= 0 &&
-                    left <= right && (middle < left || middle > right);
+                    sourceOrigins[index - 1] is (GraphModelOrigin.Direct or GraphModelOrigin.LegacyUnknown) &&
+                    sourceOrigins[index] is (GraphModelOrigin.Direct or GraphModelOrigin.LegacyUnknown) &&
+                    sourceOrigins[index + 1] is (GraphModelOrigin.Direct or GraphModelOrigin.LegacyUnknown) &&
+                    IsKnown(left) && IsKnown(middle) && IsKnown(right) &&
+                    !HasConfirmedGapBetween(originalGaps, samples[index - 1].Timestamp, samples[index + 1].Timestamp) &&
+                    CompareRawValues(left, right) <= 0 &&
+                    (CompareRawValues(middle, left) < 0 || CompareRawValues(middle, right) > 0);
             }
 
             var accepted = Enumerable.Repeat(double.NaN, samples.Count).ToArray();
             var acceptedOrigins = Enumerable.Repeat(GraphModelOrigin.Unknown, samples.Count).ToArray();
-            double? directBaseline = null;
+            int? acceptedBaselineIndex = null;
             for (var index = 0; index < samples.Count; index++)
             {
                 var candidate = raw[index];
-                if (samples[index].IsSyntheticTail || !double.IsFinite(candidate) || candidate < 0)
+                if (samples[index].IsSyntheticTail || !IsKnown(index))
                 {
                     continue;
                 }
-                if (sourceOrigins[index] is GraphModelOrigin.LegacyUnknown)
-                {
-                    accepted[index] = candidate;
-                    acceptedOrigins[index] = GraphModelOrigin.LegacyUnknown;
-                    continue;
-                }
-                if (sourceOrigins[index] is not GraphModelOrigin.Direct)
+                if (sourceOrigins[index] is not (GraphModelOrigin.Direct or GraphModelOrigin.LegacyUnknown))
                 {
                     continue;
                 }
-                if (isolated[index] || directBaseline is { } prior && candidate < prior)
+                if (isolated[index] || acceptedBaselineIndex is { } prior && CompareRawValues(index, prior) < 0)
                 {
                     modelCorrectionStarts.Add(samples[index].Timestamp);
                     correctionStarts.Add(samples[index].Timestamp);
-                    accepted[index] = directBaseline ?? candidate;
+                    accepted[index] = acceptedBaselineIndex is { } baseline ? raw[baseline] : candidate;
                     acceptedOrigins[index] = GraphModelOrigin.Rejected;
                     continue;
                 }
                 accepted[index] = candidate;
-                acceptedOrigins[index] = GraphModelOrigin.Direct;
-                directBaseline = candidate;
-            }
-
-            // Legacy rows are display-only. Keep one only when it fits between
-            // the surrounding accepted direct observations; otherwise leave
-            // the slot unknown so the UI projection below can visibly infer it.
-            // A legacy value never updates directBaseline or correctionStarts.
-            var nextDirectValue = Enumerable.Repeat(double.NaN, samples.Count).ToArray();
-            var nextDirect = double.NaN;
-            for (var index = samples.Count - 1; index >= 0; index--)
-            {
-                nextDirectValue[index] = nextDirect;
-                if (acceptedOrigins[index] is GraphModelOrigin.Direct)
-                {
-                    nextDirect = accepted[index];
-                }
-            }
-            var displayFloor = double.NaN;
-            for (var index = 0; index < samples.Count; index++)
-            {
-                if (acceptedOrigins[index] is GraphModelOrigin.Direct)
-                {
-                    displayFloor = accepted[index];
-                    continue;
-                }
-                if (acceptedOrigins[index] is not GraphModelOrigin.LegacyUnknown)
-                {
-                    continue;
-                }
-                var belowFloor = double.IsFinite(displayFloor) && accepted[index] < displayFloor;
-                var aboveCeiling = double.IsFinite(nextDirectValue[index]) &&
-                    accepted[index] > nextDirectValue[index];
-                if (belowFloor || aboveCeiling)
-                {
-                    accepted[index] = double.NaN;
-                    acceptedOrigins[index] = GraphModelOrigin.Unknown;
-                }
-                else
-                {
-                    displayFloor = accepted[index];
-                }
+                acceptedOrigins[index] = sourceOrigins[index];
+                acceptedBaselineIndex = index;
             }
 
             var anchors = Enumerable.Range(0, samples.Count)
@@ -1488,139 +1408,6 @@ public sealed class GraphScene
             correctionStarts);
     }
 
-    private static ModelProjection NormalizeDollarProjectionFromTokenIdentity(
-        IReadOnlyList<ApiHistorySample> samples,
-        ModelProjection dollars,
-        ModelProjection tokens,
-        IReadOnlyDictionary<string, IReadOnlyList<GraphIdleInterval>> modelIdleIntervals)
-    {
-        var valueArrays = dollars.Values.ToDictionary(
-            pair => pair.Key,
-            pair => pair.Value.ToArray(),
-            StringComparer.Ordinal);
-        var reliabilityArrays = dollars.Reliability.ToDictionary(
-            pair => pair.Key,
-            pair => pair.Value.ToArray(),
-            StringComparer.Ordinal);
-        var lineReliabilityArrays = dollars.LineReliability.ToDictionary(
-            pair => pair.Key,
-            pair => pair.Value.ToArray(),
-            StringComparer.Ordinal);
-        var originArrays = dollars.Origins.ToDictionary(
-            pair => pair.Key,
-            pair => pair.Value.ToArray(),
-            StringComparer.Ordinal);
-        var correctionSets = dollars.CorrectionStartsByModel.ToDictionary(
-            pair => pair.Key,
-            pair => pair.Value.ToHashSet(),
-            StringComparer.Ordinal);
-
-        foreach (var name in valueArrays.Keys)
-        {
-            if (!tokens.Origins.TryGetValue(name, out var tokenOrigins))
-            {
-                continue;
-            }
-            var values = valueArrays[name];
-            var reliable = reliabilityArrays[name];
-            var lineReliable = lineReliabilityArrays[name];
-            var origins = originArrays[name];
-            var runs = new List<List<int>>();
-            var run = new List<int>();
-            ulong? runIdentity = null;
-            for (var index = 0; index < samples.Count; index++)
-            {
-                var tokenOrigin = tokenOrigins[index];
-                var eligibleOrigin = tokenOrigin is GraphModelOrigin.Direct ||
-                    tokenOrigin is GraphModelOrigin.LegacyUnknown &&
-                    modelIdleIntervals[name].Any(
-                        interval => interval.StartAt <= samples[index].Timestamp &&
-                            samples[index].Timestamp <= interval.EndAt);
-                var rawTokens = eligibleOrigin
-                    ? PublishedModels(samples[index])
-                        .FirstOrDefault(model => model.Name == name)
-                        ?.TotalTokens
-                    : null;
-                var identity = rawTokens;
-                if (identity is { } currentIdentity && runIdentity == currentIdentity)
-                {
-                    run.Add(index);
-                }
-                else if (identity is { } nextIdentity)
-                {
-                    if (run.Count > 0)
-                    {
-                        runs.Add(run);
-                    }
-                    run = [index];
-                    runIdentity = nextIdentity;
-                }
-                else
-                {
-                    if (run.Count > 0)
-                    {
-                        runs.Add(run);
-                    }
-                    run = [];
-                    runIdentity = null;
-                }
-            }
-            if (run.Count > 0)
-            {
-                runs.Add(run);
-            }
-
-            foreach (var tokenFlatRun in runs.Where(candidate => candidate.Count >= 2))
-            {
-                var baselineIndex = tokenFlatRun.FirstOrDefault(
-                    index => (origins[index] == tokenOrigins[index] ||
-                            tokenOrigins[index] is GraphModelOrigin.LegacyUnknown) &&
-                        double.IsFinite(values[index]) &&
-                        values[index] >= 0,
-                    -1);
-                if (baselineIndex < 0)
-                {
-                    continue;
-                }
-                var baseline = values[baselineIndex];
-                foreach (var index in tokenFlatRun)
-                {
-                    values[index] = baseline;
-                    reliable[index] = tokenOrigins[index] is GraphModelOrigin.Direct;
-                    lineReliable[index] = true;
-                    origins[index] = tokenOrigins[index];
-                    correctionSets[name].Remove(samples[index].Timestamp);
-                }
-            }
-        }
-
-        var correctionStarts = correctionSets.Values
-            .SelectMany(set => set)
-            .ToHashSet();
-        return new ModelProjection(
-            valueArrays.ToDictionary(
-                pair => pair.Key,
-                pair => (IReadOnlyList<double>)pair.Value,
-                StringComparer.Ordinal),
-            reliabilityArrays.ToDictionary(
-                pair => pair.Key,
-                pair => (IReadOnlyList<bool>)pair.Value,
-                StringComparer.Ordinal),
-            lineReliabilityArrays.ToDictionary(
-                pair => pair.Key,
-                pair => (IReadOnlyList<bool>)pair.Value,
-                StringComparer.Ordinal),
-            originArrays.ToDictionary(
-                pair => pair.Key,
-                pair => (IReadOnlyList<GraphModelOrigin>)pair.Value,
-                StringComparer.Ordinal),
-            correctionSets.ToDictionary(
-                pair => pair.Key,
-                pair => (IReadOnlySet<long>)pair.Value,
-                StringComparer.Ordinal),
-            correctionStarts);
-    }
-
     /// <summary>
     /// Prevent a sparse inferred value from moving a cumulative display
     /// backwards after a legacy observation. Direct values remain the only
@@ -1675,9 +1462,8 @@ public sealed class GraphScene
 
     private static double RawModelValue(ApiHistorySample sample, string name, GraphMetric metric)
     {
-        if (sample.ModelSource != ApiHistorySample.LegacyUnknownModelSource &&
-            (sample.ModelSource != ApiHistorySample.ConfirmedModelSource ||
-             !sample.ModelsComplete))
+        if (sample.ModelSource is not (ApiHistorySample.LegacyUnknownModelSource or
+            ApiHistorySample.ConfirmedModelSource))
         {
             return double.NaN;
         }
@@ -1702,37 +1488,15 @@ public sealed class GraphScene
                     : (double?)null)
             .ToArray();
 
-        var isolated = new bool[points.Count];
-        for (var index = 1; index + 1 < points.Count; index++)
-        {
-            if (rawValues[index - 1] is not { } left ||
-                rawValues[index] is not { } middle ||
-                rawValues[index + 1] is not { } right)
-            {
-                continue;
-            }
-            isolated[index] = left >= right && (middle > left || middle < right);
-        }
-
-        double? minimum = null;
         for (var index = 0; index < rawValues.Length; index++)
         {
             if (rawValues[index] is not { } raw)
             {
                 continue;
             }
-            if (isolated[index] || minimum is { } prior && raw > prior)
-            {
-                values[index] = minimum;
-                origins[index] = GraphRemainingOrigin.MonotonicHold;
-            }
-            else
-            {
-                values[index] = raw;
-                origins[index] = GraphRemainingOrigin.Raw;
-                rawReliable[index] = true;
-                minimum = raw;
-            }
+            values[index] = raw;
+            origins[index] = GraphRemainingOrigin.Raw;
+            rawReliable[index] = true;
         }
 
         var runStart = 0;
@@ -1757,8 +1521,7 @@ public sealed class GraphScene
             }
 
             var bounded = runEnd < rawValues.Length && values[runEnd] is not null;
-            var canInterpolate = bounded && values[runEnd] is { } rightValue &&
-                values[left] is { } leftValue && rightValue < leftValue &&
+            var canInterpolate = bounded &&
                 points[runEnd].Timestamp > points[left].Timestamp;
             for (var index = runStart; index < runEnd; index++)
             {
@@ -1795,83 +1558,14 @@ public sealed class GraphScene
     /// renderer may add holds, smoothing, and interpolation, but those values
     /// are intentionally absent from this authority path.
     /// </summary>
-    private static IReadOnlyList<GraphIdleInterval> BuildTaskIdleIntervals(
-        IReadOnlyList<ApiHistorySample> samples, long start, long end,
-        IReadOnlyList<GraphConfirmedGap> boundaries)
-    {
-        var intervals = new List<GraphIdleInterval>();
-        var changes = RecordedUsageChanges(samples);
-        var changeIndex = 0;
-        for (var index = 1; index < samples.Count; index++)
-        {
-            var left = samples[index - 1];
-            var right = samples[index];
-            if (right.TaskActiveSincePrevious != false || left.ResetAt != right.ResetAt ||
-                left.IsSyntheticTail || right.IsSyntheticTail)
-                continue;
-            var from = Math.Max(start, left.Timestamp);
-            var to = Math.Min(end, right.Timestamp);
-            while (changeIndex < changes.Count && changes[changeIndex].EndAt <= from) changeIndex++;
-            var hasChange = changeIndex < changes.Count && changes[changeIndex].StartAt < to;
-            if (to > from && !hasChange && !boundaries.Any(gap => gap.StartAt < to && gap.EndAt > from))
-                intervals.Add(new GraphIdleInterval(from, to, false));
-        }
-        return MergeIdleIntervals(intervals)
-            .Where(interval => interval.EndAt - interval.StartAt >= SustainedUnusedMinimumSeconds)
-            .ToArray();
-    }
-
-    private static IReadOnlyList<GraphIdleInterval> RecordedUsageChanges(IReadOnlyList<ApiHistorySample> samples)
-    {
-        var changes = new List<GraphIdleInterval>();
-        var models = new Dictionary<string, (long Timestamp, ulong Tokens)>(StringComparer.Ordinal);
-        (long Timestamp, double Value)? quota = null;
-        long? reset = null;
-        foreach (var sample in samples)
-        {
-            if (sample.IsSyntheticTail) continue;
-            if (sample.ResetAt != reset)
-            {
-                models.Clear();
-                quota = null;
-                reset = sample.ResetAt;
-            }
-            if (sample.RemainingPercent is { } remaining && double.IsFinite(remaining) && remaining is >= 0 and <= 100)
-            {
-                if (quota is { } previous && !RemainingBitsEqual(previous.Value, remaining))
-                    changes.Add(new GraphIdleInterval(previous.Timestamp, sample.Timestamp, false));
-                quota = (sample.Timestamp, remaining);
-            }
-            foreach (var model in PublishedModels(sample))
-            {
-                if (model.TotalTokens is not { } tokens) continue;
-                if (models.TryGetValue(model.Name, out var previous) && previous.Tokens != tokens)
-                    changes.Add(new GraphIdleInterval(previous.Timestamp, sample.Timestamp, false));
-                models[model.Name] = (sample.Timestamp, tokens);
-            }
-        }
-        return MergeIdleIntervals(changes);
-    }
-
-    private static IReadOnlyList<GraphIdleInterval> MergeIdleIntervals(IEnumerable<GraphIdleInterval> intervals)
-    {
-        var merged = new List<GraphIdleInterval>();
-        foreach (var interval in intervals.OrderBy(item => item.StartAt))
-        {
-            if (merged.Count > 0 && interval.StartAt <= merged[^1].EndAt)
-                merged[^1] = merged[^1] with { EndAt = Math.Max(merged[^1].EndAt, interval.EndAt) };
-            else
-                merged.Add(interval);
-        }
-        return merged;
-    }
-
     private static IReadOnlyList<GraphIdleInterval> BuildConfirmedIdleIntervals(
         IReadOnlyList<ApiHistorySample> samples,
         long periodStart,
         long periodEnd,
         IReadOnlyList<GraphConfirmedGap> confirmedGaps,
         ModelProjection tokenProjection,
+        IReadOnlySet<int> recoverableSamplingSlots,
+        IReadOnlyList<GraphAccountOwnershipInterval>? accountOwnershipIntervals,
         string? modelName = null)
     {
         if (periodEnd <= periodStart || samples.Count < 2)
@@ -1900,6 +1594,10 @@ public sealed class GraphScene
             if (right.Timestamp <= left.Timestamp ||
                 left.ResetAt != right.ResetAt ||
                 !TokenVectorsEqual(before.Vector, after.Vector) ||
+                !IsCoveredByOneOwnershipInterval(
+                    left.Timestamp,
+                    right.Timestamp,
+                    accountOwnershipIntervals) ||
                 modelName is null && !SameRecordedRemaining(left, right) ||
                 HasConfirmedGapBetween(
                     confirmedGaps,
@@ -1912,6 +1610,7 @@ public sealed class GraphScene
                     left.ResetAt,
                     before.Vector,
                     tokenProjection,
+                    recoverableSamplingSlots,
                     modelName))
             {
                 continue;
@@ -1946,6 +1645,22 @@ public sealed class GraphScene
             .ToArray();
     }
 
+    private static bool IsCoveredByOneOwnershipInterval(
+        long startAt,
+        long endAt,
+        IReadOnlyList<GraphAccountOwnershipInterval>? ownershipIntervals)
+    {
+        if (ownershipIntervals is null)
+        {
+            return false;
+        }
+
+        return ownershipIntervals.Any(interval =>
+            interval.StartAt is { } ownershipStartAt &&
+            ownershipStartAt <= startAt &&
+            (interval.EndAt is not { } ownershipEndAt || endAt < ownershipEndAt));
+    }
+
     private static bool HasIdleContradiction(
         IReadOnlyList<ApiHistorySample> samples,
         int before,
@@ -1953,6 +1668,7 @@ public sealed class GraphScene
         long resetAt,
         IReadOnlyDictionary<string, DirectModelValue> baseline,
         ModelProjection tokenProjection,
+        IReadOnlySet<int> recoverableSamplingSlots,
         string? modelName)
     {
         // The endpoint pair is evaluated by the exact-equality or low-rate
@@ -1962,16 +1678,7 @@ public sealed class GraphScene
             var sample = samples[index];
             // A missing model sample between matching direct observations is
             // not a model change. Keep its independent remaining observation.
-            if (modelName is not null && index == before + 1 && after == index + 1 &&
-                sample.ModelSource == ApiHistorySample.UnavailableModelSource &&
-                !sample.ModelsComplete && !sample.IsSyntheticTail &&
-                samples[before].ModelSource == ApiHistorySample.ConfirmedModelSource &&
-                samples[before].ModelsComplete &&
-                samples[after].ModelSource == ApiHistorySample.ConfirmedModelSource &&
-                samples[after].ModelsComplete &&
-                sample.ResetAt == resetAt &&
-                sample.Timestamp - samples[before].Timestamp == RecoverableSamplingJitterSeconds &&
-                samples[after].Timestamp - sample.Timestamp == RecoverableSamplingJitterSeconds)
+            if (index == before + 1 && after == index + 1 && recoverableSamplingSlots.Contains(index))
             {
                 continue;
             }
@@ -2028,7 +1735,7 @@ public sealed class GraphScene
 
             vector = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal)
             {
-                [modelName] = new DirectModelValue(totalTokens),
+                [modelName] = RawModelTokenIdentity(matching[0], totalTokens),
             };
             return true;
         }
@@ -2049,7 +1756,7 @@ public sealed class GraphScene
         foreach (var model in PublishedModels(sample))
         {
             if (model.TotalTokens is not ulong totalTokens ||
-                !result.TryAdd(model.Name, new DirectModelValue(totalTokens)))
+                !result.TryAdd(model.Name, RawModelTokenIdentity(model, totalTokens)))
             {
                 return false;
             }
@@ -2089,7 +1796,7 @@ public sealed class GraphScene
                 vector = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal);
                 return false;
             }
-            if (!result.TryAdd(model.Name, new DirectModelValue(totalTokens)))
+            if (!result.TryAdd(model.Name, RawModelTokenIdentity(model, totalTokens)))
             {
                 vector = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal);
                 return false;
@@ -2105,7 +1812,7 @@ public sealed class GraphScene
         IReadOnlyDictionary<string, DirectModelValue> right) =>
         left.Count == right.Count && left.Keys.All(name =>
             right.TryGetValue(name, out var candidate) &&
-            candidate.TotalTokens == left[name].TotalTokens);
+            candidate == left[name]);
 
     private static bool RemainingBitsEqual(double left, double right) =>
         BitConverter.DoubleToInt64Bits(left) == BitConverter.DoubleToInt64Bits(right);
@@ -2366,7 +2073,15 @@ public sealed class GraphScene
             names.SelectMany(name => CorrectionStartsByModel[name]).ToHashSet());
     }
 
-    private readonly record struct DirectModelValue(ulong TotalTokens);
+    private static DirectModelValue RawModelTokenIdentity(ApiHistoryModelSample model, ulong totalTokens) =>
+        new(totalTokens, model.InputTokens, model.CachedInputTokens, model.CacheWriteInputTokens, model.OutputTokens);
+
+    private readonly record struct DirectModelValue(
+        ulong TotalTokens,
+        ulong? InputTokens,
+        ulong? CachedInputTokens,
+        ulong? CacheWriteInputTokens,
+        ulong? OutputTokens);
 
     private sealed class Utf8ModelNameComparer : IComparer<string>
     {

@@ -7,9 +7,8 @@
 Document state: `REQUIREMENTS_SELECTED / PRODUCT_PENDING` (requirements selection is not
 implementation or product-acceptance evidence).
 
-SSH-001/RC-061〜063の追加契約もこのledgerへ参照としてjoinする。状態は
-`REQUIREMENTS_SELECTED / PRODUCT_PENDING`であり、installed API serviceのexact install/start/stop/restart/
-uninstall/rollback command、実装、host、artifact、fresh image、独立製品判定は未取得である。
+SSH-001/RC-061〜063の接続・起動・停止・復旧の規範はPRODUCTのmanaged service契約、UX §4.4/4.6、SECURITYのWindows bootstrap境界を参照する。
+本書の`PRODUCT_PENDING`は対象host/artifactの実証が揃っていない状態であり、必要なcommandや失敗動作を将来の実装者へ決定委譲する意味ではない。
 
 This ledger records the user correction that the Windows client must not lose
 functionality that already exists in the native Rust/Slint client.
@@ -18,6 +17,10 @@ functionality that already exists in the native Rust/Slint client.
 
 Provide the existing Codex Info behavior on Windows without weakening the
 loopback/SSH trust boundary or exposing credentials and backend error details.
+
+## RECORDED-USAGE-SCOPE-604 consumer
+
+PRODUCTの同IDは原本の集計・照合と既存UI保持の境界を定める。Mainの期間・価格、Graphの週期間と日付group、timezone暦月、連続線と既存操作を維持する。「記録範囲」UIや記録分／保存観測切替への置換を行わない。具体的な表示・操作はUXの各既存契約に従う。不明・部分記録・保存済みの旧数値・既知0を混同しない。
 
 ## New request clauses (2026-08-22)
 
@@ -35,8 +38,9 @@ boundary and must not hide or duplicate values defined by the linked master.
 
 - Do not remove or redesign the existing Linux/WSL native UI.
 - Do not accept a monitoring-only subset as feature parity.
-- Do not expose Codex tokens, passwords, account email, filesystem paths, or
-  raw backend errors through the Windows API.
+- Do not expose Codex tokens, passwords, filesystem paths, or raw backend errors
+  through the Windows API. The display-only `login_id` in WIRE's account catalog is
+  the sole account-label exception and may be an email address; it is not an authentication authority.
 
 ## Invariants
 
@@ -68,10 +72,10 @@ boundary and must not hide or duplicate values defined by the linked master.
 - An app-wide supervisor owns one bootstrap/tunnel child, reaps it, and performs next-launch auto-reconnect from
   the saved selector. Concurrent tunnel count is one, orphan tunnel count is zero, and same-generation automatic
   infinite retry is zero. Recorder ownership continues after app/tunnel exit.
-- Setup is `server/API prepare → listener → readiness health → details → auth-start when needed → separate auth-check → details`.
-  Health, details, auth-start, and auth-check are not interchangeable. Authentication operations are control-only;
-  their response is never merged into the display root, and Setup/app confirmation is not repeated on
-  poll, reconnect, or same-generation rebuild.
+- Setup ordering and authentication confirmation follow UX §4.4/4.6; resource versions and exact-404 fallback follow WIRE.
+  Preparation, health, and auth-start results never enter the display root. Installed-client authentication confirmation
+  accepts one fresh strict data bundle; it neither assumes a separate auth-check RPC nor fetches a second bundle after acceptance.
+  Poll, reconnect, and same-generation rebuild do not start another authentication flow.
 - Headless silent REST requires Slint component/window/event-loop generation=0, `DISPLAY`/Wayland/X11 dependency=0,
   Slint visible/hidden HWND=0, and headless snapshot builder + read-only publisher only. This remains PRODUCT_PENDING.
 
@@ -88,8 +92,8 @@ binary. Its observable surfaces are:
   confirmation/check, error/retry, and legal notice.
 - Graph surface: one instance, current/older reset-period selection, dollar or
   token metric, remaining/SOL/TERRA/LUNA/ASTRA visibility toggles, cumulative lines,
-  current labels, unused intervals, and resident-service-backed history from the
-  strict details root.
+  current labels, unused intervals, and resident-service-backed history. WIRE owns v5 directory/v3 selected-history pages
+  and the exact-404 legacy path; a deprecated details root is not the required transport for a current server.
 - Threads surface: one instance, empty/single/multiple rows, parent-first
   depth-first subtree-contiguous order, role/depth/orphan guides, model,
   context usage, cumulative tokens, thread age, and instruction age.
@@ -223,9 +227,11 @@ implementation or acceptance claim.
 ## API contract decisions
 
 `GET /v1/details`, `GET /v2/details`, and the combined `GET /v3/details` remain read-only compatibility contracts.
-The current generic-model read surface is versioned by `api_version: "v3"` and split into `GET /v3/current`,
-`GET /v3/history/periods`, selected-period `GET /v3/history`, and `GET /v3/threads`.
-Together with readiness-only `GET /health` (`/v1/health` compatibility), these routes are the complete public read surface. V1/v2
+The complete public read surface and each route's exact version are owned by WIRE's
+`Request resource contract`; the current producer provides all routes in that contract, including the maintained compatibility routes.
+Windows prefers v4 current, v5 period directories, and v3 selected-period history, threads, and accounts.
+Readiness-only health and diagnostic runtime are separate resources. Route-local exact-404 fallback follows WIRE;
+this client preference neither removes an older route nor assigns v3 to a v4/v5 body. V1/v2
 top-level shape is the exact set `api_version`, `state`, `observed_at`,
 `authenticated`, `plan_label`, `quota`, `models`, `active_thread_count`,
 `history_periods`, `history_samples`, `history_gaps`, `threads`, and `estimated_cost_label`.
@@ -239,17 +245,17 @@ values to be null, while the other states require all six to be present. A detai
 whole candidate and retains the last complete root; a schema-valid health `product_version` mismatch is diagnostic
 only and does not block details retrieval.
 The server-side published-generation header contract revision is `rest-v1-published-pair-header-20260827`.
-Every successful v1, v2, or v3 details response contains exactly one
+Every successful v1, v2, or v3 details response from the current producer contains exactly one
 `Codex-Info-Published-Pair` header whose value is `v1:` followed by 64 lowercase
 hex characters: a 128-bit process server epoch followed by a 128-bit successful-publish
-counter. The resident service publishes all representations from one immutable domain generation. Windows Main first
-requests one strict `/v3/current` response. Graph requests periods and only its selected-period pages, while Threads requests
-thread rows only while its window is open. Each surface atomically accepts only the complete set carrying one pair.
-When `/v3/current` returns exact 404, Windows falls back to one strict `/v3/details`, then one strict v2 and v1 response on successive exact 404s.
-No second response repairs an accepted legacy root. After a valid v3 resource, its route-local pair may be sent as one
+counter. The resident service publishes each account's representations from one immutable domain generation. The global account catalog is independently admitted under WIRE `ACCOUNT-SELECT-134`; it is not joined to a selected historical account's data bundle. Windows Main first
+requests one strict `/v4/current` response. Graph requests periods and only its selected-period pages, while Threads requests
+thread rows only while its window is open. Each surface atomically accepts only the complete set carrying one account and one pair.
+On successive exact 404s, Windows follows WIRE's current fallback order: v4 current, v3 current, one v3 details, one v2 details, then one v1 details.
+No second response repairs an accepted legacy root. After a valid v3/v4/v5 snapshot resource, its route-local pair may be sent as one
 quoted `If-None-Match`; matching 304/body zero retains last-good and is not a failure. V1/v2 fallback sends no
-conditional header. A missing, duplicate, malformed, or case-altered details header rejects
-the complete candidate and retains the last complete root. Health and error responses do not
+conditional header and does not accept 304. A missing header is accepted only for a complete v1/v2 body from a legacy server, without synthesizing a pair or joining another resource. V3/v4/v5 require the header. Field names are case-insensitive under WIRE; a duplicate header or a malformed or case-altered pair value rejects
+the complete candidate, including v1/v2, and retains the last complete root. Health and error responses do not
 carry this header. The production UI treats the details header only as that response's opaque generation identity;
 it does not derive data meaning from either component.
 The split resources contain only their current model cost rows, reset periods, selected-period minute history samples,
@@ -261,21 +267,23 @@ JSON, bodies beyond the existing OOM/DoS boundary, and values outside domain lim
 replacing the relevant last valid surface snapshot. Normal sample/model counts are not rejected by an arbitrary performance cap;
 history pages are divided only as needed to remain inside the existing memory-safety boundary and their opaque cursor must advance. A cursor binds the selected period, last canonical key, and the canonical sample/gap prefix fingerprint rather than expiring merely because the published pair advanced. Windows appends a delta only after the server proves that prefix unchanged and every returned page has one new pair; any corrected prefix forces one full refresh.
 When `/v3/current` returns an exact 404, the connection enters legacy-details mode: one accepted fallback details root supplies Main, Graph, and Threads, split routes are not requested, and capability detection restarts on the next connection.
-After reset-tolerance canonicalization, `(period.id, timestamp)` is also unique.
+In the public canonical history, `(period.id, timestamp)` is unique under WIRE.
 A collision rejects the complete candidate; Windows must not merge, maximize,
 select the last row, null a conflicting remaining value, or render multiple
 vertical values at one canonical minute.
 
-Before a public details candidate exists, the resident service `HistoryCanonicalizer` groups only rows with the
-same admitted storage scope, validated cycle, and minute. It emits one logical sample only when distinct non-null
-quota has cardinality at most one and one existing cumulative vector `(sol_dollars, terra_dollars, luna_dollars,
-sol_tokens, terra_tokens, luna_tokens)` uniquely componentwise-dominates every row. Zero non-null quota yields
-`null`; quota conflict, incomparable/non-unique/no dominant vector, or unknown scope/cycle/minute/period boundary
-rejects the whole candidate and retains last-good. Values shaped as 100%, seven days, or quota-only are not filtered.
-Neither REST nor Windows synthesizes component maxima, last-row, null-on-conflict, or arbitrary merges.
+The resident service's storage canonicalization follows DATA `HISTORY-CANONICAL-134`, including its separate
+rules for legacy migration, normal collection updates, and official-period requalification. A non-comparable legacy
+minute is excluded with its corresponding sidecar while its original values remain in the verified backup; other
+valid minutes remain eligible. This is distinct from Windows rejecting a malformed public resource as a complete
+surface candidate under WIRE. Storage scope or period uncertainty is handled at the boundary defined by DATA;
+this explanatory ledger does not broaden it to every minute or unrelated surface. Values shaped as 100%, seven
+days, or quota-only are not filtered. Neither REST nor Windows synthesizes component maxima, last-row,
+null-on-conflict, or arbitrary merges.
 
-The API does not expose account email, filesystem paths, raw backend errors,
-session contents, or credentials. Authentication actions remain a separate
+The API does not expose filesystem paths, raw backend errors, session contents,
+or credentials. Account display labels follow WIRE `ACCOUNT-SELECT-134`; an email-form
+`login_id` is permitted only in that catalog field. Authentication actions remain a separate
 explicit command boundary and must never be represented as a successful read
 when they are unavailable.
 
@@ -298,6 +306,8 @@ when they are unavailable.
 Graph/historyの外部契約と有限oracleは本表へ複製せず、UX owner文書
 `docs/WINDOWS_UX_SPEC.md`の唯一master `CUM-138-06`だけを参照する。
 
+Windows更新の表示・再試行はPRODUCT §6から参照するUX §4.6「Windows更新の表示状態」を正本とする。上表の旧local結果は改定状態遷移の適合証拠ではない。更新確認失敗、download/検証/起動失敗からの再試行、Setup起動と適用完了の分離、終了時取消とbackend表示保持を含む現在仕様の品質確認は未完了である。
+
 | ID | Source / contract | Boundaries and failure behavior | Dependencies | Oracle | Status |
 | --- | --- | --- | --- | --- | --- |
 | WIN-PAR-01 | User correction: no requested functionality reduction. Windows must preserve the observable native feature set. | Any omitted native feature is a failure; no silent monitoring-only scope. | Native UI inventory, Windows UI inventory | Feature inventory diff, Core/Presentation tests, `WINDOWS_ACCEPTANCE_E2E_2026-08-22.md`, rendered controls | verified |
@@ -306,7 +316,7 @@ Graph/historyの外部契約と有限oracleは本表へ複製せず、UX owner�
 | WIN-PAR-04 | Preserve model token and expected-dollar presentation. | Input, cached input, output are separate token and dollar columns; unsupported/empty models are omitted. | Local session usage and pricing data | Presentation fixture totals, model view-model tests, source ownership table | verified |
 | WIN-PAR-05 | Preserve seven-cell period gauge and countdown. | 0%, intermediate, 100%, zero-day wording, weekly/monthly period. The visible label identifies time until reset; all seven cells use only the specified accent/muted surfaces, with no themed ProgressBar state colors. | Quota reset/window data | Quota boundary tests, installed UI Automation palette sampling for full/partial/empty cells, and fresh 0/10/100% host images | current release pending |
 | WIN-PAR-07 | Preserve active-thread details. | Empty, one thread, multiple parent/child/orphan rows, context/token data, stale/error retention. Keep the fixed 900×480 client; show six complete 56px two-line cards with 4px gaps and no scrollbar, then allow list-only vertical scrolling from row seven. A one-row result is not expanded and tree rails do not overlap text. | thread/list and model context data | Thread fixture tests plus fresh 900×480 images for six rows/no scrollbar and seven rows/list scrollbar, with pixel overlap measurement | local independent PASS: installed six/seven-row images; same-SHA CI pending |
-| WIN-PAR-08 | Preserve legal-notice view and licensing text. | Accessible while authenticated and unauthenticated; `UX-20260822-UX-002` pre-authored chapter paging exposes the complete text in the fixed viewport, with chapter position, Back, and Close always visible. | Repository license notices, `UX-20260822-UX-002` chapter paging | Legal source/paragraph manifest, page-hash join, and fresh Legal image | unverified |
+| WIN-PAR-08 | Preserve legal-notice view and licensing text. | Accessible while authenticated and unauthenticated; UX §4.5 defines source order, complete-text chapter paging in the fixed viewport, page position, previous/next boundaries, failure state and Close. | Repository license notices, `WINDOWS_UX_SPEC.md` §4.5 | Complete packaged-text reconstruction, previous/next/Close effects and fresh Legal image | unverified |
 | WIN-PAR-09 | Preserve locale/timezone behavior. | Supported locales, fallback locale, absolute vs relative time semantics. | Existing localization/time helpers | Localization tests, en/de/unknown fresh images, timezone settings image | verified |
 | WIN-PAR-10 | Preserve custom window behavior where applicable. | No accidental data loss on close; child windows are single-instance and cancellable; all six top-level surfaces support one native move gesture plus Minimize/Close, while only Graph supports native resize and Maximize/Restore. | Windows geometry/DPI/non-scroll reference, UX-002, window lifecycle | Fresh process HWND/rect/control trace and child-window captures | unverified |
 | WIN-PAR-11 | Preserve strict transport/API safety. | Fixed endpoint policy, size/type/schema validation, no redirects/cookies/proxy/decompression, redacted failures. | REST contract | Existing security tests plus expanded endpoint tests, contract gate | verified |

@@ -26,11 +26,7 @@ WIN-CONNECTION-GUIDANCE-603
 
 ## 0. 状態と適用範囲
 
-状態: `REQUIREMENTS_SELECTED / PRODUCT_PENDING`
-
-SSH-001/RC-061〜063の接続・保存・headless契約は本仕様へ伝播する抽出正本であり、状態は
-`REQUIREMENTS_SELECTED / PRODUCT_PENDING`とする。installed API serviceのexact command、実装、host、
-artifact、fresh image、独立製品判定は未取得で、文書から製品PASSを主張しない。
+本書は登録UX契約の正本である。接続・保存・headlessの責務はPRODUCT/DATA/WIREのownerへ参照で結合し、installed起動commandはPRODUCTのlauncher/service契約に従う。仕様の規範性と、実装・host・artifact・fresh imageによる品質確認の進捗を混同しない。文書が存在することだけで製品PASSを主張しない。
 
 この文書は、Windows版を「表示できるもの」にするためではなく、顧客が迷わず
 監視・接続・復旧・設定・更新・削除できる製品として設計するためのUX正本である。
@@ -38,13 +34,19 @@ X版はデータ意味論、状態、所有権の参照元であり、Windows版
 無条件に複製する根拠にはならない。Windows固有の判断は、この文書に目的・代替案・
 採用理由・影響する要求ID・受入証拠を登録しない限り採用してはならない。
 
-要求抽出が `EXTRACTION_COMPLETE` になるまで、未確定の契約は文書化に限定し、実装、テスト、
-ビルド、インストール、画面評価、成果物差し替えを行わない。Issue #349で利用者が確定した
-`WIN-PARITY-UX`、`ACCOUNT-UX-134`およびI18N ownerの`PROC-I18N-01`に属する下記Main構成と
-Linux timezone設定、Issue #422で利用者が選択したWindows版の`WIN-THEME-422`だけは有限scopeの実装・直接評価対象とする。この限定決定は本書全体の
-`PRODUCT_PENDING`を解除せず、他の未確定契約を`EXTRACTION_COMPLETE`として扱う根拠にしない。
-Issue #590で利用者が依頼したSettingsの2タブ切替に限り、`WIN-SETTINGS-TABS-590`も有限scopeの実装・直接評価対象とする。
-Issue #603で利用者が依頼したWindow境界、Settings、接続案内の6点は、`WIN-WINDOW-BOUNDARY-603`、`WIN-SETTINGS-TABS-590`、`WIN-SETTINGS-REFRESH-603`、`WIN-CONNECTION-GUIDANCE-603`を有限scopeの実装・直接評価対象とする。
+実装開始には、対象経路の全入力、採否、状態、操作結果、失敗時保持、外部依存がowner仕様から一意に決まることを必須とする。未決定条件を実装へ持ち越さない。対象はユーザーが許可した要求とその直接依存に限り、他の契約の文書化や過去の実装許可を理由にscopeを増やさない。品質確認の未完了は仕様未決定を意味せず、仕様確定も品質確認完了を意味しない。
+
+## RECORDED-USAGE-SCOPE-604 — 既存の期間・価格・描画仕様の保持
+
+PRODUCTの同IDは原本集計と保存値の資格を定め、既存UIを置換する権限を与えない。ユーザーが要求していない「記録範囲」、rolling＋UTC月の期間一覧、記録分／保存観測の切替、全保存値の点表示、階段強制は採用しない。
+
+- Mainの期間・モデル別tokenと隣接する参考ドルは既存契約を維持する。必要成分と採用済みcatalogがある参考額を常時「価格未確定」へ変更しない。保存済み過去額の保持と参考額計算はPRODUCT `MODEL-PRICING-463`に従う。
+- Graphは週期間・24時間・1週間・1か月、日付group内の各期間選択、前後移動を維持する。期間一覧とoriginは既存のexact保存key・掲載条件から構成し、補助APIのrolling/UTC月一覧へ置換しない。
+- 月は表示timezoneの暦月を使う。モデル系列ON/OFFで全modelの月・日合計を変えない。未計測と既知0を区別し、正の利用記録がない日は既存月仕様どおり控えめにする。
+- 正常な連続run、PCHIP、実線/破線、hover、idle、forecastは既存G137と本書の各詳細規則に従う。period identityが不明であることだけで既知観測の全連結を停止しない。疎な観測と真の欠測・非所有・reset・数値異常を区別し、未知の0/100%や利用のない帯を作らない。
+- 必要resourceを同account・同pairで受理してからatomic更新する。失敗・不一致では該当surfaceのlast-goodを保持する。補助集計の採用や新しい操作を、既存画面を利用する条件にしない。
+
+この復旧は2026-10-18のユーザー指示に従う既存UIへの復旧であり、新UI仕様の承認ではない。従来の各節と矛盾する旧置換記述を本節の根拠として再導入しない。
 
 ## WIN-WINDOW-BOUNDARY-603 — Windows各Windowの境界
 
@@ -135,7 +137,63 @@ E2Eで画面内の色を判定する追加roleは次のexact値とする。`stat
 | Graph selector popup選択行 | `#DAE9EE` | `#DCE8DB` | `#D7E5F7` | `#284B70` | `#1E5B67` | `#555147` | `#174A66` |
 | キーボードfocus枠 | `#276A91` | `#126A7F` | `#275FA8` | `#7CD2FF` | `#74D2DB` | `#F2CB78` | `#FFFFFF` |
 
-上の2表に記した21表示roleは、同じclassic色を共有するcard面／Threads子cardとaccent／quota充填をまとめると19個のclassic色キーになる。既存paletteの72キー全件について、新規presetの色は次の決定的な規則で定める。19キーは上表のexact値を優先する。残り53キーは現行`ThemePalette.Colors`の`light`列または`graphite-dark`列のRGB 8-bit値へ、下表の符号付き差分を各channelに加えて0..255へclampし、大文字`#RRGGBB`にする。`ink-dark`だけは各channel `c`に対して`c < 128`なら`floor(3c/4)`、それ以外なら`min(255, floor(5c/4))`とする。未知のclassic色キーは例外で拒否し、元の暗色へのfallbackを行わない。
+上の2表に記した21表示roleは、同じclassic色を共有するcard面／Threads子cardとaccent／quota充填をまとめると19個のclassic色キーになる。paletteの72キー全件について、新規presetの色は次の決定的な規則で定める。19キーは上表のexact値を優先する。残り53キーの基準値は次の設計表とし、実装内のpaletteを正本にしない。classic色キー自体がclassicの色であり、他presetへの派生はこの表の`light`列または`graphite-dark`列のRGB 8-bit値へ、後続の符号付き差分を各channelに加えて0..255へclampし、大文字`#RRGGBB`にする。`ink-dark`だけは各channel `c`に対して`c < 128`なら`floor(3c/4)`、それ以外なら`min(255, floor(5c/4))`とする。未知のclassic色キーは例外で拒否し、元の暗色へのfallbackを行わない。19の明示roleと補助面・状態色を同じ基準から派生させ、保存済みpresetで画面の一部だけ配色が変わることを防ぐ。
+
+| 補助色のclassicキー | `graphite-dark`基準 | `light`基準 |
+| --- | --- | --- |
+| `#0A111A` | `#15171B` | `#F1F4F8` |
+| `#101925` | `#1D2026` | `#F0F4F8` |
+| `#101F2D` | `#20242B` | `#EAF0F6` |
+| `#111A27` | `#20232A` | `#E9EFF6` |
+| `#172C42` | `#1D354A` | `#E7F1FA` |
+| `#18283A` | `#292F39` | `#EAF0F6` |
+| `#1B2735` | `#292D34` | `#EBEFF3` |
+| `#1B2838` | `#292F39` | `#EAF0F6` |
+| `#1B2A3A` | `#2B313A` | `#E8EEF5` |
+| `#1C5D91` | `#285A80` | `#D7EAF7` |
+| `#1D2A38` | `#292D34` | `#EDF1F5` |
+| `#236B9E` | `#2676A8` | `#176AAB` |
+| `#24415E` | `#30485D` | `#D7EAF7` |
+| `#263548` | `#3A444F` | `#D5DFE9` |
+| `#294968` | `#35506A` | `#D9E9F7` |
+| `#2A3A4B` | `#454C55` | `#C7D0DA` |
+| `#2C4258` | `#424B57` | `#C5D0DC` |
+| `#2D3D56` | `#444F5C` | `#C0CDDA` |
+| `#2D6193` | `#3972A0` | `#5A91C2` |
+| `#304052` | `#454C55` | `#C7D0DA` |
+| `#304A63` | `#4B596B` | `#B6C5D4` |
+| `#356087` | `#3D617F` | `#C7E0F4` |
+| `#36516B` | `#506071` | `#B8C8D7` |
+| `#3A1D24` | `#41262B` | `#FDECEF` |
+| `#3A2A13` | `#42331B` | `#FFF3DC` |
+| `#3B506F` | `#536073` | `#B6C5D4` |
+| `#405779` | `#54677C` | `#AEC1D2` |
+| `#47769F` | `#5B7E9E` | `#82A9CB` |
+| `#5DC98A` | `#70CF99` | `#16794B` |
+| `#5EA7E5` | `#6EB5E9` | `#267DB7` |
+| `#61B4EB` | `#72BDEA` | `#267DB7` |
+| `#718196` | `#9AA8B8` | `#5F7183` |
+| `#71C7FF` | `#84C7F3` | `#176AAB` |
+| `#71D39A` | `#83D4A7` | `#16794B` |
+| `#78879C` | `#A2ADB8` | `#526579` |
+| `#8A651F` | `#A98037` | `#B8892D` |
+| `#8E3D4D` | `#AB5362` | `#C77382` |
+| `#8EA1B5` | `#9DAAB6` | `#687A8A` |
+| `#9FB0C5` | `#B5BEC9` | `#526579` |
+| `#A88CF5` | `#B69CF1` | `#6A4BCC` |
+| `#B79BFF` | `#C5AFF5` | `#6A4BCC` |
+| `#B8C6D7` | `#C9D0DA` | `#526579` |
+| `#D5A43A` | `#E0B255` | `#805800` |
+| `#E06B7A` | `#E5808C` | `#A32746` |
+| `#E6A23C` | `#EBB460` | `#985F08` |
+| `#E6B85C` | `#ECC779` | `#805800` |
+| `#E7C26A` | `#EBCF89` | `#805800` |
+| `#E86E9F` | `#EC87AC` | `#B23553` |
+| `#EAF2FB` | `#F2F4F7` | `#1C2834` |
+| `#F0A35B` | `#F2BA82` | `#985F08` |
+| `#F1B35A` | `#EFC176` | `#985F08` |
+| `#F2F6FC` | `#F7F8FA` | `#1C2834` |
+| `#F5FAFF` | `#F8FBFF` | `#FFFFFF` |
 
 | preset | 基準列 | R差分 | G差分 | B差分 |
 | --- | --- | ---: | ---: | ---: |
@@ -375,11 +433,17 @@ Mainを既定の到達先とし、保存済みselectorで次回自動再接続�
 自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
 
-Mainはstrict validation済み`/v3/current`、Graphは`/v3/history/periods`と選択期間のhistory page、Threadsは`/v3/threads`を使う。account selectorは`/v3/accounts`の非秘密IDを使い、起動時の既定と起動後の選択維持は`ACCOUNT-LIFECYCLE-134`に従う。`default_account_id=null`の新規起動または現accountへの追従中は選択中accountを0件にし、Linux/Windowsとも旧accountのidentity、quota、reset、model、threadを同じ境界で消去して、selectorなし`/v3/current`の`auth_required`を表示する。選択変更時はMain、Graph、Threadsの旧account値、pair、cursor、pending、errorを一括破棄し、選択accountのresourceだけを再取得する。各取得cycleは必要な応答が全て同じaccountかつ同じpublished pairの場合だけatomic置換する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v3/current`がexact 404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
-exact 404でlegacy details modeへ入った接続は、一つの受理済みdetails rootをMain、Graph、Threadsへ同時投影し、split routeを追加要求しない。再接続時に`/v3/current`から能力判定をやり直す。
+Mainはstrict validation済み`/v4/current`、GraphはWIREのversion優先順位に従うdirectoryと選択期間のv3 history page、Threadsは`/v3/threads`を使う。account selectorは`/v3/accounts`の非秘密IDを使い、起動時の既定と起動後の選択維持は`ACCOUNT-LIFECYCLE-134`に従う。`default_account_id=null`の新規起動または現accountへの追従中は選択中accountを0件にし、Linux/Windowsとも旧accountのidentity、quota、reset、model、threadを同じ境界で消去して、selectorなしのcurrent resourceが確認した`auth_required`、`initializing`、`error`の該当状態を表示する。default nullだけを未認証の証拠にしない。選択変更時はMain、Graph、Threadsの旧account値、pair、cursor、pending、errorを一括破棄し、選択accountのresourceだけを再取得する。各data取得cycleは必要なsnapshot応答が全て同じaccountかつ同じpublished pairの場合だけatomic置換する。global account catalogはWIREに従って独立受理し、明示選択した歴史accountのdata pairとの一致を要求しない。catalog更新からdata pair/cursorを作らず、account選択の境界だけを適用する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v4/current`のexact404だけ`/v3/current`、さらにexact404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
+exact 404でlegacy details modeへ入った接続は、一つの受理済みdetails rootをMain、Graph、Threadsへ同時投影し、split routeを追加要求しない。再接続時に`/v4/current`から能力判定をやり直す。
 Mainは10秒、Graph差分はopen中60秒、Threadsはopen中5秒で確認し、Graph/Threadsを閉じている間は対応requestを送らない。SQLite、別pair、認証control応答でfieldを補完せず、quota/history/threadの再収集、
 値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は該当surfaceだけが同じlast-good rootを保持し、他surfaceやrecorderを変更しない。
 Mainが新しいcurrent/threads bundleを受理した周期には、開いたThreads詳細も同じthread行と0件状態へ直ちに追従する。独立5秒取得を追加せず、Main受理前に始めた独立応答で追従結果を戻さない。
+
+明示選択IDの消失でPRODUCTが未選択へ遷移させた場合は、Main/Graph/Threadsの旧account値と未完了要求を同じ境界で破棄する。
+Mainは「アカウント未選択」と、設定から表示対象を選べることを表示localeで示し、primary CTAを「設定」とする。
+quota/model/threadの未知を0や100%で表示せず、selectorなしdata要求によって別のdefault accountを表示しない。
+未選択中もglobal catalogの通常確認、Settings、Legal、Window操作は利用可能である。新規起動やcurrent追従中の
+default nullでは、前段のselectorなしstrict boundary表示を使う。この二つの未選択理由を相互に置換しない。
 
 ### 3.3 詳細・設定・法的情報
 
@@ -390,10 +454,9 @@ Mainが新しいcurrent/threads bundleを受理した周期には、開いたThr
 
 ## 4. 画面別UX仕様
 
-この節の抽象的な列挙順より、`DESIGN.md`の情報所有権とlogical layout式、および後発Decision
-`UX-20260822-UX-002`、`UX-20260822-GRAPH-001`、`UX-20260822-SSH-001`、
-`UX-20260823-ERROR-001`、`UX-20260823-KEYBOARD-001`の具体的な順序・分割・状態遷移を優先する。列挙順を理由に、正本の
-component順や表示所有者を変更しない。
+この節と本書の各契約節が画面の情報所有権、順序、logical layout、操作と失敗状態を所有する。
+`DESIGN.md`は非規範の構造案内であり、本書を上書きしない。過去のDecision IDだけを参照して、
+本書にない状態遷移・定数・操作結果を実装者が補わない。取得と保存の採否はPRODUCTが登録する各ownerを参照する。
 
 ### 4.1 Monitor
 
@@ -441,6 +504,7 @@ component順や表示所有者を変更しない。
   約`318px`、observed labelの文字左端が約`445px`、observed時刻の文字右端が約`865px`となる。
   Mainの時刻表記は`PROC-I18N-01`に従い、quota値、期間境界、
   reset/observed epochをUIで再計算しない。
+  期間名は受理済みの正の`window_seconds`から作る。86400、3600、60の順に割り切れる最初の単位を使い、整数の「N日周期」「N時間周期」「N分周期」、どれでもなければ「N秒周期」の意味をlocaleへ翻訳する。`monthly`やplan labelから7日・1か月を代入しない。7等幅区分は表示上の分割数であり、各区分が1日であるという意味ではない。時間barの残存割合は`clamp((reset_at-t)/window_seconds,0,1)`で、tはlive accountではUIの現在UTC時刻、historical accountでは下記の最終quota観測時刻とする。残り時間も同じtに対する`max(reset_at-t,0)`を使い、秒未満を切り捨て、日/時/分の商と余りを表示する。quotaを受理できていない初回は割合・期間名・残り時間を未知表示にし、0や7日を仮置きしない。絶対reset/observed時刻は元のepochの表示だけを行う。
 - AccountActivityはWindowsのtotal＋model別件数構成を使い、件数は`THREAD-OPEN-362`の公開対象となった現在openのSession thread集合とする。受理済みの現在accountの
   `open_session_thread_count=0`でも同じ`56px` cardに`0件`、5 modelの`0`、`68×30px`の
   `Details`を表示し、Detailsから空のThreads画面へ進める。未受理のcurrentやhistorical
@@ -459,31 +523,64 @@ component順や表示所有者を変更しない。
 - 数値、単位、説明、状態、操作の文字サイズと太さに役割差を付ける。細すぎるフォント、薄すぎる文字、
   余白だけで分断されたカードは採用しない。
 - `ui/components.slint`のMain component root styleを変更する場合は、同fileを`include_str!`で参照する
-  既存Rust source oracleを逆引きし、Issue固有testと実画面gateに加えてworkspace/all-targets testを
-  実行する。focused selectorまたはpixel gateだけで既存source oracleとの整合をverifiedにしない。
+  既存Rust source oracleを逆引きし、変更したcomponentを直接検査する関数の有限集合と実画面gateを
+  実行する。実行対象・元のassert・0件でない実件数を保持し、focused selectorまたはpixel gateだけで
+  既存source oracleとの整合をverifiedにしない。巨大なMain test assemblyを必要としない自己完結した
+  source oracleは、元の関数本文と`#[test]`のbyte同一性および参照先を確認した小さいharnessでも
+  実行できる。その結果は当該source oracleの証拠に限定し、Main全体の動作や実描画へ昇格しない。
+  関連しないworkspace/all-targets suiteを必須条件にせず、追加の直接consumerが見つかった場合だけ
+  実行前に有限集合を更新する（Issue #104の直接影響範囲に従う）。
+
+### 全surfaceの表示と操作の受理（WIN-WINDOW-BOUNDARY-603 / #604）
+
+Main / Setup / Settings / Graph / Threads / Legalの6 Windowを対象とする。実装された各button、toggle、selector、scroll、共通Window操作には、入力後に起きる既存ownerの効果と、有効/無効の条件が必要である。見えるだけで呼出し先がない操作を残さない。
+
+| surface・操作 | 完了として観測する効果 | データ不足・失敗時 |
+| --- | --- | --- |
+| Mainの推移・設定・thread詳細 | 対応するsingleton Windowが前面で操作可能。thread詳細0件も開ける | 遷移不能を黙殺せず既存の失敗表示。0件の作成で未取得を偽装しない |
+| Main再試行・認証操作 | 再試行は本書4.6の待機条件を満たすときだけ既存single-flight取得を1回開始。認証control後はfresh currentを再受理 | listener/health/controlだけでreadyにしない。旧有効値と失敗の表示を分離 |
+| Graph mode・metric・系列ON/OFF | 入力を直ちに反映し、完成した対応sceneを一括表示。隠した系列は描画/hoverからも除く | 作成途中はloading。失敗はlast-good。未取得を記録なしにしない |
+| Graph日付見出し・period・前後 | 見出しは展開だけ。exact period選択、隣接periodまたは固定幅/月単位移動。端は既存規則で無効 | 部分directoryを使って端を確定しない。選択先の値を前periodの値と混ぜない |
+| Threads | 同じmembershipの行・tree・実state/context。Main更新で同じ行集合へ置換 | 独立詳細取得失敗をMain障害にしない。未観測を停止中にしない |
+| Settingsのaccount・draft・tabs・Save/Cancel | accountだけ即時の表示対象変更。tabはdraft保持。Saveは永続化成功後にactive化。Cancel/Closeはdraft破棄 | Save失敗は開いたままactive値保持。theme選択/previewは`WIN-THEME-422`の保存済み値へ戻し、他のdraftは保持。account即時選択はCancelで戻さない |
+| Settings接続再確認・Setup・Legal入口 | 各既存actionが観測可能な状態更新または対応Windowを前面化 | process起動と接続/データ成功を混同しない。Legalは監視障害で塞がない |
+| Setup接続/認証 | prepare→listener→health→必要時control→fresh strict currentの既存順序 | 失敗した段階を保持し、該当する既存CTAを操作可能にする |
+| 共通最小化・Close・移動・focus・scroll | OS標準の効果、可視範囲、tab/focus順、隠れた全行への到達 | 操作対象が存在しないときだけ無効。データ取得待ちでWindow全体を凍結しない |
+
+fresh startupで未受理の値は`—`/既存の未取得表現とする。model未取得を確定0行、thread未取得を確定0件、quota未取得を100%として表示しない。WIREが定める初回の有効なcurrent Error応答では、その応答にある既知quota/modelだけを失敗状態・元観測時刻とともに表示し、thread件数は未知とする。成功bundleを受理したことにはせず、正常な空/正常な100%へ読み替えない。既受理世代があれば、同じaccountの失敗は有効な最後の表示と失敗状態を併記する。account境界の消去はPRODUCTに従う。
+
+月カレンダーでは、正の利用記録がない日を控えめな面と文字で表示する。ただし「記録分0」「未計測」「未来日の空欄」を同じ値にしない。未計測日に0を印字して未使用と断定しない。日別値・月合計・期間累計の意味はPRODUCTの差分規則に従い、tooltip/アクセシビリティも同じ正確な数値と既知性を伝える。
 
 ### 4.2 Trends / Graph（master: `CUM-138-06`）
 
 - Windowsの単位切替は「ドル・スイッチ・トークン」を余白付きで並べ、両ラベルを常時表示する。Graphを開いたときはトークンを選択し、つまみの位置と選択状態で単位を明示する。二重のボタン枠は置かず、ウィンドウ操作ボタンとの間隔を保つ。pointer、キーボード、UI AutomationのToggle操作で同じ切替を行える。単位変更中はスイッチを先に更新し、完成まで既存の描画を保持する。
 - 上部はタイトル／単位切替、表示タイプ・期間情報・前後移動を一つにまとめた行、凡例の3段とする。タイトル、操作行、凡例、グラフの各行間に8 DIPの縦余白を設け、操作行と凡例は同じ背景帯にまとめる。ヘッダー・中央の帯・グラフ枠を接触させず、最小サイズでもグラフの高さを確保する。週期間のselectorと固定時間の日時情報は同じ中央領域を使い、前後移動には方向と短い文字を表示する。ボタン群の角丸・高さ・余白・選択状態を揃え、通常940×640／最小700×480で情報や操作を重ねない。長い期間名は省略表示と全文tooltipを併用する。グラフに被る「時間ごとの累計…」説明文は表示せず、数値軸・単位スイッチ・凡例を維持する。
 - ローカル日付の境界は、data rectangleの上に確保した日付軸で「月/日」と下向きの目印を表示する。日付文字をデータ線へ重ねず、画面外の境界や重なる日付ラベルを描かない。既存の現地0時の細線・reset線の意味とDST処理は維持する。
-- 滑らかさは既存の単調PCHIPを維持し、描画用の曲線分割を1000px級のplotで1px以下の横刻みへ細分化する。accepted raw、変化点、極値、idle、欠測、補正、reset境界の位置と値は変更しない。欠測を実測線で結ぶ、曲線が観測範囲を越える、別reset間を結ぶことを禁止する。記録済みmodel累計が同値の区間の両端時刻・値を保持し、後続の増加を同値区間へ前倒ししない。明示task停止帯の開始・終了もmodel平滑化の境界として保持し、再開後の増加を停止帯へ前倒ししない。
+- 滑らかさは既存の単調PCHIPを維持し、描画用の曲線分割を1000px級のplotで1px以下の横刻みへ細分化する。accepted raw、変化点、極値、idle、欠測、補正、reset境界の位置と値は変更しない。欠測を実測線で結ぶ、曲線が観測範囲を越える、別reset間を結ぶことを禁止する。記録済みmodel累計が同値の区間の両端時刻・値を保持し、後続の増加を同値区間へ前倒ししない。task停止metadataだけで未使用帯や水平保持を作らず、実測の変化区間を前後へ移動しない。
 - 未使用帯はtoken不変だけでなく、保存済みの利用枠残量も同値である区間に限る。task停止が記録されていても、同区間の保存済みtokenまたは残量が変化した場合は帯を分断し、実測の変化を未使用表示で覆わない。model単独の水平線は他model・残量の変化と独立に保つ。
 - Graph専用の系列色は、暗色presetでRemaining `#56B2F5`、LUNA `#E6A23C`、TERRA `#5DC98A`、SOL `#A88CF5`、ASTRA `#EF6A6A`、明色preset（light/paper-light/sand-light/steel-light/lavender-light/mint-light）で順に `#176AAB`、`#985F08`、`#16794B`、`#6A4BCC`、`#B23553` とする。凡例・線・末尾値に同じ役割色を用い、themeのaccent色を系列の代用にしない。全16 presetのplot面とidle面に対して系列は3:1以上の輝度コントラストを保つ。Main/Threads等の共有色キーは変更しない。
 - Windowsのidle面はWIN-THEME-422表のGraph背景とidle基準色を各RGB channelで半分ずつ混合し、0.5を切り上げた最終不透明色を使う。classic-darkは `#162232`、teal-darkは `#0F3E49`、lightは `#F2F6FA` となる。旧面より控えめにしつつ背景と区別できる帯として表示し、idleの判定や時間範囲は変えない。上表のidle色および他節の固定idle色はWindowsではこの最終色へ置換する。Linux/Xの色・描画契約は変更しない。
 - 週期間・24時間・1週間の各reset期間の下部表示値も選択metricへ連動する。ドルでは保存ドルの整数表示、トークンでは全modelの保存token合計をM単位で表示する。モデル表示ON/OFFに依存せず、raw記録以外の補間／holdを合計しない。100万未満のトークンは桁区切り付き整数とし、100万以上はM表記を用いる。カレンダー・トークン軸・期間値は同じ書式を用い、M値は表示時だけ四捨五入した整数とする。軸の隣接目盛りが丸めで同じ表記になる場合は上側のラベルだけを表示し、目盛り位置と値域は変えない。hoverは桁区切り付きの正確な整数token数を表示し、raw記録の精度を維持する。
 - Windowsの表示モードは「週期間」（既定）、「24時間」、「1週間」、「1か月」とする。表示mode群と中央の日時・期間欄の列間に12 DIPを追加し、従来の中央欄marginを維持する。「週期間」は以下の既存reset期間の範囲を維持する。固定時間モードは表示窓だけを独立させ、右端を現在時刻、幅をそれぞれ86,400秒／604,800秒とする。未観測の終端から現在時刻までは空白であり、観測値を延長しない。Linuxの表示・操作は変更しない（Issue #554、#600）。
 - 「1か月」は表示timezoneの暦月を曜日7列のカレンダーで表示する。中央見出しは対象年月（yyyy/MM）だけを示し、選択済みモード名と日付範囲を重複表示しない。日曜／週初曜日は表示cultureに従い、月初前・月末後は空欄、未来日は日付のみとする。前後移動は暦月単位で未来月へ進めない。各日には全モデル（未知modelを含む）の合計使用量を一つ表示し、モデル別棒・曲線・軸・凡例は表示しない。ドル／トークン切替を日別合計へ連動し、ドルは小数2桁、トークンは日ごとの使用量を一目で比較できるよう、100万以上を四捨五入した整数のM単位（1 M = 1,000,000 tokens）、100万未満を桁区切り整数とする。日別値の文字サイズを維持し、通常幅と最小幅で量と単位を省略せずに表示する。正確なトークン数はtooltipとアクセシビリティ名に桁区切り整数で残し、保存値・集計値は丸めない。モデル表示ON/OFFは日別合計へ影響しない。日別値の採否は`G137-GRAPH-01`を維持し、記録分／未計測を区別、価格不明のモデルがある日の既知部分だけを全額として表示しない。今日を枠で示し、現在／過去の未計測日は「—」、未来日は値を出さない。正の利用記録がない日は背景と文字を控えめにし、利用記録のある日を優先して読めるようにする。記録分0と未計測はそれぞれの値・状態を残し、部分記録や未計測を一日未使用の確証へ読み替えない。最小幅ではセルを7列のまま保ち、縦方向へscroll可能とする。
-- 固定時間モードの「＜」「＞」は窓の全幅だけ移動する。過去へ移動した右端は更新中も固定し、24時間／1週間間の変更でも維持する。現在へ到達すると現在追従へ戻り、未来へは進めない。週期間モードの「＜」「＞」は、公開済み期間一覧の隣接する古い／新しいリセット期間へ移動する。固定日数を加減せず、既存selectorと同じ期間選択・取得・失敗時保持を使う。最古では「＜」、現在では「＞」を無効にし、一覧が空または1期間だけの場合は両方を無効にする。selectorからも引き続き任意の期間を選択できる。
-- 表示窓に重なる全reset期間を同じaccount・published pairから完全に受理する。週期間・24時間・1週間では各期間を既存の累計・残量・欠測規則で個別投影してから表示窓に切り出し、期間をまたぐ線・idle帯・累計の足算を作らない。月表示では同じ受理済みraw履歴を日別投影に使う。縦軸の単位と既存スケール規則は維持する。空の時間窓でも選択した期間の軸を保つ。
+- 固定時間モードの「＜」「＞」は窓の全幅だけ移動する。過去へ移動した右端は更新中も固定し、24時間／1週間間の変更でも維持する。現在へ到達すると現在追従へ戻り、未来へは進めない。週期間モードの「＜」「＞」は、後述のselectorと同じ全page受理済みselectable表示順を平坦化した一つの配列を使う。「＜」は選択index+1、「＞」はindex-1を選ぶ。先頭では「＞」、末尾では「＜」を無効にし、空または単件では両方を無効にする。取得directoryだけのquota/gap-only過去IDへ移動せず、固定日数を加減しない。期間の取得・失敗時保持・選択IDの意味をselectorと共有する。
+- 表示窓に重なる全reset期間を同じaccount・published pairから完全に受理する。週期間・24時間・1週間では各期間をPRODUCTの累計・残量・欠測規則で個別投影してから表示窓に切り出し、期間をまたぐ線・idle帯・累計の足算を作らない。月表示では同じ受理済みraw履歴を日別投影に使う。数値軸と時刻軸は本節「数値軸・時刻軸の値と座標」に従う。空の時間窓でも選択した期間の軸を保つ。
 - 週期間・24時間・1週間では表示タイムゾーンの日付が変わる0時に、幅0.5px・不透明度30%の白い細線を引く。公開された各期間の開始時刻`start_at`が表示窓内にある場合、その位置に幅1px・不透明度70%の黄色系テーマ解決色（`#E6B85C`）の区切り線をグラフ内だけに描く。期間識別に使う`reset_at`や予定リセット日時を実際の切替位置として描かない。区切り時刻をサンプルの増減や欠測、表示窓の左端から推定せず、同じ開始時刻は1本にまとめ、日付境界と重なった場合は期間区切り線を優先する。夏時間のある地域も現地暦の日付境界を用い、86,400秒ごとの線で代用しない。上部は本節の3段構成とし、空の固定高さ行を置かない。940×640と最小700×480で操作とplotが重ならない。
 - 更新では受理済みの画面・軸・日時を保持し、全候補の準備後にまとめて切り替える。失敗と遅延応答によって部分的な期間や古い表示窓を公開しない。account変更では別accountの画面を保持しない。期間ごとの描画用geometryを再利用し、固定窓では範囲内と境界の描画点だけを渡す。元履歴を間引き・書換えせず、滑らかさのために観測値を変更しない。
 - 期間、ドル/トークン、Remaining/LUNA/TERRA/SOL/ASTRAの操作を上部固定帯に置く。
   model名と累積値は同じaccepted v3 rootから取得し、ASTRAを「その他」へ集約しない。
-- 期間リストはpointer pressの1回で展開し、metricスイッチは1回の操作で切替し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。7日1分bucket由来の10,080点と契約最大1暦月由来の44,640点は対象データ規模であって、通常データを拒否する任意の上限ではない。最低動作環境と承認baselineが定義されるまでは、根拠のない絶対ms値やcold maxをUX合否条件にしない。
-- 系列ON/OFFはpointer pressで状態とボタン面を先に更新する。同じ入力でplot画像も必ず変化する。物理入力、UI状態、実描画を別経路で確認する。
-- 期間リストは選択専用resourceの公開start_atを表示タイムゾーンの日付でまとめ、公開されたexact IDを個別に選べる。現期間は空でも残し、過去期間は範囲内の公開modelに正のtotal_tokensがある場合に掲載する。不完全・legacy-unknownの正tokenも残す。quotaのみ・欠測区間のみ・tokenが0または未取得の過去期間は通常一覧に載せないが、未使用とは判定しない。選択とpair再整列は同じ選択用resourceを使い、日・週・月の時間窓は従来の取得directoryでquota/欠測区間を取得する。取得cacheはresourceとaccountで分離し、選択resourceのexact404だけ旧directoryへ戻る。その他の失敗は既存の失敗表示とlast-good保持を維持する。見出しの展開では期間を変更せず、同日の期間を統合しない。ディレクトリ更新でも残る選択IDと展開操作を保持し、選択IDが除外されたときは現期間へ戻す。31日より古い保存期間も同じ操作で選べる（#646）。
+- 期間リストはpointer pressの1回で展開し、metricスイッチは1回の操作で切替し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。7日1分bucket由来の10,080点と互換31日窓由来の44,640点は対象データ規模であって、通常データを拒否する任意の上限ではない。通常処理時間の絶対msは保証せず、入力への即時acknowledgement、UI thread外処理、既存deadlineでの失敗隔離を合否条件とする。根拠のないcold maxは追加しない。
+- 系列ON/OFFはpointer pressで状態とボタン面を先に更新し、完成sceneの描画・hover対象をその状態へ一致させる。対象系列の描画要素がある場合は、OFFでその要素が消え、ONで採用済みの同じ値・線種・境界の要素が戻る。対象系列に採用点も描画要素もない場合はplotのpixel差を要求せず、選択面と可視状態の変更を確認する。表示差を作るために値・線・帯を追加しない。この選択状態は以後のscene更新でも保持する。物理入力、UI状態、実描画/hoverへの反映を別経路で確認する。
+- 期間リストは選択専用resourceの公開start_atを表示タイムゾーンの日付でまとめ、公開されたexact IDを個別に選べる。現期間は空でも残し、過去期間は範囲内の公開modelに正のtotal_tokensがある場合に掲載する。不完全・legacy-unknownの正tokenも残す。PRODUCTの未解消の旧利用記録を持つperiodも、serverが掲載した選択肢をそのまま残す。clientが掲載後の不明model値を見て再filterしない。選択後に確認できる数値がない場合は未取得と原本不足の表示を維持し、0・未使用・100%を作らない。この保持対象を除き、初めからquotaのみ・欠測区間のみ・正のmodel記録がない過去期間は通常一覧に載せないが、未使用とは判定しない。選択とpair再整列は同じ選択用resourceを使い、日・週・月の時間窓は従来の取得directoryでquota/欠測区間を取得する。取得cacheはresourceとaccountで分離し、選択resourceのexact404だけ旧directoryへ戻る。その他の失敗は既存の失敗表示とlast-good保持を維持する。見出しの展開では期間を変更せず、同日の期間を統合しない。ディレクトリ更新でも展開操作を保持し、選択は次項の明示的な追従規則で決める。31日より古い保存期間も同じ操作で選べる（#646）。
+- selectorの表示順はwireの配列順から独立させる。各periodのstart_atをactive表示timezoneのlocal dateへ変換してgroup化し、groupは「currentを含む」優先、残りはlocal date降順とする。group内はcurrent優先、その後はstart_at、reset_at、IDの順で全て降順とし、IDの比較はUTF-8 unsigned byte辞書順とする。これを平坦化した同じ配列を選択indexと前後移動の唯一の順序とし、popup側で別にsortしない。公式resetが後方へ動いてもcurrentは先頭であり、全page受理済みの掲載selectable IDへ隣接移動できる。取得directoryだけのIDは前項の通り移動対象に含めない。この順序は表示用であり、providerの取得順や実際の期間の新旧を推定する規則ではない。日付・時刻・raw IDは変更しない。
+- 選択intentは「current追従」と「過去ID固定」の二つとする。初回と、利用者がcurrentを選んだ場合はcurrent追従であり、一覧更新ごとに受理済み`current=true`のIDを選ぶ。currentがない完全な一覧では表示順の先頭、空一覧では選択なしとし、追従intentは保持する。利用者が過去periodを選んだ場合（前後移動を含む）はそのexact ID固定とし、更新後もIDがあれば保持する。固定IDが除外された場合はcurrent追従へ戻り、同じ初回規則で選ぶ。timezone・locale・metric変更、wire版変更、page分割だけでは選択intentと残存IDを変更しない。timezone変更ではgroupと順序だけを再計算し、架空のcurrentや近接resetの代替IDを作らない。
 - 期間リストとmetricスイッチはユーザーの選択で状態を変え、pollやlocale通知による同値候補の再公開では選択へ読み替えない。開いているリストを自動で閉じない。
+- 開いているpopupの未確定の強調候補は確定済み選択とは別に持ち、periodはexact ID、日付見出しは表示timezoneのlocal dateで識別する。
+  完全な一覧更新で順序が変わっても、残る同じ候補を強調し、行番号を選択identityへ使わない。強調periodが消えた場合は、
+  更新後の要求選択IDが残ればそれ、なければ表示順の最初のperiodを強調する。periodが0件なら強調なしとし、Enterで選択を作らない。
+  強調見出しだけが消えた場合も同じperiodへの戻り先を使う。強調periodを表示するために必要なgroupだけを展開し、その他の残るgroupの展開状態を維持する。
+  利用者が強調periodを含むgroupを折り畳んだ場合は、その見出しを強調し、Enterは再展開だけを行う。
+  強調の移動・一覧更新だけではperiodを確定しない。Enterはその時点の強調対象にだけ作用し、取得失敗では前回の完全一覧と強調を保持する。
 - 期間変更は`idle → loading → ready|confirmed-empty|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
   accepted same-pair history page集合のparseとpresentation projectionはUI thread外で行う。SQLite再読込やsampleの
   canonicalization/merge/recalculationは行わない。既存の遅延残量補間と終端保持はpresentation-onlyで行い、
@@ -491,39 +588,37 @@ component順や表示所有者を変更しない。
   indeterminate progressと「期間データを読み込み中…」を表示し、`記録なし`や`利用不可`を先に表示しない。
   same-pairの全pageが0件と確定した場合だけ`confirmed-empty`へ進む。loading中は直前に完成したgraph・
   metric・軸を保持し、候補完成時だけ1回のUI publishで全てを同時に差し替える。
+  入力中の要求ID/mode/metricと受理済みsceneはPRODUCT `G137-10`に従って分離する。
+  旧graphを保持している間はその期間・単位を旧dataのまま示し、要求先と
+  「直前のグラフを表示中」をloading/error表示へ含める。新要求の値を既に表示したように見せない。
 - 期間を連続選択した場合は旧候補をcancelし、最新revisionだけをpublishする。失敗・timeout・cancelを
   空graphや部分graphへ変換せず、直前graphを保持してbounded errorを表示する。キャッシュ済みで次paint
   までに切替できる場合はprogressを点滅させない。入力への反応と期間データ完成は別条件として確認する。
-- 週期間モードのcurrent期間の`start_at/end_at`はCOREが同じ最新quota観測から動的に投影したpairを唯一のauthorityとする。
-  期間欄、メイン画面の利用期間、selected period start、plotの横軸左端・右端はaccepted periods resourceの
-  同じpairをそのまま使い、Windowsで再計算しない。completed/historical期間は保存済みpairを使う。quotaの
-  `reset_at`はリセット時刻表示の別項目である。current periodの
+- 週期間モードのcurrent期間の`start_at/end_at`は、COREが最新quotaの公式windowとPRODUCT `CURRENT-PERIOD-BOUNDS-129`の同periodデータ観測終端から投影したmetadataを唯一のauthorityとする。quota原時刻だけで後続model点を切り捨てたり、clientの現在時刻で終端を延ばしたりしない。
+  期間欄、selected period start、plotの横軸左端・右端はaccepted periods resourceの
+  同じpairをそのまま使い、Windowsで再計算しない。completed/historical期間もPRODUCTから投影・公開されたpairを使う。quotaの
+  `reset_at`はリセット時刻表示の別項目であり、Mainのリセットまでの区間は公式originとresetを使う。current periodの
   `end_at`は同じatomic published rootのaccepted観測終端であり、UI取得後のlocal現在時刻へ延ばさない。
   completed periodは保存された固定`end_at`までを右端とする。
-- 週期間モードの期間欄、横軸、折れ線、ホバー値は同じselected reset IDだけから一括投影する。poll後の
-  bounded reset aliasは60秒以内だけ同一期間として選択を維持し、欄だけ旧期間・plotだけ現在期間の
-  混在を禁止する。
-- 既定の現期間を選択している間は、期間ディレクトリ更新後も`Current=true`を追従する。ユーザーが明示的に選んだ
-  過去期間は維持する。Mainが受理したquotaのreset/window変更は期間取得を促す通知として扱い、canonical IDは
+- 週期間モードの期間欄、横軸、折れ線、ホバー値は同じselected exact reset IDだけから一括投影する。60秒以内でも異なる公式IDを同一期間として扱わず、欄だけ旧期間・plotだけ現在期間の混在を禁止する。旧wire sampleの所属互換だけはWIREのexact一致優先規則に従い、selectorのID同一性へ流用しない。
+- 期間更新時は上記の選択intentを使う。Mainが受理したquotaのreset/window変更は期間取得を促す通知として扱い、canonical IDは
   same-pairの期間ディレクトリから決める。同じquota pairの観測更新だけでは追加取得しない。通知以前の遅延応答は
   revisionで棄却し、選択やgraphを古い期間へ戻さない。
-- 確認済み期間開始から最初の実測へ、Remainingは現期間・過去期間とも100%を起点とする表示専用実線を引く。
-  モデルの0起点も確認済み開始を持つ現期間・過去期間へ適用する。0/100%の実測観測は不要であり、最初の実測が正のtokens/95%でも接続する。
-  開始authorityと欠損を跨がない条件は`G137-6`に従い、補助点をhoverの実測値として表示しない。
-  開始authority不明の期間や固定時間窓の左端からは値を作らない。
+- 期間起点は時刻の証拠であり、値の証拠ではない。現期間・過去期間とも最初の実測以前へ0 token/100%の補助線を作らない。公開`origin_at`を確認できる場合は横軸起点として使い、最初の観測とその時刻を維持する。先頭の値が欠けている場合は未記録区間として示す。原本復元で回復した観測は通常の実測として表示する。raw/API/hoverに架空の起点を追加しない。
 - Windowsグラフの角丸枠は内容の描画に覆われず全周を連続して表示する。内容のclipと枠線の描画順を分離し、枠線はplotのhoverや入力を妨げない。通常・最小サイズとresize時にも角を保持する。
 - Windowsでは右端の常時数値ラベル・leader・専用gutterを置かず、その横幅をplotへ割り当てる。線端の切れを避ける通常の描画余白と軸ラベルの余白は、数値表示の専用領域とは分離する。横方向のresize差分はplotへ割り当て、縦軸の意味と期間の端点は変えない。Linuxの右端ラベルは従来どおり維持する。
-- Windowsのplot内でマウスを動かすと、近い一つの実観測時刻の日時と表示中の全系列をまとめたツールチップを出す。日時は表示timezone、Tokensは元の整数精度、Dollarsはその観測点のaccepted/read-time補正値、Remainingはraw観測値を用い、単位を明示する。欠けた系列は`—`とし、補間・hold・synthetic tailを実観測値として出さない。viewport内の同じreset期間だけを探索し、confirmed gapや非所有区間を越えて別時刻の値を拾わない。非表示系列は除外し、pointer離脱・scene/metric/表示系列の変更・リサイズ時に旧ツールチップを残さない。観測索引はscene生成時に保持し、pointer移動で全履歴の再投影や全件走査を行わない。
+- Windowsのplot内でマウスを動かすと、近い一つの実観測時刻の日時と表示中の全系列をまとめたツールチップを出す。日時は表示timezone、Tokensは元の整数精度、Dollarsはその観測点のaccepted保存額、Remainingはraw観測値を用い、単位を明示する。欠けた系列は`—`とし、補間・hold・synthetic tailを実観測値として出さない。viewport内の同じreset期間だけを探索し、confirmed gapや非所有区間を越えて別時刻の値を拾わない。非表示系列は除外し、pointer離脱・scene/metric/表示系列の変更・リサイズ時に旧ツールチップを残さない。観測索引はscene生成時に保持し、pointer移動で全履歴の再投影や全件走査を行わない。
+  pointerのxをsceneの同じ横軸でUTC秒tへ逆変換し、そのtを含むperiod表示範囲・連続所有区間内で候補を求める。所有metadata欠落・空配列・開始nullにより所有が未確認の範囲は、PRODUCT G137の未確認spanとして扱う。その同じ未確認区間内の保存済み点も候補にできるが、tooltipは選んだ点の元日時/値を示すだけで、pointer時刻の観測や所有を証明しない。候補は表示中のmetric/Remainingの実観測値が一つ以上ある元timestampで、pointer位置と候補の間に当該表示系列の未回復gapまたは明示非所有区間がある場合は候補にしない。exactな実観測時刻tそのものはgap内でもその元値を表示できる。距離`abs(timestamp-t)`が最小の候補を選び、同距離なら早いUTC秒、同じUTC秒の別periodならexact IDのUTF-8 unsigned byte昇順を使う。週期間modeは選択IDだけを対象とする。複数periodが重なる固定時間modeでも一つのperiodの同じ観測rowだけを使い、他periodのmodelや別時刻のRemainingを同じtooltipへ継ぎ足さない。候補0件、全系列OFF、plot外ではtooltipを出さない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
-- Graph の線表示上部に、表示範囲内の最初の実測日時・残量、破線の未確認・欠測の意味を常時読める折返し文で示す（`Graph.HistoryEvidence`）。非所有区間がある場合は最長区間の開始・終了と「このアカウントを記録していない／区間内利用量不明」を示す。残量から使用者・model 使用量を特定せず、範囲外の記録まで不明と断定しない。回復した quota-only 点は数値を表示するが、未取得 model を0や確認済みにしない（`HISTORY-RECOVERY-614`）。
+- Graph の線表示上部に、表示範囲内の最初の実測日時・残量、破線の未確認・欠測の意味を常時読める折返し文で示す（`Graph.HistoryEvidence`）。非所有区間がある場合は最長区間の開始・終了と「このアカウントを記録していない／区間内利用量不明」を示す。所有metadataが不足する範囲は「アカウントの記録区間が未確認／区間内利用量不明」と区別し、欠落・空配列を所有済みとして非表示にしない。いずれも未使用の意味にせず、保存済みの表示可能な点は保持する。残量から使用者・model 使用量を特定せず、範囲外の記録まで不明と断定しない。回復した quota-only 点は数値を表示するが、未取得 model を0や確認済みにしない（`HISTORY-RECOVERY-614`）。
 - 完全集計から省略された未使用familyは、G137-2の同一reset・既知0・過去正値なし条件を満たす場合だけ、表示合計0を実線とhoverで示す。
   完全な空集合と取得不能を区別し、既知0 memberの省略を実際のモデル版の利用開始後も欠測扱いにしない。未取得・既知0でないmemberの欠落・正の累計の消失は従来の欠測表示を維持する。rawモデル行、集計額、idleの証拠へ表示0を追加しない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
-- `reconstructed-from-session`、`unknown`、`unavailable`および（`legacy-unknown`を除く）`models_complete=false`ではモデル数値を表示せず、
-  model key/sourceと欠損metadataだけを表示する。`legacy-unknown`は保存済みの同じmodel keyの値だけ表示でき、確定した集計・予測には使わない。月カレンダーだけは`G137-GRAPH-01`の日別配賦条件を満たす保存値を「記録分」へ表示上加算し、model集合の完備や確定した日合計へ昇格しない。同一runの同一非空model集合・lossless raw tokenとraw Remainingの完全不変・欠測／異常／confirmed gapなしを全て満たす場合だけidle判定に利用できる。
+- `reconstructed-from-session`、`unknown`、`unavailable`ではモデル数値を表示せず、
+  model key/sourceと欠損metadataだけを表示する。`confirmed`の部分集合には確認できたmodelの数値を表示し、`models_complete=false`だけを理由に消さない。`legacy-unknown`は保存済みの同じmodel keyの値だけ表示でき、確定した集計・予測には使わない。月カレンダーだけは`G137-GRAPH-01`の日別配賦条件を満たす保存値を「記録分」へ表示上加算し、model集合の完備や確定した日合計へ昇格しない。同一runの同一非空model集合・lossless raw tokenとraw Remainingの完全不変・欠測／異常／confirmed gapなしを全て満たす場合だけidle判定に利用できる。
   直接観測(`confirmed`)または保存済みlossless `legacy-unknown`の値を通常実線とし、補間・hold・smoothing・予測はUI presentation-onlyでAPI/DBへ書き戻さない。
   これらの破線はDBまたは取得記録の欠損・異常を示すNG表示であり、正常な実線の代替ではない。
-  current期間の終端分が集計中で、直前の確定分まで同じ系列の記録がある場合、その先のモデル線を実線・破線・idleで延長しない。公開された時間軸と原観測は保持する。確定済みの分の欠損、過去期間、明示されたgapまたはモデル補正を、この集計待ち条件で隠してはならない。
+  最終実測と公開終端が同じcanonical minuteならPRODUCTの終端規則に従い実測点で止める。後続minuteのmodel欠損を、current期間の末尾という理由だけで「集計待ち」と推測して隠さない。公開された時間軸と原観測、欠損・gap・棄却理由を保持する。
 - グラフでは`gpt-6-luna`をLUNAに集約する。旧family集計欄の0から同じfamilyの正確なmodel IDの保存実測へ表現が切り替わっても、その名前の違いを未取得と判定しない。実測線とhoverは同じfamilyの記録値を示し、本当に未確定の部分だけを破線にする。元model keyと保存値は変更しない。
 - model系列の有限表示状態は次を正本とし、model名ごとの全直積には展開しない。
 
@@ -535,21 +630,17 @@ component順や表示所有者を変更しない。
   | 正常な直接観測点のtimestampだけが疎 | timestamp差だけでは欠損化せず、同値・増加とも3px実線で結ぶ。明示的なunavailable、confirmed gap、異常とは分離する（`G137-4`,`G137-7`） |
   | model値自体が未取得、または確認済みrecorder停止区間 | model key/sourceと欠損metadataだけを表示し、数値を0補完しない。必要な破線bridge／holdは表示専用で、API/DB、集計、idle判定へ反映しない。`Remaining`からmodel値やtailを外挿しない |
   | 累積が後退し、その後に回復 | source completenessを問わず最後のaccepted値を下回るrawを表示値へ採用せず、当該modelだけを回復点まで細い破線hold／bridgeとする（`G137-3`） |
-  | period内の最初の既知点 | 公式起点を確認できない場合は0からの斜線を捏造せず、その値・時刻から開始する。公式起点を確認できた場合の表示専用baselineは`G137-6`に従う |
-  | 60秒以内のreset alias／正式reset境界 | 前者は同一periodへ正規化し、後者は別periodとして混ぜない |
+  | period内の最初の既知点 | 公式起点を確認できない場合は0からの斜線を捏造せず、その値・時刻から開始する。公式起点を確認できても値は生成せず、先頭未記録区間の扱いは`G137-6`に従う |
+  | 旧wireのreset alias／正式reset境界 | 旧sampleの所属受理はWIREのexact一致優先・一意候補の互換規則に従う。時刻の近さでperiod IDを統合しない。公式の別resetは別periodとして保持 |
   | 確認済み0／model行なし | 前者だけ0として描き、後者は未知として数値・線を作らない |
-  | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える。ドルはtokenから得る派生表示値でありidle authorityにはしない。同じmodelのraw token不変runでドルだけが変化または欠測した場合は、DB/API rawを変えず左端の有限ドル値へread-timeで水平補正する |
+  | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える。各metric自身のaccepted観測を表示し、token同値を理由に保存USDの変化・欠測を補正しない。USDはidle authorityにしない |
 
-  アイドル帯はsame `reset_at`のperiod内で、run全体が`confirmed && models_complete=true`または保存済みlossless token vectorを持つ`legacy-unknown`であり、同じ非空model key集合、全raw
-  `total_tokens`がexact equal、raw Remainingがfiniteかつbitwise equalであり、confirmed gap、token／Remainingの欠測、観測値の矛盾が
-  ない区間だけを候補にする。`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値はendpointまたは
-  矛盾なしのauthorityにしない。ただしexact 60秒の1 sampling slotだけが`unavailable`で、その前後がsame reset、同一model集合、全raw token／Remaining exact equalかつgapなしなら、そのrowをread-time表示入力から除外して分断しない。2 slot以上、前後値またはmodel集合の相違、`unknown`、その他の不完全rowは分断する。task lifecycleだけは
-  値変化のauthorityにせず、exact equalなaccepted raw値をactive metadataだけで使用済みに変更しない。timestamp不連続だけは
-  gapまたは利用の証拠にせず、正常なaccepted raw endpointが上記条件を満たすintervalを分断しない。ドルの変化・欠測・異常はidleの開始・分断・終了条件にしない。上記条件を満たす連続10分以上のrunだけをgray表示し、同じX範囲の全modelとRemainingを1px水平実線にする。観測点数やaccepted raw endpointを欠く欠測時間だけで確定しない。
+  アイドル帯の採否はPRODUCT `G137-5`を唯一の定義とする。same reset内の同じ非空model集合について、全rowのlossless T/I/C/W/O（optional成分の既知性を含む）とraw Remainingが不変で、同節のsource・numeric採否・未回復gap条件を満たした連続10分以上だけをgray表示する。task lifecycle、表示丸め、USDの値をその証拠にしない。
+  限定1 sampling slotの例外は`G137-4` / `G137-5`の全条件を使い、そのslotを元row列・他metric・hoverから削除しない。前後のraw tokenだけでUSDの明示欠測を補完しない。tokenとRemainingは同じbandのX範囲を1px水平実線にし、USDは自身の不変の実測だけ1px水平実線、実測増加は3px、欠測・棄却異常は1px破線にする。帯のために未知USDを作らない。観測点数やaccepted raw endpointを欠く欠測時間だけで確定しない。
   10分は画面幅に依存しない意味閾値とし、pixel幅filter、最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
   Remainingは`G137-6`に従い、accepted raw値を元時刻・元値の証拠として保持し、token増分またはtask lifecycleでraw値を
   移動しない。表示geometryも同値反復を含む全accepted観測点を通過し、横ばい区間と変化時刻を保つ。隣接観測間だけを
-  単調PCHIPの3px実線でつなぎ、実測の横ばいを滑らかな減少へ置き換えない。確定idleだけはbandと同じX範囲のexactな1px水平実線として分離する。raw-null、unavailable、confirmed gap、異常、
+  各隣接区間の増加・減少・不変を保つPCHIPの3px実線でつなぎ、実測の横ばいや反転を変更しない。確定idleだけはbandと同じX範囲のexactな1px水平実線として分離する。raw-null、unavailable、confirmed gap、異常、
   terminal holdだけを1px破線の予測とし、導出値をanchorへ昇格させずAPI/DBへ書き戻さない。
   `Remaining`のeffective値からmodel系列の値またはそのperiod tailを外挿しない。
   raw-null補間、gap、異常、終端hold等の欠測・予測の破線は
@@ -581,12 +672,36 @@ component順や表示所有者を変更しない。
 - finite oracleは、shared rolloverのperiod A→B `100% / $1 → 41% / $323.674247`、
   `graph_delayed_quota`のfirst observation・遅延quota・missing quota、model別回帰/回復、
   confirmed gap、raw-null quota、current/historical右端、no-historyの9 causal caseとする。
-  ASTRAのtoken/指定4単価、旧3モデルだけが既知のincomplete period、period選択後pollのbounded reset aliasは
+  ASTRAのtoken/指定4単価、旧3モデルだけが既知のincomplete period、period選択後pollのexact reset ID維持は
   今回観測した同じ到達経路へ統合し、別の全直積を作らない。
   X/Windowsは同じfixtureの固定期待値を独立に検査し、値形状による100%・7日・quota-only除外、
   platform helperから期待値を生成する循環oracle、新workflow gate、全test/all-suite/全直積を追加しない。
 - 操作帯を開閉してもplotの位置・高さを変えず、軸ラベルや値を確認する操作を隠さない。
 - 記録なし、欠測、アイドル、活動、0/中間/100を明示的な設計状態として扱う。
+
+#### 数値軸・時刻軸の値と座標
+
+月カレンダーを除くGraphで、左軸は選択metricのmodel累積（TokensまたはUSD）、右軸はRemainingの百分率を表す。RemainingをtokenやUSDへ換算せず、左軸の目盛りをRemainingの量として読ませない。Remainingを表示するときは右の百分率目盛りを表示し、RemainingをOFFにしたときだけ右の目盛文字を隠す。系列OFFによる線の非表示だけでは左右の数値domainを変えない。右端のmodel値labelやleaderを置かない規則は、百分率軸を隠す規則ではない。これらはLinuxの対応Graphにも同じ数量の意味で適用し、platformごとのfont・色・window寸法を統一する意味ではない。
+
+1. model側の最大値Vは、PRODUCTのnumeric採否とfamily表示membershipを完了した全model系列を表示窓へ切り出し、その窓内のaccepted anchorと描画される曲線・欠測bridge/holdの値の最大から求める。系列OFFも同じpotential系列を計算対象に残す。別periodの最大値を足し合わせず、窓外の値はその窓へ入る境界geometryを決めるためにだけ使う。表示曲線は下節の形状保持補間なので、窓内の端点と切出し境界で最大を求められる。値がない場合はV=0とするが、これは観測値0を作ることではない。描画domainの上端はM=max(1,V)、下端は0とする。最低spanの1は、全0・空データ・1 USD未満でも有限の軸を構成するための製品表示値であり、観測点・予算・公式上限ではない。
+2. Remaining側のdomainは常に0..100%である。modelのM・選択metric・model欠測から変更せず、quotaからmodelのMを逆算しない。plot内の上から下への正規化座標をyとすると、model値vは`y=0.99-0.98*(v/M)`、Remaining値pは`y=0.99-0.98*(p/100)`へ対応する。上下1%は線の端を枠に重ねないための表示余白で、負の利用量や100%超のquotaではない。rawの採否と正確な整数計算を終えてから座標の近似計算へ移り、線を収めるためrawを丸め・clampしない。
+3. major目盛りはi=0..4について、左が`M*i/4`、右が`25*i%`であり、上式による同じyに置く。下端の0はy=0.99、上端のM/100%はy=0.01の目盛りとして表示する。これらを余白外端のy=1/0へ移さず、ラベルの値と位置を一致させる。左のUSDは`$`と小数2桁、Tokensは本節のM/桁区切り整数書式を使い、表示時だけPRODUCTの丸め規則を適用する。右は0/25/50/75/100に`%`を付ける。丸めによる重複ラベルは本節の上側優先規則で省略し、目盛りの位置・M・hover値は変えない。空/全0でも軸を描けるが、数値が未取得のmodelの線・点・利用量0を追加しない。
+4. 横軸の範囲は同じ受理済みsceneのS=start_at、E=end_atとする。S<Eなら`S+floor((E-S)*i/4)`（i=0..4）の整数UTC秒を候補とし、同じUTC秒の候補は一つにする。目盛りと観測のxは`(t-S)/(E-S)`へ対応し、raw時刻を等間隔bucketへ移さない。S=EならそのUTC秒を中央の一目盛りとし、実測点も中央へ置き、長さのある線や架空の終端を生成しない。固定時間modeの空窓も受理したS/Eを保持する。
+5. 横軸目盛り・日付境界・hoverの時刻文字列はI18N `PROC-I18N-01`に従う。異なるUTC秒の目盛りが同じ表示文字になる場合は年・秒の精度またはoffsetで区別し、時刻をずらして文字だけを異ならせない。ラベル候補は元のiが0、4、2、1、3の優先順で置き、先に置いた文字の実測boundsと重なる候補の文字だけを省略する。重複UTC秒で除いたiは飛ばす。S=Eでは中央の一文字列だけを使う。省略によって軸domain・目盛り時刻・データgeometryは変えない。
+
+独立した数量例としてM=200では、左`0/50/100/150/200`と右`0/25/50/75/100%`は、下から`y=0.99/0.745/0.5/0.255/0.01`に対応する。左100と右50%が同じ高さであることは、50%が100 tokenや100 USDであることを意味しない。V=0でも未知modelの点は0件のままである。S=100,E=102の時刻候補は`100/101/102`、S=E=100は中央の100だけとなる。これらの表示値をDB/APIへ保存しない。
+
+#### PCHIPの値と端点
+
+本節のPCHIPは、[形状保持補間の導関数定義](https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.PchipInterpolator.html#notes)と[端点の片側推定式](https://github.com/scipy/scipy/blob/v1.18.0/scipy/interpolate/_cubic.py)を次の式で固定する。特定libraryの導入やその将来版への自動追従を要求する意味ではない。PRODUCTの同じperiod/metricの連続実測runを入力とし、reset、correction、明示欠測、非所有、未回復gapを越えて接線を共有しない。欠測bridgeはその既知両端だけを独立した2点入力とする。確定idleの水平部は式を変えず線幅だけ分離する。
+
+- 入力を時刻昇順の`(x_i,y_i)`、`h_i=x_(i+1)-x_i>0`、区間傾きを`d_i=(y_(i+1)-y_i)/h_i`とする。2点の場合は両端の導関数を`d_0`とし、線形になる。1点に補間区間はない。
+- 内点の導関数`m_i`は、隣の傾きのどちらかが0、または符号が異なる場合は0。それ以外は`w1=2*h_i+h_(i-1)`、`w2=h_i+2*h_(i-1)`として、`m_i=(w1+w2)/(w1/d_(i-1)+w2/d_i)`とする。
+- 3点以上の左端は`m_0=((2*h_0+h_1)*d_0-h_0*d_1)/(h_0+h_1)`を候補とする。`m_0`と`d_0`の符号が違えば0。そうでなく`d_0`と`d_1`の符号が違い、`abs(m_0)>3*abs(d_0)`なら`3*d_0`とする。右端は時系列を反転した同じ片側規則を使う。
+- 区間内の`u=(x-x_i)/h_i`に対して、値は`(2*u^3-3*u^2+1)*y_i+(u^3-2*u^2+u)*h_i*m_i+(-2*u^3+3*u^2)*y_(i+1)+(u^3-u^2)*h_i*m_(i+1)`とする。両端の元値を通過し、値をrun外へ外挿しない。rawの採否・同値・整数差分はこの近似座標計算に入る前に完了する。
+- 独立した数値例は`x=[0,1,2],y=[0,1,1]`の最初の区間の`u=0.25/0.5/0.75`が`0.3671875/0.6875/0.9140625`、`x=[0,1,3],y=[0,1,2]`の導関数が`[7/6,9/13,1/6]`である。反転`y=[90,95,89]`の内点導関数は0であり、95を棄却しない。線をpixelへ分割する密度は実装詳細だが、この関数・anchor・線種・境界を変更してはならない。
+
+月の日額に価格不明の寄与がある場合はPRODUCTの日別配賦規則を使い、Dollarsセルは「—」、tooltipとアクセシビリティは「金額不明」とする。既知部分の額だけを日額の位置へ出さない。Tokensの既知記録分と、無正値日の控えめな配色は独立に保持する。
 
 ### 4.3 Threads
 
@@ -652,10 +767,10 @@ component順や表示所有者を変更しない。
 - 設定破損・空JSON・途中書込み・old 4-key・invalid selectorはWelcomeを無限表示せず、Main disconnectedと
   Settings recoveryへ遷移し、recovery command count=0とする。
 - 保存成功、保存失敗、取消、再起動後の保持を同じ画面で確認可能にする。
-- WSL/remote/one-session raw recovery、ArgumentList、API到達、認証開始、認証確認、app-wide single
-  supervisor/tunnel/reapの境界は`UX-20260822-SSH-001`を正本とする。
+- WSL/remote/one-session raw recovery、ArgumentListと保存しない資格情報は本節とSECURITYのWindows bootstrap境界を正本とする。
+  認証の順序は次段落、失敗時の操作は4.6、single supervisor/tunnel/reapは4.6末尾に従う。
 
-Setupの順序はserver/API prepare→listener→readiness `GET /health`→strict `GET /v3/current`（新resourceがexact 404の旧serviceだけv3 details→v2→v1）→
+Setupの順序はserver/API prepare→listener→readiness `GET /health`→strict `GET /v4/current`（exact404だけv3 current、さらにexact404の旧serviceだけv3 details→v2→v1）→
 必要時だけauth-start→別auth-check→新しいstrict currentで固定する。auth-start/auth-checkはcontrol-onlyであり、
 応答を表示rootへmergeしない。healthだけ、またはcontrol成功だけでdata readyとしない。
 
@@ -663,6 +778,15 @@ RC-121のprofile別action意味論も固定する。WSLのserver prepare/service
 tunnelはそれぞれ独立したvisible+enabled Tab step/UIA actionであり、`action.StartForward`へ丸めない。
 `action.StartForward`はforwardingだけを表し、SetupOperationGeneration・busy・stale completionは現行世代だけを
 受理し、古い完了はcommitしない。
+
+SetupのBackは、現在stepより前のstepがあり、Setup操作がin-flightでも取消し後の終了待ちでもない場合だけ有効とする。
+有効なBackは前stepへ一つ戻り、旧SetupOperationGenerationを失効させる。busy中のBackは無効である。
+Closeはbusy中も有効とし、popupのないEscapeは有効なBackがあればBack、なければCloseと同じ動作をする。
+CloseはそのSetup操作を取消して世代を失効させ、遅れた結果で設定保存、次step、Window再表示、focus移動を行わない。
+その操作だけが所有する未完了request/childは取消し対象で、app-wide supervisorが終了確認・reapまで所有を保持する。
+Mainが既に使用中の検証済みtunnelや独立recorderをSetupのCloseで停止しない。再入場でも旧childが終了・reapする前に二つ目を起動せず、
+終了待ちを表示してBackと処理CTAを無効にする。終了後は新世代で現在stepの入力から再確認し、旧完了を成功へ引き継がない。
+完了済みの外部installや認証事実を画面の取消しだけで巻き戻したとは扱わない。
 
 Windowsのselector寸法は`WIN-SETTINGS-TABS-590`に従う。
 
@@ -688,18 +812,91 @@ Settingsから開く場合は`WIN-CONNECTION-GUIDANCE-603`に従って接続設�
 
 - GPL、第三者フォント、schema、dependency、distribution noticeを省略しない。
 - Legalは監視画面の主操作と分離し、戻る/閉じるを常時表示する。
+- 本文の正本は同じ配布物に同梱した`LICENSE`、`LICENSE.ja.md`、root/Windowsの`THIRD_PARTY_NOTICES.md`、`assets/NOTICE.txt`と各`LICENSES`本文である。外部networkやAPI正常性を表示条件にしない。章は次表の順とし、複数sourceの章は表内の順で出典名と全文を結合する。日本語の説明章だけで原licenseを置換しない。
+
+| 章 | 同梱sourceの順（root基準、Windows noticesだけWindows project基準） |
+| --- | --- |
+| 本ソフトウェア | `LICENSE.ja.md` |
+| 無保証 | `LICENSE` |
+| ライセンス | `LICENSE` |
+| フォント | `THIRD_PARTY_NOTICES.md`、`LICENSES/OFL-1.1.txt` |
+| プロトコル | `THIRD_PARTY_NOTICES.md`、`LICENSES/Apache-2.0.txt`、`LICENSES/OPENAI-CODEX-NOTICE.txt` |
+| schema | `LICENSES/Apache-2.0.txt`、`LICENSES/OPENAI-CODEX-NOTICE.txt` |
+| 第三者 | `THIRD_PARTY_NOTICES.md`、`LICENSES/MIT.txt`、`LICENSES/BSD-3-Clause-ANGLE.txt` |
+| 詳細 | `THIRD_PARTY_NOTICES.md`、`windows-client/THIRD_PARTY_NOTICES.md`、`assets/NOTICE.txt` |
+| 配布 | `LICENSE.ja.md`、`LICENSES/Inno-Setup.txt`、`windows-client/THIRD_PARTY_NOTICES.md` |
+
+  本文は章を跨いで省略・要約・重複除去しない。Markdownは書式記号だけを表示用に除去できるが、copyrightを含む本文、code内の文字、linkの表示文字とURLを失わない。
+  Legalの本文内scrollへ依存せず、実際のfont/本文幅/本文高で折り返した行を先頭からpageへ詰める。次の段落全体が収まるなら同pageへ置き、収まらず現pageに本文があれば次pageへ送る。1段落だけで本文高を超える場合だけ表示行の境界で分割する。fontを縮小せず、page境界だけで原文へ文字を追加・削除しない。章を跨いで同pageに詰めない。
+  全pageの順は章順・原文順、初回は先頭pageとする。前/次で1 pageずつ移動し、端だけ無効とする。前ボタンの「戻る」は前pageを意味し、Window終了は常時有効なCloseで行う。現在の章名と全体のpage位置を表示し、再flowでpage数が変わる場合は変更前に先頭だった原文位置を含むpageへ移す。
+  source欠落・読取り失敗では不完全なlicenseを正常表示せず、法的文書を取得できず再インストールによる復旧が必要であることを表示localeで一つ表示する。前/次は無効、Closeと他画面の監視は利用可能とする。自動のインストールや配布許可の判断を行わない。全pageから復元した本文と同梱sourceの意味上の全文一致、切れ・重なりのない実画面、前/次/Closeの効果を受入で確認する。
 - HelpはSSH、WSL、API、認証、更新、アンインストール、障害時の情報採取範囲を利用者向けに説明する。
 - UIなしsilent RESTはSlint component/window/event-loop生成0、`DISPLAY`/Wayland/X11依存0、Slint HWND=0
-  （visible/hidden HWNDとも0）、headless snapshot builder+read-only publisherだけとする。実装・host・artifact
-  証拠未取得のためこのGUI依存ゼロ契約は`PRODUCT_PENDING`である。
+  （visible/hidden HWNDとも0）、headless snapshot builder+read-only publisherだけとする。実装と実hostによる証拠がなければ、この契約の品質確認完了とは扱わない。
 - Help/Connection guideはMain client `900×542 logical`内の情報surfaceであり、独立Window/HWNDを
   作らない（additional HWND=0）。registered top-level surface inventoryはMain、Setup、Settings、
   Graph、Threads、Legalの正確な6個で、runtime HWNDはMain=1＋open child subset 0..5（合計1..6）である。
 
 ### 4.6 失敗と復旧
 
-- failure classごとのCause、Impact、primary CTA、route、last-good保持は
-  `UX-20260823-ERROR-001`を正本とする。
+#### Windows更新の表示状態
+
+更新はPRODUCT §6とSECURITYのWindows updater境界を前提とする独立した状態である。下表の結果をSettingsの更新欄へ表示し、StatusBannerには新版候補がある場合だけ更新操作を置く。backendの接続・認証のprimary CTAを優先し、それが必要な間は更新操作を隠すが、更新の結果はSettingsで閲覧できる。更新状態をLinux側の取得エラーや認証失敗として表示せず、backendの時刻・数値・last-good dataを書き換えない。表示文はI18Nの対応localeへ翻訳し、raw応答・例外本文・保存先pathを含めない。
+
+| 入力・遷移 | 表示と次の操作 |
+| --- | --- |
+| 新版未確認、確認中 | 更新情報は未確認または確認中。更新操作は表示しない。確認だけでdownloadしない |
+| 確認成功、新版なし | 更新なし。更新操作は表示しない |
+| 確認失敗、新版候補なし | 更新情報を取得できなかったと表示する。新版なし・更新済みとしない。常設の更新ボタンを追加せず、次のアプリ起動の更新確認で再判定する。失敗を理由に自動retryしない |
+| Release/manifestの資格を満たす新版候補あり | 候補versionと「更新」相当の操作を表示する。この時点ではinstaller bytesの検証済みとは表示しない。利用者の1操作から、その試行のdownload・完全検証・標準GUI Setup起動だけを1回行う |
+| download・検証・Setup起動中 | 該当する進行状態を表示し、同じ更新操作を無効にする。再クリックをqueueせず、backendの通常取得と独立して処理する |
+| download・検証・Setup起動に失敗 | 失敗した段階を短く表示し、「更新を再試行」相当の操作を再び可能にする。候補versionは前回確認した候補であることを保持し、成功・適用済みにしない。自動で再実行しない。明示再試行はRelease確認から1回やり直し、新版なしなら操作を消し、確認失敗なら同じ再試行可能状態を保つ。有効な新版があればその試行で再取得・完全検証し、前の失敗fileや未検証候補を起動しない |
+| GUI Setupの子processを正常に開始 | 「セットアップを起動しました」相当を表示する。起動中の同じ子processが終了するまでは更新操作を無効にし、二重起動しない。終了後は実行中アプリのversionを変更せず、候補がそのversionより新しければ更新操作を再び可能にする。子processの開始・終了・exit codeだけで更新済みにせず、次に起動したアプリ自身のversionを使用する。取消・失敗したSetupのrollbackはPRODUCT §6が所有する |
+| アプリ終了・世代破棄 | 未完の確認/downloadを取消し、部分fileを破棄する。遅延結果で破棄済み画面を更新せず、成功へ変換しない。既に利用者が開いたGUI Setupは独立して継続し、自動restartは行わない |
+
+新しい確認結果が既に受理済みの候補を置き換える場合は、その結果のversionと資格を一組で採用する。古い候補のversionと新しいmanifest/hashを混ぜない。再試行中も前のbackend表示と更新失敗の事実を保持し、進行中であることだけを追加する。更新の失敗・成功によって別surfaceの取得を開始しない。
+
+#### 接続・認証・data取得の失敗
+
+認証制御には次の二つのadapterがあり、応答を混同しない。いずれもHTTP data routeへ認証mutationを追加しない。
+
+- raw embedded nativeのauth-startは、同processの認証control ownerがCodex App Serverの`account/login/start`へ`type="chatgpt"`を一度送る。認識するresultは必須の`type="chatgpt"`、非空文字列`loginId`、文字列`authUrl`を持つobjectだけとし、文字列はSECURITYのtext/URL制限を満たす必要がある。重複key・既知fieldの不正型・URL欠落/不正・別typeは失敗とする。追加fieldはopaqueとして無視し、表示・保存へ転用しない。このbrowser flowでURLなしの正常resultを推測しない。外部の型定義はCodex CLI 0.159.2の生成`v2/LoginAccountResponse`、意味は[公式App Server認証](https://learn.chatgpt.com/docs/app-server#authentication)を参照する。外部schemaの他typeを、この製品が要求したbrowser flowの応答へ代用しない。
+- installed Linux UIとWindowsのauth-startは、対象Linux profileのCodex CLIに対する明示起動であり、JSON-RPC resultやURL文字列をUIへ返す操作ではない。ローカルadapterの結果は`Launched`（非nullの子process handleを取得）または`Failed`（起動例外/null handle）の二値とする。installed Linux UIはresidentと同じ検証済みCODEX_HOMEとSECURITYの実行file検証を使い`codex login`を起動する。WindowsのWSLは保存済みの検証済みdistributionを対象に`codex login`、SSHは保存済みの検証済みHost aliasを対象に`codex login --device-auth`を実行し、利用者が操作できるconsoleを表示する。入力可能な汎用commandは作らず、Windows側は検証済みwsl.exe/ssh.exeと構造化ArgListを使う。CLIの[公式login契約](https://learn.chatgpt.com/docs/developer-commands#codex-login)に従い、browser/device code・資格情報の取得/保存は選択sourceのCLIが所有する。stdoutをURL/資格情報としてparse・保存・logしない。Windowsのprofile=`none`では手動接続先のLinux hostを特定できないためdefault WSLへ代用せず、Setupで接続profileを指定する操作を提示する。
+- `Launched`は認証済みではない。installed Linux/Windowsの認証確認actionは、既存profileの接続準備・healthの制御段階の後、別にfresh strict currentと必要なthreads bundleを一度取得する一つの明示操作である。起動成否・接続準備成否をdata rootへmergeせず、このbundleの受理済み認証状態だけで表示を遷移する。別のauth-check HTTP/RPC応答schemaを仮定せず、UIからApp Serverへの通常収集requestを追加しない。raw embeddedも認証確認後はfreshな公開dataの受理を必要とする。
+- pendingの認証sessionは開始成功から、fresh bundleの認証済み受理、control/CLIの明示失敗・取消、またはgeneration破棄まで保持する。CLIの正常終了だけではpendingを消さず、認証確認を再び操作可能にする。CLIの非0終了・起動失敗、または同じloginIdの失敗通知では再開始可能にする。通知や終了コードから認証済みdataを生成しない。pending child/control/URLはgenerationへ結び、実行中の同じ対象へ二重auth-startを行わない。
+
+失敗の分類は下表で固定する。原因は確認できた境界までを短く表示し、raw backend error、stderr、秘密情報を表示しない。
+保存済み同accountの有効値を保持する場合は最終受理時刻と失敗を併記し、最新/正常と表示しない。last-goodのない値は未知である。
+認証主体変更・logout・identity不成立の消去はPRODUCT/DATAのhard boundaryを優先し、別accountの値を保持しない。
+取得待機/in-flightの無効条件を先に適用し、最新の取得失敗は保持中の古いready/auth_required/partial状態より優先してprimary CTAを決める。取得に成功してauth_requiredを再受理した場合だけ認証操作へ戻す。独立surfaceとSettings保存の失敗をMainの状態へ重ねて優先順位を作らない。
+
+| 入力状態・原因 | 利用者への影響 | 単一primary CTAと結果 |
+| --- | --- | --- |
+| 設定fileが空・破損・schema/selector不正 | 接続設定を受理できずMainはdisconnected | 「設定」からSettings recoveryへ。自動のcommand実行・Welcome再表示をしない |
+| prepare、WSL起動、SSH/tunnel起動またはlistener検証失敗 | APIへ到達できない。受理済み表示は保持 | Setupでは失敗した同じprofile stepの再試行。Mainでは再試行で既存接続手順を1回開始。未知ownerへsignalしない |
+| health、HTTP、timeout、pair、schema/domain検証失敗 | 新しい表示bundleを受理できない | 「再試行」で同surfaceの取得を1回開始。health/controlだけで成功表示しない |
+| positive Main bundleのthreads失敗・pair/件数不一致 | Mainと詳細の一組を受理できず直前の完全表示を保持 | 下記10秒待機規則。待機・取得中はCTA無効で、自動再取得を重複させない |
+| Linux応答の`state=error`、または取得済みmodel集合のpartial/unavailable | Linux側の取得状態と確認できた値の範囲を表示。client接続失敗と混同しない | 「再試行」でMainのread-only取得を1回行う。daemon再起動・DB修復が成功したとは表示しない |
+| Windowsで`auth_required`かつprofile=`none` | 手動接続先の認証を自動操作する対象が不明 | 「接続設定」でSetupへ。別sourceのCLIを起動しない |
+| `auth_required`、認証開始前 | 認証完了まで新しい認証済みdataを受理できない | 「認証を開始」で既存profileのauth-startを1回実行。操作中は無効 |
+| auth-startでSECURITYの検証を通した認証URLを取得 | 外部browserで利用者の認証が必要 | URLを1回開き、primaryを「認証を確認」にする。再度開くためのURLはsecondary linkとし、同格CTAを増やさない |
+| CLI auth-startが`Launched` | 対象sourceのCLIで認証を開始した。dataではまだ未確認 | 「認証を確認」を操作可能にする。CLI起動/終了コードだけでreadyにせず、URLのないJSON正常応答と解釈しない |
+| 認証URLのbrowser起動失敗 | 認証ページをまだ開けていない | 「認証ページを開く」で同じ検証済みURLを開く。成功後は「認証を確認」へ。URLを永続化しない |
+| auth-start失敗、またはURL不正 | 認証を開始できていない | 「認証を開始」を再び操作可能にする。不正URLは開かず、controlの失敗でdata rootを変更しない |
+| 認証確認で有効なfresh bundleを受理したが`auth_required` | 認証は未完了 | pendingの認証sessionがあれば「認証を確認」を再び操作可能にする。pendingがなければ「認証を開始」。成功したprocess exitだけでreadyにしない |
+| 認証確認のcontrol段階だけ成功（raw embedded adapter） | 認証済みdataは未受理 | 同じ確認action内でfresh strict currentと必要なthreads bundleを1回取得し、その受理結果へ遷移。installed Linux/Windowsに独立したauth-check RPCを追加しない |
+| 認証確認で認証済みのfresh bundleを受理 | 公開dataで認証状態を確認できた | この受理済みbundleをatomicに表示し、pending認証sessionを終了する。成功を理由に二度目のbundle取得を追加しない。`state=error`やpartial等の表示は受理した値と上記の状態規則に従い、認証済みだけでreadyとしない |
+| Graph/Threads独立取得失敗 | 対象surfaceだけlast-goodと失敗を保持 | そのsurfaceの選択/通常周期で再取得。Mainを失敗に変更せず、Windowを勝手に前面化しない |
+| Settings保存失敗 | 旧active設定とtheme以外のdraftを保持しWindowを閉じない。theme選択/previewは`WIN-THEME-422`に従って保存済み値へ戻す | 「保存」で現在のdraftを再試行可能。取消/Closeはdraftを破棄し、保存成功を偽装しない |
+| 未知の失敗種別 | 成功とは判断できない | 同surfaceの一般取得失敗へ分類して再試行可能。新たな自動復旧commandや未知値を作らない |
+
+Mainのpositive bundle失敗時は、失敗が確定したmonotonic時刻から10秒後を次の取得時刻とし、currentを条件headerなしで1回取得する。
+その時刻より前、および取得中はMain再試行とSettings「状態を更新」の同じMain取得部分を無効にし、「再試行待ち」または「取得中」を表示する。
+force入力をqueueして期限を短縮・延長せず、Graphと独立Threadsのrequestも開始しない。Windowの開閉やlast-goodの閲覧は可能とする。
+再取得も失敗した場合はその失敗確定時刻から次の10秒待機とし、一つのcallback内で反復しない。成功したMain bundleだけが待機・errorを解除する。
+認証主体/表示account/接続設定generationの確定変更では旧generationの待機とin-flight応答を破棄し、新対象の通常起動手順へ進む。
+同じ対象でのforce、Window開閉、操作連打はgeneration変更ではない。
+
 - 状態card内のprimary CTAは1個だけとし、同格の「再試行」「設定」「戻る」を並べて利用者へ
   選択を転嫁しない。Settings/Helpは共通navigationからsecondaryに到達できる。
 - background failureはWindowを前面化せず、focus/cursorを奪わない。利用者がCTAを押した場合だけ
@@ -721,10 +918,27 @@ Settingsから開く場合は`WIN-CONNECTION-GUIDANCE-603`に従って接続設�
 
 - ユーザーのマウス、カーソル位置、フォーカス、キーボード入力を製品コードが奪わない。
 - 物理入力を伴う試験は明示的許可がある環境だけで実施し、通常の受入でユーザー環境を操作しない。
-- キーボードTab順、Enter、Escape、Alt/メニュー操作は`UX-20260823-KEYBOARD-001`の6 Window別
-  exact route matrixと`windows-keyboard-v1` manifestに従う。
-- フォーカス、hover、pressed、disabled、busy、errorを視認できる。focus indicatorの面積、
-  2 logical pixel、3:1 contrast、DPI/high-contrast境界は同Decisionを正本とする。
+Tab/Shift+Tabは、現在表示中で有効な操作だけを次表の順で巡回する。非表示page、無効CTA、装飾labelへfocusしない。
+同じ行のフォーム欄と選択肢は、当該pageの表示順（上から下、同じ行は左から右）とする。Windowを初めて開くときは最初の有効な内容操作へfocusし、背景更新でfocusを移さない。
+
+| Window | 内容操作のTab順 | Escape（popupがない場合） |
+| --- | --- | --- |
+| Main | 推移→法的通知→設定→thread詳細→状態CTA→最小化→閉じる | 何も変更しない |
+| Graph | mode表示順→metric→period selector→前→次→series表示順→最小化→閉じる | Graphを閉じる |
+| Threads | 一覧scroll→最小化→閉じる | Threadsを閉じる |
+| Settings | tab表示順→選択tabのフォーム/操作表示順→接続設定/Legal入口→Save→Cancel→閉じる | Cancelと同じdraft破棄 |
+| Setup | 現stepの選択/入力/操作表示順→Back→primary CTA→閉じる | Backが有効なら前step、なければ閉じる。実行中処理の旧generation完了をcommitしない |
+| Legal | 前page→次page→最小化→閉じる | Legalを閉じる |
+
+Enter/Spaceはfocus中のbutton/toggleを実行する。single-line入力欄のEnterは、そのpageの有効なprimary CTAを1回実行し、なければ何もしない。
+tabの左右矢印は隣のtabを選び、その内容を直ちに表示する。両端では移動せず、Settingsの未保存draftはtab切替で保持する。
+閉じたselectorのEnter/Space、下矢印、Alt+下矢印は候補popupを開き、現在の選択を強調する。
+popup内の上下矢印は表示中の隣の候補へ強調だけを移動し、両端では移動しない。Enterまたは候補のclickで選択を確定して閉じる。Settingsのaccount切替はこの確定時に反映し、Saveを待たない。
+Graphの日付見出しはEnter/Spaceで展開状態を切り替え、右矢印で展開、左矢印で折り畳む。見出しの操作だけではperiodを選ばない。
+popupが開いているEscapeはpopupだけを閉じ、確定済みの選択、Window、draftを変更しない。
+Alt+F4は現在のWindowのCloseと同じ動作とし、単独Altや未定義のaccess keyに追加actionを割り当てない。
+フォーカス、hover、pressed、disabled、busy、errorを視認できる。focus枠は対象外周の2 logical pixel、隣接面に対して3:1以上とし、
+integer DPIのscaleで描画する。Windows high contrastではOSのfocus/foreground色を使い、theme固定色で不可視にしない。
 
 ### 5.3 マルチモニタ/DPI
 
@@ -763,9 +977,9 @@ Settingsから開く場合は`WIN-CONNECTION-GUIDANCE-603`に従って接続設�
 | 影響要求 | `WIN-A..M` のID |
 | 非スクロール影響 | 主要操作/値がどのviewportに収まるか |
 | 証拠 | 影響master IDの直接オラクル。機械判定できない表示意味に限りfresh画像と独立評価 |
-| 未確定 | 解消条件と担当 |
+| 未決定条件 | 実装開始時は0件。発見したらowner仕様へ戻して解消する |
 
-## 7. UX受入ゲート（実装開始後に使用するが、抽出中は実行禁止）
+## 7. UX受入ゲート（対象仕様の確定後に使用）
 
 次をすべて満たさない限りUX PASSにしない。
 

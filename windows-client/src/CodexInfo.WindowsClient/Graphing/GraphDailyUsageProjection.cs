@@ -13,7 +13,9 @@ internal readonly record struct GraphDailyUsageValue(
     string ModelName,
     ulong? Tokens,
     double? Dollars,
-    bool IsPartial);
+    bool IsPartial)
+{
+}
 
 /// <summary>Read-only daily attribution from accepted canonical-period raw observations.</summary>
 internal static class GraphDailyUsageProjection
@@ -91,8 +93,8 @@ internal static class GraphDailyUsageProjection
         foreach (var sample in samples)
         {
             var models = Models(sample).Where(model => model.Name == name).ToArray();
-            var authoritative = (sample.ModelSource == ApiHistorySample.ConfirmedModelSource && sample.ModelsComplete ||
-                sample.ModelSource == ApiHistorySample.LegacyUnknownModelSource) &&
+            var authoritative = sample.ModelSource is (ApiHistorySample.ConfirmedModelSource or
+                ApiHistorySample.LegacyUnknownModelSource) &&
                 models.Length == 1 && OwnsSpan(sample.Timestamp, sample.Timestamp, ownershipIntervals);
             var model = authoritative ? models[0] : null;
             var tokens = model?.TotalTokens;

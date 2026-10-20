@@ -499,10 +499,10 @@ fn history_model_usage_v3(
     PublicHistoryModelUsageV3 {
         model: total.model.clone(),
         total_tokens: total.total_tokens,
-        input_tokens: Some(total.input_tokens),
-        cached_input_tokens: Some(total.cached_input_tokens),
+        input_tokens: total.input_tokens,
+        cached_input_tokens: total.cached_input_tokens,
         cache_write_input_tokens: total.cache_write_input_tokens,
-        output_tokens: Some(total.output_tokens),
+        output_tokens: total.output_tokens,
         total_dollars,
     }
 }
@@ -669,9 +669,15 @@ impl ModelUsageTotals {
                     .or_insert_with(|| ModelUsageRow::new(&total.model)),
             };
             row.tokens = total.total_tokens;
-            row.input_tokens = total.input_tokens;
-            row.cached_input_tokens = total.cached_input_tokens;
-            row.output_tokens = total.output_tokens;
+            row.input_tokens = total
+                .input_tokens
+                .expect("legacy test collector requires known input_tokens");
+            row.cached_input_tokens = total
+                .cached_input_tokens
+                .expect("legacy test collector requires known cached_input_tokens");
+            row.output_tokens = total
+                .output_tokens
+                .expect("legacy test collector requires known output_tokens");
             row.cache_write_input_tokens = total.cache_write_input_tokens;
         }
         result
@@ -685,9 +691,9 @@ impl ModelUsageTotals {
                 cache_write_input_tokens: row.cache_write_input_tokens,
                 model: row.name.clone(),
                 total_tokens: row.tokens,
-                input_tokens: row.input_tokens,
-                cached_input_tokens: row.cached_input_tokens,
-                output_tokens: row.output_tokens,
+                input_tokens: Some(row.input_tokens),
+                cached_input_tokens: Some(row.cached_input_tokens),
+                output_tokens: Some(row.output_tokens),
             })
             .collect::<Vec<_>>();
         totals.sort_by(|left, right| left.model.cmp(&right.model));
@@ -817,9 +823,9 @@ impl ModelUsageTotals {
 #[cfg(test)]
 fn session_model_total_has_usage(total: &usage_store::SessionModelTotal) -> bool {
     total.total_tokens > 0
-        || total.input_tokens > 0
-        || total.cached_input_tokens > 0
-        || total.output_tokens > 0
+        || total.input_tokens > Some(0)
+        || total.cached_input_tokens > Some(0)
+        || total.output_tokens > Some(0)
         || total
             .cache_write_input_tokens
             .is_some_and(|tokens| tokens > 0)
@@ -2245,9 +2251,7 @@ fn read_active_thread_rollout_cached_with_checkpoints(
                 thread_contract::RolloutAccumulator::seeded_with_context(
                     checkpoint.last_model.clone(),
                     checkpoint.previous_total,
-                    checkpoint
-                        .last_task_running
-                        .or_else(|| (complete_len > parse_start).then_some(true)),
+                    checkpoint.last_task_running,
                     checkpoint.context_usage_tokens,
                     checkpoint.context_window_tokens,
                 )
@@ -4077,23 +4081,20 @@ fn store_observation_from_public_v3(
     let models = accept_models
         .then_some(observation.models.as_ref())
         .flatten();
-    // The compatibility carrier cannot represent missing token components.
-    // Keep a model group only when every required component was actually
-    // published; substituting zero here would turn absence into an observation.
-    let model_totals = models.and_then(|models| {
+    // The history carrier preserves nullable components independently of T.
+    // Current wire's required components are a different contract.
+    let model_totals = models.map(|models| {
         models
             .iter()
-            .map(|model| {
-                Some(usage_store::SessionModelTotal {
-                    model: model.model.clone(),
-                    total_tokens: model.total_tokens,
-                    input_tokens: model.input_tokens?,
-                    cached_input_tokens: model.cached_input_tokens?,
-                    output_tokens: model.output_tokens?,
-                    cache_write_input_tokens: model.cache_write_input_tokens,
-                })
+            .map(|model| usage_store::SessionModelTotal {
+                model: model.model.clone(),
+                total_tokens: model.total_tokens,
+                input_tokens: model.input_tokens,
+                cached_input_tokens: model.cached_input_tokens,
+                output_tokens: model.output_tokens,
+                cache_write_input_tokens: model.cache_write_input_tokens,
             })
-            .collect::<Option<Vec<_>>>()
+            .collect()
     });
     let model_totals_complete = models_complete && model_totals.is_some();
     usage_store::UsageHistoryObservation {
@@ -5015,9 +5016,9 @@ enum GraphModelOrigin {
     Rejected,
     Unknown,
     Direct,
-    /// A lossless value stored by an older schema without confirmed model-set
-    /// metadata. It never becomes an arithmetic baseline, but a complete
-    /// exact-equal raw run may prove inactivity together with raw Remaining.
+    /// A saved value without confirmed model-set metadata. It participates
+    /// in numeric display acceptance, never aggregation authority. A complete
+    /// lossless, exact-equal raw run may prove inactivity with raw Remaining.
     LegacyObserved,
     /// A numeric value from a confirmed row whose model vector is incomplete.
     /// It remains display evidence but can never prove inactivity.
@@ -5039,9 +5040,13 @@ struct GraphModelPoint {
     tokens: f64,
     /// Lossless cumulative token authority; `tokens` is display-only f64.
     raw_tokens: Option<u64>,
+    /// Saved I/C/W/O values and knownness, independent of total tokens.
+    raw_components: [Option<u128>; 4],
     origin: GraphModelOrigin,
 }
 
+type GraphRawTokenIdentity = (u64, [Option<u128>; 4]);
+type GraphRawTokenVector = Vec<(String, GraphRawTokenIdentity)>;
 type GraphModelTimelines = BTreeMap<String, BTreeMap<i64, GraphModelPoint>>;
 
 struct GraphSelectionInput<'a> {
@@ -5065,7 +5070,6 @@ enum GraphRemainingOrigin {
     BoundedNullHold,
     TerminalNullHold,
     SyntheticTailHold,
-    MonotonicHold,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -5124,6 +5128,16 @@ fn graph_model_raw_tokens(point: &GraphModelPoint) -> Option<u64> {
     point.raw_tokens
 }
 
+fn graph_model_raw_token_identity(point: &GraphModelPoint) -> Option<GraphRawTokenIdentity> {
+    Some((graph_model_raw_tokens(point)?, point.raw_components))
+}
+
+fn graph_component_total(values: impl Iterator<Item = Option<u64>>) -> Option<u128> {
+    // A resident collection has at most usize::MAX UInt64 members. Their
+    // sum fits UInt128 on the supported 64-bit targets; unknown stays unknown.
+    values.map(|value| value.map(u128::from)).sum()
+}
+
 fn graph_model_line_is_exact(point: &GraphModelPoint) -> bool {
     point.origin == GraphModelOrigin::Direct
         || point.origin == GraphModelOrigin::LegacyObserved && point.raw_tokens.is_some()
@@ -5136,96 +5150,25 @@ fn graph_model_is_lossless_idle_observation(point: &GraphModelPoint) -> bool {
     ) && point.raw_tokens.is_some()
 }
 
-/// Normalize only the presentation copy of derived dollars. A lossless raw
-/// token total that is unchanged over a same-origin run proves that the same
-/// model accrued no additional cost; a changed, missing, or rejected dollar
-/// inside that run is therefore a dollar-side projection error, not usage
-/// evidence. Legacy observations are eligible only inside an independently
-/// confirmed idle interval and retain their non-authoritative provenance.
-#[cfg(test)]
-fn normalize_graph_dollars_from_token_identity(
-    dollar_timelines: &mut GraphModelTimelines,
-    token_timelines: &GraphModelTimelines,
-    idle_timestamp_intervals: &[(i64, i64)],
-) {
-    normalize_graph_dollars_from_token_identity_by_model(
-        dollar_timelines,
-        token_timelines,
-        idle_timestamp_intervals,
-        None,
-    );
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+enum GraphObservedMetricValue {
+    Tokens(u64),
+    Dollars(f64),
 }
 
-fn normalize_graph_dollars_from_token_identity_by_model(
-    dollar_timelines: &mut GraphModelTimelines,
-    token_timelines: &GraphModelTimelines,
-    idle_timestamp_intervals: &[(i64, i64)],
-    model_idle_intervals: Option<&BTreeMap<String, Vec<(i64, i64)>>>,
-) {
-    for (name, token_timeline) in token_timelines {
-        let Some(dollar_timeline) = dollar_timelines.get_mut(name) else {
-            continue;
-        };
-        let idle_timestamp_intervals = model_idle_intervals
-            .and_then(|intervals| intervals.get(name))
-            .map(Vec::as_slice)
-            .unwrap_or(idle_timestamp_intervals);
-        let mut runs = Vec::<Vec<i64>>::new();
-        let mut run = Vec::<i64>::new();
-        let mut run_identity = None::<u64>;
-        for (timestamp, point) in token_timeline {
-            let eligible_origin = point.origin == GraphModelOrigin::Direct
-                || point.origin == GraphModelOrigin::LegacyObserved
-                    && idle_timestamp_intervals
-                        .iter()
-                        .any(|(start, end)| *start <= *timestamp && *timestamp <= *end);
-            let identity = eligible_origin
-                .then(|| graph_model_raw_tokens(point))
-                .flatten();
-            match identity {
-                Some(identity) if run_identity == Some(identity) => run.push(*timestamp),
-                Some(identity) => {
-                    if !run.is_empty() {
-                        runs.push(std::mem::take(&mut run));
-                    }
-                    run_identity = Some(identity);
-                    run.push(*timestamp);
-                }
-                None => {
-                    if !run.is_empty() {
-                        runs.push(std::mem::take(&mut run));
-                    }
-                    run_identity = None;
-                }
-            }
+impl GraphObservedMetricValue {
+    fn from_point(point: &GraphModelPoint, show_tokens: bool) -> Option<Self> {
+        if show_tokens {
+            point.raw_tokens.map(Self::Tokens)
+        } else {
+            (point.dollar.is_finite() && point.dollar >= 0.0).then_some(Self::Dollars(point.dollar))
         }
-        if !run.is_empty() {
-            runs.push(run);
-        }
+    }
 
-        for run in runs.into_iter().filter(|run| run.len() >= 2) {
-            let baseline = run.iter().find_map(|timestamp| {
-                let token_point = token_timeline.get(timestamp)?;
-                let dollar_point = dollar_timeline.get(timestamp)?;
-                ((dollar_point.origin == token_point.origin
-                    || token_point.origin == GraphModelOrigin::LegacyObserved)
-                    && dollar_point.dollar.is_finite()
-                    && dollar_point.dollar >= 0.0)
-                    .then_some(dollar_point.dollar)
-            });
-            let Some(baseline) = baseline else {
-                continue;
-            };
-            for timestamp in run {
-                let Some(token_origin) = token_timeline.get(&timestamp).map(|point| point.origin)
-                else {
-                    continue;
-                };
-                if let Some(point) = dollar_timeline.get_mut(&timestamp) {
-                    point.dollar = baseline;
-                    point.origin = token_origin;
-                }
-            }
+    fn display_value(self) -> f64 {
+        match self {
+            Self::Tokens(value) => value as f64,
+            Self::Dollars(value) => value,
         }
     }
 }
@@ -5234,7 +5177,7 @@ fn accepted_graph_model_timelines(
     timelines: &GraphModelTimelines,
     projection_minutes: &BTreeSet<i64>,
     show_tokens: bool,
-    _confirmed_gaps: &[GraphConfirmedGap],
+    confirmed_gaps: &[GraphConfirmedGap],
 ) -> (GraphModelTimelines, BTreeSet<i64>) {
     let mut accepted = timelines.clone();
     let mut correction_starts = BTreeSet::new();
@@ -5245,103 +5188,74 @@ fn accepted_graph_model_timelines(
         .collect::<BTreeSet<_>>();
     all_timestamps.extend(projection_minutes.iter().copied());
     for timeline in accepted.values_mut() {
-        let raw = timeline
+        // Numeric acceptance runs on the original row timebase, before any
+        // display-only sampling-slot bridge. Missing rows break a triple.
+        let raw = all_timestamps
             .iter()
-            .map(|(timestamp, point)| {
+            .map(|timestamp| {
+                let point = timeline.get(timestamp);
                 (
                     *timestamp,
-                    graph_model_value(point, show_tokens),
-                    point.origin,
+                    point
+                        .and_then(|point| GraphObservedMetricValue::from_point(point, show_tokens)),
+                    point.map_or(GraphModelOrigin::Unknown, |point| point.origin),
                 )
             })
             .collect::<Vec<_>>();
+        let observed_origin = |origin| match origin {
+            // Completeness belongs to the raw global idle vector. Each
+            // known confirmed model/metric remains a direct observation.
+            GraphModelOrigin::Direct | GraphModelOrigin::IncompleteObserved => {
+                Some(GraphModelOrigin::Direct)
+            }
+            GraphModelOrigin::LegacyObserved => Some(GraphModelOrigin::LegacyObserved),
+            _ => None,
+        };
         let isolated = raw
             .windows(3)
             .filter_map(|window| {
                 let [left, middle, right] = window else {
                     return None;
                 };
-                let finite = [left.1, middle.1, right.1]
-                    .into_iter()
-                    .all(|value| value.is_finite() && value >= 0.0);
+                let (Some(left_value), Some(middle_value), Some(right_value)) =
+                    (left.1, middle.1, right.1)
+                else {
+                    return None;
+                };
                 ([left.2, middle.2, right.2]
                     .into_iter()
-                    .all(|origin| origin == GraphModelOrigin::Direct)
-                    && finite
-                    && left.1 <= right.1
-                    && (middle.1 < left.1 || middle.1 > right.1))
+                    .all(|origin| observed_origin(origin).is_some())
+                    && !graph_interval_overlaps_confirmed_gap(left.0, right.0, confirmed_gaps)
+                    && left_value <= right_value
+                    && (middle_value < left_value || middle_value > right_value))
                     .then_some(middle.0)
             })
             .collect::<BTreeSet<_>>();
-        let mut direct_baseline = None::<f64>;
+        let mut baseline = None::<GraphObservedMetricValue>;
         for (timestamp, raw_value, source_origin) in raw {
             let Some(point) = timeline.get_mut(&timestamp) else {
                 continue;
             };
-            if !raw_value.is_finite() || raw_value < 0.0 {
+            let (Some(raw_value), Some(origin)) = (raw_value, observed_origin(source_origin))
+            else {
                 point.origin = GraphModelOrigin::Unknown;
                 set_graph_model_value(point, show_tokens, f64::NAN);
                 continue;
-            }
-            match source_origin {
-                GraphModelOrigin::Direct => {
-                    point.origin = GraphModelOrigin::Rejected;
-                    let rejected = isolated.contains(&timestamp)
-                        || direct_baseline.is_some_and(|accepted_value| raw_value < accepted_value);
-                    if rejected {
-                        correction_starts.insert(timestamp);
-                        if let Some(accepted_value) = direct_baseline {
-                            set_graph_model_value(point, show_tokens, accepted_value);
-                        } else {
-                            set_graph_model_value(point, show_tokens, f64::NAN);
-                        }
-                    } else {
-                        direct_baseline = Some(raw_value);
-                        point.origin = GraphModelOrigin::Direct;
-                    }
-                }
-                GraphModelOrigin::LegacyObserved | GraphModelOrigin::IncompleteObserved => {
-                    // Retain saved non-direct values for presentation only.
-                    // Neither can become the baseline for accepting direct
-                    // data; only LegacyObserved remains eligible for idle.
-                    point.origin = GraphModelOrigin::LegacyObserved;
-                }
-                _ => {
-                    point.origin = GraphModelOrigin::Unknown;
-                    set_graph_model_value(point, show_tokens, f64::NAN);
-                }
-            }
-        }
-
-        // A legacy value may be drawn only when it fits between the surrounding
-        // accepted direct observations. Out-of-bounds legacy values are removed
-        // from the displayed series and may be replaced below by an explicitly
-        // inferred UI value. Neither outcome changes direct-data acceptance.
-        let direct_anchors = timeline
-            .iter()
-            .filter_map(|(timestamp, point)| {
-                (point.origin == GraphModelOrigin::Direct)
-                    .then_some((*timestamp, graph_model_value(point, show_tokens)))
-            })
-            .collect::<Vec<_>>();
-        let mut display_floor = None::<f64>;
-        for (timestamp, point) in timeline.iter_mut() {
-            let value = graph_model_value(point, show_tokens);
-            match point.origin {
-                GraphModelOrigin::Direct => display_floor = Some(value),
-                GraphModelOrigin::LegacyObserved => {
-                    let next = direct_anchors.partition_point(|(at, _)| *at <= *timestamp);
-                    let upper = direct_anchors.get(next).map(|(_, value)| *value);
-                    let outside_bounds = display_floor.is_some_and(|floor| value < floor)
-                        || upper.is_some_and(|ceiling| value > ceiling);
-                    if outside_bounds {
-                        point.origin = GraphModelOrigin::Unknown;
-                        set_graph_model_value(point, show_tokens, f64::NAN);
-                    } else {
-                        display_floor = Some(value);
-                    }
-                }
-                _ => {}
+            };
+            if isolated.contains(&timestamp)
+                || baseline.is_some_and(|accepted| raw_value < accepted)
+            {
+                correction_starts.insert(timestamp);
+                point.origin = GraphModelOrigin::Rejected;
+                set_graph_model_value(
+                    point,
+                    show_tokens,
+                    baseline.map_or(f64::NAN, GraphObservedMetricValue::display_value),
+                );
+            } else {
+                baseline = Some(raw_value);
+                point.origin = origin;
+                set_graph_model_value(point, show_tokens, raw_value.display_value());
             }
         }
 
@@ -5540,9 +5454,9 @@ fn graph_non_owned_intervals(
         })
         .collect::<Vec<_>>();
     owned.sort_by_key(|interval| interval.0);
-    if owned.iter().any(|(start, end)| start >= end)
-        || owned.windows(2).any(|pair| pair[0].1 > pair[1].0)
-    {
+    let invalid_range = owned.iter().any(|(start, end)| start > end);
+    owned.retain(|(start, end)| start != end);
+    if invalid_range || owned.windows(2).any(|pair| pair[0].1 > pair[1].0) {
         return vec![GraphConfirmedGap {
             start_at: period_start,
             end_at: period_end,
@@ -5689,6 +5603,7 @@ fn graph_paths_with_sources(
                         GraphModelPoint {
                             dollar,
                             tokens: tokens as f64,
+                            raw_components: [None; 4],
                             raw_tokens: Some(tokens),
                             origin: GraphModelOrigin::Direct,
                         },
@@ -5960,7 +5875,7 @@ fn recoverable_sampling_jitter_minutes(
     sampling_unavailable_minutes: &BTreeSet<i64>,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> BTreeSet<i64> {
-    let direct_model_vector = |timestamp: i64| -> Option<Vec<(String, u64)>> {
+    let direct_model_vector = |timestamp: i64| -> Option<GraphRawTokenVector> {
         let mut vector = Vec::new();
         for (name, timeline) in model_timelines {
             let Some(point) = timeline.get(&timestamp) else {
@@ -5969,7 +5884,7 @@ fn recoverable_sampling_jitter_minutes(
             if point.origin != GraphModelOrigin::Direct {
                 return None;
             }
-            vector.push((name.clone(), graph_model_raw_tokens(point)?));
+            vector.push((name.clone(), graph_model_raw_token_identity(point)?));
         }
         (!vector.is_empty()).then_some(vector)
     };
@@ -6066,29 +5981,25 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sa
 #[cfg(test)]
 fn graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_sampling_and_line_gaps(
     input: GraphSelectionInput<'_>,
-    task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
+    _task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
     sampling_unavailable_minutes: Option<&BTreeSet<i64>>,
     line_gaps: &[GraphConfirmedGap],
     non_owned_gaps: &[GraphConfirmedGap],
 ) -> GraphPaths {
     graph_paths_with_period_authority(
         input,
-        task_activity_by_minute,
         sampling_unavailable_minutes,
         line_gaps,
         non_owned_gaps,
-        false,
         false,
     )
 }
 
 fn graph_paths_with_period_authority(
     input: GraphSelectionInput<'_>,
-    task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
     sampling_unavailable_minutes: Option<&BTreeSet<i64>>,
     line_gaps: &[GraphConfirmedGap],
     non_owned_gaps: &[GraphConfirmedGap],
-    verified_origin: bool,
     is_current: bool,
 ) -> GraphPaths {
     let GraphSelectionInput {
@@ -6110,14 +6021,6 @@ fn graph_paths_with_period_authority(
         .chain(non_owned_gaps)
         .copied()
         .collect::<Vec<_>>();
-    let task_idle_intervals = graph_task_idle_intervals(
-        samples,
-        task_activity_by_minute,
-        period_start,
-        period_end,
-        &idle_boundaries,
-        model_timelines,
-    );
     let recovered_sampling_minutes = sampling_unavailable_minutes
         .map(|minutes| {
             recoverable_sampling_jitter_minutes(
@@ -6131,6 +6034,10 @@ fn graph_paths_with_period_authority(
             )
         })
         .unwrap_or_default();
+    let original_projection_minutes = samples
+        .iter()
+        .map(|sample| sample.timestamp.div_euclid(60) * 60)
+        .collect::<BTreeSet<_>>();
     let presentation_samples = samples
         .iter()
         .copied()
@@ -6156,10 +6063,7 @@ fn graph_paths_with_period_authority(
     // rejected token regression and makes dollar/token idle bands disagree.
     // Display metric and idle evidence therefore have independent
     // anomaly state. Remaining quota is projected independently from tokens.
-    let projection_minutes = samples
-        .iter()
-        .map(|sample| sample.timestamp.div_euclid(60) * 60)
-        .collect::<BTreeSet<_>>();
+    let projection_minutes = original_projection_minutes;
     let (mut dollar_timelines, _dollar_anomaly_starts) =
         accepted_graph_model_timelines(model_timelines, &projection_minutes, false, confirmed_gaps);
     let (mut token_timelines, token_anomaly_starts) =
@@ -6177,29 +6081,6 @@ fn graph_paths_with_period_authority(
         model_timelines,
         &idle_boundaries,
         Some(&GraphIdleRenderEvidence { untrusted_minutes }),
-    );
-    let model_idle_intervals = model_timelines
-        .keys()
-        .map(|name| {
-            (
-                name.clone(),
-                token_idle_timestamp_intervals_for_model(
-                    samples,
-                    period_start,
-                    period_end,
-                    model_timelines,
-                    confirmed_gaps,
-                    Some(&GraphIdleRenderEvidence { untrusted_minutes }),
-                    Some(name),
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    normalize_graph_dollars_from_token_identity_by_model(
-        &mut dollar_timelines,
-        &token_timelines,
-        &idle_timestamp_intervals,
-        Some(&model_idle_intervals),
     );
     let display_timelines = if show_tokens {
         token_timelines.clone()
@@ -6289,7 +6170,7 @@ fn graph_paths_with_period_authority(
         });
     if has_remaining_observation {
         if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
-            let (idle, solid, inferred) = remaining_paths_with_task_stops(
+            let (idle, solid, inferred) = remaining_paths_with_boundaries_and_idle_with_non_owned(
                 RemainingPathContext {
                     points: &remaining_points,
                     samples,
@@ -6301,7 +6182,6 @@ fn graph_paths_with_period_authority(
                     idle_timestamp_intervals: &idle_timestamp_intervals,
                 },
                 non_owned_gaps,
-                &task_idle_intervals,
             );
             paths.remaining = [idle.as_str(), solid.as_str(), inferred.as_str()]
                 .into_iter()
@@ -6319,15 +6199,8 @@ fn graph_paths_with_period_authority(
             paths.current_remaining_point_y = normalized;
         }
     }
-    let stopped_bands = merge_graph_idle_intervals(
-        idle_timestamp_intervals
-            .iter()
-            .chain(&task_idle_intervals)
-            .copied()
-            .collect(),
-    );
     paths.unused_intervals = unused_interval_positions_from_timestamp_intervals(
-        &stopped_bands,
+        &idle_timestamp_intervals,
         period_start,
         period_end,
     );
@@ -6420,17 +6293,13 @@ fn graph_paths_with_period_authority(
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: false,
             correction_starts: &correction_starts,
-            idle_timestamp_intervals: model_idle_intervals
-                .get("LUNA")
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+            idle_timestamp_intervals: &idle_timestamp_intervals,
         };
-        let (idle, flat, rising, inferred) = split_metric_line_paths_with_task_stops(
+        let (idle, flat, rising, inferred) = split_metric_line_paths_with_evidence_idle_and_tokens(
             &context,
             |point| point.luna,
             token_timelines.get("LUNA"),
             non_owned_gaps,
-            &task_idle_intervals,
         );
         paths.luna_idle = idle;
         paths.luna_flat = flat;
@@ -6464,17 +6333,13 @@ fn graph_paths_with_period_authority(
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: false,
             correction_starts: &correction_starts,
-            idle_timestamp_intervals: model_idle_intervals
-                .get("TERRA")
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+            idle_timestamp_intervals: &idle_timestamp_intervals,
         };
-        let (idle, flat, rising, inferred) = split_metric_line_paths_with_task_stops(
+        let (idle, flat, rising, inferred) = split_metric_line_paths_with_evidence_idle_and_tokens(
             &context,
             |point| point.terra,
             token_timelines.get("TERRA"),
             non_owned_gaps,
-            &task_idle_intervals,
         );
         paths.terra_idle = idle;
         paths.terra_flat = flat;
@@ -6508,17 +6373,13 @@ fn graph_paths_with_period_authority(
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: false,
             correction_starts: &correction_starts,
-            idle_timestamp_intervals: model_idle_intervals
-                .get("SOL")
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+            idle_timestamp_intervals: &idle_timestamp_intervals,
         };
-        let (idle, flat, rising, inferred) = split_metric_line_paths_with_task_stops(
+        let (idle, flat, rising, inferred) = split_metric_line_paths_with_evidence_idle_and_tokens(
             &context,
             |point| point.sol,
             token_timelines.get("SOL"),
             non_owned_gaps,
-            &task_idle_intervals,
         );
         paths.sol_idle = idle;
         paths.sol_flat = flat;
@@ -6552,17 +6413,13 @@ fn graph_paths_with_period_authority(
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: false,
             correction_starts: &correction_starts,
-            idle_timestamp_intervals: model_idle_intervals
-                .get("ASTRA")
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
+            idle_timestamp_intervals: &idle_timestamp_intervals,
         };
-        let (idle, flat, rising, inferred) = split_metric_line_paths_with_task_stops(
+        let (idle, flat, rising, inferred) = split_metric_line_paths_with_evidence_idle_and_tokens(
             &context,
             |point| point.astra,
             token_timelines.get("ASTRA"),
             non_owned_gaps,
-            &task_idle_intervals,
         );
         paths.astra_idle = idle;
         paths.astra_flat = flat;
@@ -6579,122 +6436,7 @@ fn graph_paths_with_period_authority(
             paths.current_astra_point_y = paths.current_astra_y;
         }
     }
-    if verified_origin {
-        let span = (period_end - period_start).max(1) as f64;
-        let x = |at: i64| ((at - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
-        if let Some(first) = remaining_evidence
-            .iter()
-            .find(|point| point.origin == GraphRemainingOrigin::Raw)
-        {
-            if first.timestamp > period_start
-                && !graph_interval_overlaps_confirmed_gap(period_start, first.timestamp, line_gaps)
-            {
-                append_graph_path_segment(
-                    &mut paths.remaining_solid,
-                    (0.0, 1.0),
-                    (
-                        x(first.timestamp),
-                        (99.0 - first.effective * 0.98).clamp(1.0, 99.0),
-                    ),
-                );
-                paths.remaining = [
-                    &paths.remaining_idle,
-                    &paths.remaining_solid,
-                    &paths.remaining_inferred,
-                ]
-                .into_iter()
-                .filter(|path| !path.is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" ");
-            }
-        }
-        for (name, visible, flat, rising) in [
-            ("SOL", show_sol, &mut paths.sol_flat, &mut paths.sol_rising),
-            (
-                "TERRA",
-                show_terra,
-                &mut paths.terra_flat,
-                &mut paths.terra_rising,
-            ),
-            (
-                "LUNA",
-                show_luna,
-                &mut paths.luna_flat,
-                &mut paths.luna_rising,
-            ),
-            (
-                "ASTRA",
-                show_astra,
-                &mut paths.astra_flat,
-                &mut paths.astra_rising,
-            ),
-        ] {
-            if !visible {
-                continue;
-            }
-            let Some((at, point)) = display_timelines.get(name).and_then(|timeline| {
-                timeline.iter().find(|(_, point)| {
-                    graph_model_line_is_exact(point) && graph_model_value(point, show_tokens) >= 0.0
-                })
-            }) else {
-                continue;
-            };
-            if *at <= period_start
-                || graph_interval_overlaps_confirmed_gap(period_start, *at, line_gaps)
-                || model_timelines.get(name).is_some_and(|timeline| {
-                    timeline
-                        .range(period_start..*at)
-                        .any(|(_, point)| !graph_model_line_is_exact(point))
-                })
-            {
-                continue;
-            }
-            let value = graph_model_value(point, show_tokens);
-            let target = if value == 0.0 { flat } else { rising };
-            append_graph_path_segment(
-                target,
-                (0.0, 99.0),
-                (
-                    x(*at),
-                    (99.0 - value / scale_maximum * 98.0).clamp(1.0, 99.0),
-                ),
-            );
-        }
-        paths.sol = [
-            &paths.sol_idle,
-            &paths.sol_flat,
-            &paths.sol_rising,
-            &paths.sol_inferred,
-        ]
-        .into_iter()
-        .filter(|path| !path.is_empty())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
-        paths.terra = [
-            &paths.terra_idle,
-            &paths.terra_flat,
-            &paths.terra_rising,
-            &paths.terra_inferred,
-        ]
-        .into_iter()
-        .filter(|path| !path.is_empty())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
-        paths.luna = [
-            &paths.luna_idle,
-            &paths.luna_flat,
-            &paths.luna_rising,
-            &paths.luna_inferred,
-        ]
-        .into_iter()
-        .filter(|path| !path.is_empty())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
-    }
+
     paths
 }
 
@@ -7155,127 +6897,6 @@ fn split_metric_line_paths_with_evidence(
     split_metric_line_paths_with_boundaries(context, value)
 }
 
-fn merge_graph_idle_intervals(mut intervals: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
-    intervals.sort_unstable();
-    let mut merged: Vec<(i64, i64)> = Vec::new();
-    for (start, end) in intervals {
-        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
-            last.1 = last.1.max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
-    merged
-}
-
-fn graph_task_idle_intervals(
-    samples: &[&UsageHistorySample],
-    activity: Option<&BTreeMap<i64, Option<bool>>>,
-    start: i64,
-    end: i64,
-    non_owned: &[GraphConfirmedGap],
-    model_timelines: &GraphModelTimelines,
-) -> Vec<(i64, i64)> {
-    let Some(activity) = activity else {
-        return Vec::new();
-    };
-    let mut changes = Vec::new();
-    let mut previous_quota: Option<(i64, i64, f64)> = None;
-    for sample in samples {
-        if sample.remaining_percent.is_finite() && (0.0..=100.0).contains(&sample.remaining_percent)
-        {
-            if let Some((timestamp, _, _)) = previous_quota.filter(|(_, reset, value)| {
-                *reset == sample.reset_at && value.to_bits() != sample.remaining_percent.to_bits()
-            }) {
-                changes.push((timestamp, sample.timestamp));
-            }
-            previous_quota = Some((sample.timestamp, sample.reset_at, sample.remaining_percent));
-        }
-    }
-    for timeline in model_timelines.values() {
-        let mut previous_tokens: Option<(i64, i64, u64)> = None;
-        for sample in samples {
-            if let Some(tokens) = timeline
-                .get(&sample.timestamp)
-                .and_then(graph_model_raw_tokens)
-            {
-                if let Some((timestamp, _, _)) = previous_tokens
-                    .filter(|(_, reset, value)| *reset == sample.reset_at && *value != tokens)
-                {
-                    changes.push((timestamp, sample.timestamp));
-                }
-                previous_tokens = Some((sample.timestamp, sample.reset_at, tokens));
-            }
-        }
-    }
-    let changes = merge_graph_idle_intervals(changes);
-    let mut change_index = 0;
-    let intervals = samples
-        .windows(2)
-        .filter_map(|pair| {
-            let left = pair[0];
-            let right = pair[1];
-            let from = start.max(left.timestamp);
-            let to = end.min(right.timestamp);
-            while change_index < changes.len() && changes[change_index].1 <= from {
-                change_index += 1;
-            }
-            let has_change = change_index < changes.len() && changes[change_index].0 < to;
-            (left.reset_at == right.reset_at
-                && to > from
-                && activity.get(&right.timestamp) == Some(&Some(false))
-                && !has_change
-                && !graph_interval_overlaps_confirmed_gap(from, to, non_owned))
-            .then_some((from, to))
-        })
-        .collect();
-    merge_graph_idle_intervals(intervals)
-        .into_iter()
-        .filter(|(a, b)| b - a >= SUSTAINED_UNUSED_MIN_DURATION_SECONDS)
-        .collect()
-}
-
-// Display-only holds for inferred bridges; never manufacture model/quota observations.
-fn append_stopped_graph_bridge(
-    idle: &mut String,
-    inferred: &mut String,
-    start: (f64, f64),
-    end: (f64, f64),
-    stops: &[(i64, i64)],
-    period_start: i64,
-    span: f64,
-) -> bool {
-    let stops = stops
-        .iter()
-        .map(|(a, b)| {
-            (
-                canonical_graph_viewbox_value((*a - period_start) as f64 / span * 100.0),
-                canonical_graph_viewbox_value((*b - period_start) as f64 / span * 100.0),
-            )
-        })
-        .filter(|(a, b)| *a < end.0 && *b > start.0)
-        .collect::<Vec<_>>();
-    if stops.is_empty() {
-        return false;
-    }
-    let mut cursor = start.0;
-    for (a, b) in stops {
-        let from = a.max(start.0);
-        let to = b.min(end.0);
-        if from > cursor {
-            append_dashed_segment(inferred, (cursor, start.1), (from, start.1));
-        }
-        if to > from {
-            append_graph_path_segment(idle, (from, start.1), (to, start.1));
-        }
-        cursor = to;
-    }
-    if cursor < end.0 {
-        append_dashed_segment(inferred, (cursor, start.1), end);
-    }
-    true
-}
-
 fn graph_interval_is_confirmed_idle(
     start_at: i64,
     end_at: i64,
@@ -7308,7 +6929,7 @@ fn apply_confirmed_idle_to_metric_segments(
     idle_timestamp_intervals: &[(i64, i64)],
 ) {
     for segment in segments {
-        if segment.kind != GraphMetricSegmentKind::Inferred
+        if segment.kind == GraphMetricSegmentKind::Flat
             && graph_interval_is_confirmed_idle(
                 points[segment.start_index].timestamp,
                 points[segment.end_index].timestamp,
@@ -7661,10 +7282,11 @@ fn metric_line_segments_with_boundaries_and_idle_with_tokens(
             .unwrap_or(false);
         let idle_model_change = confirmed_idle && token_change;
         let inferred = current < previous || crosses_prediction || hard_break || idle_model_change;
+        let idle_metric = confirmed_idle && !idle_model_change && current == previous;
         segments.push(GraphMetricSegment {
             start_index,
             end_index,
-            kind: if confirmed_idle && !idle_model_change {
+            kind: if idle_metric {
                 GraphMetricSegmentKind::Idle
             } else if inferred {
                 GraphMetricSegmentKind::Inferred
@@ -7673,7 +7295,7 @@ fn metric_line_segments_with_boundaries_and_idle_with_tokens(
             } else {
                 GraphMetricSegmentKind::Rising
             },
-            smoothable: !confirmed_idle
+            smoothable: !idle_metric
                 && current >= previous
                 && !graph_interval_overlaps_confirmed_gap(
                     points[start_index].timestamp,
@@ -7727,16 +7349,6 @@ fn split_metric_line_paths_with_evidence_idle_and_tokens(
     token_timeline: Option<&BTreeMap<i64, GraphModelPoint>>,
     non_owned_gaps: &[GraphConfirmedGap],
 ) -> (String, String, String, String) {
-    split_metric_line_paths_with_task_stops(context, value, token_timeline, non_owned_gaps, &[])
-}
-
-fn split_metric_line_paths_with_task_stops(
-    context: &MetricLinePathContext<'_>,
-    value: impl Fn(&HourlyModelSpend) -> f64,
-    token_timeline: Option<&BTreeMap<i64, GraphModelPoint>>,
-    non_owned_gaps: &[GraphConfirmedGap],
-    task_stops: &[(i64, i64)],
-) -> (String, String, String, String) {
     let span = (context.period_end - context.period_start).max(1) as f64;
     let scale = context.maximum.max(1.0);
     let coordinate = |point: &HourlyModelSpend| {
@@ -7765,16 +7377,6 @@ fn split_metric_line_paths_with_task_stops(
         context.points,
         context.idle_timestamp_intervals,
     );
-    for segment in &mut segments {
-        if segment.kind == GraphMetricSegmentKind::Inferred
-            && task_stops.iter().any(|(a, b)| {
-                *a < context.points[segment.end_index].timestamp
-                    && *b > context.points[segment.start_index].timestamp
-            })
-        {
-            segment.smoothable = false;
-        }
-    }
     let mut idle = String::new();
     let mut flat = String::new();
     let mut rising = String::new();
@@ -7806,7 +7408,6 @@ fn split_metric_line_paths_with_task_stops(
         let preserved_timestamps = context
             .idle_timestamp_intervals
             .iter()
-            .chain(task_stops.iter())
             .flat_map(|(start, end)| [*start, *end])
             .collect::<BTreeSet<_>>();
         let preserved_indices = run
@@ -7875,17 +7476,7 @@ fn split_metric_line_paths_with_task_stops(
     {
         let start = coordinate(&context.points[segment.start_index]);
         let end = coordinate(&context.points[segment.end_index]);
-        if !append_stopped_graph_bridge(
-            &mut idle,
-            &mut inferred,
-            start,
-            end,
-            task_stops,
-            context.period_start,
-            span,
-        ) {
-            append_dashed_segment(&mut inferred, start, end);
-        }
+        append_dashed_segment(&mut inferred, start, end);
     }
     (idle, flat, rising, inferred)
 }
@@ -8057,28 +7648,13 @@ fn accepted_remaining_samples(
                 .then_some((timestamp, first))
         })
         .collect::<Vec<_>>();
-    let isolated = raw
-        .windows(3)
-        .filter_map(|window| {
-            let [left, middle, right] = window else {
-                return None;
-            };
-            (left.1 >= right.1 && (middle.1 > left.1 || middle.1 < right.1)).then_some(middle.0)
-        })
-        .collect::<BTreeSet<_>>();
-    let mut baseline = None::<f64>;
     raw.into_iter()
         .map(|(timestamp, value)| {
-            let reliable = !isolated.contains(&timestamp)
-                && baseline.is_none_or(|accepted_value| value <= accepted_value);
-            if reliable {
-                baseline = Some(value);
-            }
             (
                 timestamp,
                 AcceptedRemainingSample {
                     raw: value,
-                    reliable,
+                    reliable: true,
                 },
             )
         })
@@ -8128,13 +7704,18 @@ fn token_idle_timestamp_intervals_for_model(
         .values()
         .flat_map(BTreeMap::keys)
         .copied()
+        .chain(
+            samples
+                .iter()
+                .map(|sample| sample.timestamp.div_euclid(60) * 60),
+        )
         .collect::<BTreeSet<_>>();
     let (accepted_tokens, _) =
         accepted_graph_model_timelines(raw_timelines, &projection_minutes, true, confirmed_gaps);
     // Only a non-empty vector of lossless same-minute raw observations can
     // prove inactivity. A slow change also requires positive short rates on
     // both sides; no dollar value or interpolated sample is authority.
-    let raw_idle_vector = |timestamp: i64| -> Option<(Vec<(String, u64)>, bool)> {
+    let raw_idle_vector = |timestamp: i64| -> Option<(GraphRawTokenVector, bool)> {
         let mut vector = Vec::new();
         let mut all_legacy = true;
         for (name, timeline) in raw_timelines {
@@ -8155,7 +7736,7 @@ fn token_idle_timestamp_intervals_for_model(
             {
                 return None;
             }
-            vector.push((name.clone(), graph_model_raw_tokens(point)?));
+            vector.push((name.clone(), graph_model_raw_token_identity(point)?));
         }
         if untrusted_minutes.contains(&timestamp) && !all_legacy {
             return None;
@@ -8187,32 +7768,33 @@ fn token_idle_timestamp_intervals_for_model(
     // Every direct observation inside a sparse interval must preserve the
     // exact endpoint model set and lossless token totals. Dollars are derived
     // display values and never participate in this authority path.
-    let direct_models_remain_flat = |start: i64, end: i64, values: &[(String, u64)]| {
-        let baseline = values
-            .iter()
-            .map(|(name, tokens)| (name.as_str(), *tokens))
-            .collect::<BTreeMap<_, _>>();
-        for timestamp in exact_model_timestamps.range((
-            std::ops::Bound::Excluded(start),
-            std::ops::Bound::Excluded(end),
-        )) {
-            let Some((vector, _)) = raw_idle_vector(*timestamp) else {
-                return false;
-            };
-            let values = vector
+    let direct_models_remain_flat =
+        |start: i64, end: i64, values: &[(String, GraphRawTokenIdentity)]| {
+            let baseline = values
                 .iter()
                 .map(|(name, tokens)| (name.as_str(), *tokens))
                 .collect::<BTreeMap<_, _>>();
-            if values.len() != baseline.len()
-                || baseline
+            for timestamp in exact_model_timestamps.range((
+                std::ops::Bound::Excluded(start),
+                std::ops::Bound::Excluded(end),
+            )) {
+                let Some((vector, _)) = raw_idle_vector(*timestamp) else {
+                    return false;
+                };
+                let values = vector
                     .iter()
-                    .any(|(name, expected)| values.get(name).copied() != Some(*expected))
-            {
-                return false;
+                    .map(|(name, tokens)| (name.as_str(), *tokens))
+                    .collect::<BTreeMap<_, _>>();
+                if values.len() != baseline.len()
+                    || baseline
+                        .iter()
+                        .any(|(name, expected)| values.get(name).copied() != Some(*expected))
+                {
+                    return false;
+                }
             }
-        }
-        true
-    };
+            true
+        };
 
     let mut anchors = raw_timelines
         .iter()
@@ -8478,7 +8060,6 @@ fn remaining_evidence_from_model_timelines(
         .then_some(sample.remaining_percent);
         by_timestamp.entry(sample.timestamp).or_default().push(raw);
     }
-    let accepted_remaining = accepted_remaining_samples(samples, period_start, period_end);
     let mut rows = by_timestamp
         .into_iter()
         .map(|(timestamp, candidates)| {
@@ -8504,21 +8085,10 @@ fn remaining_evidence_from_model_timelines(
 
     let mut values = vec![None; rows.len()];
     let mut origins = vec![None; rows.len()];
-    let mut minimum = None::<f64>;
     for (index, row) in rows.iter().enumerate() {
-        let Some(raw) = row.raw else {
-            continue;
-        };
-        let reliable = accepted_remaining
-            .get(&row.timestamp)
-            .is_some_and(|sample| sample.reliable && sample.raw == raw);
-        if !reliable || minimum.is_some_and(|prior| raw > prior) {
-            values[index] = minimum;
-            origins[index] = Some(GraphRemainingOrigin::MonotonicHold);
-        } else {
+        if let Some(raw) = row.raw {
             values[index] = Some(raw);
             origins[index] = Some(GraphRemainingOrigin::Raw);
-            minimum = Some(raw);
         }
     }
 
@@ -8545,10 +8115,7 @@ fn remaining_evidence_from_model_timelines(
         };
         let bounded = run_end < rows.len() && values[run_end].is_some();
         let mut interpolated = false;
-        if bounded
-            && values[run_end].is_some_and(|right| right < left_value)
-            && rows[run_end].timestamp > rows[left].timestamp
-        {
+        if bounded && rows[run_end].timestamp > rows[left].timestamp {
             let right_value = values[run_end].expect("bounded value exists");
             let total_elapsed = rows[run_end].timestamp.saturating_sub(rows[left].timestamp) as f64;
             if total_elapsed > f64::EPSILON {
@@ -8837,7 +8404,7 @@ fn remaining_segments_with_boundaries_and_evidence_and_non_owned(
             graph_interval_crosses_correction(before.0, after.0, correction_starts);
         let hard_break =
             graph_interval_has_hard_break(before.0, after.0, confirmed_gaps, correction_starts);
-        let kind = if after.1 > before.1 || !measured || crosses_prediction || hard_break {
+        let kind = if !measured || crosses_prediction || hard_break {
             GraphRemainingSegmentKind::Inferred
         } else {
             GraphRemainingSegmentKind::Solid
@@ -8846,8 +8413,7 @@ fn remaining_segments_with_boundaries_and_evidence_and_non_owned(
             start_index,
             end_index,
             kind,
-            smoothable: after.1 <= before.1
-                && !graph_interval_overlaps_confirmed_gap(before.0, after.0, non_owned_gaps)
+            smoothable: !graph_interval_overlaps_confirmed_gap(before.0, after.0, non_owned_gaps)
                 && !crosses_correction,
         });
     }
@@ -8889,8 +8455,7 @@ fn remaining_point_has_measured_quota(
         GraphRemainingOrigin::Interpolated
         | GraphRemainingOrigin::BoundedNullHold
         | GraphRemainingOrigin::TerminalNullHold
-        | GraphRemainingOrigin::SyntheticTailHold
-        | GraphRemainingOrigin::MonotonicHold => false,
+        | GraphRemainingOrigin::SyntheticTailHold => false,
     }
 }
 
@@ -8914,14 +8479,6 @@ fn remaining_paths_with_boundaries_and_idle(
 fn remaining_paths_with_boundaries_and_idle_with_non_owned(
     context: RemainingPathContext<'_>,
     non_owned_gaps: &[GraphConfirmedGap],
-) -> (String, String, String) {
-    remaining_paths_with_task_stops(context, non_owned_gaps, &[])
-}
-
-fn remaining_paths_with_task_stops(
-    context: RemainingPathContext<'_>,
-    non_owned_gaps: &[GraphConfirmedGap],
-    task_stops: &[(i64, i64)],
 ) -> (String, String, String) {
     let RemainingPathContext {
         points,
@@ -8951,15 +8508,6 @@ fn remaining_paths_with_task_stops(
         non_owned_gaps,
     );
     apply_confirmed_idle_to_remaining_segments(&mut segments, points, idle_timestamp_intervals);
-    for segment in &mut segments {
-        if segment.kind == GraphRemainingSegmentKind::Inferred
-            && task_stops.iter().any(|(a, b)| {
-                *a < points[segment.end_index].0 && *b > points[segment.start_index].0
-            })
-        {
-            segment.smoothable = false;
-        }
-    }
     let mut idle_commands = String::new();
     let mut solid_commands = String::new();
     let mut inferred_commands = String::new();
@@ -9045,17 +8593,7 @@ fn remaining_paths_with_task_stops(
     }) {
         let start = coordinate(points[segment.start_index]);
         let end = coordinate(points[segment.end_index]);
-        if !append_stopped_graph_bridge(
-            &mut idle_commands,
-            &mut inferred_commands,
-            start,
-            end,
-            task_stops,
-            period_start,
-            span,
-        ) {
-            append_dashed_segment(&mut inferred_commands, start, end);
-        }
+        append_dashed_segment(&mut inferred_commands, start, end);
     }
     (idle_commands, solid_commands, inferred_commands)
 }
@@ -11576,6 +11114,9 @@ fn same_session_checkpoint_state(
         && left.history_base_pending == right.history_base_pending
         && left.last_task_running == right.last_task_running
         && left.last_model == right.last_model
+        && left.last_model_context_kind == right.last_model_context_kind
+        && left.last_model_interval == right.last_model_interval
+        && left.source_admission == right.source_admission
         && left.previous_total == right.previous_total
         && left.previous_input == right.previous_input
         && left.previous_cached_input == right.previous_cached_input
@@ -11665,11 +11206,19 @@ fn collect_session_append(
             checkpoint.last_task_running,
             checkpoint.last_model.clone(),
             TokenSnapshot {
-                total: checkpoint.previous_total,
+                total: checkpoint
+                    .previous_total
+                    .expect("legacy test collector requires a known total baseline"),
                 cache_write_input: checkpoint.previous_cache_write_input,
-                input: checkpoint.previous_input,
-                cached_input: checkpoint.previous_cached_input,
-                output: checkpoint.previous_output,
+                input: checkpoint
+                    .previous_input
+                    .expect("legacy test collector requires a known input baseline"),
+                cached_input: checkpoint
+                    .previous_cached_input
+                    .expect("legacy test collector requires a known cached_input baseline"),
+                output: checkpoint
+                    .previous_output
+                    .expect("legacy test collector requires a known output baseline"),
             },
             checkpoint.prefix_generation,
             checkpoint.prefix_sha256.clone(),
@@ -11856,10 +11405,13 @@ fn collect_session_append(
         history_base_pending: false,
         last_task_running,
         last_model: model.as_deref().and_then(ModelUsageTotals::canonical_model),
-        previous_total: previous.total,
-        previous_input: previous.input,
-        previous_cached_input: previous.cached_input,
-        previous_output: previous.output,
+        last_model_context_kind: None,
+        last_model_interval: None,
+        source_admission: None,
+        previous_total: Some(previous.total),
+        previous_input: Some(previous.input),
+        previous_cached_input: Some(previous.cached_input),
+        previous_output: Some(previous.output),
         context_usage_tokens: continuous_checkpoint
             .and_then(|checkpoint| checkpoint.context_usage_tokens),
         context_window_tokens: continuous_checkpoint
@@ -15164,9 +14716,9 @@ impl CodexInfoState {
                                 usage_store::SessionModelTotal {
                                     model: model.to_owned(),
                                     total_tokens: astra_tokens,
-                                    input_tokens: astra_tokens,
-                                    cached_input_tokens: 0,
-                                    output_tokens: 0,
+                                    input_tokens: Some(astra_tokens),
+                                    cached_input_tokens: Some(0),
+                                    output_tokens: Some(0),
                                     cache_write_input_tokens: Some(0),
                                 }
                             })
@@ -16204,8 +15756,8 @@ impl CodexInfoState {
         gaps: Vec<PublicHistoryGap>,
         cursor: Option<String>,
     ) -> Result<bool, String> {
-        if self.service_current_pair.as_deref() != Some(published_pair.as_str()) {
-            return Err("history resource generation differs from current".into());
+        if !valid_published_pair(&published_pair) {
+            return Err("invalid history resource generation".into());
         }
         let Some(mut validation) = self.service_current_snapshot.clone() else {
             return Err("history resource has no current root".into());
@@ -16214,6 +15766,12 @@ impl CodexInfoState {
         validation.history_samples = samples.clone();
         validation.history_gaps = gaps.clone();
         validation.threads.clear();
+        // History has its own verified clock and revision. Current may have
+        // advanced (including to another week) while this frame was retained.
+        validation.quota = None;
+        if let Some(period) = periods.iter().find(|period| period.current) {
+            validation.observed_at = Some(period.end_at);
+        }
         validation.validate().map_err(|error| error.to_string())?;
         let next_samples = samples
             .iter()
@@ -16261,8 +15819,8 @@ impl CodexInfoState {
         published_pair: String,
         periods: Vec<PublicHistoryPeriod>,
     ) -> Result<bool, String> {
-        if self.service_current_pair.as_deref() != Some(published_pair.as_str()) {
-            return Err("history periods generation differs from current".into());
+        if !valid_published_pair(&published_pair) {
+            return Err("invalid history periods generation".into());
         }
         let Some(mut validation) = self.service_current_snapshot.clone() else {
             return Err("history periods have no current root".into());
@@ -16271,6 +15829,10 @@ impl CodexInfoState {
         validation.history_samples.clear();
         validation.history_gaps.clear();
         validation.threads.clear();
+        validation.quota = None;
+        if let Some(period) = periods.iter().find(|period| period.current) {
+            validation.observed_at = Some(period.end_at);
+        }
         validation.validate().map_err(|error| error.to_string())?;
 
         let changed = self.service_history_periods_pair.as_deref() != Some(published_pair.as_str())
@@ -17930,10 +17492,7 @@ impl CodexInfoState {
 
     fn history_periods_at(&self, observed_at: i64) -> Vec<HistoryPeriod> {
         if !self.preview {
-            let authoritative_periods = if self.service_history_periods_pair.is_some()
-                && self.service_history_periods_pair.as_deref()
-                    == self.service_current_pair.as_deref()
-            {
+            let authoritative_periods = if self.service_history_periods_pair.is_some() {
                 Some(self.service_history_periods.as_slice())
             } else if !self.service_split_capable
                 && self.service_published_pair.is_some()
@@ -18057,8 +17616,8 @@ impl CodexInfoState {
         if self.preview || !self.service_split_capable {
             return false;
         }
-        let Some(current_pair) = self.service_current_pair.as_deref() else {
-            return false;
+        let Some(history_pair) = self.service_history_periods_pair.as_deref() else {
+            return self.service_current_pair.is_some();
         };
         // An exact stale-cursor response schedules a head recovery. Until
         // that recovery commits, keep the last-good scene behind loading;
@@ -18068,9 +17627,6 @@ impl CodexInfoState {
         }
         if self.service_history_error.is_some() {
             return false;
-        }
-        if self.service_history_periods_pair.as_deref() != Some(current_pair) {
-            return true;
         }
         let selected_period = self
             .service_history_pending_reset_at
@@ -18089,9 +17645,9 @@ impl CodexInfoState {
             // committed for the same pair. A retained page or an initial
             // page-less state is still waiting for the history resource.
             return self.service_history_period_id.is_some()
-                || self.service_history_pair.as_deref() != Some(current_pair);
+                || self.service_history_pair.as_deref() != Some(history_pair);
         };
-        self.service_history_pair.as_deref() != Some(current_pair)
+        self.service_history_pair.as_deref() != Some(history_pair)
             || self.service_history_period_id.as_deref() != Some(selected_period.id.as_str())
     }
 
@@ -18490,6 +18046,7 @@ impl CodexInfoState {
         (samples, untrusted_minutes, sampling_unavailable_minutes)
     }
 
+    #[cfg(test)]
     fn graph_task_activity_for_selection(
         &self,
         selected_reset: i64,
@@ -18586,6 +18143,14 @@ impl CodexInfoState {
                     // consistent historical token vector.
                     dollar: dollars.unwrap_or(-1.0),
                     tokens: tokens as f64,
+                    raw_components: [
+                        graph_component_total(models.iter().map(|model| model.input_tokens)),
+                        graph_component_total(models.iter().map(|model| model.cached_input_tokens)),
+                        graph_component_total(
+                            models.iter().map(|model| model.cache_write_input_tokens),
+                        ),
+                        graph_component_total(models.iter().map(|model| model.output_tokens)),
+                    ],
                     raw_tokens: Some(tokens),
                     origin,
                 },
@@ -18641,6 +18206,7 @@ impl CodexInfoState {
                         GraphModelPoint {
                             dollar,
                             tokens: tokens as f64,
+                            raw_components: [None; 4],
                             raw_tokens: Some(tokens),
                             origin,
                         },
@@ -18675,6 +18241,14 @@ impl CodexInfoState {
                 GraphModelPoint {
                     dollar,
                     tokens: tokens as f64,
+                    raw_components: [
+                        graph_component_total(models.iter().map(|model| model.input_tokens)),
+                        graph_component_total(models.iter().map(|model| model.cached_input_tokens)),
+                        graph_component_total(
+                            models.iter().map(|model| model.cache_write_input_tokens),
+                        ),
+                        graph_component_total(models.iter().map(|model| model.output_tokens)),
+                    ],
                     raw_tokens: Some(tokens),
                     origin,
                 },
@@ -18912,23 +18486,6 @@ impl CodexInfoState {
         line_gaps.extend_from_slice(&non_owned_gaps);
         let raw_model_timelines =
             self.graph_raw_model_timelines_for_selection(selected_reset, period_start, period_end);
-        let task_activity =
-            self.graph_task_activity_for_selection(selected_reset, period_start, period_end);
-        let published_authority = self
-            .service_history_periods_pair
-            .as_ref()
-            .is_some_and(|pair| self.service_current_pair.as_ref() == Some(pair));
-        let verified_origin = published_authority
-            && self.service_history_periods.iter().any(|published| {
-                published.reset_at == selected_reset
-                    && published.start_at == period_start
-                    && published.origin_at == Some(period_start)
-            })
-            || published_authority
-                && period.current
-                && self.reset_at == Some(selected_reset)
-                && self.window_seconds > 0
-                && selected_reset.checked_sub(self.window_seconds) == Some(period_start);
         let mut paths = graph_paths_with_period_authority(
             GraphSelectionInput {
                 samples: &sample_references,
@@ -18943,11 +18500,9 @@ impl CodexInfoState {
                 confirmed_gaps: &confirmed_gaps,
                 model_timelines: &raw_model_timelines,
             },
-            Some(&task_activity),
             Some(&sampling_unavailable_minutes),
             &line_gaps,
             &non_owned_gaps,
-            verified_origin,
             period.current,
         );
         if !self.has_quota_percent {
@@ -21730,6 +21285,8 @@ fn request_service_details_with_etag_and_timeout(
     let mut content_type = false;
     let mut cache_control = false;
     let mut connection_close = false;
+    let mut history_state = None;
+    let mut history_verified_at = None;
     for line in lines {
         let (name, value) = line
             .split_once(": ")
@@ -21737,6 +21294,20 @@ fn request_service_details_with_etag_and_timeout(
         let name = name.to_ascii_lowercase();
         match name.as_str() {
             "codex-info-published-pair" if pair.is_none() => pair = Some(value.to_owned()),
+            "codex-info-history-state"
+                if history_state.is_none() && matches!(value, "verified" | "refreshing") =>
+            {
+                history_state = Some(value);
+            }
+            "codex-info-history-verified-at" if history_verified_at.is_none() => {
+                history_verified_at = Some(
+                    value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|at| *at > 0 && value.bytes().all(|byte| byte.is_ascii_digit()))
+                        .ok_or("invalid history verification time")?,
+                );
+            }
             "content-type"
                 if !content_type
                     && value.eq_ignore_ascii_case("application/json; charset=utf-8") =>
@@ -21758,6 +21329,14 @@ fn request_service_details_with_etag_and_timeout(
             }
             _ => return Err("unexpected or duplicate details response header".into()),
         }
+    }
+    // These headers describe availability of the verified History frame.
+    // Its original pair and body still own the data; refreshing never means
+    // that missing newer observations are known or may be synthesized.
+    if history_state.is_some() != history_verified_at.is_some()
+        || (history_state.is_some() && !matches!(status, 200 | 304))
+    {
+        return Err("history response metadata is incomplete or unsuccessful".into());
     }
     // The account directory is metadata rather than a snapshot generation;
     // the standalone REST owner intentionally omits the published-pair
@@ -22109,11 +21688,18 @@ fn parse_service_history_periods_document(
     for (period, origin) in periods.iter_mut().zip(origins) {
         period.origin_at = origin;
     }
-    let observed_at = periods
-        .iter()
-        .map(|period| period.end_at)
-        .max()
-        .unwrap_or(1);
+    // The current period owns its clock. Another exact period may have a
+    // later retained observation without extending the current period.
+    let observed_at = periods.iter().find(|period| period.current).map_or_else(
+        || {
+            periods
+                .iter()
+                .map(|period| period.end_at)
+                .max()
+                .unwrap_or(1)
+        },
+        |period| period.end_at,
+    );
     let validation = PublicDetails {
         state: PublicState::Ready,
         observed_at: Some(observed_at),
@@ -22433,7 +22019,12 @@ fn service_main_account_options(accounts: &[ServiceAccountV3]) -> Vec<(String, b
 /// the directory itself and therefore intentionally has no account selector.
 /// Legacy v1/v2 fallback routes remain unchanged.
 fn service_route_with_account(route: &str, account_id: Option<&str>) -> String {
-    if (!route.starts_with("/v3/") && route != "/v4/current") || route == "/v3/accounts" {
+    if (!route.starts_with("/v3/")
+        && !route.starts_with("/v4/")
+        && !route.starts_with("/v5/")
+        && !route.starts_with("/v6/"))
+        || route == "/v3/accounts"
+    {
         return route.to_owned();
     }
     let Some(account_id) = account_id else {
@@ -23230,6 +22821,11 @@ where
     F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
 {
     if let Some(suffix) = route.strip_prefix("/v3/history/periods") {
+        let v5 =
+            request_service_directory_v5(&format!("/v5/history/periods{suffix}"), &mut request)?;
+        if v5.status != 404 {
+            return Ok(v5);
+        }
         // Versioned metadata is one coherent publication. Never send a v3
         // directory ETag to v4: its equal DB pair is not a cached v4 body.
         let response = request(&format!("/v4/history/periods{suffix}"), None)?;
@@ -23245,6 +22841,119 @@ where
         }
     }
     request(route, prior)
+}
+
+fn request_service_directory_v5<F>(
+    route: &str,
+    request: &mut F,
+) -> Result<ServiceDetailsHttpResponse, String>
+where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    // The existing cache belongs to a legacy schema, so it is never sent to
+    // this route. Only a fully received set is adapted to the internal v4
+    // metadata representation; every network page remains strict v5.
+    let mut response = request(route, None)?;
+    if response.status == 304 {
+        return Err("cacheless v5 directory 304".into());
+    }
+    if response.status != 200 {
+        return Ok(response);
+    }
+    let pair = response_published_pair(&response)?;
+    let mut rows = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_resets = BTreeSet::new();
+    let mut seen_cursors = BTreeSet::new();
+    let mut previous_key = None;
+    let mut current_count = 0;
+    loop {
+        if response.status != 200 || response_published_pair(&response)? != pair {
+            return Err("directory page failed or changed publication".into());
+        }
+        let mut document = decode_unique_json(&response.body)?;
+        let object = document
+            .as_object_mut()
+            .ok_or("directory page is not an object")?;
+        if object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+            != BTreeSet::from(["api_version", "history_periods", "next_cursor"])
+            || object.get("api_version").and_then(Value::as_str) != Some("v5")
+        {
+            return Err("directory page fields or version differ from v5".into());
+        }
+        let next = object.remove("next_cursor").ok_or("missing next cursor")?;
+        let next = if next.is_null() {
+            None
+        } else {
+            let text = next.as_str().ok_or("invalid directory cursor")?;
+            if text.is_empty()
+                || text.len() > 512
+                || !text.is_ascii()
+                || text.bytes().any(|byte| byte.is_ascii_control())
+            {
+                return Err("invalid directory cursor".into());
+            }
+            Some(text.to_owned())
+        };
+        object.insert("api_version".into(), Value::String("v4".into()));
+        let validated = parse_service_history_periods_document(
+            &serde_json::to_vec(&document).map_err(|error| error.to_string())?,
+        )?;
+        if next.is_some() && validated.is_empty() {
+            return Err("nonterminal directory page is empty".into());
+        }
+        for period in &validated {
+            let key = (period.reset_at, period.id.as_bytes().to_vec());
+            if !seen_ids.insert(period.id.clone())
+                || !seen_resets.insert(period.reset_at)
+                || previous_key
+                    .as_ref()
+                    .is_some_and(|previous| previous >= &key)
+            {
+                return Err("directory order or uniqueness is invalid".into());
+            }
+            previous_key = Some(key);
+            current_count += usize::from(period.current);
+            if current_count > 1 {
+                return Err("directory contains multiple current periods".into());
+            }
+        }
+        let page_rows = document
+            .get_mut("history_periods")
+            .and_then(Value::as_array_mut)
+            .ok_or("directory periods are not an array")?;
+        rows.extend(validated.into_iter().zip(page_rows.drain(..)));
+        let Some(next) = next else {
+            break;
+        };
+        if !seen_cursors.insert(next.clone()) {
+            return Err("directory cursor repeated".into());
+        }
+        let separator = if route.contains('?') { '&' } else { '?' };
+        response = request(
+            &format!(
+                "{route}{separator}cursor={}",
+                percent_encode_query_component(&next)
+            ),
+            None,
+        )?;
+    }
+    rows.sort_by(|(left, _), (right, _)| {
+        (right.start_at, right.reset_at, right.id.as_bytes()).cmp(&(
+            left.start_at,
+            left.reset_at,
+            left.id.as_bytes(),
+        ))
+    });
+    let periods = rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+    Ok(ServiceDetailsHttpResponse {
+        status: 200,
+        pair: Some(pair),
+        body: serde_json::to_vec(
+            &serde_json::json!({"api_version":"v4", "history_periods":periods}),
+        )
+        .map_err(|error| error.to_string())?,
+    })
 }
 
 fn select_service_history_and_poll(
@@ -23299,6 +23008,7 @@ fn poll_service_graph_resources_with<F>(
     let previous_cursor = state.service_history_cursor.clone();
     let selected_account = state.service_selected_account_id.clone();
     let mut periods = state.service_history_periods.clone();
+    let mut history_pair = previous_periods_pair.clone();
     let mut periods_selectable = state.service_history_periods_selectable;
     let refresh_periods = force
         || !periods_selectable
@@ -23322,24 +23032,19 @@ fn poll_service_graph_resources_with<F>(
             periods_selectable = selectable;
             match fetched {
                 ServiceResourceFetch::Fresh { pair, value } => {
-                    if pair != current_pair {
-                        return Err("history periods generation differs from current".into());
-                    }
+                    history_pair = Some(pair);
                     periods = value;
                 }
                 ServiceResourceFetch::NotModified { pair } => {
-                    if pair != current_pair {
-                        return Err(
-                            "not-modified history periods generation differs from current".into(),
-                        );
-                    }
+                    history_pair = Some(pair);
                 }
             }
         }
+        let history_pair = history_pair.ok_or("history directory has no verified generation")?;
         if !graph_open {
             if refresh_periods {
                 state.apply_service_history_periods_resource(
-                    current_pair.clone(),
+                    history_pair.clone(),
                     periods.clone(),
                 )?;
             }
@@ -23354,7 +23059,7 @@ fn poll_service_graph_resources_with<F>(
             .map(|period| (period.id.clone(), period.reset_at));
         let Some((period_id, _)) = selected_period else {
             state.apply_service_history_resource(
-                current_pair.clone(),
+                history_pair.clone(),
                 periods,
                 Vec::new(),
                 Vec::new(),
@@ -23440,7 +23145,7 @@ fn poll_service_graph_resources_with<F>(
             };
             match page {
                 ServiceResourceFetch::NotModified { pair } => {
-                    if full_refresh || pair != current_pair {
+                    if full_refresh || pair != history_pair {
                         return Err(
                             "not-modified history page cannot replace current resource".into()
                         );
@@ -23448,8 +23153,8 @@ fn poll_service_graph_resources_with<F>(
                     break state.service_history_cursor.clone();
                 }
                 ServiceResourceFetch::Fresh { pair, value } => {
-                    if pair != current_pair {
-                        return Err("history page generation differs from current".into());
+                    if pair != history_pair {
+                        return Err("history page generation differs from its directory".into());
                     }
                     if !full_refresh && !value.gaps.is_empty() {
                         // Cursor continuity is valid only while the selected
@@ -23499,7 +23204,7 @@ fn poll_service_graph_resources_with<F>(
             }
         };
         state.apply_service_history_resource(
-            current_pair,
+            history_pair,
             periods,
             samples,
             gaps,
@@ -24744,6 +24449,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue604_main_and_graph_keep_existing_resource_entrypoints() {
+        let mut routes = Vec::new();
+        let _ = super::fetch_service_current_with_etag(
+            |route, _| {
+                routes.push(route.to_owned());
+                Ok(super::ServiceDetailsHttpResponse {
+                    status: 503,
+                    pair: None,
+                    body: Vec::new(),
+                })
+            },
+            None,
+            None,
+        );
+        assert_eq!(
+            routes,
+            ["/v4/current"],
+            "Main must use its existing current contract without a supplementary scope request"
+        );
+        let mut state = CodexInfoState::service_client();
+        state.service_split_capable = true;
+        state.service_current_pair = Some(published_pair(604, 1));
+        state.service_history_force_poll = true;
+        let mut graph_routes = Vec::new();
+        super::poll_service_graph_resources_with(&mut state, Instant::now(), true, |route, _| {
+            graph_routes.push(route.to_owned());
+            Ok(super::ServiceDetailsHttpResponse {
+                status: 503,
+                pair: None,
+                body: Vec::new(),
+            })
+        });
+        assert_eq!(
+            graph_routes,
+            ["/v3/history/periods/selectable"],
+            "Graph must retain the period selector without a supplementary scope request"
+        );
+    }
+
     use super::daemon;
     use super::winit;
     use super::{
@@ -26536,6 +26281,94 @@ mod tests {
     }
 
     #[test]
+    fn issue604_linux_graph_accepts_verified_history_http_metadata() {
+        let history_pair = published_pair(604, 10);
+        let current_pair = published_pair(604, 11);
+        let exchange = |route: &str, status: u16, metadata: &str, body: &[u8]| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nCodex-Info-Published-Pair: {history_pair}\r\n{metadata}Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                std::str::from_utf8(body).unwrap()
+            );
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request);
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let result = super::request_service_details_with_etag(address, route, None);
+            worker.join().unwrap();
+            result
+        };
+        let (mut period, samples) = split_graph_fixture();
+        period.current = true;
+        let mut directory: Value =
+            serde_json::from_slice(&split_history_periods_body(&period)).unwrap();
+        directory["api_version"] = json!("v5");
+        directory["next_cursor"] = Value::Null;
+        directory["history_periods"][0]["origin_at"] = Value::Null;
+        let directory = serde_json::to_vec(&directory).unwrap();
+        let page = split_history_page_body(&samples[..2], None, Some("resume"));
+        let metadata = "Codex-Info-History-State: refreshing\r\nCodex-Info-History-Verified-At: 1800000300\r\n";
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_current_v3(current_pair.clone(), split_graph_current(&period))
+            .unwrap();
+        super::poll_service_graph_resources_with(
+            &mut state,
+            Instant::now(),
+            true,
+            |route, prior| {
+                super::request_graph_resource_with_origin(route, prior, |wire_route, _| {
+                    let body = if wire_route.starts_with("/v5/history/periods") {
+                        &directory
+                    } else {
+                        &page
+                    };
+                    exchange(wire_route, 200, metadata, body)
+                })
+            },
+        );
+        assert!(
+            state.service_history_error.is_none(),
+            "valid history HTTP metadata must reach Graph: {:?}",
+            state.service_history_error
+        );
+        assert!(!state.graph_history_loading());
+        assert_eq!(state.service_history_samples, samples[..2]);
+        assert_eq!(
+            state.service_history_pair.as_deref(),
+            Some(history_pair.as_str())
+        );
+        assert_eq!(
+            state.service_current_pair.as_deref(),
+            Some(current_pair.as_str())
+        );
+
+        for freshness in ["verified", "refreshing"] {
+            let metadata = format!(
+                "Codex-Info-History-State: {freshness}\r\nCodex-Info-History-Verified-At: 1800000300\r\n"
+            );
+            let response = exchange("/v3/history?period=1", 304, &metadata, b"").unwrap();
+            assert_eq!(response.pair.as_deref(), Some(history_pair.as_str()));
+            assert!(response.body.is_empty());
+        }
+        for invalid in [
+            "Codex-Info-History-State: complete\r\nCodex-Info-History-Verified-At: 1800000300\r\n",
+            "Codex-Info-History-State: refreshing\r\nCodex-Info-History-Verified-At: -1\r\n",
+            "Codex-Info-History-State: refreshing\r\n",
+            "Codex-Info-History-Verified-At: 1800000300\r\n",
+            "Codex-Info-History-State: refreshing\r\nCodex-Info-History-State: verified\r\nCodex-Info-History-Verified-At: 1800000300\r\n",
+            "Codex-Info-History-State: refreshing\r\nCodex-Info-History-Verified-At: 1800000300\r\nCodex-Info-History-Verified-At: 1800000300\r\n",
+            "X-Unrecognized: value\r\n",
+        ] {
+            assert!(exchange("/v3/history?period=1", 200, invalid, &page).is_err());
+        }
+    }
+
+    #[test]
     fn service_client_response_budget_matches_the_rest_request_budget() {
         assert_eq!(super::SERVICE_RESPONSE_TIMEOUT, Duration::from_secs(3));
     }
@@ -27299,7 +27132,7 @@ mod tests {
     }
 
     #[test]
-    fn split_history_apply_is_atomic_at_the_current_pair_boundary() {
+    fn split_history_apply_is_atomic_at_the_history_validation_boundary() {
         let source = CodexInfoState::preview("normal");
         let mut current = source.public_details_candidates().2;
         let periods = current.history_periods.clone();
@@ -27318,10 +27151,12 @@ mod tests {
             .apply_service_current_v3(pair.clone(), current)
             .expect("current root is valid");
 
+        let mut invalid_periods = periods.clone();
+        invalid_periods[0].end_at = invalid_periods[0].start_at - 1;
         assert!(client
             .apply_service_history_resource(
                 wrong_pair,
-                periods.clone(),
+                invalid_periods,
                 samples.clone(),
                 gaps.clone(),
                 None
@@ -27417,6 +27252,151 @@ mod tests {
         }
     }
 
+    fn issue604_directory_v5_page(rows: &[i64], next: Option<&str>, current_index: i64) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "api_version":"v5",
+            "history_periods":rows.iter().map(|&index| serde_json::json!({
+                "id":(1_800_604_800 + index * 60).to_string(),
+                "start_at":1_800_000_000 + index * 60,
+                "end_at":1_800_000_059 + index * 60,
+                "reset_at":1_800_604_800 + index * 60,
+                "label":format!("2027/01/15 17:{index:02}:00 +09:00 ～ 2027/01/15 17:{index:02}:59 +09:00"),
+                "current":index == current_index,
+                "origin_at":1_800_000_000 + index * 60,
+            })).collect::<Vec<_>>(),
+            "next_cursor":next,
+        })).unwrap()
+    }
+
+    #[test]
+    fn issue604_native_v5_directory_accepts_only_the_complete_ordered_set() {
+        let pair = format!("v1:{}", "a".repeat(64));
+        let mut paths = Vec::new();
+        let response = super::request_graph_resource_with_origin(
+            "/v3/history/periods/selectable?account=account-7",
+            Some(&pair),
+            |route, prior| {
+                paths.push((route.to_owned(), prior.map(str::to_owned)));
+                assert!(prior.is_none(), "a legacy schema cache cannot validate v5");
+                assert!(route.starts_with("/v5/"));
+                Ok(super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(pair.clone()),
+                    body: if route.contains("cursor=") {
+                        issue604_directory_v5_page(&[2, 3], None, 0)
+                    } else {
+                        issue604_directory_v5_page(&[0, 1], Some("opaque.next"), 0)
+                    },
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            paths,
+            [
+                (
+                    "/v5/history/periods/selectable?account=account-7".into(),
+                    None
+                ),
+                (
+                    "/v5/history/periods/selectable?account=account-7&cursor=opaque.next".into(),
+                    None
+                ),
+            ]
+        );
+        assert_eq!(response.pair, Some(pair));
+        let periods = super::parse_service_history_periods_document(&response.body).unwrap();
+        assert_eq!(
+            periods.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["1800604980", "1800604920", "1800604860", "1800604800"]
+        );
+        assert_eq!(periods[3].origin_at, Some(1_800_000_000));
+        assert!(periods[3].current);
+    }
+
+    #[test]
+    fn issue604_native_v5_directory_rejects_incomplete_or_mixed_pages_without_fallback() {
+        let pair = format!("v1:{}", "a".repeat(64));
+        for defect in [
+            "pair",
+            "duplicate",
+            "order",
+            "empty",
+            "repeat",
+            "current",
+            "missing-cursor",
+            "extra-key",
+            "404",
+            "503",
+        ] {
+            let mut paths = Vec::new();
+            let response = super::request_graph_resource_with_origin(
+                "/v3/history/periods?account=account-7",
+                None,
+                |route, prior| {
+                    paths.push(route.to_owned());
+                    assert!(prior.is_none());
+                    assert!(route.starts_with("/v5/"));
+                    let continuation = route.contains("cursor=");
+                    let body = if continuation {
+                        match defect {
+                            "duplicate" => issue604_directory_v5_page(&[1], None, 3),
+                            "order" => issue604_directory_v5_page(&[0], None, 3),
+                            "empty" => issue604_directory_v5_page(&[], Some("different.cursor"), 3),
+                            "repeat" => issue604_directory_v5_page(&[2], Some("next.cursor"), 3),
+                            "current" => issue604_directory_v5_page(&[3], None, 3),
+                            "missing-cursor" | "extra-key" => {
+                                let mut value: serde_json::Value = serde_json::from_slice(
+                                    &issue604_directory_v5_page(&[2], None, 3),
+                                )
+                                .unwrap();
+                                if defect == "missing-cursor" {
+                                    value.as_object_mut().unwrap().remove("next_cursor");
+                                } else {
+                                    value["extra"] = serde_json::json!(0);
+                                }
+                                serde_json::to_vec(&value).unwrap()
+                            }
+                            _ => issue604_directory_v5_page(&[2], None, 3),
+                        }
+                    } else {
+                        issue604_directory_v5_page(
+                            &[1],
+                            Some("next.cursor"),
+                            if defect == "current" { 1 } else { 3 },
+                        )
+                    };
+                    Ok(super::ServiceDetailsHttpResponse {
+                        status: if continuation && defect == "404" {
+                            404
+                        } else if continuation && defect == "503" {
+                            503
+                        } else {
+                            200
+                        },
+                        pair: Some(if continuation && defect == "pair" {
+                            format!("v1:{}", "b".repeat(64))
+                        } else {
+                            pair.clone()
+                        }),
+                        body,
+                    })
+                },
+            );
+            assert!(
+                response.is_err(),
+                "invalid v5 candidate was accepted: {defect}"
+            );
+            assert_eq!(
+                paths,
+                [
+                    "/v5/history/periods?account=account-7",
+                    "/v5/history/periods?account=account-7&cursor=next.cursor"
+                ]
+            );
+        }
+    }
+
     #[test]
     fn issue614_native_origin_transport_falls_back_only_on_404() {
         for status in [200, 404, 503] {
@@ -27427,7 +27407,9 @@ mod tests {
                 |route, prior| {
                     paths.push((route.to_owned(), prior.map(str::to_owned)));
                     Ok(super::ServiceDetailsHttpResponse {
-                        status: if route.starts_with("/v4/") {
+                        status: if route.starts_with("/v5/") {
+                            404
+                        } else if route.starts_with("/v4/") {
                             status
                         } else {
                             200
@@ -27441,15 +27423,22 @@ mod tests {
             assert_eq!(
                 paths[0],
                 (
+                    "/v5/history/periods/selectable?account=account-7".into(),
+                    None
+                )
+            );
+            assert_eq!(
+                paths[1],
+                (
                     "/v4/history/periods/selectable?account=account-7".into(),
                     None
                 )
             );
-            assert_eq!(paths.len(), if status == 404 { 2 } else { 1 });
+            assert_eq!(paths.len(), if status == 404 { 3 } else { 2 });
             assert_eq!(response.status, if status == 404 { 200 } else { status });
             if status == 404 {
                 assert_eq!(
-                    paths[1],
+                    paths[2],
                     (
                         "/v3/history/periods/selectable?account=account-7".into(),
                         Some("prior".into())
@@ -27563,7 +27552,7 @@ mod tests {
     }
 
     #[test]
-    fn issue614_native_verified_origin_is_display_only_for_both_metrics() {
+    fn issue614_native_verified_origin_does_not_create_values() {
         let state = issue614_native_origin_scene(Some(1_800_000_000), false);
         let raw = state.service_history_samples.clone();
         for tokens in [false, true] {
@@ -27576,12 +27565,12 @@ mod tests {
                 tokens,
             );
             assert!(
-                paths.remaining_solid.contains("M0.00 1.00"),
-                "verified remaining origin must be full"
+                !paths.remaining_solid.contains("M0.00 1.00"),
+                "verified time origin does not prove a 100% observation"
             );
             assert!(
-                paths.astra_rising.contains("M0.00 99.00"),
-                "verified model origin must be zero"
+                !paths.astra_rising.contains("M0.00 99.00"),
+                "verified time origin does not prove a zero token observation"
             );
         }
         assert_eq!(
@@ -27675,6 +27664,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 1.0,
                             tokens: 10.0,
+                            raw_components: [None; 4],
                             raw_tokens: Some(10),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -27684,6 +27674,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 2.0,
                             tokens: 20.0,
+                            raw_components: [None; 4],
                             raw_tokens: Some(20),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -27714,10 +27705,8 @@ mod tests {
                         model_timelines: &timelines,
                     },
                     None,
-                    None,
                     &gaps,
                     &[],
-                    false,
                     current,
                 );
                 assert_eq!(
@@ -27728,6 +27717,31 @@ mod tests {
                 assert!(paths.unused_intervals.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn issue604_period_directory_accepts_all_exact_ids() {
+        let rows = (0..188)
+            .rev()
+            .map(|index| {
+                let start = 1_800_000_000_i64 + index * 60;
+                json!({"id":(start+604800).to_string(),"start_at":start,"end_at":start+59,
+                "reset_at":start+604800,"current":index==187,"label":"official","origin_at":start})
+            })
+            .collect::<Vec<_>>();
+        let bytes =
+            serde_json::to_vec(&json!({"api_version":"v4","history_periods":rows})).unwrap();
+        let periods = super::parse_service_history_periods_document(&bytes)
+            .expect("every legitimate exact reset must remain readable");
+        assert_eq!(periods.len(), 188);
+        assert_eq!(
+            periods
+                .iter()
+                .map(|p| p.reset_at)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            188
+        );
     }
 
     #[test]
@@ -27870,6 +27884,114 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(paths, ["/v3/history/periods/selectable"]);
         }
+    }
+
+    #[test]
+    fn issue604_linux_graph_admits_its_history_revision_independently_of_current() {
+        let history_pair = published_pair(604, 1);
+        let current_pair = published_pair(604, 2);
+        let later_current_pair = published_pair(604, 3);
+        let next_history_pair = published_pair(604, 4);
+        let (mut period, samples) = split_graph_fixture();
+        period.current = true;
+        period.end_at = samples[1].timestamp;
+        let mut current = split_graph_current(&period);
+        current.quota.as_mut().unwrap().window_seconds = period.reset_at - period.start_at;
+        current.observed_at = Some(period.end_at + 60);
+        current.quota.as_mut().unwrap().remaining_percent = 80.0;
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_current_v3(current_pair.clone(), current.clone())
+            .unwrap();
+        let mut requests = 0;
+        super::poll_service_graph_resources_with(&mut state, Instant::now(), true, |route, _| {
+            requests += 1;
+            Ok(super::ServiceDetailsHttpResponse {
+                status: 200,
+                pair: Some(history_pair.clone()),
+                body: if route == "/v3/history/periods/selectable" {
+                    split_history_periods_body(&period)
+                } else {
+                    split_history_page_body(&samples[..1], None, Some("C0"))
+                },
+            })
+        });
+        assert_eq!(
+            requests, 2,
+            "directory and page must be consumed as one history revision"
+        );
+        assert!(
+            state.service_history_error.is_none(),
+            "verified History must not be rejected by a newer Current pair"
+        );
+        assert_eq!(
+            state.service_history_pair.as_deref(),
+            Some(history_pair.as_str())
+        );
+        assert_eq!(state.service_history_samples, samples[..1]);
+        assert_eq!(
+            state.service_current_pair.as_deref(),
+            Some(current_pair.as_str())
+        );
+        assert_eq!(state.remaining_percent, Some(80.0));
+        assert_eq!(
+            state.history_periods_at(period.end_at + 60)[0].end,
+            period.end_at
+        );
+        assert!(!state.graph_history_loading());
+
+        current.observed_at = Some(period.end_at + 120);
+        current.quota.as_mut().unwrap().remaining_percent = 70.0;
+        state
+            .apply_service_current_v3(later_current_pair.clone(), current)
+            .unwrap();
+        super::poll_service_graph_resources_with(&mut state, Instant::now(), true, |_, prior| {
+            assert_eq!(prior, Some(history_pair.as_str()));
+            Ok(super::ServiceDetailsHttpResponse {
+                status: 304,
+                pair: Some(history_pair.clone()),
+                body: Vec::new(),
+            })
+        });
+        assert!(state.service_history_error.is_none());
+        assert!(
+            !state.graph_history_loading(),
+            "Current refresh must not withdraw verified History"
+        );
+        assert_eq!(state.service_history_samples, samples[..1]);
+        assert_eq!(
+            state.service_current_pair.as_deref(),
+            Some(later_current_pair.as_str())
+        );
+        assert_eq!(state.remaining_percent, Some(70.0));
+
+        state.service_history_force_poll = true;
+        super::poll_service_graph_resources_with(&mut state, Instant::now(), true, |route, _| {
+            let directory = route == "/v3/history/periods/selectable";
+            Ok(super::ServiceDetailsHttpResponse {
+                status: 200,
+                pair: Some(if directory {
+                    next_history_pair.clone()
+                } else {
+                    later_current_pair.clone()
+                }),
+                body: if directory {
+                    split_history_periods_body(&period)
+                } else {
+                    split_history_page_body(&samples[1..2], None, Some("C1"))
+                },
+            })
+        });
+        assert!(
+            state.service_history_error.is_some(),
+            "mixed history directory/page revisions still fail atomically"
+        );
+        assert_eq!(
+            state.service_history_pair.as_deref(),
+            Some(history_pair.as_str())
+        );
+        assert_eq!(state.service_history_samples, samples[..1]);
+        assert_eq!(state.remaining_percent, Some(70.0));
     }
 
     #[test]
@@ -28209,7 +28331,6 @@ mod tests {
                 super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                 super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
                 super::GraphRemainingOrigin::SyntheticTailHold => "synthetic_tail_hold",
-                super::GraphRemainingOrigin::MonotonicHold => "monotonic_hold",
             }
         }
 
@@ -28670,7 +28791,7 @@ mod tests {
             .difference(&recovered_sampling_minutes)
             .copied()
             .collect::<BTreeSet<_>>();
-        let projection_minutes = presentation_references
+        let projection_minutes = references
             .iter()
             .map(|sample| sample.timestamp.div_euclid(60) * 60)
             .collect::<BTreeSet<_>>();
@@ -28709,11 +28830,7 @@ mod tests {
         for timeline in token_timelines.values_mut() {
             super::normalize_graph_model_display_monotonic(timeline, true);
         }
-        super::normalize_graph_dollars_from_token_identity(
-            &mut dollar_timelines,
-            &token_timelines,
-            &idle_timestamp_intervals,
-        );
+
         let dollar_correction_starts = dollar_timelines
             .values()
             .flat_map(|timeline| super::graph_model_correction_starts(Some(timeline)))
@@ -29023,7 +29140,6 @@ mod tests {
                     super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                     super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
                     super::GraphRemainingOrigin::SyntheticTailHold => "synthetic_tail_hold",
-                    super::GraphRemainingOrigin::MonotonicHold => "monotonic_hold",
                 };
                 serde_json::json!({
                     "timestamp": point.timestamp,
@@ -29404,7 +29520,6 @@ mod tests {
                 super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                 super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
                 super::GraphRemainingOrigin::SyntheticTailHold => "synthetic_tail_hold",
-                super::GraphRemainingOrigin::MonotonicHold => "monotonic_hold",
             }
         }
 
@@ -29659,7 +29774,9 @@ mod tests {
             &references,
             &minute,
             &[],
-            &token_correction_starts,
+            // Every quota value here is an accepted official observation.
+            // The rejected SOL token point at +480 is not a quota boundary.
+            &BTreeSet::new(),
             Some((&token_timelines, true)),
         );
         let actual_remaining = |kind| {
@@ -29852,6 +29969,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: row["dollars"].as_f64().unwrap(),
                                 tokens: row["tokens"].as_u64().unwrap() as f64,
+                                raw_components: [None; 4],
                                 raw_tokens: row["tokens"].as_u64(),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -29866,7 +29984,7 @@ mod tests {
                 .into_iter()
                 .map(|(start_at, end_at)| super::GraphConfirmedGap { start_at, end_at })
                 .collect::<Vec<_>>();
-            let (mut dollar_timelines, _) = super::accepted_graph_model_timelines(
+            let (dollar_timelines, _) = super::accepted_graph_model_timelines(
                 &raw,
                 &BTreeSet::new(),
                 false,
@@ -29879,11 +29997,7 @@ mod tests {
                 &confirmed_gaps,
             );
             let expected_idle = intervals(&case["idle_intervals"]);
-            super::normalize_graph_dollars_from_token_identity(
-                &mut dollar_timelines,
-                &token_timelines,
-                &expected_idle,
-            );
+
             let graph = |show_tokens| {
                 super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
                     super::GraphSelectionInput {
@@ -30057,7 +30171,6 @@ mod tests {
                 super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                 super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
                 super::GraphRemainingOrigin::SyntheticTailHold => "synthetic_tail_hold",
-                super::GraphRemainingOrigin::MonotonicHold => "monotonic_hold",
             }
         }
 
@@ -30112,6 +30225,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: row["dollars"].as_f64().unwrap(),
                                 tokens: row["tokens"].as_u64().unwrap() as f64,
+                                raw_components: [None; 4],
                                 raw_tokens: row["tokens"].as_u64(),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -30286,6 +30400,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: sample.sol_dollars,
                             tokens: sample.sol_tokens as f64,
+                            raw_components: [None; 4],
                             raw_tokens: Some(sample.sol_tokens),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -30364,7 +30479,8 @@ mod tests {
         );
         assert_eq!(
             correction_starts.iter().copied().collect::<Vec<_>>(),
-            serde_json::from_value::<Vec<i64>>(expected["corrections"].clone()).unwrap()
+            serde_json::from_value::<Vec<i64>>(fixture["expected_correction_starts"].clone())
+                .unwrap()
         );
         let expected_sol = serde_json::from_value::<Vec<f64>>(expected["accepted_sol"].clone())
             .expect("accepted SOL values");
@@ -30460,7 +30576,7 @@ mod tests {
             &sample_references,
             &minute,
             &[],
-            &correction_starts,
+            &BTreeSet::new(),
             Some((&model_timelines, false)),
         );
         let actual_remaining = |kind| {
@@ -30524,6 +30640,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: model["total_dollars"].as_f64().expect("model dollars"),
                             tokens: model["total_tokens"].as_u64().expect("model tokens") as f64,
+                            raw_components: [None; 4],
                             raw_tokens: model["total_tokens"].as_u64(),
                             origin,
                         },
@@ -30641,7 +30758,389 @@ mod tests {
     }
 
     #[test]
-    fn graph_oracle_preserves_raw_quota_increase_but_displays_monotonic_hold() {
+    fn issue604_official_remaining_reversals_preserve_raw_observations() {
+        for middle in [95.0, 80.0] {
+            let samples = [
+                UsageHistorySample::new(0, 10_000, 90.0, ModelDollarTotals::default()),
+                UsageHistorySample::new(60, 10_000, middle, ModelDollarTotals::default()),
+                UsageHistorySample::new(120, 10_000, 89.0, ModelDollarTotals::default()),
+            ];
+            let references = samples.iter().collect::<Vec<_>>();
+            let evidence = super::remaining_evidence_from_model_timelines(
+                &references,
+                0,
+                120,
+                &BTreeMap::new(),
+                false,
+                &[],
+                &BTreeSet::new(),
+            );
+            assert_eq!(
+                evidence
+                    .iter()
+                    .map(|point| point.effective)
+                    .collect::<Vec<_>>(),
+                vec![90.0, middle, 89.0]
+            );
+            assert!(evidence
+                .iter()
+                .all(|point| point.origin == super::GraphRemainingOrigin::Raw));
+            let points = evidence
+                .iter()
+                .map(|point| (point.timestamp, point.effective))
+                .collect::<Vec<_>>();
+            let segments = super::remaining_segments_with_boundaries_and_evidence_and_non_owned(
+                &points,
+                &references,
+                &[],
+                &BTreeSet::new(),
+                Some(&evidence),
+                &[],
+            );
+            assert_eq!(segments.len(), 2);
+            assert!(segments.iter().all(|segment| segment.kind
+                == super::GraphRemainingSegmentKind::Solid
+                && segment.smoothable));
+        }
+    }
+
+    #[test]
+    fn issue604_official_remaining_missing_interval_can_increase() {
+        let samples = [
+            UsageHistorySample::new(0, 10_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::from_model_history(60, 10_000, ModelDollarTotals::default()),
+            UsageHistorySample::new(120, 10_000, 94.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let evidence = super::remaining_evidence_from_model_timelines(
+            &references,
+            0,
+            120,
+            &BTreeMap::new(),
+            false,
+            &[],
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|point| point.effective)
+                .collect::<Vec<_>>(),
+            vec![90.0, 92.0, 94.0]
+        );
+        assert_eq!(evidence[1].raw, None);
+        assert_eq!(
+            evidence[1].origin,
+            super::GraphRemainingOrigin::Interpolated
+        );
+        let points = evidence
+            .iter()
+            .map(|point| (point.timestamp, point.effective))
+            .collect::<Vec<_>>();
+        let segments = super::remaining_segments_with_boundaries_and_evidence_and_non_owned(
+            &points,
+            &references,
+            &[],
+            &BTreeSet::new(),
+            Some(&evidence),
+            &[],
+        );
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].kind, super::GraphRemainingSegmentKind::Inferred);
+        assert!(segments[0].smoothable);
+    }
+
+    #[test]
+    fn issue604_native_saved_usd_changes_without_tokens_remain_measured() {
+        let samples = [0, 600]
+            .into_iter()
+            .map(|timestamp| {
+                UsageHistorySample::new(timestamp, 10_000, 90.0, ModelDollarTotals::default())
+            })
+            .collect::<Vec<_>>();
+        let refs = samples.iter().collect::<Vec<_>>();
+        for origin in [
+            super::GraphModelOrigin::Direct,
+            super::GraphModelOrigin::LegacyObserved,
+        ] {
+            let raw = BTreeMap::from([(
+                "SOL".to_owned(),
+                [0, 600]
+                    .into_iter()
+                    .zip([1.0, 2.0])
+                    .map(|(timestamp, dollar)| {
+                        (
+                            timestamp,
+                            super::GraphModelPoint {
+                                dollar,
+                                tokens: 100.0,
+                                raw_components: [None; 4],
+                                raw_tokens: Some(100),
+                                origin,
+                            },
+                        )
+                    })
+                    .collect(),
+            )]);
+            let graph = super::graph_paths_for_selection_with_sources_and_astra(
+                super::GraphSelectionInput {
+                    samples: &refs,
+                    period_start: 0,
+                    period_end: 600,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: false,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &[],
+                    model_timelines: &raw,
+                },
+            );
+            assert_eq!(graph.current_sol_label, "$2.00");
+            assert!(!graph.sol_rising.is_empty());
+            assert!(graph.sol_idle.is_empty());
+            assert!(graph.sol_inferred.is_empty());
+            assert_eq!(
+                graph.unused_intervals.len(),
+                1,
+                "raw tokens and quota alone establish the band"
+            );
+        }
+    }
+
+    #[test]
+    fn issue604_native_missing_usd_is_not_restored_from_token_identity() {
+        let samples = [0, 600, 1200]
+            .into_iter()
+            .map(|timestamp| {
+                UsageHistorySample::new(timestamp, 10_000, 90.0, ModelDollarTotals::default())
+            })
+            .collect::<Vec<_>>();
+        let refs = samples.iter().collect::<Vec<_>>();
+        for origin in [
+            super::GraphModelOrigin::Direct,
+            super::GraphModelOrigin::LegacyObserved,
+        ] {
+            let raw = BTreeMap::from([(
+                "SOL".to_owned(),
+                [0, 600, 1200]
+                    .into_iter()
+                    .zip([1.0, f64::NAN, 1.0])
+                    .map(|(timestamp, dollar)| {
+                        (
+                            timestamp,
+                            super::GraphModelPoint {
+                                dollar,
+                                tokens: 100.0,
+                                raw_components: [None; 4],
+                                raw_tokens: Some(100),
+                                origin,
+                            },
+                        )
+                    })
+                    .collect(),
+            )]);
+            let graph = super::graph_paths_for_selection_with_sources_and_astra(
+                super::GraphSelectionInput {
+                    samples: &refs,
+                    period_start: 0,
+                    period_end: 1200,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: false,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &[],
+                    model_timelines: &raw,
+                },
+            );
+            assert_eq!(graph.unused_intervals.len(), 1);
+            assert!(graph.sol_idle.is_empty());
+            assert!(
+                !graph.sol_inferred.is_empty(),
+                "unknown USD stays inferred inside a token/Remaining idle band"
+            );
+            assert!(raw["SOL"][&600].dollar.is_nan());
+        }
+    }
+
+    #[test]
+    fn issue604_model_numeric_respects_original_rows_gaps_and_legacy_values() {
+        for origin in [
+            super::GraphModelOrigin::Direct,
+            super::GraphModelOrigin::LegacyObserved,
+        ] {
+            for tokens in [false, true] {
+                for (times, projection, gaps, expected, rejected_at) in [
+                    (
+                        vec![0, 60, 120],
+                        vec![0, 60, 120],
+                        vec![],
+                        [10.0, 10.0, 11.0],
+                        60,
+                    ),
+                    (
+                        vec![0, 60, 120],
+                        vec![0, 60, 120],
+                        vec![super::GraphConfirmedGap {
+                            start_at: 60,
+                            end_at: 120,
+                        }],
+                        [10.0, 20.0, 20.0],
+                        120,
+                    ),
+                    (
+                        vec![0, 120, 180],
+                        vec![0, 60, 120, 180],
+                        vec![],
+                        [10.0, 20.0, 20.0],
+                        180,
+                    ),
+                ] {
+                    let timeline = times
+                        .iter()
+                        .copied()
+                        .zip([10_u64, 20, 11])
+                        .map(|(at, raw)| {
+                            (
+                                at,
+                                super::GraphModelPoint {
+                                    dollar: raw as f64,
+                                    tokens: raw as f64,
+                                    raw_components: [None; 4],
+                                    raw_tokens: Some(raw),
+                                    origin,
+                                },
+                            )
+                        })
+                        .collect();
+                    let input = BTreeMap::from([("SOL".to_owned(), timeline)]);
+                    let (accepted, corrections) = super::accepted_graph_model_timelines(
+                        &input,
+                        &projection.into_iter().collect(),
+                        tokens,
+                        &gaps,
+                    );
+                    assert_eq!(
+                        corrections,
+                        BTreeSet::from([rejected_at]),
+                        "origin={origin:?} tokens={tokens} times={times:?}"
+                    );
+                    assert_eq!(
+                        times
+                            .iter()
+                            .map(|at| super::graph_model_value(&accepted["SOL"][at], tokens))
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                    assert_eq!(
+                        accepted["SOL"][&rejected_at].origin,
+                        super::GraphModelOrigin::Rejected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue604_model_numeric_compares_tokens_above_f64_integer_precision() {
+        let first = 9_007_199_254_740_992_u64;
+        for origin in [
+            super::GraphModelOrigin::Direct,
+            super::GraphModelOrigin::LegacyObserved,
+        ] {
+            let timeline = [0, 60, 120]
+                .into_iter()
+                .zip([first, first + 1, first])
+                .map(|(at, raw)| {
+                    (
+                        at,
+                        super::GraphModelPoint {
+                            dollar: 1.0,
+                            tokens: raw as f64,
+                            raw_components: [None; 4],
+                            raw_tokens: Some(raw),
+                            origin,
+                        },
+                    )
+                })
+                .collect();
+            let input = BTreeMap::from([("SOL".to_owned(), timeline)]);
+            let (accepted, corrections) = super::accepted_graph_model_timelines(
+                &input,
+                &BTreeSet::from([0, 60, 120]),
+                true,
+                &[],
+            );
+            assert_eq!(corrections, BTreeSet::from([60]));
+            assert_eq!(
+                accepted["SOL"][&60].origin,
+                super::GraphModelOrigin::Rejected
+            );
+            assert_eq!(
+                accepted["SOL"][&60].raw_tokens,
+                Some(first + 1),
+                "raw observation remains intact"
+            );
+            assert_eq!(accepted["SOL"][&120].origin, origin);
+        }
+    }
+
+    #[test]
+    fn issue604_model_numeric_does_not_use_future_direct_values_to_replace_legacy_baseline() {
+        let input = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (
+                    0,
+                    super::GraphModelPoint {
+                        dollar: 20.0,
+                        tokens: 20.0,
+                        raw_components: [None; 4],
+                        raw_tokens: Some(20),
+                        origin: super::GraphModelOrigin::LegacyObserved,
+                    },
+                ),
+                (
+                    60,
+                    super::GraphModelPoint {
+                        dollar: 15.0,
+                        tokens: 15.0,
+                        raw_components: [None; 4],
+                        raw_tokens: Some(15),
+                        origin: super::GraphModelOrigin::Direct,
+                    },
+                ),
+            ]),
+        )]);
+        for tokens in [false, true] {
+            let (accepted, corrections) = super::accepted_graph_model_timelines(
+                &input,
+                &BTreeSet::from([0, 60]),
+                tokens,
+                &[],
+            );
+            assert_eq!(super::graph_model_value(&accepted["SOL"][&0], tokens), 20.0);
+            assert_eq!(
+                accepted["SOL"][&0].origin,
+                super::GraphModelOrigin::LegacyObserved
+            );
+            assert_eq!(
+                super::graph_model_value(&accepted["SOL"][&60], tokens),
+                20.0
+            );
+            assert_eq!(
+                accepted["SOL"][&60].origin,
+                super::GraphModelOrigin::Rejected
+            );
+            assert_eq!(corrections, BTreeSet::from([60]));
+        }
+    }
+
+    #[test]
+    fn graph_oracle_preserves_raw_quota_increase_as_measured() {
         let document: Value =
             serde_json::from_str(include_str!("../tests/fixtures/graph_evidence_oracle.json"))
                 .expect("shared graph evidence fixture");
@@ -30666,6 +31165,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar,
                         tokens: token as f64,
+                        raw_components: [None; 4],
                         raw_tokens: Some(token),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -30710,15 +31210,12 @@ mod tests {
             serde_json::from_value::<Vec<f64>>(expected["effective"].clone()).unwrap()
         );
         assert_eq!(evidence[0].origin, super::GraphRemainingOrigin::Raw);
-        assert_eq!(
-            evidence[1].origin,
-            super::GraphRemainingOrigin::MonotonicHold
-        );
+        assert_eq!(evidence[1].origin, super::GraphRemainingOrigin::Raw);
         assert_eq!(
             evidence.last().map(|point| point.origin),
             Some(super::GraphRemainingOrigin::SyntheticTailHold)
         );
-        assert_eq!(format_percent(evidence.last().unwrap().effective), "90%");
+        assert_eq!(format_percent(evidence.last().unwrap().effective), "92%");
 
         let points = evidence
             .iter()
@@ -30746,12 +31243,18 @@ mod tests {
             &BTreeSet::new(),
             Some((&timelines, false)),
         );
-        assert!(segments
-            .iter()
-            .all(|segment| segment.kind == super::GraphRemainingSegmentKind::Inferred));
+        assert_eq!(segments[0].kind, super::GraphRemainingSegmentKind::Solid);
+        assert_eq!(
+            (
+                points[segments[0].start_index].0,
+                points[segments[0].end_index].0
+            ),
+            (4_000, 4_060)
+        );
         assert_eq!(
             segments
                 .iter()
+                .filter(|segment| segment.kind == super::GraphRemainingSegmentKind::Inferred)
                 .map(|segment| (points[segment.start_index].0, points[segment.end_index].0))
                 .collect::<Vec<_>>(),
             expected["remaining_dashed"]
@@ -32155,9 +32658,9 @@ mod tests {
         let durable = super::usage_store::SessionModelTotal {
             model: "SOL".into(),
             total_tokens: 555_312_427,
-            input_tokens: 553_537_987,
-            cached_input_tokens: 544_468_480,
-            output_tokens: 1_774_440,
+            input_tokens: Some(553_537_987),
+            cached_input_tokens: Some(544_468_480),
+            output_tokens: Some(1_774_440),
             cache_write_input_tokens: Some(0),
         };
         let mut state = super::usage_store::SessionCollectionState {
@@ -32357,9 +32860,9 @@ mod tests {
             cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 1_000,
-            input_tokens: 800,
-            cached_input_tokens: 300,
-            output_tokens: 200,
+            input_tokens: Some(800),
+            cached_input_tokens: Some(300),
+            output_tokens: Some(200),
         };
         let mut restarted = super::usage_store::SessionCollectionState {
             data_generation: 7,
@@ -32433,11 +32936,14 @@ mod tests {
             token_baseline_known: true,
             history_base_pending: false,
             last_model: Some("LUNA".into()),
+            last_model_context_kind: None,
+            last_model_interval: None,
+            source_admission: None,
             last_task_running: Some(false),
-            previous_total: 686_397,
-            previous_input: 674_095,
-            previous_cached_input: 546_560,
-            previous_output: 12_302,
+            previous_total: Some(686_397),
+            previous_input: Some(674_095),
+            previous_cached_input: Some(546_560),
+            previous_output: Some(12_302),
             context_usage_tokens: None,
             context_window_tokens: None,
         };
@@ -32456,9 +32962,9 @@ mod tests {
             model_totals: vec![super::usage_store::SessionModelTotal {
                 model: "LUNA".into(),
                 total_tokens: 686_397,
-                input_tokens: 674_095,
-                cached_input_tokens: 546_560,
-                output_tokens: 12_302,
+                input_tokens: Some(674_095),
+                cached_input_tokens: Some(546_560),
+                output_tokens: Some(12_302),
                 cache_write_input_tokens: Some(0),
             }],
         };
@@ -32494,17 +33000,17 @@ mod tests {
                 cache_write_input_tokens: None,
                 model: "SOL".into(),
                 total_tokens: 100,
-                input_tokens: 80,
-                cached_input_tokens: 30,
-                output_tokens: 20,
+                input_tokens: Some(80),
+                cached_input_tokens: Some(30),
+                output_tokens: Some(20),
             },
             super::usage_store::SessionModelTotal {
                 cache_write_input_tokens: None,
                 model: "LUNA".into(),
                 total_tokens: 50,
-                input_tokens: 40,
-                cached_input_tokens: 10,
-                output_tokens: 10,
+                input_tokens: Some(40),
+                cached_input_tokens: Some(10),
+                output_tokens: Some(10),
             },
         ]);
         let recovered = ModelUsageTotals::from_session_totals(&[
@@ -32512,17 +33018,17 @@ mod tests {
                 cache_write_input_tokens: None,
                 model: "SOL".into(),
                 total_tokens: 1_100,
-                input_tokens: 880,
-                cached_input_tokens: 330,
-                output_tokens: 220,
+                input_tokens: Some(880),
+                cached_input_tokens: Some(330),
+                output_tokens: Some(220),
             },
             super::usage_store::SessionModelTotal {
                 cache_write_input_tokens: None,
                 model: "LUNA".into(),
                 total_tokens: 50,
-                input_tokens: 40,
-                cached_input_tokens: 10,
-                output_tokens: 10,
+                input_tokens: Some(40),
+                cached_input_tokens: Some(10),
+                output_tokens: Some(10),
             },
         ]);
         let checkpoint = super::usage_store::SessionCheckpoint {
@@ -32541,11 +33047,14 @@ mod tests {
             token_baseline_known: true,
             history_base_pending: false,
             last_model: Some("SOL".into()),
+            last_model_context_kind: None,
+            last_model_interval: None,
+            source_admission: None,
             last_task_running: Some(true),
-            previous_total: 100,
-            previous_input: 80,
-            previous_cached_input: 30,
-            previous_output: 20,
+            previous_total: Some(100),
+            previous_input: Some(80),
+            previous_cached_input: Some(30),
+            previous_output: Some(20),
             context_usage_tokens: None,
             context_window_tokens: None,
         };
@@ -32698,11 +33207,14 @@ mod tests {
                 token_baseline_known: true,
                 history_base_pending: false,
                 last_model: None,
+                last_model_context_kind: None,
+                last_model_interval: None,
+                source_admission: None,
                 last_task_running: None,
-                previous_total: 0,
-                previous_input: 0,
-                previous_cached_input: 0,
-                previous_output: 0,
+                previous_total: Some(0),
+                previous_input: Some(0),
+                previous_cached_input: Some(0),
+                previous_output: Some(0),
                 context_usage_tokens: None,
                 context_window_tokens: None,
             })
@@ -32755,25 +33267,25 @@ mod tests {
                     cache_write_input_tokens: None,
                     model: "SOL".into(),
                     total_tokens: 1_000_000,
-                    input_tokens: 800_000,
-                    cached_input_tokens: 300_000,
-                    output_tokens: 200_000,
+                    input_tokens: Some(800_000),
+                    cached_input_tokens: Some(300_000),
+                    output_tokens: Some(200_000),
                 },
                 super::usage_store::SessionModelTotal {
                     cache_write_input_tokens: Some(0),
                     model: "TERRA".into(),
                     total_tokens: 0,
-                    input_tokens: 0,
-                    cached_input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens: Some(0),
+                    cached_input_tokens: Some(0),
+                    output_tokens: Some(0),
                 },
                 super::usage_store::SessionModelTotal {
                     cache_write_input_tokens: None,
                     model: "LUNA".into(),
                     total_tokens: 2_000_000,
-                    input_tokens: 1_800_000,
-                    cached_input_tokens: 800_000,
-                    output_tokens: 200_000,
+                    input_tokens: Some(1_800_000),
+                    cached_input_tokens: Some(800_000),
+                    output_tokens: Some(200_000),
                 },
             ]
             .into_iter()
@@ -33689,34 +34201,34 @@ mod tests {
             usage_store::SessionModelTotal {
                 model: "LUNA".into(),
                 total_tokens: 22_816_483,
-                input_tokens: 22_343_994,
-                cached_input_tokens: 20_068_352,
-                output_tokens: 472_489,
+                input_tokens: Some(22_343_994),
+                cached_input_tokens: Some(20_068_352),
+                output_tokens: Some(472_489),
                 cache_write_input_tokens: Some(0),
             },
             usage_store::SessionModelTotal {
                 model: "SOL".into(),
                 total_tokens: 555_312_427,
-                input_tokens: 553_537_987,
-                cached_input_tokens: 544_468_480,
-                output_tokens: 1_774_440,
+                input_tokens: Some(553_537_987),
+                cached_input_tokens: Some(544_468_480),
+                output_tokens: Some(1_774_440),
                 cache_write_input_tokens: Some(0),
             },
         ];
         let first_suffix = vec![usage_store::SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 91_512,
-            input_tokens: 84_194,
-            cached_input_tokens: 73_472,
-            output_tokens: 7_318,
+            input_tokens: Some(84_194),
+            cached_input_tokens: Some(73_472),
+            output_tokens: Some(7_318),
             cache_write_input_tokens: Some(0),
         }];
         let current_suffix = vec![usage_store::SessionModelTotal {
             model: "LUNA".into(),
             total_tokens: 2_446_273,
-            input_tokens: 2_382_039,
-            cached_input_tokens: 2_035_200,
-            output_tokens: 64_234,
+            input_tokens: Some(2_382_039),
+            cached_input_tokens: Some(2_035_200),
+            output_tokens: Some(64_234),
             cache_write_input_tokens: Some(0),
         }];
         let observation = |timestamp: i64,
@@ -33801,9 +34313,9 @@ mod tests {
             .unwrap();
         assert_eq!(corrected_sol.total_tokens, 555_312_427);
         assert_eq!(corrected_luna.total_tokens, 25_262_756);
-        assert_eq!(corrected_luna.input_tokens, 24_726_033);
-        assert_eq!(corrected_luna.cached_input_tokens, 22_103_552);
-        assert_eq!(corrected_luna.output_tokens, 536_723);
+        assert_eq!(corrected_luna.input_tokens, Some(24_726_033));
+        assert_eq!(corrected_luna.cached_input_tokens, Some(22_103_552));
+        assert_eq!(corrected_luna.output_tokens, Some(536_723));
 
         let mut producer = CodexInfoState::preview("normal");
         producer.preview = false;
@@ -34211,10 +34723,13 @@ mod tests {
             history_base_pending: false,
             last_task_running: None,
             last_model: Some("SOL".into()),
-            previous_total: 100,
-            previous_input: 80,
-            previous_cached_input: 20,
-            previous_output: 20,
+            last_model_context_kind: None,
+            last_model_interval: None,
+            source_admission: None,
+            previous_total: Some(100),
+            previous_input: Some(80),
+            previous_cached_input: Some(20),
+            previous_output: Some(20),
             context_usage_tokens: None,
             context_window_tokens: None,
         };
@@ -34256,9 +34771,9 @@ mod tests {
                 cache_write_input_tokens: None,
                 model: "SOL".into(),
                 total_tokens: 100,
-                input_tokens: 80,
-                cached_input_tokens: 20,
-                output_tokens: 20,
+                input_tokens: Some(80),
+                cached_input_tokens: Some(20),
+                output_tokens: Some(20),
             }],
             history_continuity_recovery: None,
             cumulative_recovery: None,
@@ -34384,9 +34899,9 @@ mod tests {
             cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 120,
-            input_tokens: 100,
-            cached_input_tokens: 20,
-            output_tokens: 20,
+            input_tokens: Some(100),
+            cached_input_tokens: Some(20),
+            output_tokens: Some(20),
         }];
         let observed_at = state.last_success_at.expect("fresh quota timestamp");
         let admission = state
@@ -34444,9 +34959,9 @@ mod tests {
             cache_write_input_tokens: None,
             model: "LUNA".into(),
             total_tokens: 44,
-            input_tokens: 40,
-            cached_input_tokens: 4,
-            output_tokens: 4,
+            input_tokens: Some(40),
+            cached_input_tokens: Some(4),
+            output_tokens: Some(4),
         }];
         let admission = state
             .current_account_admission()
@@ -36160,7 +36675,7 @@ mod tests {
             &newest_path,
             [
                 json!({"type":"session_meta","payload":{"id":"newest"}}).to_string(),
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}".to_owned(),
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"payload\":{\"type\":\"token_count\"}}".to_owned(),
             ]
             .join("\n")
                 + "\n",
@@ -36170,9 +36685,9 @@ mod tests {
             &fallback_path,
             [
                 json!({"type":"session_meta","payload":{"id":"fallback"}}),
-                json!({"type":"event_msg","payload":{"type":"task_started"}}),
-                json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-5.6-sol"}}),
-                json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":12345}}}}),
+                json!({"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"task_started"}}),
+                json!({"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"turn_context","model":"gpt-5.6-sol"}}),
+                json!({"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":12345}}}}),
             ]
             .into_iter()
             .map(|value| value.to_string())
@@ -36244,8 +36759,8 @@ mod tests {
             &completed_path,
             [
                 json!({"type":"session_meta","payload":{"id":"completed"}}),
-                json!({"type":"task_started"}),
-                json!({"type":"task_complete"}),
+                json!({"type":"task_started","timestamp":"2026-01-01T00:00:00Z"}),
+                json!({"type":"task_complete","timestamp":"2026-01-01T00:00:01Z"}),
             ]
             .into_iter()
             .map(|value| value.to_string())
@@ -36262,9 +36777,9 @@ mod tests {
                 path,
                 [
                     json!({"type":"session_meta","payload":{"id":path.file_stem().unwrap().to_str().unwrap()}}),
-                    json!({"type":"thread_context","model":model}),
-                    json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":total_tokens}}}}),
-                    json!({"type":"task_started"}),
+                    json!({"type":"thread_context","timestamp":"2026-01-01T00:00:00Z","model":model}),
+                    json!({"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":total_tokens}}}}),
+                    json!({"type":"task_started","timestamp":"2026-01-01T00:00:00Z"}),
                 ]
                 .into_iter()
                 .map(|value| value.to_string())
@@ -36369,14 +36884,15 @@ mod tests {
                 "type":"session_meta",
                 "payload":{"id":path.file_stem().unwrap().to_str().unwrap()}
             }),
-            json!({"type":"thread_context","model":model}),
+            json!({"type":"thread_context","timestamp":user_timestamp,"model":model}),
             json!({
                 "type":"event_msg",
                 "timestamp":user_timestamp,
-                "payload":{"type":"user_message"}
+                "payload":{"type":"user_message","message":"synthetic user"}
             }),
             json!({
                 "type":"event_msg",
+                "timestamp":user_timestamp,
                 "payload":{
                     "type":"token_count",
                     "info":{
@@ -36386,10 +36902,10 @@ mod tests {
                     }
                 }
             }),
-            json!({"type":"task_started"}),
+            json!({"type":"task_started","timestamp":user_timestamp}),
         ];
         if completed {
-            records.push(json!({"type":"task_complete"}));
+            records.push(json!({"type":"task_complete","timestamp":user_timestamp}));
         }
         fs::write(
             path,
@@ -36539,8 +37055,8 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let path = root.join("active.jsonl");
         let complete = concat!(
-            "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
-            "{\"type\":\"task_started\"}\n"
+            "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
+            "{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n"
         );
         let partial = "{\"type\":\"event_msg\"";
         fs::write(&path, format!("{complete}{partial}")).unwrap();
@@ -36560,7 +37076,7 @@ mod tests {
         assert_eq!(rollout.total_tokens(), None);
 
         let remainder = concat!(
-            ",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            ",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{",
             "\"total_token_usage\":{\"total_tokens\":77}}}}\n"
         );
         let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -36602,8 +37118,8 @@ mod tests {
         let path = root.join("cached.jsonl");
         let initial = concat!(
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"cache-thread\"}}\n",
-            "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
-            "{\"type\":\"task_started\"}\n"
+            "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
+            "{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n"
         );
         fs::write(&path, initial).unwrap();
         let canonical = fs::canonicalize(&path).unwrap();
@@ -36641,7 +37157,7 @@ mod tests {
         assert_eq!(entry.complete_offset, initial_len);
 
         let remainder = concat!(
-            ",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            ",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{",
             "\"total_token_usage\":{\"total_tokens\":77}}}}\n"
         );
         let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -36677,7 +37193,7 @@ mod tests {
         let path = root.join("seeded.jsonl");
         let prefix = concat!(
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"seeded-thread\"}}\n",
-            "{\"type\":\"thread_context\",\"model\":\"wrong-prefix-model\"}\n"
+            "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"wrong-prefix-model\"}\n"
         );
         fs::write(&path, prefix).unwrap();
         fs::OpenOptions::new()
@@ -36686,7 +37202,7 @@ mod tests {
             .unwrap()
             .set_len(security::MAX_SESSION_FILE_BYTES + 1)
             .unwrap();
-        let tail = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":123}}}}\n";
+        let tail = "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":123}}}}\n";
         let checkpoint_metadata = fs::metadata(&path).unwrap();
         #[cfg(unix)]
         let (file_device, file_inode) = {
@@ -36713,10 +37229,13 @@ mod tests {
             history_base_pending: false,
             last_task_running: Some(true),
             last_model: Some("SOL".into()),
-            previous_total: 100,
-            previous_input: 80,
-            previous_cached_input: 20,
-            previous_output: 20,
+            last_model_context_kind: None,
+            last_model_interval: None,
+            source_admission: None,
+            previous_total: Some(100),
+            previous_input: Some(80),
+            previous_cached_input: Some(20),
+            previous_output: Some(20),
             context_usage_tokens: None,
             context_window_tokens: None,
         };
@@ -36745,14 +37264,31 @@ mod tests {
             fs::metadata(&path).unwrap().len()
         );
         checkpoint.last_task_running = None;
+        let mut legacy_cache = ThreadRolloutCache::default();
         let (_, legacy_rollout) = super::read_active_thread_rollout_cached_with_checkpoints(
             &root,
             &path,
-            &mut ThreadRolloutCache::default(),
+            &mut legacy_cache,
             std::slice::from_ref(&checkpoint),
         )
-        .expect("legacy checkpoint bridges a verified appended turn");
-        assert!(legacy_rollout.is_running());
+        .expect("legacy checkpoint preserves an unknown task state after token-only append");
+        assert_eq!(legacy_rollout.last_task_running(), None);
+        assert_eq!(legacy_rollout.total_tokens(), Some(123));
+
+        let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        append
+            .write_all(b"{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:02Z\"}\n")
+            .unwrap();
+        drop(append);
+        let (_, started) = super::read_active_thread_rollout_cached_with_checkpoints(
+            &root,
+            &path,
+            &mut legacy_cache,
+            std::slice::from_ref(&checkpoint),
+        )
+        .expect("only an explicit lifecycle event establishes a running task");
+        assert!(started.is_running());
+        assert_eq!(started.total_tokens(), Some(123));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -36792,34 +37328,45 @@ mod tests {
 
         let recoverable = root.join("recoverable.jsonl");
         let prefix = concat!(
-            "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
-            "{\"type\":\"task_started\"}\n"
+            "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
+            "{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n"
         );
         let oversized = format!(
-            "{{\"type\":\"response_item\",\"payload\":\"{}\"}}\n",
+            "{{\"type\":\"response_item\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{{\"text\":\"{}\"}}}}\n",
             "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
         );
         let suffix = concat!(
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"payload\":{\"type\":\"token_count\",",
             "\"info\":{\"total_token_usage\":{\"total_tokens\":321}}}}\n"
         );
         let mut bytes = prefix.as_bytes().to_vec();
         bytes.extend_from_slice(oversized.as_bytes());
-        bytes.extend_from_slice(&[b'{', 0xff, b'}', b'\n']);
         bytes.extend_from_slice(suffix.as_bytes());
         fs::write(&recoverable, bytes).unwrap();
         let rollout = read_thread_rollout_path(&root, &recoverable)
-            .expect("oversized/invalid-UTF8 records are isolated by the production reader");
+            .expect("a completely validated oversized NoOp preserves the live state");
         assert!(rollout.is_running());
         assert_eq!(rollout.total_tokens(), Some(321));
+
+        let invalid_utf8 = root.join("invalid-utf8.jsonl");
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.extend_from_slice(b"{\"type\":\"response_item\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"text\":\"");
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"\"}}\n");
+        bytes.extend_from_slice(suffix.as_bytes());
+        fs::write(&invalid_utf8, bytes).unwrap();
+        assert!(
+            read_thread_rollout_path(&root, &invalid_utf8).is_err(),
+            "invalid UTF-8 cannot prove that a live record is harmless"
+        );
 
         let malformed = root.join("malformed.jsonl");
         fs::write(
             &malformed,
             concat!(
-                "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
+                "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
                 "{not-json}\n",
-                "{\"type\":\"task_started\"}\n"
+                "{\"type\":\"task_started\",\"timestamp\":\"2026-01-01T00:00:01Z\"}\n"
             ),
         )
         .unwrap();
@@ -36829,8 +37376,8 @@ mod tests {
         fs::write(
             &known_event_error,
             concat!(
-                "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
-                "{\"type\":\"event_msg\",\"payload\":{}}\n"
+                "{\"type\":\"thread_context\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"model\":\"gpt-5.6-sol\"}\n",
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{}}\n"
             ),
         )
         .unwrap();
@@ -38878,9 +39425,9 @@ mod tests {
             model_totals: vec![usage_store::SessionModelTotal {
                 model: "SOL".into(),
                 total_tokens: 0,
-                input_tokens: 0,
-                cached_input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: Some(0),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
             }],
             ..usage_store::SessionCollectionState::default()
@@ -39132,7 +39679,7 @@ mod tests {
             .find(|checkpoint| checkpoint.committed_offset == START_OFFSET)
             .expect("fixed durable checkpoint");
         assert_eq!(prior.last_model.as_deref(), Some("SOL"));
-        assert_eq!(prior.previous_total, 77_858_168);
+        assert_eq!(prior.previous_total, Some(77_858_168));
         let candidate = SessionFileCandidate {
             fingerprint: fingerprint.clone(),
             recorded_source: usage_store::RecordedSessionSource {
@@ -39281,7 +39828,12 @@ mod tests {
                 sol.cached_input_tokens,
                 sol.output_tokens,
             ),
-            EXPECTED_SOL
+            (
+                EXPECTED_SOL.0,
+                Some(EXPECTED_SOL.1),
+                Some(EXPECTED_SOL.2),
+                Some(EXPECTED_SOL.3)
+            )
         );
         assert_eq!(
             state
@@ -39808,8 +40360,8 @@ mod tests {
         stale_checkpoint.prefix_sha256 = "99".repeat(32);
         stale_checkpoint.last_task_running = None;
         stale_checkpoint.last_model = None;
-        stale_checkpoint.previous_total = 0;
-        stale_checkpoint.previous_input = 0;
+        stale_checkpoint.previous_total = Some(0);
+        stale_checkpoint.previous_input = Some(0);
 
         let mut append = fs::OpenOptions::new().append(true).open(&session).unwrap();
         writeln!(append, "{next}").unwrap();
@@ -40149,10 +40701,13 @@ mod tests {
                     history_base_pending: false,
                     last_task_running: None,
                     last_model: fully_attributed_from_zero.then(|| "SOL".into()),
-                    previous_total: u64::from(fully_attributed_from_zero) * 129,
-                    previous_input: u64::from(fully_attributed_from_zero) * 100,
-                    previous_cached_input: u64::from(fully_attributed_from_zero) * 20,
-                    previous_output: u64::from(fully_attributed_from_zero) * 29,
+                    last_model_context_kind: None,
+                    last_model_interval: None,
+                    source_admission: None,
+                    previous_total: Some(u64::from(fully_attributed_from_zero) * 129),
+                    previous_input: Some(u64::from(fully_attributed_from_zero) * 100),
+                    previous_cached_input: Some(u64::from(fully_attributed_from_zero) * 20),
+                    previous_output: Some(u64::from(fully_attributed_from_zero) * 29),
                     context_usage_tokens: None,
                     context_window_tokens: None,
                 }
@@ -40280,10 +40835,13 @@ mod tests {
                     history_base_pending: false,
                     last_task_running: None,
                     last_model: Some("SOL".into()),
-                    previous_total: 229,
-                    previous_input: 180,
-                    previous_cached_input: 40,
-                    previous_output: 49,
+                    last_model_context_kind: None,
+                    last_model_interval: None,
+                    source_admission: None,
+                    previous_total: Some(229),
+                    previous_input: Some(180),
+                    previous_cached_input: Some(40),
+                    previous_output: Some(49),
                     context_usage_tokens: None,
                     context_window_tokens: None,
                 };
@@ -40718,9 +41276,9 @@ mod tests {
             cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 1_000,
-            input_tokens: 1_000,
-            cached_input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: Some(1_000),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(0),
         };
         let mut durable_state = super::usage_store::SessionCollectionState {
             data_generation: 3,
@@ -46017,6 +46575,41 @@ mod tests {
     }
 
     #[test]
+    fn issue604_native_ownership_empty_markers_have_no_coverage() {
+        use super::graph_non_owned_intervals;
+        use codex_info_rest_contract::PublicAccountOwnershipInterval as Interval;
+        let intervals = [
+            Interval {
+                start_at: Some(100),
+                end_at: Some(300),
+            },
+            Interval {
+                start_at: Some(150),
+                end_at: Some(150),
+            },
+            Interval {
+                start_at: Some(253_402_300_799),
+                end_at: Some(253_402_300_799),
+            },
+        ];
+        assert!(
+            graph_non_owned_intervals(&intervals, 100, 300).is_empty(),
+            "empty markers cannot reject otherwise fully owned coverage"
+        );
+        let empty = [Interval {
+            start_at: Some(150),
+            end_at: Some(150),
+        }];
+        let gaps = graph_non_owned_intervals(&empty, 100, 300);
+        assert_eq!(
+            gaps.iter()
+                .map(|gap| (gap.start_at, gap.end_at))
+                .collect::<Vec<_>>(),
+            vec![(100, 300)]
+        );
+    }
+
+    #[test]
     fn selected_account_ownership_gap_dashes_native_model_and_remaining_lines() {
         let mut state = CodexInfoState::preview("normal");
         let period = state
@@ -46043,9 +46636,9 @@ mod tests {
                     vec![usage_store::SessionModelTotal {
                         model: "SOL".to_owned(),
                         total_tokens: sample.sol_tokens,
-                        input_tokens: sample.sol_tokens,
-                        cached_input_tokens: 0,
-                        output_tokens: 0,
+                        input_tokens: Some(sample.sol_tokens),
+                        cached_input_tokens: Some(0),
+                        output_tokens: Some(0),
                         cache_write_input_tokens: Some(0),
                     }],
                 )
@@ -46626,6 +47219,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: sample.sol_dollars,
                             tokens: sample.sol_tokens as f64,
+                            raw_components: [None; 4],
                             raw_tokens: Some(sample.sol_tokens),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -46976,16 +47570,17 @@ mod tests {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 0.0, ModelDollarTotals::default()),
-            // A transient upward reread must not move the line endpoint back
-            // above the last monotonic value.
+            // Valid raw quota values are independent of cumulative model
+            // anomaly filtering, including a subsequent upward reread.
             UsageHistorySample::new(120, 1_000, 10.0, ModelDollarTotals::default()),
         ];
         let references = samples.iter().collect::<Vec<_>>();
         let paths = graph_paths(&references, 0, 120);
         assert_eq!(paths.current_remaining_label, "10%");
         let remaining = remaining_graph_points(&references, 0, 120);
-        assert_eq!(remaining, [(0, 100.0), (60, 100.0), (120, 10.0)]);
-        assert!(paths.remaining.matches('M').count() > 2);
+        assert_eq!(remaining, [(0, 100.0), (60, 0.0), (120, 10.0)]);
+        assert!(!paths.remaining_solid.is_empty());
+        assert!(paths.remaining_inferred.is_empty());
     }
 
     #[test]
@@ -47259,6 +47854,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 0.0,
                             tokens: 0.0,
+                            raw_components: [None; 4],
                             raw_tokens: Some(0),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -47268,6 +47864,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 0.0,
                             tokens: 100.0,
+                            raw_components: [None; 4],
                             raw_tokens: Some(100),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -47277,6 +47874,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 0.0,
                             tokens: 200.0,
+                            raw_components: [None; 4],
                             raw_tokens: Some(200),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -47825,6 +48423,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 10.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(10),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -47834,6 +48433,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 2.0,
                         tokens: 20.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(20),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -47987,6 +48587,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: sample.sol_dollars,
                                 tokens: sample.sol_tokens as f64,
+                                raw_components: [None; 4],
                                 raw_tokens: Some(sample.sol_tokens),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -48004,6 +48605,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: 0.0,
                                 tokens: 0.0,
+                                raw_components: [None; 4],
                                 raw_tokens: Some(0),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -48021,6 +48623,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: 0.0,
                                 tokens: 0.0,
+                                raw_components: [None; 4],
                                 raw_tokens: Some(0),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -48066,6 +48669,7 @@ mod tests {
         let observed = |tokens| super::GraphModelPoint {
             dollar: 0.0,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens as u64),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -48128,7 +48732,10 @@ mod tests {
     #[test]
     fn final_render_evidence_is_the_single_idle_authority() {
         let sample = |timestamp, remaining| {
-            UsageHistorySample::new(timestamp, 1_000, remaining, ModelDollarTotals::default())
+            let mut sample =
+                UsageHistorySample::new(timestamp, 1_000, remaining, ModelDollarTotals::default());
+            sample.remaining_percent = remaining;
+            sample
         };
         let samples = [
             sample(0, 17.0),
@@ -48141,6 +48748,7 @@ mod tests {
         let observed = |tokens| super::GraphModelPoint {
             dollar: 0.0,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens as u64),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -48235,9 +48843,9 @@ mod tests {
         assert!(!missing_graph.remaining_inferred.is_empty());
         assert!(missing_graph.unused_intervals.is_empty());
 
-        // Dollars are derived from tokens and cannot become a usage
-        // authority. This run is shorter than the idle threshold, so its
-        // token-proven correction remains an ordinary horizontal 3px line.
+        // Saved dollars remain an independent display metric. Token equality
+        // does not flatten their increase, and this run is below the idle
+        // threshold regardless of task activity metadata.
         let mut dollar_change = complete_flat.clone();
         dollar_change
             .get_mut("SOL")
@@ -48279,7 +48887,9 @@ mod tests {
                 Some(&inactive_activity),
             );
         assert!(!changing_graph.sol_flat.is_empty());
-        assert!(changing_graph.sol_rising.is_empty());
+        assert!(!changing_graph.sol_rising.is_empty());
+        assert!(changing_graph.sol_inferred.is_empty());
+        assert_eq!(changing_graph.current_sol_label, "$1.00");
         assert!(changing_graph.unused_intervals.is_empty());
 
         let mut legacy = complete_flat.clone();
@@ -48326,6 +48936,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 0.0,
                         tokens,
+                        raw_components: [None; 4],
                         raw_tokens: Some(tokens as u64),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -48368,6 +48979,7 @@ mod tests {
         let direct = super::GraphModelPoint {
             dollar: 1.0,
             tokens: 100.0,
+            raw_components: [None; 4],
             raw_tokens: Some(100),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -48402,6 +49014,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 100.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(100),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -48470,6 +49083,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar,
                                 tokens: 100.0,
+                                raw_components: [None; 4],
                                 raw_tokens: Some(100),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -48487,6 +49101,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: 0.0,
                                 tokens: 0.0,
+                                raw_components: [None; 4],
                                 raw_tokens: Some(0),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -48538,10 +49153,11 @@ mod tests {
                 graph.unused_intervals.is_empty(),
                 "recorded account quota consumption cannot be labelled unused"
             );
-            assert!(!graph.sol_idle.is_empty());
-            assert!(!graph.luna_idle.is_empty());
-            assert!(graph.sol_flat.is_empty());
-            assert!(graph.sol_rising.is_empty());
+            assert!(graph.sol_idle.is_empty());
+            assert!(graph.luna_idle.is_empty());
+            assert!(!graph.sol_flat.is_empty());
+            assert!(!graph.luna_flat.is_empty());
+            assert_eq!(graph.sol_rising.is_empty(), show_tokens);
             assert!(graph.sol_inferred.is_empty());
             assert!(graph.remaining_idle.is_empty());
             assert!(graph.remaining_solid.contains("M0.00 10.80"));
@@ -48554,7 +49170,7 @@ mod tests {
             assert_eq!(graph.current_remaining_label, "88%");
             assert_eq!(
                 graph.current_sol_label,
-                if show_tokens { "100" } else { "$1.00" }
+                if show_tokens { "100" } else { "$1.01" }
             );
         }
     }
@@ -48594,6 +49210,7 @@ mod tests {
                                 super::GraphModelPoint {
                                     dollar,
                                     tokens: tokens as f64,
+                                    raw_components: [None; 4],
                                     raw_tokens: Some(tokens),
                                     origin: super::GraphModelOrigin::Direct,
                                 },
@@ -48673,6 +49290,7 @@ mod tests {
         let direct = super::GraphModelPoint {
             dollar: 1.0,
             tokens: 100.0,
+            raw_components: [None; 4],
             raw_tokens: Some(100),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -48716,6 +49334,230 @@ mod tests {
     }
 
     #[test]
+    fn issue604_native_idle_numeric_uses_original_missing_rows() {
+        let samples = (0..=15)
+            .map(|minute| {
+                UsageHistorySample::new(minute * 60, 10_000, 90.0, ModelDollarTotals::default())
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let raw = BTreeMap::from([(
+            "SOL".to_owned(),
+            (0..=15)
+                .filter(|minute| *minute != 1)
+                .map(|minute| {
+                    let tokens = match minute {
+                        0 => 100,
+                        2 => 200,
+                        _ => 110,
+                    };
+                    (
+                        minute * 60,
+                        super::GraphModelPoint {
+                            dollar: tokens as f64 / 100.0,
+                            tokens: tokens as f64,
+                            raw_tokens: Some(tokens),
+                            raw_components: [None; 4],
+                            origin: super::GraphModelOrigin::Direct,
+                        },
+                    )
+                })
+                .collect(),
+        )]);
+        let untrusted = BTreeSet::from([60]);
+        for tokens in [false, true] {
+            let graph = super::graph_paths_for_selection_with_sources_and_astra(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 900,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: tokens,
+                    untrusted_minutes: &untrusted,
+                    confirmed_gaps: &[],
+                    model_timelines: &raw,
+                },
+            );
+            // The unavailable original row prevents a 100/200/110 triple.
+            // 200 is accepted; later 110s stay rejected rather than proving idle.
+            assert!(graph.unused_intervals.is_empty());
+            assert!(graph.sol_idle.is_empty());
+            assert!(!graph.sol_inferred.is_empty());
+        }
+    }
+
+    #[test]
+    fn issue604_native_idle_compares_saved_token_components_and_knownness() {
+        for legacy in [false, true] {
+            for (input, cached, output) in [(90, Some(0), 10), (100, Some(1), 0), (100, None, 0)] {
+                let mut state = CodexInfoState::service_client();
+                state.service_history_samples =
+                    [(0, 100, Some(0), 0), (600, input, cached, output)]
+                        .into_iter()
+                        .map(
+                            |(timestamp, input_tokens, cached_input_tokens, output_tokens)| {
+                                super::PublicHistoryObservationV3 {
+                                    timestamp,
+                                    reset_at: 10_000,
+                                    remaining_percent: Some(90.0),
+                                    task_active_since_previous: Some(false),
+                                    models: Some(vec![super::PublicHistoryModelUsageV3 {
+                                        model: "gpt-6.1-sol".into(),
+                                        total_tokens: 100,
+                                        input_tokens: Some(input_tokens),
+                                        cached_input_tokens,
+                                        cache_write_input_tokens: Some(0),
+                                        output_tokens: Some(output_tokens),
+                                        total_dollars: Some(1.0),
+                                    }]),
+                                    models_complete: !legacy,
+                                    model_source: if legacy {
+                                        "legacy-unknown"
+                                    } else {
+                                        "confirmed"
+                                    }
+                                    .into(),
+                                }
+                            },
+                        )
+                        .collect();
+                let (samples, untrusted, _) = state.graph_samples_for_selection(10_000, 0, 600);
+                let references = samples.iter().collect::<Vec<_>>();
+                let timelines = state.graph_raw_model_timelines_for_selection(10_000, 0, 600);
+                for tokens in [false, true] {
+                    let graph = super::graph_paths_for_selection_with_sources_and_astra(
+                        super::GraphSelectionInput {
+                            samples: &references,
+                            period_start: 0,
+                            period_end: 600,
+                            show_luna: false,
+                            show_terra: false,
+                            show_sol: true,
+                            show_astra: false,
+                            show_tokens: tokens,
+                            untrusted_minutes: &untrusted,
+                            confirmed_gaps: &[],
+                            model_timelines: &timelines,
+                        },
+                    );
+                    assert!(
+                        graph.unused_intervals.is_empty(),
+                        "legacy={legacy}, input={input}, cached={cached:?}, output={output}"
+                    );
+                    assert!(graph.sol_idle.is_empty());
+                    assert!(!graph.sol_flat.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn issue604_actual_confirmed_partial_values_remain_measured() {
+        // Exact SOL sidecar values from the read-only 2026-10-15 DB audit.
+        // Missing model-set completeness cannot erase this known model.
+        let recorded = [
+            (
+                1_792_060_020,
+                42_628_014_u64,
+                42_391_371,
+                41_169_664,
+                236_643,
+                8.926810399999999,
+            ),
+            (
+                1_792_060_080,
+                43_329_949,
+                43_091_879,
+                41_856_640,
+                238_070,
+                9.036842,
+            ),
+            (
+                1_792_060_140,
+                43_329_949,
+                43_091_879,
+                41_856_640,
+                238_070,
+                9.036842,
+            ),
+        ];
+        let reset = 1_792_655_864;
+        let start = 1_792_060_020;
+        let end = 1_792_060_140;
+        let mut state = CodexInfoState::service_client();
+        state.service_history_samples = recorded
+            .iter()
+            .map(|&(timestamp, total, input, cached, output, dollars)| {
+                super::PublicHistoryObservationV3 {
+                    timestamp,
+                    reset_at: reset,
+                    remaining_percent: None,
+                    task_active_since_previous: None,
+                    models: Some(vec![super::PublicHistoryModelUsageV3 {
+                        model: "gpt-6.1-sol".into(),
+                        total_tokens: total,
+                        input_tokens: Some(input),
+                        cached_input_tokens: Some(cached),
+                        cache_write_input_tokens: Some(0),
+                        output_tokens: Some(output),
+                        total_dollars: Some(dollars),
+                    }]),
+                    models_complete: false,
+                    model_source: "confirmed".into(),
+                }
+            })
+            .collect();
+        let raw = state.graph_raw_model_timelines_for_selection(reset, start, end);
+        // The raw set metadata remains incomplete for the global idle oracle.
+        assert!(raw["SOL"]
+            .values()
+            .all(|point| point.origin == super::GraphModelOrigin::IncompleteObserved));
+        let (samples, untrusted, _) = state.graph_samples_for_selection(reset, start, end);
+        let references = samples.iter().collect::<Vec<_>>();
+        for tokens in [false, true] {
+            let (accepted, anomalies) =
+                state.graph_model_lineage_for_selection(reset, start, end, tokens, &[]);
+            assert!(anomalies.is_empty());
+            for &(at, total, _, _, _, dollars) in &recorded {
+                let point = &accepted["SOL"][&at];
+                assert_eq!(point.origin, super::GraphModelOrigin::Direct);
+                assert_eq!(point.raw_tokens, Some(total));
+                assert_eq!(
+                    super::graph_model_value(point, tokens),
+                    if tokens { total as f64 } else { dollars }
+                );
+            }
+            let graph = super::graph_paths_for_selection_with_sources_and_astra(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: start,
+                    period_end: end,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: tokens,
+                    untrusted_minutes: &untrusted,
+                    confirmed_gaps: &[],
+                    model_timelines: &raw,
+                },
+            );
+            assert!(!graph.sol_rising.is_empty());
+            assert!(!graph.sol_flat.is_empty());
+            assert!(graph.sol_inferred.is_empty());
+            assert!(graph.sol_idle.is_empty());
+            assert!(graph.unused_intervals.is_empty());
+        }
+        assert!(state
+            .service_history_samples
+            .iter()
+            .all(|row| !row.models_complete));
+    }
+
+    #[test]
     fn numeric_incomplete_row_between_direct_endpoints_vetoes_idle() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 90.0, ModelDollarTotals::default()),
@@ -48726,6 +49568,7 @@ mod tests {
         let direct = |tokens, origin| super::GraphModelPoint {
             dollar: 1.0,
             tokens: tokens as f64,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens),
             origin,
         };
@@ -48770,6 +49613,7 @@ mod tests {
         let direct = |tokens| super::GraphModelPoint {
             dollar: 1.0,
             tokens: tokens as f64,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -48860,6 +49704,7 @@ mod tests {
                 super::GraphModelPoint {
                     dollar: 1.0,
                     tokens: 100.0,
+                    raw_components: [None; 4],
                     raw_tokens: Some(100),
                     origin: super::GraphModelOrigin::Direct,
                 },
@@ -48923,6 +49768,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 1.0 + m as f64,
                             tokens: 100.0 + m as f64,
+                            raw_components: [None; 4],
                             raw_tokens: Some(100 + m as u64),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -48945,7 +49791,7 @@ mod tests {
     }
 
     #[test]
-    fn issue614_task_stopped_bands_exclude_changes_across_missing_observations() {
+    fn issue614_task_stops_do_not_replace_raw_idle_evidence_across_missing_observations() {
         for (quota_changes, after_tokens) in [(false, 110), (false, 90), (true, 100)] {
             let samples = (0..=30)
                 .map(|minute| {
@@ -48976,6 +49822,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: 1.0,
                                 tokens: tokens as f64,
+                                raw_components: [None; 4],
                                 raw_tokens: Some(tokens),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -48983,19 +49830,30 @@ mod tests {
                     })
                     .collect(),
             )]);
-            let intervals = super::graph_task_idle_intervals(
-                &references,
-                Some(&activity),
-                0,
-                1_800,
-                &[],
-                &timelines,
-            );
+            let missing = if quota_changes {
+                BTreeSet::new()
+            } else {
+                (11..20).map(|minute| minute * 60).collect()
+            };
+            let graph = super::graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
+                super::GraphSelectionInput { samples: &references, period_start: 0, period_end: 1800,
+                    show_luna: false, show_terra: true, show_sol: false, show_astra: false, show_tokens: true,
+                    untrusted_minutes: &missing, confirmed_gaps: &[], model_timelines: &timelines },
+                Some(&activity), None);
+            let expected = if after_tokens < 100 {
+                vec![(0, 600)]
+            } else {
+                vec![(0, 600), (1200, 1800)]
+            };
             assert_eq!(
-                intervals,
-                [(0, 600), (1_200, 1_800)],
+                graph.unused_intervals.len(),
+                expected.len(),
                 "quota={quota_changes}, tokens={after_tokens}"
             );
+            for (actual, (start, end)) in graph.unused_intervals.iter().zip(expected) {
+                assert!((actual.start - start as f64 / 18.0).abs() < 0.001);
+                assert!((actual.width - (end - start) as f64 / 18.0).abs() < 0.001);
+            }
         }
     }
 
@@ -49015,6 +49873,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 1.0,
                             tokens: 100.0,
+                            raw_components: [None; 4],
                             raw_tokens: Some(100),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -49081,6 +49940,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar,
                                 tokens: tokens as f64,
+                                raw_components: [None; 4],
                                 raw_tokens: Some(tokens),
                                 origin,
                             },
@@ -49096,7 +49956,16 @@ mod tests {
                     Some(&activity), Some(&missing));
                 assert_eq!(graph.unused_intervals.len(), 1);
                 assert!((graph.unused_intervals[0].start - 100.0 / 18.0).abs() < 0.001);
-                assert!((graph.unused_intervals[0].width - 1500.0 / 18.0).abs() < 0.001);
+                // G137-4 permits the unavailable slot bridge only for
+                // complete confirmed endpoints. Legacy data stops the
+                // proven run at minute 12; task metadata cannot heal it.
+                let idle_end_minute = if origin == super::GraphModelOrigin::Direct {
+                    16.0
+                } else {
+                    12.0
+                };
+                let width = (idle_end_minute - 1.0) * 100.0 / 18.0;
+                assert!((graph.unused_intervals[0].width - width).abs() < 0.001);
                 let path = format!(
                     "{} {} {} {}",
                     graph.sol_idle, graph.sol_flat, graph.sol_rising, graph.sol_inferred
@@ -49149,6 +50018,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: if t == 0 { 1.0 } else { 2.0 },
                             tokens: if t == 0 { 100.0 } else { 200.0 },
+                            raw_components: [None; 4],
                             raw_tokens: Some(if t == 0 { 100 } else { 200 }),
                             origin: super::GraphModelOrigin::Direct,
                         },
@@ -49184,7 +50054,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_unavailable_minutes_preserve_confirmed_task_stop() {
+    fn consecutive_unavailable_minutes_do_not_prove_idle_from_task_stop() {
         let samples = (0..=10)
             .map(|minute| {
                 UsageHistorySample::new(
@@ -49206,6 +50076,7 @@ mod tests {
                 super::GraphModelPoint {
                     dollar: 1.0,
                     tokens: 100.0,
+                    raw_components: [None; 4],
                     raw_tokens: Some(100),
                     origin: super::GraphModelOrigin::Direct,
                 },
@@ -49242,7 +50113,9 @@ mod tests {
                 Some(&untrusted_minutes),
             );
 
-        assert_eq!(graph.unused_intervals.len(), 1);
+        assert!(graph.unused_intervals.is_empty());
+        assert!(!graph.sol_inferred.is_empty());
+        assert!(!graph.remaining_inferred.is_empty());
     }
 
     #[test]
@@ -49268,6 +50141,7 @@ mod tests {
                 super::GraphModelPoint {
                     dollar,
                     tokens: 100.0,
+                    raw_components: [None; 4],
                     raw_tokens: Some(100),
                     origin: super::GraphModelOrigin::Direct,
                 },
@@ -49331,6 +50205,7 @@ mod tests {
         let direct = |tokens| super::GraphModelPoint {
             dollar: tokens,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens as u64),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -49350,6 +50225,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 0.0,
                         tokens: 0.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(0),
                         origin: super::GraphModelOrigin::LegacyObserved,
                     },
@@ -49379,6 +50255,7 @@ mod tests {
         let direct = |tokens| super::GraphModelPoint {
             dollar: tokens as f64,
             tokens: tokens as f64,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -49440,6 +50317,7 @@ mod tests {
         let direct = |tokens| super::GraphModelPoint {
             dollar: tokens as f64,
             tokens: tokens as f64,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -49479,6 +50357,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 100.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(100),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -49488,6 +50367,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 100.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(100),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -49497,6 +50377,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 100.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(100),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -49539,7 +50420,8 @@ mod tests {
         let point = |value, reliable: bool| super::GraphModelPoint {
             dollar: value,
             tokens: value * 1_000.0,
-            raw_tokens: reliable.then_some((value * 1_000.0) as u64),
+            raw_components: [None; 4],
+            raw_tokens: Some((value * 1_000.0) as u64),
             origin: if reliable {
                 super::GraphModelOrigin::Direct
             } else {
@@ -49589,6 +50471,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 0.0,
                         tokens: 0.0,
+                        raw_components: [None; 4],
                         raw_tokens: None,
                         origin: super::GraphModelOrigin::LegacyObserved,
                     },
@@ -49598,6 +50481,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 10.0,
+                        raw_components: [None; 4],
                         raw_tokens: None,
                         origin: super::GraphModelOrigin::LegacyObserved,
                     },
@@ -49647,6 +50531,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 0.0,
                         tokens: 0.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(0),
                         origin: super::GraphModelOrigin::LegacyObserved,
                     },
@@ -49656,6 +50541,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 10.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(10),
                         origin: super::GraphModelOrigin::LegacyObserved,
                     },
@@ -49718,6 +50604,7 @@ mod tests {
         let legacy = |tokens, dollar| super::GraphModelPoint {
             dollar,
             tokens: tokens as f64,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens),
             origin: super::GraphModelOrigin::LegacyObserved,
         };
@@ -49753,47 +50640,47 @@ mod tests {
 
         assert_eq!(idle, vec![(START, START + 1_800)]);
 
-        let mut normalized_dollars = timelines.clone();
-        super::normalize_graph_dollars_from_token_identity(
-            &mut normalized_dollars,
-            &timelines,
-            &idle,
-        );
-        assert!(normalized_dollars
+        let (dollars, _) =
+            super::accepted_graph_model_timelines(&timelines, &legacy_minutes, false, &[]);
+        assert!(dollars
             .values()
-            .all(|timeline| timeline.values().all(|point| point.dollar == 0.0
-                && point.origin == super::GraphModelOrigin::LegacyObserved)));
+            .all(|timeline| timeline.values().all(|point| point.dollar == 0.0)));
+        assert!(dollars.values().all(
+            |timeline| timeline[&(START + 15 * 60)].origin == super::GraphModelOrigin::Rejected
+        ));
 
-        let graph =
-            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
-                super::GraphSelectionInput {
-                    samples: &references,
-                    period_start: START,
-                    period_end: START + 1_800,
-                    show_luna: true,
-                    show_terra: true,
-                    show_sol: true,
-                    show_astra: false,
-                    show_tokens: true,
-                    untrusted_minutes: &legacy_minutes,
-                    confirmed_gaps: &[],
-                    model_timelines: &timelines,
-                },
-                None,
-            );
-        assert!(!graph.sol_idle.is_empty());
-        assert!(!graph.terra_idle.is_empty());
-        assert!(!graph.luna_idle.is_empty());
-        assert!(graph.sol_flat.is_empty());
-        assert!(graph.sol_rising.is_empty());
-        assert!(graph.sol_inferred.is_empty());
-        assert!(!graph.remaining_idle.is_empty());
-        assert!(graph.remaining_solid.is_empty());
-        assert!(graph.remaining_inferred.is_empty());
+        for show_tokens in [false, true] {
+            let graph =
+                super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: START,
+                        period_end: START + 1_800,
+                        show_luna: true,
+                        show_terra: true,
+                        show_sol: true,
+                        show_astra: false,
+                        show_tokens,
+                        untrusted_minutes: &legacy_minutes,
+                        confirmed_gaps: &[],
+                        model_timelines: &timelines,
+                    },
+                    None,
+                );
+            assert!(!graph.sol_idle.is_empty());
+            assert!(!graph.terra_idle.is_empty());
+            assert!(!graph.luna_idle.is_empty());
+            assert!(graph.sol_flat.is_empty());
+            assert!(graph.sol_rising.is_empty());
+            assert_eq!(graph.sol_inferred.is_empty(), show_tokens);
+            assert!(!graph.remaining_idle.is_empty());
+            assert!(graph.remaining_solid.is_empty());
+            assert!(graph.remaining_inferred.is_empty());
+        }
     }
 
     #[test]
-    fn lossless_source_transitions_do_not_split_idle_or_dollar_hold() {
+    fn lossless_source_transitions_keep_idle_and_independent_saved_usd() {
         for legacy_first in [false, true] {
             let samples = (0..=10)
                 .map(|minute| {
@@ -49810,6 +50697,7 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: if before_transition { 1.0 } else { 2.0 },
                             tokens: 100.0,
+                            raw_components: [None; 4],
                             raw_tokens: Some(100),
                             origin: if legacy {
                                 super::GraphModelOrigin::LegacyObserved
@@ -49838,15 +50726,12 @@ mod tests {
             );
             assert_eq!(idle, vec![(0, 600)]);
 
-            let mut normalized_dollars = timelines.clone();
-            super::normalize_graph_dollars_from_token_identity(
-                &mut normalized_dollars,
-                &timelines,
-                &idle,
-            );
-            for (timestamp, normalized) in &normalized_dollars["SOL"] {
-                assert_eq!(normalized.dollar, 1.0);
-                assert_eq!(normalized.origin, timelines["SOL"][timestamp].origin);
+            let minutes = samples.iter().map(|sample| sample.timestamp).collect();
+            let (dollars, _) =
+                super::accepted_graph_model_timelines(&timelines, &minutes, false, &[]);
+            for (timestamp, point) in &dollars["SOL"] {
+                assert_eq!(point.dollar, if *timestamp <= 300 { 1.0 } else { 2.0 });
+                assert_eq!(point.origin, timelines["SOL"][timestamp].origin);
             }
 
             let graph =
@@ -49869,7 +50754,8 @@ mod tests {
             assert_eq!(graph.unused_intervals.len(), 1);
             assert!(!graph.sol_idle.is_empty());
             assert!(graph.sol_flat.is_empty());
-            assert!(graph.sol_rising.is_empty());
+            assert!(!graph.sol_rising.is_empty());
+            assert_eq!(graph.current_sol_label, "$2.00");
             assert!(graph.sol_inferred.is_empty());
             assert!(!graph.remaining_idle.is_empty());
             assert!(graph.remaining_solid.is_empty());
@@ -49878,11 +50764,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_outlier_cannot_reject_or_move_later_direct_observation() {
+    fn legacy_isolated_pulse_uses_the_same_rejection_as_direct() {
         let point = |value, origin| super::GraphModelPoint {
             dollar: value,
             tokens: value,
-            raw_tokens: matches!(origin, super::GraphModelOrigin::Direct).then_some(value as u64),
+            raw_components: [None; 4],
+            raw_tokens: Some(value as u64),
             origin,
         };
         let timelines = BTreeMap::from([(
@@ -49909,11 +50796,11 @@ mod tests {
             );
             assert_eq!(
                 timeline[&60].origin,
-                super::GraphModelOrigin::Interpolated,
-                "the UI replaces an out-of-bounds display-only legacy point using direct anchors"
+                super::GraphModelOrigin::Rejected,
+                "the original three raw rows reject the isolated legacy pulse"
             );
-            assert_eq!(super::graph_model_value(&timeline[&60], show_tokens), 105.0);
-            assert!(correction_starts.is_empty());
+            assert_eq!(super::graph_model_value(&timeline[&60], show_tokens), 100.0);
+            assert_eq!(correction_starts, BTreeSet::from([60]));
         }
     }
 
@@ -49929,6 +50816,7 @@ mod tests {
         let point = |tokens| super::GraphModelPoint {
             dollar: 0.0,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens as u64),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -49985,6 +50873,7 @@ mod tests {
         let point = |tokens| super::GraphModelPoint {
             dollar: 0.0,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens as u64),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -50061,6 +50950,7 @@ mod tests {
         let point = |tokens| super::GraphModelPoint {
             dollar: tokens / 1_000_000.0,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens as u64),
             // Direct model evidence must not create a leading quota value.
             // Remaining starts only at its own first direct observation.
@@ -50129,6 +51019,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 0.0,
                         tokens: 10.0,
+                        raw_components: [None; 4],
                         raw_tokens: None,
                         origin: super::GraphModelOrigin::LegacyObserved,
                     },
@@ -50138,6 +51029,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 0.0,
                         tokens: 100.0,
+                        raw_components: [None; 4],
                         raw_tokens: None,
                         origin: super::GraphModelOrigin::LegacyObserved,
                     },
@@ -50173,6 +51065,7 @@ mod tests {
         let point = |tokens| super::GraphModelPoint {
             dollar: 0.0,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens as u64),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -50216,6 +51109,7 @@ mod tests {
         let point = |tokens| super::GraphModelPoint {
             dollar: tokens,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens as u64),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -50245,10 +51139,8 @@ mod tests {
             &[],
             &BTreeSet::new(),
         );
-        assert_eq!(
-            remaining[1].origin,
-            super::GraphRemainingOrigin::MonotonicHold
-        );
+        assert_eq!(remaining[1].origin, super::GraphRemainingOrigin::Raw);
+        assert_eq!(remaining[1].effective, 80.0);
         assert_eq!(remaining[2].origin, super::GraphRemainingOrigin::Raw);
         assert_eq!(remaining[2].effective, 89.0);
     }
@@ -50265,6 +51157,7 @@ mod tests {
         let point = |tokens| super::GraphModelPoint {
             dollar: 0.0,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens as u64),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -50339,6 +51232,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 4.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(4),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -50348,6 +51242,7 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 4.0,
+                        raw_components: [None; 4],
                         raw_tokens: Some(4),
                         origin: super::GraphModelOrigin::Direct,
                     },
@@ -50375,6 +51270,7 @@ mod tests {
                 super::GraphModelPoint {
                     dollar: -1.0,
                     tokens: 4.0,
+                    raw_components: [None; 4],
                     raw_tokens: Some(4),
                     origin: super::GraphModelOrigin::Direct,
                 },
@@ -50402,6 +51298,7 @@ mod tests {
         let point = |tokens, raw_tokens| super::GraphModelPoint {
             dollar: 1.0,
             tokens,
+            raw_components: [None; 4],
             raw_tokens: Some(raw_tokens),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -50437,6 +51334,7 @@ mod tests {
         let point = |dollar| super::GraphModelPoint {
             dollar,
             tokens: dollar * 1_000.0,
+            raw_components: [None; 4],
             raw_tokens: Some((dollar * 1_000.0) as u64),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -50767,7 +51665,21 @@ mod tests {
         );
         assert_eq!(stored.sol_tokens, Some(17));
         assert_eq!(stored.sol_dollars, Some(2.5));
-        assert!(stored.model_totals.is_none());
+        let models = stored
+            .model_totals
+            .as_ref()
+            .expect("known total remains representable");
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            (
+                models[0].total_tokens,
+                models[0].input_tokens,
+                models[0].cached_input_tokens,
+                models[0].output_tokens,
+                models[0].cache_write_input_tokens
+            ),
+            (17, None, Some(0), Some(1), None)
+        );
         assert!(!stored.model_totals_complete);
     }
 
@@ -51020,14 +51932,11 @@ mod tests {
         let observed_at = Utc::now().timestamp().div_euclid(60) * 60;
         let current_reset = producer.reset_at.expect("preview reset");
         let historical_reset = current_reset - WEEK_SECONDS;
-        let first = producer
+        let first = historical_reset.div_euclid(60) * 60 - 240;
+        producer
             .history
             .samples
-            .iter()
-            .map(|sample| sample.timestamp)
-            .min()
-            .expect("preview history")
-            - WEEK_SECONDS;
+            .retain(|sample| sample.reset_at != historical_reset);
         for (timestamp, tokens, source, complete, sol, luna) in [
             (
                 first,
@@ -51083,9 +51992,9 @@ mod tests {
             let mut model_totals = vec![usage_store::SessionModelTotal {
                 model: "ASTRA".into(),
                 total_tokens: tokens,
-                input_tokens: tokens,
-                cached_input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: Some(tokens),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
             }];
             if complete {
@@ -51093,25 +52002,25 @@ mod tests {
                     usage_store::SessionModelTotal {
                         model: "SOL".into(),
                         total_tokens: sol,
-                        input_tokens: sol,
-                        cached_input_tokens: 0,
-                        output_tokens: 0,
+                        input_tokens: Some(sol),
+                        cached_input_tokens: Some(0),
+                        output_tokens: Some(0),
                         cache_write_input_tokens: None,
                     },
                     usage_store::SessionModelTotal {
                         model: "TERRA".into(),
                         total_tokens: 0,
-                        input_tokens: 0,
-                        cached_input_tokens: 0,
-                        output_tokens: 0,
+                        input_tokens: Some(0),
+                        cached_input_tokens: Some(0),
+                        output_tokens: Some(0),
                         cache_write_input_tokens: None,
                     },
                     usage_store::SessionModelTotal {
                         model: "LUNA".into(),
                         total_tokens: luna,
-                        input_tokens: luna,
-                        cached_input_tokens: 0,
-                        output_tokens: 0,
+                        input_tokens: Some(luna),
+                        cached_input_tokens: Some(0),
+                        output_tokens: Some(0),
                         cache_write_input_tokens: None,
                     },
                 ]);
@@ -51184,8 +52093,19 @@ mod tests {
             })
             .count();
         assert_eq!(
-            astra_observations, 2,
-            "legacy generic models stay on the lossless service graph path and do not enter the fixed-column compatibility store"
+            astra_observations, 4,
+            "the generic observation carrier preserves every published ASTRA row"
+        );
+        assert_eq!(
+            client
+                .history
+                .samples
+                .iter()
+                .filter(|sample| sample.reset_at == historical.reset_at)
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            [first + 120, first + 180],
+            "only complete confirmed fixed-column rows enter the compatibility samples"
         );
         let astra_points = client.graph_model_points_for_selection(
             historical.reset_at,
@@ -51216,6 +52136,7 @@ mod tests {
         );
         assert!(paths.astra_flat.is_empty());
         assert!(!paths.astra_rising.is_empty());
+        assert!(historical.end_at.div_euclid(60) > (first + 180).div_euclid(60));
         assert!(!paths.astra_inferred.is_empty());
         assert_eq!(paths.current_astra_label, "$40.00");
         let luna_points = client.graph_model_points_for_selection(
@@ -51257,11 +52178,11 @@ mod tests {
                 .values()
                 .next_back()
                 .map(|point| (point.dollar, point.origin)),
-            Some((30.0, super::GraphModelOrigin::Held)),
+            Some((30.0, super::GraphModelOrigin::Direct)),
         );
         assert_eq!(
             paths.current_luna_label, "$30.00",
-            "the later lower unconfirmed values remain hidden until recovery; raw={luna_points:?}"
+            "the latest directly observed LUNA value is preserved; raw={luna_points:?}"
         );
         assert_eq!(
             paths.current_sol_label,
@@ -51611,6 +52532,7 @@ mod tests {
         let direct = |dollar, tokens| super::GraphModelPoint {
             dollar,
             tokens: tokens as f64,
+            raw_components: [None; 4],
             raw_tokens: Some(tokens),
             origin: super::GraphModelOrigin::Direct,
         };
@@ -51650,7 +52572,14 @@ mod tests {
             graph.unused_intervals.is_empty(),
             "a token increase is usage"
         );
-        assert!(!graph.sol_idle.is_empty(), "SOL is unchanged throughout");
+        assert!(
+            graph.sol_idle.is_empty(),
+            "a model-specific flat is not session-wide idle while LUNA increases"
+        );
+        assert!(
+            !graph.sol_flat.is_empty(),
+            "SOL's unchanged observations remain an ordinary measured line"
+        );
         assert!(
             !graph.luna_rising.is_empty(),
             "LUNA's directly recorded increase remains a rising line"
@@ -51764,6 +52693,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: 1.0,
                                 tokens: 10.0,
+                                raw_components: [None; 4],
                                 raw_tokens: Some(10),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -51773,6 +52703,7 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: if changed_dollar { 1.01 } else { 1.0 },
                                 tokens: 10.0,
+                                raw_components: [None; 4],
                                 raw_tokens: Some(10),
                                 origin: super::GraphModelOrigin::Direct,
                             },
@@ -51822,9 +52753,10 @@ mod tests {
             super::split_metric_line_paths_with_evidence_and_idle(&repriced_context, |point| {
                 point.sol
             });
-        assert_eq!(idle, "M0.00 50.00 L100.00 50.00");
+        assert!(idle.is_empty());
         assert!(flat.is_empty());
-        assert!(rising.is_empty());
+        assert!(rising.starts_with("M0.00 50.00"));
+        assert!(rising.ends_with("L100.00 49.51"));
         assert!(inferred.is_empty());
     }
 
@@ -52052,18 +52984,17 @@ mod tests {
                 .and_then(|point| point.raw_tokens),
             Some(0)
         );
-        let sol_model_idle = super::token_idle_timestamp_intervals_for_model(
+        let global_idle = super::token_idle_timestamp_intervals_with_render_evidence(
             &references,
             period.start,
             period.end,
             &raw_timelines,
             &[],
             None,
-            Some("SOL"),
         );
-        assert!(sol_model_idle
+        assert!(!global_idle
             .iter()
-            .any(|(start, end)| { *start <= period.start && *end >= period.start + 10 * 60 }));
+            .any(|(start, end)| *start <= period.start && *end >= period.start + 10 * 60));
         let luna_tokens = raw_timelines.get("LUNA").expect("LUNA raw model timeline");
         assert_eq!(
             luna_tokens
@@ -52077,18 +53008,6 @@ mod tests {
                 .and_then(|point| point.raw_tokens),
             Some(0)
         );
-        let luna_model_idle = super::token_idle_timestamp_intervals_for_model(
-            &references,
-            period.start,
-            period.end,
-            &raw_timelines,
-            &[],
-            None,
-            Some("LUNA"),
-        );
-        assert!(luna_model_idle
-            .iter()
-            .any(|(start, end)| { *start <= period.start && *end >= period.start + 10 * 60 }));
         let points = remaining_graph_points(&references, period.start, period.end);
         assert_eq!(points.first().map(|(_, value)| *value), Some(88.0));
         assert_eq!(points.last().map(|(_, value)| *value), Some(87.0));
@@ -52114,17 +53033,22 @@ mod tests {
             true,
             false,
         );
-        // SOL and LUNA have identical lossless token totals in their first
-        // ten-minute pair, so model-specific idle starts while ASTRA rises.
-        // ASTRA's changed token total remains a measured rise.
+        // Saved SOL/LUNA dollars rise independently of their unchanged
+        // raw tokens. ASTRA and Remaining also change in the opening span;
+        // only the later globally unchanged run is a thin idle line.
+        let sol_saved = raw_timelines.get("SOL").unwrap();
+        let luna_saved = raw_timelines.get("LUNA").unwrap();
+        assert!(sol_saved[&period.start].dollar < sol_saved[&period.end].dollar);
+        assert!(luna_saved[&period.start].dollar < luna_saved[&period.end].dollar);
         assert!(!paths.sol_idle.is_empty());
         assert!(!paths.terra_idle.is_empty());
         assert!(!paths.luna_idle.is_empty());
-        assert!(paths.sol_rising.is_empty());
+        assert!(!paths.sol_rising.is_empty());
         assert!(paths.sol_flat.is_empty());
         assert!(paths.terra_rising.is_empty());
-        assert!(paths.luna_rising.is_empty());
+        assert!(!paths.luna_rising.is_empty());
         assert!(paths.luna_flat.is_empty());
+        assert!(!paths.terra_flat.is_empty());
         assert!(!paths.astra_idle.is_empty());
         assert!(!paths.astra_rising.is_empty());
         assert!(paths.astra_inferred.is_empty());
