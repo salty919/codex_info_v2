@@ -672,52 +672,14 @@ connection.close()
 PY
 chmod 600 "$state_fixture"
 fake_codex="$root_dir/scripts/fake_codex_app_server.py"
+fixture_helper="$root_dir/scripts/x11_service_recovery_fixture.py"
+[[ -f "$fixture_helper" ]] || fail 'service recovery fixture helper is unavailable'
 
 # Seed pre-boundary records that must be baselined without attribution. A
 # verified append after the first ready generation supplies the visible model
 # rows; this keeps the rendered fixture aligned with SESSION-129.
 session_fixture="$temp_root/codex/sessions/fixture.jsonl"
-python3 - "$session_fixture" <<'PY'
-import datetime
-import json
-import sys
-import time
-
-timestamp = datetime.datetime.fromtimestamp(
-    time.time() - 120, datetime.timezone.utc
-).isoformat().replace("+00:00", "Z")
-events = [
-    ("gpt-5.6-sol", 1_000, 700, 100, 300),
-    ("gpt-5.6-terra", 2_000, 1_400, 200, 600),
-    ("gpt-5.6-luna", 3_000, 2_100, 300, 900),
-]
-with open(sys.argv[1], "w", encoding="utf-8") as stream:
-    stream.write(json.dumps({
-        "type": "session_meta",
-        "payload": {"id": "fixture-thread", "session_id": "session-fixture-thread"},
-    }) + "\n")
-    for model, total, input_tokens, cached, output in events:
-        stream.write(json.dumps({"type": "thread_context", "model": model, "timestamp": timestamp}) + "\n")
-        stream.write(json.dumps({
-            "type": "event_msg",
-            "timestamp": timestamp,
-            "payload": {
-                "type": "token_count",
-                "info": {
-                    "total_token_usage": {
-                        "total_tokens": total,
-                        "input_tokens": input_tokens,
-                        "cached_input_tokens": cached,
-                        "output_tokens": output,
-                    }
-                },
-            },
-        }) + "\n")
-    # The last context is the active-thread model authority. Keep it SOL and
-    # leave the lifecycle open so the exact one-thread Main fixture is live.
-    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol", "timestamp": timestamp}) + "\n")
-    stream.write(json.dumps({"type": "task_started", "timestamp": timestamp}) + "\n")
-PY
+python3 -B "$fixture_helper" baseline "$session_fixture"
 chmod 600 "$session_fixture"
 
 holder_source="$(readlink -f "$(command -v python3)")"
@@ -839,19 +801,7 @@ assert_recorder_unchanged() {
 service_ready() {
     local details
     details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
-    python3 - "$details" <<'PY'
-import json
-import sys
-try:
-    details = json.loads(sys.argv[1])
-except (IndexError, json.JSONDecodeError):
-    raise SystemExit(1)
-raise SystemExit(0 if (
-    details.get("api_version") == "v4"
-    and details.get("state") == "ready"
-    and details.get("authenticated") is True
-) else 1)
-PY
+    printf '%s' "$details" | python3 -B "$fixture_helper" ready
 }
 wait_service_ready() {
     for _ in $(seq 1 80); do
@@ -904,74 +854,12 @@ fi
 echo "x11-service-recovery-visual-gate: UI is alive before service readiness (pid=$ui_pid)"
 
 append_verified_usage() {
-    python3 - "$session_fixture" <<'PY'
-import datetime
-import json
-import sys
-import time
-
-timestamp = datetime.datetime.fromtimestamp(
-    time.time(), datetime.timezone.utc
-).isoformat().replace("+00:00", "Z")
-events = [
-    ("gpt-5.6-sol", 4_000, 2_800, 400, 1_200),
-    ("gpt-5.6-sol", 5_000, 3_500, 500, 1_500),
-    ("gpt-5.6-terra", 6_000, 4_200, 600, 1_800),
-    ("gpt-5.6-terra", 7_000, 4_900, 700, 2_100),
-    ("gpt-5.6-luna", 8_000, 5_600, 800, 2_400),
-    ("gpt-5.6-luna", 9_000, 6_300, 900, 2_700),
-]
-with open(sys.argv[1], "a", encoding="utf-8") as stream:
-    for model, total, input_tokens, cached, output in events:
-        stream.write(json.dumps({"type": "thread_context", "model": model, "timestamp": timestamp}) + "\n")
-        stream.write(json.dumps({
-            "type": "event_msg",
-            "timestamp": timestamp,
-            "payload": {
-                "type": "token_count",
-                "info": {
-                    "total_token_usage": {
-                        "total_tokens": total,
-                        "input_tokens": input_tokens,
-                        "cached_input_tokens": cached,
-                        "output_tokens": output,
-                    }
-                },
-            },
-        }) + "\n")
-    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol", "timestamp": timestamp}) + "\n")
-    # An untimed lifecycle event leaves the scanned source incomplete.
-    stream.write(json.dumps({"type": "task_started", "timestamp": timestamp}) + "\n")
-PY
+    python3 -B "$fixture_helper" append "$session_fixture"
 }
 service_models_ready() {
     local details
     details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
-    python3 - "$details" <<'PY'
-import json
-import sys
-try:
-    details = json.loads(sys.argv[1])
-except (IndexError, json.JSONDecodeError):
-    raise SystemExit(1)
-models = details.get("models")
-model_names = [
-    item.get("model")
-    for item in models
-    if isinstance(item, dict)
-] if isinstance(models, list) else []
-expected_models = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
-raise SystemExit(0 if (
-    details.get("api_version") == "v4"
-    and details.get("state") == "ready"
-    and details.get("authenticated") is True
-    and isinstance(models, list)
-    and len(models) == len(expected_models)
-    and len(model_names) == len(models)
-    and all(isinstance(name, str) for name in model_names)
-    and set(model_names) == expected_models
-) else 1)
-PY
+    printf '%s' "$details" | python3 -B "$fixture_helper" models
 }
 wait_service_models_ready() {
     for _ in $(seq 1 80); do
