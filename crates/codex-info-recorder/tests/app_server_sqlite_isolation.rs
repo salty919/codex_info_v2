@@ -1828,7 +1828,16 @@ fn issue604_collector_retires_only_the_original_counter_matched_to_a_response() 
 
 #[test]
 fn issue604_collector_requalifies_only_the_matching_saved_legacy_family_key() {
-    verify_bound_source_event_collection(false, false, true, false, false, false, false);
+    verify_bound_source_event_collection_with_options(BoundSourceEventOptions {
+        restore_original: false,
+        retire_counter: false,
+        legacy_family: true,
+        live_before_reconstruction: false,
+        live_before_original_repair: false,
+        reactivated: false,
+        prior_rpc_response: false,
+        withhold_initial_quota: true,
+    });
 }
 
 #[test]
@@ -1875,6 +1884,40 @@ fn verify_bound_source_event_collection(
     reactivated: bool,
     prior_rpc_response: bool,
 ) {
+    verify_bound_source_event_collection_with_options(BoundSourceEventOptions {
+        restore_original,
+        retire_counter,
+        legacy_family,
+        live_before_reconstruction,
+        live_before_original_repair,
+        reactivated,
+        prior_rpc_response,
+        withhold_initial_quota: false,
+    });
+}
+
+struct BoundSourceEventOptions {
+    restore_original: bool,
+    retire_counter: bool,
+    legacy_family: bool,
+    live_before_reconstruction: bool,
+    live_before_original_repair: bool,
+    reactivated: bool,
+    prior_rpc_response: bool,
+    withhold_initial_quota: bool,
+}
+
+fn verify_bound_source_event_collection_with_options(options: BoundSourceEventOptions) {
+    let BoundSourceEventOptions {
+        restore_original,
+        retire_counter,
+        legacy_family,
+        live_before_reconstruction,
+        live_before_original_repair,
+        reactivated,
+        prior_rpc_response,
+        withhold_initial_quota,
+    } = options;
     fn counter(total: u64, at: i64) -> String {
         let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp(at, 0)
             .unwrap()
@@ -1960,12 +2003,15 @@ for line in sys.stdin:
             auth.chmod(0o600)
         result = {'thread':item}
     elif method == 'account/rateLimits/read':
-        used = 0
-        if mode == 'repair-live':
-            state = root / 'repair-percent'
-            used = int(state.read_text()) + 1 if state.exists() else 1
-            state.write_text(str(used))
-        result = {'rateLimits':{'primary':{'usedPercent':used,'resetsAt':int((root / 'reset-at').read_text()),'windowDurationMins':10080}}}
+        if mode == 'no-quota':
+            error = {'code':-32000,'message':'fixture quota unavailable before durable receipt'}
+        else:
+            used = 0
+            if mode == 'repair-live':
+                state = root / 'repair-percent'
+                used = int(state.read_text()) + 1 if state.exists() else 1
+                state.write_text(str(used))
+            result = {'rateLimits':{'primary':{'usedPercent':used,'resetsAt':int((root / 'reset-at').read_text()),'windowDurationMins':10080}}}
     response = {'id':req['id'],'error':error} if error else {'id':req['id'],'result':result}
     print(json.dumps(response), flush=True)
 "#).unwrap();
@@ -2274,7 +2320,12 @@ for line in sys.stdin:
         fs::write(root.path().join("home/sessions/one.jsonl"), &original).unwrap();
     }
     let began = chrono::Utc::now().timestamp();
-    let (success, log) = run(root.path(), "success", "success", false);
+    let initial_mode = if withhold_initial_quota {
+        "no-quota"
+    } else {
+        "success"
+    };
+    let (success, log) = run(root.path(), initial_mode, "success", false);
     assert!(success, "source binding startup failed\n{log}");
     let ended = chrono::Utc::now().timestamp();
     let (db, canonical) = database(root.path());
@@ -2313,17 +2364,39 @@ for line in sys.stdin:
         ledger(&db).is_empty(),
         "the initial cumulative 15 is not account consumption"
     );
-    let initial_history_tokens: Option<i64> = db
+    let initial_history_state: (i64, i64, i64, i64, i64, i64, i64) = db
         .query_row(
-            "SELECT sol_tokens FROM usage_history ORDER BY timestamp DESC LIMIT 1",
+            "SELECT COUNT(*),COUNT(sol_tokens),COUNT(terra_tokens),COUNT(luna_tokens),COUNT(sol_dollars),COUNT(terra_dollars),COUNT(luna_dollars) FROM usage_history",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
         )
         .unwrap();
     assert_eq!(
-        initial_history_tokens, None,
-        "an unproved initial source baseline cannot publish a confirmed empty period"
+        (
+            initial_history_state.1,
+            initial_history_state.2,
+            initial_history_state.3,
+            initial_history_state.4,
+            initial_history_state.5,
+            initial_history_state.6,
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "an unproved initial source baseline cannot publish model usage; history rows={} (zero rows and quota-only rows are both valid before a durable receipt)",
+        initial_history_state.0
     );
+    if withhold_initial_quota {
+        let durable_receipts: i64 = db
+            .query_row("SELECT COUNT(*) FROM quota_receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            durable_receipts, 0,
+            "the fixture withholds the first quota receipt"
+        );
+        assert_eq!(
+            initial_history_state.0, 0,
+            "without a durable quota receipt no period history row may be invented"
+        );
+    }
     drop(db);
     let previous_journal_sequence = latest_journal_receipt(root.path()).map(|receipt| receipt.0);
 
