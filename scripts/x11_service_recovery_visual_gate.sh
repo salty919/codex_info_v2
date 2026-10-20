@@ -687,17 +687,17 @@ timestamp = datetime.datetime.fromtimestamp(
     time.time() - 120, datetime.timezone.utc
 ).isoformat().replace("+00:00", "Z")
 events = [
-    ("gpt-5.6-sol", 1_000, 700, 100, 200),
-    ("gpt-5.6-terra", 2_000, 1_400, 200, 400),
-    ("gpt-5.6-luna", 3_000, 2_100, 300, 600),
+    ("gpt-5.6-sol", 1_000, 700, 100, 300),
+    ("gpt-5.6-terra", 2_000, 1_400, 200, 600),
+    ("gpt-5.6-luna", 3_000, 2_100, 300, 900),
 ]
 with open(sys.argv[1], "w", encoding="utf-8") as stream:
     stream.write(json.dumps({
         "type": "session_meta",
-        "payload": {"id": "fixture-thread"},
+        "payload": {"id": "fixture-thread", "session_id": "session-fixture-thread"},
     }) + "\n")
     for model, total, input_tokens, cached, output in events:
-        stream.write(json.dumps({"type": "thread_context", "model": model}) + "\n")
+        stream.write(json.dumps({"type": "thread_context", "model": model, "timestamp": timestamp}) + "\n")
         stream.write(json.dumps({
             "type": "event_msg",
             "timestamp": timestamp,
@@ -715,7 +715,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as stream:
         }) + "\n")
     # The last context is the active-thread model authority. Keep it SOL and
     # leave the lifecycle open so the exact one-thread Main fixture is live.
-    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol"}) + "\n")
+    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol", "timestamp": timestamp}) + "\n")
     stream.write(json.dumps({"type": "task_started", "timestamp": timestamp}) + "\n")
 PY
 chmod 600 "$session_fixture"
@@ -838,7 +838,7 @@ assert_recorder_unchanged() {
 }
 service_ready() {
     local details
-    details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" 2>/dev/null)" || return 1
+    details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
     python3 - "$details" <<'PY'
 import json
 import sys
@@ -846,7 +846,11 @@ try:
     details = json.loads(sys.argv[1])
 except (IndexError, json.JSONDecodeError):
     raise SystemExit(1)
-raise SystemExit(0 if details.get("state") == "ready" and details.get("authenticated") is True else 1)
+raise SystemExit(0 if (
+    details.get("api_version") == "v4"
+    and details.get("state") == "ready"
+    and details.get("authenticated") is True
+) else 1)
 PY
 }
 wait_service_ready() {
@@ -855,7 +859,7 @@ wait_service_ready() {
         sleep 0.25
     done
     sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
-    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" >&2 || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" >&2 || true
     return 1
 }
 
@@ -910,16 +914,16 @@ timestamp = datetime.datetime.fromtimestamp(
     time.time(), datetime.timezone.utc
 ).isoformat().replace("+00:00", "Z")
 events = [
-    ("gpt-5.6-sol", 4_000, 2_800, 400, 800),
-    ("gpt-5.6-sol", 5_000, 3_500, 500, 1_000),
-    ("gpt-5.6-terra", 6_000, 4_200, 600, 1_200),
-    ("gpt-5.6-terra", 7_000, 4_900, 700, 1_400),
-    ("gpt-5.6-luna", 8_000, 5_600, 800, 1_600),
-    ("gpt-5.6-luna", 9_000, 6_300, 900, 1_800),
+    ("gpt-5.6-sol", 4_000, 2_800, 400, 1_200),
+    ("gpt-5.6-sol", 5_000, 3_500, 500, 1_500),
+    ("gpt-5.6-terra", 6_000, 4_200, 600, 1_800),
+    ("gpt-5.6-terra", 7_000, 4_900, 700, 2_100),
+    ("gpt-5.6-luna", 8_000, 5_600, 800, 2_400),
+    ("gpt-5.6-luna", 9_000, 6_300, 900, 2_700),
 ]
 with open(sys.argv[1], "a", encoding="utf-8") as stream:
     for model, total, input_tokens, cached, output in events:
-        stream.write(json.dumps({"type": "thread_context", "model": model}) + "\n")
+        stream.write(json.dumps({"type": "thread_context", "model": model, "timestamp": timestamp}) + "\n")
         stream.write(json.dumps({
             "type": "event_msg",
             "timestamp": timestamp,
@@ -935,14 +939,14 @@ with open(sys.argv[1], "a", encoding="utf-8") as stream:
                 },
             },
         }) + "\n")
-    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol"}) + "\n")
+    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol", "timestamp": timestamp}) + "\n")
     # An untimed lifecycle event leaves the scanned source incomplete.
     stream.write(json.dumps({"type": "task_started", "timestamp": timestamp}) + "\n")
 PY
 }
 service_models_ready() {
     local details
-    details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" 2>/dev/null)" || return 1
+    details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
     python3 - "$details" <<'PY'
 import json
 import sys
@@ -950,10 +954,22 @@ try:
     details = json.loads(sys.argv[1])
 except (IndexError, json.JSONDecodeError):
     raise SystemExit(1)
+models = details.get("models")
+model_names = [
+    item.get("model")
+    for item in models
+    if isinstance(item, dict)
+] if isinstance(models, list) else []
+expected_models = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
 raise SystemExit(0 if (
-    details.get("state") == "ready"
+    details.get("api_version") == "v4"
+    and details.get("state") == "ready"
     and details.get("authenticated") is True
-    and len(details.get("models", [])) == 3
+    and isinstance(models, list)
+    and len(models) == len(expected_models)
+    and len(model_names) == len(models)
+    and all(isinstance(name, str) for name in model_names)
+    and set(model_names) == expected_models
 ) else 1)
 PY
 }
@@ -963,13 +979,13 @@ wait_service_models_ready() {
         sleep 0.25
     done
     sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
-    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" >&2 || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" >&2 || true
     return 1
 }
 
 service_thread_bundle_ready() {
     local current threads
-    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" 2>/dev/null)" || return 1
+    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
     threads="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/threads" 2>/dev/null)" || return 1
     python3 - "$current" "$threads" <<'PY'
 import json
@@ -999,7 +1015,7 @@ wait_service_thread_bundle_ready() {
         sleep 0.25
     done
     sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
-    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >&2 || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" >&2 || true
     curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/threads" >&2 || true
     return 1
 }
@@ -1013,7 +1029,7 @@ inject_app_server_failure() {
             # still be in the recorder/publication queue: pin the baseline only
             # after REST has published the last durable observation.
             curl --fail --silent --show-error --max-time 1 \
-                "http://127.0.0.1:$port/v3/current" >"$ready_current" || return 1
+                "http://127.0.0.1:$port/v4/current" >"$ready_current" || return 1
             if python3 - "$ready_current" "$temp_root/data/history/quota/observations.sqlite3" <<'PY'
 import json
 from pathlib import Path
@@ -1042,7 +1058,7 @@ PY
 
 service_last_good_error() {
     local current
-    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" 2>/dev/null)" || return 1
+    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
     python3 - "$current" "$ready_current" <<'PY'
 import json
 import sys
@@ -1071,7 +1087,7 @@ wait_service_last_good_error() {
     printf '\nPinned last-good baseline:\n' >&2
     cat "$ready_current" >&2
     printf '\nCurrent response:\n' >&2
-    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >&2 || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" >&2 || true
     return 1
 }
 
@@ -1083,7 +1099,7 @@ append_verified_usage
 wait_service_models_ready || fail 'post-baseline fixture usage did not publish model details'
 wait_service_thread_bundle_ready || fail 'resident service did not publish the exact one-SOL thread bundle'
 curl --fail --silent --show-error --max-time 1 --dump-header "$current_headers" \
-    --output "$ready_current" "http://127.0.0.1:$port/v3/current"
+    --output "$ready_current" "http://127.0.0.1:$port/v4/current"
 curl --fail --silent --show-error --max-time 1 --dump-header "$threads_headers" \
     --output "$ready_threads" "http://127.0.0.1:$port/v3/threads"
 python3 - "$ready_current" "$current_headers" "$ready_threads" "$threads_headers" <<'PY'
