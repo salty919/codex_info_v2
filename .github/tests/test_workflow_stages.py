@@ -108,7 +108,7 @@ class FeatCallerTests(unittest.TestCase):
     def git(self, *args):
         # Only this test's local Git repository and literal fixture commands reach this call.
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
-        return subprocess.check_output(  # nosec B603 # absolute Git and fixed offline fixture argv.
+        return subprocess.check_output(  # noqa: S603, RUF100 # nosec B603 # fixed Git executable and offline fixture argv.
             [GIT, "-C", str(self.repo), *args], text=True, shell=False,
             stderr=subprocess.DEVNULL,
         ).strip()
@@ -136,7 +136,7 @@ class FeatCallerTests(unittest.TestCase):
         script = next(step["run"] for step in steps if step.get("id") == "classify")
         # Execute this checkout's workflow step with local Git and the finite GitHub stub above.
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
-        result = subprocess.run(  # nosec B603 # trusted checked-in script, offline fixtures, no shell=True.
+        result = subprocess.run(  # noqa: S603, RUF100 # nosec B603 # trusted checked-in script and offline fixtures.
             [BASH, "-euo", "pipefail", "-c", script], cwd=self.repo,
             env=env, text=True, capture_output=True, shell=False, check=False,
         )
@@ -373,6 +373,14 @@ class LinuxBuildFlowTests(unittest.TestCase):
                     chmod +x "$target/x86_64-unknown-linux-gnu/release/$name"
                 done
 ''')
+            fixture_stub = root / 'scripts' / 'test_x11_service_recovery_fixture.py'
+            fixture_stub.write_text(
+                'import os\n'
+                'with open(os.environ["CALLS"], "a", encoding="utf-8") as calls:\n'
+                '    calls.write("fixture\\n")\n'
+                'if os.environ["FAIL_AT"] == "fixture":\n'
+                '    raise SystemExit(23)\n'
+            )
             script('bin/xvfb-run', '''
                 while [[ "$1" == --* ]]; do shift; done
                 exec "$@"
@@ -425,7 +433,7 @@ class LinuxBuildFlowTests(unittest.TestCase):
                         env[key] = str(expression(value, bindings)).lower()
                 # Execute the checked-in workflow against finite local command fixtures only.
                 # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
-                result = subprocess.run(  # nosec B603 # absolute Bash, trusted workflow, fixed offline fixtures.
+                result = subprocess.run(  # noqa: S603, RUF100 # nosec B603 # absolute Bash and checked-in offline workflow.
                     [BASH, '-euo', 'pipefail', '-c', step['run']], cwd=root, env=env,
                     text=True, capture_output=True, shell=False, check=False)
                 if result.returncode:
@@ -441,12 +449,17 @@ class LinuxBuildFlowTests(unittest.TestCase):
             with self.subTest(owners=owners):
                 result, calls = self.run_candidate(owners)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(calls, ['build', 'bundle', 'bundle-check', *expected])
+                self.assertEqual(calls, ['build', 'fixture', 'bundle', 'bundle-check', *expected])
 
     def test_candidate_stops_on_acceptance_failure(self):
         result, calls = self.run_candidate(['LINUX_BACKEND', 'LINUX_UI'], fail_at='daemon')
         self.assertEqual(result.returncode, 23, result.stderr)
-        self.assertEqual(calls, ['build', 'bundle', 'bundle-check', 'cli', 'daemon'])
+        self.assertEqual(calls, ['build', 'fixture', 'bundle', 'bundle-check', 'cli', 'daemon'])
+
+    def test_candidate_stops_on_fixture_failure(self):
+        result, calls = self.run_candidate(['LINUX_BACKEND', 'LINUX_UI'], fail_at='fixture')
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(calls, ['build', 'fixture'])
 
 
 if __name__ == "__main__":

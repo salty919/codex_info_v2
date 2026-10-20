@@ -73,6 +73,7 @@ jobs:
           RUN_UI_ACCEPTANCE: ${{ inputs.release_candidate && inputs.linux_ui_acceptance }}
         run: |
           set -euo pipefail
+          python3 -B scripts/test_x11_service_recovery_fixture.py
           output_dir="$RUNNER_TEMP/codex-info-linux-bundle"
           mkdir -p "$output_dir"
           bash scripts/build_linux_bundle.sh \

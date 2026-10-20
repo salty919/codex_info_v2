@@ -185,6 +185,7 @@ for check in "${checks[@]}"; do
             bash scripts/regression_guard.sh --test
             ;;
         linux-ui-contract)
+            python3 -B scripts/test_x11_service_recovery_fixture.py
             command -v xvfb-run >/dev/null 2>&1 || fail 'xvfb-run is unavailable'
             cargo build --release --locked
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \

@@ -672,52 +672,14 @@ connection.close()
 PY
 chmod 600 "$state_fixture"
 fake_codex="$root_dir/scripts/fake_codex_app_server.py"
+fixture_helper="$root_dir/scripts/x11_service_recovery_fixture.py"
+[[ -f "$fixture_helper" ]] || fail 'service recovery fixture helper is unavailable'
 
 # Seed pre-boundary records that must be baselined without attribution. A
 # verified append after the first ready generation supplies the visible model
 # rows; this keeps the rendered fixture aligned with SESSION-129.
 session_fixture="$temp_root/codex/sessions/fixture.jsonl"
-python3 - "$session_fixture" <<'PY'
-import datetime
-import json
-import sys
-import time
-
-timestamp = datetime.datetime.fromtimestamp(
-    time.time() - 120, datetime.timezone.utc
-).isoformat().replace("+00:00", "Z")
-events = [
-    ("gpt-5.6-sol", 1_000, 700, 100, 200),
-    ("gpt-5.6-terra", 2_000, 1_400, 200, 400),
-    ("gpt-5.6-luna", 3_000, 2_100, 300, 600),
-]
-with open(sys.argv[1], "w", encoding="utf-8") as stream:
-    stream.write(json.dumps({
-        "type": "session_meta",
-        "payload": {"id": "fixture-thread"},
-    }) + "\n")
-    for model, total, input_tokens, cached, output in events:
-        stream.write(json.dumps({"type": "thread_context", "model": model}) + "\n")
-        stream.write(json.dumps({
-            "type": "event_msg",
-            "timestamp": timestamp,
-            "payload": {
-                "type": "token_count",
-                "info": {
-                    "total_token_usage": {
-                        "total_tokens": total,
-                        "input_tokens": input_tokens,
-                        "cached_input_tokens": cached,
-                        "output_tokens": output,
-                    }
-                },
-            },
-        }) + "\n")
-    # The last context is the active-thread model authority. Keep it SOL and
-    # leave the lifecycle open so the exact one-thread Main fixture is live.
-    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol"}) + "\n")
-    stream.write(json.dumps({"type": "task_started", "timestamp": timestamp}) + "\n")
-PY
+python3 -B "$fixture_helper" baseline "$session_fixture"
 chmod 600 "$session_fixture"
 
 holder_source="$(readlink -f "$(command -v python3)")"
@@ -838,16 +800,8 @@ assert_recorder_unchanged() {
 }
 service_ready() {
     local details
-    details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" 2>/dev/null)" || return 1
-    python3 - "$details" <<'PY'
-import json
-import sys
-try:
-    details = json.loads(sys.argv[1])
-except (IndexError, json.JSONDecodeError):
-    raise SystemExit(1)
-raise SystemExit(0 if details.get("state") == "ready" and details.get("authenticated") is True else 1)
-PY
+    details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
+    printf '%s' "$details" | python3 -B "$fixture_helper" ready
 }
 wait_service_ready() {
     for _ in $(seq 1 80); do
@@ -855,7 +809,7 @@ wait_service_ready() {
         sleep 0.25
     done
     sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
-    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" >&2 || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" >&2 || true
     return 1
 }
 
@@ -900,62 +854,12 @@ fi
 echo "x11-service-recovery-visual-gate: UI is alive before service readiness (pid=$ui_pid)"
 
 append_verified_usage() {
-    python3 - "$session_fixture" <<'PY'
-import datetime
-import json
-import sys
-import time
-
-timestamp = datetime.datetime.fromtimestamp(
-    time.time(), datetime.timezone.utc
-).isoformat().replace("+00:00", "Z")
-events = [
-    ("gpt-5.6-sol", 4_000, 2_800, 400, 800),
-    ("gpt-5.6-sol", 5_000, 3_500, 500, 1_000),
-    ("gpt-5.6-terra", 6_000, 4_200, 600, 1_200),
-    ("gpt-5.6-terra", 7_000, 4_900, 700, 1_400),
-    ("gpt-5.6-luna", 8_000, 5_600, 800, 1_600),
-    ("gpt-5.6-luna", 9_000, 6_300, 900, 1_800),
-]
-with open(sys.argv[1], "a", encoding="utf-8") as stream:
-    for model, total, input_tokens, cached, output in events:
-        stream.write(json.dumps({"type": "thread_context", "model": model}) + "\n")
-        stream.write(json.dumps({
-            "type": "event_msg",
-            "timestamp": timestamp,
-            "payload": {
-                "type": "token_count",
-                "info": {
-                    "total_token_usage": {
-                        "total_tokens": total,
-                        "input_tokens": input_tokens,
-                        "cached_input_tokens": cached,
-                        "output_tokens": output,
-                    }
-                },
-            },
-        }) + "\n")
-    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol"}) + "\n")
-    # An untimed lifecycle event leaves the scanned source incomplete.
-    stream.write(json.dumps({"type": "task_started", "timestamp": timestamp}) + "\n")
-PY
+    python3 -B "$fixture_helper" append "$session_fixture"
 }
 service_models_ready() {
     local details
-    details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" 2>/dev/null)" || return 1
-    python3 - "$details" <<'PY'
-import json
-import sys
-try:
-    details = json.loads(sys.argv[1])
-except (IndexError, json.JSONDecodeError):
-    raise SystemExit(1)
-raise SystemExit(0 if (
-    details.get("state") == "ready"
-    and details.get("authenticated") is True
-    and len(details.get("models", [])) == 3
-) else 1)
-PY
+    details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
+    printf '%s' "$details" | python3 -B "$fixture_helper" models
 }
 wait_service_models_ready() {
     for _ in $(seq 1 80); do
@@ -963,13 +867,13 @@ wait_service_models_ready() {
         sleep 0.25
     done
     sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
-    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" >&2 || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" >&2 || true
     return 1
 }
 
 service_thread_bundle_ready() {
     local current threads
-    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" 2>/dev/null)" || return 1
+    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
     threads="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/threads" 2>/dev/null)" || return 1
     python3 - "$current" "$threads" <<'PY'
 import json
@@ -999,7 +903,7 @@ wait_service_thread_bundle_ready() {
         sleep 0.25
     done
     sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
-    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >&2 || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" >&2 || true
     curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/threads" >&2 || true
     return 1
 }
@@ -1013,7 +917,7 @@ inject_app_server_failure() {
             # still be in the recorder/publication queue: pin the baseline only
             # after REST has published the last durable observation.
             curl --fail --silent --show-error --max-time 1 \
-                "http://127.0.0.1:$port/v3/current" >"$ready_current" || return 1
+                "http://127.0.0.1:$port/v4/current" >"$ready_current" || return 1
             if python3 - "$ready_current" "$temp_root/data/history/quota/observations.sqlite3" <<'PY'
 import json
 from pathlib import Path
@@ -1042,7 +946,7 @@ PY
 
 service_last_good_error() {
     local current
-    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" 2>/dev/null)" || return 1
+    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" 2>/dev/null)" || return 1
     python3 - "$current" "$ready_current" <<'PY'
 import json
 import sys
@@ -1071,7 +975,7 @@ wait_service_last_good_error() {
     printf '\nPinned last-good baseline:\n' >&2
     cat "$ready_current" >&2
     printf '\nCurrent response:\n' >&2
-    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >&2 || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v4/current" >&2 || true
     return 1
 }
 
@@ -1083,7 +987,7 @@ append_verified_usage
 wait_service_models_ready || fail 'post-baseline fixture usage did not publish model details'
 wait_service_thread_bundle_ready || fail 'resident service did not publish the exact one-SOL thread bundle'
 curl --fail --silent --show-error --max-time 1 --dump-header "$current_headers" \
-    --output "$ready_current" "http://127.0.0.1:$port/v3/current"
+    --output "$ready_current" "http://127.0.0.1:$port/v4/current"
 curl --fail --silent --show-error --max-time 1 --dump-header "$threads_headers" \
     --output "$ready_threads" "http://127.0.0.1:$port/v3/threads"
 python3 - "$ready_current" "$current_headers" "$ready_threads" "$threads_headers" <<'PY'
