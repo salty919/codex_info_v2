@@ -7,7 +7,7 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
+import subprocess  # noqa: B404  # nosec B404 - fixed offline fixture processes only
 import tempfile
 import time
 from datetime import datetime
@@ -63,7 +63,7 @@ def run_real_write_fixture(root: Path) -> tuple[Path, list[dict[str, object]], d
             "case_data": str(case_data),
         }
     )
-    completed = subprocess.run(
+    completed = subprocess.run(  # noqa: B603  # nosec B603 - fixed interpreter; test-owned stdin and fixture environment
         ["/bin/bash", "--noprofile", "--norc", "-s"],
         input=wrapper,
         check=True,
@@ -192,7 +192,7 @@ def check_fake_app_server(
                 "RECORD_DAEMON_FAKE_APP_SERVER": str(FAKE_APP_SERVER),
             }
         )
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: B603  # nosec B603 - fixed interpreter; test-owned code and fixture environment
             [
                 "/usr/bin/python3",
                 "-c",
@@ -240,8 +240,10 @@ def run_rest_assertion(
         (
             "set -euo pipefail",
             assertion,
-            f'{function_name} "$RECORD_DAEMON_BODY_PATH" "$RECORD_DAEMON_HEADERS_PATH" '
-            '"$RECORD_DAEMON_RESET_AT" "$RECORD_DAEMON_EXPECTED_TOTAL"',
+            (
+                f'{function_name} "$RECORD_DAEMON_BODY_PATH" "$RECORD_DAEMON_HEADERS_PATH" '
+                '"$RECORD_DAEMON_RESET_AT" "$RECORD_DAEMON_EXPECTED_TOTAL"'
+            ),
         )
     )
     environment = os.environ.copy()
@@ -253,7 +255,7 @@ def run_rest_assertion(
             "RECORD_DAEMON_EXPECTED_TOTAL": str(expected_total),
         }
     )
-    return subprocess.run(
+    return subprocess.run(  # noqa: B603  # nosec B603 - fixed interpreter; test-owned stdin and fixture environment
         ["/bin/bash", "--noprofile", "--norc", "-s"],
         input=wrapper,
         capture_output=True,
@@ -370,10 +372,14 @@ def run_history_snapshot_assertion(
             'is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }',
             read_projection_snapshot,
             assert_history_matches_sqlite,
-            'snapshot="$(read_projection_snapshot "$RECORD_DAEMON_RESET_AT" '
-            '"$RECORD_DAEMON_HISTORY_PATH" "$RECORD_DAEMON_EXPECTED_TOTAL")"',
-            'assert_history_matches_sqlite "$RECORD_DAEMON_HISTORY_PATH" "$snapshot" '
-            '"$RECORD_DAEMON_RESET_AT"',
+            (
+                'snapshot="$(read_projection_snapshot "$RECORD_DAEMON_RESET_AT" '
+                '"$RECORD_DAEMON_HISTORY_PATH" "$RECORD_DAEMON_EXPECTED_TOTAL")"'
+            ),
+            (
+                'assert_history_matches_sqlite "$RECORD_DAEMON_HISTORY_PATH" "$snapshot" '
+                '"$RECORD_DAEMON_RESET_AT"'
+            ),
         )
     )
     environment = os.environ.copy()
@@ -385,7 +391,7 @@ def run_history_snapshot_assertion(
             "RECORD_DAEMON_EXPECTED_TOTAL": str(expected_total),
         }
     )
-    return subprocess.run(
+    return subprocess.run(  # noqa: B603  # nosec B603 - fixed interpreter; test-owned code and fixture environment
         ["/bin/bash", "--noprofile", "--norc", "-s"],
         input=wrapper,
         capture_output=True,
