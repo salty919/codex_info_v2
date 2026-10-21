@@ -98,10 +98,19 @@ class LinuxReleaseSelectionFixtures(unittest.TestCase):
         before = self.snapshot()
         if direct:
             source = INSTALLER.read_text()
-            function = "select_release() {" + source.split("select_release() {", 1)[1].split("\ndownload_asset() {", 1)[0]
+            version_function = (
+                "version_python() {" + source.split("version_python() {", 1)[1]
+                .split("\nupdate_channel_record() {", 1)[0]
+            )
+            selector_function = (
+                "select_release() {" + source.split("select_release() {", 1)[1]
+                .split("\ndownload_asset() {", 1)[0]
+            )
             harness = (
                 'set -euo pipefail\nTARGET="$1"\nrunning_installer_source="$2"\n'
-                + function + '\nselect_release "$3" "$4" "$5"\n'
+                + "RECOVERY_PRODUCT_VERSION_B64=''\n"
+                + version_function + '\n' + selector_function
+                + '\nselect_release "$3" "$4" "$5"\n'
             )
             arguments = [
                 "/bin/bash", "--noprofile", "--norc", "-c", harness,
@@ -115,7 +124,7 @@ class LinuxReleaseSelectionFixtures(unittest.TestCase):
             ]
             if channel is not None:
                 arguments += ["--channel", channel]
-        result = subprocess.run(  # nosec B603 # Fixed Bash argv and bounded offline metadata.
+        result = subprocess.run(  # Fixed Bash argv executes the checked-in selector with offline fixture inputs.  # nosec B603
             ["/bin/bash", *arguments[1:]],
             env=self.env, cwd=self.root, capture_output=True, text=True,
             timeout=10, check=False, shell=False,

@@ -33,13 +33,14 @@ FUNCTIONS = (
     "restore_legacy_combined_runtime", "verify_legacy_combined_terminal",
     "recover_legacy_combined_state", "rollback_transaction", "resume_transaction",
     "perform_install", "enforce_desired_state",
-    "atomic_recovery_copy", "legacy_recovery_reader_source", "legacy_recovery_reader_valid",
+    "atomic_recovery_copy", "legacy_recovery_reader_source", "legacy_recovery_reader_build", "legacy_recovery_reader_valid",
     "legacy_recovery_reader_active", "prepare_legacy_recovery_reader",
     "validate_legacy_recovery_installer_binding", "publish_legacy_recovery_reader",
     "restore_legacy_recovery_installer", "validate_legacy_handoff_destination",
     "stage_legacy_recovery_handoff", "promote_legacy_recovery_handoff",
     "recover_legacy_reader_handoff", "finish_committed_legacy_recovery",
     "legacy_recovery_reader_image", "legacy_recovery_reader_prior_hash", "seal_legacy_reader_handoff",
+    "incident_override_pair_receipt",
 )
 
 MODEL = r"""
@@ -179,6 +180,33 @@ class LegacyRecoveryTests(unittest.TestCase):
             (self.home / name).write_bytes(data)
         self.generation = False
         self.operation = None
+
+    def assert_recovery_reader(self, path):
+        reader = path.read_bytes()
+        original = INSTALLER.read_bytes()
+        module = (INSTALLER.parents[1] / "scripts/product_version.py").read_bytes()
+        field = b"RECOVERY_PRODUCT_VERSION_B64='"
+        lines = [line for line in reader.splitlines(keepends=True) if line.startswith(field)]
+        self.assertEqual(len(lines), 1, "recovery reader must have one embedded module")
+        line = lines[0]
+        ending = b"\r\n" if line.endswith(b"\r\n") else b"\n" if line.endswith(b"\n") else b""
+        body = line[:-len(ending)] if ending else line
+        self.assertTrue(body.startswith(field) and body.endswith(b"'"))
+        module_image = body[len(field):-1].decode("ascii")
+        expected_image = base64.b64encode(gzip.compress(module, mtime=0)).decode("ascii")
+        self.assertEqual(module_image, expected_image)
+        self.assertEqual(gzip.decompress(base64.b64decode(module_image, validate=True)), module)
+        restored_source = reader.replace(line, b"RECOVERY_PRODUCT_VERSION_B64=''" + ending, 1)
+        self.assertEqual(restored_source, original, "emptying the fixed field must reproduce installer source")
+        pending = self.share / ".legacy-recovery-transaction.json"
+        authority = pending if pending.exists() else self.journal
+        operation = json.loads(authority.read_text())["operation_id"]
+        identity = operation.split("~lc1~", 1)[1].split("~")
+        self.assertEqual(len(identity), 3)
+        encoded_hash = identity[2]
+        digest = base64.urlsafe_b64decode(encoded_hash + "=" * (-len(encoded_hash) % 4))
+        self.assertEqual(base64.urlsafe_b64encode(digest).decode("ascii").rstrip("="), encoded_hash)
+        self.assertEqual(hashlib.sha256(reader).digest(), digest)
 
     def seed(self, generation=False):
         self.generation = generation
@@ -346,7 +374,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.assertEqual(json.loads(self.journal.read_text())["phase"], "rollback_verified")
         # Keep the new reader selected until the transaction is committed;
         # the exact frozen old installer is restored at the final boundary.
-        self.assertEqual(self.paths["install.sh"].read_bytes(), INSTALLER.read_bytes())
+        self.assert_recovery_reader(self.paths["install.sh"])
         recovered = self.run_installed_startup()
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assert_snapshot()
@@ -400,7 +428,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.assertEqual(interrupted.returncode, 75, interrupted.stderr)
         committed = self.journal.read_bytes()
         self.assertEqual(json.loads(committed)["phase"], "committed")
-        self.assertEqual(self.paths["install.sh"].read_bytes(), INSTALLER.read_bytes())
+        self.assert_recovery_reader(self.paths["install.sh"])
         (self.home / "codex-info.service.active").write_text("0\n")
         recovered = self.run_installed_startup()
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
@@ -464,7 +492,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.assertEqual(first.returncode, -9, first.stderr)
         self.assertEqual((self.home / "cache-receipt").read_text(), "recovery cache file and directory fsynced\n")
         cache = self.share / ".legacy-recovery-install.sh"
-        self.assertEqual(cache.read_bytes(), INSTALLER.read_bytes())
+        self.assert_recovery_reader(cache)
         pending = self.share / ".legacy-recovery-transaction.json"
         self.assertTrue(pending.exists(), "fsynced recovery code has no durable authority")
         self.operation = json.loads(pending.read_text())["operation_id"]
@@ -489,7 +517,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         recovered = self.run_step("resume", reader_source=newer)
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assert_snapshot()
-        self.assertEqual(cache.read_bytes(), INSTALLER.read_bytes())
+        self.assert_recovery_reader(cache)
 
     def test_foreign_staged_code_image_preserves_snapshot_and_authority(self):
         self.seed_pinned_installer()
@@ -503,6 +531,27 @@ class LegacyRecoveryTests(unittest.TestCase):
         recovered = self.run_step("resume")
         self.assertEqual(recovered.returncode, 88, recovered.stderr)
         self.assertEqual(pending.read_bytes(), foreign)
+        self.assertFalse(self.journal.exists())
+        self.assertFalse((self.share / ".legacy-recovery-install.sh").exists())
+        for name, (data, mode) in self.snapshot.items():
+            self.assertEqual(self.paths[name].read_bytes(), data, name)
+            self.assertEqual(self.paths[name].stat().st_mode & 0o777, mode, name)
+        for name, data in self.sentinels.items():
+            self.assertEqual((self.home / name).read_bytes(), data)
+
+    def test_staged_code_image_over_limit_preserves_snapshot(self):
+        self.seed_pinned_installer()
+        first = self.run_step("install", interrupt_phase="legacy_handoff_staged")
+        self.assertEqual(first.returncode, 75, first.stderr)
+        pending = self.share / ".legacy-recovery-transaction.json"
+        document = json.loads(pending.read_text())
+        self.assertLessEqual(len(document["legacy_reader_image"]), 98304)
+        document["legacy_reader_image"] = "A" * 98305
+        oversized = (json.dumps(document) + "\n").encode()
+        pending.write_bytes(oversized)
+        blocked = self.run_step("resume")
+        self.assertEqual(blocked.returncode, 88, blocked.stderr)
+        self.assertEqual(pending.read_bytes(), oversized)
         self.assertFalse(self.journal.exists())
         self.assertFalse((self.share / ".legacy-recovery-install.sh").exists())
         for name, (data, mode) in self.snapshot.items():
@@ -542,7 +591,7 @@ class LegacyRecoveryTests(unittest.TestCase):
         recovered = self.run_step("resume", reader_source=newer)
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assert_snapshot()
-        self.assertEqual(cache.read_bytes(), INSTALLER.read_bytes())
+        self.assert_recovery_reader(cache)
 
     def test_retired_active_combined_resumes_original_runtime(self):
         self.retired_runtime(False)
