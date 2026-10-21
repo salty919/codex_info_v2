@@ -124,7 +124,7 @@ class LinuxReleaseSelectionFixtures(unittest.TestCase):
             ]
             if channel is not None:
                 arguments += ["--channel", channel]
-        result = subprocess.run(  # noqa: S603 -- Fixed Bash argv executes the checked-in selector with offline fixture inputs.  # nosec B603
+        result = subprocess.run(  # Fixed Bash argv executes the checked-in selector with offline fixture inputs.  # nosec B603
             ["/bin/bash", *arguments[1:]],
             env=self.env, cwd=self.root, capture_output=True, text=True,
             timeout=10, check=False, shell=False,

@@ -360,12 +360,24 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]).touch()
         pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"]).touch()
         self.control("running")
-        for unit in ("codex-info-recorder.service", "codex-info-rest.service"):
-            result = subprocess.run(  # noqa: S603 -- Fixed interpreter and test-owned adapter with fixed service arguments.
-                ["/usr/bin/python3", str(self.bin / "systemctl"), "--user", "restart", "--no-block", unit],
-                env=self.env, capture_output=True, text=True, check=False, timeout=5,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
+        recorder = subprocess.run(
+            [
+                "/usr/bin/python3", "systemctl", "--user", "restart", "--no-block",
+                "codex-info-recorder.service",
+            ],
+            cwd=self.bin, env=self.env, capture_output=True, text=True,
+            check=False, timeout=5, shell=False,
+        )
+        self.assertEqual(recorder.returncode, 0, recorder.stderr)
+        rest = subprocess.run(
+            [
+                "/usr/bin/python3", "systemctl", "--user", "restart", "--no-block",
+                "codex-info-rest.service",
+            ],
+            cwd=self.bin, env=self.env, capture_output=True, text=True,
+            check=False, timeout=5, shell=False,
+        )
+        self.assertEqual(rest.returncode, 0, rest.stderr)
 
     def incident_database(self):
         db = self.home / ".local/share/codex-info/history/accounts/fixture-account/epoch-one/usage_history.sqlite3"
