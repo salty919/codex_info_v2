@@ -21,3 +21,8 @@ select = [
 ]
 # Bandit/Prospector own these suppressions; they are not Ruff rule codes.
 external = ["B404", "B603"]
+
+[lint.per-file-ignores]
+# This offline selector harness executes checked-in Bash with fixed argv;
+# Bandit owns its existing, documented B603 exception.
+"scripts/test_linux_release_selection.py" = ["S603"]

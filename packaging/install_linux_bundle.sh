@@ -8,6 +8,7 @@ COMPATIBILITY="glibc"
 PRODUCT="codex_info"
 SCHEMA="codex-info-linux-bundle-v1"
 CONTROL_SCHEMA="codex-info-control-state-v1"
+RECOVERY_PRODUCT_VERSION_B64=''
 REPOSITORY="salty919/codex_info_v2"
 RELEASES_URL="https://api.github.com/repos/salty919/codex_info_v2/releases/latest"
 HEALTH_URL="http://127.0.0.1:8787/v1/health"
@@ -85,6 +86,8 @@ manifest_destination="$share_dir/manifest.json"
 unit_destination="$unit_dir/codex-info-recorder.service"
 recorder_override_destination="$unit_destination.d/90-issue-134-current-cli.conf"
 rest_unit_destination="$unit_dir/codex-info-rest.service"
+incident_recorder_override_destination="$unit_destination.d/604-hotfix.conf"
+incident_rest_override_destination="$rest_unit_destination.d/604-hotfix.conf"
 legacy_combined_unit_destination="$unit_dir/codex-info.service"
 legacy_combined_enable_destination="$unit_dir/default.target.wants/codex-info.service"
 update_service_destination="$unit_dir/codex-info-update.service"
@@ -309,33 +312,44 @@ PY
 }
 
 version_python() {
-    local module="${running_installer_source%/*}/product_version.py"
-    if [[ "${running_installer_source##*/}" == install_linux_bundle.sh &&
-          "${running_installer_source%/*}" == */packaging ]]; then
-        module="${running_installer_source%/*}/../scripts/product_version.py"
+    local module source_dir
+    source_dir="$(dirname -- "$running_installer_source")"
+    module="$source_dir/product_version.py"
+    if [[ "$running_installer_source" == */packaging/install_linux_bundle.sh ]]; then
+        module="$(dirname -- "$source_dir")/scripts/product_version.py"
     fi
     {
         cat <<'PY_VERSION_AUTHORITY'
-import hashlib, importlib.util, json, os, pathlib, re, stat, sys
+import base64, gzip, hashlib, importlib.util, io, json, os, pathlib, re, stat, sys
+module_image = sys.argv.pop()
 module_path = pathlib.Path(sys.argv.pop())
 try:
-    module_fd = os.open(module_path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(module_fd, "rb") as module_stream:
-        module_stat = os.fstat(module_stream.fileno())
-        if not stat.S_ISREG(module_stat.st_mode) or module_stat.st_size > 1024 * 1024:
-            raise ValueError("shared version module is not regular/bounded")
-        module_bytes = module_stream.read()
-    manifest_path = module_path.parent / "manifest.json"
-    if manifest_path.exists():
-        if manifest_path.is_symlink(): raise ValueError("shared version manifest is not regular")
-        manifest_raw = manifest_path.read_bytes()
-        generation_parts = module_path.parent.name.rsplit("-", 2)
-        if len(generation_parts) != 3 or hashlib.sha256(manifest_raw).hexdigest() != generation_parts[2]:
-            raise ValueError("shared version generation manifest differs")
-        manifest = json.loads(manifest_raw)
-        entries = [entry for entry in manifest["files"] if entry["path"] == "product_version.py"]
-        if len(entries) != 1 or entries[0]["sha256"] != hashlib.sha256(module_bytes).hexdigest() or entries[0]["size"] != len(module_bytes) or entries[0]["mode"] != 0o644:
-            raise ValueError("shared version module differs from manifest")
+    if module_image:
+        compressed = base64.b64decode(module_image, validate=True)
+        if base64.b64encode(compressed).decode("ascii") != module_image:
+            raise ValueError("embedded version module encoding is invalid")
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
+            module_bytes = stream.read(1024 * 1024 + 1)
+        if len(module_bytes) > 1024 * 1024:
+            raise ValueError("embedded version module is too large")
+    else:
+        module_fd = os.open(module_path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(module_fd, "rb") as module_stream:
+            module_stat = os.fstat(module_stream.fileno())
+            if not stat.S_ISREG(module_stat.st_mode) or module_stat.st_size > 1024 * 1024:
+                raise ValueError("shared version module is not regular/bounded")
+            module_bytes = module_stream.read()
+        manifest_path = module_path.parent / "manifest.json"
+        if manifest_path.exists():
+            if manifest_path.is_symlink(): raise ValueError("shared version manifest is not regular")
+            manifest_raw = manifest_path.read_bytes()
+            generation_parts = module_path.parent.name.rsplit("-", 2)
+            if len(generation_parts) != 3 or hashlib.sha256(manifest_raw).hexdigest() != generation_parts[2]:
+                raise ValueError("shared version generation manifest differs")
+            manifest = json.loads(manifest_raw)
+            entries = [entry for entry in manifest["files"] if entry["path"] == "product_version.py"]
+            if len(entries) != 1 or entries[0]["sha256"] != hashlib.sha256(module_bytes).hexdigest() or entries[0]["size"] != len(module_bytes) or entries[0]["mode"] != 0o644:
+                raise ValueError("shared version module differs from manifest")
     spec = importlib.util.spec_from_file_location("codex_info_update_version", module_path)
     if spec is None: raise ValueError("shared version module unavailable")
     version_authority = importlib.util.module_from_spec(spec)
@@ -362,7 +376,7 @@ def canonical_generation(value):
     return len(parts) == 3 and canonical_version(parts[0]) and re.fullmatch(r"[0-9a-f]{40}", parts[1]) is not None and re.fullmatch(r"[0-9a-f]{64}", parts[2]) is not None
 PY_VERSION_AUTHORITY
         cat
-    } | python3 -B - "$@" "$module"
+    } | python3 -B - "$@" "$module" "$RECOVERY_PRODUCT_VERSION_B64"
 }
 
 update_channel_record() {
@@ -945,7 +959,7 @@ if "~lc1~" in document["operation_id"]:
         raise SystemExit("legacy combined journal prestate is invalid")
 reader_image = document.get("legacy_reader_image", "")
 if staged_image:
-    if legacy is None or not isinstance(reader_image,str) or not reader_image or len(reader_image)>65536:
+    if legacy is None or not isinstance(reader_image,str) or not reader_image or len(reader_image)>98304:
         raise SystemExit("legacy reader image is invalid")
     compressed = base64.b64decode(reader_image, validate=True)
     if base64.b64encode(compressed).decode()!=reader_image: raise SystemExit("legacy reader encoding is invalid")
@@ -2140,13 +2154,18 @@ backup_legacy_path() {
         safe_blocked "legacy path owner is not trusted: $destination"
     local expected_mode
     case "$destination" in
+        "$incident_recorder_override_destination"|"$incident_rest_override_destination") expected_mode=600 ;;
         "$binary_destination"|"$recorder_binary_destination"|"$rest_binary_destination"|"$installer_destination") expected_mode=755 ;;
         *) expected_mode=644 ;;
     esac
     [[ "$(stat -c '%a' -- "$destination")" == "$expected_mode" ]] ||
         safe_blocked "legacy path mode is not trusted: $destination"
     local backup
-    backup="$backup_dir/$operation_id-$(basename -- "$destination")"
+    case "$destination" in
+        "$incident_recorder_override_destination") backup="$backup_dir/$operation_id-recorder-604-hotfix.conf" ;;
+        "$incident_rest_override_destination") backup="$backup_dir/$operation_id-rest-604-hotfix.conf" ;;
+        *) backup="$backup_dir/$operation_id-$(basename -- "$destination")" ;;
+    esac
     [[ ! -e "$backup" && ! -L "$backup" ]] || safe_blocked 'legacy backup collision'
     mkdir -p -- "$backup_dir"; chmod 700 -- "$backup_dir"
     python3 - "$destination" "$backup" <<'PY'
@@ -2219,18 +2238,31 @@ link_entrypoints() {
     atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.timer' "$update_timer_destination"
 }
 restore_backups() {
-    python3 - "$operation_id" "$backup_dir" "${legacy_recovery_reader_hash:-}" "$installer_destination" "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination" "$recorder_override_destination" <<'PY'
+    python3 - "$operation_id" "$backup_dir" "${legacy_recovery_reader_hash:-}" "$installer_destination" \
+        "$incident_recorder_override_destination" "$incident_rest_override_destination" \
+        "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" \
+        "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" \
+        "$rest_unit_destination" "$legacy_combined_unit_destination" "$update_service_destination" \
+        "$update_timer_destination" "$recorder_override_destination" "$incident_recorder_override_destination" \
+        "$incident_rest_override_destination" <<'PY'
 import os,sys
 from pathlib import Path
-operation,backup_root,reader_hash,installer,*destinations=sys.argv[1:]
+operation,backup_root,reader_hash,installer,incident_recorder,incident_rest,*destinations=sys.argv[1:]
 backup_root=Path(backup_root)
 for destination_name in reversed(destinations):
     if reader_hash and destination_name == installer: continue
     destination=Path(destination_name)
-    backup=backup_root / (operation + "-" + destination.name)
+    if destination_name == incident_recorder:
+        backup=backup_root / (operation + "-recorder-604-hotfix.conf")
+        expected=0o600
+    elif destination_name == incident_rest:
+        backup=backup_root / (operation + "-rest-604-hotfix.conf")
+        expected=0o600
+    else:
+        backup=backup_root / (operation + "-" + destination.name)
+        expected=0o755 if destination.name in {"codex_info","codex_info_recorder","codex_info_rest","codex-info-install.sh"} else 0o644
     if backup.exists() or backup.is_symlink():
         if destination.exists() or destination.is_symlink(): destination.unlink()
-        expected=0o755 if destination.name in {"codex_info","codex_info_recorder","codex_info_rest","codex-info-install.sh"} else 0o644
         if not backup.is_symlink() and (backup.stat().st_mode & 0o7777) != expected:
             raise SystemExit("legacy backup mode changed before restore")
         os.replace(backup,destination)
@@ -2487,8 +2519,259 @@ PY_RECORDER_PRESTATE
     mkdir -p -- "$backup_dir"; chmod 700 -- "$backup_dir"
     atomic_text "$backup_dir/$operation_id-recorder-override-prestate.json" 600 "$content"
 }
+incident_override_pair_receipt() {
+    printf '%s/%s-incident-override-pair-prestate.json\n' "$backup_dir" "$operation_id"
+}
+incident_override_pair_operation() {
+    local action="$1" generation="$2" receipt="$3"
+    local recorder_properties rest_properties recorder_active=0 rest_active=0 recorder_enabled=0 rest_enabled=0
+    local recorder_pid=0 rest_pid=0 listener_pid=
+    local pair_operation_id="${operation_id-}"
+    if [[ "$action" != inspect || -n "$receipt" ]]; then
+        [[ -n "$pair_operation_id" ]] || safe_blocked 'paired migration transaction identity is unavailable'
+    fi
+    if [[ "$action" == restore-state ]]; then
+        python3 - "$(incident_override_pair_receipt)" "$generation" "$pair_operation_id" <<'PY_INCIDENT_PAIR_STATE'
+import json, os, pathlib, stat, sys
+path=pathlib.Path(sys.argv[1])
+try:
+    metadata=path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600 or path.resolve(strict=True) != path:
+        raise ValueError("receipt owner/type/mode/path differs")
+    document=json.loads(path.read_text(encoding="utf-8"))
+except Exception as error:
+    raise SystemExit("SAFE_BLOCKED: incident override rollback receipt is unavailable: " + str(error))
+if not isinstance(document,dict) or document.get("schema") != "codex-info-incident-override-pair-v1" or document.get("operation_id") != sys.argv[3] or document.get("generation") != sys.argv[2]:
+    raise SystemExit("SAFE_BLOCKED: incident override rollback receipt identity differs")
+runtime=document.get("runtime")
+required={"recorder_active","recorder_enabled","rest_active","rest_enabled"}
+if not isinstance(runtime,dict) or set(runtime) != required or any(type(v) is not bool for v in runtime.values()):
+    raise SystemExit("SAFE_BLOCKED: incident override rollback intent is invalid")
+print(int(runtime["recorder_active"]), int(runtime["recorder_enabled"]), int(runtime["rest_active"]), int(runtime["rest_enabled"]), sep="\t")
+PY_INCIDENT_PAIR_STATE
+        return
+    fi
+    recorder_properties="$(systemctl_user show --property=ExecStart --property=FragmentPath --property=DropInPaths codex-info-recorder.service)" ||
+        safe_blocked 'recorder effective ExecStart cannot be inspected for paired migration'
+    rest_properties="$(systemctl_user show --property=ExecStart --property=FragmentPath --property=DropInPaths codex-info-rest.service)" ||
+        safe_blocked 'REST effective ExecStart cannot be inspected for paired migration'
+    probe_active codex-info-recorder.service && recorder_active=1 || true
+    probe_active codex-info-rest.service && rest_active=1 || true
+    probe_enabled codex-info-recorder.service && recorder_enabled=1 || true
+    probe_enabled codex-info-rest.service && rest_enabled=1 || true
+    if (( recorder_active )); then recorder_pid="$(recorder_systemd_pid)"; fi
+    if (( rest_active )); then
+        rest_pid="$(systemd_pid)"
+        listener_pid="$(socket_pid)" || safe_blocked 'REST listener ownership is ambiguous during paired migration'
+    fi
+    python3 - "$action" "$generation" "$receipt" "$pair_operation_id" \
+        "$incident_recorder_override_destination" "$incident_rest_override_destination" \
+        "$generations_dir/$generation" "$home_dir/.local/share/codex-info/incident-604-hotfix-20261018T1440JST/codex_info_recorder-v3" \
+        "$home_dir/.local/share/codex-info/incident-604-hotfix-20261018T1440JST/codex_info_rest" \
+        "$recorder_properties" "$rest_properties" "$recorder_pid" "$rest_pid" "$listener_pid" \
+        "$recorder_active" "$recorder_enabled" "$rest_active" "$rest_enabled" "$proc_root" "$backup_dir" <<'PY_INCIDENT_PAIR'
+import base64, hashlib, json, os, pathlib, re, stat, sys, tempfile
+(action, generation, receipt_name, operation, recorder_override_name, rest_override_name,
+ generation_dir_name, recorder_hotfix_name, rest_hotfix_name, recorder_properties, rest_properties,
+ recorder_pid, rest_pid, listener_pid, recorder_active, recorder_enabled, rest_active, rest_enabled,
+ proc_root_name, backup_root_name) = sys.argv[1:]
+
+def fail(reason):
+    raise SystemExit("SAFE_BLOCKED: incident override pair is unsupported; " + reason + "; both configurations preserved")
+
+def flag(value):
+    if value not in {"0", "1"}: fail("service state is ambiguous")
+    return value == "1"
+
+runtime={"recorder_active":flag(recorder_active), "recorder_enabled":flag(recorder_enabled),
+         "rest_active":flag(rest_active), "rest_enabled":flag(rest_enabled)}
+proc_root=pathlib.Path(proc_root_name)
+generation_dir=pathlib.Path(generation_dir_name)
+paths={"recorder":(pathlib.Path(recorder_override_name),pathlib.Path(recorder_hotfix_name),recorder_properties,recorder_pid,runtime["recorder_active"],""),
+       "rest":(pathlib.Path(rest_override_name),pathlib.Path(rest_hotfix_name),rest_properties,rest_pid,runtime["rest_active"]," --port 8787")}
+
+def pairs(items):
+    result={}
+    for key,value in items:
+        if key in result: raise ValueError("duplicate receipt key")
+        result[key]=value
+    return result
+
+receipt=None
+if receipt_name:
+    path=pathlib.Path(receipt_name)
+    try:
+        metadata=path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600 or path.resolve(strict=True) != path:
+            fail("rollback receipt owner/type/mode/path differs")
+        receipt=json.loads(path.read_text(encoding="utf-8"),object_pairs_hook=pairs)
+    except Exception as error: fail("rollback receipt is unavailable: " + str(error))
+    required={"schema","operation_id","generation","recorder","rest","runtime"}
+    if not isinstance(receipt,dict) or set(receipt) != required or receipt["schema"] != "codex-info-incident-override-pair-v1" or receipt["operation_id"] != operation or receipt["generation"] != generation:
+        fail("rollback receipt authority differs")
+    if not isinstance(receipt["runtime"],dict) or set(receipt["runtime"]) != set(runtime) or receipt["runtime"] != runtime or any(type(v) is not bool for v in runtime.values()):
+        fail("restored service active/enabled intent differs")
+
+def read_properties(raw):
+    result={}
+    for line in raw.splitlines():
+        key,separator,value=line.partition("=")
+        if not separator or key in result: fail("effective service properties are ambiguous")
+        result[key]=value
+    if set(result) != {"ExecStart","FragmentPath","DropInPaths"}: fail("effective service properties are incomplete")
+    return result
+
+def read_file(path, mode, label):
+    try: before=path.lstat(); data=path.read_bytes(); after=path.lstat()
+    except OSError as error: fail(label + " is unavailable: " + str(error))
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) != mode or path.resolve(strict=True) != path or
+        (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns) != (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns)):
+        fail(label + " owner/type/mode/path or stable-read identity differs")
+    return data
+
+def executable(path):
+    try: metadata=path.lstat(); data=path.read_bytes()
+    except OSError as error: fail("hotfix executable is unavailable: " + str(error))
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700 or path.resolve(strict=True) != path:
+        fail("hotfix executable owner/type/mode/path differs")
+    return {"path":str(path),"device":metadata.st_dev,"inode":metadata.st_ino,"mode":stat.S_IMODE(metadata.st_mode),"sha256":hashlib.sha256(data).hexdigest()}
+
+def process(service, path, pid_text, active, payload):
+    if not active:
+        if pid_text not in {"", "0"}: fail(service + " inactive state has a MainPID")
+        return None
+    if not re.fullmatch(r"[1-9][0-9]*",pid_text): fail(service + " active state has no MainPID")
+    directory=proc_root/pid_text
+    try:
+        actual=directory/"exe"; metadata=actual.stat()
+        if actual.resolve(strict=True) != path or (metadata.st_dev,metadata.st_ino) != (payload["device"],payload["inode"]): fail(service + " process executable identity differs")
+        if hashlib.sha256(actual.read_bytes()).hexdigest() != payload["sha256"]: fail(service + " process executable digest differs")
+        argv=[part.decode("utf-8") for part in (directory/"cmdline").read_bytes().split(b"\0") if part]
+        expected=[str(path)]+(["--port","8787"] if service == "REST" else [])
+        if argv != expected: fail(service + " process arguments differ")
+        fields=(directory/"stat").read_text(encoding="utf-8").rsplit(") ",1)[1].split()
+        if len(fields)<20 or not fields[19].isdigit() or int(fields[19])<=0: fail(service + " process starttime is unavailable")
+        return {"pid":int(pid_text),"starttime":int(fields[19])}
+    except OSError as error: fail(service + " process identity is unavailable: " + str(error))
+
+if action == "remove-rest":
+    if receipt is None: fail("paired REST removal has no saved transaction receipt")
+    saved=receipt["recorder"]
+    keys={"override","override_b64","override_mode","override_sha256","executable"}
+    if not isinstance(saved,dict) or set(saved) != keys: fail("saved Recorder identity schema is invalid")
+    recorder_override=paths["recorder"][0]
+    if saved["override"] != str(recorder_override): fail("saved Recorder override path differs")
+    if recorder_override.exists() or recorder_override.is_symlink(): fail("Recorder override was not removed before REST removal")
+    try: saved_bytes=base64.b64decode(saved["override_b64"],validate=True)
+    except Exception: fail("saved Recorder configuration bytes are invalid")
+    if (base64.b64encode(saved_bytes).decode()!=saved["override_b64"] or saved["override_mode"]!=0o600 or
+        saved["override_sha256"]!=hashlib.sha256(saved_bytes).hexdigest()):
+        fail("saved Recorder configuration identity is invalid")
+    recorder_backup=pathlib.Path(backup_root_name)/(operation+"-recorder-604-hotfix.conf")
+    backup_bytes=read_file(recorder_backup,0o600,"service-specific Recorder backup")
+    if backup_bytes != saved_bytes: fail("service-specific Recorder backup differs from saved prestate")
+
+observed={}
+for service,(override,hotfix,raw_properties,pid,active,suffix) in paths.items():
+    if action == "remove-rest" and service == "recorder": continue
+    props=read_properties(raw_properties)
+    fragment="codex-info-recorder.service" if service == "recorder" else "codex-info-rest.service"
+    try:
+        if pathlib.Path(props["FragmentPath"]).resolve(strict=True) != (generation_dir/fragment).resolve(strict=True): fail(service + " fragment is not the saved generation")
+    except OSError: fail(service + " service fragment is unavailable")
+    if props["DropInPaths"].split() != [str(override)]: fail(service + " has additional or different drop-ins")
+    match=re.fullmatch(r"\{\s*path=(.*?)\s*;\s*argv\[\]=(.*?)\s*;[^{}]*\}",props["ExecStart"])
+    if match is None or match.group(1) != str(hotfix) or match.group(2) != str(hotfix)+suffix: fail(service + " effective ExecStart differs")
+    data=read_file(override,0o600,service + " drop-in")
+    expected=("[Service]\nExecStart=\nExecStart="+str(hotfix)+suffix+"\n").encode()
+    if data != expected: fail(service + " drop-in contains unsupported settings")
+    payload=executable(hotfix)
+    if receipt is not None:
+        saved=receipt[service]
+        keys={"override","override_b64","override_mode","override_sha256","executable"}
+        if not isinstance(saved,dict) or set(saved) != keys: fail(service + " saved identity schema is invalid")
+        try: saved_bytes=base64.b64decode(saved["override_b64"],validate=True)
+        except Exception: fail(service + " saved configuration bytes are invalid")
+        if (base64.b64encode(saved_bytes).decode()!=saved["override_b64"] or saved["override"]!=str(override) or saved["override_mode"]!=0o600 or
+            saved["override_sha256"]!=hashlib.sha256(saved_bytes).hexdigest() or data!=saved_bytes or payload!=saved["executable"]):
+            fail(service + " restored configuration or hotfix identity differs from exact prestate")
+    current=process("RECORDER" if service=="recorder" else "REST",hotfix,pid,active,payload)
+    if service=="rest" and active and listener_pid!=pid: fail("REST service does not own the listener")
+    observed[service]={"override":str(override),"override_b64":base64.b64encode(data).decode(),"override_mode":0o600,
+                       "override_sha256":hashlib.sha256(data).hexdigest(),"executable":payload,"process":current}
+
+if action == "capture":
+    document={"schema":"codex-info-incident-override-pair-v1","operation_id":operation,"generation":generation,
+              "recorder":{k:v for k,v in observed["recorder"].items() if k in {"override","override_b64","override_mode","override_sha256","executable"}},
+              "rest":{k:v for k,v in observed["rest"].items() if k in {"override","override_b64","override_mode","override_sha256","executable"}},
+              "runtime":runtime}
+    print(json.dumps(document,separators=(",",":")))
+elif action == "snapshot":
+    root=pathlib.Path(backup_root_name)
+    if root.is_symlink() or not root.is_dir() or root.stat().st_uid!=os.getuid() or stat.S_IMODE(root.stat().st_mode)!=0o700: fail("backup directory owner/type/mode differs")
+    for service,name in (("recorder",operation+"-recorder-604-hotfix.conf"),("rest",operation+"-rest-604-hotfix.conf")):
+        destination=root/name
+        if destination.exists() or destination.is_symlink(): fail("service-specific backup already exists")
+        fd,temporary=tempfile.mkstemp(prefix=".incident-pair.",dir=root)
+        try:
+            with os.fdopen(fd,"wb") as output: output.write(base64.b64decode(receipt[service]["override_b64"],validate=True)); output.flush(); os.fsync(output.fileno())
+            os.chmod(temporary,0o600); os.replace(temporary,destination)
+            fd=os.open(root,os.O_DIRECTORY)
+            try: os.fsync(fd)
+            finally: os.close(fd)
+        finally:
+            try: os.unlink(temporary)
+            except FileNotFoundError: pass
+elif action in {"remove-recorder","remove-rest"}:
+    service=action.removeprefix("remove-")
+    path=pathlib.Path(receipt[service]["override"]); expected=base64.b64decode(receipt[service]["override_b64"],validate=True)
+    if path.is_symlink() or not path.is_file() or path.stat().st_uid!=os.getuid() or stat.S_IMODE(path.stat().st_mode)!=0o600 or path.read_bytes()!=expected:
+        fail(service + " configuration changed before removal")
+    path.unlink(); fd=os.open(path.parent,os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+elif action != "inspect":
+    fail("unknown paired migration action")
+elif receipt is not None:
+    print(receipt["recorder"]["executable"]["sha256"], receipt["rest"]["executable"]["sha256"], sep="\t")
+else:
+    print("ok")
+PY_INCIDENT_PAIR
+}
+capture_incident_override_pair_prestate() {
+    local generation="$1" content receipt
+    mkdir -p -- "$backup_dir"
+    [[ ! -L "$backup_dir" && "$(stat -c '%u' -- "$backup_dir")" == "$(id -u)" ]] || safe_blocked 'legacy backup directory owner/type differs'
+    chmod 700 -- "$backup_dir"
+    receipt="$(incident_override_pair_receipt)"
+    content="$(incident_override_pair_operation capture "$generation" "")" || safe_blocked 'paired incident prestate capture failed; configuration preserved'
+    atomic_text "$receipt" 600 "$content"
+    incident_override_pair_operation snapshot "$generation" "$receipt" >/dev/null || safe_blocked 'paired incident backups could not be made durable'
+}
+restore_incident_runtime_prestate() {
+    local state
+    state="$(incident_override_pair_operation restore-state "$previous_id" "")" || safe_blocked 'paired incident runtime intent is unavailable'
+    IFS=$'\t' read -r main_active main_enabled rest_active rest_enabled <<<"$state"
+}
 recorder_execution_record() {
     local generation="$1" properties info expected_hash
+    if [[ -e "$incident_recorder_override_destination" || -L "$incident_recorder_override_destination" ||
+          -e "$incident_rest_override_destination" || -L "$incident_rest_override_destination" ]]; then
+        local pair_record receipt=
+        declare -p rollback_incident_pair_receipt >/dev/null 2>&1 && receipt="$rollback_incident_pair_receipt" || true
+        if [[ -n "$receipt" ]]; then
+            pair_record="$(incident_override_pair_operation inspect "$generation" "$receipt")" || return 1
+            printf 'paired-restored\t%s\n' "$pair_record"
+            return
+        fi
+        (( migrate_recorder_override )) ||
+            safe_blocked 'incident Recorder and REST overrides require explicit --update --migrate-recorder-override; configuration preserved'
+        incident_override_pair_operation inspect "$generation" "" >/dev/null || return 1
+        printf 'INCIDENT_OVERRIDE_PAIR_MIGRATION: recorder=%s; rest=%s; service-specific rollback backups\n' \
+            "$incident_recorder_override_destination" "$incident_rest_override_destination" >&2
+        printf 'paired-selected\n'
+        return
+    fi
     [[ -e "$unit_destination" || -L "$unit_destination" ]] || { printf 'canonical\n'; return; }
     [[ -n "$generation" ]] || safe_blocked 'recorder ExecStart override has no product generation authority'
     properties="$(systemctl_user show --property=ExecStart --property=FragmentPath --property=DropInPaths codex-info-recorder.service)" ||
@@ -2582,15 +2865,17 @@ except (OSError, UnicodeError, ValueError, KeyError, TypeError): reject("overrid
 PY_RECORDER_EXECUTION
 }
 recorder_binary_identity_check() {
-    local pid="$1" generation="$2" execution info expected_hash actual_hash before after record restored_hash
+    local pid="$1" generation="$2" execution info expected_hash actual_hash before after record restored_hash restored_rest_hash
     record="$(recorder_execution_record "$generation")" || return 1
-    IFS=$'\t' read -r execution restored_hash <<<"$record"
+    IFS=$'\t' read -r execution restored_hash restored_rest_hash <<<"$record"
     [[ "$execution" == canonical || ( "$execution" == legacy && "${allow_legacy_recorder_override:-0}" == 1 ) ||
-       ( "$execution" == restored && "${allow_legacy_recorder_override:-0}" == 1 && -n "${rollback_recorder_receipt:-}" ) ]] ||
+       ( "$execution" == restored && "${allow_legacy_recorder_override:-0}" == 1 && -n "${rollback_recorder_receipt:-}" ) ||
+       ( "$execution" == paired-restored && "${allow_legacy_recorder_override:-0}" == 1 &&
+         -n "$restored_hash" && -n "$restored_rest_hash" && -n "$rollback_incident_pair_receipt" ) ]] ||
         safe_blocked 'recorder effective ExecStart remains pinned by a product override'
     info="$(manifest_record "$generations_dir/$generation/manifest.json")" || return 1
     IFS=$'\t' read -r _ _ _ expected_hash <<<"$info"
-    if [[ "$execution" == restored ]]; then expected_hash="$restored_hash"; fi
+    if [[ "$execution" == restored || "$execution" == paired-restored ]]; then expected_hash="$restored_hash"; fi
     [[ "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || safe_blocked 'recorder verification digest is invalid'
     before="$(proc_starttime "$pid" 2>/dev/null || true)"
     [[ -n "$before" && "$(recorder_systemd_pid)" == "$pid" ]] || safe_blocked 'recorder MainPID/starttime is unavailable'
@@ -2688,7 +2973,13 @@ proc_identity_check() {
 health_readback() {
     local pid="$1" before="$2" version="$3" source="$4" manifest_hash="$5" binary_hash="$6" response details after after_pid expected_exe health_limit health_now health_remaining readback_deadline current_status current_version
     expected_exe="$generations_dir/$version-$source-$manifest_hash/codex_info_rest"
-    proc_identity_check "$pid" "$binary_hash" "$expected_exe"
+    if [[ -n "${rollback_incident_pair_receipt:-}" ]]; then
+        incident_override_pair_operation inspect \
+            "$version-$source-$manifest_hash" \
+            "$rollback_incident_pair_receipt" >/dev/null || return 1
+    else
+        proc_identity_check "$pid" "$binary_hash" "$expected_exe" || return 1
+    fi
     health_now="$(now_unix)" || safe_blocked 'health clock is unavailable'
     readback_deadline=$((health_now + HEALTH_TIMEOUT))
     if (( readiness_deadline > 0 && readiness_deadline < readback_deadline )); then
@@ -2702,7 +2993,7 @@ health_readback() {
     [[ -n "$before" && "$after" == "$before" ]] || safe_blocked 'MainPID/starttime changed during health'
     after_pid="$(systemd_pid)"
     [[ "$after_pid" == "$pid" ]] || safe_blocked 'systemd MainPID changed during health'
-    python3 - "$response" "$version" "$source" "$manifest_hash" <<'PY'
+    python3 - "$response" "$version" "$source" "$manifest_hash" <<'PY' || return 1
 import json,sys
 def pairs(items):
     result={}
@@ -2772,11 +3063,17 @@ if sys.argv[1] == "v4":
             if model[key] is not None and (not uint(model[key]) or model[key] > model["total_tokens"]): raise SystemExit("current component is invalid")
         cost=model["estimated_cost"]
         if cost is not None and (not isinstance(cost,dict) or set(cost) != {"price_version","ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars"}): raise SystemExit("current price schema is invalid")
-' "$current_version" <<< "$details"
+' "$current_version" <<< "$details" || return 1
     local recorder_pid
     recorder_pid="$(recorder_systemd_pid)"; [[ "$recorder_pid" != 0 ]] || safe_blocked 'recorder service has no MainPID'
-    recorder_identity_check "$recorder_pid" "$version" "$source" "$manifest_hash"
-    proc_identity_check "$pid" "$binary_hash" "$expected_exe"
+    recorder_identity_check "$recorder_pid" "$version" "$source" "$manifest_hash" || return 1
+    if [[ -n "${rollback_incident_pair_receipt:-}" ]]; then
+        incident_override_pair_operation inspect \
+            "$version-$source-$manifest_hash" \
+            "$rollback_incident_pair_receipt" >/dev/null || return 1
+    else
+        proc_identity_check "$pid" "$binary_hash" "$expected_exe" || return 1
+    fi
 }
 verify_runtime() {
     verify_fixed_links
@@ -2799,7 +3096,7 @@ verify_runtime() {
     before="$(proc_starttime "$pid" 2>/dev/null || true)"; [[ -n "$before" ]] || safe_blocked 'MainPID starttime unavailable'
     recorder_pid="$(recorder_systemd_pid)"; [[ "$recorder_pid" != 0 ]] || safe_blocked 'recorder service has no MainPID'
     recorder_binary_identity_check "$recorder_pid" "$generation" || return 1
-    health_readback "$pid" "$before" "$version" "$source" "$manifest_hash" "$rest_hash"
+    health_readback "$pid" "$before" "$version" "$source" "$manifest_hash" "$rest_hash" || return 1
     printf 'ready version=%s source=%s generation=%s pid=%s\n' "$version" "$source" "$generation" "$pid"
 }
 verify_ui_source() {
@@ -2987,6 +3284,54 @@ capture_legacy_combined_state() {
 legacy_recovery_reader_source() {
     printf '%s\n' "$running_installer_source"
 }
+legacy_recovery_reader_build() {
+    local mode="$1" source
+    source="$(legacy_recovery_reader_source)"
+    version_python "$source" "$mode" "$legacy_recovery_reader_hash" <<'PY_RECOVERY_READER'
+import base64, gzip, hashlib, os, pathlib, stat, sys
+source_path = pathlib.Path(sys.argv[1])
+mode, expected_hash = sys.argv[2:]
+try:
+    source_stat = source_path.lstat()
+    if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_uid != os.getuid():
+        raise ValueError("legacy reader source is not owned regular bytes")
+    data = source_path.read_bytes()
+    if len(data) > 524288:
+        raise ValueError("legacy reader source is too large")
+    module_image = base64.b64encode(gzip.compress(module_bytes, mtime=0)).decode("ascii")
+    marker = b"RECOVERY_PRODUCT_VERSION_B64="
+    lines = data.splitlines(keepends=True)
+    matches = [index for index, line in enumerate(lines) if line.startswith(marker)]
+    if len(matches) != 1:
+        raise ValueError("recovery module field is missing or duplicated")
+    index = matches[0]
+    line = lines[index]
+    ending = b"\r\n" if line.endswith(b"\r\n") else b"\n" if line.endswith(b"\n") else b""
+    body = line[:-len(ending)] if ending else line
+    empty_field = marker + b"''"
+    embedded_field = marker + b"'" + module_image.encode("ascii") + b"'"
+    if body == empty_field:
+        lines[index] = embedded_field + ending
+        data = b"".join(lines)
+    elif body != embedded_field:
+        raise ValueError("embedded version module changed during recovery")
+    if len(data) > 524288:
+        raise ValueError("legacy reader source with module is too large")
+    if mode == "render":
+        sys.stdout.buffer.write(data)
+    elif mode == "image":
+        if hashlib.sha256(data).hexdigest() != expected_hash:
+            raise ValueError("legacy reader identity changed before staging")
+        image = base64.b64encode(gzip.compress(data, mtime=0)).decode("ascii")
+        if len(image) > 98304:
+            raise ValueError("legacy reader image is too large")
+        print(image)
+    else:
+        raise ValueError("legacy reader build mode is invalid")
+except (OSError, ValueError, gzip.BadGzipFile) as error:
+    raise SystemExit(str(error))
+PY_RECOVERY_READER
+}
 legacy_recovery_reader_valid() {
     local expected="${1:-$legacy_recovery_reader_hash}"
     [[ -n "$expected" && -f "$legacy_recovery_reader_destination" && ! -L "$legacy_recovery_reader_destination" &&
@@ -3004,7 +3349,7 @@ import base64, gzip, hashlib, io, os, pathlib, sys, tempfile
 source, destination = map(pathlib.Path, sys.argv[1:3])
 expected, previous, reader_image = sys.argv[3:]
 if reader_image:
-    if len(reader_image)>65536: raise SystemExit("recovery image is too large")
+    if len(reader_image)>98304: raise SystemExit("recovery image is too large")
     with gzip.GzipFile(fileobj=io.BytesIO(base64.b64decode(reader_image, validate=True))) as image:
         data = image.read(524289)
     if len(data)>524288: raise SystemExit("recovery image is too large")
@@ -3052,19 +3397,8 @@ stage_legacy_recovery_handoff() {
     [[ ! -e "$legacy_recovery_journal" && ! -L "$legacy_recovery_journal" ]] ||
         safe_blocked 'legacy reader handoff journal already exists'
     local legacy_recovery_reader_image
-    legacy_recovery_reader_image="$(python3 - "$(legacy_recovery_reader_source)" "$legacy_recovery_reader_hash" <<'PY'
-import base64, gzip, hashlib, os, pathlib, sys
-source = pathlib.Path(sys.argv[1])
-if not source.is_file() or source.is_symlink() or source.stat().st_uid!=os.getuid():
-    raise SystemExit("legacy reader source is not owned regular bytes")
-data = source.read_bytes()
-if len(data)>524288 or hashlib.sha256(data).hexdigest()!=sys.argv[2]:
-    raise SystemExit("legacy reader source identity changed")
-image = base64.b64encode(gzip.compress(data, mtime=0)).decode()
-if len(image)>65536: raise SystemExit("legacy reader image is too large")
-print(image)
-PY
-    )" || safe_blocked 'legacy reader image could not be preserved'
+    legacy_recovery_reader_image="$(legacy_recovery_reader_build image)" ||
+        safe_blocked 'legacy reader image could not be preserved'
     local transaction="$legacy_recovery_journal" CODEX_INFO_INTERRUPT_PHASE=
     write_journal prepared
 }
@@ -3172,6 +3506,8 @@ prepare_legacy_recovery_reader() {
     fi
     if [[ -e "$legacy_recovery_journal" || -L "$legacy_recovery_journal" ]]; then
         reader_image="$(legacy_recovery_reader_image)" || safe_blocked 'legacy reader image is unavailable'
+    else
+        reader_image="$(legacy_recovery_reader_build image)" || safe_blocked 'legacy reader image could not be rebuilt'
     fi
     atomic_recovery_copy "$(legacy_recovery_reader_source)" "$legacy_recovery_reader_destination" "$legacy_recovery_reader_hash" "$previous" "$reader_image" ||
         safe_blocked 'legacy recovery executable could not be preserved'
@@ -3237,8 +3573,8 @@ print(json.dumps({"generation": generation == "1", "enabled": enabled == "1",
                   "active": active == "1", "manifest_sha256": manifest_hash}))
 PY
     )" || safe_blocked 'legacy combined prestate could not be captured'
-    local source; source="$(legacy_recovery_reader_source)"
-    legacy_recovery_reader_hash="$(sha256sum -- "$source" | awk '{print $1}')" || safe_blocked 'running installer identity is unavailable'
+    legacy_recovery_reader_hash="$(legacy_recovery_reader_build render | sha256sum | awk '{print $1}')" ||
+        safe_blocked 'running installer identity is unavailable'
     [[ "$operation_id" =~ ^[A-Za-z0-9_-]{1,64}$ && "$legacy_recovery_reader_hash" =~ ^[0-9a-f]{64}$ ]] ||
         safe_blocked 'legacy recovery operation identity is invalid'
     local encoded_identity
@@ -3536,8 +3872,12 @@ rollback_transaction() {
     if [[ -n "$update_stage" ]]; then update_stage=rollback; update_log started "$reason"; fi
     local allow_legacy_recorder_override=1
     local rollback_recorder_receipt=
+    local rollback_incident_pair_receipt=
     if [[ -f "$backup_dir/$operation_id-recorder-override-prestate.json" ]]; then
         rollback_recorder_receipt="$backup_dir/$operation_id-recorder-override-prestate.json"
+    fi
+    if [[ -f "$(incident_override_pair_receipt)" ]]; then
+        rollback_incident_pair_receipt="$(incident_override_pair_receipt)"
     fi
     local overall_deadline="${install_deadline:-$operation_deadline}"
     rollback_now="$(now_unix)" || safe_blocked 'rollback clock is unavailable'
@@ -3564,12 +3904,12 @@ rollback_transaction() {
     else
         restore_runtime_state || ok=0
     fi
-    if ((ok)) && [[ "$desired_state" != running && "$main_active" == 1 ]]; then
+    if ((ok)) && [[ -z "$rollback_incident_pair_receipt" && "$desired_state" != running && "$main_active" == 1 ]]; then
         systemctl_stop_user stop --no-block codex-info-recorder.service >/dev/null 2>&1 || ok=0
         wait_inactive codex-info-recorder.service || ok=0
         main_active=0
     fi
-    if ((ok)) && [[ "$desired_state" != running && "$rest_active" == 1 ]]; then
+    if ((ok)) && [[ -z "$rollback_incident_pair_receipt" && "$desired_state" != running && "$rest_active" == 1 ]]; then
         systemctl_stop_user stop --no-block codex-info-rest.service >/dev/null 2>&1 || ok=0
         wait_inactive codex-info-rest.service || ok=0
         rest_active=0
@@ -3577,6 +3917,13 @@ rollback_transaction() {
     if ((ok)); then
         if (( previous_combined )); then
             verify_legacy_combined_terminal || ok=0
+        elif [[ -n "$rollback_incident_pair_receipt" ]]; then
+            if (( main_active && rest_active )); then
+                wait_runtime_ready || ok=0
+            else
+                incident_override_pair_operation inspect "$previous" \
+                    "$rollback_incident_pair_receipt" >/dev/null || ok=0
+            fi
         elif [[ -n "$previous" ]]; then
             if [[ "$desired_state" == running ]]; then
                 if ! ((main_active)); then
@@ -3628,6 +3975,7 @@ resume_transaction() {
     journal_owner_pid="$$"; journal_owner_starttime="$(owner_starttime)" || safe_blocked 'journal resume owner starttime is unavailable'; journal_boot_id="$(boot_id)"
     require_user_manager
     capture_runtime_state
+    if [[ -f "$(incident_override_pair_receipt)" ]]; then restore_incident_runtime_prestate; fi
     recover_legacy_combined_state
     if [[ -n "${legacy_recovery_reader_hash:-}" ]]; then prepare_legacy_recovery_reader; fi
     if [[ "$journal_phase" == current_switched || "$journal_phase" == activation_requested ]]; then
@@ -3741,6 +4089,7 @@ perform_install() {
     # listener-less flat installation with no recovery authority.
     # Preserve explicit prestate before prepared, so interruption there can restore it.
     if [[ "$recorder_execution" == selected ]]; then capture_recorder_override_prestate "$previous_id"; fi
+    if [[ "$recorder_execution" == paired-selected ]]; then capture_incident_override_pair_prestate "$previous_id"; fi
     if [[ -n "$legacy_recovery_reader_hash" ]]; then
         stage_legacy_recovery_handoff
         [[ "${CODEX_INFO_INTERRUPT_PHASE-}" != legacy_handoff_staged ]] || exit 75
@@ -3750,7 +4099,16 @@ perform_install() {
         promote_legacy_recovery_handoff
     fi
     write_journal prepared
-    if [[ "$recorder_execution" == legacy || "$recorder_execution" == selected ]]; then
+    if [[ "$recorder_execution" == paired-selected ]]; then
+        local pair_receipt
+        pair_receipt="$(incident_override_pair_receipt)"
+        incident_override_pair_operation remove-recorder "$previous_id" "$pair_receipt" >/dev/null || safe_blocked 'recorder incident override changed before paired migration'
+        write_journal prepared
+        [[ "$(printenv CODEX_INFO_INTERRUPT_PHASE 2>/dev/null || true)" != incident_recorder_backed_up ]] || exit 75
+        incident_override_pair_operation remove-rest "$previous_id" "$pair_receipt" >/dev/null || safe_blocked 'REST incident override changed before paired migration'
+        write_journal prepared
+        recorder_override_migrated=1
+    elif [[ "$recorder_execution" == legacy || "$recorder_execution" == selected ]]; then
         backup_legacy_path "$recorder_override_destination"
         recorder_override_migrated=1
         write_journal prepared
@@ -3833,17 +4191,26 @@ startup_local_generation_can_run() {
     printf '%s\n' "$current_id"
 }
 reconcile_recorder_override() {
-    local generation="$1" execution
+    local generation="$1" execution pair_receipt
     execution="$(recorder_execution_record "$generation")" || return 1
-    [[ "$execution" == legacy || "$execution" == selected ]] || return 0
+    [[ "$execution" == legacy || "$execution" == selected || "$execution" == paired-selected ]] || return 0
     previous_id="$generation"; candidate_id="$generation"; operation_id="$(new_operation_id)"
     previous_flat=0; previous_combined=0; recorder_reused=0
     journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""; legacy_combined_prestate=; legacy_recovery_reader_hash=
     capture_runtime_state
     reserve_rollback_budget
     if [[ "$execution" == selected ]]; then capture_recorder_override_prestate "$generation"; fi
+    if [[ "$execution" == paired-selected ]]; then capture_incident_override_pair_prestate "$generation"; fi
     write_journal prepared
-    backup_legacy_path "$recorder_override_destination"
+    if [[ "$execution" == paired-selected ]]; then
+        pair_receipt="$(incident_override_pair_receipt)"
+        incident_override_pair_operation remove-recorder "$generation" "$pair_receipt" >/dev/null || safe_blocked 'recorder incident override changed before paired migration'
+        write_journal prepared
+        [[ "$(printenv CODEX_INFO_INTERRUPT_PHASE 2>/dev/null || true)" != incident_recorder_backed_up ]] || exit 75
+        incident_override_pair_operation remove-rest "$generation" "$pair_receipt" >/dev/null || safe_blocked 'REST incident override changed before paired migration'
+    else
+        backup_legacy_path "$recorder_override_destination"
+    fi
     recorder_override_migrated=1
     write_journal current_switched
     if ! activate_candidate; then
@@ -3990,31 +4357,17 @@ run_update() {
     rm -r -- "$update_root"; update_root=; update_stage=complete; update_log succeeded; ((QUIET)) || printf 'updated from=%s to=%s\n' "$installed_version" "$newest"
 }
 select_release() {
-    local release="$1" current="$2" local_coherent="${3:-0}" channel="${4:-stable}" version_module
-    version_module="${running_installer_source%/*}/product_version.py"
-    # Direct source invocation has a fixed source-tree layout. Installed
-    # generations always use their own manifest-bound sibling, never a repo.
-    if [[ "${running_installer_source##*/}" == install_linux_bundle.sh &&
-          "${running_installer_source%/*}" == */packaging ]]; then
-        version_module="${running_installer_source%/*}/../scripts/product_version.py"
-    fi
-    python3 -B - "$release" "$current" "$local_coherent" "$TARGET" "$channel" "$version_module" <<'PY'
-import importlib.util,json,pathlib,re,sys
-release_path,current_text,local_coherent,target,channel,module_name=sys.argv[1:]
+    local release="$1" current="$2" local_coherent="${3:-0}" channel="${4:-stable}"
+    [[ -n "$local_coherent" ]] || local_coherent=0
+    [[ -n "$channel" ]] || channel=stable
+    version_python "$release" "$current" "$local_coherent" "$TARGET" "$channel" <<'PY'
+import json,pathlib,re,sys
+release_path,current_text,local_coherent,target,channel=sys.argv[1:]
 def reject(message): raise SystemExit("release metadata validation failed: "+message)
 if channel not in {"stable","beta"} or local_coherent not in {"0","1"}: reject("selection arguments invalid")
-module_path=pathlib.Path(module_name)
-if module_path.is_symlink() or not module_path.is_file(): reject("shared comparison module unavailable")
-try:
-    spec=importlib.util.spec_from_file_location("codex_info_product_version",module_path)
-    if spec is None or spec.loader is None: reject("shared comparison module unavailable")
-    product_version=importlib.util.module_from_spec(spec)
-    sys.modules[spec.name]=product_version
-    spec.loader.exec_module(product_version)
-except (OSError,ImportError,SyntaxError) as error: reject(str(error))
 def compare(left,right):
-    try: return product_version.compare_versions(left,right)
-    except product_version.ProductVersionError as error: reject(str(error))
+    try: return version_authority.compare_versions(left,right)
+    except version_authority.ProductVersionError as error: reject(str(error))
 compare(current_text,current_text)
 try: metadata=json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
 except (OSError,UnicodeError,json.JSONDecodeError) as error: reject(str(error))
@@ -4066,6 +4419,7 @@ print("update",newest_text,sep="\t")
 print(*archive,sep="\t")
 PY
 }
+
 download_asset() {
     local url="$1" destination="$2" digest="$3" download_limit
     download_limit=300

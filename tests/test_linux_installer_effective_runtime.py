@@ -6,9 +6,11 @@ Only an isolated HOME, fake proc tree and trusted fixture bundles are used.
 
 import hashlib
 import json
+import os
 import pathlib
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -79,16 +81,28 @@ if action == "show" and unit and any("ExecStart" in item or "DropInPaths" in ite
 if action in {"start", "restart"} and unit in {"codex-info-recorder.service", "codex-info-rest.service"}:
     _, _, command = execution()
     target = pathlib.Path(shlex.split(command)[0]).resolve(strict=True)
+    argv = shlex.split(command)
     pid = os.environ["FAKE_MAIN_PID"] if unit == "codex-info-recorder.service" else os.environ["FAKE_REST_PID"]
     executable = proc / pid / "exe"
+    executable.parent.mkdir(parents=True, exist_ok=True)
     if executable.is_symlink(): executable.unlink()
     executable.symlink_to(target)
+    (proc / pid / "cmdline").write_bytes(b"\0".join(item.encode() for item in argv) + b"\0")
+    manifest_path = target.parent / "manifest.json"
+    version = json.loads(manifest_path.read_text())["version"] if manifest_path.is_file() else ""
     if unit == "codex-info-rest.service":
-        manifest = json.loads((target.parent / "manifest.json").read_text())
-        os.environ["FAKE_HEALTH_VERSION"] = manifest["version"]
+        if manifest_path.is_file():
+            os.environ["FAKE_HEALTH_VERSION"] = version
     with pathlib.Path(os.environ["FAKE_EFFECTIVE_LOG"]).open("a") as stream:
         stream.write(json.dumps({"unit": unit, "command": command, "path": str(target)}) + "\n")
-raise SystemExit(subprocess.run(["/bin/bash", os.environ["FAKE_SYSTEMCTL_BASE"], *args], check=False).returncode)
+result = subprocess.run(["/bin/bash", os.environ["FAKE_SYSTEMCTL_BASE"], *args], check=False)
+if (result.returncode == 0 and action in {"start", "restart"} and unit == "codex-info-recorder.service" and
+        os.environ.get("FAKE_RECORDER_FAIL_READY_VERSION") == version):
+    history = pathlib.Path(os.environ["FAKE_RECORDER_REFRESH"])
+    (history / "recorder-state.json").write_text("{}\n")
+    marker = pathlib.Path(os.environ["FAKE_RECORDER_READINESS_MARKER"])
+    marker.write_text(json.dumps({"version": version, "injection": "recorder-readiness"}) + "\n")
+raise SystemExit(result.returncode)
 '''
 
 CURL_ADAPTER = r'''#!/usr/bin/python3
@@ -113,7 +127,10 @@ if url.endswith("/v1/details") and os.environ.get("FAKE_REJECT_LEGACY_DETAILS") 
     raise SystemExit(22)
 if "http://127.0.0.1:8787/v1/health" in args:
     target = (pathlib.Path(os.environ["HOME"]) / ".local/share/codex-info/current").resolve(strict=True)
-    os.environ["FAKE_HEALTH_VERSION"] = json.loads((target / "manifest.json").read_text())["version"]
+    version = json.loads((target / "manifest.json").read_text())["version"]
+    if os.environ.get("FAKE_HEALTH_FAIL_VERSION") == version:
+        raise SystemExit(22)
+    os.environ["FAKE_HEALTH_VERSION"] = version
 raise SystemExit(subprocess.run(["/bin/bash", os.environ["FAKE_CURL_BASE"], *args], check=False).returncode)
 '''
 
@@ -217,11 +234,13 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         path.write_text(json.dumps(value) + "\n")
         path.chmod(0o600)
 
-    def bundle(self, version, source, recorder_bytes=None):
+    def bundle(self, version, source, recorder_bytes=None, ui_bytes=None):
         for name in ("codex_info", "codex_info_recorder", "codex_info_rest"):
             path = self.payload / name
             if name == "codex_info_recorder" and recorder_bytes is not None:
                 path.write_bytes(recorder_bytes)
+            elif name == "codex_info" and ui_bytes is not None:
+                path.write_bytes(ui_bytes)
             else:
                 path.write_text(f"trusted fixture product {name} {version}\n")
             path.chmod(0o755)
@@ -233,8 +252,8 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         self.assertEqual(result.returncode, 0, "fixture bundle build failed:\n" + result.stderr)
         return self.root / f"output/codex-info-{version}-x86_64-unknown-linux-gnu.tar.gz"
 
-    def release(self, version, source, recorder_bytes=None, include_sidecars=True):
-        archive = self.bundle(version, source, recorder_bytes=recorder_bytes)
+    def release(self, version, source, recorder_bytes=None, include_sidecars=True, ui_bytes=None):
+        archive = self.bundle(version, source, recorder_bytes=recorder_bytes, ui_bytes=ui_bytes)
         paths = [archive]
         if include_sidecars:
             paths.extend((pathlib.Path(str(archive) + ".sha256"), archive.with_suffix("").with_suffix(".manifest.json")))
@@ -291,6 +310,158 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
     def preserved_profile(self):
         self.assertEqual(self.sentinel.read_bytes(), b"independent history preservation oracle\n")
         self.assertEqual(self.auth.read_bytes(), b"independent credential preservation oracle\n")
+
+    def incident_override_pair(self):
+        incident = self.home / ".local/share/codex-info/incident-604-hotfix-20261018T1440JST"
+        incident.mkdir(parents=True)
+        self.hotfix = incident / "codex_info_recorder-v3"
+        self.rest_hotfix = incident / "codex_info_rest"
+        self.hotfix.write_bytes(b"isolated issue 604 recorder hotfix fixture\n")
+        self.rest_hotfix.write_bytes(b"isolated issue 604 REST hotfix fixture\n")
+        self.hotfix.chmod(0o700)
+        self.rest_hotfix.chmod(0o700)
+
+        self.override = self.unit_dir / "codex-info-recorder.service.d/604-hotfix.conf"
+        self.rest_override = self.unit_dir / "codex-info-rest.service.d/604-hotfix.conf"
+        self.override.parent.mkdir(parents=True)
+        self.rest_override.parent.mkdir(parents=True)
+        self.override_bytes = ("[Service]\nExecStart=\nExecStart=" + str(self.hotfix) + "\n").encode()
+        self.rest_override_bytes = (
+            "[Service]\nExecStart=\nExecStart=" + str(self.rest_hotfix) + " --port 8787\n"
+        ).encode()
+        self.override.write_bytes(self.override_bytes)
+        self.rest_override.write_bytes(self.rest_override_bytes)
+        self.override.chmod(0o600)
+        self.rest_override.chmod(0o600)
+
+        for pid, target in ((RECORDER_PID, self.hotfix), (REST_PID, self.rest_hotfix)):
+            directory = self.proc / str(pid)
+            (directory / "fd").mkdir(parents=True)
+            fields = ["S", *("0" for _ in range(18)), "101"]
+            (directory / "stat").write_text(f"{pid} (issue-604-hotfix-fixture) " + " ".join(fields) + "\n")
+            (directory / "exe").symlink_to(target)
+            command = [str(target)] + (["--port", "8787"] if pid == REST_PID else [])
+            (directory / "cmdline").write_bytes(b"\0".join(part.encode() for part in command) + b"\0")
+        (self.proc / str(REST_PID) / "fd/3").symlink_to("socket:[599]")
+        socket = (
+            "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+            "  0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 599 1\n"
+        )
+        fields = socket.splitlines()[1].split()
+        self.assertEqual(fields[7], "1000")
+        self.assertEqual(fields[9], "599")
+        self.assertEqual(
+            os.readlink(self.proc / str(REST_PID) / "fd/3"),
+            "socket:[599]",
+        )
+        (self.proc / "net/tcp").write_text(socket)
+        self.env["FAKE_REST_SOCKET_NET_FILE"] = str(self.proc / "net/tcp")
+        self.env["FAKE_REST_SOCKET_CONTENT"] = socket
+        pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]).touch()
+        pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"]).touch()
+        self.control("running")
+        # Literal argv, fixed interpreter, test-owned adapter cwd, shell=False.
+        recorder = subprocess.run(  # nosec B603
+            [
+                "/usr/bin/python3", "systemctl", "--user", "restart", "--no-block",
+                "codex-info-recorder.service",
+            ],
+            cwd=self.bin, env=self.env, capture_output=True, text=True,
+            check=False, timeout=5, shell=False,
+        )
+        self.assertEqual(recorder.returncode, 0, recorder.stderr)
+        # Literal argv, fixed interpreter, test-owned adapter cwd, shell=False.
+        rest = subprocess.run(  # nosec B603
+            [
+                "/usr/bin/python3", "systemctl", "--user", "restart", "--no-block",
+                "codex-info-rest.service",
+            ],
+            cwd=self.bin, env=self.env, capture_output=True, text=True,
+            check=False, timeout=5, shell=False,
+        )
+        self.assertEqual(rest.returncode, 0, rest.stderr)
+
+    def incident_database(self):
+        db = self.home / ".local/share/codex-info/history/accounts/fixture-account/epoch-one/usage_history.sqlite3"
+        db.parent.mkdir(parents=True)
+        with sqlite3.connect(db) as connection:
+            connection.execute("CREATE TABLE preserved_usage (observed_at INTEGER NOT NULL, tokens INTEGER NOT NULL)")
+            connection.execute("INSERT INTO preserved_usage VALUES (1792478542, 123456)")
+            rows = connection.execute("SELECT observed_at, tokens FROM preserved_usage").fetchall()
+        return db, db.read_bytes(), rows
+
+    def incident_pair_prestate(self, db, db_bytes, rows):
+        enabled_paths = (
+            self.unit_dir / "default.target.wants/codex-info-recorder.service",
+            self.unit_dir / "default.target.wants/codex-info-rest.service",
+        )
+        process_state = {}
+        active_files = {
+            RECORDER_PID: pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]),
+            REST_PID: pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"]),
+        }
+        for pid, active_file in active_files.items():
+            if not active_file.is_file():
+                continue
+            directory = self.proc / str(pid)
+            executable = directory / "exe"
+            target = executable.resolve(strict=True)
+            metadata = target.stat()
+            process_state[pid] = {
+                "target": target,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "sha256": digest(target),
+                "cmdline": (directory / "cmdline").read_bytes(),
+            }
+        payload_state = {}
+        for path in (self.hotfix, self.rest_hotfix):
+            metadata = path.stat()
+            payload_state[path] = (metadata.st_dev, metadata.st_ino, digest(path), path.read_bytes())
+        return {
+            "generation": self.current().resolve(strict=True),
+            "recorder_override": (self.override.read_bytes(), self.override.stat().st_mode & 0o777),
+            "rest_override": (self.rest_override.read_bytes(), self.rest_override.stat().st_mode & 0o777),
+            "payloads": payload_state,
+            "processes": process_state,
+            "active": tuple(path.exists() for path in (
+                pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]), pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"])
+            )),
+            "enabled": tuple((path.is_symlink(), os.readlink(path) if path.is_symlink() else None) for path in enabled_paths),
+            "db": (db, db_bytes, rows),
+        }
+
+    def assert_incident_pair_prestate(self, before):
+        self.assertEqual(self.current().resolve(strict=True), before["generation"])
+        for path, expected in ((self.override, before["recorder_override"]), (self.rest_override, before["rest_override"])):
+            self.assertEqual((path.read_bytes(), path.stat().st_mode & 0o777), expected)
+        for path, expected in before["payloads"].items():
+            metadata = path.stat()
+            self.assertEqual((metadata.st_dev, metadata.st_ino, digest(path), path.read_bytes()), expected)
+        for pid, expected in before["processes"].items():
+            directory = self.proc / str(pid)
+            actual = directory / "exe"
+            metadata = actual.stat()
+            self.assertEqual(actual.resolve(strict=True), expected["target"])
+            self.assertEqual((metadata.st_dev, metadata.st_ino, digest(actual)), (
+                expected["device"], expected["inode"], expected["sha256"]
+            ))
+            self.assertEqual((directory / "cmdline").read_bytes(), expected["cmdline"])
+        active = tuple(path.exists() for path in (
+            pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]), pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"])
+        ))
+        self.assertEqual(active, before["active"])
+        enabled_paths = (
+            self.unit_dir / "default.target.wants/codex-info-recorder.service",
+            self.unit_dir / "default.target.wants/codex-info-rest.service",
+        )
+        enabled = tuple((path.is_symlink(), os.readlink(path) if path.is_symlink() else None) for path in enabled_paths)
+        self.assertEqual(enabled, before["enabled"])
+        db, db_bytes, rows = before["db"]
+        self.assertEqual(db.read_bytes(), db_bytes)
+        with sqlite3.connect(db) as connection:
+            self.assertEqual(connection.execute("SELECT observed_at, tokens FROM preserved_usage").fetchall(), rows)
+        self.preserved_profile()
 
     def test_regular_update_migrates_product_override_and_tracks_next_generation(self):
         self.active_override(owned=True)
@@ -537,6 +708,174 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         journal = json.loads((self.home / ".local/share/codex-info/install-transaction.json").read_text())
         self.assertEqual(journal["phase"], "committed", "rollback must finish its existing verification gate")
         self.preserved_profile()
+
+    def test_paired_override_migration_restores_ui_entrypoint(self):
+        self.incident_override_pair()
+        db, db_before, rows_before = self.incident_database()
+        before = self.incident_pair_prestate(db, db_before, rows_before)
+        self.release("1.0.20", "2" * 40, ui_bytes=b"#!/bin/sh\nprintf 'fixture UI payload reached\\n'\n")
+
+        launcher = self.home / ".local/bin/codex-info"
+        failed_ui = self.command(launcher, "--ui")
+        self.assertNotEqual(failed_ui.returncode, 0)
+        self.assertIn(
+            "incident Recorder and REST overrides require explicit "
+            "--update --migrate-recorder-override; configuration preserved",
+            failed_ui.stderr,
+        )
+        self.assertIn("E_UI_SOURCE_UNAVAILABLE", failed_ui.stderr)
+        self.assertEqual(self.override.read_bytes(), self.override_bytes)
+        self.assertEqual(self.rest_override.read_bytes(), self.rest_override_bytes)
+
+        migrated = self.command(INSTALLER, "--update", "--migrate-recorder-override")
+        self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+        generation = self.current().resolve(strict=True)
+        self.assertNotEqual(generation, before["generation"])
+        self.assertEqual((self.proc / str(RECORDER_PID) / "exe").resolve(strict=True), generation / "codex_info_recorder")
+        self.assertEqual((self.proc / str(REST_PID) / "exe").resolve(strict=True), generation / "codex_info_rest")
+        backups = self.home / ".local/share/codex-info/legacy-backups"
+        for service, override, original in (
+            ("recorder", self.override, self.override_bytes),
+            ("rest", self.rest_override, self.rest_override_bytes),
+        ):
+            self.assertFalse(override.exists())
+            saved = list(backups.glob(f"*-{service}-604-hotfix.conf"))
+            self.assertEqual(len(saved), 1)
+            self.assertEqual((saved[0].read_bytes(), saved[0].stat().st_mode & 0o777), (original, 0o600))
+
+        launched = self.command(launcher, "--ui")
+        self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
+        self.assertIn("fixture UI payload reached", launched.stdout)
+        self.assertEqual(db.read_bytes(), db_before)
+        with sqlite3.connect(db) as connection:
+            self.assertEqual(connection.execute("SELECT observed_at, tokens FROM preserved_usage").fetchall(), rows_before)
+
+    def test_paired_override_failures_restore_exact_prestate(self):
+        cases = (
+            ("recorder-start", "start", "codex-info-recorder.service"),
+            ("rest-start", "start", "codex-info-rest.service"),
+            ("recorder-readiness", "readiness", "recorder"),
+            ("rest-readiness", "readiness", "rest"),
+        )
+        for index, (name, failure, target) in enumerate(cases):
+            with self.subTest(failure=name):
+                if index:
+                    self.doCleanups()
+                    self.setUp()
+                self.incident_override_pair()
+                db, db_bytes, rows = self.incident_database()
+                before = self.incident_pair_prestate(db, db_bytes, rows)
+                self.release("1.0.20", "2" * 40)
+                if failure == "start":
+                    self.env["FAKE_FAIL_START_UNIT"] = target
+                    self.env["FAKE_FAIL_START_ONCE_FILE"] = str(self.root / f"{name}-once")
+                else:
+                    self.env["CODEX_INFO_DEADLINE"] = str(int(time.time()) + 75)
+                    if target == "recorder":
+                        self.env["FAKE_RECORDER_FAIL_READY_VERSION"] = "1.0.20"
+                        readiness_marker = self.root / "recorder-readiness-injection.json"
+                        self.env["FAKE_RECORDER_READINESS_MARKER"] = str(readiness_marker)
+                    else:
+                        self.env["FAKE_HEALTH_FAIL_VERSION"] = "1.0.20"
+                result = self.command(INSTALLER, "--update", "--migrate-recorder-override")
+                if failure == "readiness" and target == "recorder":
+                    self.assertEqual(
+                        json.loads(readiness_marker.read_text()),
+                        {"version": "1.0.20", "injection": "recorder-readiness"},
+                    )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("previous generation restored", result.stderr)
+                self.assert_incident_pair_prestate(before)
+                journal = json.loads((self.home / ".local/share/codex-info/install-transaction.json").read_text())
+                self.assertEqual(journal["phase"], "committed")
+
+    def test_paired_override_failure_preserves_inactive_recorder(self):
+        self.incident_override_pair()
+        pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]).unlink()
+        self.assertFalse(pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]).exists())
+        self.assertTrue(pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"]).is_file())
+        db, db_bytes, rows = self.incident_database()
+        before = self.incident_pair_prestate(db, db_bytes, rows)
+        self.assertEqual(before["active"], (False, True))
+        self.release("1.0.20", "2" * 40)
+        self.env["FAKE_FAIL_START_UNIT"] = "codex-info-rest.service"
+        fail_once = self.root / "inactive-recorder-rest-start-failed-once"
+        self.env["FAKE_FAIL_START_ONCE_FILE"] = str(fail_once)
+
+        result = self.command(INSTALLER, "--update", "--migrate-recorder-override")
+        self.assertTrue(fail_once.is_file(), "new-generation REST start failure injection did not fire")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_incident_pair_prestate(before)
+        self.assertIn("previous generation restored", result.stderr)
+        journal = json.loads((self.home / ".local/share/codex-info/install-transaction.json").read_text())
+        self.assertEqual(journal["phase"], "committed")
+
+    def test_paired_override_no_update_migrates_both_services(self):
+        self.incident_override_pair()
+        db, db_bytes, rows = self.incident_database()
+        before = self.incident_pair_prestate(db, db_bytes, rows)
+        self.release("1.0.19", "1" * 40)
+
+        result = self.command(INSTALLER, "--update", "--migrate-recorder-override")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        generation = self.current().resolve(strict=True)
+        self.assertEqual(generation, before["generation"])
+        self.assertEqual((self.proc / str(RECORDER_PID) / "exe").resolve(strict=True), generation / "codex_info_recorder")
+        self.assertEqual((self.proc / str(REST_PID) / "exe").resolve(strict=True), generation / "codex_info_rest")
+        self.assertFalse(self.override.exists())
+        self.assertFalse(self.rest_override.exists())
+        backups = self.home / ".local/share/codex-info/legacy-backups"
+        for service, expected in (("recorder", self.override_bytes), ("rest", self.rest_override_bytes)):
+            saved = list(backups.glob(f"*-{service}-604-hotfix.conf"))
+            self.assertEqual(len(saved), 1)
+            self.assertEqual((saved[0].read_bytes(), saved[0].stat().st_mode & 0o777), (expected, 0o600))
+        for path, expected in before["payloads"].items():
+            metadata = path.stat()
+            self.assertEqual((metadata.st_dev, metadata.st_ino, digest(path), path.read_bytes()), expected)
+        self.assertEqual(db.read_bytes(), db_bytes)
+        with sqlite3.connect(db) as connection:
+            self.assertEqual(connection.execute("SELECT observed_at, tokens FROM preserved_usage").fetchall(), rows)
+        self.preserved_profile()
+
+    def test_paired_override_rejects_unsupported_rest_before_mutation(self):
+        self.incident_override_pair()
+        self.rest_override.write_bytes(self.rest_override_bytes + b"Environment=USER_SETTING=preserve\n")
+        self.rest_override.chmod(0o600)
+        db, db_bytes, rows = self.incident_database()
+        before = self.incident_pair_prestate(db, db_bytes, rows)
+        self.release("1.0.20", "2" * 40)
+        journal_path = self.home / ".local/share/codex-info/install-transaction.json"
+        journal_before = journal_path.read_bytes()
+        commands_before = pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"]).read_bytes()
+
+        result = self.command(INSTALLER, "--update", "--migrate-recorder-override")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rest drop-in contains unsupported settings", result.stderr)
+        self.assert_incident_pair_prestate(before)
+        self.assertEqual(journal_path.read_bytes(), journal_before)
+        self.assertEqual(pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"]).read_bytes(), commands_before)
+
+    def test_paired_override_interrupted_backup_restores_both(self):
+        self.incident_override_pair()
+        db, db_bytes, rows = self.incident_database()
+        before = self.incident_pair_prestate(db, db_bytes, rows)
+        self.release("1.0.20", "2" * 40)
+        self.env["CODEX_INFO_INTERRUPT_PHASE"] = "incident_recorder_backed_up"
+
+        interrupted = self.command(INSTALLER, "--update", "--migrate-recorder-override")
+        self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout + interrupted.stderr)
+        self.assertFalse(self.override.exists())
+        self.assertTrue(self.rest_override.exists())
+        journal = json.loads((self.home / ".local/share/codex-info/install-transaction.json").read_text())
+        self.assertEqual(journal["phase"], "prepared")
+        self.env.pop("CODEX_INFO_INTERRUPT_PHASE")
+
+        resumed = self.command(INSTALLER, "--update")
+        self.assertNotEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn("explicit --update --migrate-recorder-override", resumed.stderr)
+        self.assert_incident_pair_prestate(before)
+        journal = json.loads((self.home / ".local/share/codex-info/install-transaction.json").read_text())
+        self.assertEqual(journal["phase"], "committed")
 
     def test_explicit_migration_preserves_mixed_or_unsafe_dropin(self):
         for index, kind in enumerate(("mixed", "unsafe_mode")):
