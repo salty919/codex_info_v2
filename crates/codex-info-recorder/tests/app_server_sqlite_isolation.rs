@@ -98,7 +98,7 @@ impl QuotaJournalFixture {
         let calls = root.path().join("calls");
         let server = root.path().join("server.py");
         fs::write(&server, r#"#!/usr/bin/env python3
-import json, os, sys, time
+import json, os, select, sys, time
 quota_read = False
 for line in sys.stdin:
     req = json.loads(line)
@@ -116,7 +116,16 @@ for line in sys.stdin:
         with open(calls, 'a') as f:
             f.write(str(count) + '\n')
         if count >= int(os.environ['QUOTA_FIXTURE_RESPONSES']):
-            time.sleep(30)
+            # Keep withholding the response, but stop when the fixture owner
+            # closes its input pipe instead of leaving an orphan until timeout.
+            deadline = time.monotonic() + 30
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readable, _, _ = select.select([sys.stdin], [], [], remaining)
+                if not readable or not os.read(sys.stdin.fileno(), 4096):
+                    break
             break
         with open(os.environ['QUOTA_FIXTURE_PAYLOAD']) as f:
             result = json.load(f)
