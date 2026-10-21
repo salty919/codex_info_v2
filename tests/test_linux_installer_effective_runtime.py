@@ -360,7 +360,8 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         pathlib.Path(self.env["FAKE_MAIN_ACTIVE_FILE"]).touch()
         pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"]).touch()
         self.control("running")
-        recorder = subprocess.run(
+        # Literal argv, fixed interpreter, test-owned adapter cwd, shell=False.
+        recorder = subprocess.run(  # nosec B603
             [
                 "/usr/bin/python3", "systemctl", "--user", "restart", "--no-block",
                 "codex-info-recorder.service",
@@ -369,7 +370,8 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
             check=False, timeout=5, shell=False,
         )
         self.assertEqual(recorder.returncode, 0, recorder.stderr)
-        rest = subprocess.run(
+        # Literal argv, fixed interpreter, test-owned adapter cwd, shell=False.
+        rest = subprocess.run(  # nosec B603
             [
                 "/usr/bin/python3", "systemctl", "--user", "restart", "--no-block",
                 "codex-info-rest.service",
