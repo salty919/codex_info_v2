@@ -44,6 +44,9 @@ FUNCTIONS = (
 )
 
 MODEL = r"""
+# This fixture stages an ordinary published candidate. Full-source
+# effective/archive tests own local-recovery manifest and receipt validation.
+manifest_is_local_recovery() { return 1; }
 update_stage=
 operation_id=
 previous_id=

@@ -30,6 +30,9 @@ cat > "$HOME_FIXTURE/.local/share/codex-info/current/codex_info" <<'FAKE_PAYLOAD
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'payload %s\n' "$*" >> "$FAKE_LAUNCHER_LOG"
+if [[ "${1:-}" == --ui ]]; then
+    printf 'READY\n' > "$CODEX_INFO_UI_STARTUP_FIFO"
+fi
 if [[ "${1:-}" == --help ]]; then
     [[ "${CODEX_INFO_LAUNCHER_HELP:-}" == 1 ]] || exit 3
     printf '%s\n' '--start --ui --stop --disable-autostart --remove --status --update --help'
