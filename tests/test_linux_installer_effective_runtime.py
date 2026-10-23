@@ -326,8 +326,9 @@ with open(root / "ui-exit-permission", "rb") as permission: permission.read(1)
 
     def test_issue669_installed_ui_returns_after_ready_and_keeps_ui_alive(self):
         self.ui_startup_fixture()
-        launcher = subprocess.Popen(  # noqa: S603 -- installed fixture launcher and isolated HOME.  # nosec B603
-            ["/bin/bash", str(self.home / ".local/bin/codex-info"), "--ui"],
+        launcher = subprocess.Popen(  # installed fixture launcher in isolated HOME.  # nosec B603
+            ["/bin/bash", ".local/bin/codex-info", "--ui"],
+            cwd=self.home,
             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:
