@@ -65,6 +65,7 @@ recorder_override_migrated=0
 migrate_recorder_override=0
 rollback_recorder_receipt=
 transaction_recovered=0
+preserved_local_timer_state=
 operation_deadline=0
 install_deadline=
 readiness_deadline=0
@@ -363,9 +364,41 @@ def canonical_version(value):
     try: return version_authority.compare_versions(value, value) == 0
     except version_authority.ProductVersionError: return False
 
+def canonical_manifest_producer(document):
+    producer = document.get("run_id")
+    if not isinstance(producer, str): return False
+    if re.fullmatch(r"[1-9][0-9]*", producer): return True
+    match = re.fullmatch(r"local-([0-9a-f]{64})", producer)
+    if match is None: return False
+    # Local recovery uses the existing exact-file transaction, but never
+    # impersonates an Actions run. The producer names a manifested receipt.
+    entries = document.get("files")
+    if not isinstance(entries, list): return False
+    proofs = [entry for entry in entries if isinstance(entry, dict) and entry.get("path") == "LOCAL_RECOVERY.json"]
+    return (len(proofs) == 1 and proofs[0].get("sha256") == match[1]
+            and type(proofs[0].get("size")) is int and 0 < proofs[0]["size"] <= 1048576
+            and proofs[0].get("mode") == 0o644)
+
+def local_recovery_receipt_valid(document, raw):
+    if not str(document.get("run_id", "")).startswith("local-"): return True
+    if not canonical_manifest_producer(document) or len(raw) > 1048576: return False
+    if document["run_id"] != "local-" + hashlib.sha256(raw).hexdigest(): return False
+    def unique(items):
+        result = {}
+        for key, value in items:
+            if key in result: raise ValueError("duplicate local recovery key")
+            result[key] = value
+        return result
+    try: receipt = json.loads(raw, object_pairs_hook=unique)
+    except (ValueError, UnicodeError): return False
+    return (isinstance(receipt, dict) and receipt.get("kind") == "local-recovery"
+            and receipt.get("base_source_sha") == document.get("source_sha")
+            and isinstance(receipt.get("source_diff_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", receipt["source_diff_sha256"]) is not None)
+
 def canonical_manifest_version(document):
     value = document.get("version")
-    if not canonical_version(value): return False
+    if not canonical_version(value) or not canonical_manifest_producer(document): return False
     if "-beta." not in value: return True
     attempt = document.get("run_attempt")
     return isinstance(attempt, int) and not isinstance(attempt, bool) and attempt > 0 and str(attempt) == value.rsplit(".", 1)[1]
@@ -724,7 +757,7 @@ converge_enable_links() {
         running|stopped)
             enable_managed_unit codex-info-recorder.service &&
                 enable_managed_unit codex-info-rest.service &&
-                enable_managed_unit codex-info-update.timer
+                { [[ "$preserved_local_timer_state" == disabled ]] || enable_managed_unit codex-info-update.timer; }
             ;;
         disabled|removed)
             disable_managed_unit codex-info-recorder.service &&
@@ -1319,7 +1352,7 @@ if document["schema"] != schema or document["product"] != product or document["t
 if (not isinstance(document["version"], str) or
         not canonical_manifest_version(document) or
         not isinstance(document["source_sha"], str) or not re.fullmatch(r"[0-9a-f]{40}", document["source_sha"]) or
-        not isinstance(document["run_id"], str) or not re.fullmatch(r"[1-9][0-9]*", document["run_id"]) or
+        not canonical_manifest_producer(document) or
         isinstance(document["run_attempt"], bool) or not isinstance(document["run_attempt"], int) or document["run_attempt"] < 1):
     raise SystemExit("generation version identity is invalid")
 if not isinstance(document["glibc_minimum"], str) or not re.fullmatch(r"[0-9]+(?:[.][0-9]+)+", document["glibc_minimum"]):
@@ -1360,6 +1393,7 @@ for entry in entries:
     if mode != expected_mode or path.stat().st_size != entry["size"]: raise SystemExit("generation mode or size differs")
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     if digest != entry["sha256"]: raise SystemExit("generation digest differs")
+    if entry["path"] == "LOCAL_RECOVERY.json" and not local_recovery_receipt_valid(document, path.read_bytes()): raise SystemExit("local recovery receipt differs")
 sum_path = root / "SHA256SUMS"
 if sum_path.stat().st_uid != os.getuid() or stat.S_IMODE(sum_path.stat().st_mode) != 0o644: raise SystemExit("generation checksum owner or mode differs")
 records = {}
@@ -1513,7 +1547,7 @@ def validate_generation(name, root_fd):
                 canonical_manifest_version(document) and
                 isinstance(document["source_sha"], str) and re.fullmatch(r"[0-9a-f]{40}", document["source_sha"]) is not None,
                 "generation version identity differs")
-        require(isinstance(document["run_id"], str) and re.fullmatch(r"[1-9][0-9]*", document["run_id"]) is not None and
+        require(canonical_manifest_producer(document) and
                 type(document["run_attempt"]) is int and document["run_attempt"] > 0,
                 "generation workflow identity differs")
         require(isinstance(document["glibc_minimum"], str) and
@@ -1579,6 +1613,8 @@ def validate_generation(name, root_fd):
                         entry = expected[child_path]
                         require(len(data) == entry["size"] and hashlib.sha256(data).hexdigest() == entry["sha256"],
                                 "generation payload digest differs")
+                        if child_path == "LOCAL_RECOVERY.json":
+                            require(local_recovery_receipt_valid(document, data), "local recovery receipt differs")
         walk(generation_fd, "")
         require(seen_files == expected_files and seen_dirs.keys() == expected_dirs | {""},
                 "generation member set differs")
@@ -1858,9 +1894,19 @@ PY
     generation_prune_failed 'verified obsolete generation cleanup did not complete'
     return 1
 }
+verify_update_timer_registration() {
+    # Disabling a linked systemd unit can remove its registration as well as
+    # its wants link. The manifested timer payload remains verified separately.
+    if [[ ! -e "$update_timer_destination" && ! -L "$update_timer_destination" ]]; then
+        ! probe_enabled codex-info-update.timer && ! probe_active codex-info-update.timer
+        return
+    fi
+    [[ -L "$update_timer_destination" &&
+       "$(readlink -- "$update_timer_destination")" == '../../../.local/share/codex-info/current/codex-info-update.timer' ]]
+}
 verify_fixed_links() {
     local destination expected
-    for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination"; do
         [[ -L "$destination" ]] || safe_blocked "fixed link missing: $destination"
     done
     [[ "$(readlink -- "$binary_destination")" == '../share/codex-info/current/codex_info' ]] || safe_blocked 'UI binary link is not canonical'
@@ -1869,14 +1915,15 @@ verify_fixed_links() {
     [[ "$(readlink -- "$launcher_destination")" == '../share/codex-info/current/run.sh' ]] || safe_blocked 'launcher link is not canonical'
     [[ "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' ]] || safe_blocked 'installer link is not canonical'
     [[ "$(readlink -- "$manifest_destination")" == 'current/manifest.json' ]] || safe_blocked 'manifest link is not canonical'
-    for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination"; do
         expected="../../../.local/share/codex-info/current/$(basename -- "$destination")"
         [[ "$(readlink -- "$destination")" == "$expected" ]] || safe_blocked "unit link is not canonical"
     done
+    verify_update_timer_registration || safe_blocked 'update timer registration is not canonical or disabled'
 }
 verify_fixed_links_local() {
     local destination expected
-    for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination"; do
         [[ -L "$destination" ]] || return 1
     done
     [[ "$(readlink -- "$binary_destination")" == '../share/codex-info/current/codex_info' ]] || return 1
@@ -1885,10 +1932,11 @@ verify_fixed_links_local() {
     [[ "$(readlink -- "$launcher_destination")" == '../share/codex-info/current/run.sh' ]] || return 1
     [[ "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' ]] || return 1
     [[ "$(readlink -- "$manifest_destination")" == 'current/manifest.json' ]] || return 1
-    for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination"; do
         expected="../../../.local/share/codex-info/current/$(basename -- "$destination")"
         [[ "$(readlink -- "$destination")" == "$expected" ]] || return 1
     done
+    verify_update_timer_registration
 }
 verify_local_generation() {
     [[ -L "$current_link" ]] || return 1
@@ -1960,7 +2008,7 @@ validate_bundle() {
     if (( operation_deadline > 0 )); then
         validation_limit="$(deadline_timeout "$VALIDATE_TIMEOUT")" || return 1
     fi
-    python3 - "$archive" "$external" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" "$validation_limit" "$destination" "$checksum" "$release_digest" <<'PY'
+    version_python "$archive" "$external" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" "$validation_limit" "$destination" "$checksum" "$release_digest" <<'PY'
 import hashlib,json,os,pathlib,re,signal,stat,sys,tarfile,tempfile
 archive_name,manifest_name,schema,product,target,compatibility,timeout_seconds,destination_name,checksum_name,release_digest=sys.argv[1:]
 def reject(message): raise SystemExit("candidate staging failed: "+message)
@@ -1997,7 +2045,9 @@ def stage():
     if not re.fullmatch(stable_pattern,version) and beta_version is None: reject("version")
     if pathlib.Path(archive_name).name!=f"codex-info-{manifest['version']}-{target}.tar.gz": reject("archive name")
     if not isinstance(manifest["source_sha"],str) or not re.fullmatch(r"[0-9a-f]{40}",manifest["source_sha"]): reject("source")
-    if not isinstance(manifest["run_id"],str) or not re.fullmatch(r"[1-9][0-9]*",manifest["run_id"]): reject("run id")
+    if not canonical_manifest_producer(manifest): reject("run id")
+    if release_digest and manifest["run_id"].startswith("local-"):
+        reject("local recovery is not a published Release producer")
     if isinstance(manifest["run_attempt"],bool) or not isinstance(manifest["run_attempt"],int) or manifest["run_attempt"]<1: reject("run attempt")
     if beta_version is not None and beta_version["attempt"]!=str(manifest["run_attempt"]): reject("beta version run attempt differs")
     if manifest["target"]!=target or manifest["compatibility"]!=compatibility: reject("target")
@@ -2088,6 +2138,8 @@ def stage():
                     try: os.unlink(temporary)
                     except FileNotFoundError: pass
         if identity(os.fstat(source.fileno()))!=identity(before) or identity(os.lstat(archive_name))!=identity(before): reject("archive changed during staging")
+    if manifest["run_id"].startswith("local-") and not local_recovery_receipt_valid(manifest, (destination / "LOCAL_RECOVERY.json").read_bytes()):
+        reject("local recovery receipt differs")
     stage_fd=os.open(destination,os.O_DIRECTORY)
     try: os.fsync(stage_fd)
     finally: os.close(stage_fd)
@@ -3036,10 +3088,11 @@ def pairs(items):
 try: document=json.load(sys.stdin,object_pairs_hook=pairs)
 except Exception as error: raise SystemExit(str(error))
 if not isinstance(document,dict): raise SystemExit("details is not an object")
-if document.get("state") not in {"ready","auth_required"}:
+allowed_states={"ready","auth_required","error"} if sys.argv[1] == "v4" else {"ready","auth_required"}
+if document.get("state") not in allowed_states:
     raise SystemExit("details state is unknown")
 observed_at=document.get("observed_at")
-if not (sys.argv[1] == "v4" and document["state"] == "auth_required" and observed_at is None) and (isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0):
+if not (sys.argv[1] == "v4" and document["state"] in {"auth_required","error"} and observed_at is None) and (isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0):
     raise SystemExit("details observed_at is invalid")
 if sys.argv[1] == "v4":
     required={"api_version","state","observed_at","authenticated","plan_label","quota","models_status","models","active_thread_count","open_session_thread_count"}
@@ -3171,6 +3224,15 @@ verify_legacy_terminal() {
     fi
 }
 rearm_update_timer() {
+    if [[ -n "$preserved_local_timer_state" ]]; then
+        ! probe_active codex-info-update.timer || return 1
+        if [[ "$preserved_local_timer_state" == disabled ]]; then
+            ! probe_enabled codex-info-update.timer
+        else
+            probe_enabled codex-info-update.timer
+        fi
+        return
+    fi
     if probe_active codex-info-update.timer; then
         systemctl_stop_user stop --no-block codex-info-update.timer >/dev/null 2>&1 || return 1
         wait_inactive codex-info-update.timer || return 1
@@ -3235,8 +3297,16 @@ verify_nonrunning_terminal() {
         stopped)
             probe_enabled codex-info-recorder.service || return 1
             probe_enabled codex-info-rest.service || return 1
-            probe_enabled codex-info-update.timer || return 1
-            probe_active codex-info-update.timer || return 1
+            if [[ "$preserved_local_timer_state" == disabled ]]; then
+                ! probe_enabled codex-info-update.timer || return 1
+            else
+                probe_enabled codex-info-update.timer || return 1
+            fi
+            if ! probe_active codex-info-update.timer; then
+                if [[ -z "$preserved_local_timer_state" ]]; then
+                    manifest_is_local_recovery "$manifest_destination" || return 1
+                fi
+            fi
             ;;
         disabled)
             probe_enabled codex-info-recorder.service && return 1
@@ -3957,6 +4027,14 @@ rollback_transaction() {
     ((ok)) || safe_blocked "rollback could not be verified within $ROLLBACK_TIMEOUT seconds"
     update_log succeeded "$reason"
 }
+manifest_is_local_recovery() {
+    # Callers first validate the full generation or incoming bundle. This is
+    # only a producer classification, never a substitute for that validation.
+    version_python "$1" <<'PY'
+document = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+raise SystemExit(0 if str(document.get("run_id", "")).startswith("local-") else 1)
+PY
+}
 resume_transaction() {
     if [[ -e "${legacy_recovery_journal:-}" || -L "${legacy_recovery_journal:-}" ]]; then
         recover_legacy_reader_handoff
@@ -4042,6 +4120,7 @@ verify_candidate() {
 }
 perform_install() {
     local validation bundle_version source_hash manifest_hash binary_hash recorder_execution=canonical
+    local preserved_local_timer_state=
     local install_deadline="$operation_deadline"
     local operation_deadline="$operation_deadline"
     local release_digest=
@@ -4082,6 +4161,11 @@ perform_install() {
         previous_flat=1
     fi
     capture_runtime_state
+    if [[ "$timer_active" == 0 ]] &&
+        manifest_is_local_recovery "$candidate_stage/manifest.json"; then
+        if [[ "$timer_enabled" == 1 ]]; then preserved_local_timer_state=paused
+        else preserved_local_timer_state=disabled; fi
+    fi
     local managed_pid=0; probe_active codex-info-rest.service && managed_pid="$(systemd_pid)" || true
     reserve_rollback_budget
     # The durable pre-state marker must exist before the first stop or TERM.
@@ -4518,11 +4602,29 @@ fi
 
 if [[ "$ACTION" == start ]]; then
     load_control_state; require_user_manager
+    start_local_recovery=0
+    if [[ -L "$current_link" ]] && manifest_is_local_recovery "$manifest_destination"; then
+        verify_local_generation || safe_blocked 'local recovery generation is incoherent before start'
+        start_generation="$(current_generation)"
+        [[ "$(recorder_execution_record "$start_generation")" == canonical ]] ||
+            safe_blocked 'local recovery recorder execution is not canonical'
+        preflight_listener_owner
+        if ! probe_active codex-info-update.timer; then
+            if probe_enabled codex-info-update.timer; then preserved_local_timer_state=paused
+            else preserved_local_timer_state=disabled; fi
+        fi
+        start_local_recovery=1
+    fi
     # An explicit start supersedes a same-boot --stop intent.  Persist this
     # desired-state transition before resolving so the shared installer keeps
     # the service running even when the resolver selects an equal generation.
     write_control_state running
-    run_update
+    desired_state=running
+    if (( start_local_recovery )); then
+        repair_known_managed_runtime
+    else
+        run_update
+    fi
     enable_managed_unit codex-info-recorder.service || safe_blocked 'could not enable recorder service'
     enable_managed_unit codex-info-rest.service || safe_blocked 'could not enable REST service'
     rearm_update_timer || safe_blocked 'could not enable update timer'

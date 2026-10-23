@@ -23740,6 +23740,26 @@ fn run_ui(
     initial_service_error: Option<String>,
     service_config: ApiServerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let startup = std::env::var_os("CODEX_INFO_UI_STARTUP_FIFO")
+        .map(|path| -> std::io::Result<fs::File> {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            let before = fs::symlink_metadata(&path)?;
+            if !before.file_type().is_fifo() {
+                return Err(std::io::Error::other(
+                    "UI startup notification is not a FIFO",
+                ));
+            }
+            let file = OpenOptions::new().write(true).open(path)?;
+            let opened = file.metadata()?;
+            if !opened.file_type().is_fifo()
+                || before.dev() != opened.dev()
+                || before.ino() != opened.ino()
+            {
+                return Err(std::io::Error::other("UI startup notification changed"));
+            }
+            Ok(file)
+        })
+        .transpose()?;
     let ui = MainWindow::new()?;
     let service_endpoint = service_config.listen_addr();
     install_fixed_window_guard(ui.window(), 498);
@@ -24419,7 +24439,18 @@ fn run_ui(
             }
         });
     }
-    ui.run()?;
+    if let Some(mut startup) = startup {
+        ui.show()?;
+        slint::invoke_from_event_loop(move || {
+            if startup.write_all(b"READY\n").is_err() {
+                let _ = slint::quit_event_loop();
+            }
+        })?;
+        slint::run_event_loop()?;
+        ui.hide()?;
+    } else {
+        ui.run()?;
+    }
     Ok(())
 }
 
@@ -38591,7 +38622,8 @@ mod tests {
         assert!(run.contains("installer_ready"));
         assert!(run.contains("require_payload"));
         assert!(run.contains("exec \"$installer\" \"--$operation\""));
-        assert!(run.contains("exec \"$payload\" --ui"));
+        assert!(run.contains("launch_verified_ui"));
+        assert!(run.contains("CODEX_INFO_UI_STARTUP_FIFO"));
         assert!(run.contains("exec \"$payload\" --help"));
         assert!(run.contains("export CODEX_INFO_UI_CLIENT_ONLY=1"));
         assert!(run.contains("unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR"));

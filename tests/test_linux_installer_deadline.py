@@ -28,6 +28,9 @@ FUNCTIONS = (
 )
 
 MODEL = r'''
+# This fixture stages an ordinary published candidate. Full-source
+# effective/archive tests own local-recovery manifest and receipt validation.
+manifest_is_local_recovery() { return 1; }
 fixture_root="$FIXTURE_ROOT"
 share_dir="$fixture_root/share"
 backup_dir="$share_dir/legacy-backups"
