@@ -32,8 +32,9 @@ PAYLOAD = {
 # Inject only at private fixture I/O. No production hook, resource exhaustion,
 # process killing, network, host service, or real installation is used.
 SHIM = r'''import os,pathlib,sys,tarfile
-assert sys.argv[1] == "-"
 sys.argv = sys.argv[1:]
+if sys.argv[0] == "-B": sys.argv.pop(0)
+assert sys.argv[0] == "-"
 code=sys.stdin.read()
 original_close=tarfile.TarFile.close
 original_replace=os.replace
@@ -170,7 +171,8 @@ class ArchiveStageTests(unittest.TestCase):
         source = INSTALLER.read_text()
         prefix = source.split("\nusage() {", 1)[0]
         functions = []
-        for name in ("validate_bundle", "extract_candidate", "published_release_identity",
+        for name in ("version_python", "validate_bundle", "extract_candidate", "published_release_identity",
+                     "manifest_is_local_recovery",
                      "perform_install", "cleanup_candidate_stage"):
             functions.extend(re.findall(rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", source))
         script = prefix + "\n" + "\n".join(functions) + MODEL
@@ -183,7 +185,8 @@ class ArchiveStageTests(unittest.TestCase):
         # The literal fixture overrides only candidate input paths after production
         # defaults; all archive processing and perform_install ordering are real.
         assignment = f"ARCHIVE={str(self.archive)!r}\nMANIFEST={str(self.external)!r}\nCHECKSUM={str(self.checksum)!r}\n"
-        assignment += "VALIDATE_TIMEOUT=5\noperation_deadline=0\nQUIET=1\n"
+        assignment += (f"running_installer_source={str(INSTALLER)!r}\n"
+                       "VALIDATE_TIMEOUT=5\noperation_deadline=0\nQUIET=1\n")
         script = script.replace(MODEL, assignment + MODEL)
         return subprocess.run(  # nosec B603 # fixed Bash/env, owned temporary paths and service stubs.
             ["/bin/bash", "--noprofile", "--norc", "-s"], input=script, env=env,

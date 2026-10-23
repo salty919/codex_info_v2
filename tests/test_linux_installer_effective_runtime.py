@@ -5,6 +5,7 @@ Only an isolated HOME, fake proc tree and trusted fixture bundles are used.
 """
 
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -12,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tarfile
 import tempfile
 import time
 import unittest
@@ -251,6 +253,249 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         )
         self.assertEqual(result.returncode, 0, "fixture bundle build failed:\n" + result.stderr)
         return self.root / f"output/codex-info-{version}-x86_64-unknown-linux-gnu.tar.gz"
+
+    def local_recovery_bundle(self, version="1.0.19", ui_bytes=None):
+        archive = self.bundle(version, "2" * 40, recorder_bytes=b"local repaired recorder\n",
+                              ui_bytes=ui_bytes or b"#!/usr/bin/python3\nimport os, pathlib\npathlib.Path(os.environ['HOME'], 'ui-started').write_text('verified local UI client\\n')\nif path := os.environ.get('CODEX_INFO_UI_STARTUP_FIFO'):\n    with open(path, 'w') as ready: ready.write('READY\\n')\n")
+        with tarfile.open(archive, "r:gz") as source:
+            members = {item.name: (source.extractfile(item).read(), item.mode)
+                       for item in source.getmembers()}
+        document = json.loads(members["manifest.json"][0])
+        provenance = json.dumps({"kind": "local-recovery", "base_source_sha": "2" * 40,
+                                 "source_diff_sha256": "a" * 64}, sort_keys=True).encode()
+        proof_hash = hashlib.sha256(provenance).hexdigest()
+        document["run_id"] = "local-" + proof_hash
+        document["files"].append({"path": "LOCAL_RECOVERY.json", "size": len(provenance),
+                                  "sha256": proof_hash, "mode": 0o644})
+        document["files"].sort(key=lambda entry: entry["path"])
+        raw = json.dumps(document, indent=2).encode() + b"\n"
+        members["LOCAL_RECOVERY.json"] = (provenance, 0o644)
+        members["manifest.json"] = (raw, 0o644)
+        members["SHA256SUMS"] = ("".join(
+            hashlib.sha256(data).hexdigest() + "  " + name + "\n"
+            for name, (data, mode) in sorted(members.items()) if name != "SHA256SUMS").encode(), 0o644)
+        with tarfile.open(archive, "w:gz") as output:
+            for name, (data, mode) in sorted(members.items()):
+                entry = tarfile.TarInfo(name)
+                entry.size, entry.mode = len(data), mode
+                output.addfile(entry, io.BytesIO(data))
+        archive.with_suffix("").with_suffix(".manifest.json").write_bytes(raw)
+        pathlib.Path(str(archive) + ".sha256").write_text(digest(archive) + "  " + archive.name + "\n")
+        return archive
+
+
+    def canonical_process_fixture(self, rest_active=False):
+        for pid in (RECORDER_PID, REST_PID):
+            directory = self.proc / str(pid)
+            (directory / "fd").mkdir(parents=True, exist_ok=True)
+            fields = ["S", *("0" for _ in range(18)), "101"]
+            (directory / "stat").write_text(f"{pid} (canonical-fixture) " + " ".join(fields) + "\n")
+        (self.proc / str(REST_PID) / "exe").symlink_to(self.old_generation / "codex_info_rest")
+        (self.proc / str(REST_PID) / "fd/3").symlink_to("socket:[599]")
+        socket = (
+            "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+            "  0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 599 1\n"
+        )
+        self.env["FAKE_REST_SOCKET_NET_FILE"] = str(self.proc / "net/tcp")
+        self.env["FAKE_REST_SOCKET_CONTENT"] = socket
+        if rest_active:
+            pathlib.Path(self.env["FAKE_REST_ACTIVE_FILE"]).touch()
+            (self.proc / "net/tcp").write_text(socket)
+
+
+    def ui_startup_fixture(self, *, fail=False):
+        payload = b'''#!/usr/bin/python3
+import os, pathlib, sys
+root = pathlib.Path(os.environ["HOME"])
+(root / "ui-pid").write_text(str(os.getpid()))
+if os.environ.get("FAKE_UI_INIT_FAILURE") == "1": sys.exit(23)
+if path := os.environ.get("CODEX_INFO_UI_STARTUP_FIFO"):
+    with open(path, "w") as ready: ready.write("READY\\n")
+(root / "ui-displayed").touch()
+with open(root / "ui-exit-permission", "rb") as permission: permission.read(1)
+(root / "ui-exited").touch()
+'''
+        installed = self.command(INSTALLER, "--bundle", self.local_recovery_bundle(ui_bytes=payload))
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.canonical_process_fixture()
+        started = self.command(self.installed, "--start")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        os.mkfifo(self.home / "ui-exit-permission", 0o600)
+        if fail:
+            self.env["FAKE_UI_INIT_FAILURE"] = "1"
+
+    def test_issue669_installed_ui_returns_after_ready_and_keeps_ui_alive(self):
+        self.ui_startup_fixture()
+        launcher = subprocess.Popen(  # installed fixture launcher in isolated HOME.  # nosec B603
+            ["/bin/bash", ".local/bin/codex-info", "--ui"],
+            cwd=self.home,
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while not (self.home / "ui-displayed").exists():
+                self.assertLess(time.monotonic(), deadline, "fixture UI did not reach its display oracle")
+                time.sleep(0.02)
+            try:
+                stdout, stderr = launcher.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.fail("launcher still waits for UI exit after initial display")
+            self.assertEqual(launcher.returncode, 0, stdout + stderr)
+            pid = int((self.home / "ui-pid").read_text())
+            os.kill(pid, 0)
+            self.assertFalse((self.home / "ui-exited").exists())
+            self.preserved_profile()
+        finally:
+            try:
+                permission = os.open(self.home / "ui-exit-permission", os.O_WRONLY | os.O_NONBLOCK)
+                os.write(permission, b"x")
+                os.close(permission)
+                deadline = time.monotonic() + 5
+                while not (self.home / "ui-exited").exists():
+                    self.assertLess(time.monotonic(), deadline, "fixture UI did not acknowledge exit")
+                    time.sleep(0.02)
+            except OSError:
+                launcher.terminate()
+            launcher.communicate(timeout=5)
+
+    def test_issue669_installed_ui_initialization_failure_returns_nonzero(self):
+        self.ui_startup_fixture(fail=True)
+        result = self.command(self.home / ".local/bin/codex-info", "--ui")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home / "ui-displayed").exists())
+        self.preserved_profile()
+
+    def test_issue604_local_recovery_start_ui_preserves_disabled_update_timer(self):
+        installed = self.command(INSTALLER, "--bundle", self.local_recovery_bundle())
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.canonical_process_fixture()
+        started = self.command(self.installed, "--start")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        recovered = self.current().resolve(strict=True)
+        effective = pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"])
+        owners_before = effective.read_bytes()
+
+        # systemctl disable removes both the external unit registration and
+        # its wants link; the manifested timer inside current is still valid.
+        timer = self.unit_dir / "codex-info-update.timer"
+        enabled = self.unit_dir / "timers.target.wants/codex-info-update.timer"
+        timer.unlink()
+        enabled.unlink()
+        pathlib.Path(self.env["FAKE_TIMER_ACTIVE_FILE"]).unlink(missing_ok=True)
+        commands = pathlib.Path(self.env["FAKE_LOG"])
+        before = commands.read_text()
+        self.env["FAKE_RELEASE_FAILURE"] = "1"
+
+        restarted = self.command(self.installed, "--start")
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        verified = self.command(self.installed, "--verify-ui", "--quiet")
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        ui = self.command(self.home / ".local/bin/codex-info", "--ui")
+        self.assertEqual(ui.returncode, 0, ui.stderr)
+        self.assertEqual((self.home / "ui-started").read_text(), "verified local UI client\n")
+        self.assertEqual(self.current().resolve(strict=True), recovered)
+        self.assertEqual(effective.read_bytes(), owners_before)
+        self.assertFalse(timer.exists() or timer.is_symlink())
+        self.assertFalse(enabled.exists() or enabled.is_symlink())
+        self.assertFalse(pathlib.Path(self.env["FAKE_TIMER_ACTIVE_FILE"]).exists())
+        added = commands.read_text()[len(before):]
+        self.assertNotRegex(added, r"systemctl .*\b(?:enable|start|restart)\b.*codex-info-update.timer")
+        self.assertNotIn("/releases/", added)
+        self.preserved_profile()
+
+    def test_issue604_local_recovery_start_does_not_discover_or_replace(self):
+        archive = self.local_recovery_bundle()
+        pathlib.Path(self.env["FAKE_TIMER_ACTIVE_FILE"]).unlink(missing_ok=True)
+        installed = self.command(INSTALLER, "--bundle", archive)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        recovered = self.current().resolve(strict=True)
+        self.canonical_process_fixture()
+        # A newer published version must not replace this explicitly started
+        # repair. Discovery itself fails, so a hidden network dependency fails.
+        self.release("1.0.20", "3" * 40)
+        self.env["FAKE_RELEASE_FAILURE"] = "1"
+        result = self.command(self.installed, "--start")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current().resolve(strict=True), recovered)
+        commands = pathlib.Path(self.env["FAKE_LOG"]).read_text()
+        self.assertNotIn("/releases/", commands)
+        executions = [json.loads(line) for line in pathlib.Path(self.env["FAKE_EFFECTIVE_LOG"]).read_text().splitlines()]
+        self.assertEqual({item["unit"] for item in executions},
+                         {"codex-info-recorder.service", "codex-info-rest.service"})
+        self.assertTrue(all(pathlib.Path(item["path"]).parent == recovered for item in executions))
+        self.assertFalse(pathlib.Path(self.env["FAKE_TIMER_ACTIVE_FILE"]).exists())
+        self.preserved_profile()
+
+
+    def test_issue604_local_recovery_keeps_canonical_ui_and_update_entrypoints(self):
+        archive = self.local_recovery_bundle()
+        result = self.command(INSTALLER, "--bundle", archive)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        recovered = self.current().resolve(strict=True)
+        self.assertNotEqual(recovered, self.old_generation)
+        self.assertTrue(self.old_generation.is_dir())
+        manifest = json.loads((recovered / "manifest.json").read_bytes())
+        self.assertEqual(manifest["run_id"], "local-" + digest(recovered / "LOCAL_RECOVERY.json"))
+        self.release("1.0.19", "1" * 40)
+        # The fake service manager creates exe/cmdline on start; proc stat and
+        # the listener fixture are independent OS inputs supplied by this test.
+        for pid in (RECORDER_PID, REST_PID):
+            directory = self.proc / str(pid)
+            (directory / "fd").mkdir(parents=True)
+            fields = ["S", *("0" for _ in range(18)), "101"]
+            (directory / "stat").write_text(f"{pid} (local-recovery-fixture) " + " ".join(fields) + "\n")
+        (self.proc / str(REST_PID) / "fd/3").symlink_to("socket:[599]")
+        self.env["FAKE_REST_SOCKET_NET_FILE"] = str(self.proc / "net/tcp")
+        self.env["FAKE_REST_SOCKET_CONTENT"] = (
+            "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+            "  0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 599 1\n"
+        )
+        self.control("running")
+        ui = self.command(self.home / ".local/bin/codex-info", "--ui")
+        self.assertEqual(ui.returncode, 0, ui.stderr)
+        self.assertEqual((self.home / "ui-started").read_text(), "verified local UI client\n")
+        self.assertNotIn("E_UI_SOURCE_UNAVAILABLE", ui.stderr)
+        self.assertEqual(self.current().resolve(strict=True), recovered)
+        self.assertFalse(list(self.unit_dir.glob("codex-info-*.service.d/*.conf")))
+        update = self.command(self.installed, "--update")
+        self.assertEqual(update.returncode, 0, update.stderr)
+        self.assertEqual(self.current().resolve(strict=True), recovered)
+        self.assertEqual(self.sentinel.read_bytes(), b"independent history preservation oracle\n")
+
+
+    def test_issue604_local_recovery_allows_later_published_generation(self):
+        archive = self.local_recovery_bundle()
+        installed = self.command(INSTALLER, "--bundle", archive)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        local_generation = self.current().resolve(strict=True)
+        self.release("1.0.20", "3" * 40)
+        updated = self.command(self.installed, "--update")
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        final = self.current().resolve(strict=True)
+        self.assertNotEqual(final, local_generation)
+        manifest = json.loads((final / "manifest.json").read_bytes())
+        self.assertEqual((manifest["version"], manifest["run_id"]), ("1.0.20", "92001"))
+        self.assertEqual(self.sentinel.read_bytes(), b"independent history preservation oracle\n")
+
+
+    def test_issue604_public_release_rejects_local_recovery_producer(self):
+        self.release("1.0.20", "2" * 40)
+        archive = self.local_recovery_bundle("1.0.20")
+        for path in (archive, pathlib.Path(str(archive) + ".sha256"),
+                     archive.with_suffix("").with_suffix(".manifest.json")):
+            shutil.copyfile(path, self.assets / path.name)
+        metadata_path = pathlib.Path(self.env["FAKE_RELEASE_JSON"])
+        metadata = json.loads(metadata_path.read_text())
+        for asset in metadata["assets"]:
+            path = self.assets / asset["name"]
+            asset["size"], asset["digest"] = path.stat().st_size, "sha256:" + digest(path)
+        metadata_path.write_text(json.dumps(metadata))
+        result = self.command(self.installed, "--update")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("local recovery is not a published Release producer", result.stderr)
+        self.assertEqual(self.current().resolve(strict=True), self.old_generation)
+        self.assertEqual(self.sentinel.read_bytes(), b"independent history preservation oracle\n")
+
 
     def release(self, version, source, recorder_bytes=None, include_sidecars=True, ui_bytes=None):
         archive = self.bundle(version, source, recorder_bytes=recorder_bytes, ui_bytes=ui_bytes)
@@ -516,6 +761,52 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         self.assertNotIn("rejected-legacy-details", log)
         self.preserved_profile()
 
+    def acquisition_error_response(self, observed_at=1792228061):
+        return {
+            "api_version": "v4", "state": "error", "observed_at": observed_at,
+            "authenticated": True, "plan_label": None, "quota": None,
+            "models_status": "unavailable", "models": [],
+            "active_thread_count": 0, "open_session_thread_count": 0,
+        }
+
+
+    def use_acquisition_error_response(self, observed_at=1792228061):
+        self.env.update(
+            FAKE_CURRENT_STATUS="200",
+            FAKE_CURRENT_BODY=json.dumps(self.acquisition_error_response(observed_at)),
+            FAKE_REJECT_LEGACY_DETAILS="1",
+        )
+
+
+    def test_current_readiness_accepts_acquisition_error_without_rewriting_it(self):
+        for observed_at in (1792228061, None):
+            with self.subTest(observed_at=observed_at):
+                self.use_acquisition_error_response(observed_at)
+                before = self.env["FAKE_CURRENT_BODY"]
+                result = self.current_readiness()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.env["FAKE_CURRENT_BODY"], before)
+                self.assertNotIn("rejected-legacy-details", pathlib.Path(self.env["FAKE_LOG"]).read_text())
+        self.preserved_profile()
+
+
+    def test_current_readiness_rejects_invalid_error_snapshots(self):
+        invalid = (
+            {"state": "initializing"}, {"state": "unknown"}, {"observed_at": -1},
+            {"observed_at": True}, {"authenticated": "true"},
+            {"models": [{"model": "fabricated"}]}, {"unexpected": "field"},
+        )
+        for changes in invalid:
+            with self.subTest(changes=changes):
+                current = self.acquisition_error_response()
+                current.update(changes)
+                self.env.update(FAKE_CURRENT_STATUS="200", FAKE_CURRENT_BODY=json.dumps(current),
+                                FAKE_REJECT_LEGACY_DETAILS="1")
+                result = self.current_readiness()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.preserved_profile()
+
+
     def test_current_failure_does_not_fall_back_to_legacy_details(self):
         self.env.update(FAKE_CURRENT_STATUS="503", FAKE_CURRENT_BODY='{"error":"snapshot_unavailable"}')
         before = pathlib.Path(self.env["FAKE_LOG"]).read_text()
@@ -713,7 +1004,10 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         self.incident_override_pair()
         db, db_before, rows_before = self.incident_database()
         before = self.incident_pair_prestate(db, db_before, rows_before)
-        self.release("1.0.20", "2" * 40, ui_bytes=b"#!/bin/sh\nprintf 'fixture UI payload reached\\n'\n")
+        self.release("1.0.20", "2" * 40, ui_bytes=(
+            b'#!/bin/sh\n: > "$HOME/ui-started"\n'
+            b'printf \'READY\\n\' > "$CODEX_INFO_UI_STARTUP_FIFO"\n'
+        ))
 
         launcher = self.home / ".local/bin/codex-info"
         failed_ui = self.command(launcher, "--ui")
@@ -745,7 +1039,7 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
 
         launched = self.command(launcher, "--ui")
         self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
-        self.assertIn("fixture UI payload reached", launched.stdout)
+        self.assertTrue((self.home / "ui-started").is_file(), "verified UI payload reached")
         self.assertEqual(db.read_bytes(), db_before)
         with sqlite3.connect(db) as connection:
             self.assertEqual(connection.execute("SELECT observed_at, tokens FROM preserved_usage").fetchall(), rows_before)
