@@ -2278,7 +2278,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void TokenFlatQuotaDropKeepsMeasuredFlatModelsWithoutAnUnusedBand()
+    public void TokenFlatQuotaDropWithoutKnownOwnershipKeepsMeasuredFlatModels()
     {
         using var document = LoadGraphEvidenceOracle();
         var fixture = document.RootElement.GetProperty("issue137_token_flat_quota_drop_v1");
@@ -2286,6 +2286,9 @@ public sealed class GraphPlotControlTests
         var samples = Issue137TokenFlatQuotaDropSamples(fixture);
         var periodStart = fixture.GetProperty("period_start").GetInt64();
         var periodEnd = fixture.GetProperty("period_end").GetInt64();
+        // This fixture deliberately has no account ownership interval. It
+        // preserves the unknown-owner negative path independently of quota.
+        // Known-owner quota-independent idle is covered by the Issue #673 tests.
         var scene = GraphScene.Create(samples, GraphMetric.Tokens, periodStart, periodEnd);
 
         Assert.Equal(
@@ -3522,7 +3525,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Idle_never_overlaps_changed_official_remaining()
+    public void ShortQuotaReversalsRemainMeasuredWithoutProvingSustainedLocalUnused()
     {
         var samples = new[]
         {
@@ -3535,7 +3538,8 @@ public sealed class GraphPlotControlTests
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
         // Official percentages are independent observations, not cumulative
-        // model counters. A valid rise must remain visible, and prevents idle.
+        // model counters. The valid rise stays visible; this 120-second run
+        // is below the 600-second band threshold and has no known ownership.
         Assert.Equal([90d, 95d, 90d], scene.Remaining);
         Assert.Equal([1_000d, 1_060d, 1_120d], remaining.Solid.X);
         Assert.Equal([90d, 95d, 90d], remaining.Solid.Y);
@@ -4671,7 +4675,7 @@ public sealed class GraphPlotControlTests
     [InlineData(false, 110UL)]
     [InlineData(false, 90UL)]
     [InlineData(true, 100UL)]
-    public void Raw_unused_bands_exclude_changes_across_missing_observations(bool quotaChanges, ulong afterTokens)
+    public void RawUnusedBandsFollowLocalTokensIndependentlyOfMissingQuota(bool quotaChanges, ulong afterTokens)
     {
         var samples = Enumerable.Range(0, 31).Select(minute =>
         {
@@ -4695,9 +4699,11 @@ public sealed class GraphPlotControlTests
             hiddenModelNames: null,
             accountOwnershipIntervals: [new GraphAccountOwnershipInterval(1_000, 2_801)]);
 
-        GraphIdleInterval[] expected = afterTokens < 100
-            ? [new GraphIdleInterval(1_000, 1_600, false)]
-            : [new GraphIdleInterval(1_000, 1_600, false), new GraphIdleInterval(2_200, 2_800, false)];
+        GraphIdleInterval[] expected = quotaChanges
+            ? [new GraphIdleInterval(1_000, 2_800, false)]
+            : afterTokens < 100
+                ? [new GraphIdleInterval(1_000, 1_600, false)]
+                : [new GraphIdleInterval(1_000, 1_600, false), new GraphIdleInterval(2_200, 2_800, false)];
         Assert.Equal(expected, scene.IdleIntervals);
     }
 
@@ -5080,7 +5086,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Sep22_low_rate_interval_keeps_lines_connected_without_unused_band()
+    public void Sep22LocalTokenPlateauKeepsItsUnusedBandIndependentOfQuota()
     {
         const long beforeRateStart = 1_789_965_300;
         const long beforeRateEnd = 1_789_965_360;
@@ -5191,11 +5197,12 @@ public sealed class GraphPlotControlTests
             Assert.DoesNotContain(segment, SegmentPairs(luna.Idle, luna.Flat, luna.Rising));
             Assert.DoesNotContain(segment, SegmentPairs(remaining.Idle, remaining.Solid));
         });
-        // Equal local model totals cannot prove global inactivity: this
-        // interval has an independently recorded quota decline, 76 -> 75.
+        // The 29-minute local token plateau is within known ownership.
+        // Independently recorded quota changes remain visible and do not
+        // remove this application's local-unused band.
         Assert.Equal(76d, points[1].RemainingPercent);
         Assert.Equal(75d, points[2].RemainingPercent);
-        Assert.Empty(scene.IdleIntervals);
+        Assert.Equal([new GraphIdleInterval(beforeRateEnd, gapStart, false)], scene.IdleIntervals);
 
         var shortScene = GraphScene.Create(
             [

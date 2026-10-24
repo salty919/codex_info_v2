@@ -852,7 +852,8 @@ internal static class GraphPlotProjection
             .Where(index => double.IsFinite(scene.Remaining[index]) &&
                 scene.RemainingOrigins[index] is GraphRemainingOrigin.Raw)
             .ToArray();
-        var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
+        var measuredIntervals = new List<(int Left, int Right, bool Dashed)>();
+        var remainingIdleRuns = new List<GraphIdleInterval>();
         for (var anchor = 1; anchor < anchors.Length; anchor++)
         {
             var left = anchors[anchor - 1];
@@ -880,8 +881,34 @@ internal static class GraphPlotProjection
                     scene.Timestamps[right]) ||
                 crossesPrediction ||
                 !measured;
+            measuredIntervals.Add((left, right, dashed));
             if (!dashed && SameDoubleBits(current, before) && IsConfirmedIdleInterval(
                     scene.IdleIntervals,
+                    scene.Timestamps[left],
+                    scene.Timestamps[right]))
+            {
+                var start = (long)scene.Timestamps[left];
+                var end = (long)scene.Timestamps[right];
+                if (remainingIdleRuns.Count > 0 && remainingIdleRuns[^1].EndAt == start)
+                {
+                    remainingIdleRuns[^1] = remainingIdleRuns[^1] with { EndAt = end };
+                }
+                else
+                {
+                    remainingIdleRuns.Add(new(start, end, false));
+                }
+            }
+        }
+        var remainingIdle = remainingIdleRuns
+            .Where(interval => interval.EndAt - interval.StartAt >= GraphScene.SustainedUnusedMinimumSeconds)
+            .ToArray();
+        var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
+        foreach (var (left, right, dashed) in measuredIntervals)
+        {
+            var before = RemainingValue(scene, left);
+            var current = RemainingValue(scene, right);
+            if (!dashed && SameDoubleBits(current, before) && IsConfirmedIdleInterval(
+                    remainingIdle,
                     scene.Timestamps[left],
                     scene.Timestamps[right]))
             {
@@ -1008,7 +1035,9 @@ internal static class GraphPlotProjection
             }
             var before = values[left];
             var current = values[right];
-            var confirmedIdle = IsConfirmedIdleInterval(
+            var localUnused = scene.Metric == GraphMetric.Tokens &&
+                scene.HasLocalUnusedInterval(scene.Timestamps[left], scene.Timestamps[right]);
+            var confirmedIdle = localUnused || IsConfirmedIdleInterval(
                 idleIntervals,
                 scene.Timestamps[left],
                 scene.Timestamps[right]);
@@ -1030,7 +1059,7 @@ internal static class GraphPlotProjection
                 values,
                 scene.Timestamps[left],
                 scene.Timestamps[right]);
-            if (confirmedIdle && !crossesPrediction && !crossesCorrection && current == before)
+            if (confirmedIdle && (localUnused || !crossesPrediction) && !crossesCorrection && current == before)
             {
                 AppendSegment(
                     idleX,
@@ -1118,20 +1147,62 @@ internal static class GraphPlotProjection
                 !scene.HasModelHardBreakBetween(values, scene.Timestamps[previous], scene.PeriodEndAt)) &&
             !scene.OverlapsNonOwnedInterval(scene.Timestamps[previous], scene.PeriodEndAt))
         {
+            var localUnused = scene.Metric == GraphMetric.Tokens &&
+                scene.HasLocalUnusedInterval(scene.Timestamps[previous], scene.PeriodEndAt);
             AppendSegment(
-                    dashedX,
-                    dashedY,
+                    localUnused ? idleX : dashedX,
+                    localUnused ? idleY : dashedY,
                     scene.Timestamps[previous],
                     values[previous],
                     scene.PeriodEndAt,
                     values[previous]);
         }
 
+        if (scene.Metric == GraphMetric.Tokens)
+        {
+            foreach (var interval in scene.LocalUnusedIntervals)
+            {
+                var anchor = anchors.LastOrDefault(index => scene.Timestamps[index] <= interval.StartAt, -1);
+                if (anchor < 0 || scene.HasModelCorrectionBetween(values, scene.Timestamps[anchor], interval.EndAt) ||
+                    anchors.Any(index => scene.Timestamps[index] >= interval.StartAt &&
+                        scene.Timestamps[index] <= interval.EndAt && values[index] != values[anchor])) continue;
+                RemoveInterval(idleX, idleY, interval.StartAt, interval.EndAt);
+                RemoveInterval(flatX, flatY, interval.StartAt, interval.EndAt);
+                RemoveInterval(risingX, risingY, interval.StartAt, interval.EndAt);
+                RemoveInterval(dashedX, dashedY, interval.StartAt, interval.EndAt);
+                AppendSegment(idleX, idleY, interval.StartAt, values[anchor], interval.EndAt, values[anchor]);
+            }
+        }
         return new GraphModelLineProjection(
             new GraphLineProjection(idleX, idleY),
             new GraphLineProjection(flatX, flatY),
             new GraphLineProjection(risingX, risingY),
             new GraphLineProjection(dashedX, dashedY));
+    }
+
+    // Clip presentation geometry only. The saved model samples and their
+    // validity remain unchanged; local logs justify a hold from a known value.
+    private static void RemoveInterval(List<double> x, List<double> y, double start, double end)
+    {
+        var nextX = new List<double>();
+        var nextY = new List<double>();
+        for (var index = 1; index < x.Count; index++)
+        {
+            var left = x[index - 1];
+            var right = x[index];
+            if (!double.IsFinite(left) || !double.IsFinite(right) || right <= left) continue;
+            var before = y[index - 1];
+            var after = y[index];
+            double At(double at) => before + (after - before) * (at - left) / (right - left);
+            if (right <= start || left >= end) AppendSegment(nextX, nextY, left, before, right, after);
+            else
+            {
+                if (left < start) AppendSegment(nextX, nextY, left, before, start, At(start));
+                if (right > end) AppendSegment(nextX, nextY, end, At(end), right, after);
+            }
+        }
+        x.Clear(); x.AddRange(nextX);
+        y.Clear(); y.AddRange(nextY);
     }
 
     // A period ending inside its latest observed minute has no missing

@@ -212,6 +212,7 @@ pub struct PublishedSnapshot {
     pub history_samples_v3: Vec<codex_info_rest_contract::PublicHistoryObservationV3>,
     pub history_samples_v2: Vec<codex_info_rest_contract::PublicHistoryObservation>,
     pub retained_history: HistoryArchive,
+    local_recordings: Option<Arc<codex_info_db_reader::RecordedArchive>>,
     history_index: HistoryIndex,
     directory_indices: [Vec<usize>; 2],
     directory_pages: Arc<DirectoryPages>,
@@ -260,6 +261,7 @@ impl PublishedSnapshot {
         self.history_samples_v2
             .clone_from(&history.history_samples_v2);
         self.retained_history.clone_from(&history.retained_history);
+        self.local_recordings.clone_from(&history.local_recordings);
         self.history_index = history.history_index.clone();
         self.directory_indices
             .clone_from(&history.directory_indices);
@@ -293,6 +295,7 @@ impl PublishedSnapshot {
             models_v3: snapshot.models_v3,
             history_samples_v3: snapshot.history_samples_v3,
             history_samples_v2: snapshot.history_samples_v2,
+            local_recordings: snapshot.recordings,
             retained_history: snapshot.retained_history,
             history_index,
             directory_indices,
@@ -345,6 +348,7 @@ impl PublishedSnapshot {
             history_samples_v3: Vec::new(),
             history_samples_v2: Vec::new(),
             retained_history: HistoryArchive::default(),
+            local_recordings: None,
             history_index: HistoryIndex::default(),
             directory_indices: Default::default(),
             directory_pages: Arc::default(),
@@ -2658,6 +2662,7 @@ struct Request {
     cursor: Option<String>,
     if_none_match: Option<String>,
     body_length: usize,
+    local_usage: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2864,13 +2869,17 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
     // Qualification belongs to this captured route/query even when the pair
     // matches. A conditional response cannot hide a failed history resource,
     // an invalid cursor or a transport boundary. This reads no database.
-    let body = match serialize_route(
-        &snapshot,
-        route,
-        request.period.as_deref(),
-        request.cursor,
-        degraded,
-    ) {
+    let body = match if route == Route::HistoryV3 && request.local_usage {
+        serialize_history_extended(&snapshot, request.period.as_deref(), request.cursor)
+    } else {
+        serialize_route(
+            &snapshot,
+            route,
+            request.period.as_deref(),
+            request.cursor,
+            degraded,
+        )
+    } {
         Ok(body) => body,
         Err(error) => {
             write_route_error(stream, &store.diagnostics, route_label, error);
@@ -3090,6 +3099,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ParseError> {
         cursor,
         if_none_match,
         body_length: content_length,
+        local_usage: header(&headers, "codex-info-history-extensions") == Some("local-usage-v1"),
     })
 }
 
@@ -3718,6 +3728,56 @@ fn serialize_history(
     }))
 }
 
+fn serialize_history_extended(
+    snapshot: &PublishedSnapshot,
+    period: Option<&str>,
+    cursor: Option<String>,
+) -> Result<Vec<u8>, RouteError> {
+    use codex_info_rest_contract::recorded_usage::LocalUsage;
+    if !snapshot.history_available {
+        return Err(RouteError::HistoryUnavailable);
+    }
+    let (indexed, start) = history_selection(snapshot, period, cursor.as_deref())?;
+    let selected = snapshot
+        .retained_history
+        .periods
+        .iter()
+        .find(|p| Some(p.id.as_str()) == period)
+        .ok_or(RouteError::UnknownPeriod)?;
+    let end = start
+        .saturating_add(MAX_HISTORY_PAGE)
+        .min(indexed.samples.len());
+    let start_at = if start == 0 {
+        selected.start_at
+    } else {
+        indexed
+            .samples
+            .get(start - 1)
+            .map(|&row| {
+                snapshot.retained_history.samples[row]
+                    .timestamp
+                    .max(selected.start_at)
+            })
+            .unwrap_or(selected.start_at)
+    };
+    let end_at = indexed
+        .samples
+        .get(end)
+        .map(|&row| snapshot.retained_history.samples[row].timestamp)
+        .unwrap_or_else(|| selected.end_at.saturating_add(1));
+    let end_at = end_at.max(start_at.saturating_add(1));
+    let evidence = snapshot
+        .local_recordings
+        .as_ref()
+        .and_then(|archive| archive.local_usage(start_at, end_at).ok())
+        .unwrap_or_else(|| LocalUsage::unavailable(start_at, end_at));
+    let mut document: Value = serde_json::from_slice(&serialize_history(snapshot, period, cursor)?)
+        .map_err(|_| RouteError::Serialization)?;
+    document["local_usage"] =
+        serde_json::to_value(evidence).map_err(|_| RouteError::Serialization)?;
+    serialize_json(&document)
+}
+
 fn serialize_json(value: &Value) -> Result<Vec<u8>, RouteError> {
     serde_json::to_vec(value).map_err(|_| RouteError::Serialization)
 }
@@ -4210,6 +4270,7 @@ mod tests {
             history_samples_v2: Vec::new(),
             history_samples_v3: Vec::new(),
             retained_history: HistoryArchive::default(),
+            local_recordings: None,
             history_index: HistoryIndex::default(),
             directory_indices: Default::default(),
             directory_pages: Arc::default(),
@@ -4278,6 +4339,7 @@ mod tests {
             history_samples_v2: Vec::new(),
             history_samples_v3: Vec::new(),
             retained_history: HistoryArchive::default(),
+            local_recordings: None,
             history_index: HistoryIndex::default(),
             directory_indices: Default::default(),
             directory_pages: Arc::default(),
@@ -6557,7 +6619,10 @@ mod tests {
             .collect();
         PublishedSnapshot::from_db_for_account(
             DbSnapshot {
-                recordings: Some(Arc::default()),
+                recordings: Some(Arc::new(codex_info_db_reader::RecordedArchive {
+                    local_index_initialized: true,
+                    ..Default::default()
+                })),
                 generation,
                 data_hash: format!("{generation:064x}"),
                 has_pending_ranges: false,
@@ -6683,7 +6748,7 @@ mod tests {
     ) -> PublishedSnapshot {
         let generation = snapshot.generation + 1;
         let mut candidate = DbSnapshot {
-            recordings: Some(Arc::default()),
+            recordings: snapshot.local_recordings,
             generation,
             data_hash: format!("{generation:064x}"),
             has_pending_ranges: snapshot.has_pending_ranges,
@@ -6968,6 +7033,67 @@ mod tests {
         );
         assert!(repeated.starts_with("HTTP/1.1 200"), "{repeated}");
         server.shutdown();
+    }
+
+    #[test]
+    fn issue673_history_local_usage_is_opt_in_scoped_and_cursor_bound() {
+        let original = history_test_fixture(10, 1, 2, false, false, "1802678400");
+        let legacy = history_test_page(&original, "1802678400", None).unwrap();
+        assert_eq!(legacy.as_object().unwrap().len(), 5);
+        let extended: Value = serde_json::from_slice(
+            &serialize_history_extended(&original, Some("1802678400"), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(extended.as_object().unwrap().len(), 6);
+        assert_eq!(extended["history_samples"], legacy["history_samples"]);
+        assert_eq!(extended["local_usage"]["intervals"][0]["state"], "unused");
+        assert_eq!(extended["local_usage"]["start_at"], 1_799_999_400);
+        assert_eq!(extended["local_usage"]["end_at"], 1_800_000_061);
+        let cursor = history_test_resume(&original);
+        let appended = history_test_edit(original.clone(), 10, |snapshot| {
+            let mut next = snapshot.history_samples_v3.last().unwrap().clone();
+            next.timestamp += 60;
+            snapshot.details.history_periods[0].end_at = next.timestamp;
+            snapshot.history_samples_v3.push(next);
+        });
+        let delta: Value = serde_json::from_slice(
+            &serialize_history_extended(&appended, Some("1802678400"), Some(cursor.clone()))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(delta["history_samples"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            delta["local_usage"]["start_at"], 1_800_000_060,
+            "a delta overlaps the previous endpoint instead of leaving a 59-second hole"
+        );
+        assert_eq!(delta["local_usage"]["end_at"], 1_800_000_121);
+        let changed = history_test_edit(original.clone(), 10, |snapshot| {
+            let mut archive = codex_info_db_reader::RecordedArchive {
+                local_index_initialized: true,
+                ..Default::default()
+            };
+            archive.pending_numeric_times.insert(1_800_000_000);
+            snapshot.recordings = Some(Arc::new(archive));
+        });
+        assert!(matches!(
+            history_test_page(&changed, "1802678400", Some(&cursor)),
+            Err(RouteError::StaleCursor)
+        ));
+        let unavailable = history_test_edit(original, 10, |snapshot| snapshot.recordings = None);
+        let body: Value = serde_json::from_slice(
+            &serialize_history_extended(&unavailable, Some("1802678400"), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["local_usage"]["intervals"][0]["state"], "unavailable");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let parser = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream).unwrap().local_usage
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.write_all(format!("GET /v3/history?period=1802678400 HTTP/1.1\r\nHost:{address}\r\nCodex-Info-History-Extensions: local-usage-v1\r\n\r\n").as_bytes()).unwrap();
+        assert!(parser.join().unwrap());
     }
 
     #[test]

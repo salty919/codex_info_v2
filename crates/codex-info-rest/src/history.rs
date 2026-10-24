@@ -95,7 +95,7 @@ impl HistoryIndex {
             );
             hash.update(b"\n");
             indexed.fingerprints.reserve(indexed.samples.len());
-            for &row in &indexed.samples {
+            for (position, &row) in indexed.samples.iter().enumerate() {
                 #[cfg(test)]
                 crate::record_history_row_visit();
                 hash.update(
@@ -103,6 +103,35 @@ impl HistoryIndex {
                         .expect("validated history observation is serializable"),
                 );
                 hash.update(b"\n");
+                // Prove the local evidence in the same prefix as the samples.
+                // Empty unused tails may grow without invalidating a cursor;
+                // new/corrected activity in an old interval must reject it.
+                let start = if position == 0 {
+                    period.start_at
+                } else {
+                    snapshot.retained_history.samples[row].timestamp
+                };
+                let end = indexed
+                    .samples
+                    .get(position + 1)
+                    .map(|&next| snapshot.retained_history.samples[next].timestamp)
+                    .unwrap_or_else(|| period.end_at.saturating_add(1));
+                if let Some(archive) = &snapshot.recordings {
+                    if let Ok(local) = archive.local_usage(start, end) {
+                        for interval in local.intervals.iter().filter(|v| v.state != codex_info_rest_contract::recorded_usage::LocalUsageState::Unused) {
+                            let mut minute = interval.start_at.div_euclid(60) * 60;
+                            while minute < interval.end_at {
+                                hash.update(minute.to_le_bytes());
+                                hash.update([u8::from(interval.state == codex_info_rest_contract::recorded_usage::LocalUsageState::Used)]);
+                                minute += 60;
+                            }
+                        }
+                    } else {
+                        hash.update(b"local-invalid\n");
+                    }
+                } else {
+                    hash.update(b"local-unavailable\n");
+                }
                 indexed.fingerprints.push(hash.clone().finalize().into());
             }
         }

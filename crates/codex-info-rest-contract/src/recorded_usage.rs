@@ -9,6 +9,74 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_END_EXCLUSIVE: i64 = 253_402_300_800;
 
+/// Opt-in evidence about this application's Codex logs, never account quota.
+pub const LOCAL_USAGE_HEADER: &str = "Codex-Info-History-Extensions";
+pub const LOCAL_USAGE_EXTENSION: &str = "local-usage-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalUsageState {
+    Used,
+    Unused,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalUsageInterval {
+    pub start_at: i64,
+    pub end_at: i64,
+    pub state: LocalUsageState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalUsage {
+    pub version: u8,
+    pub start_at: i64,
+    pub end_at: i64,
+    pub intervals: Vec<LocalUsageInterval>,
+}
+
+impl LocalUsage {
+    pub fn unavailable(start_at: i64, end_at: i64) -> Self {
+        Self {
+            version: 1,
+            start_at,
+            end_at,
+            intervals: vec![LocalUsageInterval {
+                start_at,
+                end_at,
+                state: LocalUsageState::Unavailable,
+            }],
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.version != 1
+            || self.start_at < 1
+            || self.start_at >= self.end_at
+            || self.end_at > MAX_END_EXCLUSIVE
+        {
+            return Err(ContractError::InvalidPeriod);
+        }
+        let mut cursor = self.start_at;
+        for interval in &self.intervals {
+            if interval.start_at != cursor
+                || interval.end_at <= cursor
+                || interval.end_at > self.end_at
+            {
+                return Err(ContractError::InvalidPeriod);
+            }
+            cursor = interval.end_at;
+        }
+        if cursor != self.end_at {
+            return Err(ContractError::InvalidPeriod);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeriodIdentity {
