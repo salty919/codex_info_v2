@@ -96,6 +96,73 @@ fn same_value(old: &LosslessSessionEvent, new: &LosslessSessionEvent) -> bool {
                 && matches!(old.model.as_str(), "SOL" | "TERRA" | "LUNA")
                 && codex_info_pricing::family(exact_model(new)) == Some(old.model.as_str())))
 }
+
+/// An unqualified old counter can name the same consumption at the matched
+/// counter's original second. Only this full-prefix rebind may retire it in
+/// favour of the independently qualified response's original second.
+fn same_bijection_value(
+    old: &LosslessSessionEvent,
+    new: &LosslessSessionEvent,
+    responses: &[source_admission::PendingResponse],
+    numeric_records: &[serde_json::Value],
+) -> bool {
+    if same_value(old, new) {
+        return true;
+    }
+    if old.admission.is_some()
+        || old.period.is_some()
+        || old.tokens != new.tokens
+        || old.source.root_identity != new.source.root_identity
+        || old.source.relative_path != new.source.relative_path
+        || (old.source.file_device, old.source.file_inode)
+            == (new.source.file_device, new.source.file_inode)
+        || !(exact_model(old) == exact_model(new)
+            || (matches!(old.model.as_str(), "SOL" | "TERRA" | "LUNA")
+                && codex_info_pricing::family(exact_model(new)) == Some(old.model.as_str())))
+    {
+        return false;
+    }
+    let Some(admission) = &new.admission else {
+        return false;
+    };
+    let NumericEventProof::ResponseRecord { candidate, .. } = &admission.numeric else {
+        return false;
+    };
+    let Some(counter) = candidate.matched_counter() else {
+        return false;
+    };
+    if !admission.valid_for(new, new.period)
+        || !responses.iter().any(|saved| saved == candidate.as_ref())
+        || counter.timestamp != old.timestamp
+        || counter.timestamp < admission.ownership.start_at
+        || admission
+            .ownership
+            .end_at
+            .is_some_and(|end| counter.timestamp >= end)
+    {
+        return false;
+    }
+    let mut matching = numeric_records.iter().filter(|record| {
+        record["pointer"]["start"].as_u64() == Some(counter.start)
+            && record["pointer"]["end"].as_u64() == Some(counter.end)
+            && record["pointer"]["sha256"].as_str() == Some(counter.sha256.as_str())
+            && record["timestamp"].as_i64() == Some(counter.timestamp)
+    });
+    let Some(record) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() || record["outcome"] != "checked-counter-delta" {
+        return false;
+    }
+    let (Ok(before), Ok(after)) = (
+        serde_json::from_value::<TokenFacts>(record["before"].clone()),
+        serde_json::from_value::<TokenFacts>(record["raw"].clone()),
+    ) else {
+        return false;
+    };
+    after.checked_delta(before) == Ok(old.tokens)
+}
+
 fn numeric_pointer(fact: &LosslessSessionEvent) -> Option<&crate::source_admission::RecordPointer> {
     match &fact.admission.as_ref()?.numeric {
         NumericEventProof::LegacyCounter(proof)
@@ -159,7 +226,34 @@ impl UsageStore {
         if inventory.is_empty() {
             return Err(invalid("equivalence has no original event inventory"));
         }
-        let state = self.load_session_collection_state()?;
+        let checkpoints = {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &self.connection,
+                TransactionBehavior::Deferred,
+            )?;
+            let mut checkpoints = Vec::new();
+            let mut physical_sources = BTreeSet::new();
+            for checkpoint in std::iter::once(old_checkpoint)
+                .chain(prefixes.iter().map(|prefix| &prefix.checkpoint))
+            {
+                let physical = (
+                    checkpoint.root_identity.clone(),
+                    checkpoint.relative_path.clone(),
+                    checkpoint.file_device,
+                    checkpoint.file_inode,
+                );
+                if physical_sources.insert(physical) {
+                    checkpoints.extend(load_session_checkpoints_matching(
+                        &transaction,
+                        "WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3 AND file_inode=?4",
+                        params![checkpoint.root_identity, checkpoint.relative_path,
+                            checkpoint.file_device.to_string(), checkpoint.file_inode.to_string()],
+                    )?);
+                }
+            }
+            transaction.commit()?;
+            checkpoints
+        };
         let mut fingerprints = Vec::new();
         for prefix in &prefixes {
             let checkpoint = &prefix.checkpoint;
@@ -168,7 +262,7 @@ impl UsageStore {
             if prefix.parser_version != "codex-info-session-recorder-v3" {
                 return Err(invalid("unsupported equivalence parser input version"));
             }
-            if !state.checkpoints.contains(checkpoint)
+            if !checkpoints.contains(checkpoint)
                 || self.load_session_ranges_for_checkpoint(checkpoint)? != prefix.ranges
             {
                 return Err(invalid("equivalence prefix inventory changed"));
@@ -243,7 +337,7 @@ impl UsageStore {
         }
         // Fence every generation of the complete old physical inventory,
         // including checkpoints whose original FD no longer exists.
-        for checkpoint in state.checkpoints.iter().filter(|cp| {
+        for checkpoint in checkpoints.iter().filter(|cp| {
             cp.root_identity == old_checkpoint.root_identity
                 && cp.relative_path == old_checkpoint.relative_path
                 && cp.file_device == old_checkpoint.file_device
@@ -373,10 +467,23 @@ impl UsageStore {
                 let mut used = BTreeSet::new();
                 let mut retained = BTreeMap::new();
                 for old in &inventory {
+                    let prefix = &prefixes[0];
                     let candidates = prefixes[0]
                         .qualified_events
                         .iter()
-                        .filter(|new| same_value(old, new))
+                        .filter(|new| {
+                            same_bijection_value(
+                                old,
+                                new,
+                                &prefix
+                                    .verification_checkpoint
+                                    .source_admission
+                                    .as_ref()
+                                    .expect("validated source qualification")
+                                    .responses,
+                                &prefix.numeric_records,
+                            )
+                        })
                         .collect::<Vec<_>>();
                     if candidates.len() != 1 {
                         return Err(invalid(
@@ -716,6 +823,8 @@ struct PrefixEvidence {
     binding: source_admission::SourceAccountBinding,
     end: u64,
     ranges: BTreeSet<String>,
+    responses: Vec<source_admission::PendingResponse>,
+    numeric_records: Vec<serde_json::Value>,
 }
 fn range_key(source: &SessionEventSource) -> Result<String> {
     let mut values: Vec<String> = serde_json::from_str(&crate::recorded_usage::source_key(source)?)
@@ -811,6 +920,11 @@ fn prefix_evidence(
         binding,
         end,
         ranges,
+        responses: state.responses,
+        numeric_records: value["numeric_records"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
@@ -1093,6 +1207,23 @@ fn load_snapshot(connection: &Connection) -> Result<CanonicalSourceSnapshot> {
                         )
                     {
                         return Err(invalid("equivalence canonical row changed"));
+                    }
+                    if value["mode"] == "event-bijection"
+                        && !evidence.iter().any(|prefix| {
+                            qualified.admission.as_ref().is_some_and(|admission| {
+                                admission.source_binding == prefix.binding
+                                    && admission.verified_prefix_end == prefix.end
+                            }) && range_key(&qualified.source)
+                                .is_ok_and(|key| prefix.ranges.contains(&key))
+                                && same_bijection_value(
+                                    raw.get(&original).expect("original validated"),
+                                    &qualified,
+                                    &prefix.responses,
+                                    &prefix.numeric_records,
+                                )
+                        })
+                    {
+                        return Err(invalid("event rebind counterpart evidence changed"));
                     }
                 }
                 _ => return Err(invalid("invalid equivalence canonical kind")),

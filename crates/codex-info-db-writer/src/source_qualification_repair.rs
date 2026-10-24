@@ -289,6 +289,13 @@ pub struct SourceCounterRetirement {
     pub counter: event_admission::LegacyCounterProof,
 }
 
+impl SourceCounterRetirement {
+    /// Use the same original-record predicate as the sealed repair factory.
+    pub fn is_proved(&self) -> bool {
+        valid_retirement(self)
+    }
+}
+
 pub(super) const SCHEMA:&str="CREATE TABLE IF NOT EXISTS source_prefix_repairs (repair_id TEXT PRIMARY KEY,payload_json TEXT NOT NULL,payload_sha256 TEXT NOT NULL) WITHOUT ROWID;";
 
 pub(super) const CANDIDATE_INDEX_SCHEMA: &str = "CREATE INDEX IF NOT EXISTS source_prefix_repairs_v2_candidates ON source_prefix_repairs(repair_id) WHERE substr(CAST(payload_json AS BLOB),-13) <> CAST(',\"version\":1}' AS BLOB)";
