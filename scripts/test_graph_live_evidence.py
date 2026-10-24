@@ -64,6 +64,62 @@ def v3_fixture(rows, *, gaps=None, period_id="test"):
 
 
 class GraphLiveEvidenceTests(unittest.TestCase):
+    def test_issue673_local_log_unused_does_not_depend_on_quota_or_full_model_coverage(self):
+        for quota in (None, 45):
+            fixture = v3_fixture([{"timestamp": at, "tokens": 100, "remaining_percent": quota,
+                                   "models_complete": False} for at in range(1020, 1681, 60)])
+            fixture["history_page"]["local_usage"] = {"version": 1, "start_at": 1020, "end_at": 1681,
+                "intervals": [{"start_at": 1020, "end_at": 1681, "state": "unused"}]}
+            _segments, idle = oracle.build_expected(fixture)
+            self.assertEqual([{"start_at": 1020, "end_at": 1680}], idle)
+            fixture["history_page"]["local_usage"]["intervals"][0]["state"] = "unavailable"
+            self.assertEqual([], oracle.build_expected(fixture)[1])
+
+    def test_issue673_local_unused_holds_a_known_token_value_without_fabricating_raw_rows(self):
+        fixture = v3_fixture([{"timestamp": 1020, "tokens": 100, "remaining_percent": 50},
+                              {"timestamp": 1680, "models": None, "model_source": "unavailable",
+                               "models_complete": False, "remaining_percent": None}])
+        fixture["history_page"]["local_usage"] = {"version": 1, "start_at": 1020, "end_at": 1681,
+            "intervals": [{"start_at": 1020, "end_at": 1080, "state": "used"},
+                          {"start_at": 1080, "end_at": 1681, "state": "unused"}]}
+        before = copy.deepcopy(fixture)
+        for segments in oracle.build_expected_segments_by_platform(fixture).values():
+            self.assertIn([1080, 1680], pairs(segments, "idle", "tokens", "SOL"))
+            self.assertFalse(any(segment["style"] == "dashed" and segment["metric"] == "tokens"
+                                 and segment["end_at"] > 1080 and segment["start_at"] < 1680
+                                 for segment in segments))
+        self.assertEqual(before, fixture)
+        fixture["history_page"]["local_usage"]["intervals"][1]["start_at"] += 1
+        with self.assertRaises(oracle.EvidenceError):
+            oracle.build_expected(fixture)
+
+    def test_issue673_overlapping_local_pages_keep_a_continuous_scope(self):
+        pages = [{"version": 1, "start_at": 1020, "end_at": 1621,
+                  "intervals": [{"start_at": 1020, "end_at": 1621, "state": "unused"}]},
+                 {"version": 1, "start_at": 1620, "end_at": 1681,
+                  "intervals": [{"start_at": 1620, "end_at": 1681, "state": "unused"}]}]
+        merged = oracle._merge_local_pages(pages)
+        self.assertEqual([{"start_at": 1020, "end_at": 1681, "state": "unused"}], merged["intervals"])
+        pages[1]["intervals"][0]["state"] = "used"
+        with self.assertRaises(oracle.EvidenceError):
+            oracle._merge_local_pages(pages)
+
+    def test_issue673_local_unused_preserves_independent_measured_quota_plateaus(self):
+        fixture = v3_fixture([
+            {"timestamp": 1020 + index * 300, "tokens": 100, "remaining_percent": quota}
+            for index, quota in enumerate((90, 90, 89, 89, 88))
+        ])
+        fixture["history_page"]["local_usage"] = {"version": 1, "start_at": 1020, "end_at": 2221,
+            "intervals": [{"start_at": 1020, "end_at": 2221, "state": "unused"}]}
+        before = copy.deepcopy(fixture)
+        for segments in oracle.build_expected_segments_by_platform(fixture).values():
+            self.assertEqual([], pairs(segments, "idle"))
+            self.assertEqual([], pairs(segments, "dashed"))
+            self.assertEqual([[1020, 1320], [1320, 1620], [1620, 1920], [1920, 2220]],
+                             pairs(segments, "solid"))
+        self.assertEqual([{"start_at": 1020, "end_at": 2220}], oracle.build_expected(fixture)[1])
+        self.assertEqual(before, fixture)
+
     @classmethod
     def setUpClass(cls):
         cls.document = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -1378,7 +1434,10 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         connection.putrequest.assert_called_once_with(
             "GET", "/v3/history?period=fixture", skip_accept_encoding=True
         )
-        connection.putheader.assert_called_once_with("Accept", "application/json")
+        self.assertEqual([
+            mock.call("Accept", "application/json"),
+            mock.call("Codex-Info-History-Extensions", "local-usage-v1"),
+        ], connection.putheader.call_args_list)
         connection.endheaders.assert_called_once_with()
         connection.close.assert_called_once_with()
 
@@ -1836,9 +1895,10 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         contracts = oracle.build_expected_render_contracts(fixture)
         dollars = contracts["dollars"]
 
-        self.assertTrue(
-            dollars["models"][0]["flat"].startswith("M0.00 1.00 L0.25 1.00")
-        )
+        self.assertEqual("", dollars["models"][0]["flat"])
+        self.assertEqual("M0.00 1.00 L100.00 1.00", dollars["models"][0]["idle"])
+        self.assertEqual([{"start": "0.000000000000", "width": "100.000000000000"}],
+                         dollars["idle_geometry"])
         self.assertEqual("", dollars["models"][0]["dashed"])
         self.assertTrue(
             dollars["remaining"]["solid"].startswith("M0.00 1.00 L0.25 1.02")

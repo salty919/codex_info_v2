@@ -2,7 +2,7 @@
 """Capture and independently verify live graph evidence for Issue #137.
 
 The oracle intentionally does not import product code.  It turns the strict
-v3 history wire into endpoint-pair line roles and observed token/quota idle intervals.
+v3 history wire into endpoint-pair line roles and local Codex-log unused intervals; quota remains independent.
 Linux and Windows test projections are then compared with these expectations.
 Evidence is written only to an explicitly supplied directory outside the repo.
 """
@@ -170,8 +170,62 @@ def _hard_break(start: int, end: int, gaps: list[dict[str, Any]]) -> bool:
     return any(start < gap["end_at"] and end > gap["start_at"] for gap in gaps)
 
 
+def _validate_local_usage(value: Any, start: int, end: int) -> list[dict[str, Any]]:
+    if not isinstance(value, dict) or set(value) != {"version", "start_at", "end_at", "intervals"}:
+        raise EvidenceError("local usage has an unexpected schema")
+    left = _integer(value["start_at"], "local_usage.start_at")
+    right = _integer(value["end_at"], "local_usage.end_at")
+    if value["version"] != 1 or isinstance(value["version"], bool) or left < start or right > end + 1 or left >= right:
+        raise EvidenceError("local usage is outside its selected period")
+    if not isinstance(value["intervals"], list) or len(value["intervals"]) > 31 * 24 * 60:
+        raise EvidenceError("local usage intervals are not bounded")
+    cursor = left
+    result = []
+    for interval in value["intervals"]:
+        if not isinstance(interval, dict) or set(interval) != {"start_at", "end_at", "state"}:
+            raise EvidenceError("local usage interval has an unexpected schema")
+        at = _integer(interval["start_at"], "local_usage.interval.start_at")
+        after = _integer(interval["end_at"], "local_usage.interval.end_at")
+        state = interval["state"]
+        if at != cursor or after <= at or after > right or state not in {"used", "unused", "unavailable"}:
+            raise EvidenceError("local usage intervals do not cover their declared scope")
+        cursor = after
+        if at < end:
+            result.append({"start_at": at, "end_at": min(after, end), "state": state})
+    if cursor != right:
+        raise EvidenceError("local usage has an uncovered tail")
+    return result
+
+
+def _merge_local_pages(pages: list[dict[str, Any]]) -> dict[str, Any]:
+    events: dict[int, dict[str, int]] = {}
+    for page in pages:
+        for interval in page["intervals"]:
+            for at, delta in ((interval["start_at"], 1), (interval["end_at"], -1)):
+                states = events.setdefault(at, {})
+                states[interval["state"]] = states.get(interval["state"], 0) + delta
+    active: dict[str, int] = {}
+    previous = None
+    intervals: list[dict[str, Any]] = []
+    for at, changes in sorted(events.items()):
+        if previous is not None:
+            states = [state for state, count in active.items() if count > 0]
+            if len(states) != 1:
+                raise EvidenceError("same-pair local usage pages conflict or leave a gap")
+            state = states[0]
+            if intervals and intervals[-1]["state"] == state:
+                intervals[-1]["end_at"] = at
+            else:
+                intervals.append({"start_at": previous, "end_at": at, "state": state})
+        for state, delta in changes.items():
+            active[state] = active.get(state, 0) + delta
+        previous = at
+    return {"version": 1, "start_at": intervals[0]["start_at"],
+            "end_at": intervals[-1]["end_at"], "intervals": intervals}
+
+
 def _validate_fixture(fixture: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-    period = fixture["period"]
+    period = dict(fixture["period"])
     start = _integer(period["start_at"], "period.start_at")
     end = _integer(period["end_at"], "period.end_at")
     reset = _integer(period["reset_at"], "period.reset_at")
@@ -267,6 +321,8 @@ def _validate_fixture(fixture: dict[str, Any]) -> tuple[dict[str, Any], list[dic
         if gap_end < gap_start or gap_start < start or gap_end > end:
             raise EvidenceError(f"gap {index} is outside the selected period")
         normalized_gaps.append({"start_at": gap_start, "end_at": gap_end})
+    if "local_usage" in page:
+        period["_local_usage"] = _validate_local_usage(page["local_usage"], start, end)
     return period, samples, normalized_gaps
 
 
@@ -814,6 +870,27 @@ def _remaining_projection(
     ]
 
 
+def _local_token_holds(rows: list[dict[str, Any]], projection: list[ModelEvidence],
+                       local_usage: list[dict[str, Any]] | None) -> list[tuple[int, int, int | float]]:
+    result = []
+    for interval in local_usage or []:
+        if interval["state"] != "unused":
+            continue
+        start, end = interval["start_at"], interval["end_at"]
+        anchors = [(row["timestamp"], point.value) for row, point in zip(rows, projection, strict=True)
+                   if row["timestamp"] <= start and not row.get("synthetic", False)
+                   and point.origin in {"direct", "legacy"} and point.value is not None]
+        if not anchors:
+            continue
+        anchor_at, value = anchors[-1]
+        if any(anchor_at < row["timestamp"] <= end and
+               (point.origin == "rejected" or point.origin in {"direct", "legacy"} and point.value != value)
+               for row, point in zip(rows, projection, strict=True)):
+            continue
+        result.append((start, end, value))
+    return result
+
+
 def _model_segments(
     rows: list[dict[str, Any]],
     model: str,
@@ -822,6 +899,7 @@ def _model_segments(
     gaps: list[dict[str, Any]],
     idle_intervals: list[dict[str, int]],
     sampling_slots: set[int],
+    local_usage: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
 
@@ -913,7 +991,22 @@ def _model_segments(
                     "causes": _causes(causes),
                 }
             )
-    return segments
+    if metric == "tokens":
+        for start, end, _value in _local_token_holds(rows, projection, local_usage):
+            clipped = []
+            for segment in segments:
+                left, right = segment["start_at"], segment["end_at"]
+                if right <= start or left >= end:
+                    clipped.append(segment)
+                else:
+                    if left < start:
+                        clipped.append(dict(segment, end_at=start))
+                    if right > end:
+                        clipped.append(dict(segment, start_at=end))
+            segments = clipped
+            segments.append({"metric": metric, "series": model, "start_at": start,
+                             "end_at": end, "style": "idle", "causes": []})
+    return sorted(segments, key=_segment_key)
 
 
 def _remaining_segments(
@@ -951,9 +1044,6 @@ def _remaining_segments(
                 "style": (
                     "dashed"
                     if causes
-                    else "idle"
-                    if before.effective == after.effective
-                    and _is_idle_interval(before.timestamp, after.timestamp, idle_intervals)
                     else "solid"
                 ),
                 "causes": _causes(causes),
@@ -979,6 +1069,25 @@ def _remaining_segments(
                         "causes": _causes(causes),
                     }
                 )
+    # Quota's own measured constant runs must be sustained. A local token
+    # band cannot turn shorter independent quota plateaus into idle segments.
+    values = {point.timestamp: point.effective for point in evidence}
+    remaining_idle: list[dict[str, int]] = []
+    for segment in result:
+        start, end = segment["start_at"], segment["end_at"]
+        if (segment["style"] != "solid" or values[start] != values[end]
+                or not _is_idle_interval(start, end, idle_intervals)):
+            continue
+        if remaining_idle and remaining_idle[-1]["end_at"] == start:
+            remaining_idle[-1]["end_at"] = end
+        else:
+            remaining_idle.append({"start_at": start, "end_at": end})
+    remaining_idle = [interval for interval in remaining_idle
+                      if interval["end_at"] - interval["start_at"] >= SUSTAINED_UNUSED_MIN_DURATION_SECONDS]
+    for segment in result:
+        if segment["style"] == "solid" and _is_idle_interval(
+                segment["start_at"], segment["end_at"], remaining_idle):
+            segment["style"] = "idle"
     return result
 
 
@@ -988,19 +1097,25 @@ def _idle_intervals(
     token_models: dict[str, list[ModelEvidence]],
     gaps: list[dict[str, Any]],
 ) -> list[dict[str, int]]:
+    if "_local_usage" in period:
+        return [{"start_at": item["start_at"], "end_at": item["end_at"]}
+                for item in period["_local_usage"] if item["state"] == "unused"
+                and item["end_at"] - item["start_at"] >= SUSTAINED_UNUSED_MIN_DURATION_SECONDS]
+
     def raw_idle_origin(row: dict[str, Any], point: ModelEvidence) -> bool:
         if row.get("synthetic", False):
             return False
-        if row.get("model_source") == "confirmed" and row.get("models_complete") is True:
-            return point.origin == "direct" and point.reliable
+        if row.get("model_source") == "confirmed":
+            local_known = row.get("models_complete") is True or all(
+                isinstance(model.get(field), int) and not isinstance(model.get(field), bool)
+                for model in row.get("models") or []
+                for field in ("total_tokens", "input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens")
+            )
+            return local_known and point.origin == "direct" and point.reliable
         if row.get("model_source") == "legacy-unknown":
             return point.origin == "legacy" and point.value is not None
         return False
 
-    remaining = {
-        point.timestamp: point
-        for point in _remaining_projection(period, rows, token_models, gaps)
-    }
     intervals: list[tuple[int, int]] = []
     sampling_slots = _recoverable_sampling_slots(rows, gaps, token_models)
     observed_indices = [index for index in range(len(rows)) if index not in sampling_slots]
@@ -1041,20 +1156,6 @@ def _idle_intervals(
             or right_models[name]["total_tokens"] < 0
             or left_models[name]["total_tokens"] != right_models[name]["total_tokens"]
             for name in left_names
-        ):
-            continue
-        before = remaining.get(start)
-        after = remaining.get(end)
-        if (
-            before is None
-            or after is None
-            or before.origin != "raw"
-            or after.origin != "raw"
-            or before.raw is None
-            or after.raw is None
-            or not math.isfinite(before.raw)
-            or not math.isfinite(after.raw)
-            or struct.pack("!d", before.raw) != struct.pack("!d", after.raw)
         ):
             continue
         intervals.append((start, end))
@@ -1106,6 +1207,7 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
                     gaps,
                     idle,
                     sampling_slots,
+                    period.get("_local_usage"),
                 )
             )
     segments.sort(key=_segment_key)
@@ -1129,7 +1231,7 @@ def _build_windows_model_segments(fixture: dict[str, Any]) -> list[dict[str, Any
         for family in sorted(grouped[metric], key=lambda value: value.encode("utf-8")):
             projection = grouped[metric][family]
             segments.extend(
-                _model_segments(rows, family, metric, projection, gaps, idle, sampling_slots)
+                _model_segments(rows, family, metric, projection, gaps, idle, sampling_slots, period.get("_local_usage"))
             )
     segments.sort(key=_segment_key)
     return segments
@@ -1732,6 +1834,8 @@ def build_expected_render_contracts(
         gaps,
         idle,
     )
+    remaining_idle = [{"start_at": segment["start_at"], "end_at": segment["end_at"]}
+                      for segment in remaining_segments if segment["style"] == "idle"]
     idle_geometry = [
         {
             "start": f"{(interval['start_at'] - period['start_at']) / max(1, period['end_at'] - period['start_at']) * 100.0:.12f}",
@@ -1787,12 +1891,17 @@ def build_expected_render_contracts(
                 gaps,
                 idle,
                 sampling_slots,
+                period.get("_local_usage"),
             )
             values = {
                 row["timestamp"]: point.value
                 for row, point in zip(rows, renderable_projections[model], strict=True)
                 if point.value is not None
             }
+            if metric == "tokens":
+                for start, end, value in _local_token_holds(rows, renderable_projections[model], period.get("_local_usage")):
+                    values[start] = value
+                    values[end] = value
             models.append(
                 {
                     "series": model,
@@ -1890,7 +1999,7 @@ def build_expected_render_contracts(
                     period,
                     100,
                     True,
-                    idle,
+                    remaining_idle,
                     curve_max_step,
                     preserve_dash_phase=platform == "windows",
                     preserve_observed_plateaus=platform == "windows",
@@ -1902,7 +2011,7 @@ def build_expected_render_contracts(
                     period,
                     100,
                     True,
-                    idle,
+                    remaining_idle,
                     curve_max_step,
                     preserve_observed_plateaus=platform == "windows",
                 ),
@@ -1913,7 +2022,7 @@ def build_expected_render_contracts(
                     period,
                     100,
                     True,
-                    idle,
+                    remaining_idle,
                     curve_max_step,
                     preserve_observed_plateaus=platform == "windows",
                 ),
@@ -1945,6 +2054,8 @@ def _fetch(url: str) -> tuple[bytes, str]:
         # Accept-Encoding. http.client adds it unless this flag is explicit.
         connection.putrequest("GET", target, skip_accept_encoding=True)
         connection.putheader("Accept", "application/json")
+        if parsed.path == "/v3/history":
+            connection.putheader("Codex-Info-History-Extensions", "local-usage-v1")
         connection.endheaders()
         response = connection.getresponse()
         if response.status != 200:
@@ -2023,6 +2134,7 @@ def capture(
     gaps: list[dict[str, Any]] = []
     cursor: str | None = None
     resume_cursor: str | None = None
+    local_pages: list[dict[str, Any]] = []
     for page_index in range(MAX_PAGES):
         query = [("period", period["id"])]
         if account_id is not None:
@@ -2035,9 +2147,12 @@ def capture(
             raise EvidenceError("history page published pair differs from periods")
         inputs.append(("history", page_index, raw))
         page = _json_loads(raw)
-        if set(page) != {"api_version", "history_samples", "history_gaps", "next_cursor", "resume_cursor"} or page["api_version"] != "v3":
+        fields = {"api_version", "history_samples", "history_gaps", "next_cursor", "resume_cursor"}
+        if set(page) not in (fields, fields | {"local_usage"}) or page["api_version"] != "v3":
             raise EvidenceError(f"history page {page_index} has an unexpected schema")
         samples.extend(page["history_samples"])
+        if "local_usage" in page:
+            local_pages.append(page["local_usage"])
         if page_index == 0:
             gaps = page["history_gaps"]
         elif page["history_gaps"]:
@@ -2057,6 +2172,12 @@ def capture(
         "next_cursor": None,
         "resume_cursor": resume_cursor,
     }
+    if local_pages:
+        if len(local_pages) != page_index + 1:
+            raise EvidenceError("history pages mixed extension support within one published pair")
+        for page in local_pages:
+            _validate_local_usage(page, period["start_at"], period["end_at"])
+        history_page["local_usage"] = _merge_local_pages(local_pages)
     fixture = {
         "account_id": account_id,
         "published_pair": pair,

@@ -161,6 +161,14 @@ public sealed class LoopbackStatusClient :
         "next_cursor",
         "resume_cursor");
 
+    private static readonly HashSet<string> ExtendedHistoryPageProperties =
+        new(HistoryPageTopLevelProperties, StringComparer.Ordinal) { "local_usage" };
+
+    private static readonly HashSet<string> LocalUsageProperties = CreatePropertySet(
+        "version", "start_at", "end_at", "intervals");
+    private static readonly HashSet<string> LocalUsageIntervalProperties = CreatePropertySet(
+        "start_at", "end_at", "state");
+
     private static readonly HashSet<string> ThreadsTopLevelProperties = CreatePropertySet(
         "api_version",
         "threads");
@@ -992,6 +1000,10 @@ public sealed class LoopbackStatusClient :
             using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
             request.Headers.Accept.Clear();
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            if (endpoint.StartsWith($"{HistoryEndpoint}?", StringComparison.Ordinal))
+            {
+                request.Headers.Add("Codex-Info-History-Extensions", "local-usage-v1");
+            }
             if (cached is not null)
             {
                 request.Headers.IfNoneMatch.Add(
@@ -2283,7 +2295,8 @@ public sealed class LoopbackStatusClient :
                     MaxDepth = 24,
                 });
             var root = document.RootElement;
-            if (!HasExactlyProperties(root, HistoryPageTopLevelProperties, 5) ||
+            if ((!HasExactlyProperties(root, HistoryPageTopLevelProperties, 5) &&
+                 !HasExactlyProperties(root, ExtendedHistoryPageProperties, 6)) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
                 apiVersion != "v3" ||
                 !TryGetHistorySamplesV3(root, periods: null, out var samples) ||
@@ -2295,21 +2308,53 @@ public sealed class LoopbackStatusClient :
                 return null;
             }
 
+            ApiLocalUsage? localUsage = null;
+            if (root.TryGetProperty("local_usage", out var local) &&
+                !TryGetLocalUsage(local, out localUsage)) return null;
+            var carriedSamples = localUsage is null ? samples :
+                samples.Select(sample => sample with { LocalUsage = localUsage }).ToList();
             return new ApiHistoryPage(
                 expectedPeriodId,
-                new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(samples),
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(carriedSamples),
                 new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryGap>(gaps),
                 nextCursor,
                 resumeCursor,
                 publishedPair)
             {
                 ApiVersion = apiVersion,
+                LocalUsage = localUsage,
             };
         }
         catch (Exception)
         {
             return null;
         }
+    }
+
+    private static bool TryGetLocalUsage(JsonElement value, out ApiLocalUsage? result)
+    {
+        result = null;
+        if (!HasExactlyProperties(value, LocalUsageProperties, 4) ||
+            !value.GetProperty("version").TryGetInt32(out var version) || version != 1 ||
+            !value.GetProperty("start_at").TryGetInt64(out var start) || start < 1 ||
+            !value.GetProperty("end_at").TryGetInt64(out var end) || end <= start || end > 253402300800L ||
+            value.GetProperty("intervals") is not { ValueKind: JsonValueKind.Array } items ||
+            items.GetArrayLength() > MaxHistorySamples) return false;
+        var intervals = new List<ApiLocalUsageInterval>();
+        var cursor = start;
+        foreach (var item in items.EnumerateArray())
+        {
+            if (!HasExactlyProperties(item, LocalUsageIntervalProperties, 3) ||
+                !item.GetProperty("start_at").TryGetInt64(out var left) || left != cursor ||
+                !item.GetProperty("end_at").TryGetInt64(out var right) || right <= left || right > end ||
+                !TryGetString(item, "state", out var state) || state is not ("used" or "unused" or "unavailable"))
+                return false;
+            intervals.Add(new(left, right, state));
+            cursor = right;
+        }
+        if (cursor != end) return false;
+        result = new(start, end, intervals.AsReadOnly());
+        return true;
     }
 
     private static ApiThreadsSnapshot? ParseThreads(

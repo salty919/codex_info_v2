@@ -779,8 +779,10 @@ impl DbReader {
         scope: ProjectionScope,
     ) -> Result<CommittedSnapshot, ReaderError> {
         let include_history = matches!(scope, ProjectionScope::History | ProjectionScope::All);
-        let include_recordings =
-            matches!(scope, ProjectionScope::Recordings | ProjectionScope::All);
+        let include_recordings = matches!(
+            scope,
+            ProjectionScope::History | ProjectionScope::Recordings | ProjectionScope::All
+        );
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let commit = read_collection_commit(&transaction)?;
@@ -999,7 +1001,17 @@ impl DbReader {
         }
         let retained_history = retained_history.unwrap_or_default();
         let recordings = include_recordings
-            .then(|| recordings::read(&transaction).map(Arc::new).ok())
+            .then(|| {
+                if matches!(scope, ProjectionScope::History) {
+                    recordings::read_local(&transaction, |at| self.read_intervals.contains(at))
+                } else if matches!(scope, ProjectionScope::All) {
+                    recordings::read_all(&transaction, |at| self.read_intervals.contains(at))
+                } else {
+                    recordings::read(&transaction)
+                }
+                .map(Arc::new)
+                .ok()
+            })
             .flatten();
         let mut hasher = Sha256::new();
         hasher.update(generation.to_be_bytes());
