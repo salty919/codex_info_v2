@@ -8699,6 +8699,178 @@ fn prepare_original_event_qualification(
     ))
 }
 
+fn reconcile_original_numerical_evidence(
+    checkpoint: &SessionCheckpoint,
+    original: &[LosslessSessionEvent],
+    qualified: &mut Vec<LosslessSessionEvent>,
+    admission: &SourceAdmission,
+    replay_pending: &[SessionPendingRange],
+    counter_proofs: &[LegacyCounterProof],
+) -> Vec<SessionPendingRange> {
+    // A reconstructed response marker is resolved only by the same qualified
+    // root, accepted bytes and owner. Other responses keep their pending proof.
+    let (pending, proved_counters) = {
+        let mut roots = BTreeMap::<_, Vec<_>>::new();
+        for candidate in &admission.responses {
+            roots
+                .entry((candidate.pointer.start, candidate.pointer.end))
+                .or_default()
+                .push(candidate);
+        }
+        let mut qualified_roots = BTreeMap::<_, Vec<_>>::new();
+        let mut qualified_counters = BTreeMap::<_, Vec<_>>::new();
+        for fact in qualified.iter() {
+            let Some(proof) = fact.admission.as_ref().filter(|proof| {
+                proof.valid_for(fact, fact.period)
+                    && proof.source_binding.matches_checkpoint(checkpoint)
+            }) else {
+                continue;
+            };
+            let NumericEventProof::ResponseRecord { candidate, .. } = &proof.numeric else {
+                continue;
+            };
+            let key = (candidate.pointer.start, candidate.pointer.end);
+            if !roots.get(&key).is_some_and(
+                |saved| matches!(saved.as_slice(), [root] if *root == candidate.as_ref()),
+            ) {
+                continue;
+            }
+            qualified_roots.entry(key).or_default().push(fact);
+            if let Some(counter) = candidate.matched_counter() {
+                qualified_counters
+                    .entry((counter.start, counter.end))
+                    .or_default()
+                    .push(fact);
+            }
+        }
+        let pending = replay_pending
+            .iter()
+            .filter(|pending| {
+                if pending.reason != "response-qualification-pending"
+                    || !pending.complete
+                    || pending.root_identity != checkpoint.root_identity
+                    || pending.relative_path != checkpoint.relative_path
+                    || pending.file_device != checkpoint.file_device
+                    || pending.file_inode != checkpoint.file_inode
+                    || pending.prefix_generation != checkpoint.prefix_generation
+                    || pending.end_offset > checkpoint.committed_offset
+                {
+                    return true;
+                }
+                let Some([fact]) = qualified_roots
+                    .get(&(pending.start_offset, pending.end_offset))
+                    .map(Vec::as_slice)
+                else {
+                    return true;
+                };
+                let NumericEventProof::ResponseRecord { candidate, .. } =
+                    &fact.admission.as_ref().expect("qualified root").numeric
+                else {
+                    return true;
+                };
+                let digest = (0..64)
+                    .step_by(2)
+                    .map(|at| {
+                        candidate
+                            .pointer
+                            .sha256
+                            .get(at..at + 2)
+                            .and_then(|text| u8::from_str_radix(text, 16).ok())
+                    })
+                    .collect::<Option<Vec<_>>>();
+                digest.is_none_or(|digest| {
+                    pending.record_sha256 != format!("{:x}", Sha256::digest(digest))
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        // Index the original counter pointers once. An old ordinal traverses
+        // only its accepted range, never the whole source for each old event.
+        let mut counter_index = BTreeMap::<_, Vec<_>>::new();
+        for counter in counter_proofs {
+            if counter.after.total > counter.before.total {
+                counter_index
+                    .entry(counter.after.pointer.start)
+                    .or_default()
+                    .push(counter);
+            }
+        }
+        let mut proved = BTreeSet::new();
+        for (index, old) in original
+            .iter()
+            .enumerate()
+            .filter(|(_, fact)| fact.admission.is_none())
+        {
+            let Some(ordinal) = usize::try_from(old.source.event_index).ok() else {
+                continue;
+            };
+            let Some(counter) = counter_index
+                .range(old.source.range_start..old.source.range_end)
+                .flat_map(|(_, proofs)| proofs.iter().copied())
+                .filter(|counter| counter.after.pointer.end <= old.source.range_end)
+                .nth(ordinal)
+            else {
+                continue;
+            };
+            let matches = qualified_counters
+                .get(&(counter.after.pointer.start, counter.after.pointer.end))
+                .into_iter()
+                .flatten()
+                .filter(|fact| {
+                    codex_info_db_writer::SourceCounterRetirement {
+                        original: old.clone(),
+                        replacement: (***fact).clone(),
+                        counter: (*counter).clone(),
+                    }
+                    .is_proved()
+                })
+                .take(2)
+                .count();
+            if matches == 1 {
+                proved.insert(index);
+            }
+        }
+        (pending, proved)
+    };
+    let full_numeric = pending.iter().all(|pending| {
+        matches!(
+            pending.reason.as_str(),
+            "initial-counter-prefix-unknown"
+                | "account-counter-prefix-unknown"
+                | "counter-outside-account-ownership"
+                | "raw-counter-regression-or-invalid-delta"
+                | "model-interval-unqualified"
+                | "response-record-missing"
+        )
+    });
+    if !full_numeric {
+        let key = |source: &codex_info_db_writer::SessionEventSource| {
+            (
+                source.range_start,
+                source.range_end,
+                source.record_sha256.clone(),
+                source.event_index,
+            )
+        };
+        let present = qualified
+            .iter()
+            .map(|fact| key(&fact.source))
+            .collect::<BTreeSet<_>>();
+        qualified.extend(
+            original
+                .iter()
+                .enumerate()
+                .filter(|(index, fact)| {
+                    fact.admission.is_none()
+                        && !proved_counters.contains(index)
+                        && !present.contains(&key(&fact.source))
+                })
+                .map(|(_, fact)| fact.clone()),
+        );
+    }
+    pending
+}
+
 fn prepare_original_numerical_repair(
     writer: &mut UsageStore,
     reconstruction: &SourceParserReconstruction,
@@ -8732,27 +8904,6 @@ fn prepare_original_numerical_repair(
         .filter(|fact| fact.admission.is_some())
         .cloned()
         .collect::<Vec<_>>();
-    let full_numeric = reconstruction.pending.iter().all(|pending| {
-        matches!(
-            pending.reason.as_str(),
-            "initial-counter-prefix-unknown"
-                | "account-counter-prefix-unknown"
-                | "counter-outside-account-ownership"
-                | "raw-counter-regression-or-invalid-delta"
-                | "model-interval-unqualified"
-                | "response-record-missing"
-        )
-    });
-    if !full_numeric {
-        // Unknown bytes cannot disprove an unmatched old event. Independent
-        // new qualified records can still be recovered as a partial result.
-        qualified.extend(
-            original
-                .iter()
-                .filter(|fact| fact.admission.is_none())
-                .cloned(),
-        );
-    }
     let mut used = Vec::new();
     for (raw, proof) in &reconstruction.numeric_events {
         let owners = ownership
@@ -8938,6 +9089,14 @@ fn prepare_original_numerical_repair(
             qualified.push(fact);
         }
     }
+    let pending = reconcile_original_numerical_evidence(
+        checkpoint,
+        &original,
+        &mut qualified,
+        admission,
+        &reconstruction.pending,
+        &reconstruction.counter_proofs,
+    );
     if reconstruction.prefix_matches(source, checkpoint, accepted)? != Some(true) {
         return Err(RecorderError::Invalid(
             "numerical original changed before preparation".into(),
@@ -8956,7 +9115,7 @@ fn prepare_original_numerical_repair(
             codex_info_db_writer::SourceNumericalReplay {
                 checkpoint: restored,
                 records: reconstruction.numeric_records.clone(),
-                pending: reconstruction.pending.clone(),
+                pending,
             },
         )
         .map_err(RecorderError::from)
@@ -15115,6 +15274,303 @@ mod tests {
                     "cached_input_tokens":3,"cache_write_input_tokens":2,"output_tokens":1}}}})
         );
         (root, database, source, recorder, epoch, at, suffix)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue676_partial_numerical_repair_retires_proved_counters_with_unresolved_peer() {
+        let (root, database) = prepare("issue676-partial-numerical-peer");
+        write_test_account_authority(&root, "synthetic-response-account");
+        let epoch = AccountEpochProof::capture(&root).unwrap();
+        let at = Utc::now().timestamp().div_euclid(60) * 60 - 600;
+        let reset = at + 3603;
+        let source_path = root.join("sessions/one.jsonl");
+        let stamp = |value| {
+            DateTime::<Utc>::from_timestamp(value, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let context = |model: Value, time| {
+            json!({"type":"turn_context","timestamp":stamp(time),
+            "payload":{"model":model,"turn_id":"turn","root_turn_id":"root-turn"}})
+            .to_string()
+        };
+        let counter = |total, last, time| {
+            json!({"type":"event_msg","timestamp":stamp(time),
+            "payload":{"type":"token_count","info":{"total_token_usage":{
+                "total_tokens":total,"input_tokens":total,"cached_input_tokens":0,
+                "cache_write_input_tokens":0,"output_tokens":0},"last_token_usage":{
+                "total_tokens":last,"input_tokens":last,"cached_input_tokens":0,
+                "cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}}})
+            .to_string()
+        };
+        let response = |id, total, time| {
+            let usage = json!({"total_tokens":total,"input_tokens":total,"cached_input_tokens":0,
+                "cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0});
+            json!({"type":"token_usage_record","timestamp":stamp(time),"payload":{
+                "thread_id":"thread","session_id":"session","turn_id":"turn",
+                "root_turn_id":"root-turn","response_id":id,"usage":usage,
+                "turn_token_usage":usage,"thread_token_usage":usage}})
+            .to_string()
+        };
+        fs::write(
+            &source_path,
+            format!(
+                "{}\n{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":"thread","session_id":"session"}}),
+                context(json!("gpt-6.1-sol"), at - 5),
+                counter(0, 0, at - 4)
+            ),
+        )
+        .unwrap();
+        let intervals = vec![SessionLifecycleInterval::new(Some(at - 100), None)];
+        let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+            config(&root, 65536),
+            &database,
+            &identity(),
+            None,
+            None,
+            intervals.clone(),
+        )
+        .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        for (index, observed_at) in [at + 10, at + 40].into_iter().enumerate() {
+            let receipt = codex_info_db_writer::QuotaReceipt {
+                receipt_id: format!("{:064x}", index + 1),
+                sequence: index as i64 + 1,
+                observed_at,
+                reset_at: reset,
+                window_seconds: 3600,
+                remaining_percent: 90.0,
+            };
+            stage_fixture_official_quota(&mut recorder, &receipt);
+            recorder
+                .writer
+                .commit_quota_receipts(&[receipt], false)
+                .unwrap();
+        }
+        // The model-less response precedes this exact period. The two later
+        // requests have independently matched counters and known model/owner.
+        let suffix = [
+            context(Value::Null, at),
+            response("unresolved", 3, at + 1),
+            counter(3, 3, at + 2),
+            context(json!("gpt-6.1-sol"), at + 10),
+            response("five", 5, at + 11),
+            counter(8, 5, at + 12),
+            response("nine", 9, at + 21),
+            counter(17, 9, at + 22),
+        ]
+        .join("\n")
+            + "\n";
+        OpenOptions::new()
+            .append(true)
+            .open(&source_path)
+            .unwrap()
+            .write_all(suffix.as_bytes())
+            .unwrap();
+        recorder
+            .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+            .unwrap()
+            .unwrap();
+        let state = recorder.state().unwrap();
+        let checkpoint = state.checkpoints[0].clone();
+        let ranges = recorder
+            .writer
+            .load_session_ranges_for_checkpoint(&checkpoint)
+            .unwrap();
+        let source = discover_sources(&root.join("sessions"))
+            .unwrap()
+            .sources
+            .remove(0);
+        let ownership = SourceOwnership {
+            intervals: &intervals,
+            eligible_from: None,
+        };
+        let mut reconstruction = SourceParserReconstruction {
+            original: checkpoint.clone(),
+            ranges: ranges.clone(),
+            fingerprint: source_fingerprint(&source).unwrap(),
+            account_boundary_epoch: None,
+            lifecycle_intervals: intervals.clone(),
+            replayed: None,
+            pending: Vec::new(),
+            raw_conflict: false,
+            qualification_attempted: false,
+            read_container: None,
+            numeric_events: Vec::new(),
+            counter_proofs: Vec::new(),
+            numeric_records: Vec::new(),
+        };
+        reconstruction
+            .advance(
+                &source,
+                checkpoint.committed_offset,
+                checkpoint.cycle_seq,
+                Some(&ownership),
+            )
+            .unwrap();
+        let replayed = reconstruction.original_repair_checkpoint().unwrap();
+        let replay_state = replayed.source_admission.as_ref().unwrap();
+        assert_eq!(replay_state.responses.len(), 3);
+        assert_eq!(
+            replay_state
+                .responses
+                .iter()
+                .filter(|item| item.qualified_model().is_some())
+                .count(),
+            2
+        );
+        let binding = checkpoint
+            .source_admission
+            .as_ref()
+            .unwrap()
+            .account_binding
+            .as_ref()
+            .unwrap()
+            .clone();
+        let known = recorder
+            .writer
+            .source_events_for_qualification_repair(&checkpoint)
+            .unwrap();
+        let known = known
+            .into_iter()
+            .filter(|fact| {
+                fact.admission.as_ref().is_some_and(|admission| {
+                    matches!(admission.numeric, NumericEventProof::ResponseRecord { .. })
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(known.len(), 2);
+        let db = Connection::open(&database).unwrap();
+        let mut old_counters = Vec::new();
+        for fact in &known {
+            let NumericEventProof::ResponseRecord { candidate, .. } =
+                &fact.admission.as_ref().unwrap().numeric
+            else {
+                panic!("response evidence")
+            };
+            let pointer = candidate.matched_counter().unwrap();
+            let counter_index = reconstruction
+                .counter_proofs
+                .iter()
+                .filter(|proof| {
+                    fact.source.range_start <= proof.after.pointer.start
+                        && proof.after.pointer.end <= fact.source.range_end
+                        && proof.after.total > proof.before.total
+                })
+                .position(|proof| proof.after.pointer == *pointer)
+                .unwrap();
+            let mut old = fact.clone();
+            old.source.event_index = counter_index as u64;
+            old.timestamp = pointer.timestamp;
+            old.period = None;
+            old.admission = None;
+            let s = &old.source;
+            db.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,
+                range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,
+                cached_input_tokens,cache_write_input_tokens,output_tokens) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,'0','0','0')",
+                rusqlite::params![s.root_identity,s.relative_path,s.file_device.to_string(),s.file_inode.to_string(),
+                    format!("{:032x}",s.prefix_generation),s.range_start,s.range_end,s.record_sha256,s.event_index,
+                    old.timestamp,old.model,old.tokens.total.to_string()]).unwrap();
+            old_counters.push(old);
+        }
+        // An unrelated legacy value before the period has no proved response
+        // counterpart and must remain exactly as stored.
+        let mut unmatched = old_counters[0].clone();
+        unmatched.source.event_index = 999;
+        unmatched.timestamp = at + 2;
+        unmatched.tokens.total = 3;
+        unmatched.tokens.input = Some(3);
+        let s = &unmatched.source;
+        db.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,
+            range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,
+            cached_input_tokens,cache_write_input_tokens,output_tokens) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,999,?9,?10,'3','3','0','0','0')",
+            rusqlite::params![s.root_identity,s.relative_path,s.file_device.to_string(),s.file_inode.to_string(),
+                format!("{:032x}",s.prefix_generation),s.range_start,s.range_end,s.record_sha256,
+                unmatched.timestamp,unmatched.model]).unwrap();
+        let saved_price: String = db.query_row("SELECT price_version FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6.1-sol'",
+            rusqlite::params![reset,at],|row|row.get(0)).unwrap();
+        db.execute("UPDATE usage_model_history SET total_tokens='5',input_tokens='5',total_dollars=0.000010,model_set_complete=0
+            WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6.1-sol'",rusqlite::params![reset,at]).unwrap();
+        drop(db);
+        let prepared = recorder
+            .writer
+            .prepare_period_attribution(&identity(), &intervals)
+            .unwrap();
+        let mut repair_inputs = None;
+        let repair = prepare_original_numerical_repair(
+            &mut recorder.writer,
+            &reconstruction,
+            OriginalQualificationInput {
+                source: &source,
+                checkpoint: &checkpoint,
+                accepted: &ranges,
+                binding: &binding,
+                prepared: &prepared,
+                ownership: Some(&ownership),
+                database: &database,
+                identity: &identity(),
+                repair_inputs: &mut repair_inputs,
+                budget: 0,
+            },
+        )
+        .unwrap();
+        recorder
+            .writer
+            .commit_historical_source_repairs(&prepared, &[repair])
+            .unwrap();
+        let db = Connection::open(&database).unwrap();
+        let actual: (String, Option<f64>, String, i64) = db
+            .query_row(
+                "SELECT total_tokens,total_dollars,price_version,model_set_complete
+            FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6.1-sol'",
+                rusqlite::params![reset, at],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            actual.0, "14",
+            "a proved 5+9 is independent of an unresolved earlier response"
+        );
+        assert_eq!(actual.1.unwrap().to_bits(), 0.000028_f64.to_bits());
+        assert_eq!(actual.2, saved_price);
+        assert_eq!(actual.3, 0);
+        assert_eq!(
+            db.query_row(
+                "SELECT remaining_percent FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                rusqlite::params![reset, at],
+                |row| row.get::<_, Option<f64>>(0)
+            )
+            .unwrap(),
+            Some(90.0)
+        );
+        let after = recorder
+            .writer
+            .source_events_for_qualification_repair(&checkpoint)
+            .unwrap();
+        assert!(after.contains(&unmatched));
+        assert!(old_counters.iter().all(|old| !after.contains(old)));
+        assert!(known.iter().all(|fact| after.contains(fact)));
+        let pending = recorder.writer.load_session_pending_ranges().unwrap();
+        let response_pending = pending
+            .iter()
+            .filter(|item| item.reason == "response-qualification-pending")
+            .collect::<Vec<_>>();
+        assert_eq!(response_pending.len(), 1);
+        assert_eq!(
+            response_pending[0].start_offset,
+            replay_state
+                .responses
+                .iter()
+                .find(|item| item.qualified_model().is_none())
+                .unwrap()
+                .pointer
+                .start
+        );
+        drop(db);
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

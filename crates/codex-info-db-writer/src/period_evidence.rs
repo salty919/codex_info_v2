@@ -790,12 +790,98 @@ pub(super) fn apply_reassignments(
     Ok(periods)
 }
 
-/// Rebuild both old and new suffixes from exact persisted membership. No
-/// negative token event or transfer of a different period's saved price occurs.
+/// Internal evidence distinguishes a source-derived partial projection from
+/// an independently retained absolute observation with the same quality flag.
+pub(super) const PROJECTION_ORIGIN_KEY: &str = "session_projection";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectionOrigin {
+    version: u8,
+    window_seconds: i64,
+    source_sha256: String,
+    value_sha256: String,
+}
+
+pub(super) fn valid_projection_origin(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<ProjectionOrigin>(value.clone()).is_ok_and(|origin| {
+        origin.version == 1
+            && (1..=crate::MAX_PUBLIC_UNIX_SECONDS).contains(&origin.window_seconds)
+            && crate::validate_data_hash(&origin.source_sha256).is_ok()
+            && crate::validate_data_hash(&origin.value_sha256).is_ok()
+    })
+}
+
+fn projection_origin(snapshot_json: &str) -> Result<Option<ProjectionOrigin>> {
+    let value = crate::validate_observation_json(snapshot_json)?;
+    value
+        .get(PROJECTION_ORIGIN_KEY)
+        .map(|origin| {
+            serde_json::from_value(origin.clone())
+                .map_err(|_| invalid("saved session projection origin is invalid"))
+        })
+        .transpose()
+}
+
+fn projection_value_sha256(
+    connection: &Connection,
+    reset: i64,
+    timestamp: i64,
+    models: &BTreeMap<String, crate::SavedModelPrice>,
+    source_sha256: &str,
+) -> Result<Option<String>> {
+    let fixed = connection
+        .query_row(
+            "SELECT sol_tokens,terra_tokens,luna_tokens,sol_dollars,terra_dollars,luna_dollars
+             FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+            params![reset, timestamp],
+            |row| {
+                Ok((
+                    [
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ],
+                    [
+                        row.get::<_, Option<f64>>(3)?.map(f64::to_bits),
+                        row.get::<_, Option<f64>>(4)?.map(f64::to_bits),
+                        row.get::<_, Option<f64>>(5)?.map(f64::to_bits),
+                    ],
+                ))
+            },
+        )
+        .optional()?;
+    let Some(fixed) = fixed else {
+        return Ok(None);
+    };
+    let models = models
+        .iter()
+        .map(|(model, saved)| {
+            (
+                model,
+                &saved.total_tokens,
+                &saved.input_tokens,
+                &saved.cached_input_tokens,
+                &saved.cache_write_input_tokens,
+                &saved.output_tokens,
+                saved.total_dollars.map(f64::to_bits),
+                &saved.price_version,
+            )
+        })
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&(reset, timestamp, fixed, models))
+        .map_err(|_| invalid("session projection value cannot be encoded"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-info-session-projection-value-v1\0");
+    hasher.update(source_sha256.as_bytes());
+    hasher.update(encoded);
+    Ok(Some(format!("{:x}", hasher.finalize())))
+}
 pub(super) struct OriginalProjectionPrice {
     models: BTreeMap<String, crate::SavedModelPrice>,
     fixed: [Option<f64>; 3],
     has_fixed_tokens: bool,
+    projection_origin: Option<ProjectionOrigin>,
 }
 
 pub(super) type OriginalProjectionPrices =
@@ -819,12 +905,45 @@ pub(super) fn capture_projection_prices(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (timestamp, fixed, has_fixed_tokens) in rows {
+            let models = crate::load_saved_model_prices(tx, period.0, timestamp)?;
+            let snapshot_json: Option<String> = tx
+                .query_row(
+                    "SELECT snapshot_json FROM durable_state WHERE singleton>=2 AND data_hash=?1
+                     AND CASE WHEN json_valid(snapshot_json)
+                         THEN json_type(snapshot_json,'$.session_projection') IS NOT NULL ELSE 0 END",
+                    [crate::observation_data_hash(period.0, timestamp)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let projection_origin = snapshot_json
+                .as_deref()
+                .map(projection_origin)
+                .transpose()?
+                .flatten();
+            let projection_origin = match projection_origin {
+                Some(origin)
+                    if origin.window_seconds == period.1
+                        && projection_value_sha256(
+                            tx,
+                            period.0,
+                            timestamp,
+                            &models,
+                            &origin.source_sha256,
+                        )?
+                        .as_deref()
+                            == Some(origin.value_sha256.as_str()) =>
+                {
+                    Some(origin)
+                }
+                _ => None,
+            };
             originals.insert(
                 timestamp,
                 OriginalProjectionPrice {
-                    models: crate::load_saved_model_prices(tx, period.0, timestamp)?,
+                    models,
                     fixed,
                     has_fixed_tokens,
+                    projection_origin,
                 },
             );
         }
@@ -867,14 +986,16 @@ pub(super) fn reproject_periods(
         if let Some(end) = retained_end {
             crate::mark_retained_history_models_unknown(tx, reset, end)?;
         }
-        let events = crate::source_events::read_matching(
+        let facts = crate::source_events::read_matching(
             tx,
             "WHERE reset_at=?1 AND window_seconds=?2 AND timestamp>=?3 AND timestamp<?1",
             params![reset, window, origin],
-        )?
-        .into_iter()
-        .map(SessionEvent::try_from)
-        .collect::<Result<Vec<_>>>()?;
+        )?;
+        let events = facts
+            .iter()
+            .cloned()
+            .map(SessionEvent::try_from)
+            .collect::<Result<Vec<_>>>()?;
         let mut targets = BTreeSet::new();
         let mut statement=tx.prepare("SELECT timestamp FROM usage_history WHERE reset_at=?1 AND timestamp>=?2 AND timestamp<?3 ORDER BY timestamp")?;
         for value in statement.query_map(params![reset, since.div_euclid(60) * 60, reset], |r| {
@@ -906,6 +1027,10 @@ pub(super) fn reproject_periods(
         let first_unqualified:Option<i64>=tx.query_row(&format!("SELECT min(timestamp) FROM {} WHERE timestamp>=?1 AND timestamp<?2 AND admission_json IS NULL",crate::source_qualification_repair::canonical_table(tx)?),params![origin,reset],|row|row.get(0))?;
         let mut prefix = Vec::new();
         let mut cursor = 0;
+        let mut source_hasher = Sha256::new();
+        source_hasher.update(b"codex-info-session-projection-source-v1\0");
+        source_hasher.update(reset.to_be_bytes());
+        source_hasher.update(window.to_be_bytes());
         for timestamp in targets {
             // This prefix still has an unretired legacy offset. An exact
             // proof for a later suffix cannot replace its saved numerics or
@@ -921,6 +1046,35 @@ pub(super) fn reproject_periods(
                     &[crate::event_model_total(&events[cursor])],
                 )
                 .ok_or(UsageStoreError::GenerationOverflow)?;
+                let fact = &facts[cursor];
+                let source = &fact.source;
+                let encoded = serde_json::to_vec(&(
+                    (
+                        &source.root_identity,
+                        &source.relative_path,
+                        source.file_device,
+                        source.file_inode,
+                        format!("{:032x}", source.prefix_generation),
+                        source.range_start,
+                        source.range_end,
+                        &source.record_sha256,
+                        source.event_index,
+                    ),
+                    fact.timestamp,
+                    &fact.model,
+                    (
+                        fact.tokens.total,
+                        fact.tokens.input,
+                        fact.tokens.cached_input,
+                        fact.tokens.cache_write_input,
+                        fact.tokens.output,
+                    ),
+                    &fact.period,
+                    &fact.admission,
+                ))
+                .map_err(|_| invalid("session projection source cannot be encoded"))?;
+                source_hasher.update((encoded.len() as u64).to_be_bytes());
+                source_hasher.update(encoded);
                 cursor += 1;
             }
             if canonical_scope.preserves_observation(reset, timestamp) {
@@ -952,6 +1106,11 @@ pub(super) fn reproject_periods(
                 })
                 .transpose()?
                 .flatten();
+            let previous_projection = previous
+                .as_ref()
+                .map(|(_, _, json)| projection_origin(json))
+                .transpose()?
+                .flatten();
             let previous = previous
                 .map(|(at, hash, json)| crate::observation_from_sql(at, hash, json))
                 .transpose()?;
@@ -960,6 +1119,27 @@ pub(super) fn reproject_periods(
             let current_saved = crate::load_saved_model_prices(tx, reset, timestamp)?;
             let original_period = original_prices.get(&(reset, window));
             let original = original_period.and_then(|period| period.get(&timestamp));
+            let origins = [
+                original.and_then(|old| old.projection_origin.as_ref()),
+                previous_projection.as_ref(),
+            ];
+            let mut owns_projection = false;
+            for origin in origins.into_iter().flatten() {
+                if origin.window_seconds == window
+                    && projection_value_sha256(
+                        tx,
+                        reset,
+                        timestamp,
+                        &current_saved,
+                        &origin.source_sha256,
+                    )?
+                    .as_deref()
+                        == Some(origin.value_sha256.as_str())
+                {
+                    owns_projection = true;
+                    break;
+                }
+            }
             if (original.is_some_and(|old| {
                 !old.models.is_empty()
                     || old.has_fixed_tokens
@@ -967,6 +1147,7 @@ pub(super) fn reproject_periods(
             }) || !current_saved.is_empty())
                 && first_unqualified
                     .is_some_and(|at| at <= timestamp.saturating_add(59).min(reset - 1))
+                && !owns_projection
             {
                 // A proof for one source cannot disprove saved contributions
                 // from another source whose original qualification is absent.
@@ -1123,6 +1304,41 @@ pub(super) fn reproject_periods(
                 .map(|at| BTreeMap::from([((reset, timestamp), at)]))
                 .unwrap_or_default();
             crate::upsert_observations_with_sources(tx, &[observation], &timestamps)?;
+            let saved = crate::load_saved_model_prices(tx, reset, timestamp)?;
+            if saved.len() != prefix.len()
+                || !prefix.iter().all(|total| {
+                    saved
+                        .get(&total.model)
+                        .is_some_and(|model| same_saved_usage(total, model))
+                })
+            {
+                continue;
+            }
+            let source_sha256 = format!("{:x}", source_hasher.clone().finalize());
+            let Some(value_sha256) =
+                projection_value_sha256(tx, reset, timestamp, &saved, &source_sha256)?
+            else {
+                continue;
+            };
+            let origin = ProjectionOrigin {
+                version: 1,
+                window_seconds: window,
+                source_sha256,
+                value_sha256,
+            };
+            let encoded = serde_json::to_string(&origin)
+                .map_err(|_| invalid("session projection origin cannot be encoded"))?;
+            tx.execute(
+                "UPDATE durable_state SET snapshot_json=json_set(snapshot_json,'$.session_projection',json(?1))
+                 WHERE singleton>=2 AND data_hash=?2",
+                params![encoded, crate::observation_data_hash(reset, timestamp)],
+            )?;
+            let json: String = tx.query_row(
+                "SELECT snapshot_json FROM durable_state WHERE singleton>=2 AND data_hash=?1",
+                [crate::observation_data_hash(reset, timestamp)],
+                |row| row.get(0),
+            )?;
+            crate::validate_observation_json(&json)?;
         }
     }
     Ok(())

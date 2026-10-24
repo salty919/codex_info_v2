@@ -2392,6 +2392,207 @@ fn validate_session_key(root_identity: &str, relative_path: &str) -> Result<()> 
     .validate()
 }
 
+// Decode and validate only the caller-selected stored checkpoint inventory.
+// Normal collection passes no filter; a sealed source repair selects every
+// generation of its old/new physical sources without parsing unrelated state.
+fn load_session_checkpoints_matching<P: rusqlite::Params>(
+    connection: &Connection,
+    filter: &str,
+    parameters: P,
+) -> Result<Vec<SessionCheckpoint>> {
+    let task_running_column = if session_checkpoint_running_column_present(connection)? {
+        "last_task_running"
+    } else {
+        // A read-only resident can reach the legacy partition before
+        // its serialized writer performs the migration. Preserve the
+        // unknown state without making that read depend on a column
+        // which does not exist yet.
+        "NULL"
+    };
+    let context_usage_column =
+        if cache_write_column_present(connection, "session_checkpoints", "context_usage_tokens")? {
+            "context_usage_tokens"
+        } else {
+            "NULL"
+        };
+    let context_window_column = if cache_write_column_present(
+        connection,
+        "session_checkpoints",
+        "context_window_tokens",
+    )? {
+        "context_window_tokens"
+    } else {
+        "NULL"
+    };
+    let checkpoint_query = format!(
+        "SELECT root_identity, relative_path, file_device, file_inode,
+                committed_offset, discard_until_lf, collector_epoch, cycle_seq,
+                prefix_generation, prefix_sha256, fully_attributed_from_zero,
+                token_baseline_known, {history_base_column}, last_model,
+                {task_running_column}, {context_usage_column},
+                {context_window_column}, previous_total, previous_input,
+                previous_cached_input, previous_output, {cache_write_column}, {model_context_kind_column}, {model_interval_column}, {source_admission_column}
+         FROM session_checkpoints {filter}
+         ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation",
+        history_base_column = if session_checkpoint_history_base_column_present(connection)? {
+            "history_base_pending"
+        } else {
+            "0"
+        },
+        model_context_kind_column = if cache_write_column_present(
+            connection,
+            "session_checkpoints",
+            "last_model_context_kind"
+        )? {
+            "last_model_context_kind"
+        } else {
+            "NULL"
+        },
+        model_interval_column = if cache_write_column_present(
+            connection, "session_checkpoints", "last_model_interval"
+        )? { "last_model_interval" } else { "NULL" },
+        source_admission_column = if cache_write_column_present(
+            connection, "session_checkpoints", "source_admission"
+        )? { "source_admission" } else { "NULL" },
+        cache_write_column = if cache_write_column_present(
+            connection,
+            "session_checkpoints",
+            "previous_cache_write_input"
+        )? {
+            "previous_cache_write_input"
+        } else {
+            "NULL"
+        }
+    );
+    let checkpoints = {
+        let mut checkpoint_statement = connection.prepare(&checkpoint_query)?;
+        let rows = checkpoint_statement.query_map(parameters, |row| {
+            let committed_offset = row.get::<_, i64>(4)?;
+            let collector_epoch = row.get::<_, String>(6)?;
+            let cycle_seq = row.get::<_, String>(7)?;
+            let cycle_seq = cycle_seq
+                .parse::<u64>()
+                .ok()
+                .filter(|parsed| parsed.to_string() == cycle_seq)
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            let context_usage_tokens = row
+                .get::<_, Option<String>>(15)?
+                .map(|text| {
+                    text.parse::<u64>()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)
+                })
+                .transpose()?;
+            let context_window_tokens = row
+                .get::<_, Option<String>>(16)?
+                .map(|text| {
+                    text.parse::<u64>()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)
+                })
+                .transpose()?;
+            let (context_usage_tokens, context_window_tokens) =
+                canonical_context_pair(context_usage_tokens, context_window_tokens);
+            Ok(SessionCheckpoint {
+                root_identity: row.get(0)?,
+                relative_path: row.get(1)?,
+                file_device: row
+                    .get::<_, String>(2)?
+                    .parse()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                file_inode: row
+                    .get::<_, String>(3)?
+                    .parse()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                committed_offset: u64::try_from(committed_offset)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                discard_until_lf: row.get::<_, i64>(5)? == 1,
+                collector_epoch: u128::from_str_radix(&collector_epoch, 16)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                cycle_seq,
+                prefix_generation: u128::from_str_radix(&row.get::<_, String>(8)?, 16)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                prefix_sha256: row.get(9)?,
+                fully_attributed_from_zero: row.get::<_, i64>(10)? == 1,
+                token_baseline_known: row.get::<_, i64>(11)? == 1,
+                history_base_pending: row.get::<_, i64>(12)? == 1,
+                last_model: row.get(13)?,
+                last_model_context_kind: row
+                    .get::<_, Option<String>>(22)?
+                    .as_deref()
+                    .map(|value| {
+                        SessionModelContextKind::parse(value).ok_or(rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?,
+                last_model_interval: row
+                    .get::<_, Option<String>>(23)?
+                    .as_deref()
+                    .map(|value| {
+                        SessionModelInterval::parse(value).ok_or(rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?,
+                source_admission: row
+                    .get::<_, Option<String>>(24)?
+                    .map(|value| {
+                        source_admission::SourceAdmission::from_storage(
+                            &value,
+                            committed_offset as u64,
+                        )
+                        .ok_or(rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?,
+                last_task_running: match row.get::<_, Option<i64>>(14)? {
+                    None => None,
+                    Some(0) => Some(false),
+                    Some(1) => Some(true),
+                    Some(_) => return Err(rusqlite::Error::InvalidQuery),
+                },
+                context_usage_tokens,
+                context_window_tokens,
+                previous_total: row
+                    .get::<_, Option<String>>(17)?
+                    .map(|text| {
+                        canonical_u64_text(&text, "checkpoint previous_total")
+                            .map_err(|_| rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?,
+                previous_input: row
+                    .get::<_, Option<String>>(18)?
+                    .map(|text| {
+                        canonical_u64_text(&text, "checkpoint previous_input")
+                            .map_err(|_| rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?,
+                previous_cached_input: row
+                    .get::<_, Option<String>>(19)?
+                    .map(|text| {
+                        canonical_u64_text(&text, "checkpoint previous_cached_input")
+                            .map_err(|_| rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?,
+                previous_output: row
+                    .get::<_, Option<String>>(20)?
+                    .map(|text| {
+                        canonical_u64_text(&text, "checkpoint previous_output")
+                            .map_err(|_| rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?,
+                previous_cache_write_input: row
+                    .get::<_, Option<String>>(21)?
+                    .map(|text| {
+                        text.parse::<u64>()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for checkpoint in &checkpoints {
+        validate_session_checkpoint(checkpoint)?;
+    }
+    validate_source_binding_partitions(connection, &checkpoints)?;
+    Ok(checkpoints)
+}
+
 fn validate_session_checkpoint(checkpoint: &SessionCheckpoint) -> Result<()> {
     validate_session_key(&checkpoint.root_identity, &checkpoint.relative_path)?;
     if checkpoint.committed_offset > i64::MAX as u64
@@ -8612,7 +8813,19 @@ fn validate_observation_json(snapshot_json: &str) -> Result<serde_json::Value> {
     let object = value.as_object().ok_or_else(|| {
         UsageStoreError::InvalidDurableRecord("observation JSON must be an object".into())
     })?;
-    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if object
+        .get(period_evidence::PROJECTION_ORIGIN_KEY)
+        .is_some_and(|origin| !period_evidence::valid_projection_origin(origin))
+    {
+        return Err(UsageStoreError::InvalidDurableRecord(
+            "observation session projection origin is invalid".into(),
+        ));
+    }
+    let actual = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| *key != period_evidence::PROJECTION_ORIGIN_KEY)
+        .collect::<BTreeSet<_>>();
     let expected = OBSERVATION_JSON_KEYS
         .iter()
         .copied()
@@ -12363,200 +12576,7 @@ impl UsageStore {
                 "durable session quota deadline is invalid".into(),
             ));
         }
-        let task_running_column = if session_checkpoint_running_column_present(&transaction)? {
-            "last_task_running"
-        } else {
-            // A read-only resident can reach the legacy partition before
-            // its serialized writer performs the migration. Preserve the
-            // unknown state without making that read depend on a column
-            // which does not exist yet.
-            "NULL"
-        };
-        let context_usage_column = if cache_write_column_present(
-            &transaction,
-            "session_checkpoints",
-            "context_usage_tokens",
-        )? {
-            "context_usage_tokens"
-        } else {
-            "NULL"
-        };
-        let context_window_column = if cache_write_column_present(
-            &transaction,
-            "session_checkpoints",
-            "context_window_tokens",
-        )? {
-            "context_window_tokens"
-        } else {
-            "NULL"
-        };
-        let checkpoint_query = format!(
-            "SELECT root_identity, relative_path, file_device, file_inode,
-                    committed_offset, discard_until_lf, collector_epoch, cycle_seq,
-                    prefix_generation, prefix_sha256, fully_attributed_from_zero,
-                    token_baseline_known, {history_base_column}, last_model,
-                    {task_running_column}, {context_usage_column},
-                    {context_window_column}, previous_total, previous_input,
-                    previous_cached_input, previous_output, {cache_write_column}, {model_context_kind_column}, {model_interval_column}, {source_admission_column}
-             FROM session_checkpoints
-             ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation",
-            history_base_column = if session_checkpoint_history_base_column_present(&transaction)? {
-                "history_base_pending"
-            } else {
-                "0"
-            },
-            model_context_kind_column = if cache_write_column_present(
-                &transaction,
-                "session_checkpoints",
-                "last_model_context_kind"
-            )? {
-                "last_model_context_kind"
-            } else {
-                "NULL"
-            },
-            model_interval_column = if cache_write_column_present(
-                &transaction, "session_checkpoints", "last_model_interval"
-            )? { "last_model_interval" } else { "NULL" },
-            source_admission_column = if cache_write_column_present(
-                &transaction, "session_checkpoints", "source_admission"
-            )? { "source_admission" } else { "NULL" },
-            cache_write_column = if cache_write_column_present(
-                &transaction,
-                "session_checkpoints",
-                "previous_cache_write_input"
-            )? {
-                "previous_cache_write_input"
-            } else {
-                "NULL"
-            }
-        );
-        let checkpoints = {
-            let mut checkpoint_statement = transaction.prepare(&checkpoint_query)?;
-            let rows = checkpoint_statement.query_map([], |row| {
-                let committed_offset = row.get::<_, i64>(4)?;
-                let collector_epoch = row.get::<_, String>(6)?;
-                let cycle_seq = row.get::<_, String>(7)?;
-                let cycle_seq = cycle_seq
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|parsed| parsed.to_string() == cycle_seq)
-                    .ok_or(rusqlite::Error::InvalidQuery)?;
-                let context_usage_tokens = row
-                    .get::<_, Option<String>>(15)?
-                    .map(|text| {
-                        text.parse::<u64>()
-                            .map_err(|_| rusqlite::Error::InvalidQuery)
-                    })
-                    .transpose()?;
-                let context_window_tokens = row
-                    .get::<_, Option<String>>(16)?
-                    .map(|text| {
-                        text.parse::<u64>()
-                            .map_err(|_| rusqlite::Error::InvalidQuery)
-                    })
-                    .transpose()?;
-                let (context_usage_tokens, context_window_tokens) =
-                    canonical_context_pair(context_usage_tokens, context_window_tokens);
-                Ok(SessionCheckpoint {
-                    root_identity: row.get(0)?,
-                    relative_path: row.get(1)?,
-                    file_device: row
-                        .get::<_, String>(2)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    file_inode: row
-                        .get::<_, String>(3)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    committed_offset: u64::try_from(committed_offset)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    discard_until_lf: row.get::<_, i64>(5)? == 1,
-                    collector_epoch: u128::from_str_radix(&collector_epoch, 16)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    cycle_seq,
-                    prefix_generation: u128::from_str_radix(&row.get::<_, String>(8)?, 16)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    prefix_sha256: row.get(9)?,
-                    fully_attributed_from_zero: row.get::<_, i64>(10)? == 1,
-                    token_baseline_known: row.get::<_, i64>(11)? == 1,
-                    history_base_pending: row.get::<_, i64>(12)? == 1,
-                    last_model: row.get(13)?,
-                    last_model_context_kind: row
-                        .get::<_, Option<String>>(22)?
-                        .as_deref()
-                        .map(|value| {
-                            SessionModelContextKind::parse(value)
-                                .ok_or(rusqlite::Error::InvalidQuery)
-                        })
-                        .transpose()?,
-                    last_model_interval: row
-                        .get::<_, Option<String>>(23)?
-                        .as_deref()
-                        .map(|value| {
-                            SessionModelInterval::parse(value).ok_or(rusqlite::Error::InvalidQuery)
-                        })
-                        .transpose()?,
-                    source_admission: row
-                        .get::<_, Option<String>>(24)?
-                        .map(|value| {
-                            source_admission::SourceAdmission::from_storage(
-                                &value,
-                                committed_offset as u64,
-                            )
-                            .ok_or(rusqlite::Error::InvalidQuery)
-                        })
-                        .transpose()?,
-                    last_task_running: match row.get::<_, Option<i64>>(14)? {
-                        None => None,
-                        Some(0) => Some(false),
-                        Some(1) => Some(true),
-                        Some(_) => return Err(rusqlite::Error::InvalidQuery),
-                    },
-                    context_usage_tokens,
-                    context_window_tokens,
-                    previous_total: row
-                        .get::<_, Option<String>>(17)?
-                        .map(|text| {
-                            canonical_u64_text(&text, "checkpoint previous_total")
-                                .map_err(|_| rusqlite::Error::InvalidQuery)
-                        })
-                        .transpose()?,
-                    previous_input: row
-                        .get::<_, Option<String>>(18)?
-                        .map(|text| {
-                            canonical_u64_text(&text, "checkpoint previous_input")
-                                .map_err(|_| rusqlite::Error::InvalidQuery)
-                        })
-                        .transpose()?,
-                    previous_cached_input: row
-                        .get::<_, Option<String>>(19)?
-                        .map(|text| {
-                            canonical_u64_text(&text, "checkpoint previous_cached_input")
-                                .map_err(|_| rusqlite::Error::InvalidQuery)
-                        })
-                        .transpose()?,
-                    previous_output: row
-                        .get::<_, Option<String>>(20)?
-                        .map(|text| {
-                            canonical_u64_text(&text, "checkpoint previous_output")
-                                .map_err(|_| rusqlite::Error::InvalidQuery)
-                        })
-                        .transpose()?,
-                    previous_cache_write_input: row
-                        .get::<_, Option<String>>(21)?
-                        .map(|text| {
-                            text.parse::<u64>()
-                                .map_err(|_| rusqlite::Error::InvalidQuery)
-                        })
-                        .transpose()?,
-                })
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for checkpoint in &checkpoints {
-            validate_session_checkpoint(checkpoint)?;
-        }
-        validate_source_binding_partitions(&transaction, &checkpoints)?;
+        let checkpoints = load_session_checkpoints_matching(&transaction, "", [])?;
 
         let model_totals = {
             let write_column = if cache_write_column_present(
@@ -18186,6 +18206,205 @@ mod tests {
     }
 
     #[test]
+    fn issue676_partial_projection_adds_newly_qualified_source() {
+        use crate::period_evidence::OfficialQuotaInput;
+
+        const AT: i64 = 1_791_871_200;
+        const RESET: i64 = AT + 100;
+        const MODEL: &str = "gpt-6.1-sol";
+        // Two independent original counter deltas: 15-10=5 and 29-20=9.
+        // At AT the saved model tariff is $2 / million ordinary input tokens:
+        // the known partial prefix is 14 tokens and $0.000028. The pending
+        // third source contributes no qualified numeric fact or zero claim.
+        const FOURTEEN_INPUT_DOLLARS: f64 = 0.000028;
+        const PRICE_REVISION: &str = "1791430564-183968cc652f6276";
+        let path = database_path("issue676-partial-source-addition");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let intervals = [SessionLifecycleInterval::new(Some(AT), None)];
+        let sessions = path.parent().unwrap().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        store
+            .stage_official_quota_inputs(
+                &[(1_u64, AT + 2), (2, AT + 10)]
+                    .into_iter()
+                    .map(|(sequence, observed_at)| OfficialQuotaInput {
+                        input_id: format!("{sequence:064x}"),
+                        account_scope: identity.account_scope_id.clone(),
+                        sequence,
+                        observed_at,
+                        content_sha256: format!("{sequence:064x}"),
+                        reset_at: Some(RESET),
+                        window_seconds: Some(200),
+                        reason: None,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        for (relative, inode, at, tokens) in [
+            ("one.jsonl", 42, AT + 3, 5),
+            ("two.jsonl", 43, AT + 4, 9),
+            ("pending.jsonl", 44, AT + 5, 7),
+        ] {
+            store.connection.execute(
+                "INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20',?1,'10',?2,?3,0,100,?4,0,?5,?6,?7,?7,'0','0','0',NULL)",
+                params![relative,inode.to_string(),format!("{:032x}",0x5678_u128),"00".repeat(32),at,MODEL,tokens.to_string()],
+            ).unwrap();
+        }
+        let before = read_session_event_facts(&store.connection).unwrap();
+        let pending = before
+            .iter()
+            .find(|fact| fact.source.relative_path == "pending.jsonl")
+            .unwrap()
+            .clone();
+        store
+            .connection
+            .execute(
+                "INSERT INTO usage_history(timestamp,reset_at,remaining_percent) VALUES(?1,?2,90)",
+                params![AT, RESET],
+            )
+            .unwrap();
+        let tx = store.connection.transaction().unwrap();
+        let mut unknown = UsageHistoryObservation::unavailable(AT, RESET, Some(90.0));
+        unknown.model_source = ModelSource::LegacyUnknown;
+        upsert_observations(&tx, &[unknown]).unwrap();
+        tx.commit().unwrap();
+
+        for (cycle, relative, before_tokens, after_tokens, known_total) in [
+            (1_u64, "one.jsonl", 10_u64, 15_u64, 5_u64),
+            (2, "two.jsonl", 20, 29, 14),
+        ] {
+            let prepared = store
+                .prepare_period_attribution(&identity, &intervals)
+                .unwrap();
+            let mut fact = before
+                .iter()
+                .find(|fact| fact.source.relative_path == relative)
+                .unwrap()
+                .clone();
+            let mut binding = issue604_source_binding_json()["account_binding"].clone();
+            binding["relative_path"] = serde_json::json!(relative);
+            binding["file_inode"] = serde_json::json!(fact.source.file_inode);
+            let witness = |start, end, at, total| {
+                serde_json::json!({
+                    "pointer":{"start":start,"end":end,"sha256":"22".repeat(32),"timestamp":at},
+                    "total":total,"input":total,"cached_input":0,"cache_write_input":0,"output":0
+                })
+            };
+            fact.admission = Some(
+                serde_json::from_value(serde_json::json!({
+                    "version":1,"source_binding":binding,
+                    "verified_prefix_end":100,"ownership":{"start_at":AT,"end_at":null},
+                    "numeric":{"kind":"legacy-counter",
+                        "before":witness(10,20,AT+2,before_tokens),
+                        "after":witness(20,30,fact.timestamp,after_tokens),
+                        "model_context":{"pointer":{"start":0,"end":10,"sha256":"33".repeat(32)},
+                            "kind":"turn","interval":"none"}},
+                    "period":null
+                }))
+                .unwrap(),
+            );
+            prepared.assign(&mut fact).unwrap();
+            assert_eq!(fact.period.unwrap().reset_at, RESET);
+            let raw = SessionEvent::try_from(fact.clone()).unwrap();
+            let range = SessionRange {
+                root_identity: raw.root_identity.clone(),
+                relative_path: raw.relative_path.clone(),
+                file_device: raw.file_device,
+                file_inode: raw.file_inode,
+                start_offset: raw.range_start,
+                end_offset: raw.range_end,
+                collector_epoch: 1,
+                cycle_seq: cycle,
+                prefix_generation: raw.prefix_generation,
+                record_sha256: raw.record_sha256.clone(),
+            };
+            let totals = [SessionModelTotal {
+                model: MODEL.into(),
+                total_tokens: known_total,
+                input_tokens: Some(known_total),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(0),
+                cache_write_input_tokens: Some(0),
+            }];
+            store
+                .commit_session_collection_with_source_event_facts(
+                    SessionCollectionCommit {
+                        reset_at: RESET,
+                        window_seconds: 200,
+                        collector_epoch: 1,
+                        cycle_seq: cycle,
+                        samples: &[],
+                        checkpoints: &[],
+                        ranges: &[range],
+                        model_totals: &totals,
+                        recorded_sessions: &[],
+                    },
+                    &[],
+                    RESET,
+                    SessionSourceCommitEvidence {
+                        task: SessionTaskEvidenceInput {
+                            events: &[raw],
+                            pending_ranges: &[],
+                            token_anchor_recoveries: &[],
+                            token_anchor_resolutions: &[],
+                            task_events: &[],
+                            task_indexed_ranges: &[],
+                        },
+                        timeline_recovery: None,
+                        exact_history_span: None,
+                        sessions_root: &sessions,
+                        lifecycle_intervals: &intervals,
+                    },
+                    SessionEventCommitEvidence {
+                        source_repairs: &[],
+                        events: &[fact],
+                        period_attribution: Some(&prepared),
+                        response_replays: &[],
+                    },
+                )
+                .unwrap();
+            let saved: (String, i64, Option<f64>, Option<String>) = store
+                .connection
+                .query_row(
+                    "SELECT total_tokens,model_set_complete,total_dollars,price_version FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model=?3",
+                    params![RESET, AT, MODEL],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                saved.1, 0,
+                "the unqualified peer cannot establish a complete model set"
+            );
+            assert_eq!(
+                saved.0,
+                known_total.to_string(),
+                "the same quota-only-origin minute must include every newly qualified independent source"
+            );
+            if cycle == 2 {
+                assert_eq!(saved.2, Some(FOURTEEN_INPUT_DOLLARS));
+                assert_eq!(saved.3.as_deref(), Some(PRICE_REVISION));
+                let remaining: Option<f64> = store.connection.query_row(
+                    "SELECT remaining_percent FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                    params![RESET,AT], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(remaining, Some(90.0));
+            }
+            assert_eq!(
+                read_session_event_facts(&store.connection)
+                    .unwrap()
+                    .into_iter()
+                    .find(|fact| fact.source.relative_path == "pending.jsonl")
+                    .unwrap(),
+                pending,
+                "the unqualified source remains an unchanged original fact"
+            );
+        }
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
     fn issue604_normal_replay_preserves_original_admission_when_official_support_expands() {
         verify_official_evidence_saved_prices(true, false, false, false, true, false);
     }
@@ -19201,6 +19420,296 @@ mod tests {
             snapshot_loads, 1,
             "two previous-point lookups share one validated snapshot"
         );
+        drop(reopened);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn issue676_event_bijection_retires_only_the_proved_counter_time() {
+        issue676_counter_time_bijection_case(false);
+    }
+
+    #[test]
+    fn issue676_event_bijection_scopes_checkpoint_qualification() {
+        issue676_counter_time_bijection_case(true);
+    }
+
+    fn issue676_counter_time_bijection_case(with_unrelated_checkpoint: bool) {
+        const AT: i64 = 1_791_871_200;
+        let path = database_path("issue676-counter-time-bijection");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let binding = issue604_source_binding_json();
+        let pointer = |start, end, at| serde_json::json!({"start":start,"end":end,"timestamp":at,"sha256":"22".repeat(32)});
+        let ids = source_admission::ResponseIds {
+            thread_id: "binding-thread".into(),
+            session_id: "binding-session".into(),
+            root_turn_id: "root-turn".into(),
+            turn_id: "turn".into(),
+            response_id: "one-completed-response".into(),
+        };
+        let usage = serde_json::json!({"total":5,"input":4,"cached_input":1,"cache_write_input":0,"output":1,"reasoning_output":1});
+        let candidate = serde_json::json!({"key":ids.key(),"record":{"ids":ids,"usage":usage,"turn_usage":usage,"thread_usage":usage},
+            "pointer":pointer(20,30,AT+3),"session_scope_qualified":true,
+            "root_context":{"model":"gpt-6.1-sol","context":{"turn_id":"turn","root_turn_id":"root-turn","pointer":pointer(0,10,AT+1)}},
+            "classification":{"state":"normal","boundary":{"kind":"record","pointer":{"start":30,"end":40,"sha256":"22".repeat(32)}}},
+            "counter_association":{"state":"matched","pointer":pointer(30,40,AT+4),"last":usage,"snapshot":null}});
+        let mut checkpoints = Vec::new();
+        for inode in [42_u64, 99] {
+            let source = RecordedSessionSource {
+                root_identity: "unix:10:20".into(),
+                relative_path: "one.jsonl".into(),
+                file_device: 10,
+                file_inode: inode,
+                file_bytes: 100,
+                modified_nanos: 1,
+            };
+            let mut cp = checkpoint(&source, 100);
+            if inode == 99 {
+                let mut state = binding.clone();
+                state["stream"] = serde_json::json!("response-record");
+                state["account_binding"]["file_inode"] = serde_json::json!(inode);
+                state["responses"] = serde_json::json!([candidate]);
+                cp.source_admission = Some(serde_json::from_value(state).unwrap());
+            }
+            validate_session_checkpoint(&cp).unwrap();
+            store.connection.execute("INSERT INTO session_checkpoints(root_identity,relative_path,file_device,file_inode,committed_offset,discard_until_lf,collector_epoch,cycle_seq,prefix_generation,prefix_sha256,fully_attributed_from_zero,token_baseline_known,history_base_pending,last_model,previous_total,previous_input,previous_cached_input,previous_output,source_admission) VALUES('unix:10:20','one.jsonl','10',?1,100,0,?2,'1',?3,?4,1,1,0,'SOL','20','12','2','8',?5)",
+                params![inode.to_string(),format!("{:032x}",0x1234),format!("{:032x}",0x5678),"00".repeat(32),cp.source_admission.as_ref().map(|s|s.to_storage().unwrap())]).unwrap();
+            store.connection.execute("INSERT INTO session_ranges VALUES('unix:10:20','one.jsonl','10',?1,0,100,?2,'1',?3,?4)",
+                params![inode.to_string(),format!("{:032x}",0x1234),format!("{:032x}",0x5678),"00".repeat(32)]).unwrap();
+            checkpoints.push(cp);
+        }
+        if with_unrelated_checkpoint {
+            store.connection.execute("INSERT INTO session_checkpoints(root_identity,relative_path,file_device,file_inode,committed_offset,discard_until_lf,collector_epoch,cycle_seq,prefix_generation,prefix_sha256,fully_attributed_from_zero,token_baseline_known,history_base_pending,last_model,previous_total,previous_input,previous_cached_input,previous_output,source_admission) VALUES('unix:10:20','unrelated.jsonl','10','777',100,0,?1,'1',?2,?3,1,1,0,'SOL','20','12','2','8',?4)",
+                params![format!("{:032x}",0x1234),format!("{:032x}",0x5678),"00".repeat(32),r#"{"version":2}"#]).unwrap();
+            assert!(matches!(store.load_session_collection_state(),
+                Err(UsageStoreError::Sqlite(rusqlite::Error::InvalidQuery))),
+                "ordinary whole-account state must still reject the unrelated malformed saved admission");
+        }
+        store.connection.execute("INSERT INTO session_events VALUES('unix:10:20','one.jsonl','10','42',?1,0,100,?2,0,?3,'gpt-6.1-sol','5','4','1','1','0',NULL,NULL,NULL)",
+            params![format!("{:032x}",0x5678),"00".repeat(32),AT+4]).unwrap();
+        store.connection.execute("INSERT INTO usage_history(timestamp,reset_at,remaining_percent,sol_dollars,terra_dollars,luna_dollars,sol_tokens,terra_tokens,luna_tokens) VALUES(?1,?2,90,0,0,0,0,0,0)",
+            params![AT,AT+100]).unwrap();
+        let price = 0.123_456_789_012_345_66_f64;
+        store.connection.execute("INSERT INTO usage_model_history(reset_at,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,model_set_complete,total_dollars,price_version) VALUES(?1,?2,'gpt-6.1-sol','5','4','1','1','0',0,?3,'saved-price-version')",
+            params![AT+100,AT,price]).unwrap();
+        let original = read_session_event_facts(&store.connection).unwrap();
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].timestamp, AT + 4);
+        assert!(original[0].admission.is_none());
+        let mut admission = serde_json::json!({"version":1,"source_binding":binding["account_binding"],
+            "verified_prefix_end":100,"ownership":{"start_at":AT,"end_at":null},"period":null,
+            "numeric":{"kind":"response-record","candidate":candidate}});
+        admission["source_binding"]["file_inode"] = serde_json::json!(99);
+        let mut proposed = original[0].clone();
+        proposed.source.file_inode = 99;
+        proposed.source.event_index = 20;
+        proposed.timestamp = AT + 3;
+        proposed.admission = Some(serde_json::from_value(admission).unwrap());
+        assert!(proposed
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&proposed, None));
+        // These are the parser's existing immutable numerical records, not a
+        // new repair-side token ledger or a timestamp tolerance.
+        let numeric = serde_json::json!({"pointer":{"start":30,"end":40,"sha256":"22".repeat(32)},
+            "timestamp":AT+4,"before":{"total":10,"input":8,"cached_input":2,"cache_write_input":0,"output":2},
+            "raw":{"total":15,"input":12,"cached_input":3,"cache_write_input":0,"output":3},
+            "outcome":"checked-counter-delta"});
+        let prefix = SourceEquivalencePrefix {
+            checkpoint: checkpoints[1].clone(),
+            verification_checkpoint: checkpoints[1].clone(),
+            ranges: store
+                .load_session_ranges_for_checkpoint(&checkpoints[1])
+                .unwrap(),
+            qualified_events: vec![proposed],
+            numeric_records: vec![numeric],
+            parser_version: "codex-info-session-recorder-v3".into(),
+        };
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 3).unwrap();
+        let inputs = store.prepare_source_repair_inputs(backup).unwrap();
+        for fault in [
+            "no-association",
+            "different-counter-time",
+            "different-delta",
+            "duplicate-counter",
+            "outside-owner",
+        ] {
+            let mut altered = prefix.clone();
+            match fault {
+                "no-association" | "different-counter-time" => {
+                    let event_admission::NumericEventProof::ResponseRecord { candidate, .. } =
+                        &mut altered.qualified_events[0]
+                            .admission
+                            .as_mut()
+                            .unwrap()
+                            .numeric
+                    else {
+                        unreachable!()
+                    };
+                    if fault == "no-association" {
+                        candidate.counter_association =
+                            source_admission::ResponseCounterAssociation::LegacyUnknown;
+                    } else if let source_admission::ResponseCounterAssociation::Matched {
+                        pointer,
+                        ..
+                    } = &mut candidate.counter_association
+                    {
+                        pointer.timestamp += 1;
+                    }
+                    altered
+                        .verification_checkpoint
+                        .source_admission
+                        .as_mut()
+                        .unwrap()
+                        .responses[0] = (**candidate).clone();
+                }
+                "different-delta" => {
+                    altered.numeric_records[0]["raw"]["total"] = serde_json::json!(16);
+                    altered.numeric_records[0]["raw"]["input"] = serde_json::json!(13);
+                }
+                "duplicate-counter" => altered
+                    .numeric_records
+                    .push(altered.numeric_records[0].clone()),
+                "outside-owner" => {
+                    altered.qualified_events[0]
+                        .admission
+                        .as_mut()
+                        .unwrap()
+                        .ownership
+                        .end_at = Some(AT + 4)
+                }
+                _ => unreachable!(),
+            }
+            validate_session_checkpoint(&altered.verification_checkpoint).unwrap();
+            assert!(
+                altered.qualified_events[0]
+                    .admission
+                    .as_ref()
+                    .unwrap()
+                    .valid_for(&altered.qualified_events[0], None),
+                "independently valid fixture: {fault}"
+            );
+            assert!(
+                store
+                    .prepare_source_equivalence(
+                        SourceEquivalenceMode::EventBijection,
+                        &checkpoints[0],
+                        vec![altered],
+                        inputs.clone()
+                    )
+                    .is_err(),
+                "unproved bridge accepted: {fault}"
+            );
+            assert_eq!(
+                read_session_event_facts(&store.connection).unwrap(),
+                original
+            );
+        }
+        if with_unrelated_checkpoint {
+            let mut stale = prefix.clone();
+            stale.checkpoint.last_task_running = Some(true);
+            assert!(
+                store
+                    .prepare_source_equivalence(
+                        SourceEquivalenceMode::EventBijection,
+                        &checkpoints[0],
+                        vec![stale],
+                        inputs.clone()
+                    )
+                    .is_err(),
+                "the independently selected checkpoint must still match every stored field"
+            );
+            store.connection.execute("INSERT INTO session_checkpoints(root_identity,relative_path,file_device,file_inode,committed_offset,discard_until_lf,collector_epoch,cycle_seq,prefix_generation,prefix_sha256,fully_attributed_from_zero,token_baseline_known,history_base_pending,last_model,previous_total,previous_input,previous_cached_input,previous_output,source_admission) VALUES('unix:10:20','one.jsonl','10','42',100,0,?1,'1',?2,?3,1,1,0,'SOL','20','12','2','8',?4)",
+                params![format!("{:032x}",0x1234),format!("{:032x}",0x5679),"00".repeat(32),r#"{"version":2}"#]).unwrap();
+            assert!(
+                store
+                    .prepare_source_equivalence(
+                        SourceEquivalenceMode::EventBijection,
+                        &checkpoints[0],
+                        vec![prefix.clone()],
+                        inputs.clone()
+                    )
+                    .is_err(),
+                "every generation of the selected old physical source remains qualified and fenced"
+            );
+            store.connection.execute("DELETE FROM session_checkpoints WHERE relative_path='one.jsonl' AND file_inode='42' AND prefix_generation=?1",
+                [format!("{:032x}",0x5679)]).unwrap();
+        }
+        let repair = store
+            .prepare_source_equivalence(
+                SourceEquivalenceMode::EventBijection,
+                &checkpoints[0],
+                vec![prefix],
+                inputs,
+            )
+            .expect("the exact matched counter proves the old event belongs to this root response");
+        let intervals = [SessionLifecycleInterval::new(Some(AT), None)];
+        let period = store
+            .prepare_period_attribution(&identity, &intervals)
+            .unwrap();
+        store
+            .commit_historical_source_repairs(&period, std::slice::from_ref(&repair))
+            .unwrap();
+        let physical = store
+            .source_physical_event_inventory(&checkpoints[0])
+            .unwrap();
+        assert_eq!(
+            physical, original,
+            "retirement must retain the old raw key/time/value"
+        );
+        let canonical = store.load_session_events().unwrap();
+        assert_eq!(
+            canonical.len(),
+            1,
+            "counter and response are the same single consumption"
+        );
+        assert_eq!(canonical[0].timestamp, AT + 3);
+        assert_eq!(canonical[0].total_tokens, 5);
+        let saved: (f64, String, i64) = store
+            .connection
+            .query_row(
+                "SELECT total_dollars,price_version,model_set_complete FROM usage_model_history",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(saved.0.to_bits(), price.to_bits());
+        assert_eq!(saved.1, "saved-price-version");
+        assert_eq!(saved.2, 0);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT remaining_percent FROM usage_history", [], |r| r
+                    .get::<_, f64>(0))
+                .unwrap(),
+            90.0
+        );
+        drop(store);
+        let reopened = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(
+            reopened.load_session_events().unwrap(),
+            canonical,
+            "saved relation must validate on a fresh canonical read"
+        );
+        assert_eq!(
+            reopened
+                .source_physical_event_inventory(&checkpoints[0])
+                .unwrap(),
+            original
+        );
+        if with_unrelated_checkpoint {
+            let unchanged: String = reopened.connection.query_row(
+                "SELECT source_admission FROM session_checkpoints WHERE relative_path='unrelated.jsonl' AND file_inode='777'", [], |row|row.get(0)).unwrap();
+            assert_eq!(
+                unchanged, r#"{"version":2}"#,
+                "source-local qualification must not repair or discard unrelated saved evidence"
+            );
+            assert!(reopened.load_session_collection_state().is_err(),
+                "a successful source repair must not silently make invalid whole-account state valid");
+        }
         drop(reopened);
         remove_database(&path);
     }
