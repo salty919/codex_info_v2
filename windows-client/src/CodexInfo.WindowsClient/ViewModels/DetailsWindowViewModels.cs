@@ -1850,6 +1850,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         left.ModelsComplete == right.ModelsComplete &&
         left.TaskActiveSincePrevious == right.TaskActiveSincePrevious &&
         left.IsSyntheticTail == right.IsSyntheticTail &&
+        (left.LocalUsage is null ? right.LocalUsage is null : left.LocalUsage.ContentEquals(right.LocalUsage)) &&
         (left.ModelSamples is null) == (right.ModelSamples is null) &&
         (left.ModelSamples is null || left.ModelSamples.SequenceEqual(right.ModelSamples!));
 
@@ -2409,6 +2410,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         var samples = new List<ApiHistorySample>();
         var gaps = new List<ApiHistoryGap>();
+        var localUsage = new List<ApiLocalUsage>();
         string? cursor = null;
         string? requestedCursor = null;
         var firstPage = true;
@@ -2451,6 +2453,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             }
 
             samples.AddRange(page.Samples);
+            if (page.LocalUsage is { } local) localUsage.Add(local);
             if (firstPage)
             {
                 gaps.AddRange(page.HistoryGaps);
@@ -2465,6 +2468,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                     return WindowPeriodFetchResult.Failure;
                 }
 
+                mergedSamples = ApiLocalUsage.Attach(mergedSamples, localUsage);
                 return WindowPeriodFetchResult.Success(new GraphWindowPeriodData(
                     period with { Samples = mergedSamples },
                     mergedSamples,
@@ -2585,6 +2589,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             var cursor = fullRefresh ? null : candidateResourceNextCursor;
             var appendingProvenPrefix = canContinueFromPreviousCursor;
             var pageSamples = new List<ApiHistorySample>();
+            var pageLocalUsage = new List<ApiLocalUsage>();
             var pageGaps = new List<ApiHistoryGap>();
             var requestedCursor = cursor;
             var pageCount = 0;
@@ -2638,6 +2643,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                     requestedCursor = null;
                     pageCount = 0;
                     pageSamples.Clear();
+                    pageLocalUsage.Clear();
                     pageGaps.Clear();
                     resumeCursor = null;
                     continue;
@@ -2728,6 +2734,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                     requestedCursor = null;
                     pageCount = 0;
                     pageSamples.Clear();
+                    pageLocalUsage.Clear();
                     pageGaps.Clear();
                     resumeCursor = null;
                     continue;
@@ -2758,6 +2765,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 }
 
                 pageSamples.AddRange(page.Samples);
+                if (page.LocalUsage is { } local) pageLocalUsage.Add(local);
                 if (firstPage)
                 {
                     pageGaps.AddRange(page.HistoryGaps);
@@ -2799,6 +2807,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
+            mergedSamples = ApiLocalUsage.Attach(mergedSamples, pageLocalUsage);
             if (accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
             {
                 return;
@@ -2932,6 +2941,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private static bool ValidateHistoryPage(ApiHistoryPeriod period, ApiHistoryPage page)
     {
+        if (page.LocalUsage is { } local &&
+            (local.StartAt < period.StartAt || local.EndAt > period.EndAt + 1)) return false;
         foreach (var sample in page.Samples)
         {
             if (!period.ContainsHistoryMinute(sample.Timestamp) ||

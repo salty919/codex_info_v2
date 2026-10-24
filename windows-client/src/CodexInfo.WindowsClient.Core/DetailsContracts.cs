@@ -166,6 +166,57 @@ public sealed record ApiHistoryGap(
     long EndAt,
     string Reason);
 
+/// <summary>Local Codex-log consumption in a half-open UTC interval; quota is independent.</summary>
+public sealed record ApiLocalUsageInterval(long StartAt, long EndAt, string State);
+
+/// <summary>An optional, validated local-log projection for one history page.</summary>
+public sealed record ApiLocalUsage(long StartAt, long EndAt, IReadOnlyList<ApiLocalUsageInterval> Intervals)
+{
+    public bool ContentEquals(ApiLocalUsage? other) => other is not null &&
+        StartAt == other.StartAt && EndAt == other.EndAt && Intervals.SequenceEqual(other.Intervals);
+
+    public static ApiLocalUsage Combine(IEnumerable<ApiLocalUsage> evidence)
+    {
+        var events = new SortedDictionary<long, int[]>();
+        foreach (var interval in evidence.SelectMany(item => item.Intervals))
+        {
+            var state = interval.State == "used" ? 0 : interval.State == "unavailable" ? 1 : 2;
+            if (!events.TryGetValue(interval.StartAt, out var left)) events[interval.StartAt] = left = new int[3];
+            if (!events.TryGetValue(interval.EndAt, out var right)) events[interval.EndAt] = right = new int[3];
+            left[state]++; right[state]--;
+        }
+        var intervals = new List<ApiLocalUsageInterval>();
+        var active = new int[3];
+        long? previous = null;
+        foreach (var (at, changes) in events)
+        {
+            if (previous is { } start && at > start)
+            {
+                var state = active[0] > 0 ? "used" : active[1] > 0 || active[2] == 0 ? "unavailable" : "unused";
+                if (intervals.Count > 0 && intervals[^1].State == state)
+                    intervals[^1] = intervals[^1] with { EndAt = at };
+                else intervals.Add(new(start, at, state));
+            }
+            for (var index = 0; index < active.Length; index++) active[index] += changes[index];
+            previous = at;
+        }
+        return new(intervals[0].StartAt, intervals[^1].EndAt, intervals);
+    }
+
+    // A continuation can contain only metadata. Keep it with the retained raw
+    // samples without inventing a numeric observation or losing prior pages.
+    public static IReadOnlyList<ApiHistorySample> Attach(
+        IReadOnlyList<ApiHistorySample> samples, IEnumerable<ApiLocalUsage> additions)
+    {
+        if (samples.Count == 0) return samples;
+        var evidence = samples.Select(sample => sample.LocalUsage).OfType<ApiLocalUsage>()
+            .Concat(additions).Distinct().ToArray();
+        if (evidence.Length == 0) return samples;
+        var combined = Combine(evidence);
+        return samples.Select((sample, index) => sample with { LocalUsage = index == 0 ? combined : null }).ToArray();
+    }
+}
+
 /// <summary>A single validated history point.</summary>
 public sealed record ApiHistorySample(
     long Timestamp,
@@ -190,6 +241,8 @@ public sealed record ApiHistorySample(
     /// session reconstruction can carry either complete or partial model sets.
     /// </summary>
     public bool ModelsComplete { get; init; } = true;
+
+    public ApiLocalUsage? LocalUsage { get; init; }
 
     /// <summary>
     /// Whether the task was active since the preceding history sample. A null
@@ -552,6 +605,8 @@ public sealed record ApiHistoryPage(
     public string? AccountId { get; init; }
 
     public bool IsLegacyFallback { get; init; }
+
+    public ApiLocalUsage? LocalUsage { get; init; }
 
     internal static ApiHistoryPage? FromDetails(ApiDetailsSnapshot details, string periodId)
     {

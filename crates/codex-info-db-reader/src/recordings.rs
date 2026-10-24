@@ -14,6 +14,11 @@ pub struct RecordedArchive {
     pub observations: Vec<StoredObservation>,
     pub coverage: RecordingCoverage,
     pub fact_revision: u64,
+    /// A valid auxiliary archive may predate initialization of its local index.
+    /// This is a read-transaction fact, not new persisted state or coverage.
+    pub local_index_initialized: bool,
+    /// Timed numeric candidates whose local consumption is not yet qualified.
+    pub pending_numeric_times: BTreeSet<i64>,
 }
 
 fn invalid(message: &str) -> ReaderError {
@@ -24,6 +29,60 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 impl RecordedArchive {
+    /// Presence of local consumption, at the graph's existing minute granularity.
+    /// Neither quota observations nor all-device recording coverage participate.
+    pub fn local_usage(&self, start: i64, end: i64) -> Result<LocalUsage, ReaderError> {
+        if !self.local_index_initialized {
+            return Err(invalid("local usage index uninitialized"));
+        }
+        let mut minutes = BTreeMap::<i64, LocalUsageState>::new();
+        for values in self.prefixes.values() {
+            let first = values.partition_point(|(at, _)| *at < start);
+            let last = values.partition_point(|(at, _)| *at < end);
+            for index in first..last {
+                let zero = RecordedTokenPrefix::default();
+                let before = index.checked_sub(1).map_or(&zero, |i| &values[i].1);
+                let state = match values[index].1.difference(before)? {
+                    Some(tokens) if tokens.total > 0 => LocalUsageState::Used,
+                    Some(_) => continue,
+                    None => LocalUsageState::Unavailable,
+                };
+                let minute = values[index].0.div_euclid(60) * 60;
+                let entry = minutes.entry(minute).or_insert(state);
+                if state == LocalUsageState::Used {
+                    *entry = state;
+                }
+            }
+        }
+        for &at in self.pending_numeric_times.range(start..end) {
+            minutes
+                .entry(at.div_euclid(60) * 60)
+                .or_insert(LocalUsageState::Unavailable);
+        }
+        let mut intervals = Vec::<LocalUsageInterval>::new();
+        let mut cursor = start;
+        for (minute, state) in minutes {
+            let left = minute.max(start);
+            let right = (minute + 60).min(end);
+            if cursor < left {
+                push_local_interval(&mut intervals, cursor, left, LocalUsageState::Unused);
+            }
+            push_local_interval(&mut intervals, left, right, state);
+            cursor = right;
+        }
+        if cursor < end {
+            push_local_interval(&mut intervals, cursor, end, LocalUsageState::Unused);
+        }
+        let evidence = LocalUsage {
+            version: 1,
+            start_at: start,
+            end_at: end,
+            intervals,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
     pub fn latest_fact_at(&self) -> Option<i64> {
         self.prefixes
             .values()
@@ -67,6 +126,160 @@ impl RecordedArchive {
             })
             .collect()
     }
+}
+
+fn push_local_interval(
+    intervals: &mut Vec<LocalUsageInterval>,
+    start_at: i64,
+    end_at: i64,
+    state: LocalUsageState,
+) {
+    if start_at >= end_at {
+        return;
+    }
+    if let Some(previous) = intervals
+        .last_mut()
+        .filter(|v| v.end_at == start_at && v.state == state)
+    {
+        previous.end_at = end_at;
+    } else {
+        intervals.push(LocalUsageInterval {
+            start_at,
+            end_at,
+            state,
+        });
+    }
+}
+
+/// The history lane needs only local numeric evidence, not the auxiliary
+/// archive's full copy of quota and saved model observations.
+pub(super) fn read_local(
+    connection: &Connection,
+    includes: impl Fn(i64) -> bool,
+) -> Result<RecordedArchive, ReaderError> {
+    let mut archive = read_prefixes(connection, true)?;
+    read_pending_numeric_times(connection, &mut archive, includes)?;
+    Ok(archive)
+}
+
+fn read_pending_numeric_times(
+    connection: &Connection,
+    archive: &mut RecordedArchive,
+    includes: impl Fn(i64) -> bool,
+) -> Result<(), ReaderError> {
+    if table_exists(connection, "session_events")?
+        && table_exists(connection, "session_pending_ranges")?
+    {
+        let mut query = connection.prepare(
+            "SELECT DISTINCT e.timestamp FROM session_pending_ranges p JOIN session_events e
+               ON p.root_identity=e.root_identity AND p.relative_path=e.relative_path
+                 AND p.file_device=e.file_device AND p.file_inode=e.file_inode
+                 AND p.prefix_generation=e.prefix_generation
+                 AND p.start_offset<=e.range_start AND p.end_offset>=e.range_end
+             WHERE e.admission_json IS NULL AND e.total_tokens <> '0'",
+        )?;
+        for value in query.query_map([], |row| row.get::<_, i64>(0))? {
+            let at = value?;
+            if !(1..MAX_END_EXCLUSIVE).contains(&at) {
+                return Err(invalid("invalid pending usage timestamp"));
+            }
+            if includes(at) {
+                archive.pending_numeric_times.insert(at);
+            }
+        }
+    }
+    if table_exists(connection, "session_checkpoints")?
+        && table_exists(connection, "session_pending_ranges")?
+    {
+        let mut query = connection.prepare(
+            "SELECT c.root_identity,c.relative_path,c.file_device,c.file_inode,c.prefix_generation,c.source_admission
+             FROM session_checkpoints c WHERE c.source_admission IS NOT NULL AND EXISTS (
+               SELECT 1 FROM session_pending_ranges p WHERE p.root_identity=c.root_identity
+                 AND p.relative_path=c.relative_path AND p.file_device=c.file_device
+                 AND p.file_inode=c.file_inode AND p.prefix_generation=c.prefix_generation)",
+        )?;
+        let mut ranges = connection.prepare(
+            "SELECT start_offset,end_offset FROM session_pending_ranges
+             WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3 AND file_inode=?4
+               AND prefix_generation=?5 ORDER BY start_offset,end_offset",
+        )?;
+        for row in query.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })? {
+            let (root, path, device, inode, generation, payload) = row?;
+            let spans = ranges
+                .query_map(
+                    rusqlite::params![root, path, device, inode, generation],
+                    |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut merged = Vec::<(u64, u64)>::new();
+            for (start, end) in spans {
+                if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+                    last.1 = last.1.max(end);
+                } else {
+                    merged.push((start, end));
+                }
+            }
+            // Responses also retain already-qualified proof. Only physical
+            // ranges still marked pending can contribute uncertainty here.
+            let document: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|_| invalid("invalid pending response metadata"))?;
+            let Some(responses) = document.get("responses").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for response in responses {
+                let positive = response
+                    .pointer("/record/usage/total")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|v| v > 0);
+                if !positive {
+                    continue;
+                }
+                let at = response
+                    .pointer("/pointer/timestamp")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| invalid("invalid pending response timestamp"))?;
+                let start = response
+                    .pointer("/pointer/start")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| invalid("invalid pending response range"))?;
+                let end = response
+                    .pointer("/pointer/end")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| invalid("invalid pending response range"))?;
+                if !(1..MAX_END_EXCLUSIVE).contains(&at) || start >= end {
+                    return Err(invalid("invalid pending response metadata"));
+                }
+                let index = merged.partition_point(|span| span.0 <= start);
+                let still_pending = index
+                    .checked_sub(1)
+                    .is_some_and(|index| merged[index].1 >= end);
+                if still_pending && includes(at) {
+                    archive.pending_numeric_times.insert(at);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn read_all(
+    connection: &Connection,
+    includes: impl Fn(i64) -> bool,
+) -> Result<RecordedArchive, ReaderError> {
+    let mut archive = read(connection)?;
+    if archive.local_index_initialized {
+        read_pending_numeric_times(connection, &mut archive, includes)?;
+    }
+    Ok(archive)
 }
 
 pub(super) fn read(connection: &Connection) -> Result<RecordedArchive, ReaderError> {
@@ -143,7 +356,10 @@ fn recorded_projection_failure_reason(error: &ReaderError) -> &'static str {
     }
 }
 
-fn read_inner(connection: &Connection) -> Result<RecordedArchive, ReaderError> {
+fn read_prefixes(
+    connection: &Connection,
+    require_initialized: bool,
+) -> Result<RecordedArchive, ReaderError> {
     let names = [
         "recorded_usage_facts",
         "recorded_usage_prefixes",
@@ -155,6 +371,9 @@ fn read_inner(connection: &Connection) -> Result<RecordedArchive, ReaderError> {
         .collect::<Result<Vec<_>, _>>()?;
     if present.iter().any(|v| *v) && present.iter().any(|v| !*v) {
         return Err(invalid("partial recorded usage schema"));
+    }
+    if require_initialized && !present[0] {
+        return Err(invalid("local usage index unavailable"));
     }
     let mut archive = RecordedArchive::default();
     if present[0] {
@@ -169,6 +388,10 @@ fn read_inner(connection: &Connection) -> Result<RecordedArchive, ReaderError> {
             }
         }
         let (version,initialized,revision,models,coverage,dirty):(i64,bool,String,String,String,String)=connection.query_row("SELECT format_version,initialized,fact_revision,models_json,coverage,dirty_json FROM recorded_usage_state WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+        if require_initialized && !initialized {
+            return Err(invalid("local usage index uninitialized"));
+        }
+        archive.local_index_initialized = initialized;
         archive.fact_revision = revision
             .parse::<u64>()
             .map_err(|_| invalid("invalid recorded revision"))?;
@@ -221,6 +444,11 @@ fn read_inner(connection: &Connection) -> Result<RecordedArchive, ReaderError> {
             return Err(invalid("recorded prefix/head mismatch"));
         }
     }
+    Ok(archive)
+}
+
+fn read_inner(connection: &Connection) -> Result<RecordedArchive, ReaderError> {
+    let mut archive = read_prefixes(connection, false)?;
     if table_exists(connection, "quota_receipts")? {
         let mut q=connection.prepare("SELECT sequence,observed_at,reset_at,window_seconds,remaining_percent FROM quota_receipts ORDER BY sequence")?;
         let values = q
@@ -253,7 +481,11 @@ fn read_inner(connection: &Connection) -> Result<RecordedArchive, ReaderError> {
             });
         }
     }
-    read_observations(connection, &mut archive, present[0])?;
+    read_observations(
+        connection,
+        &mut archive,
+        table_exists(connection, "recorded_usage_facts")?,
+    )?;
     archive.observations.sort_by(|a, b| {
         (
             a.timestamp,
@@ -866,6 +1098,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn issue673_local_usage_empty_positive_and_timed_pending_are_independent_of_quota() {
+        let mut archive = RecordedArchive {
+            local_index_initialized: true,
+            ..RecordedArchive::default()
+        };
+        assert_eq!(
+            archive.local_usage(60, 660).unwrap().intervals,
+            [LocalUsageInterval {
+                start_at: 60,
+                end_at: 660,
+                state: LocalUsageState::Unused
+            }]
+        );
+        let mut prefix = RecordedTokenPrefix::default();
+        prefix
+            .add(TokenFacts {
+                total: 10,
+                input: Some(8),
+                cached_input: Some(2),
+                cache_write_input: Some(0),
+                output: Some(2),
+            })
+            .unwrap();
+        archive.prefixes.insert("SOL".into(), vec![(120, prefix)]);
+        archive.pending_numeric_times.extend([120, 180]);
+        let actual = archive.local_usage(60, 660).unwrap();
+        let expected = [
+            (60, 120, LocalUsageState::Unused),
+            (120, 180, LocalUsageState::Used),
+            (180, 240, LocalUsageState::Unavailable),
+            (240, 660, LocalUsageState::Unused),
+        ];
+        assert_eq!(
+            actual.intervals,
+            expected.map(|(start_at, end_at, state)| LocalUsageInterval {
+                start_at,
+                end_at,
+                state
+            })
+        );
+        assert!(archive.quota_observations.is_empty());
+        assert_eq!(archive.coverage, RecordingCoverage::Unknown);
+        assert!(
+            read_local(&Connection::open_in_memory().unwrap(), |_| true).is_err(),
+            "a missing index is not a processed empty log set"
+        );
+    }
+
+    #[test]
+    fn issue673_pending_candidates_are_localized_without_an_offset_only_window_veto() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE session_pending_ranges(root_identity TEXT,relative_path TEXT,
+            file_device TEXT,file_inode TEXT,prefix_generation TEXT,start_offset INTEGER,end_offset INTEGER);
+            CREATE TABLE session_events(root_identity TEXT,relative_path TEXT,file_device TEXT,file_inode TEXT,
+            prefix_generation TEXT,range_start INTEGER,range_end INTEGER,timestamp INTEGER,total_tokens TEXT,admission_json TEXT);
+            CREATE TABLE session_checkpoints(root_identity TEXT,relative_path TEXT,file_device TEXT,
+                file_inode TEXT,prefix_generation TEXT,source_admission TEXT);
+            INSERT INTO session_pending_ranges VALUES('r','p','1','2','3',0,100),('r','offset-only','1','4','3',0,200);
+            INSERT INTO session_events VALUES('r','p','1','2','3',10,20,180,'5',NULL);").unwrap();
+        let pending = serde_json::json!({"responses":[
+            {"pointer":{"timestamp":300,"start":30,"end":40},"record":{"usage":{"total":2}}},
+            {"pointer":{"timestamp":360,"start":200,"end":220},"record":{"usage":{"total":2}}},
+            {"pointer":{"timestamp":420,"start":40,"end":50},"record":{"usage":{"total":0}}},
+            {"pointer":{"timestamp":900,"start":50,"end":60},"record":{"usage":{"total":2}}}]});
+        connection
+            .execute(
+                "INSERT INTO session_checkpoints VALUES('r','p','1','2','3',?1)",
+                [pending.to_string()],
+            )
+            .unwrap();
+        let mut archive = RecordedArchive {
+            local_index_initialized: true,
+            ..RecordedArchive::default()
+        };
+        read_pending_numeric_times(&connection, &mut archive, |at| at < 600).unwrap();
+        assert_eq!(archive.pending_numeric_times, BTreeSet::from([180, 300]));
+        assert_eq!(
+            archive.local_usage(360, 960).unwrap().intervals,
+            [LocalUsageInterval {
+                start_at: 360,
+                end_at: 960,
+                state: LocalUsageState::Unused
+            }]
+        );
+    }
+
+    #[test]
     fn issue604_recorded_projection_diagnostic_preserves_result() {
         let connection = Connection::open_in_memory().unwrap();
         // Existing storage definitions, with no fabricated fact or proof.
@@ -902,6 +1221,10 @@ mod tests {
         let archive = read_with_diagnostics(&connection, |reason| notifications.push(reason))
             .expect("a valid empty archive remains available");
         assert_eq!(archive, RecordedArchive::default());
+        assert!(
+            archive.local_usage(60, 660).is_err(),
+            "a valid auxiliary archive is not proof of an initialized local index"
+        );
         assert!(notifications.is_empty());
         connection
             .execute("UPDATE recorded_usage_state SET dirty_json='[]'", [])

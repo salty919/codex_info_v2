@@ -557,7 +557,7 @@ fresh startupで未受理の値は`—`/既存の未取得表現とする。mode
 - 上部はタイトル／単位切替、表示タイプ・期間情報・前後移動を一つにまとめた行、凡例の3段とする。タイトル、操作行、凡例、グラフの各行間に8 DIPの縦余白を設け、操作行と凡例は同じ背景帯にまとめる。ヘッダー・中央の帯・グラフ枠を接触させず、最小サイズでもグラフの高さを確保する。週期間のselectorと固定時間の日時情報は同じ中央領域を使い、前後移動には方向と短い文字を表示する。ボタン群の角丸・高さ・余白・選択状態を揃え、通常940×640／最小700×480で情報や操作を重ねない。長い期間名は省略表示と全文tooltipを併用する。グラフに被る「時間ごとの累計…」説明文は表示せず、数値軸・単位スイッチ・凡例を維持する。
 - ローカル日付の境界は、data rectangleの上に確保した日付軸で「月/日」と下向きの目印を表示する。日付文字をデータ線へ重ねず、画面外の境界や重なる日付ラベルを描かない。既存の現地0時の細線・reset線の意味とDST処理は維持する。
 - 滑らかさは既存の単調PCHIPを維持し、描画用の曲線分割を1000px級のplotで1px以下の横刻みへ細分化する。accepted raw、変化点、極値、idle、欠測、補正、reset境界の位置と値は変更しない。欠測を実測線で結ぶ、曲線が観測範囲を越える、別reset間を結ぶことを禁止する。記録済みmodel累計が同値の区間の両端時刻・値を保持し、後続の増加を同値区間へ前倒ししない。task停止metadataだけで未使用帯や水平保持を作らず、実測の変化区間を前後へ移動しない。
-- 未使用帯はtoken不変だけでなく、保存済みの利用枠残量も同値である区間に限る。task停止が記録されていても、同区間の保存済みtokenまたは残量が変化した場合は帯を分断し、実測の変化を未使用表示で覆わない。model単独の水平線は他model・残量の変化と独立に保つ。
+- 未使用帯はPRODUCT `G137-5` / `GRAPH-LOCAL-UNUSED-673`のローカルCodexログ消費なしを表す。Remaining未取得／変化・外部Work利用・task状態・全端末coverageから分離し、Dollars/Tokensの両方で同じ600秒以上の区間を表示する。
 - Graph専用の系列色は、暗色presetでRemaining `#56B2F5`、LUNA `#E6A23C`、TERRA `#5DC98A`、SOL `#A88CF5`、ASTRA `#EF6A6A`、明色preset（light/paper-light/sand-light/steel-light/lavender-light/mint-light）で順に `#176AAB`、`#985F08`、`#16794B`、`#6A4BCC`、`#B23553` とする。凡例・線・末尾値に同じ役割色を用い、themeのaccent色を系列の代用にしない。全16 presetのplot面とidle面に対して系列は3:1以上の輝度コントラストを保つ。Main/Threads等の共有色キーは変更しない。
 - Windowsのidle面はWIN-THEME-422表のGraph背景とidle基準色を各RGB channelで半分ずつ混合し、0.5を切り上げた最終不透明色を使う。classic-darkは `#162232`、teal-darkは `#0F3E49`、lightは `#F2F6FA` となる。旧面より控えめにしつつ背景と区別できる帯として表示し、idleの判定や時間範囲は変えない。上表のidle色および他節の固定idle色はWindowsではこの最終色へ置換する。Linux/Xの色・描画契約は変更しない。
 - 週期間・24時間・1週間の各reset期間の下部表示値も選択metricへ連動する。ドルでは保存ドルの整数表示、トークンでは全modelの保存token合計をM単位で表示する。モデル表示ON/OFFに依存せず、raw記録以外の補間／holdを合計しない。100万未満のトークンは桁区切り付き整数とし、100万以上はM表記を用いる。カレンダー・トークン軸・期間値は同じ書式を用い、M値は表示時だけ四捨五入した整数とする。軸の隣接目盛りが丸めで同じ表記になる場合は上側のラベルだけを表示し、目盛り位置と値域は変えない。hoverは桁区切り付きの正確な整数token数を表示し、raw記録の精度を維持する。
@@ -615,7 +615,7 @@ fresh startupで未受理の値は`—`/既存の未取得表現とする。mode
   完全な空集合と取得不能を区別し、既知0 memberの省略を実際のモデル版の利用開始後も欠測扱いにしない。未取得・既知0でないmemberの欠落・正の累計の消失は従来の欠測表示を維持する。rawモデル行、集計額、idleの証拠へ表示0を追加しない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
 - `reconstructed-from-session`、`unknown`、`unavailable`ではモデル数値を表示せず、
-  model key/sourceと欠損metadataだけを表示する。`confirmed`の部分集合には確認できたmodelの数値を表示し、`models_complete=false`だけを理由に消さない。`legacy-unknown`は保存済みの同じmodel keyの値だけ表示でき、確定した集計・予測には使わない。月カレンダーだけは`G137-GRAPH-01`の日別配賦条件を満たす保存値を「記録分」へ表示上加算し、model集合の完備や確定した日合計へ昇格しない。同一runの同一非空model集合・lossless raw tokenとraw Remainingの完全不変・欠測／異常／confirmed gapなしを全て満たす場合だけidle判定に利用できる。
+  model key/sourceと欠損metadataだけを表示する。`confirmed`の部分集合には確認できたmodelの数値を表示し、`models_complete=false`だけを理由に消さない。`legacy-unknown`は保存済みの同じmodel keyの値だけ表示でき、確定した集計・予測には使わない。月カレンダーだけは`G137-GRAPH-01`の日別配賦条件を満たす保存値を「記録分」へ表示上加算し、model集合の完備や確定した日合計へ昇格しない。局所未使用への利用資格はPRODUCT `G137-5`を参照し、Remainingの既知性や全端末の完備性へ結合しない。
   直接観測(`confirmed`)または保存済みlossless `legacy-unknown`の値を通常実線とし、補間・hold・smoothing・予測はUI presentation-onlyでAPI/DBへ書き戻さない。
   これらの破線はDBまたは取得記録の欠損・異常を示すNG表示であり、正常な実線の代替ではない。
   最終実測と公開終端が同じcanonical minuteならPRODUCTの終端規則に従い実測点で止める。後続minuteのmodel欠損を、current期間の末尾という理由だけで「集計待ち」と推測して隠さない。公開された時間軸と原観測、欠損・gap・棄却理由を保持する。
@@ -635,8 +635,8 @@ fresh startupで未受理の値は`—`/既存の未取得表現とする。mode
   | 確認済み0／model行なし | 前者だけ0として描き、後者は未知として数値・線を作らない |
   | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える。各metric自身のaccepted観測を表示し、token同値を理由に保存USDの変化・欠測を補正しない。USDはidle authorityにしない |
 
-  アイドル帯の採否はPRODUCT `G137-5`を唯一の定義とする。same reset内の同じ非空model集合について、全rowのlossless T/I/C/W/O（optional成分の既知性を含む）とraw Remainingが不変で、同節のsource・numeric採否・未回復gap条件を満たした連続10分以上だけをgray表示する。task lifecycle、表示丸め、USDの値をその証拠にしない。
-  限定1 sampling slotの例外は`G137-4` / `G137-5`の全条件を使い、そのslotを元row列・他metric・hoverから削除しない。前後のraw tokenだけでUSDの明示欠測を補完しない。tokenとRemainingは同じbandのX範囲を1px水平実線にし、USDは自身の不変の実測だけ1px水平実線、実測増加は3px、欠測・棄却異常は1px破線にする。帯のために未知USDを作らない。観測点数やaccepted raw endpointを欠く欠測時間だけで確定しない。
+  アイドル帯の採否はPRODUCT `G137-5`を唯一の定義とする。任意local-usage-v1の正常な空索引を含む未使用区間、または未対応serverのlossless raw比較を使う。具体的な時刻付き未処理数値と索引読取り失敗は未確定、offset-only pendingは全窓を遮断しない。所有境界は保持する。
+  拡張に基づくTokensの局所未使用区間は、既知token anchorから1px水平実線を描き、quotaやmodel sampling欠落だけで予測破線へ戻さない。元row列・hover・raw数値は変えない。旧serverの限定1 sampling slotは`G137-4`の資格を維持する。USDとRemainingは自身の観測・異常規則で独立に描き、帯のために未知値を作らない。
   10分は画面幅に依存しない意味閾値とし、pixel幅filter、最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
   Remainingは`G137-6`に従い、accepted raw値を元時刻・元値の証拠として保持し、token増分またはtask lifecycleでraw値を
   移動しない。表示geometryも同値反復を含む全accepted観測点を通過し、横ばい区間と変化時刻を保つ。隣接観測間だけを

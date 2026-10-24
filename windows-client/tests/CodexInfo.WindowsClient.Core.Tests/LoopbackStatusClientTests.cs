@@ -13,6 +13,43 @@ namespace CodexInfo.WindowsClient.Core.Tests;
 public sealed class LoopbackStatusClientTests
 {
     [Fact]
+    public async Task Issue673HistoryRequestsOptionalLocalEvidenceAndRejectsMalformedIntervals()
+    {
+        const string page = """
+            {"api_version":"v3","history_samples":[{"timestamp":1800000000,"reset_at":1800604800,
+            "remaining_percent":null,"task_active_since_previous":true,"models_complete":false,
+            "model_source":"unavailable","models":null}],"history_gaps":[],
+            "next_cursor":null,"resume_cursor":"saved-prefix",
+            "local_usage":{"version":1,"start_at":1800000000,"end_at":1800000601,
+            "intervals":[{"start_at":1800000000,"end_at":1800000601,"state":"unused"}]}}
+            """;
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            Assert.Equal("local-usage-v1", Assert.Single(request.Headers.GetValues("Codex-Info-History-Extensions")));
+            return JsonResponse(page, includePublishedPair: true);
+        }));
+        var result = await client.FetchHistoryPageAsync("account-7", "1800604800", null, CancellationToken.None);
+        Assert.True(result.IsSuccess);
+        Assert.NotNull(result.Page!.LocalUsage);
+        Assert.Same(result.Page.LocalUsage, Assert.Single(result.Page.Samples).LocalUsage);
+        Assert.Null(result.Page.Samples[0].RemainingPercent);
+        foreach (var invalid in new[] {
+            page.Replace("\"version\":1", "\"version\":2", StringComparison.Ordinal),
+            page.Replace("\"state\":\"unused\"", "\"state\":\"unknown\"", StringComparison.Ordinal),
+            page.Replace("\"end_at\":1800000601,\"state\"", "\"end_at\":1800000600,\"state\"", StringComparison.Ordinal) })
+        {
+            using var rejected = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(invalid, includePublishedPair: true)));
+            Assert.False((await rejected.FetchHistoryPageAsync("account-7", "1800604800", null, CancellationToken.None)).IsSuccess);
+        }
+        var original = result.Page.Samples;
+        var carried = ApiLocalUsage.Attach(original, [new ApiLocalUsage(1800000601, 1800000661,
+            [new(1800000601, 1800000661, "unused")])]);
+        Assert.Single(carried);
+        Assert.Equal(1800000661, carried[0].LocalUsage!.EndAt);
+        Assert.Equal(original[0].Timestamp, carried[0].Timestamp);
+    }
+
+    [Fact]
     public async Task Issue604HistoryKeepsKnownTotalsWithOptionalComponentsAndIndependentCoverage()
     {
         static string Page(string models) => """

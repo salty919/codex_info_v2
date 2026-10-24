@@ -87,6 +87,11 @@ public sealed class GraphScene
     private const long RecoverableSamplingJitterSeconds = 60;
 
     private IReadOnlyList<ApiHistorySample> RawSamples { get; set; } = [];
+
+    public IReadOnlyList<GraphIdleInterval> LocalUnusedIntervals { get; private set; } = [];
+
+    public bool HasLocalUnusedInterval(double start, double end) =>
+        LocalUnusedIntervals.Any(interval => start >= interval.StartAt && end <= interval.EndAt);
     private IReadOnlySet<int> RecoverableSamplingSlots { get; init; } = new HashSet<int>();
 
     private GraphScene(
@@ -557,7 +562,10 @@ public sealed class GraphScene
         var recoverableSamplingSlots = FindRecoverableSamplingSlots(samples, normalizedGaps, tokenProjection);
         var firstModelPublications = FirstModelPublications(samples);
         var periodCost = BuildPeriodCost(samples, latestCostObservation, firstModelPublications, dollarProjection);
-        var idleIntervals = BuildConfirmedIdleIntervals(
+        var localUnused = BuildLocalUnusedIntervals(samples, start, end, accountOwnershipIntervals);
+        var idleIntervals = samples.Any(sample => sample.LocalUsage is not null)
+            ? localUnused.Where(interval => interval.EndAt - interval.StartAt >= SustainedUnusedMinimumSeconds).ToArray()
+            : BuildConfirmedIdleIntervals(
             samples,
             start,
             end,
@@ -708,6 +716,7 @@ public sealed class GraphScene
             ModelMemberLineReliability = rawDisplayProjection.LineReliability,
             IsCurrentPeriod = isCurrentPeriod,
             RawSamples = samples.ToArray(),
+            LocalUnusedIntervals = localUnused,
             RecoverableSamplingSlots = recoverableSamplingSlots,
         };
     }
@@ -1598,7 +1607,6 @@ public sealed class GraphScene
                     left.Timestamp,
                     right.Timestamp,
                     accountOwnershipIntervals) ||
-                modelName is null && !SameRecordedRemaining(left, right) ||
                 HasConfirmedGapBetween(
                     confirmedGaps,
                     left.Timestamp,
@@ -1645,6 +1653,31 @@ public sealed class GraphScene
             .ToArray();
     }
 
+    private static IReadOnlyList<GraphIdleInterval> BuildLocalUnusedIntervals(
+        IReadOnlyList<ApiHistorySample> samples, long start, long end,
+        IReadOnlyList<GraphAccountOwnershipInterval>? ownership)
+    {
+        var evidence = samples.Select(sample => sample.LocalUsage).OfType<ApiLocalUsage>().Distinct().ToArray();
+        if (evidence.Length == 0) return Array.Empty<GraphIdleInterval>();
+        var result = new List<GraphIdleInterval>();
+        foreach (var interval in ApiLocalUsage.Combine(evidence).Intervals.Where(item => item.State == "unused"))
+        {
+            var left = Math.Max(start, interval.StartAt);
+            var right = Math.Min(end, interval.EndAt);
+            foreach (var owner in ownership ?? [])
+            {
+                if (owner.StartAt is not { } ownerStart) continue;
+                var ownedLeft = Math.Max(left, ownerStart);
+                var ownedRight = Math.Min(right, owner.EndAt ?? end);
+                if (ownedRight <= ownedLeft) continue;
+                if (result.Count > 0 && result[^1].EndAt == ownedLeft)
+                    result[^1] = result[^1] with { EndAt = ownedRight };
+                else result.Add(new(ownedLeft, ownedRight, false));
+            }
+        }
+        return result;
+    }
+
     private static bool IsCoveredByOneOwnershipInterval(
         long startAt,
         long endAt,
@@ -1683,7 +1716,6 @@ public sealed class GraphScene
                 continue;
             }
             if (sample.ResetAt != resetAt ||
-                modelName is null && !SameRecordedRemaining(samples[before], sample) ||
                 !TryGetIdleModelVector(sample, modelName, out var vector) ||
                 !AcceptedIdleVectorAt(index, vector, tokenProjection) ||
                 !TokenVectorsEqual(baseline, vector))
@@ -1695,11 +1727,6 @@ public sealed class GraphScene
         return false;
     }
 
-    private static bool SameRecordedRemaining(ApiHistorySample left, ApiHistorySample right) =>
-        left.RemainingPercent is { } before && right.RemainingPercent is { } after &&
-        double.IsFinite(before) && before is >= 0 and <= 100 &&
-        double.IsFinite(after) && after is >= 0 and <= 100 && RemainingBitsEqual(before, after);
-
     private static bool AcceptedIdleVectorAt(
         int index,
         IReadOnlyDictionary<string, DirectModelValue> vector,
@@ -1708,6 +1735,10 @@ public sealed class GraphScene
             tokenProjection.Origins.TryGetValue(name, out var tokenOrigins) &&
             index < tokenOrigins.Count &&
             ModelOriginIsLosslessIdleObservation(tokenOrigins[index]));
+
+    private static bool HasLosslessTokenComponents(ApiHistoryModelSample model) =>
+        model.TotalTokens is not null && model.InputTokens is not null && model.CachedInputTokens is not null &&
+        model.CacheWriteInputTokens is not null && model.OutputTokens is not null;
 
     private static bool TryGetIdleModelVector(
         ApiHistorySample sample,
@@ -1718,7 +1749,7 @@ public sealed class GraphScene
         {
             vector = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal);
             var confirmed = sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
-                sample.ModelsComplete;
+                (sample.ModelsComplete || PublishedModels(sample).All(HasLosslessTokenComponents));
             var legacy = sample.ModelSource == ApiHistorySample.LegacyUnknownModelSource;
             if (sample.IsSyntheticTail || !confirmed && !legacy)
             {
@@ -1746,8 +1777,10 @@ public sealed class GraphScene
         }
 
         vector = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal);
+        var localPartial = sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
+            PublishedModels(sample).All(HasLosslessTokenComponents);
         if (sample.IsSyntheticTail ||
-            sample.ModelSource != ApiHistorySample.LegacyUnknownModelSource)
+            sample.ModelSource != ApiHistorySample.LegacyUnknownModelSource && !localPartial)
         {
             return false;
         }

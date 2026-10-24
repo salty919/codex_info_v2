@@ -164,7 +164,20 @@ recorder自身の取得失敗を含むschema-validな新generationは、正常ge
 | `GET /v3/history?period=<opaque>&cursor=<opaque>` | 選択期間の履歴または`cursor`より後の差分を返す。`cursor`は初回だけ省略できる。 |
 | `GET /v3/threads` | Threads surfaceを開いたときだけthread rowsを返す。 |
 
-history成功bodyはexact 5 keys `api_version`、`history_samples`、`history_gaps`、`next_cursor`、`resume_cursor`を持つ。`next_cursor`は同じ取得cycleに後続pageがある場合だけ非nullで、その値を次requestへ使う。`resume_cursor`は応答の最後のsampleまでを証明し、最終pageでも非nullである。cursor付き要求に新sampleがない場合は受理したcursorを`resume_cursor`へ返し、初回要求にsampleがない場合だけnullとする。clientは`next_cursor=null`まで同じpairを集めた後、最後の`resume_cursor`を次回差分用に保存する。
+拡張を要求しないhistory成功bodyはexact 5 keys `api_version`、`history_samples`、`history_gaps`、`next_cursor`、`resume_cursor`を持つ。`next_cursor`は同じ取得cycleに後続pageがある場合だけ非nullで、その値を次requestへ使う。`resume_cursor`は応答の最後のsampleまでを証明し、最終pageでも非nullである。cursor付き要求に新sampleがない場合は受理したcursorを`resume_cursor`へ返し、初回要求にsampleがない場合だけnullとする。clientは`next_cursor=null`まで同じpairを集めた後、最後の`resume_cursor`を次回差分用に保存する。
+
+#### 任意の局所ログ使用区間（Issue #673）
+
+`GET /v3/history`のrequestに`Codex-Info-History-Extensions: local-usage-v1`を指定した場合だけ、同じv3 bodyへ6番目の`local_usage`を追加する。指定しない旧clientへの5項目bodyは変えない。新clientはheaderを無視する旧serverの5項目応答も受理する。未対応は有効な空索引やtoken0を意味しない。新しいroute・selector・必須補助APIを追加しない。
+
+```json
+{"version":1,"start_at":1800000000,"end_at":1800000601,"intervals":[{"start_at":1800000000,"end_at":1800000601,"state":"unused"}]}
+```
+
+`local_usage`はexact `version,start_at,end_at,intervals`、各区間はexact `start_at,end_at,state`。versionは整数1、stateは`used|unused|unavailable`、UTC秒の半開区間`[start_at,end_at)`を使う。開始は正、終端は開始より後で253402300800以下とする。区間列は昇順・連続・非重複で宣言範囲全体を覆う。stateはこのアプリが読む同accountのCodexログの数値消費資格だけから得て、Remaining・保存USD・全端末coverageを含まない。正常な空索引はunused、正のqualified消費minuteはused、時刻付き未処理数値候補または実際の索引読取り失敗はunavailable。同minuteのqualified正消費は使用として残す。offset-only pendingへ時刻を割り当てない。
+
+metadataは同じ公開pair・periodのpageと共に返す。先頭pageは公開period開始から、cursor付きpageは直前sample時刻から前page終端へ重ねて、次page先頭時刻または旧inclusive period終端+1までを覆う。描画時は既存のinclusive表示終端へclipする。空deltaのmetadataもlast-good sample集合と共に保持する。raw sample/cursorの整合性を弱めず、過去prefix内の使用／未確定の変更はcursorをstaleにし、初回から同pairを再取得する。未使用tailだけの成長はraw prefixの同一性を変えない。page/delta/cacheを別accountや別pairへ流用しない。quota rowが欠測でも既存のqualified local indexから独立に生成する。
+
 
 未定義のパスは JSON の `404`、既知パスへの非 `GET` は JSON の `405` で返す。
 応答に認証 URL、認証トークン、raw error、ローカルパス、セッション内容を含めない。
