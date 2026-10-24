@@ -2641,6 +2641,13 @@ fn parse_request(
         match name.as_str() {
             "host" => host = Some(value.to_owned()),
             "accept" | "user-agent" => {}
+            "codex-info-history-extensions"
+                if route == Some(ApiRoute::HistoryV3)
+                    && value == codex_info_rest_contract::recorded_usage::LOCAL_USAGE_EXTENSION =>
+            {
+                // This legacy publisher has no local index. Accept the
+                // optional hint while retaining its unchanged five-field page.
+            }
             "if-none-match" => {
                 if_none_match = Some(parse_details_etag(value).ok_or(ParseFailure::BadRequest)?);
             }

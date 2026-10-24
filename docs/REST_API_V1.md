@@ -751,8 +751,9 @@ queryはACCOUNT-SELECT-134のaccount指定、v3 historyのperiod/cursor、v5 dir
 | deadline | acceptからheader完了3.000秒、header完了からrequest完了1.000秒、全体3.000秒 |
 | shutdown | 新規admissionを即時停止し、既存requestを最大3.000秒drain後cancel |
 
-request header allowlistは`Host,Accept,User-Agent,Connection,Content-Length,If-None-Match`だけで、各fieldは最大1件、
+request header allowlistは`Host,Accept,User-Agent,Connection,Content-Length,If-None-Match,Codex-Info-History-Extensions`だけで、各fieldは最大1件、
 `If-None-Match`はpublished-pair headerを持つsnapshot resourceでquoted published pairを受け、health/runtime等の非snapshot routeでは400とする。v3限定の条件をv4/v5へ流用しない。
+`Codex-Info-History-Extensions: local-usage-v1`は`/v3/history`の任意hintである。局所索引を供給しない互換publisherもこの正式hintを受理し、従来の5項目bodyを返す。拡張非対応を有効な空索引やtoken 0へ変換しない。
 ただしContent-Lengthは欠落可とする。`Authorization,Cookie,Proxy-Authorization,Forwarded,X-Forwarded-For,
 X-Forwarded-Host,X-Forwarded-Proto,Upgrade,Expect,TE,Transfer-Encoding`は常に拒否する。obs-fold、NUL、CTL、
 bare LF、invalid UTF-8を値として解釈せず400またはparse前closeにする。拒否requestはbodyを無制限drainせず
