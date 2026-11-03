@@ -151,7 +151,7 @@ quotaの有限window選択はplan名によらず同じ完全なprimary/secondary
 本節は、原本から一意なlocal消費を復元・照合する内部集計の境界を定める。ユーザーが要求していない「記録範囲」UIへの置換、Mainの期間を直近W秒へ変更すること、週期間一覧をrolling範囲とUTC月一覧へ置換することは行わない。2026-10-18のユーザー指示「UI仕様を勝手に変える権利は有りません」「記録範囲なるものは要求に存在しない」に従い、これらの置換仕様を撤回する。
 
 - Mainは現在の公開period/windowの検証済みモデル値と、`MODEL-PRICING-463`のAPI相当参考額を表示する。公式quotaとlocalモデル消費のauthorityは独立である。providerが不変の実利用週IDを返さないことだけを理由に、既知のモデル値・参考額を空または常時不明へ変更しない。
-- Graphは従来の週期間、24時間、1週間、1か月のモード、日付group内の各期間選択、前後移動、表示timezoneによる暦月を維持する。週期間は元のexact保存keyとorigin metadataで選択し、報告resetをproviderが保証する不変週IDと表明しない。異なるkeyの数値を無根拠に合算・付け替えしない。
+- Graphは従来の週期間、24時間、1週間、1か月のモード、日付group内の各期間選択、前後移動、表示timezoneによる暦月を維持する。元のexact保存keyとorigin metadata、current/recent互換detailsの公式報告keyを保持する。wire上のIDはWIRE、報告枠と実resetの区別はLIVE-RESET-129、記録分の数値は本節に従う。報告resetをproviderが保証する不変週IDと表明せず、異なるkeyの数値を無根拠に合算・付け替えしない。
 - 初回利用前にreset予定だけが動く場合も、原本・exact保存keyを保持する。selectableの掲載条件はWIREの現在period、正の公開model値、または未解消の旧利用記録を持つperiodである。過去のquotaだけの空項目を増殖させず、履歴の正値や未解消記録を消さない。日付groupは表示上の分類であり保存keyの統合ではない。
 - 正常な同period・同metricの連続した観測runは既存`G137-GRAPH-01`に従う実線とPCHIPで表示する。疎なtimestamp、期間identity metadataの不明、補助集計の存在だけを理由に、全観測を点へ変更したり階段へ強制したりしない。実際の欠測、非所有、reset境界、数値異常は既存の分割・破線規則を適用し、復元できる原本から先に回復する。描画補間を実測としてDB/APIへ書き戻さない。
 - 月表示は選択timezoneの暦月・暦日を使い、元時刻と資格を満たす同一消費を一度だけ加算する。モデル系列のON/OFFで月合計を変えない。未計測と既知0を区別し、正の利用記録がない日の表示は既存月仕様どおり控えめにする。未知値を0へ変換しない。
@@ -159,6 +159,46 @@ quotaの有限window選択はplan名によらず同じ完全なprimary/secondary
 内部のqualified factは、DATAのsource/account結合・検証済みprefix・数値・exact model・連続所有区間を満たした一つのlocal消費である。同じresponseの全5 ID再掲、またはDATAの完全な同physical/generation越し対応が証明された同じrecordは一度だけ数える。別bytes原本への対応は全旧event一対一条件を必要とする。既知factの元秒とlossless成分は保持し、報告Rの更新だけでは消費を削除・再加算しない。未資格の保存値、重複未解決、未処理suffixはfactへ昇格しない。保存済み旧値は元key・元時刻・価格bitsと未解決理由を保持する。
 
 参考額の算出資格と、過去の保存額の同一性を区別する。既知token成分と正確なmodel IDには`MODEL-PRICING-463`の検証済みcatalogを適用でき、providerの期間identityや新しい価格永続schemaを前提にしない。保存済み履歴額は同契約の保持・復元規則に従い、最新価格で上書きしない。必要成分不足・矛盾・未知model・単価欠落の場合だけ対象額を不明とし、他の既知額へ波及させない。
+
+資格済み消費factのmodel・token・元時刻と参考額の公開資格は、実reset境界の判明や派生prefix cacheの初期化とは別である。cache未初期化でも同じread transactionの資格済みfactからread-only prefixを構成でき、DBと初期化flagは変更しない。資格済みfactが無い場合は数値既知とせず、元の保存値と未知の区別を保持する。価格はMODEL-PRICING-463に従い、既知保存額・保存価格版を保持する。raw累計を根拠なく別期間へ転載せず、所属不明や集合不完全を0・完全集合・取得errorへ変換しない。
+
+#### 同じ表示区間の一重公開と原本の保全
+
+是正根拠は2026-11-03のユーザー要求「区間が２重に出るなんて在りえない」「何故起こるかを確認した上で、論理的側面を考えて仕様不良を根絶しなさい」と、10/15 16:57・10/17 15:38からの項目を同じ表示区間とする具体判定である。既存Graphの選択対象は報告windowの表示区間であり、providerの実cycleを保証するものではない。この重複除去へ実resetの証明を要求しない。従来の週期間・日付group・各表示モード・価格・曲線・操作を保持する。
+
+**表示identity:** 同じaccount/epochで、資格を満たした報告windowの`origin=R-W`が同じUTC canonical minuteへ属し、exactなWが等しい元報告を一つの公開groupとする。これは完全一致key `(account/epoch, floor(origin/60)*60, W)` による分割である。反射・対称・推移が成立し、入力順、包含代表、model/token/USD、価格、原本再構成の成功、集合の完備性でmembershipを変えない。60秒以内という距離判定や、貪欲な包含group化は行わない。同じminuteであることは表示identityだけを決め、実resetの同一性を証明しない。originまたはWの資格が不明の元報告を時刻の近さでこのgroupへ入れず、元IDと既知情報を保持する。
+
+保存identityは従来のexact R/W、元秒、取得sequence、source pointerのままとする。保存row・event・checkpoint・原価格を変更しない。数値の復元失敗を理由に元memberを別のdirectory項目へ戻す分岐を除去する。旧規則の包含代表必須と「保存positiveを再現できなければ複数公開へ戻る」は不採用である。
+
+**公開identityと境界:** origin/Wが確定したgroupはmemberが一件でも`rg1-<originのUTC canonical minute>-<exact W>`をIDにする。account namespaceはselector、epochはpublication/cursorの既存束縛が所有する。IDはclientにとってopaqueである。元の十進IDと異なるnamespaceを使い、旧IDの履歴をgroup履歴で上書きしない。canonical directory/selectableにはgroupを一件だけ掲載する。掲載資格は元memberの既存掲載条件の論理和とし、currentは現在の公式報告を含むgroupだけに付ける。
+
+表示startはmemberの元startの最小値、表示endはmemberの元観測終端・有効receipt元秒・memberに完全対応するqualified fact元秒・confirmed gap終端の最大値とする。全memberの既知範囲を欠落させない最小の表示範囲であり、実reset境界を生成する操作ではない。実在する元秒だけを使い、minute末尾の59秒や現在時計を追加しない。範囲内の欠測をsampleで埋めない。既存scalar sample所属用の`reset_at`にはmemberの最大exact Rをtransport keyとして使う。各memberのend/fact資格は元のwindow内なので`start<=end<=transport reset`を保つ。この選択を最新公式quotaの取得順や実reset時刻と解釈しない。current/recentの公式quota R、保存key、元履歴は変更しない。canonicalのorigin_atはmemberの資格済み報告originの最小実秒とし、表示startと同じ値を保持する。これは表示groupの記録済み開始根拠であり、providerの実reset時刻ではない。この値は既存Graph/月の初期anchorを保持するために必要であり、group化だけでnullへ落とさない。元memberごとの各exact originはraw履歴に保持する。
+
+**点と数値:** 点集合は元のsample、有効な公式receipt、memberのqualified factの各canonical minuteの和集合を基礎とし、task/gapは既存の資格と投影規則を使用する。raw sampleがないfact-only minuteも公開し、factの元秒をendに含める。quotaはDATAのQUOTA-DURABLE-604/HISTORY-RECOVERY-614が検証した公式取得原本または受理済みreceiptの元取得順からだけ公開する。旧durable observationは、不変な公式原本IDまたはreceipt IDへの明示参照とaccount・資格・時刻精度・exact R/W・Remainingの全一致が必要である。rawの非NULL、model_source=confirmed/legacy-unknown、近傍receiptとの値一致は資格を代用しない。資格のない元値はraw namespaceへ保持し、canonicalではNULLとする。factの存在やtransport Rから未取得quotaを作らない。独立した取得順を比較できない同minute候補は値とexact R/Wが全て同値の場合だけ一事実とし、異値は当該quotaだけ不明とする。
+
+model prefixは`recorded_usage_facts.source_key`と`session_events`の9列主キー完全一致が証明する元R/W所属を使い、memberに属するqualified fact_idを一回だけ数える。各factの元秒・exact model・lossless成分・DATAの資格を保持する。pointのminute終端と実観測end+1までのprefixだけを合算し、別groupのfactを表示範囲の重なりで配賦しない。成分不足・未知model・価格不足は当該成分/額の不明を保ち、modelの不存在を0へ変えず、partialをcompleteへ昇格させない。保存額の採否と再評価はMODEL-PRICING-463に従い、有効な同一vector/価格版の保存binary64を保持する。未検証保存額を保存済みという理由だけで正しい額と認定せず、最新価格で原額を上書きしない。
+
+**旧値と旧ID:** 元retained archiveを一つのimmutableなread-only原履歴viewとして保持する。canonical viewとは別の永続表や別の保存真値を作らない。旧十進IDへのhistoryはこの元履歴の全page、元境界、元model・knownness・価格bitsを返す。opaque group IDへのhistoryはcanonical prefixを返す。旧IDをgroupへ自動redirectしない。canonicalの数値と未資格/未所属の旧派生値を別namespaceで同時に参照できることが保全条件であり、両方の値を加算しない。
+
+10/15の旧6.1-sol保存値1079709361は未所属かつfact不在の5742 event合計と一致し、10/17の旧gpt-6-sol保存値5180476は同状態の46 event合計と一致した。対象の保存集合はmodel_set_complete=false、durable provenanceはlegacy-unknownである。writerが保持した未解決旧値を、canonicalの確定消費やgroup成立条件へ昇格させてはならない。10/17の6.1-sol残差1169015は未確定のまま原値と理由を保持し、誤値とも0とも断定しない。独立に検証済みの値と未解決の旧値を混同せず、原本不足だけを根拠に原値を削除しない。
+
+**page・月・公開pair:** group/旧IDの選択は同じimmutable publicationの中で行う。cursorはaccount/epoch、要求ID、raw/canonical系列と既取得prefixへ束縛し、別namespaceへ流用しない。既取得prefixが不変のappendは既存WIREの規則で継続でき、published pairの変更だけを理由にhistory cursorを失効させない。pageの同account・同pair受理と、新pairへの完全な差分appendの既存atomic規則を保持する。local_usageは選択したnamespaceの元metadataから既存のpage時間範囲を求め、account全体のlocal activityに関する既存の意味・unknown/unused区別を維持する。local_usageを別期間のtoken配賦や月加算に使わない。月の数値入力はcanonical groupだけとし、旧十進IDの互換historyを再加算しない。月はG137-GRAPH-01の受理済み累積差分とknownnessを維持し、表示timezoneの暦日へ一度だけ帰属させる。不完全coverageの日跨ぎ差を按分せず、model ON/OFFで合計を変えない。raw履歴だけが変わる更新もpublication同値性/fingerprintへ反映し、旧pairのまま異なる旧ID応答を返さない。
+
+#### 独立した具体入力と期待結果
+
+以下は元観測と原本担当の9列完全一致queryを入力にした期待結果であり、実装が作ったgroupからoracleを生成しない。全てW=604800、historicalであり、origin_atは各startと同じ資格済み元秒である。
+
+| 元報告ID集合 | canonical ID | start / end / transport reset | 一意なqualified fact数 | directory/selectable |
+| --- | --- | --- | --- | --- |
+| 1792655842,1792655864,1792655865 | rg1-1792051020-604800 | 1792051042 / 1792219208 / 1792655865 | 5026 | 一項目 |
+| 1792823931,1792823932,1792823933 | rg1-1792219080-604800 | 1792219131 / 1792269701 / 1792823933 | 3009 | 一項目 |
+| 1793398867,1793398909,1793398910,1793398911 | rg1-1792794060-604800 | 1792794067 / 1792908744 / 1793398911 | 8802 | 一項目 |
+
+実データ入力は三つの表示keyを固定し、元receiptのR/Wからそのkeyに属する全報告をAPI取得前に列挙する。10/24のR1793398867は公式receiptが一件、元sampleが一件、model/event/qualified factは0件でも同じgroupに属する。数値の有無でmemberを除外しない。10/17の元3点（1792219200の100、1792257360/1792260300の40）はrow自身の公式参照がなく、そのminuteに独立した公式receiptも無いため、元値をrawへ保持しcanonical RemainingはNULLとする。
+
+10/15には全元範囲を包含する既存代表がないが、上記の一項目と全元履歴保全を同時に満たす。10/17は保存値の再構成不一致を残しても一項目であり、元値は旧IDで保持する。10/24だけの局所一致を全体受入へ転用しない。各旧IDはその元履歴を返し、canonicalへの同値aliasにはしない。fact-only後続minute、部分成分・価格不明、同じfact再掲、raw-only更新の各破壊経路を有限の直接testで反証する。
+
+**仕様判定：本節の表示重複除去・旧履歴保全は実装へ進める。** providerの実cycle識別はLIVE-RESET-129どおり不明のままであり、この表示重複除去の前提条件へ追加しない。製品修正の受入は、三ケースの一重掲載・元全履歴・全known数値/unknown/価格・cursor/local_usage・月の一回加算を実上位callerで同時に立証してから行う。API先行とWindows確認をユーザーが行う既存の分担を維持し、仕様確定やfixture成功を稼働環境/実画面の成功へ置換しない。
 
 補助的な明示時間範囲の集計は、accountとUTC half-open範囲`[start_at,end_at)`に元消費秒が入る一意なqualified factの成分和である。補助APIの既定rolling範囲は、最新受理quotaの窓長Wと、同accountの最新quota元秒・qualified fact元秒の最大Tから`[T+1-W,T+1)`とする。これは内部・補助resourceの計算であり、MainまたはGraphの既存期間を置換する根拠ではない。完備性不足・成分不明・未解決重複は対象ごとに保持する。異なるRの保存累計の和・最大・差だけをlocal消費や月合計の代用にしない。
 
@@ -170,9 +210,12 @@ quota応答の型検証と、有限window候補の数値資格を分ける。入
 
 「Remainingが100の間にreset予定が動く」は観測された報告値として受理するが、実消費0やproviderの恒久保証とは表明しない。同じexact R/Wは同じ報告枠の保存key、異なるR/Wは1秒差・前後方向・同一取得秒でも別の保存keyとして保持する。このkeyは実利用期間の外部identityではない。保持・表示・輸送の都合でraw keyを丸めず、実利用期間と記録分の意味はRECORDED-USAGE-SCOPE-604に従う。
 
+その期間でtoken利用を開始するまでは、リセット予定時刻は計測時刻に応じて先へ動き続ける。これは予定値の更新であり、新しい利用週の開始や実resetの発生ではない。初回取得の予定Rを固定した週境界にせず、利用開始前の予定更新をそれぞれ独立した選択週へ増殖させない。各取得原本とexact保存keyは保持する。token利用の開始と、整数のRemainingが100未満になる観測は区別し、Remaining=100をtoken消費なしの証拠にしない。
+
 公式の[rate limit field定義](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt)は現在の使用率と次回resetを報告するが、同一reset内の使用率の単調性を保証しない。このため、受理済みの0..100のRemainingが増加・反転したという形だけでは異常値として棄却しない。新しい報告枠の保存keyかどうかはexact R/Wで区別するが、新しい実利用期間かどうかをこのkeyやtoken量・料金・回復率から推測しない。これは累積event deltaの非負和として本製品が管理するmodel token/USDとは異なる外部authorityである。
 
 accountの記録上の所有境界はDATA8.6「記録上のaccount所有区間と未確認境界」を正本とする。開始不明を全時刻所有へ変換せず、初回・再起動・切替・logout・主体不明・RPCだけの失敗を同節の別条件で扱う。設定されたactivation値や現時刻によって過去の所属を生成しない。
+
 
 ### 収集・公開の依存順序と失敗境界
 
@@ -285,8 +328,32 @@ Linuxに実装された対応surfaceにも同じデータの意味と取得失�
 - current quotaの`reset_at`は、現在account partition・AuthEpochで受理した最新quotaのprovider `resetsAt`をUnix秒のまま保持し、同じ観測のWと保存する。応答順はdurable sequenceで保持し、observed_atやRの大小で変更しない。exact R/Wは報告枠の保存keyであって実利用週IDではない。旧報告枠のorigin/終端metadataを再現する場合は同じ原観測を用い、providerが保証した不変の実期間identityと表明しない。RECORDED-USAGE-SCOPE-604に従って既存Main/Graphの期間・モデル値・価格を保持し、補助rolling範囲へ置換しない。quota取得失敗、account切替、logout、identity失敗は既存のlast-good/strict-empty契約を維持する。
 - `CURRENT-PERIOD-BOUNDS-129`の公開`observed_at`は、最新受理quota receiptの元観測時刻と、同じaccount/現在exact reset/所有区間にある公開資格済み履歴観測の終端・confirmed gap終端との最大値とする。履歴はDATAのTと保持窓で資格を判定し、raw終端が保存されていればその秒、canonical minuteしかなければそのtimestampを使う。公式receiptの元観測時刻・取得順序は変更せずDBに保持する。別periodの履歴、thread活動、heartbeat、公開処理のTだけではcurrentの観測終端を進めない。current model latestは同じT/所有権/exact periodで受理した最新model事実を使い、quota観測時刻より後という理由で省略しない。recentとretainedは共通domainで求めた同じcurrent観測時刻とmetadataを使い、31日adapterから観測時刻を再計算しない。quotaがない旧形式では同じ所属条件の実在観測・gapの最大値を使い、何もなければ`observed_at=null`とする。この公開時刻は全fieldが同時に取得されたことやquotaの再取得成功を意味しない。quotaの取得成否は独立した永続acquisition状態で表示し、古いquotaを再取得済みとして扱わない。
   固定例としてquota元観測1200、同resetの有効model観測1260、T=1380なら公開`observed_at=1260`、current終端は`min(reset_at,1260)`であり、1260の点を保持する。Tだけ1440へ進めても実在記録・窓が変わらなければこの値は変わらない。quota元観測1200は書き換えず、残量値も補間しない。
-- `LIVE-RESET-129`: 公式quotaの取得・次回reset予定の変更はSession利用・開始・終了と非同期である。完全な公式応答は元のexact R/W・Remaining・取得順で保存し、Rの変化を丸めたり固定件数で拒否したりしない。取得時刻が後退しても応答順を変更しない。Rの変化は新しい報告値であり、実利用期間の切替や原因名の証明ではない。実期間の同一性と記録分の表示は`RECORDED-USAGE-SCOPE-604`に従う。Session累計counter・checkpointをquota更新でゼロ化せず、同じ消費を新しいRへ再加算しない。保存・公開窓と転送pageの容量境界はWIRE ownerに従い、報告値の受理・現在Thread・原本の保持を壊さない。
-- `CURRENT-PERIOD-BOUNDS-129`のhistorical metadataは、同じaccount/published pairの保存事実からexact resetごとに求める。`HISTORY-RECOVERY-614`の検証を通った公式originが一意なら`start_at=origin_at`、なければ公開対象の最初の観測timestampまたはconfirmed gap開始の小さい方とし、`origin_at=null`とする。`end_at`は同じexact periodの公開対象の観測終端とgap終端の最大値をresetで上限clipした値とする。観測原時刻を保持している場合はその終端を使い、canonical minuteしか保存されていない場合はそのtimestampを使う。原時刻に架空の59秒を加えない。保持内の点もgapもない過去IDは通常directoryに掲載せず、直接historyはWIREの既知ID空pageとする。履歴の回復・保持窓の変化がない限り同じmetadataとなり、UIの現在時刻で延長しない。公式windowの後方移動等により異なるIDの表示範囲が重なっても有効であり、隣periodのstartを使ってclip・統合・再所属しない。固定時間窓でも各exact periodを独立投影し、重なりは同一観測の重複計上と区別する。`start_at<=end_at<=reset_at`を構成できない場合は、WIREの履歴利用不能とcurrent保持を使い、時刻を捏造しない。
+- `LIVE-RESET-129`: 公式応答のreset日時Rは次回resetの予定時刻であり、実resetの発生時刻または実利用期間の不変IDではない。公式quotaの取得・予定変更はSession利用と非同期である。実resetには定時の実行、公式による予定前の実行、利用者によるバンクresetがあり、実際の利用期間がWより短くなることもある。
+
+  完全な公式応答は元のexact R/W・Remaining・原本参照・元観測時刻・取得順で保存する。異なるRを別keyで保持するIssue #604の契約は、報告枠の保存identityを定義したものであり、実利用期間の切替を証明するものではない。取得時刻が後退しても応答順を変更しない。
+
+  予定Rの変更または通過、最初の取得、残量の増減・100%回復、model/tokenの変化だけから、実resetの発生・原因・実効時刻を確定しない。最初の予定窓への固定、max/minによる境界の連結、固定秒tolerance、多数決によって実利用期間を生成しない。予定窓同士の非重複や実期間の固定W幅も要求しない。
+
+  実利用期間の境界には、対象account・利用枠に対応し、実resetの発生と実効時刻を直接示す根拠を用いる。現在確認したquota snapshotのR/W・usage・credit残量と取得metadataには、その根拠がない。根拠のない実境界は不明として扱い、報告枠の保存IDを実利用期間IDへ昇格しない。
+
+  実境界が不明であることを、受理済みquota、資格済み消費fact、model、token、保存価格、既知USDの無効化理由にしない。Session累計counter・checkpointをquota更新でゼロ化せず、同じ消費を新しいRへ再加算しない。期間全体の所属・完備性と、記録済み数値の既知性を分離する。保存・公開窓と転送pageの容量境界はWIRE ownerに従い、報告値の受理・現在Thread・原本の保持を壊さない。
+
+  入力の意味は、公式の[利用枠snapshotとfield定義](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt)、[reset creditのconsume応答](https://learn.chatgpt.com/docs/app-server#8-earned-rate-limit-resets-chatgpt)、[updated通知](https://learn.chatgpt.com/docs/app-server#api-overview-1)に従う。`account/rateLimits/updated`は利用枠の任意の変更通知であり、実reset専用通知ではない。バンク相当の`account/rateLimitResetCredit/consume`はoutcomeを返す。[0.166.0のoutcome定義](https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/app-server-protocol/src/protocol/v2/account.rs#L453-L461)に従い、`reset`はcredit消費と対象窓のreset完了、`alreadyRedeemed`は同じidempotency keyでresetが既に成功していること、`nothingToReset`はreset対象枠なし、`noCredit`は利用可能creditなしを示す。応答は実効日時、新しいwindow、実利用期間IDを返さない。公式はconsume後に`account/rateLimits/read`を取得し、consume応答から更新後windowを推測しないよう定めている。creditの`grantedAt`は付与日時、`expiresAt`は失効日時であり、実reset日時へ代用しない。監視目的でcreditを消費するcontrolを呼ばないという既存契約を維持する。
+
+  同じaccount・利用枠を対象にした、入力と期待結果は次のとおりとする。
+
+  | 入力 | 保存・数値の期待結果 | 実resetについて確定できること |
+  | --- | --- | --- |
+  | 予定Rだけが変わる。A→B→AでBがAより1秒後の場合も同じ | 全receiptを取得順で保持し、exact保存keyを丸めない。A→B→Aでは原本3件と報告key2種類を保持する。同じqualified factを再加算せず、既知model・token・USDを保持する | Rの同値・差だけでは実resetの有無、期間の同一性、実効日時を確定しない。A→B→Aの実cycle数を1件とも2件とも断定しない |
+  | consumeが`reset`を返す | credit消費と対象窓のreset完了として扱う。後続readのquotaは元の報告値として受理し、既知の消費を消去しない | reset完了は判明するが、この応答から正確な実効日時・更新後window・実期間IDを生成しない |
+  | 同じ償還について`alreadyRedeemed`を返す | 同じidempotency keyのreset成功済みとして扱い、新しいresetとして再計上せず、既知の消費を保持する | 既完了であることと、新しいresetの発生を区別する。実効日時はこの応答からは不明 |
+  | `nothingToReset`または`noCredit`を返す | 当該償還は不成立。これだけをquota取得laneの失敗や既知数値の消去理由にしない | 当該応答を新しいresetの発生根拠にしない |
+  | 資格済みfactあり。実境界が不明、または派生prefix cacheが未初期化 | RECORDED-USAGE-SCOPE-604の資格済みfactと既知参考額を保持する。所属・完備性の不明を数値0や取得errorへ変換しない | 不明な境界は不明のままとし、最初の予定窓、固定W幅、隣接窓の連結で補わない |
+
+  実利用期間の識別・帰属については、実resetの発生と実効時刻を対象account・利用枠へ結び付ける入力元とfield契約が未確定である。上記snapshotとconsume応答ではその不足を埋められない。この実cycle識別の部分は未確定のまま保持する。RECORDED-USAGE-SCOPE-604の表示区間のidentityとは別であり、表示重複除去の成立条件へ実cycleの証明を追加しない。根拠のない実境界生成・保存所属の統合は実装しない。
+
+  この入力不足が妨げるのは実利用期間の確定・再所属であり、保存済み報告枠の公開、既知数値の保持、根拠のない派生処理の除去を停止する条件ではない。retainedの報告ID、origin、観測時刻、model値をfirst/max等で別の範囲へ書き換えない。実装が生成した未承認範囲の集計値を、その範囲を撤回した後も別IDへ移して保持しない。原本、資格済みfact、元報告frameの既知model/token/USDと保存価格は保持する。
+- `CURRENT-PERIOD-BOUNDS-129`のhistorical metadataは、同じaccount/published pairの保存事実からexact resetごとに求める。`HISTORY-RECOVERY-614`の検証を通った公式報告windowの起点が一意なら`start_at=origin_at`、なければ公開対象の最初の観測timestampまたはconfirmed gap開始の小さい方とし、`origin_at=null`とする。`end_at`は同じexact periodの公開対象の観測終端とgap終端の最大値をresetで上限clipした値とする。観測原時刻を保持している場合はその終端を使い、canonical minuteしか保存されていない場合はそのtimestampを使う。原時刻に架空の59秒を加えない。保持内の点もgapもない過去IDは通常directoryに掲載せず、直接historyはWIREの既知ID空pageとする。履歴の回復・保持窓の変化がない限り同じmetadataとなり、UIの現在時刻で延長しない。この段落はexact報告keyから元metadataを再現する規則であり、同じ論理区間をcanonical directoryへ複数掲載する許可ではない。元の保存範囲の重なりを保持しつつ、公開区間の一意性と対応はRECORDED-USAGE-SCOPE-604で別に確定する。隣periodのstartによる無根拠なclip・統合・再所属で元metadataを変更しない。`start_at<=end_at<=reset_at`を構成できない場合は、WIREの履歴利用不能とcurrent保持を使い、時刻を捏造しない。 ここでR/Wから求めるorigin_atは報告された予定窓の起点であり、実resetの発生日時ではない。
 - account partitionの旧`reset_at` aliasと既知の`-1` quota sentinelは、DATA owner `HISTORY-CANONICAL-134`の検証済みbackup後migrationで`usage_history`単一正本へ置換する。既存model/provenance sidecarは`HistoryCanonicalizer`が実際に採用したraw usage rowのexact旧キーに結び付くものだけを同じcanonical keyへ再所属し、捨てたaliasのsidecarを比較選択・混合・補間しない。現在・過去accountへ同じmigration/write契約を適用し、稼働DBにraw/canonical並列表、revision同期、reader/UI補償を残さない。同一period内でquotaまたはvectorを一意化できない局所minuteは値を作らずlive集合から除外し、period ownerまたはcycle境界不明時だけpartition全体を無変更としてverified backupとlast-good publicationを保持する。
 - migration、restore、updateはcandidateを完全検証してからatomic switchする。検証またはswitch失敗時は旧世代だけをcurrentとして保持する。
 - cursorはsource identityと結合し、rotate、truncate、replaceを区別する。古いoffsetによるskipと二重登録を防ぐ。
@@ -848,16 +915,16 @@ Windowsのみ、既定のreset週期間、固定24時間／7日間、表示timez
 | detailsのstrict schema/domain/header検証 | 欠落・未知・重複・stale generation | Main/Graph/Threadsが異なるrootを表示する |
 | health readiness | listenerだけが存在しsnapshotを返せない状態 | Setupが利用不能serviceを接続済みと扱う |
 
-`HistoryCanonicalizer`の旧行の所属、同一minuteの採用元、比較する全model vector、局所除外とpartition rollbackはDATA owner `HISTORY-CANONICAL-134`だけが定義する。時刻の近さやresetの追随を根拠に、公式の別期間または帰属不明の旧行を同一cycleへ変換しない。account readerは検証済み`usage_history`とexact keyのsidecarを読み、公式quotaは`QUOTA-DURABLE-604`の受理済み記録から導出する。公開windowのclippingとmodelの期間再所属は別の処理であり、window内にあるという理由だけでmodelを移さない。
+`HistoryCanonicalizer`の旧行の所属、同一minuteの採用元、比較する全model vector、局所除外とpartition rollbackはDATA owner `HISTORY-CANONICAL-134`だけが定義する。時刻の近さやresetの追随を根拠に、公式の別期間または帰属不明の旧行を同一cycleへ変換しない。account readerは検証済み`usage_history`とexact keyのsidecarを読み、公式quotaは`QUOTA-DURABLE-604`の受理済み記録から導出する。公開windowのclippingと保存済みmodelの期間再所属は別の処理であり、window内にあるという理由だけで保存値を移さない。報告枠と実利用期間を区別し、記録分の数値の扱いはRECORDED-USAGE-SCOPE-604に従う。
 
 ## 「正しい表示」の判定（必須不変条件）
 
 次の条件をすべて満たした状態だけを正しい表示と定義する。
 
 1. 同一の認証主体でquotaを定期更新している間は、受理済みモデル使用量・履歴・threadを保持する。更新途中の欠測を空、0、未取得へ置き換えない。収集済みの新しい部分観測を受理した場合は、`API-V3-MODELS-01`に従い確認できた最新model値と不完全状態を一組で表示し、古い完全集合へ戻さない。
-2. 同じ公式`reset_at`は同一期間として扱う。より新しい公式quota観測で日時が変われば、quota回復やDBの観測時計に関係なく新期間として記録・公開する。
+2. 同じ公式exact R/Wは同じ報告枠の保存keyとして扱い、異なるR/Wの取得原本は別keyで記録する。報告枠と実resetの区別はLIVE-RESET-129、wire上のIDはWIREに従う。報告日時の変化だけで実利用期間の切替を断定せず、既存の記録分の数値・原本を保持する。
 3. モデル使用量（ドル・token）と残量（%）は別観測として扱う。残量観測がない時間帯をモデル使用量から逆算せず、遅れて届いた残量観測はその時刻へ反映する。
-4. DATA owner `HISTORY-CANONICAL-134`の原本で証明するperiod所属、lossless vector比較、採用元exact key、局所除外とrollbackに従う。公式quotaと別resetの受理は`QUOTA-DURABLE-604`を優先し、時刻の近さ・windowの重なり・固定期間長でmodelを再所属させない。同じexact period/minuteへの有効な新frameはDATAの通常更新規則でvectorとsidecarを同一transactionで保存する。公式取得順で新periodになった場合は新しいexact keyへ保存し、同minuteにある旧periodの有効なvectorとsidecar、Session原本・event・checkpointを保持する。UI/RESTの補償で値や所属を作り替えない。
+4. DATA owner `HISTORY-CANONICAL-134`の原本で証明するperiod所属、lossless vector比較、採用元exact key、局所除外とrollbackに従う。公式quotaと別resetの受理は`QUOTA-DURABLE-604`を優先し、時刻の近さ・windowの重なり・固定期間長でmodelを再所属させない。同じexact period/minuteへの有効な新frameはDATAの通常更新規則でvectorとsidecarを同一transactionで保存する。公式取得順で新報告枠になった場合は新しいexact keyへ保存し、同minuteにある旧periodの有効なvectorとsidecar、Session原本・event・checkpointを保持する。保存値とraw所属をUI/RESTの補償で書き換えない。保存報告枠への所属と実利用期間の境界を区別し、LIVE-RESET-129とRECORDED-USAGE-SCOPE-604に従う。
 5. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の受理済み表示を保持し、失敗状態は別途表示する。取得できた部分観測のmodel値は集合全体の不完全性だけで消去せず、MainとGraphで不完全状態を可視化し、正常・最新と誤称しない。
 6. 製品バージョンはメイン画面に一度だけ表示し、子ウインドウのタイトルやボタンへ重複表示しない。値はX版・Windows版とも同じリリースversion authorityから導出する。
 7. Windows版の初回起動では、health readiness後に最初のstrict validation済み`/v4/current` snapshot（exact404だけv3 current、さらにexact404の旧serviceだけ上記legacy chain）が揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。control応答とのmerge、途中fieldの順番描画をせず、初回取得失敗時はスピナーを解除して失敗状態と再試行手段を表示する。Linux / WindowsのMainに公開対象となった現在openのSession thread件数を表示するため、`open_session_thread_count>0`のcurrentに限り同じMain cycleでthreadsを1回取得し、同一published pair、open件数と行数、active件数と動作中行数が一致する組だけを一括表示する。`open_session_thread_count=0`はthreadsを要求せず同じcurrent pairのthread行を空として一括表示する。Mainの合計と`SOL/TERRA/LUNA/ASTRA/その他`はこの一つの受理済み行集合だけから導出し、常に合計＝各bucketの和とする。開いたThreads詳細はMainが新しいbundleを受理した同じUI更新でそのthread行（0件を含む）へ追従し、別のthreads requestを追加しない。Main更新前に始めた独立Threads取得の古い応答で、その更新を上書きしない。threads失敗・世代不一致・件数不一致ではcurrentだけを反映せず直前の完全表示を保持する。positive bundle失敗後は10秒後にcurrentを条件headerなしで1回だけ再取得し、そのbundleが成功するまでforce、Graph、独立Threads取得で待機を迂回せず、保持中のerrorを解除しない。Graphを開いていない間はGraph resourceを取得せず、Threads詳細windowを閉じている間はこのMain bundle以外の5秒周期threads取得を行わない。

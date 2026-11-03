@@ -284,7 +284,7 @@ impl PublishedSnapshot {
             .flatten();
         Self {
             generation: snapshot.generation,
-            data_hash: snapshot.data_hash,
+            data_hash: publication_data_hash(&snapshot),
             // A candidate has no public identity until its admission succeeds.
             pair: String::new(),
             has_pending_ranges: snapshot.has_pending_ranges,
@@ -389,6 +389,47 @@ fn common_facts_equal<T: serde::Serialize>(
     }
 }
 
+fn raw_history_archive(snapshot: &PublishedSnapshot) -> &HistoryArchive {
+    snapshot
+        .retained_history
+        .raw
+        .as_deref()
+        .unwrap_or(&snapshot.retained_history)
+}
+
+fn publication_data_hash(snapshot: &DbSnapshot) -> String {
+    let Some(raw) = snapshot.retained_history.raw.as_deref() else {
+        return snapshot.data_hash.clone();
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"codex-info-rest-publication-data-v2\0");
+    hash.update(snapshot.data_hash.as_bytes());
+    hash.update(serde_json::to_vec(raw).expect("validated raw history is serializable"));
+    format!("{:x}", hash.finalize())
+}
+
+fn raw_member_has_token_usage(
+    archive: &HistoryArchive,
+    history: &HistoryIndex,
+    period: &codex_info_rest_contract::PublicHistoryPeriod,
+) -> bool {
+    let raw = archive.raw.as_deref().unwrap_or(archive);
+    raw.periods
+        .iter()
+        .filter(|raw_period| {
+            raw_period.reset_at == period.reset_at
+                || archive
+                    .aliases
+                    .get(&raw_period.reset_at)
+                    .is_some_and(|reset| *reset == period.reset_at)
+        })
+        .any(|raw_period| {
+            history
+                .raw_period(&raw_period.id)
+                .is_some_and(|index| index.has_token_usage)
+        })
+}
+
 fn same_public_domain(previous: &PublishedSnapshot, candidate: &PublishedSnapshot) -> bool {
     if previous.history_available != candidate.history_available
         || previous.current.models_status != candidate.current.models_status
@@ -419,6 +460,12 @@ fn same_public_domain(previous: &PublishedSnapshot, candidate: &PublishedSnapsho
     if !previous.history_available {
         return true;
     }
+    if !exact_fact(
+        raw_history_archive(previous),
+        raw_history_archive(candidate),
+    ) {
+        return false;
+    }
     let directory = |snapshot: &PublishedSnapshot| {
         snapshot
             .retained_history
@@ -435,7 +482,13 @@ fn same_public_domain(previous: &PublishedSnapshot, candidate: &PublishedSnapsho
                                 .origins
                                 .get(&period.reset_at)
                                 .copied(),
-                            period.current || indexed.has_token_usage,
+                            period.current
+                                || indexed.has_token_usage
+                                || raw_member_has_token_usage(
+                                    &snapshot.retained_history,
+                                    &snapshot.history_index,
+                                    period,
+                                ),
                         )
                     },
                 )
@@ -485,6 +538,12 @@ fn same_public_domain(previous: &PublishedSnapshot, candidate: &PublishedSnapsho
 }
 
 fn history_facts_preserved(previous: &PublishedSnapshot, candidate: &PublishedSnapshot) -> bool {
+    if !exact_fact(
+        raw_history_archive(previous),
+        raw_history_archive(candidate),
+    ) {
+        return false;
+    }
     let (Some(old), Some(new)) = (
         &previous.history_reprojection_witness,
         &candidate.history_reprojection_witness,
@@ -3396,6 +3455,11 @@ fn serialize_route_with_budget(
                             .history_index
                             .period(&period.id)
                             .is_some_and(|index| index.has_token_usage)
+                        || raw_member_has_token_usage(
+                            &snapshot.retained_history,
+                            &snapshot.history_index,
+                            period,
+                        )
                 })
                 .collect::<Vec<_>>();
             serialize_json(&json!({
@@ -3449,6 +3513,7 @@ fn directory_indices(archive: &HistoryArchive, history: &HistoryIndex) -> [Vec<u
                 || history
                     .period(&period.id)
                     .is_some_and(|entry| entry.has_token_usage)
+                || raw_member_has_token_usage(archive, history, period)
         })
         .collect();
     [all, selectable]
@@ -3658,27 +3723,48 @@ fn flatten_with_version<T: serde::Serialize>(
     serialize_json(&Value::Object(object))
 }
 
+fn selected_history_archive<'a>(
+    snapshot: &'a PublishedSnapshot,
+    period: &str,
+) -> (&'a HistoryArchive, bool) {
+    if period.parse::<i64>().is_ok() {
+        (
+            snapshot
+                .retained_history
+                .raw
+                .as_deref()
+                .unwrap_or(&snapshot.retained_history),
+            true,
+        )
+    } else {
+        (&snapshot.retained_history, false)
+    }
+}
+
 fn history_selection<'a>(
     snapshot: &'a PublishedSnapshot,
     period: Option<&str>,
     cursor: Option<&str>,
-) -> Result<(&'a PeriodIndex, usize), RouteError> {
+) -> Result<(&'a HistoryArchive, &'a PeriodIndex, usize), RouteError> {
     let period = period.ok_or(RouteError::UnknownPeriod)?;
-    let indexed = snapshot
-        .history_index
-        .period(period)
-        .ok_or(if cursor.is_some() {
-            RouteError::StaleCursor
-        } else {
-            RouteError::UnknownPeriod
-        })?;
+    let (archive, raw) = selected_history_archive(snapshot, period);
+    let indexed = if raw {
+        snapshot.history_index.raw_period(period)
+    } else {
+        snapshot.history_index.period(period)
+    }
+    .ok_or(if cursor.is_some() {
+        RouteError::StaleCursor
+    } else {
+        RouteError::UnknownPeriod
+    })?;
     let start = match cursor {
         Some(cursor) => indexed
-            .start_after(&snapshot.retained_history.samples, cursor)
+            .start_after(&archive.samples, cursor)
             .ok_or(RouteError::StaleCursor)?,
         None => 0,
     };
-    Ok((indexed, start))
+    Ok((archive, indexed, start))
 }
 
 fn serialize_history(
@@ -3686,7 +3772,16 @@ fn serialize_history(
     period: Option<&str>,
     cursor: Option<String>,
 ) -> Result<Vec<u8>, RouteError> {
-    let (indexed, start) = history_selection(snapshot, period, cursor.as_deref())?;
+    serialize_json(&history_document(snapshot, period, cursor)?)
+}
+
+fn history_document(
+    snapshot: &PublishedSnapshot,
+    period: Option<&str>,
+    cursor: Option<String>,
+) -> Result<Value, RouteError> {
+    period.ok_or(RouteError::UnknownPeriod)?;
+    let (archive, indexed, start) = history_selection(snapshot, period, cursor.as_deref())?;
     let end = start
         .saturating_add(MAX_HISTORY_PAGE)
         .min(indexed.samples.len());
@@ -3695,11 +3790,11 @@ fn serialize_history(
         .map(|&row| {
             #[cfg(test)]
             record_history_row_visit();
-            &snapshot.retained_history.samples[row]
+            archive.samples[row].clone()
         })
         .collect::<Vec<_>>();
     let resume_cursor = if end > 0 {
-        Some(indexed.resume(&snapshot.retained_history.samples, end - 1))
+        Some(indexed.resume(&archive.samples, end - 1))
     } else {
         cursor.clone()
     };
@@ -3714,12 +3809,12 @@ fn serialize_history(
         indexed
             .gaps
             .iter()
-            .map(|&row| &snapshot.retained_history.gaps[row])
+            .map(|&row| archive.gaps[row].clone())
             .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
-    serialize_json(&json!({
+    Ok(json!({
         "api_version": API_VERSION_V3,
         "history_samples": samples,
         "history_gaps": history_gaps,
@@ -3737,12 +3832,12 @@ fn serialize_history_extended(
     if !snapshot.history_available {
         return Err(RouteError::HistoryUnavailable);
     }
-    let (indexed, start) = history_selection(snapshot, period, cursor.as_deref())?;
-    let selected = snapshot
-        .retained_history
+    let requested_id = period.ok_or(RouteError::UnknownPeriod)?;
+    let (archive, indexed, start) = history_selection(snapshot, period, cursor.as_deref())?;
+    let selected = archive
         .periods
         .iter()
-        .find(|p| Some(p.id.as_str()) == period)
+        .find(|candidate| candidate.id.as_str() == requested_id)
         .ok_or(RouteError::UnknownPeriod)?;
     let end = start
         .saturating_add(MAX_HISTORY_PAGE)
@@ -3753,17 +3848,13 @@ fn serialize_history_extended(
         indexed
             .samples
             .get(start - 1)
-            .map(|&row| {
-                snapshot.retained_history.samples[row]
-                    .timestamp
-                    .max(selected.start_at)
-            })
+            .map(|&row| archive.samples[row].timestamp.max(selected.start_at))
             .unwrap_or(selected.start_at)
     };
     let end_at = indexed
         .samples
         .get(end)
-        .map(|&row| snapshot.retained_history.samples[row].timestamp)
+        .map(|&row| archive.samples[row].timestamp)
         .unwrap_or_else(|| selected.end_at.saturating_add(1));
     let end_at = end_at.max(start_at.saturating_add(1));
     let evidence = snapshot
@@ -3771,8 +3862,7 @@ fn serialize_history_extended(
         .as_ref()
         .and_then(|archive| archive.local_usage(start_at, end_at).ok())
         .unwrap_or_else(|| LocalUsage::unavailable(start_at, end_at));
-    let mut document: Value = serde_json::from_slice(&serialize_history(snapshot, period, cursor)?)
-        .map_err(|_| RouteError::Serialization)?;
+    let mut document = history_document(snapshot, period, cursor)?;
     document["local_usage"] =
         serde_json::to_value(evidence).map_err(|_| RouteError::Serialization)?;
     serialize_json(&document)
@@ -3914,6 +4004,7 @@ pub fn loopback_addr(port: &str) -> Result<SocketAddr, RestServerError> {
 
 #[cfg(test)]
 mod tests {
+    include!("report_group_alias_tests.rs");
     use super::*;
     use rusqlite::{params, Connection};
     use std::fs;
@@ -4050,6 +4141,8 @@ mod tests {
                     samples: samples.clone(),
                     gaps: vec![],
                     origins: BTreeMap::new(),
+                    aliases: BTreeMap::new(),
+                    raw: None,
                 },
                 reprojection_witness: None,
                 details,
@@ -6634,6 +6727,8 @@ mod tests {
                     gaps: details.history_gaps.clone(),
                     samples: samples.clone(),
                     origins: BTreeMap::new(),
+                    aliases: BTreeMap::new(),
+                    raw: None,
                 },
                 reprojection_witness: None,
                 details,
@@ -6768,6 +6863,8 @@ mod tests {
             gaps: candidate.details.history_gaps.clone(),
             samples: candidate.history_samples_v3.clone(),
             origins: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            raw: None,
         };
         PublishedSnapshot::from_db_for_account(candidate, storage_epoch)
     }
@@ -7294,6 +7391,8 @@ mod tests {
                     gaps: details.history_gaps.clone(),
                     samples: history_samples.clone(),
                     origins: BTreeMap::new(),
+                    aliases: BTreeMap::new(),
+                    raw: None,
                 },
                 reprojection_witness: None,
                 details,
@@ -7611,6 +7710,149 @@ mod tests {
         assert_eq!(value["api_version"], "v1");
         assert_eq!(value["service"], "codex-info");
         assert_eq!(value["product_version"], env!("CODEX_INFO_PRODUCT_VERSION"));
+    }
+
+    #[test]
+    fn issue659_partial_legacy_history_serializes_known_values_and_other_period() {
+        const AT: i64 = 1_800_000_000;
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("issue659-partial-history.sqlite3");
+        let database = Connection::open(&path).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE usage_history(
+                timestamp INTEGER NOT NULL,reset_at INTEGER NOT NULL,
+                remaining_percent REAL,sol_dollars REAL,terra_dollars REAL,luna_dollars REAL,
+                sol_tokens INTEGER,terra_tokens INTEGER,luna_tokens INTEGER);
+             CREATE TABLE collection_generation(
+                singleton INTEGER PRIMARY KEY,data_generation TEXT NOT NULL,
+                reset_at INTEGER NOT NULL,window_seconds INTEGER NOT NULL,
+                collector_epoch TEXT,cycle_seq TEXT NOT NULL);
+             INSERT INTO collection_generation VALUES(1,'1',1800001200,600,NULL,'0');
+             INSERT INTO usage_history VALUES(1800000000,1800000600,50,0.25,0.50,0.75,100,20,30);
+             INSERT INTO usage_history VALUES(1800000660,1800001200,40,1,2,3,200,40,60);",
+            )
+            .unwrap();
+        let read = || DbReader::open(&path).unwrap().read_snapshot();
+        let normal = read().expect("normal producer-shaped legacy history must read");
+        assert_eq!(normal.history_samples_v2.len(), 2);
+        let first = normal
+            .history_samples_v2
+            .iter()
+            .find(|row| row.timestamp == AT)
+            .unwrap();
+        assert_eq!(
+            (first.sol_tokens, first.terra_tokens, first.luna_tokens),
+            (Some(100), Some(20), Some(30))
+        );
+        assert_eq!(
+            (first.sol_dollars, first.terra_dollars, first.luna_dollars),
+            (Some(0.25), Some(0.50), Some(0.75))
+        );
+        let other = normal
+            .history_samples_v2
+            .iter()
+            .find(|row| row.timestamp == AT + 660)
+            .unwrap()
+            .clone();
+        let other_v3 = normal
+            .retained_history
+            .samples
+            .iter()
+            .find(|row| row.timestamp == AT + 660)
+            .unwrap()
+            .clone();
+        let normal = PublishedSnapshot::from_db_for_account(normal, 1);
+        let normal_wire: Value = serde_json::from_slice(
+            &serialize_route(&normal, Route::DetailsV2, None, None, false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(normal_wire["history_samples"].as_array().unwrap().len(), 2);
+        eprintln!("issue659 F6 legacy normal oracle passed: periods=2 SOL=100/USD0.25 TERRA=20/USD0.50 LUNA=30/USD0.75 other-period=200/40/60");
+
+        database
+            .execute(
+                "UPDATE usage_history SET sol_tokens=NULL WHERE timestamp=?1",
+                [AT],
+            )
+            .unwrap();
+        let partial =
+            read().expect("one unknown SOL token must not reject other known history values");
+        assert_eq!(partial.history_samples_v2.len(), 2);
+        let first = partial
+            .history_samples_v2
+            .iter()
+            .find(|row| row.timestamp == AT)
+            .unwrap();
+        assert_eq!(
+            (first.sol_tokens, first.terra_tokens, first.luna_tokens),
+            (None, Some(20), Some(30))
+        );
+        assert_eq!(
+            (first.sol_dollars, first.terra_dollars, first.luna_dollars),
+            (Some(0.25), Some(0.50), Some(0.75))
+        );
+        assert_eq!(
+            partial
+                .history_samples_v2
+                .iter()
+                .find(|row| row.timestamp == AT + 660)
+                .unwrap(),
+            &other
+        );
+        assert_eq!(
+            partial
+                .retained_history
+                .samples
+                .iter()
+                .find(|row| row.timestamp == AT + 660)
+                .unwrap(),
+            &other_v3
+        );
+        let partial = PublishedSnapshot::from_db_for_account(partial, 1);
+        let details: Value = serde_json::from_slice(
+            &serialize_route(&partial, Route::DetailsV2, None, None, false).unwrap(),
+        )
+        .unwrap();
+        let first = details["history_samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["timestamp"] == AT)
+            .unwrap();
+        assert!(first["sol_tokens"].is_null());
+        assert_eq!(first["sol_dollars"], 0.25);
+        assert_eq!(first["terra_tokens"], 20);
+        assert_eq!(first["luna_tokens"], 30);
+        let period = (AT + 600).to_string();
+        let history: Value = serde_json::from_slice(
+            &serialize_route(&partial, Route::HistoryV3, Some(&period), None, false).unwrap(),
+        )
+        .unwrap();
+        let first = history["history_samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["timestamp"] == AT)
+            .unwrap();
+        let models = first["models"].as_array().unwrap();
+        assert!(!models.iter().any(|row| row["model"] == "SOL"));
+        assert!(models.iter().any(|row| row["model"] == "TERRA"
+            && row["total_tokens"] == 20
+            && row["total_dollars"] == 0.50));
+        assert!(models.iter().any(|row| row["model"] == "LUNA"
+            && row["total_tokens"] == 30
+            && row["total_dollars"] == 0.75));
+        let _: Value = serde_json::from_slice(
+            &serialize_route(&partial, Route::DetailsV3, None, None, false).unwrap(),
+        )
+        .unwrap();
+        let saved: (Option<i64>,f64,i64,i64) = database.query_row(
+            "SELECT sol_tokens,sol_dollars,terra_tokens,luna_tokens FROM usage_history WHERE timestamp=?1",
+            [AT], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        assert_eq!(saved, (None, 0.25, 20, 30));
+        eprintln!("issue659 F6 legacy preserved oracle passed: SQL SOL=None/USD0.25 other-five=known other-period=unchanged V2/V3=serialized");
     }
 
     #[test]
