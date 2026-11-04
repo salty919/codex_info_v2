@@ -184,6 +184,7 @@ wait_for_history_snapshot() {
 import json
 import re
 import sys
+import unicodedata
 
 body_path, headers_path, reset_text, reason_path = sys.argv[1:]
 
@@ -214,8 +215,11 @@ try:
             "id", "start_at", "end_at", "reset_at", "label", "current", "origin_at"
         }:
             reject("v5 history period schema is invalid")
-        if (not isinstance(period["id"], str) or not period["id"].isascii()
-                or not period["id"].isdigit() or period["id"].startswith("0")
+        if (not isinstance(period["id"], str) or not 1 <= len(period["id"]) <= 512
+                or any(unicodedata.category(c) in {"Cc", "Cs"}
+                       or ord(c) in {0x061C, 0x200E, 0x200F, 0x202A, 0x202B,
+                                     0x202C, 0x202D, 0x202E, 0x2066, 0x2067,
+                                     0x2068, 0x2069} for c in period["id"])
                 or not uint(period["start_at"]) or not uint(period["end_at"])
                 or not uint(period["reset_at"]) or not isinstance(period["label"], str)
                 or type(period["current"]) is not bool
@@ -223,8 +227,7 @@ try:
             reject("v5 history period values are invalid")
         if period["reset_at"] == expected_reset:
             matching.append(period)
-    if (len(matching) != 1 or matching[0]["id"] != str(expected_reset)
-            or matching[0]["current"] is not True):
+    if len(matching) != 1 or matching[0]["current"] is not True:
         reject("v5 directory did not contain one current period for the exact quota reset")
 
     with open(headers_path, "rb") as handle:
@@ -250,7 +253,8 @@ PY_HISTORY_DIRECTORY
             IFS=$'\t' read -r period_id pair <<<"$directory_result"
         fi
 
-        page_url="http://127.0.0.1:$port/v3/history?period=$period_id"
+        encoded_period_id="$(python3 -c 'import sys; from urllib.parse import quote; print(quote(sys.argv[1], safe=""))' "$period_id")"
+        page_url="http://127.0.0.1:$port/v3/history?period=$encoded_period_id"
         capture_http_response "$page_prefix" "$page_url"
         page_status="$(cat "$page_prefix.status" 2>/dev/null || true)"
         if [[ "$page_status" != 200 ]]; then
@@ -297,6 +301,7 @@ try:
         reject("empty v3 history page has a resume cursor")
     expected_reset = int(reset_text)
     expected_total = int(total_text) if total_text else None
+    expected_source = {"confirmed": "confirmed", "recorded": "legacy-unknown"}.get(expectation)
     saw_quota = False
     saw_unavailable = False
     saw_expected_model = False
@@ -338,8 +343,9 @@ try:
             if (not isinstance(model["model"], str) or not model["model"]
                     or not uint(model["total_tokens"])):
                 reject("v3 history model value is invalid")
-            if (expectation == "confirmed"
-                    and sample["model_source"] == "confirmed"
+            if (expectation in {"confirmed", "recorded"}
+                    and sample["model_source"] == expected_source
+                    and (expectation != "recorded" or sample["models_complete"] is False)
                     and model["model"] == "gpt-5.6-luna"
                     and model["total_tokens"] == expected_total):
                 saw_expected_model = True
@@ -348,8 +354,8 @@ try:
         reject("v3 history page has no retained observation for the requested reset")
     if expectation == "unavailable" and (not saw_quota or not saw_unavailable):
         reject("pre-append history did not retain quota with nullable unavailable model data")
-    if expectation == "confirmed" and not saw_expected_model:
-        reject("v3 history did not expose the exact confirmed gpt-5.6-luna total")
+    if expectation in {"confirmed", "recorded"} and not saw_expected_model:
+        reject("v3 history did not expose the exact " + expected_source + " gpt-5.6-luna total")
 
     with open(headers_path, "rb") as handle:
         raw_headers = handle.read().splitlines()
@@ -793,8 +799,8 @@ PY_CURRENT_RESET
 wait_for_history_snapshot "$port" "$history_reset_at" before-append unavailable 0 '' \
     >/dev/null || fail 'pre-append v3 history did not retain the nullable unavailable observation'
 history_period_id="$(cat "$tmp_root/history-period-id.txt" 2>/dev/null || true)"
-[[ "$history_period_id" == "$history_reset_at" ]] \
-    || fail 'v5 directory period id did not match the exact current quota reset'
+[[ -n "$history_period_id" ]] \
+    || fail 'v5 directory did not select a public current period id'
 assert_v1_history_unavailable "$port"
 
 pre_append_ranges="$(sqlite3 "$database" 'SELECT COUNT(*) FROM session_ranges;')"
@@ -942,9 +948,13 @@ current_before_file="$tmp_root/current-before.json"
 current_before="$(wait_for_ready_current "$port" "$post_boundary_model_total")" \
     || fail 'REST current did not expose the owned 20-to-30 model delta'
 printf '%s\n' "$current_before" >"$current_before_file"
-wait_for_history_snapshot "$port" "$history_reset_at" after-append confirmed 10 \
+# Public recorded groups and original confirmed observations have separate identities.
+wait_for_history_snapshot "$port" "$history_reset_at" after-append recorded 10 \
     "$history_period_id" >/dev/null \
-    || fail 'REST v3 history did not expose the exact confirmed model total 10'
+    || fail 'public v3 history did not expose the exact recorded model total 10'
+wait_for_history_snapshot "$port" "$history_reset_at" after-append-raw confirmed 10 \
+    "$history_reset_at" >/dev/null \
+    || fail 'raw v3 history did not preserve the exact confirmed model total 10'
 
 # Current quota/model values and nullable history are independent API
 # resources. Compare each to the recorder's committed SQLite facts without
@@ -1053,9 +1063,13 @@ if (health["api_version"], health["service"], health["product_version"]) != (
 PY
 current_after="$(wait_for_ready_current "$port" "$current_models")" \
     || fail 'restarted REST current did not expose the committed model generation'
-wait_for_history_snapshot "$port" "$history_reset_at" after-restart confirmed 20 \
+# Public recorded groups and original confirmed observations have separate identities.
+wait_for_history_snapshot "$port" "$history_reset_at" after-restart recorded 20 \
     "$history_period_id" >/dev/null \
-    || fail 'restarted REST v3 history did not expose the exact confirmed model total 20'
+    || fail 'public v3 history did not expose the exact recorded model total 20'
+wait_for_history_snapshot "$port" "$history_reset_at" after-restart-raw confirmed 20 \
+    "$history_reset_at" >/dev/null \
+    || fail 'raw v3 history did not preserve the exact confirmed model total 20'
 python3 - "$current_before_file" "$current_after" "$database" <<'PY'
 import json
 import sqlite3
