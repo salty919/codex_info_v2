@@ -239,11 +239,15 @@ v3 threadは既存12キーに`activity_status`を加えた13キーで、型とru
 
 互換detailsのcanonical sample窓は`(T-31*86,400,T]`（TはDATAの公開基準時刻）とし、retainedの先頭minute包含とは別の互換窓である。sampleの一意keyは全版で`(reset_at,timestamp)`とし、異なるexact resetの同minuteは両方を保持する。同じexact keyに公式receiptがあれば取得順が最後のreceiptをquotaに用いる。receiptがない保存quotaはDATA 8.7の明示的な公式取得provenanceを検証できる場合だけ公開し、cached Session snapshot由来または取得元不明ならRemainingをNULLとする。DB保存値を変更せず、同じkeyのmodel資格も変更しない。modelも同じexact keyだけを結合する。receiptのない別resetのmodel観測を落としたり、別resetのquota代表へ移したりしない。互換detailsのsample順は既存wireの`(reset_at,timestamp)`昇順を維持する。これは既存consumerの順序検証に対する互換制約であり、期間を跨いだ全時刻の単調順を要求しない。period指定historyは同じresetだけを含むためtimestamp昇順となる。44,640 sampleと32 MiB encoded bodyは旧consumerの輸送境界であり、minuteごとの保存数・period総数の上限ではない。この互換resourceが境界を超えれば413 `resource_too_large`とし、先頭だけの200や同minuteの別resetを捨てた200を禁止する。互換detailsはこの直近31日の一体型projection、v3/v4 directoryは一体型metadataのままとする。旧bodyに`next_cursor`を追加しない。旧directoryも全対象を32 MiB内で返せる場合だけ200、超える場合は同じ413とする。この互換adapterの限界はdomain、DB、独立v4 current、新directory、period指定のv3 historyの正常性を変えない。旧clientの128件parser制約をserverの正しい仕様とは扱わない。
 
-取得directoryの掲載条件は、同じaccount・保持窓にある観測点またはconfirmed gapを持つperiod、未解消の旧利用記録の保持資格を持つperiod、および現在periodである。元観測範囲を保持したmetadataから同じdirectory項目を構成し、origin不明を推測で補わない。selectableの掲載条件は、現在period、同じ窓の公開済みmodelに正の`total_tokens`があるperiod、またはPRODUCTで定義した未解消の旧利用記録を持つperiodである。最後の条件はmetadataによる掲載保持であり、model数値の公開資格を緩めない。source品質・集合の完備だけで保存済み正値を落とさず、旧利用記録の原本照合不足だけで選択肢を消さない。この保持対象を除き、初めからquotaだけ・gapだけ・model未取得の過去periodをselectableに載せないことは未使用の証明ではない。全exact IDは保持窓のindexで保持し、非掲載の既知IDへの直接history取得を未知IDへ変更しない。保持窓外の履歴は再公開せず、既知IDの取得結果は保持窓内の空pageとなる。
+既存directory/historyのexact reset IDは報告枠を識別する。異なるIDの保持と、実利用期間が異なることは同義ではない。予定resetを実利用期間の不変IDと表明しない。実resetと数値の独立性はPRODUCT LIVE-RESET-129およびRECORDED-USAGE-SCOPE-604に従う。既存のpaging、same-pair、unknown、partial、既知数値保持の契約は変更しない。
 
-v3 directoryのtop-levelは従来の`api_version`、`history_periods`の2キー、各periodは既存の6キーである。v4は同じ2キーと、各periodに必須nullable整数`origin_at`を加えた7キーである。公式起点は同じread transactionのexact reset/window、またはDATAが受理したaccount所有内の原本証拠からだけ求める。競合・根拠欠落ではnull。初回保存時刻から起点を生成しない。`origin_at <= start_at`を要求する。
+`/v3/history`とcanonical directoryの表示groupはPRODUCT RECORDED-USAGE-SCOPE-604に従う。canonical directory/selectableは同じ表示開始minuteとexact Wのgroupを一件だけ掲載し、raw旧IDを追加項目として掲載しない。origin/Wが確定したgroup IDは`rg1-<UTC origin minute>-<exact W>`とし、一member時から同じ形式を使う。旧十進IDは元retained archiveの全履歴・元bounds・価格bitsへ直接解決し、groupへredirectしない。opaque group IDはcanonicalの一意fact prefixへ解決する。両系列を別index bindingで保持し、raw/canonicalのsample・gap・period metadataを混合しない。pageのschemaは既存のままとし、cursor/fingerprintは要求ID・raw/canonical系列・account/epoch・既取得prefixを区別し、prefix不変のappendは既存h1規則で継続する。published pairが変わるだけではhistory cursorを失効させず、WIREの新pair差分atomic appendを保持する。local_usageのpage時間境界も同じindex bindingのmetadataから取得し、既存のaccount local activityの意味を変更しない。原履歴だけの更新もpublicationの同値比較とfingerprintへ含める。current/recentの公式quota、exact保存keyと元sampleは保持し、月入力にはcanonical groupだけを渡す。
 
-全版でproducerのperiod `id`はexactな正整数`reset_at`のcanonical ASCII十進表現とする。符号・先頭0・日付文字列・timezone・label・取得順suffixを含めない。同一accountの同じresetは同じID、異なるresetは別IDであり、account namespaceはselectorとpublished pairが所有する。clientはIDをparseせず再送する。v3/v4一体型directoryの配列順は`(start_at,reset_at,id)`の降順（idはUTF-8 unsigned byte辞書順）を維持する。v5の昇順は次節だけに適用し、UIの選択順をwire順の違いで変えない。
+取得directoryの掲載条件は、同じaccount・保持窓にある観測点またはconfirmed gapを持つperiod、未解消の旧利用記録の保持資格を持つperiod、および現在periodである。元観測範囲を保持したmetadataから同じdirectory項目を構成し、origin不明を推測で補わない。selectableの掲載条件は、現在period、同じ窓の公開済みmodelに正の`total_tokens`があるperiod、またはPRODUCTで定義した未解消の旧利用記録を持つperiodである。最後の条件はmetadataによる掲載保持であり、model数値の公開資格を緩めない。source品質・集合の完備だけで保存済み正値を落とさず、旧利用記録の原本照合不足だけで選択肢を消さない。この保持対象を除き、初めからquotaだけ・gapだけ・model未取得の過去periodをselectableに載せないことは未使用の証明ではない。全公開period IDは保持窓のindexで保持し、非掲載の既知公開period IDへの直接history取得を未知IDへ変更しない。保持窓外の履歴は再公開せず、既知IDの取得結果は保持窓内の空pageとなる。
+
+v3 directoryのtop-levelは従来の`api_version`、`history_periods`の2キー、各periodは既存の6キーである。v4は同じ2キーと、各periodに必須nullable整数`origin_at`を加えた7キーである。raw履歴のorigin_atは同じread transactionの元exact reset/window、またはDATAが受理したaccount所有内の原本証拠からだけ求め、同raw keyの競合・根拠欠落ではnullとする。canonical表示groupのorigin_atはPRODUCTの資格済みmember originの最小元秒とし、表示startと同じ初期anchorを保持する。各memberの異なるexact originを同raw keyの競合とは扱わない。これはproviderの実reset時刻ではない。初回保存時刻から起点を生成しない。`origin_at <= start_at`を要求する。
+
+period `id`はclientにとってopaqueな文字列であり、`reset_at`から再生成・数値parseしない。canonical表示groupのIDは本節のrg1形式、origin/W未確定の元periodとraw旧履歴のIDは元の正整数reset_atのcanonical ASCII十進表現とする。raw旧IDとgroup IDはnamespaceが異なる。同一account/epochの同じ表示keyは同じgroup IDとなり、account namespaceはselectorとpublished pairが所有する。clientは公開IDをそのまま再送する。group IDはURL unreserved ASCIIだけを使い、既存Linux/WindowsのURLencodeと現行history query validatorを同時に満たす。colonのpercent encodingを受け入れる新decoderは追加しない。v3/v4一体型directoryの配列順は`(start_at,reset_at,id)`の降順（idはUTF-8 unsigned byte辞書順）を維持する。v5の昇順は次節だけに適用し、UIの選択順をwire順の違いで変えない。
 
 ### v5 directory: byte境界による有限page（REST-129 / #604）
 
@@ -268,7 +272,7 @@ v5を追加する理由はdirectoryの分割に必要なwire非互換変更で�
 
 | 値・条件 | authority / 適用scope | 到達・超過時の結果 |
 | --- | --- | --- |
-| 異なる公式resetは1秒差でも別ID | PRODUCT `LIVE-RESET-129` | 取得順で受理。日付・残量回復・累積件数で拒否しない |
+| 異なる公式resetは1秒差でも別の保存報告ID。公開区間の個数とは分離 | PRODUCT `LIVE-RESET-129` | 取得順で受理。日付・残量回復・累積件数で拒否しない |
 | 3 UTC暦月 | DATAの履歴保持窓とcurrent modelの観測資格 | 公式windowの長さで延長しない。公式origin/resetのmetadataや取得順で決まる現在quotaを切り詰めず、原本・receipt/idempotence記録の保存期間と混同しない |
 | 31日 / 44,640 sample | 互換detailsの時間窓 / 旧応答の件数上限 | 同minuteの別resetも1 sampleずつ数える。domain読取り・全期間・全calendar-month・split history合計の上限ではない |
 | directory 128件 | 根拠のない旧総数上限 | 廃止。新たな固定128行/pageにも転用しない |
@@ -278,7 +282,7 @@ v5を追加する理由はdirectoryの分割に必要なwire非互換変更で�
 | idleの10分、1 slot 60秒 | PRODUCT `G137-5`の表示方針 | providerの無使用保証ではない。条件未成立なら帯を作らない |
 | request deadline・接続数 | 本書Request resource contractの収容境界 | 切断/拒否をdata不正とせず、該当surfaceのlast-goodを保持 |
 
-v3 historyはexact periodの全保持観測を最大1,024点かつ32 MiB以下のpageで返す。全page合計44,640点という制約、private retained indexの3×44,640という制約は撤回する。保持内の実際のcanonical key数と時間範囲で有限化し、raw alias行数で打ち切らない。互換detailsの`history_periods`とsamplesは直近31日projectionであり、全保持directoryを同bodyに入れない。旧v1/v2の固定3 modelとv3以後のmodel安全境界は別仕様として維持する。
+v3 historyは選択した公開periodの全保持観測を最大1,024点かつ32 MiB以下のpageで返す。全page合計44,640点という制約、private retained indexの3×44,640という制約は撤回する。保持内の実際のcanonical key数と時間範囲で有限化し、raw alias行数で打ち切らない。互換detailsの`history_periods`とsamplesは直近31日projectionであり、全保持directoryを同bodyに入れない。旧v1/v2の固定3 modelとv3以後のmodel安全境界は別仕様として維持する。
 
 互換detailsの判定順は、まず版ごとの表現可能性、次に応答件数・encoded bytesとする。v1で固定6列のunknown等を表現できない観測が含まれる場合は503 `history_unavailable`、表現可能だが44,640 sampleを超える場合はv1/v2/v3 detailsだけ413 `resource_too_large`とする。v2/v3はnullable表現を保ったまま同じ件数制限を適用する。domainの投影検証は、件数制限以外の型・値域・順序・exact keyの一意性・期間への所属を全対象で検証し、件数を減らしたりchunk単位の検証で全体の重複や順序を見逃したりしない。
 
@@ -369,15 +373,15 @@ v2/v3 projectionを使用する。正確なmodel keyの元値を保持し、互�
 `start_at <= end_at <= reset_at`、`label`はcontrol/bidi formattingなしの1..512 Unicode scalar、
 `current=true`は集合内で最大1件である。
 
-`reset_at`はperiod識別子であり、sampleの所属判定では完全一致を優先する。`end_at`はPRODUCTの期間境界規則による観測終端であり、別periodの開始時刻ではclipせず、resetの代用にしない。公式quotaの
+raw履歴の`reset_at`は元のexact報告keyである。canonical表示groupの`reset_at`はmemberの最大exact Rを選ぶsample所属用transport keyであり、公式quotaの最新取得順や実resetを表さない。sampleの所属判定では選択したraw/canonical index内の完全一致を使い、旧IDとgroup IDを数値resetの一致で同一系列にしない。`end_at`はPRODUCTの期間境界規則による観測終端であり、別periodの開始時刻ではclipせず、resetの代用にしない。公式quotaの
 受理済み記録と期間はDATA owner `QUOTA-DURABLE-604`、Session由来modelのcanonical所属は
 `HISTORY-CANONICAL-134`に従う。clientは`id`をparseせず、公開された所属を変更しない。
 
 sampleの`timestamp`は観測を含む分の開始である。所属期間の開始が秒単位でも、
 `floor(start_at / 60) * 60 <= timestamp <= end_at`を満たす最初の分を受理する。
-期間の`start_at`自体は丸めない。異なる公式IDの表示範囲の重なりを不正としない。同じ分にresetが変わった場合も
+期間の`start_at`自体は丸めない。異なる保存報告keyの原範囲が重なる事実は保持するが、同じ論理区間の複数掲載を許可するものではない。同じ分にresetが変わった場合も
 各exact resetのsampleを保持し、同じexact reset/minuteのquotaだけを取得順序で選ぶ。取得原本と受理済み記録は全観測を保持する。
-modelは同じexact reset/minuteの観測だけを結合し、別期間のmodelを移さない。
+raw履歴のmodelは同じexact reset/minuteの観測だけを結合し、別期間の保存modelを移さない。canonical表示groupのmodelだけはPRODUCTのmember完全対応fact prefixを投影し、元の保存所属とraw値を保持する。
 Linux/Windowsとも分の観測を開始時刻より前という理由で捨てず、描画は選択期間内へclipする。
 
 旧混合行の正規化はDATA owner `HISTORY-CANONICAL-134`へ従う。原本で証明できない異なるresetをrolling/jitterの形だけで統合せず、HTTP要求・clientで再canonicalizeしない。公式receiptの別exact resetは優先される。元のraw key、source資格、採用元、局所除外またはrollbackはDATAで一意に決め、WIREはその公開結果だけを運ぶ。
