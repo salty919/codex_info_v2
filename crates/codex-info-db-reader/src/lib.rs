@@ -5,6 +5,8 @@
 //! Every connection is opened with `SQLITE_OPEN_READ_ONLY`, then `query_only`
 //! is enabled and read back before any product query is issued.
 
+mod report_groups;
+
 use chrono::{DateTime, Months, Utc};
 use codex_info_pricing::{estimate as estimate_model_price, estimate_legacy, Usage as PriceUsage};
 pub use codex_info_rest_contract::model_names;
@@ -71,6 +73,12 @@ impl HistoryWindow {
 /// Retention belongs to the writer; compatibility details stay recent.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct HistoryArchive {
+    /// Internal old reset IDs resolved to an existing representative.
+    #[serde(skip)]
+    pub aliases: BTreeMap<i64, i64>,
+    /// Immutable source archive retained beside the canonical projection.
+    #[serde(skip)]
+    pub raw: Option<Box<HistoryArchive>>,
     pub periods: Vec<PublicHistoryPeriod>,
     pub samples: Vec<PublicHistoryObservationV3>,
     pub gaps: Vec<PublicHistoryGap>,
@@ -901,12 +909,23 @@ impl DbReader {
                     authority.window,
                 )?;
                 retained_details.validate_history_domain()?;
-                Ok(HistoryArchive {
+                let mut archive = HistoryArchive {
+                    aliases: BTreeMap::new(),
+                    raw: None,
                     periods: retained_details.history_periods,
                     samples: retained_v3,
                     gaps: retained_details.history_gaps,
                     origins,
-                })
+                };
+                let raw = archive.clone();
+                report_groups::project(
+                    &transaction,
+                    &mut archive,
+                    &task_evidence,
+                    &self.read_intervals,
+                )?;
+                archive.raw = Some(Box::new(raw));
+                Ok(archive)
             })()
             .inspect_err(|error| history_projection_diagnostic("retained_history", error))
             .ok();
@@ -1334,6 +1353,22 @@ impl StoredHistorySample {
             luna_tokens: self.luna_tokens?,
         })
     }
+}
+
+/// Preserve a legacy row whose fixed columns are only partly known.  The
+/// source reset remains the identity and the timestamp names its observed
+/// minute; rows with the same exact reset/minute are represented once, without
+/// synthesizing values from a neighboring row or aliasing an unproven reset.
+fn preserve_nullable_history_samples(rows: &[StoredHistorySample]) -> Vec<StoredHistorySample> {
+    let mut selected = BTreeMap::<(i64, i64), StoredHistorySample>::new();
+    for row in rows {
+        let mut sample = row.clone();
+        sample.timestamp -= sample.timestamp.rem_euclid(60);
+        // SQL source order is exact reset then timestamp, so the latest
+        // observation of this same reset/minute remains the selected source.
+        selected.insert((sample.reset_at, sample.timestamp), sample);
+    }
+    selected.into_values().collect()
 }
 
 impl From<&PublicHistorySample> for StoredHistorySample {
@@ -2348,17 +2383,15 @@ fn build_details_for_intervals(
                     || start.is_none_or(|start| row.timestamp >= start)
             })
             .collect::<Vec<_>>()
-    } else {
+    } else if recent.iter().all(|row| row.legacy_raw().is_some()) {
+        // Keep the established numeric canonicalizer byte-for-byte in meaning
+        // for complete legacy rows.  Only a partial row takes the conservative
+        // nullable path below; it must not be made complete with zeroes or
+        // another observation's values.
         let recent = recent
             .iter()
-            .map(|row| {
-                row.legacy_raw().ok_or_else(|| {
-                    ReaderError::InvalidValue(
-                        "nullable history requires canonical period identity".to_owned(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|row| row.legacy_raw().expect("complete legacy history row"))
+            .collect::<Vec<_>>();
         let mut samples = canonicalize_history_with_limit(
             &recent,
             current_reset_at,
@@ -2379,6 +2412,8 @@ fn build_details_for_intervals(
         .iter()
         .map(StoredHistorySample::from)
         .collect::<Vec<_>>()
+    } else {
+        preserve_nullable_history_samples(&recent)
     };
     let quota_only_samples = if history_is_canonical {
         quota_only_history_projection_samples(
@@ -3746,14 +3781,14 @@ fn history_observations_v2_from_stored(
         .map(|sample| {
             let fixed = legacy_by_key
                 .get(&(sample.reset_at, sample.timestamp))
-                .copied();
+                .copied()
+                .filter(|legacy| legacy.legacy_raw().is_some());
             let legacy = (!matches!(
                 sample.model_source.as_str(),
                 "reconstructed-from-session" | "unavailable"
             ))
             .then_some(fixed)
             .flatten();
-            let legacy = legacy.filter(|row| row.legacy_raw().is_some());
             PublicHistoryObservation {
                 timestamp: sample.timestamp,
                 reset_at: sample.reset_at,
@@ -3764,9 +3799,8 @@ fn history_observations_v2_from_stored(
                 sol_tokens: legacy.and_then(|legacy| legacy.sol_tokens),
                 terra_tokens: legacy.and_then(|legacy| legacy.terra_tokens),
                 luna_tokens: legacy.and_then(|legacy| legacy.luna_tokens),
-                model_source: if fixed.is_some_and(|row| row.legacy_raw().is_none())
-                    || (fixed.is_none()
-                        && matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown"))
+                model_source: if fixed.is_none()
+                    && matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown")
                 {
                     "unavailable".to_owned()
                 } else {
@@ -6345,6 +6379,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    include!("report_groups_tests.rs");
     use super::*;
     use rusqlite::params;
     use std::fs;
@@ -8427,9 +8462,21 @@ mod tests {
             .samples
             .iter()
             .find(|row| row.timestamp == 1_800_000_180)
-            .expect("later model observation must be retained");
+            .expect("later model observation must be retained in the canonical point set");
+        assert_eq!(row.reset_at, 1_800_604_801);
+        let raw = snapshot
+            .retained_history
+            .raw
+            .as_ref()
+            .expect("raw archive keeps the original model observation");
+        let raw_row = raw
+            .samples
+            .iter()
+            .find(|row| row.reset_at == 1_800_604_801 && row.timestamp == 1_800_000_180)
+            .expect("raw model observation must remain under its exact period");
         assert_eq!(
-            row.models
+            raw_row
+                .models
                 .as_ref()
                 .unwrap()
                 .iter()
@@ -8604,14 +8651,34 @@ mod tests {
             .unwrap()
             .snapshot;
         assert!(snapshot.history_available);
-        let past = snapshot
+
+        let raw = snapshot
             .retained_history
+            .raw
+            .as_ref()
+            .expect("raw archive keeps exact-period metadata");
+        let raw_past = raw
+            .periods
+            .iter()
+            .find(|period| period.reset_at == 1_800_604_800)
+            .expect("raw exact period remains in the archive");
+        assert_eq!(
+            (
+                raw_past.reset_at,
+                raw_past.start_at,
+                raw_past.end_at,
+                raw_past.current
+            ),
+            (1_800_604_800, 1_800_000_000, 1_800_000_060, false)
+        );
+        let raw_model = raw
             .samples
             .iter()
             .find(|row| row.reset_at == 1_800_604_800 && row.timestamp == 1_800_000_060)
-            .expect("the model must remain under its original exact period");
+            .expect("raw model must remain under its original exact period");
         assert_eq!(
-            past.models
+            raw_model
+                .models
                 .as_ref()
                 .unwrap()
                 .iter()
@@ -8620,12 +8687,42 @@ mod tests {
                 .total_tokens,
             30
         );
-        let quota = snapshot
+        let raw_current = raw
+            .periods
+            .iter()
+            .find(|period| period.reset_at == 1_800_604_801)
+            .expect("raw current period metadata remains available");
+        assert_eq!(
+            (
+                raw_current.reset_at,
+                raw_current.start_at,
+                raw_current.end_at,
+                raw_current.current
+            ),
+            (1_800_604_801, 1_800_000_001, 1_800_000_120, true)
+        );
+
+        let canonical_periods = snapshot
+            .retained_history
+            .periods
+            .iter()
+            .filter(|period| period.reset_at == 1_800_604_801)
+            .collect::<Vec<_>>();
+        assert_eq!(canonical_periods.len(), 1);
+        assert!(snapshot
+            .retained_history
+            .periods
+            .iter()
+            .all(|period| period.reset_at != 1_800_604_800));
+        let canonical_samples = snapshot
             .retained_history
             .samples
             .iter()
-            .find(|row| row.reset_at == 1_800_604_801 && row.timestamp == 1_800_000_060)
-            .unwrap();
+            .filter(|row| row.timestamp == 1_800_000_060)
+            .collect::<Vec<_>>();
+        assert_eq!(canonical_samples.len(), 1);
+        let quota = canonical_samples[0];
+        assert_eq!(quota.reset_at, 1_800_604_801);
         assert_eq!(quota.remaining_percent, Some(99.0));
         assert!(quota.models.is_none());
         let recent = snapshot
@@ -8681,35 +8778,33 @@ mod tests {
             Some(1_800_000_060),
             "a past period cannot move the current data clock"
         );
-        let past = snapshot
+
+        let raw = snapshot
             .retained_history
+            .raw
+            .as_ref()
+            .expect("raw archive keeps overlapping exact periods");
+        let raw_past = raw
             .periods
             .iter()
             .find(|period| period.reset_at == 1_800_604_800)
-            .expect("past exact ID must remain in the directory");
+            .expect("raw past exact ID must remain in the archive");
         assert_eq!(
-            past.end_at, 1_800_000_120,
-            "a successor's earlier origin cannot clip this period's real observation"
+            (
+                raw_past.reset_at,
+                raw_past.start_at,
+                raw_past.end_at,
+                raw_past.current
+            ),
+            (1_800_604_800, 1_800_000_000, 1_800_000_120, false)
         );
-        assert!(!past.current);
-        let current = snapshot
-            .retained_history
-            .periods
-            .iter()
-            .find(|period| period.current)
-            .unwrap();
-        assert_eq!(
-            (current.reset_at, current.start_at, current.end_at),
-            (1_800_604_801, 1_800_000_001, 1_800_000_060)
-        );
-        let point = snapshot
-            .retained_history
+        let raw_point = raw
             .samples
             .iter()
             .find(|point| point.reset_at == 1_800_604_800 && point.timestamp == 1_800_000_120)
-            .expect("the late historical point remains in its own period");
+            .expect("the late historical point remains in its raw period");
         assert_eq!(
-            point
+            raw_point
                 .models
                 .as_ref()
                 .unwrap()
@@ -8719,6 +8814,40 @@ mod tests {
                 .total_tokens,
             30
         );
+
+        let canonical_periods = snapshot
+            .retained_history
+            .periods
+            .iter()
+            .filter(|period| period.reset_at == 1_800_604_801)
+            .collect::<Vec<_>>();
+        assert_eq!(canonical_periods.len(), 1);
+        assert_eq!(
+            (
+                canonical_periods[0].reset_at,
+                canonical_periods[0].start_at,
+                canonical_periods[0].end_at,
+                canonical_periods[0].current
+            ),
+            (1_800_604_801, 1_800_000_000, 1_800_000_120, true)
+        );
+        assert!(snapshot
+            .retained_history
+            .periods
+            .iter()
+            .all(|period| period.reset_at != 1_800_604_800));
+        let canonical_point = snapshot
+            .retained_history
+            .samples
+            .iter()
+            .find(|point| point.reset_at == 1_800_604_801 && point.timestamp == 1_800_000_120)
+            .expect("canonical group keeps the late historical minute");
+        assert!(canonical_point.models.is_none());
+        assert!(snapshot
+            .retained_history
+            .samples
+            .iter()
+            .all(|point| point.reset_at != 1_800_604_800));
         drop(db);
         fs::remove_file(path).unwrap();
     }
