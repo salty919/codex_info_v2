@@ -7852,12 +7852,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             (first.sol_tokens, first.terra_tokens, first.luna_tokens),
-            (None, Some(20), Some(30))
+            (None, None, None)
         );
         assert_eq!(
             (first.sol_dollars, first.terra_dollars, first.luna_dollars),
-            (Some(0.25), Some(0.50), Some(0.75))
+            (None, None, None)
         );
+        assert_eq!(first.model_source, "unavailable");
+        assert_eq!(first.remaining_percent, Some(50.0));
         assert_eq!(
             partial
                 .history_samples_v2
@@ -7886,10 +7888,21 @@ mod tests {
             .iter()
             .find(|row| row["timestamp"] == AT)
             .unwrap();
-        assert!(first["sol_tokens"].is_null());
-        assert_eq!(first["sol_dollars"], 0.25);
-        assert_eq!(first["terra_tokens"], 20);
-        assert_eq!(first["luna_tokens"], 30);
+        for field in [
+            "sol_tokens",
+            "terra_tokens",
+            "luna_tokens",
+            "sol_dollars",
+            "terra_dollars",
+            "luna_dollars",
+        ] {
+            assert!(
+                first[field].is_null(),
+                "v2 fixed vector must be wholly null: {field}"
+            );
+        }
+        assert_eq!(first["model_source"], "unavailable");
+        assert_eq!(first["remaining_percent"], 50.0);
         let period = (AT + 600).to_string();
         let history: Value = serde_json::from_slice(
             &serialize_route(&partial, Route::HistoryV3, Some(&period), None, false).unwrap(),
@@ -7918,7 +7931,7 @@ mod tests {
             [AT], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         ).unwrap();
         assert_eq!(saved, (None, 0.25, 20, 30));
-        eprintln!("issue659 F6 legacy preserved oracle passed: SQL SOL=None/USD0.25 other-five=known other-period=unchanged V2/V3=serialized");
+        eprintln!("issue659 F6 legacy preserved oracle passed: SQL SOL=None/USD0.25 other-five=known other-period=unchanged V2=metadata-only V3=known-exact-values");
     }
 
     #[test]

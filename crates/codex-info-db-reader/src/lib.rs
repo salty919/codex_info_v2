@@ -3781,7 +3781,8 @@ fn history_observations_v2_from_stored(
         .map(|sample| {
             let fixed = legacy_by_key
                 .get(&(sample.reset_at, sample.timestamp))
-                .copied();
+                .copied()
+                .filter(|legacy| legacy.legacy_raw().is_some());
             let legacy = (!matches!(
                 sample.model_source.as_str(),
                 "reconstructed-from-session" | "unavailable"
