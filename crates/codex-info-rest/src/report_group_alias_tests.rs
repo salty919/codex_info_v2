@@ -1,45 +1,147 @@
-
 // Requirement-derived integration: SQLite -> real DbReader -> publication -> HTTP.
 #[test]
-fn attempt8_history_alias_cursor_and_local_usage(){
- let s=1803000060_i64;let a=s+10800;let b=a+5;
- let path=temp_db("attempt8-alias");
- Connection::open(&path).unwrap().execute_batch(include_str!("../../../tests/fixtures/report_groups.sql")).unwrap();
- let id=codex_info_db_reader::StoragePartitionIdentity{schema_version:"codex-info-account-db-v1".into(),profile_scope_id:"11".repeat(16),account_scope_id:"22".repeat(32),storage_epoch:13,partition_id:"33".repeat(32)};
- let reader=DbReader::open_partitioned(&path,&id).unwrap();
- let mut server=fixed_time_serialization_fixture(reader,s+10920);
- let fetch=|url:&str,extension:bool|->(String,Value){let ext=if extension{"Codex-Info-History-Extensions: local-usage-v1\r\n"}else{""};let raw=request(server.local_addr(),&format!("GET {url} HTTP/1.1\r\nHost:x\r\n{ext}\r\n"));assert!(raw.starts_with("HTTP/1.1 200"),"{}",raw.lines().next().unwrap());let body:Value=serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();(raw,body)};
- let(_,directory)=fetch("/v5/history/periods?account=account-1",false);
- let periods=directory["history_periods"].as_array().unwrap();assert_eq!(periods.iter().filter(|p|p["reset_at"]==a).count(),1);assert!(!periods.iter().any(|p|p["reset_at"]==b));assert!(periods.iter().any(|p|p["reset_at"]==a+60));
- let(_,selectable)=fetch("/v5/history/periods/selectable?account=account-1",false);assert_eq!(selectable["history_periods"].as_array().unwrap().iter().filter(|p|p["reset_at"]==a).count(),1);assert!(!selectable["history_periods"].as_array().unwrap().iter().any(|p|p["reset_at"]==b));
- let(raw,body)=fetch(&format!("/v3/history?account=account-1&period={b}"),true);
- let points=body["history_samples"].as_array().unwrap();assert!(points.iter().all(|p|p["reset_at"]==b));
- let last=points.iter().find(|p|p["timestamp"]==s+180).unwrap();assert!(last["models"].as_array().unwrap().iter().any(|m|m["model"]=="gpt-6.1-sol"&&m["total_tokens"]==99));
- assert_eq!(body["local_usage"]["start_at"],s);assert_eq!(body["local_usage"]["end_at"],s+182);
- let cursor=body["resume_cursor"].as_str().unwrap();
- let(raw2,resumed)=fetch(&format!("/v3/history?account=account-1&period={b}&cursor={cursor}"),true);
- let pair=|x:&str|x.lines().find(|l|l.to_ascii_lowercase().starts_with("codex-info-published-pair:")).unwrap().to_owned();assert_eq!(pair(&raw),pair(&raw2));assert!(resumed["history_samples"].as_array().unwrap().is_empty());
- server.shutdown();fs::remove_file(path).unwrap();
+fn attempt8_history_alias_cursor_and_local_usage() {
+    let s = 1803000060_i64;
+    let a = s + 10800;
+    let b = a + 5;
+    let group = "rg1-1803000060-10800";
+    let raw_a = a.to_string();
+    let raw_b = b.to_string();
+    let path = temp_db("attempt8-alias");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!(
+            "../../../tests/fixtures/report_groups.sqlite.fixture"
+        ))
+        .unwrap();
+    let id = codex_info_db_reader::StoragePartitionIdentity {
+        schema_version: "codex-info-account-db-v1".into(),
+        profile_scope_id: "11".repeat(16),
+        account_scope_id: "22".repeat(32),
+        storage_epoch: 13,
+        partition_id: "33".repeat(32),
+    };
+    let reader = DbReader::open_partitioned(&path, &id).unwrap();
+    let mut server = fixed_time_serialization_fixture(reader, s + 10920);
+    let fetch = |url: &str, extension: bool| -> (String, Value) {
+        let ext = if extension {
+            "Codex-Info-History-Extensions: local-usage-v1\r\n"
+        } else {
+            ""
+        };
+        let raw = request(
+            server.local_addr(),
+            &format!("GET {url} HTTP/1.1\r\nHost:x\r\n{ext}\r\n"),
+        );
+        assert!(
+            raw.starts_with("HTTP/1.1 200"),
+            "{}",
+            raw.lines().next().unwrap()
+        );
+        let body: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        (raw, body)
+    };
+    let (_, directory) = fetch("/v5/history/periods?account=account-1", false);
+    let periods = directory["history_periods"].as_array().unwrap();
+    assert_eq!(
+        periods
+            .iter()
+            .filter(|p| p["id"].as_str() == Some(group))
+            .count(),
+        1
+    );
+    let canonical = periods
+        .iter()
+        .find(|p| p["id"].as_str() == Some(group))
+        .unwrap();
+    assert_eq!(canonical["reset_at"], b);
+    assert!(!periods.iter().any(|p| {
+        p["id"].as_str() == Some(raw_a.as_str()) || p["id"].as_str() == Some(raw_b.as_str())
+    }));
+    assert!(periods.iter().any(|p| p["reset_at"] == a + 60));
+    let (_, selectable) = fetch("/v5/history/periods/selectable?account=account-1", false);
+    let selected = selectable["history_periods"].as_array().unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|p| p["id"].as_str() == Some(group))
+            .count(),
+        1
+    );
+    assert!(!selected.iter().any(|p| {
+        p["id"].as_str() == Some(raw_a.as_str()) || p["id"].as_str() == Some(raw_b.as_str())
+    }));
+    let (raw, body) = fetch(&format!("/v3/history?account=account-1&period={b}"), true);
+    let points = body["history_samples"].as_array().unwrap();
+    assert!(points.iter().all(|p| p["reset_at"] == b));
+    let last = points.iter().find(|p| p["timestamp"] == s + 120).unwrap();
+    assert!(last["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| { m["model"] == "SOL" && m["total_tokens"] == 99 }));
+    // Raw B: receipt r79 has origin R-W=S+5 and last observed second S+121.
+    // local_usage uses the existing exclusive upper bound, hence S+122.
+    assert_eq!(body["local_usage"]["start_at"], s + 5);
+    assert_eq!(body["local_usage"]["end_at"], s + 122);
+    let cursor = body["resume_cursor"].as_str().unwrap();
+    let (raw2, resumed) = fetch(
+        &format!("/v3/history?account=account-1&period={b}&cursor={cursor}"),
+        true,
+    );
+    let pair = |x: &str| {
+        x.lines()
+            .find(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("codex-info-published-pair:")
+            })
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(pair(&raw), pair(&raw2));
+    assert!(resumed["history_samples"].as_array().unwrap().is_empty());
+    server.shutdown();
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
-fn attempt8_history_extension_preserves_saved_dollar_bits(){
- let s=1803000060_i64;let a=s+10800;
- let path=temp_db("attempt13-saved-usd-bits");
- let db=Connection::open(&path).unwrap();
- db.execute_batch(include_str!("../../../tests/fixtures/report_groups.sql")).unwrap();
- db.execute("UPDATE usage_model_history SET total_dollars=?1 WHERE reset_at=?2 AND timestamp=?3 AND model='gpt-6-sol'",rusqlite::params![f64::from_bits(0x3ff01a35a0cbbd03),a,s+60]).unwrap();drop(db);
- let identity=codex_info_db_reader::StoragePartitionIdentity{schema_version:"codex-info-account-db-v1".into(),profile_scope_id:"11".repeat(16),account_scope_id:"22".repeat(32),storage_epoch:13,partition_id:"33".repeat(32)};
- let reader=DbReader::open_partitioned(&path,&identity).unwrap();
- let mut server=fixed_time_serialization_fixture(reader,s+10920);
- let plain=request(server.local_addr(),&format!("GET /v3/history?account=account-1&period={a} HTTP/1.1\r\nHost:x\r\n\r\n"));
- let extended=request(server.local_addr(),&format!("GET /v3/history?account=account-1&period={a} HTTP/1.1\r\nHost:x\r\nCodex-Info-History-Extensions: local-usage-v1\r\n\r\n"));
- let saved="\"total_dollars\":1.0063988000000001";
- assert!(plain.starts_with("HTTP/1.1 200")&&plain.contains(saved),"plain history must preserve stored binary64");
- assert!(extended.starts_with("HTTP/1.1 200")&&extended.contains(saved),"local_usage extension must preserve stored binary64");
- server.shutdown();fs::remove_file(path).unwrap();
+fn attempt8_history_extension_preserves_saved_dollar_bits() {
+    let s = 1803000060_i64;
+    let a = s + 10800;
+    let path = temp_db("attempt13-saved-usd-bits");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(include_str!(
+        "../../../tests/fixtures/report_groups.sqlite.fixture"
+    ))
+    .unwrap();
+    db.execute("UPDATE usage_model_history SET total_dollars=?1 WHERE reset_at=?2 AND timestamp=?3 AND model='gpt-6-sol'",rusqlite::params![f64::from_bits(0x3ff01a35a0cbbd03),a,s+60]).unwrap();
+    drop(db);
+    let identity = codex_info_db_reader::StoragePartitionIdentity {
+        schema_version: "codex-info-account-db-v1".into(),
+        profile_scope_id: "11".repeat(16),
+        account_scope_id: "22".repeat(32),
+        storage_epoch: 13,
+        partition_id: "33".repeat(32),
+    };
+    let reader = DbReader::open_partitioned(&path, &identity).unwrap();
+    let mut server = fixed_time_serialization_fixture(reader, s + 10920);
+    let plain = request(
+        server.local_addr(),
+        &format!("GET /v3/history?account=account-1&period={a} HTTP/1.1\r\nHost:x\r\n\r\n"),
+    );
+    let extended=request(server.local_addr(),&format!("GET /v3/history?account=account-1&period={a} HTTP/1.1\r\nHost:x\r\nCodex-Info-History-Extensions: local-usage-v1\r\n\r\n"));
+    let saved = "\"total_dollars\":1.0063988000000001";
+    assert!(
+        plain.starts_with("HTTP/1.1 200") && plain.contains(saved),
+        "plain history must preserve stored binary64"
+    );
+    assert!(
+        extended.starts_with("HTTP/1.1 200") && extended.contains(saved),
+        "local_usage extension must preserve stored binary64"
+    );
+    server.shutdown();
+    fs::remove_file(path).unwrap();
 }
-
 
 fn period_rest_prep_insert_raw_legacy_row(
     db: &Connection,
@@ -70,15 +172,12 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
 
     let path = temp_db("period-rest-prep-opaque");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch(include_str!("../../../tests/fixtures/report_groups.sql"))
-        .unwrap();
+    db.execute_batch(include_str!(
+        "../../../tests/fixtures/report_groups.sqlite.fixture"
+    ))
+    .unwrap();
     let raw_price = f64::from_bits(0x3ff123456789abcd);
-    period_rest_prep_insert_raw_legacy_row(
-        &db,
-        RAW_MEMBER,
-        ORIGIN_MINUTE + 120,
-        raw_price,
-    );
+    period_rest_prep_insert_raw_legacy_row(&db, RAW_MEMBER, ORIGIN_MINUTE + 120, raw_price);
     drop(db);
 
     let identity = codex_info_db_reader::StoragePartitionIdentity {
@@ -92,8 +191,7 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
         DbReader::open_partitioned(&path, &identity).unwrap(),
         ORIGIN_MINUTE + 10_920,
     );
-    let fetch =
-        |target: &str, local_usage: bool, expected_status: &str| -> (String, Value) {
+    let fetch = |target: &str, local_usage: bool, expected_status: &str| -> (String, Value) {
         let extension = if local_usage {
             "Codex-Info-History-Extensions: local-usage-v1\r\n"
         } else {
@@ -101,9 +199,7 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
         };
         let response = request(
             server.local_addr(),
-            &format!(
-                "GET {target} HTTP/1.1\r\nHost:x\r\n{extension}\r\n"
-            ),
+            &format!("GET {target} HTTP/1.1\r\nHost:x\r\n{extension}\r\n"),
         );
         assert!(
             response.starts_with(expected_status),
@@ -114,17 +210,20 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
             response.clone(),
             serde_json::from_str(body(&response)).unwrap(),
         )
-        };
+    };
 
-    let (directory_wire, directory) =
-        fetch("/v5/history/periods", false, "HTTP/1.1 200");
+    let (directory_wire, directory) = fetch("/v5/history/periods", false, "HTTP/1.1 200");
     let pair = published_pair(&directory_wire).to_owned();
     let periods = directory["history_periods"].as_array().unwrap();
     let canonical: Vec<_> = periods
         .iter()
         .filter(|period| period["id"].as_str() == Some(GROUP))
         .collect();
-    assert_eq!(canonical.len(), 1, "canonical directory has one opaque group");
+    assert_eq!(
+        canonical.len(),
+        1,
+        "canonical directory has one opaque group"
+    );
     assert_eq!(canonical[0]["reset_at"], RAW_MEMBER);
     assert_eq!(canonical[0]["start_at"], ORIGIN_MINUTE);
     assert!(canonical[0]["end_at"].as_i64().unwrap() >= ORIGIN_MINUTE + 180);
@@ -151,8 +250,11 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
             || period["id"].as_str() == Some(raw_member_id.as_str())
     }));
 
-    let (canonical_wire, canonical_body) =
-        fetch(&format!("/v3/history?period={GROUP}"), false, "HTTP/1.1 200");
+    let (canonical_wire, canonical_body) = fetch(
+        &format!("/v3/history?period={GROUP}"),
+        false,
+        "HTTP/1.1 200",
+    );
     assert_eq!(published_pair(&canonical_wire), pair);
     let canonical_points = canonical_body["history_samples"].as_array().unwrap();
     assert!(!canonical_points.is_empty());
@@ -165,12 +267,17 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
         }
     }
 
-    let (raw_wire, raw_body) =
-        fetch(&format!("/v3/history?period={RAW_MEMBER}"), false, "HTTP/1.1 200");
+    let (raw_wire, raw_body) = fetch(
+        &format!("/v3/history?period={RAW_MEMBER}"),
+        false,
+        "HTTP/1.1 200",
+    );
     assert_eq!(published_pair(&raw_wire), pair);
     let raw_points = raw_body["history_samples"].as_array().unwrap();
     assert!(!raw_points.is_empty());
-    assert!(raw_points.iter().all(|point| point["reset_at"] == RAW_MEMBER));
+    assert!(raw_points
+        .iter()
+        .all(|point| point["reset_at"] == RAW_MEMBER));
     let raw_model = raw_points
         .iter()
         .filter_map(|point| point["models"].as_array())
@@ -186,14 +293,19 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
 
     let (_, canonical_extended) =
         fetch(&format!("/v3/history?period={GROUP}"), true, "HTTP/1.1 200");
-    let (_, raw_extended) =
-        fetch(&format!("/v3/history?period={RAW_MEMBER}"), true, "HTTP/1.1 200");
+    let (_, raw_extended) = fetch(
+        &format!("/v3/history?period={RAW_MEMBER}"),
+        true,
+        "HTTP/1.1 200",
+    );
     assert!(canonical_extended["local_usage"].is_object());
     assert!(raw_extended["local_usage"].is_object());
-    assert!(raw_extended["local_usage"]["end_at"]
-        .as_i64()
-        .unwrap()
-        <= canonical_extended["local_usage"]["end_at"].as_i64().unwrap());
+    assert!(
+        raw_extended["local_usage"]["end_at"].as_i64().unwrap()
+            <= canonical_extended["local_usage"]["end_at"]
+                .as_i64()
+                .unwrap()
+    );
 
     let canonical_cursor = canonical_body["resume_cursor"]
         .as_str()
@@ -209,7 +321,10 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
         "HTTP/1.1 200",
     );
     assert!(canonical_resume_wire.starts_with("HTTP/1.1 200"));
-    assert!(canonical_resume["history_samples"].as_array().unwrap().is_empty());
+    assert!(canonical_resume["history_samples"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     let (raw_resume_wire, raw_resume) = fetch(
         &format!("/v3/history?period={RAW_MEMBER}&cursor={raw_cursor}"),
         false,
@@ -239,17 +354,14 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
     // once/selectable and the old raw value must remain directly readable.
     let eligible_zero_path = temp_db("period-rest-prep-eligible0");
     let db = Connection::open(&eligible_zero_path).unwrap();
-    db.execute_batch(include_str!("../../../tests/fixtures/report_groups.sql"))
-        .unwrap();
+    db.execute_batch(include_str!(
+        "../../../tests/fixtures/report_groups.sqlite.fixture"
+    ))
+    .unwrap();
     db.execute("UPDATE recorded_usage_facts SET eligible=0", [])
         .unwrap();
     let raw_price = f64::from_bits(0x3ff323456789abcd);
-    period_rest_prep_insert_raw_legacy_row(
-        &db,
-        RAW_MEMBER,
-        ORIGIN_MINUTE + 120,
-        raw_price,
-    );
+    period_rest_prep_insert_raw_legacy_row(&db, RAW_MEMBER, ORIGIN_MINUTE + 120, raw_price);
     let ineligible: i64 = db
         .query_row(
             "SELECT count(*) FROM recorded_usage_facts WHERE eligible=0",
@@ -275,8 +387,7 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
             serde_json::from_str(body(&response)).unwrap(),
         )
     };
-    let (directory_wire, directory) =
-        fetch_eligible_zero("/v5/history/periods", "HTTP/1.1 200");
+    let (directory_wire, directory) = fetch_eligible_zero("/v5/history/periods", "HTTP/1.1 200");
     let periods = directory["history_periods"].as_array().unwrap();
     assert_eq!(
         periods
@@ -290,8 +401,7 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
         period["id"].as_str() == Some(raw_representative_id.as_str())
             || period["id"].as_str() == Some(raw_member_id.as_str())
     }));
-    let (_, selectable) =
-        fetch_eligible_zero("/v5/history/periods/selectable", "HTTP/1.1 200");
+    let (_, selectable) = fetch_eligible_zero("/v5/history/periods/selectable", "HTTP/1.1 200");
     assert_eq!(
         selectable["history_periods"]
             .as_array()
@@ -301,10 +411,8 @@ fn report_group_opaque_and_raw_history_cursor_local_usage() {
             .count(),
         1
     );
-    let (raw_wire, raw_body) = fetch_eligible_zero(
-        &format!("/v3/history?period={RAW_MEMBER}"),
-        "HTTP/1.1 200",
-    );
+    let (raw_wire, raw_body) =
+        fetch_eligible_zero(&format!("/v3/history?period={RAW_MEMBER}"), "HTTP/1.1 200");
     assert_eq!(published_pair(&raw_wire), published_pair(&directory_wire));
     let raw_model = raw_body["history_samples"]
         .as_array()
@@ -334,8 +442,10 @@ fn report_group_raw_only_change_advances_publication() {
 
     let path = temp_db("period-rest-prep-raw-update");
     let mut db = Connection::open(&path).unwrap();
-    db.execute_batch(include_str!("../../../tests/fixtures/report_groups.sql"))
-        .unwrap();
+    db.execute_batch(include_str!(
+        "../../../tests/fixtures/report_groups.sqlite.fixture"
+    ))
+    .unwrap();
     let first_price = f64::from_bits(0x3ff123456789abcd);
     period_rest_prep_insert_raw_legacy_row(&db, RAW_MEMBER, RAW_TIMESTAMP, first_price);
     const LATE_CLOCK: i64 = ORIGIN_MINUTE + 32 * 86_400;
@@ -360,7 +470,10 @@ fn report_group_raw_only_change_advances_publication() {
             rusqlite::params![NEW_RESET],
         )
         .unwrap();
-    assert_eq!(generation_rows, 1, "late receipt must advance the commit marker");
+    assert_eq!(
+        generation_rows, 1,
+        "late receipt must advance the commit marker"
+    );
     tx.commit().unwrap();
     let initial_commit: (String, Option<String>, String, i64, i64) = db
         .query_row(
@@ -368,7 +481,15 @@ fn report_group_raw_only_change_advances_publication() {
                     latest_quota_reset_at
              FROM collection_generation WHERE singleton=1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(
@@ -388,12 +509,28 @@ fn report_group_raw_only_change_advances_publication() {
              FROM quota_receipts
              WHERE receipt_id='period-rest-prep-late-current'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(
         late_receipt,
-        (83, LATE_CLOCK, NEW_RESET, WINDOW_SECONDS, 74.0, "83".to_owned())
+        (
+            83,
+            LATE_CLOCK,
+            NEW_RESET,
+            WINDOW_SECONDS,
+            74.0,
+            "83".to_owned()
+        )
     );
     drop(db);
 
@@ -424,10 +561,8 @@ fn report_group_raw_only_change_advances_publication() {
         )
     };
 
-    let (canonical_first_wire, canonical_first) =
-        fetch(&format!("/v3/history?period={GROUP}"));
-    let (raw_first_wire, raw_first) =
-        fetch(&format!("/v3/history?period={RAW_MEMBER}"));
+    let (canonical_first_wire, canonical_first) = fetch(&format!("/v3/history?period={GROUP}"));
+    let (raw_first_wire, raw_first) = fetch(&format!("/v3/history?period={RAW_MEMBER}"));
     let first_pair = published_pair(&raw_first_wire).to_owned();
     assert_eq!(published_pair(&canonical_first_wire), first_pair);
     let old_raw_cursor = raw_first["resume_cursor"]
@@ -468,7 +603,11 @@ fn report_group_raw_only_change_advances_publication() {
         "the official late receipt is the reader's publication observation"
     );
     assert_eq!(
-        old_snapshot.details.quota.as_ref().map(|quota| quota.reset_at),
+        old_snapshot
+            .details
+            .quota
+            .as_ref()
+            .map(|quota| quota.reset_at),
         Some(NEW_RESET),
         "the late receipt is the current quota authority"
     );
@@ -506,7 +645,10 @@ fn report_group_raw_only_change_advances_publication() {
             [],
         )
         .unwrap();
-    assert_eq!(generation_rows, 1, "raw-only update must advance the committed generation");
+    assert_eq!(
+        generation_rows, 1,
+        "raw-only update must advance the committed generation"
+    );
     tx.commit().unwrap();
     let committed: (String, Option<String>, String) = db
         .query_row(
@@ -518,7 +660,11 @@ fn report_group_raw_only_change_advances_publication() {
         .unwrap();
     assert_eq!(
         committed,
-                ("84".to_owned(), Some("11111111111111111111111111111111".to_owned()), "2".to_owned())
+        (
+            "84".to_owned(),
+            Some("11111111111111111111111111111111".to_owned()),
+            "2".to_owned()
+        )
     );
     drop(db);
     assert!(matches!(
@@ -528,20 +674,16 @@ fn report_group_raw_only_change_advances_publication() {
     let new_snapshot = server.store().snapshot().unwrap();
     let new_recent_current = public_numeric_state(new_snapshot.as_ref());
     assert_ne!(
-        old_data_hash,
-        new_snapshot.data_hash,
+        old_data_hash, new_snapshot.data_hash,
         "publication data_hash is recomputed from the changed raw view"
     );
     assert_eq!(
-        new_recent_current,
-        old_recent_current,
+        new_recent_current, old_recent_current,
         "retained raw-only price change leaves recent/current numeric public values unchanged"
     );
 
-    let (canonical_second_wire, canonical_second) =
-        fetch(&format!("/v3/history?period={GROUP}"));
-    let (raw_second_wire, raw_second) =
-        fetch(&format!("/v3/history?period={RAW_MEMBER}"));
+    let (canonical_second_wire, canonical_second) = fetch(&format!("/v3/history?period={GROUP}"));
+    let (raw_second_wire, raw_second) = fetch(&format!("/v3/history?period={RAW_MEMBER}"));
     let second_pair = published_pair(&raw_second_wire).to_owned();
     assert_eq!(published_pair(&canonical_second_wire), second_pair);
     assert_ne!(first_pair, second_pair, "raw-only change gets a new pair");
@@ -560,7 +702,10 @@ fn report_group_raw_only_change_advances_publication() {
         .unwrap()
         .to_bits();
     assert_eq!(new_raw_price, second_price.to_bits());
-    assert_ne!(old_raw_cursor, raw_second["resume_cursor"].as_str().unwrap());
+    assert_ne!(
+        old_raw_cursor,
+        raw_second["resume_cursor"].as_str().unwrap()
+    );
 
     let stale = request(
         server.local_addr(),

@@ -1355,6 +1355,22 @@ impl StoredHistorySample {
     }
 }
 
+/// Preserve a legacy row whose fixed columns are only partly known.  The
+/// source reset remains the identity and the timestamp names its observed
+/// minute; rows with the same exact reset/minute are represented once, without
+/// synthesizing values from a neighboring row or aliasing an unproven reset.
+fn preserve_nullable_history_samples(rows: &[StoredHistorySample]) -> Vec<StoredHistorySample> {
+    let mut selected = BTreeMap::<(i64, i64), StoredHistorySample>::new();
+    for row in rows {
+        let mut sample = row.clone();
+        sample.timestamp -= sample.timestamp.rem_euclid(60);
+        // SQL source order is exact reset then timestamp, so the latest
+        // observation of this same reset/minute remains the selected source.
+        selected.insert((sample.reset_at, sample.timestamp), sample);
+    }
+    selected.into_values().collect()
+}
+
 impl From<&PublicHistorySample> for StoredHistorySample {
     fn from(sample: &PublicHistorySample) -> Self {
         Self {
@@ -2367,17 +2383,15 @@ fn build_details_for_intervals(
                     || start.is_none_or(|start| row.timestamp >= start)
             })
             .collect::<Vec<_>>()
-    } else {
+    } else if recent.iter().all(|row| row.legacy_raw().is_some()) {
+        // Keep the established numeric canonicalizer byte-for-byte in meaning
+        // for complete legacy rows.  Only a partial row takes the conservative
+        // nullable path below; it must not be made complete with zeroes or
+        // another observation's values.
         let recent = recent
             .iter()
-            .map(|row| {
-                row.legacy_raw().ok_or_else(|| {
-                    ReaderError::InvalidValue(
-                        "nullable history requires canonical period identity".to_owned(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|row| row.legacy_raw().expect("complete legacy history row"))
+            .collect::<Vec<_>>();
         let mut samples = canonicalize_history_with_limit(
             &recent,
             current_reset_at,
@@ -2398,6 +2412,8 @@ fn build_details_for_intervals(
         .iter()
         .map(StoredHistorySample::from)
         .collect::<Vec<_>>()
+    } else {
+        preserve_nullable_history_samples(&recent)
     };
     let quota_only_samples = if history_is_canonical {
         quota_only_history_projection_samples(
@@ -3772,7 +3788,6 @@ fn history_observations_v2_from_stored(
             ))
             .then_some(fixed)
             .flatten();
-            let legacy = legacy.filter(|row| row.legacy_raw().is_some());
             PublicHistoryObservation {
                 timestamp: sample.timestamp,
                 reset_at: sample.reset_at,
@@ -3783,9 +3798,8 @@ fn history_observations_v2_from_stored(
                 sol_tokens: legacy.and_then(|legacy| legacy.sol_tokens),
                 terra_tokens: legacy.and_then(|legacy| legacy.terra_tokens),
                 luna_tokens: legacy.and_then(|legacy| legacy.luna_tokens),
-                model_source: if fixed.is_some_and(|row| row.legacy_raw().is_none())
-                    || (fixed.is_none()
-                        && matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown"))
+                model_source: if fixed.is_none()
+                    && matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown")
                 {
                     "unavailable".to_owned()
                 } else {

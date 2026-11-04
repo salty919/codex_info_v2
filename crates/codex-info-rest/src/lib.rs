@@ -538,12 +538,6 @@ fn same_public_domain(previous: &PublishedSnapshot, candidate: &PublishedSnapsho
 }
 
 fn history_facts_preserved(previous: &PublishedSnapshot, candidate: &PublishedSnapshot) -> bool {
-    if !exact_fact(
-        raw_history_archive(previous),
-        raw_history_archive(candidate),
-    ) {
-        return false;
-    }
     let (Some(old), Some(new)) = (
         &previous.history_reprojection_witness,
         &candidate.history_reprojection_witness,
@@ -569,7 +563,11 @@ fn history_facts_preserved(previous: &PublishedSnapshot, candidate: &PublishedSn
             (None, None) => (i64::MIN, i64::MAX, i64::MIN, i64::MAX, i64::MIN, i64::MAX),
             _ => return false,
         };
-    if !common_facts_equal(
+    let old_raw = raw_history_archive(previous);
+    let new_raw = raw_history_archive(candidate);
+    if !common_facts_equal(&old_raw.samples, &new_raw.samples, lower, upper, |row| {
+        row.timestamp
+    }) || !common_facts_equal(
         &previous.retained_history.samples,
         &candidate.retained_history.samples,
         lower,
@@ -590,9 +588,8 @@ fn history_facts_preserved(previous: &PublishedSnapshot, candidate: &PublishedSn
     ) {
         return false;
     }
-    let gaps = |snapshot: &PublishedSnapshot| {
-        snapshot
-            .retained_history
+    let gaps = |archive: &HistoryArchive| {
+        archive
             .gaps
             .iter()
             .filter_map(|gap| {
@@ -607,55 +604,62 @@ fn history_facts_preserved(previous: &PublishedSnapshot, candidate: &PublishedSn
             })
             .collect::<BTreeMap<_, _>>()
     };
-    if gaps(previous) != gaps(candidate) {
+    if gaps(&previous.retained_history) != gaps(&candidate.retained_history)
+        || gaps(old_raw) != gaps(new_raw)
+    {
         return false;
     }
-    let periods_by_id = candidate
-        .retained_history
-        .periods
-        .iter()
-        .map(|period| (&period.id, period))
-        .collect::<BTreeMap<_, _>>();
-    fn source_facts(
-        snapshot: &PublishedSnapshot,
-    ) -> BTreeMap<
-        i64,
-        (
-            Vec<&codex_info_rest_contract::PublicHistoryObservationV3>,
-            Vec<&codex_info_rest_contract::PublicHistoryGap>,
-        ),
-    > {
-        let mut facts = BTreeMap::<i64, (Vec<_>, Vec<_>)>::new();
-        for row in &snapshot.retained_history.samples {
-            facts.entry(row.reset_at).or_default().0.push(row);
-        }
-        for gap in &snapshot.retained_history.gaps {
-            facts.entry(gap.reset_at).or_default().1.push(gap);
-        }
-        facts
-    }
-    let old_sources = source_facts(previous);
-    let new_sources = source_facts(candidate);
-    for period in &previous.retained_history.periods {
-        if let Some(next) = periods_by_id.get(&period.id) {
-            if period.reset_at != next.reset_at || period.current != next.current {
-                return false;
+    fn archive_period_facts_preserved(
+        previous: &HistoryArchive,
+        candidate: &HistoryArchive,
+    ) -> bool {
+        let periods_by_id = candidate
+            .periods
+            .iter()
+            .map(|period| (&period.id, period))
+            .collect::<BTreeMap<_, _>>();
+        fn source_facts(
+            snapshot: &HistoryArchive,
+        ) -> BTreeMap<
+            i64,
+            (
+                Vec<&codex_info_rest_contract::PublicHistoryObservationV3>,
+                Vec<&codex_info_rest_contract::PublicHistoryGap>,
+            ),
+        > {
+            let mut facts = BTreeMap::<i64, (Vec<_>, Vec<_>)>::new();
+            for row in &snapshot.samples {
+                facts.entry(row.reset_at).or_default().0.push(row);
             }
-            if previous.retained_history.origins.get(&period.reset_at)
-                != candidate.retained_history.origins.get(&period.reset_at)
-            {
-                // Origin qualification may change only with a changed source
-                // extent of this exact period, never another period's clock.
-                if exact_fact(
-                    &old_sources.get(&period.reset_at),
-                    &new_sources.get(&period.reset_at),
-                ) {
+            for gap in &snapshot.gaps {
+                facts.entry(gap.reset_at).or_default().1.push(gap);
+            }
+            facts
+        }
+        let old_sources = source_facts(previous);
+        let new_sources = source_facts(candidate);
+        for period in &previous.periods {
+            if let Some(next) = periods_by_id.get(&period.id) {
+                if period.reset_at != next.reset_at || period.current != next.current {
                     return false;
+                }
+                if previous.origins.get(&period.reset_at) != candidate.origins.get(&period.reset_at)
+                {
+                    // Origin qualification may change only with a changed source
+                    // extent of this exact period, never another period's clock.
+                    if exact_fact(
+                        &old_sources.get(&period.reset_at),
+                        &new_sources.get(&period.reset_at),
+                    ) {
+                        return false;
+                    }
                 }
             }
         }
+        true
     }
-    true
+    archive_period_facts_preserved(&previous.retained_history, &candidate.retained_history)
+        && archive_period_facts_preserved(old_raw, new_raw)
 }
 
 fn same_commit_reprojection(
@@ -5569,11 +5573,26 @@ mod tests {
             ReaderLane::History,
         );
         let mut rewritten = second_history.clone();
-        rewritten.0.retained_history.samples[1]
+        let raw_archive = rewritten
+            .0
+            .retained_history
+            .raw
+            .as_mut()
+            .expect("hidden raw archive");
+        let raw_sample = raw_archive
+            .samples
+            .iter_mut()
+            .find(|sample| sample.timestamp == 1_800_000_360)
+            .expect("known raw sample at 20");
+        let raw_model = raw_sample
             .models
             .as_mut()
-            .unwrap()[0]
-            .total_tokens = 99;
+            .unwrap()
+            .iter_mut()
+            .find(|model| model.model == "SOL")
+            .expect("known raw SOL model");
+        assert_eq!(raw_model.total_tokens, 20);
+        raw_model.total_tokens = 99;
         store.complete_reader_lane(
             "account-7",
             &second_intent,
@@ -5860,14 +5879,23 @@ mod tests {
             .unwrap();
         assert!(delayed.0.history_available);
         assert_eq!(delayed.0.retained_history.samples.len(), 1);
-        assert_eq!(
-            delayed.0.retained_history.samples[0]
-                .models
-                .as_ref()
-                .unwrap()[0]
-                .total_tokens,
-            10_u64
-        );
+        assert!(delayed.0.retained_history.samples[0].models.is_none());
+        let delayed_raw = delayed
+            .0
+            .retained_history
+            .raw
+            .as_ref()
+            .expect("hidden raw archive");
+        let delayed_raw_model = delayed_raw
+            .samples
+            .iter()
+            .find(|sample| sample.timestamp == 1_800_000_000)
+            .and_then(|sample| sample.models.as_ref())
+            .unwrap()
+            .iter()
+            .find(|model| model.model == "SOL")
+            .expect("known raw SOL model");
+        assert_eq!(delayed_raw_model.total_tokens, 10_u64);
 
         store.complete_reader_lane(
             "account-7",
@@ -5915,14 +5943,22 @@ mod tests {
             combined.retained_history.samples[0].timestamp,
             1_800_000_000
         );
-        assert_eq!(
-            combined.retained_history.samples[0]
-                .models
-                .as_ref()
-                .unwrap()[0]
-                .total_tokens,
-            10_u64
-        );
+        assert!(combined.retained_history.samples[0].models.is_none());
+        let combined_raw = combined
+            .retained_history
+            .raw
+            .as_ref()
+            .expect("hidden raw archive");
+        let combined_raw_model = combined_raw
+            .samples
+            .iter()
+            .find(|sample| sample.timestamp == 1_800_000_000)
+            .and_then(|sample| sample.models.as_ref())
+            .unwrap()
+            .iter()
+            .find(|model| model.model == "SOL")
+            .expect("known raw SOL model");
+        assert_eq!(combined_raw_model.total_tokens, 10_u64);
         assert_ne!(combined.pair, current.pair);
         combined.details.validate_history_domain().unwrap();
 
@@ -5961,8 +5997,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(history_wire["history_samples"].as_array().unwrap().len(), 1);
+        assert!(history_wire["history_samples"][0]["models"].is_null());
+        let raw_history_wire: Value = serde_json::from_slice(
+            &serialize_route(&advanced, Route::HistoryV3, Some("1800604800"), None, false).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            history_wire["history_samples"][0]["models"][0]["total_tokens"],
+            raw_history_wire["history_samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            raw_history_wire["history_samples"][0]["models"][0]["total_tokens"],
             10
         );
 
@@ -5975,10 +6023,28 @@ mod tests {
         let full = store.snapshot_account("account-7").unwrap();
         assert_eq!(full.retained_history.samples.len(), 2);
         assert_eq!(full.retained_history.samples[1].timestamp, 1_800_000_360);
-        assert_eq!(
-            full.retained_history.samples[1].models.as_ref().unwrap()[0].total_tokens,
-            20_u64
-        );
+        assert!(full
+            .retained_history
+            .samples
+            .iter()
+            .all(|sample| sample.models.is_none()));
+        let full_raw = full
+            .retained_history
+            .raw
+            .as_ref()
+            .expect("hidden raw archive");
+        for (timestamp, expected) in [(1_800_000_000, 10_u64), (1_800_000_360, 20_u64)] {
+            let raw_model = full_raw
+                .samples
+                .iter()
+                .find(|sample| sample.timestamp == timestamp)
+                .and_then(|sample| sample.models.as_ref())
+                .unwrap()
+                .iter()
+                .find(|model| model.model == "SOL")
+                .expect("known raw SOL model");
+            assert_eq!(raw_model.total_tokens, expected);
+        }
         assert_eq!(full.models_v3[0].total_tokens, 30);
         assert_eq!(full.details.observed_at, Some(1_800_000_420));
         full.details.validate_history_domain().unwrap();
@@ -8733,11 +8799,13 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let periods: Value = serde_json::from_str(body(&response)).unwrap();
         let periods = periods["history_periods"].as_array().unwrap();
-        assert_eq!(periods.len(), 2);
-        let new = periods.iter().find(|p| p["id"] == "1800604801").unwrap();
-        let old = periods.iter().find(|p| p["id"] == "1800604800").unwrap();
-        assert_eq!(new["start_at"], 1_800_000_001_i64);
-        assert!(old["end_at"].as_i64().unwrap() < new["start_at"].as_i64().unwrap());
+        assert_eq!(periods.len(), 1);
+        let display = periods
+            .iter()
+            .find(|period| period["id"] == "rg1-1800000000-604800")
+            .expect("one canonical receipt display group");
+        assert_eq!(display["reset_at"], 1_800_604_801_i64);
+        assert_eq!(display["start_at"], 1_800_000_000_i64);
         for (reset, expected) in [("1800604800", vec![10.0]), ("1800604801", vec![99.0, 98.0])] {
             let response = request(
                 server.local_addr(),
@@ -8917,6 +8985,7 @@ mod tests {
         )
         .unwrap();
         let starts = [START, START + 128, START + 190, START + 600];
+        let group_id = |start: i64| format!("rg1-{}-{}", start.div_euclid(60) * 60, WINDOW);
         for (index, start) in starts.into_iter().enumerate() {
             let observed = start + if index == 2 { 120 } else { 60 };
             let timestamp = observed - observed.rem_euclid(60);
@@ -9045,10 +9114,26 @@ mod tests {
                 1,
                 "the canonical fixture has one in-bounds observation per exact reset"
             );
-            assert_eq!(points[0].model_source, "legacy-unknown");
+            assert!(
+                points[0].models.is_none(),
+                "unqualified canonical sample must not receive raw numeric models"
+            );
+            assert_eq!(points[0].model_source, "unavailable");
             assert!(!points[0].models_complete);
+            let raw_archive = before
+                .retained_history
+                .raw
+                .as_ref()
+                .expect("raw source archive");
+            let raw_point = raw_archive
+                .samples
+                .iter()
+                .find(|point| point.reset_at == start + WINDOW)
+                .expect("raw source sample");
+            assert_eq!(raw_point.model_source, "legacy-unknown");
+            assert!(!raw_point.models_complete);
             assert_eq!(
-                points[0]
+                raw_point
                     .models
                     .as_ref()
                     .unwrap()
@@ -9081,13 +9166,7 @@ mod tests {
             .iter()
             .map(|p| p["id"].as_str().unwrap().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(
-            ids,
-            vec![
-                (starts[3] + WINDOW).to_string(),
-                (starts[2] + WINDOW).to_string()
-            ]
-        );
+        assert_eq!(ids, vec![group_id(starts[3]), group_id(starts[2])]);
         for (index, start) in starts.into_iter().enumerate() {
             let reset = start + WINDOW;
             let response = request(
@@ -9236,7 +9315,13 @@ mod tests {
         assert_eq!(
             ids,
             (0..9_i64)
-                .map(|minute| (START + minute * 60 + WINDOW).to_string())
+                .map(|minute| {
+                    format!(
+                        "rg1-{}-{}",
+                        (START + minute * 60).div_euclid(60) * 60,
+                        WINDOW
+                    )
+                })
                 .collect::<std::collections::BTreeSet<_>>()
         );
         let current = periods
@@ -9245,7 +9330,14 @@ mod tests {
             .filter(|p| p.current)
             .map(|p| p.id.clone())
             .collect::<Vec<_>>();
-        assert_eq!(current, vec![current_reset.to_string()]);
+        assert_eq!(
+            current,
+            vec![format!(
+                "rg1-{}-{}",
+                (START + 8 * 60).div_euclid(60) * 60,
+                WINDOW
+            )]
+        );
         let selectable = request(
             server.local_addr(),
             "GET /v3/history/periods/selectable HTTP/1.1\r\nHost:x\r\n\r\n",
@@ -9255,7 +9347,7 @@ mod tests {
         assert_eq!(selected["history_periods"].as_array().unwrap().len(), 1);
         assert_eq!(
             selected["history_periods"][0]["id"],
-            current_reset.to_string()
+            format!("rg1-{}-{}", (START + 8 * 60).div_euclid(60) * 60, WINDOW)
         );
         for minute in 0..9_i64 {
             let reset = START + minute * 60 + WINDOW;
@@ -9369,7 +9461,7 @@ mod tests {
         );
         assert!(catalog.starts_with("HTTP/1.1 200"), "{catalog}");
         let value: Value = serde_json::from_str(body(&catalog)).unwrap();
-        let old_period_id = OLD_RESET.to_string();
+        let old_period_id = format!("rg1-{}-{}", OLD.div_euclid(60) * 60, OLD_RESET - OLD);
         assert!(value["history_periods"]
             .as_array()
             .unwrap()

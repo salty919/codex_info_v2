@@ -14,7 +14,9 @@ fn period_reader_fixture(name: &str) -> (PathBuf, StoragePartitionIdentity) {
     let path = temp_db(name);
     Connection::open(&path)
         .unwrap()
-        .execute_batch(include_str!("../../../tests/fixtures/report_groups.sql"))
+        .execute_batch(include_str!(
+            "../../../tests/fixtures/report_groups.sqlite.fixture"
+        ))
         .unwrap();
     let identity = StoragePartitionIdentity {
         schema_version: "codex-info-account-db-v1".into(),
