@@ -4053,6 +4053,56 @@ fn canonicalize_session_events(events: Vec<SessionEvent>) -> (Vec<SessionEvent>,
     (canonical, deduplicated)
 }
 
+/// Saved canonical evidence used only for exact replay and lineage comparison.
+/// This opaque value grants no model, period, or numeric projection authority.
+#[derive(Clone, Debug)]
+pub struct SessionEventReplayIdentity(SessionEvent);
+
+impl From<SessionEvent> for SessionEventReplayIdentity {
+    fn from(event: SessionEvent) -> Self {
+        Self(event)
+    }
+}
+
+impl SessionEventReplayIdentity {
+    pub fn is_replay_of(&self, candidate: &SessionEvent) -> bool {
+        session_event_is_replay(&self.0, candidate)
+    }
+
+    pub fn has_ambiguous_lineage_with(&self, candidate: &SessionEvent) -> bool {
+        session_event_has_ambiguous_lineage(&self.0, candidate)
+    }
+}
+
+fn load_session_event_replay_identities_from_connection(
+    connection: &Connection,
+) -> Result<Vec<SessionEventReplayIdentity>> {
+    Ok(source_events::read_canonical_evidence(connection, "", [])?
+        .into_iter()
+        .map(|event| {
+            let source = event.source;
+            SessionEventReplayIdentity(SessionEvent {
+                root_identity: source.root_identity,
+                relative_path: source.relative_path,
+                file_device: source.file_device,
+                file_inode: source.file_inode,
+                prefix_generation: source.prefix_generation,
+                range_start: source.range_start,
+                range_end: source.range_end,
+                record_sha256: source.record_sha256,
+                event_index: source.event_index,
+                timestamp: event.timestamp,
+                model: event.model,
+                total_tokens: event.tokens.total,
+                input_tokens: event.tokens.input,
+                cached_input_tokens: event.tokens.cached_input,
+                output_tokens: event.tokens.output,
+                cache_write_input_tokens: event.tokens.cache_write_input,
+            })
+        })
+        .collect())
+}
+
 fn load_session_events_from_connection(connection: &Connection) -> Result<Vec<SessionEvent>> {
     let (events, _) = canonicalize_session_events(
         source_events::read_matching(connection, "", [])?
@@ -14111,6 +14161,11 @@ impl UsageStore {
         load_session_events_from_connection(&self.connection)
     }
 
+    /// Comparison inventory only; incomplete models never become numeric events.
+    pub fn session_event_replay_identities(&self) -> Result<Vec<SessionEventReplayIdentity>> {
+        load_session_event_replay_identities_from_connection(&self.connection)
+    }
+
     pub fn response_event(&self, key: &str) -> Result<Option<LosslessSessionEvent>> {
         source_events::response_by_key(&self.connection, key)
     }
@@ -15874,11 +15929,12 @@ impl UsageStore {
             )
             .max();
 
-        let existing_events = load_session_events_from_connection(&transaction)?;
+        let existing_identities =
+            load_session_event_replay_identities_from_connection(&transaction)?;
         if canonical_events.values().any(|candidate| {
-            existing_events
+            existing_identities
                 .iter()
-                .any(|existing| session_event_has_ambiguous_lineage(existing, candidate))
+                .any(|existing| existing.has_ambiguous_lineage_with(candidate))
         }) {
             return Err(UsageStoreError::InvalidImport(
                 "session event overlaps an existing prefix lineage replay".into(),
@@ -15908,6 +15964,13 @@ impl UsageStore {
         } else {
             None
         };
+        // Legacy exact reconstruction still requires the unchanged strict
+        // numeric getter. Comparison identities are never summed.
+        let legacy_exact_saved = if period_attribution.is_none() && exact_history_span.is_some() {
+            load_session_events_from_connection(&transaction)?
+        } else {
+            Vec::new()
+        };
         let exact_incoming = if period_attribution.is_some() && exact_history_span.is_some() {
             Some(
                 qualified_events
@@ -15936,7 +15999,7 @@ impl UsageStore {
                     samples,
                     observations,
                     &model_totals,
-                    exact_saved.as_deref().unwrap_or(&existing_events),
+                    exact_saved.as_deref().unwrap_or(&legacy_exact_saved),
                     exact_incoming.as_ref().unwrap_or(&canonical_events),
                     &stored_timeline_recoveries,
                 )
@@ -20036,14 +20099,48 @@ mod tests {
             numeric_records: vec![],
             parser_version: "codex-info-session-recorder-v3".into(),
         };
+        let failed_preparations = std::cell::Cell::new(0_usize);
+        let failed = store.prepare_source_equivalence_with_inputs(
+            SourceEquivalenceMode::EventBijection,
+            &checkpoints[0],
+            vec![prefix.clone()],
+            || {
+                failed_preparations.set(failed_preparations.get() + 1);
+                Err(UsageStoreError::InvalidImport(
+                    "synthetic protected-input failure".into(),
+                ))
+            },
+        );
+        assert!(
+            matches!(failed, Err(UsageStoreError::InvalidImport(message))
+                        if message == "synthetic protected-input failure")
+        );
+        assert_eq!(failed_preparations.get(), 1);
+        assert_eq!(
+            read_session_event_facts(&store.connection).unwrap(),
+            original
+        );
+        assert_eq!(
+            store.load_session_collection_state().unwrap().checkpoints,
+            original_checkpoints
+        );
+        let input_preparations = std::cell::Cell::new(0_usize);
         let repair = store
-            .prepare_source_equivalence(
+            .prepare_source_equivalence_with_inputs(
                 SourceEquivalenceMode::EventBijection,
                 &checkpoints[0],
                 vec![prefix],
-                inputs,
+                || {
+                    input_preparations.set(input_preparations.get() + 1);
+                    Ok(inputs)
+                },
             )
             .unwrap();
+        assert_eq!(
+            input_preparations.get(),
+            1,
+            "a proved nonempty repair materializes its protected inputs exactly once"
+        );
         let period = store
             .prepare_period_attribution(
                 &partition_identity('a', 7),

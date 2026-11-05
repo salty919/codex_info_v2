@@ -27,8 +27,7 @@ use codex_info_db_writer::source_admission::{
     SourceAccountBinding, SourceAdmission, SourceBindingProof, StrongContext, UsageStream,
 };
 use codex_info_db_writer::{
-    finalize_session_timeline_recovery, session_event_has_ambiguous_lineage,
-    session_event_is_replay, session_token_anchor_recovery_id, ActiveThreadRecord,
+    finalize_session_timeline_recovery, session_token_anchor_recovery_id, ActiveThreadRecord,
     ActiveThreadSnapshot, LosslessSessionEvent, QuotaTransition, RecordedSessionSource,
     SessionCheckpoint, SessionCollectionCommit, SessionCollectionState, SessionEvent,
     SessionLifecycleInterval, SessionModelContextKind, SessionModelInterval, SessionModelTotal,
@@ -1456,6 +1455,15 @@ fn request_app_server_before_deadline(
     }
 }
 
+fn thread_read_response_thread(result: &Value) -> Result<&Value, String> {
+    let result_object = result
+        .as_object()
+        .ok_or_else(|| "thread/read response envelope rejected".to_owned())?;
+    result_object
+        .get("thread")
+        .ok_or_else(|| "thread/read response missing thread".to_owned())
+}
+
 fn collect_active_thread_snapshot(
     sessions_root: &Path,
     checkpoints: &[SessionCheckpoint],
@@ -1637,13 +1645,7 @@ fn collect_active_thread_snapshot_from_paths(
                 json!({"threadId": thread_id, "includeTurns": false}),
                 deadline,
             )?;
-            let result_object = result
-                .as_object()
-                .filter(|object| object.len() == 1)
-                .ok_or_else(|| "thread/read response envelope rejected".to_owned())?;
-            let thread_item = result_object
-                .get("thread")
-                .ok_or_else(|| "thread/read response missing thread".to_owned())?;
+            let thread_item = thread_read_response_thread(&result)?;
             let candidate = thread_contract::validate_thread_item(thread_item)
                 .map_err(|_| "thread/read response rejected".to_owned())?;
             let response_path = candidate.path().and_then(|value| {
@@ -5114,6 +5116,7 @@ impl Recorder {
             return self.commit_pending().map(Some);
         }
 
+        let source_preparation = self.writer.source_preparation_scope()?;
         let period_attribution = source_context
             .as_ref()
             .map(|context| {
@@ -5283,25 +5286,26 @@ impl Recorder {
         } else {
             0
         };
-        let mut replayed_events = if period_restarted && period_available {
-            self.writer
-                .load_session_events()?
-                .into_iter()
-                .filter(|event| {
-                    event.timestamp >= reset_at.saturating_sub(window_seconds)
-                        && event.timestamp <= timeline_end
-                        && self.lifecycle_intervals.iter().any(|interval| {
-                            interval
-                                .start_at
-                                .is_none_or(|start| event.timestamp >= start)
-                                && interval.end_at.is_none_or(|end| event.timestamp < end)
-                        })
-                })
-                .map(session_event_to_timed_usage)
-                .collect::<Result<Vec<_>, RecorderError>>()?
-        } else {
-            Vec::new()
-        };
+        let mut replayed_events =
+            if period_restarted && period_available && period_attribution.is_none() {
+                self.writer
+                    .load_session_events()?
+                    .into_iter()
+                    .filter(|event| {
+                        event.timestamp >= reset_at.saturating_sub(window_seconds)
+                            && event.timestamp <= timeline_end
+                            && self.lifecycle_intervals.iter().any(|interval| {
+                                interval
+                                    .start_at
+                                    .is_none_or(|start| event.timestamp >= start)
+                                    && interval.end_at.is_none_or(|end| event.timestamp < end)
+                            })
+                    })
+                    .map(session_event_to_timed_usage)
+                    .collect::<Result<Vec<_>, RecorderError>>()?
+            } else {
+                Vec::new()
+            };
         for event in &replayed_events {
             totals.add(&event.model, event.delta)?;
         }
@@ -5311,7 +5315,20 @@ impl Recorder {
         // account-switch/restart prefix replay is removed before it reaches
         // either totals or history. Proven duplicates are filtered; any
         // non-identical record remains normal source data.
-        let mut admitted_session_events = self.writer.load_session_events()?;
+        let mut admitted_session_events = if period_attribution.is_none() {
+            self.writer.load_session_events()?
+        } else {
+            Vec::new()
+        };
+        let mut replay_identities = if period_attribution.is_some() {
+            self.writer.session_event_replay_identities()?
+        } else {
+            admitted_session_events
+                .iter()
+                .cloned()
+                .map(codex_info_db_writer::SessionEventReplayIdentity::from)
+                .collect()
+        };
 
         let mut source_verifications = BTreeMap::new();
         let mut source_binding_cycle: Option<Result<SourceBindingCycle, String>> = None;
@@ -6435,9 +6452,9 @@ impl Recorder {
             let mut ambiguous_lineage = false;
             for candidate in &result.events {
                 if !canonical_sources.is_proved_replay(candidate)?
-                    && admitted_session_events
+                    && replay_identities
                         .iter()
-                        .any(|old| session_event_has_ambiguous_lineage(old, candidate))
+                        .any(|old| old.has_ambiguous_lineage_with(candidate))
                 {
                     ambiguous_lineage = true;
                     break;
@@ -6483,9 +6500,9 @@ impl Recorder {
             }
             let mut admitted_events = Vec::with_capacity(result.events.len());
             for event in result.events {
-                let replay = admitted_session_events
+                let replay = replay_identities
                     .iter()
-                    .any(|existing| session_event_is_replay(existing, &event))
+                    .any(|existing| existing.is_replay_of(&event))
                     || canonical_sources.is_proved_replay(&event)?;
                 if replay {
                     if reset_at > 0
@@ -6503,6 +6520,7 @@ impl Recorder {
                         }
                     }
                 } else {
+                    replay_identities.push(event.clone().into());
                     admitted_session_events.push(event.clone());
                     admitted_events.push(event);
                 }
@@ -6668,9 +6686,9 @@ impl Recorder {
                     let lineage_unresolved = existing
                         .as_ref()
                         .is_none_or(|old| !codex_info_db_writer::same_response(old, &fact))
-                        && admitted_session_events
+                        && replay_identities
                             .iter()
-                            .any(|old| session_event_has_ambiguous_lineage(old, &raw));
+                            .any(|old| old.has_ambiguous_lineage_with(&raw));
                     if lineage_unresolved
                         || !fact
                             .admission
@@ -7236,6 +7254,7 @@ impl Recorder {
             self.activation_timestamp
                 .is_none_or(|boundary| event.timestamp >= boundary)
         });
+        drop(source_preparation);
         self.pending = Some(PendingBatch {
             source_repairs,
             period_attribution,
@@ -17629,10 +17648,82 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    struct Issue659EquivalenceOwnedRoot(PathBuf);
+    #[cfg(target_os = "linux")]
+    impl Drop for Issue659EquivalenceOwnedRoot {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                fs::remove_dir_all(&self.0).expect("remove owned synthetic equivalence fixture");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn issue659_equivalence_backup_bytes(database: &std::path::Path) -> Vec<Option<Vec<u8>>> {
+        (1..=3)
+            .map(|generation| {
+                match fs::read(database.with_extension(format!("sqlite3.bak.{generation}"))) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("synthetic backup observation failed: {error}"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue659_empty_source_equivalence_does_not_materialize_backup_inputs() {
+        let fixture = issue604_equivalence_fixture("issue659-empty-equivalence-no-backup");
+        let _owned = Issue659EquivalenceOwnedRoot(fixture.root.clone());
+        let Issue604EquivalenceFixture {
+            database,
+            mut recorder,
+            at,
+            ..
+        } = fixture;
+        let connection = Connection::open(&database).unwrap();
+        // This complete synthetic schema has retained checkpoints/ranges,
+        // but no old raw event inventory to authorize a replacement.
+        connection
+            .execute("DELETE FROM session_events", [])
+            .unwrap();
+        drop(connection);
+        recorder.lifecycle_intervals = vec![SessionLifecycleInterval::new(Some(at - 1), None)];
+        let before = recorder.state().unwrap();
+        let backups = issue659_equivalence_backup_bytes(&database);
+        let period = recorder
+            .writer
+            .prepare_period_attribution(&identity(), &recorder.lifecycle_intervals)
+            .unwrap();
+        let mut inputs = None;
+        let (repairs, handled, _) = recorder
+            .prepare_source_equivalences(&before, &period, &mut inputs)
+            .unwrap();
+        assert!(
+            !handled.is_empty(),
+            "the complete independent-prefix candidate must have been considered"
+        );
+        assert!(repairs.is_empty());
+        assert!(
+            inputs.is_none(),
+            "EMPTY_EQUIVALENCE_ALLOCATED_BACKUP_INPUTS"
+        );
+        assert_eq!(
+            issue659_equivalence_backup_bytes(&database),
+            backups,
+            "a candidate with no originals created or rotated backup generations"
+        );
+        assert_eq!(recorder.state().unwrap(), before);
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn issue604_reuses_rejected_source_equivalence_until_its_fixed_inputs_change() {
         use rustix::fs::inotify;
+        let fixture = issue604_equivalence_fixture("source-equivalence-negative-proof");
+        let _owned = Issue659EquivalenceOwnedRoot(fixture.root.clone());
         let Issue604EquivalenceFixture {
             root,
             database,
@@ -17642,7 +17733,7 @@ mod tests {
             old,
             current,
             ranges,
-        } = issue604_equivalence_fixture("source-equivalence-negative-proof");
+        } = fixture;
         // A well-formed old, unqualified value has no corresponding record
         // in either accepted copy. It must stay pending, without repeatedly
         // reading the same independently accepted bytes after publication.
@@ -17670,14 +17761,20 @@ mod tests {
             .writer
             .prepare_period_attribution(&identity(), &recorder.lifecycle_intervals)
             .unwrap();
+        let original_backups = issue659_equivalence_backup_bytes(&database);
         let mut inputs = None;
         let (repairs, handled, _) = recorder
             .prepare_source_equivalences(&before, &period, &mut inputs)
             .unwrap();
         assert!(repairs.is_empty());
         assert!(
-            inputs.is_some(),
-            "the first complete counterpart proof was attempted"
+            inputs.is_none(),
+            "REJECTED_EQUIVALENCE_ALLOCATED_BACKUP_INPUTS"
+        );
+        assert_eq!(
+            issue659_equivalence_backup_bytes(&database),
+            original_backups,
+            "a rejected complete counterpart proof created or rotated backups"
         );
         assert_eq!(handled.len(), 2);
         let watch =
@@ -26569,5 +26666,336 @@ mod tests {
         )
         .is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue659_normal_cycle_preserves_pending_saved_response_and_accepts_new_consumption() {
+        struct OwnedFixture(std::path::PathBuf);
+        impl Drop for OwnedFixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let (root, database, source, recorder, epoch, at, response) =
+            issue604_bound_response_prefix_fixture("issue659-normal-pending-identity");
+        let _owned = OwnedFixture(root.clone());
+        let mut recorder = recorder;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap();
+        std::io::Write::write_all(&mut file, response.as_bytes()).unwrap();
+        drop(file);
+        recorder
+            .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+            .unwrap()
+            .unwrap();
+        let before = recorder.state().unwrap();
+        assert_eq!(
+            before
+                .model_totals
+                .iter()
+                .find(|total| total.model == "gpt-6.1-sol")
+                .unwrap()
+                .total_tokens,
+            10,
+            "real producer control must complete first"
+        );
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let original:String=connection.query_row("SELECT admission_json FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='response-record'",[],|row|row.get(0)).unwrap();
+        let mut admission: codex_info_db_writer::event_admission::EventAdmission =
+            serde_json::from_str(&original).unwrap();
+        let codex_info_db_writer::event_admission::NumericEventProof::ResponseRecord {
+            candidate,
+            ..
+        } = &mut admission.numeric
+        else {
+            unreachable!()
+        };
+        candidate.classification =
+            codex_info_db_writer::source_admission::ResponseModelClassification::AwaitingBoundary;
+        candidate.counter_association =
+            codex_info_db_writer::source_admission::ResponseCounterAssociation::Awaiting;
+        let pending = serde_json::to_string(&admission).unwrap();
+        connection.execute("UPDATE session_events SET admission_json=?1 WHERE json_extract(admission_json,'$.numeric.kind')='response-record'",[&pending]).unwrap();
+        let raw = recorder
+            .writer
+            .source_events_for_qualification_repair(&before.checkpoints[0])
+            .unwrap();
+        assert_eq!(raw.len(), 1);
+        assert!(!raw[0]
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&raw[0], raw[0].period));
+        recorder
+            .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+            .expect("NORMAL_SOURCE_SCAN_REPLAY_INVENTORY_REJECTED");
+        assert_eq!(
+            recorder.state().unwrap().model_totals,
+            before.model_totals,
+            "an unchanged poll duplicated or lost the saved ten tokens"
+        );
+        let stamp = |time| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(time, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let usage = serde_json::json!({"total_tokens":7,"input_tokens":6,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0});
+        let cumulative = serde_json::json!({"total_tokens":17,"input_tokens":15,"cached_input_tokens":4,"cache_write_input_tokens":2,"output_tokens":2,"reasoning_output_tokens":1});
+        let suffix = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"token_usage_record","timestamp":stamp(at+3),"payload":{"thread_id":"thread","session_id":"session","turn_id":"turn","root_turn_id":"root-turn","response_id":"response-b","usage":usage,"turn_token_usage":cumulative,"thread_token_usage":cumulative}}),
+            serde_json::json!({"type":"event_msg","timestamp":stamp(at+4),"payload":{"type":"token_count","info":{"total_token_usage":cumulative,"last_token_usage":usage}}})
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap();
+        std::io::Write::write_all(&mut file, suffix.as_bytes()).unwrap();
+        drop(file);
+        recorder
+            .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+            .expect("NORMAL_NEW_QUALIFIED_APPEND_REJECTED")
+            .unwrap();
+        assert_eq!(
+            recorder
+                .state()
+                .unwrap()
+                .model_totals
+                .iter()
+                .find(|total| total.model == "gpt-6.1-sol")
+                .unwrap()
+                .total_tokens,
+            17,
+            "old ten and new seven must be retained exactly once"
+        );
+        let retained:String=connection.query_row("SELECT admission_json FROM session_events WHERE json_extract(admission_json,'$.numeric.candidate.record.ids.response_id')='response-a'",[],|row|row.get(0)).unwrap();
+        assert_eq!(retained, pending);
+    }
+}
+
+#[cfg(test)]
+mod issue659_thread_read_actual_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "explicit read-only typed partition/state and RPC diagnostic"]
+    fn existing_source_accepts_the_production_thread_response() {
+        let inputs: Value = serde_json::from_slice(
+            &fs::read(
+                std::env::var_os("ISSUE659_THREAD_DIAGNOSTIC_INPUTS")
+                    .expect("explicit actual input descriptor is required"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let home = PathBuf::from(inputs["codex_home"].as_str().unwrap());
+        let data_root = PathBuf::from(inputs["data_root"].as_str().unwrap());
+        let partition = codex_info_account_locator::locate_existing_partition(&home, &data_root)
+            .expect("existing initialized current partition must be readable");
+        let located = partition.storage_identity();
+        let identity = StoragePartitionIdentity {
+            schema_version: located.schema_version,
+            profile_scope_id: located.profile_scope_id,
+            account_scope_id: located.account_scope_id,
+            storage_epoch: located.storage_epoch,
+            partition_id: located.partition_id,
+        };
+        let store = UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+            .expect("existing qualified read-only partition reader");
+        let state = store
+            .load_session_collection_state()
+            .expect("existing typed collection/checkpoint/model/quota reader");
+        let sessions = home.join("sessions").canonicalize().unwrap();
+        let source = PathBuf::from(inputs["source"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert!(
+            source.starts_with(&sessions),
+            "selected source must remain under sessions"
+        );
+        let root_info = fs::metadata(&sessions).unwrap();
+        let source_info = fs::metadata(&source).unwrap();
+        let root_key = root_identity(&sessions, &root_info);
+        let relative = source.strip_prefix(&sessions).unwrap().to_str().unwrap();
+        assert!(
+            state.checkpoints.iter().any(|checkpoint| {
+                checkpoint.root_identity == root_key
+                    && checkpoint.relative_path == relative
+                    && checkpoint.file_device == file_device(&source_info)
+                    && checkpoint.file_inode == file_inode(&source_info)
+            }),
+            "selected source must have an existing qualified physical checkpoint"
+        );
+        println!("TYPED_EXISTING_INPUTS_READY custom_sql_getters=0 readonly_partition=true checkpoints_loaded=true existing_source_qualified=true");
+        let metadata = fs::metadata(&source).unwrap();
+        let qualification_deadline = Instant::now() + APP_SERVER_RESPONSE_TIMEOUT;
+        let thread_id =
+            read_session_meta_id(&sessions, &source, &metadata, qualification_deadline).unwrap();
+        let mut connection =
+            AppServerConnection::start("codex-info-recorder-thread-poller", qualification_deadline)
+                .unwrap();
+        let account = request_app_server_before_deadline(
+            &mut connection.input,
+            &connection.output,
+            2,
+            "account/read",
+            json!({}),
+            qualification_deadline,
+        )
+        .unwrap();
+        decode_app_server_account(&account).unwrap();
+        let response = request_app_server_before_deadline(
+            &mut connection.input,
+            &connection.output,
+            3,
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+            qualification_deadline,
+        )
+        .unwrap();
+        let object = response
+            .as_object()
+            .expect("actual response must be an object");
+        assert!(
+            object.contains_key("readState"),
+            "readState-only counterexample not observed"
+        );
+        assert!(object.len() > 1);
+        let generated: Value = serde_json::from_slice(
+            &fs::read(
+                std::env::var_os("ISSUE659_THREAD_DIAGNOSTIC_SCHEMA")
+                    .expect("explicit generated schema evidence is required"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let schema = &generated["schema"];
+        let mut receipt_schema = schema["properties"]["readState"].clone();
+        receipt_schema["definitions"] = json!({
+            "ThreadReadState": schema["definitions"]["ThreadReadState"].clone(),
+            "ThreadUnreadPosition": schema["definitions"]["ThreadUnreadPosition"].clone(),
+        });
+        thread_contract::validate_instance_against_schema(
+            object.get("readState").unwrap(),
+            &receipt_schema,
+        )
+        .expect("actual readState must satisfy its generated source schema");
+        let thread = object
+            .get("thread")
+            .expect("actual response must contain thread");
+        let candidate = thread_contract::validate_thread_item(thread)
+            .expect("actual Thread must satisfy the unchanged complete schema");
+        assert!(
+            candidate.id() == thread_id,
+            "actual thread identity mismatch"
+        );
+        let returned_path = candidate
+            .path()
+            .and_then(|path| {
+                security::canonical_regular_file_under(&sessions, Path::new(path)).ok()
+            })
+            .expect("actual response must reference a regular source under sessions");
+        assert!(
+            returned_path == source,
+            "actual thread source path mismatch"
+        );
+        println!("ACTUAL_THREAD_RESPONSE_VALID object=true readState_present=true readState_schema_valid=true thread_schema_valid=true source_identity_matches=true");
+        drop(connection);
+        let result = collect_active_thread_snapshot_from_paths(
+            &sessions,
+            &BTreeSet::from([source]),
+            &state.checkpoints,
+            &mut LiveRolloutCache::default(),
+        );
+        match result {
+            ActiveThreadPollResult::Snapshot { .. } => {
+                println!("EXISTING_SOURCE_THREAD_READ_ACCEPTED");
+            }
+            ActiveThreadPollResult::Failed(error)
+                if error == "thread/read response envelope rejected" =>
+            {
+                panic!("VALID_READ_STATE_REJECTED: thread/read response envelope rejected");
+            }
+            ActiveThreadPollResult::Failed(error) => {
+                panic!("OTHER_CONSUMER_FAILURE: {error}");
+            }
+            _ => panic!("source did not reach the required RPC consumer"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod issue659_thread_read_response_tests {
+    use super::*;
+
+    fn valid_thread() -> Value {
+        json!({
+            "cliVersion": "0.166.0",
+            "createdAt": 1,
+            "cwd": "/tmp/codex",
+            "ephemeral": false,
+            "id": "thread-1",
+            "modelProvider": "openai",
+            "preview": "synthetic preview",
+            "sessionId": "session-1",
+            "source": "cli",
+            "status": {"type": "idle"},
+            "turns": [],
+            "updatedAt": 1,
+            "name": "synthetic fixture",
+            "path": "/tmp/codex/thread.jsonl"
+        })
+    }
+
+    #[test]
+    fn read_state_metadata_does_not_reject_a_valid_thread() {
+        let thread = valid_thread();
+        let baseline = json!({"thread": thread.clone()});
+        let baseline_item = thread_read_response_thread(&baseline).unwrap();
+        let baseline_candidate = thread_contract::validate_thread_item(baseline_item)
+            .expect("valid independent Thread fixture");
+        for read_state in [
+            Value::Null,
+            json!({"revision": "fixture-revision", "firstUnread": null}),
+        ] {
+            let result = json!({"thread": thread.clone(), "readState": read_state});
+            let item = thread_read_response_thread(&result).expect("VALID_READ_STATE_REJECTED");
+            let candidate = thread_contract::validate_thread_item(item)
+                .expect("auxiliary result metadata cannot change the Thread schema");
+            assert_eq!(item, &thread);
+            assert_eq!(candidate.id(), baseline_candidate.id());
+            assert_eq!(candidate.path(), baseline_candidate.path());
+            assert_eq!(candidate.raw_json(), baseline_candidate.raw_json());
+            assert_eq!(result["thread"], thread);
+        }
+    }
+
+    #[test]
+    fn required_object_thread_and_complete_thread_validation_remain() {
+        for result in [
+            Value::Null,
+            json!(false),
+            json!([]),
+            json!("not an object"),
+            json!({}),
+            json!({"readState": null}),
+        ] {
+            assert!(thread_read_response_thread(&result).is_err());
+        }
+        let mut empty_id = valid_thread();
+        empty_id["id"] = json!("");
+        let mut missing_required = valid_thread();
+        missing_required
+            .as_object_mut()
+            .unwrap()
+            .remove("createdAt");
+        for thread in [Value::Null, json!({}), empty_id, missing_required] {
+            let result = json!({"thread": thread});
+            let item = thread_read_response_thread(&result).unwrap();
+            assert!(thread_contract::validate_thread_item(item).is_err());
+        }
     }
 }

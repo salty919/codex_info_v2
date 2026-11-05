@@ -118,6 +118,23 @@ impl EventAdmission {
         event: &crate::LosslessSessionEvent,
         period: Option<SessionEventPeriod>,
     ) -> bool {
+        self.valid_for_model_role(event, period, false)
+    }
+
+    pub(crate) fn valid_for_requalification(
+        &self,
+        event: &crate::LosslessSessionEvent,
+        period: Option<SessionEventPeriod>,
+    ) -> bool {
+        self.valid_for_model_role(event, period, true)
+    }
+
+    fn valid_for_model_role(
+        &self,
+        event: &crate::LosslessSessionEvent,
+        period: Option<SessionEventPeriod>,
+        allow_unconfirmed_model: bool,
+    ) -> bool {
         let source = &event.source;
         let binding = &self.source_binding;
         if self.version != 1
@@ -226,9 +243,17 @@ impl EventAdmission {
                 admission.metadata_qualified = true;
                 admission.push_response((**candidate).clone());
                 let usage = candidate.record.usage;
+                let qualified_model = candidate.qualified_model();
+                let unconfirmed_model = allow_unconfirmed_model
+                    && qualified_model.is_none()
+                    && matches!(candidate.classification,
+                        crate::source_admission::ResponseModelClassification::LegacyUnknown
+                        | crate::source_admission::ResponseModelClassification::AwaitingBoundary
+                        | crate::source_admission::ResponseModelClassification::AwaitingReplacement { .. }
+                        | crate::source_admission::ResponseModelClassification::Unassigned { .. });
                 if !candidate.session_scope_qualified
                     || !admission.valid(self.verified_prefix_end)
-                    || candidate.qualified_model() != Some(proof_model)
+                    || (qualified_model != Some(proof_model) && !unconfirmed_model)
                     || candidate.pointer.timestamp != event.timestamp
                     || !owns(candidate.pointer.timestamp)
                     || event.tokens

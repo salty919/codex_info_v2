@@ -456,7 +456,7 @@ systemctl_user() {
 verify_runtime() { (( $(now_unix) >= $(cat "$ready") )); }
 """
         with tempfile.TemporaryDirectory(prefix="issue659-activation-phase-") as directory:
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603 # fixed Bash/env; repository activation functions and literal virtual-clock fixture
                 ["/bin/bash", "--noprofile", "--norc", "-s"],
                 input=shell + "\n" + "\n".join(functions) + r"""
 activate_candidate

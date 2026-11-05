@@ -863,36 +863,38 @@ impl UsageStore {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let incomplete: bool = tx.query_row(
-            &format!(
-                "SELECT EXISTS(SELECT 1 FROM {} WHERE timestamp>=?1 AND timestamp<?2
-                 AND (admission_json IS NULL OR reset_at IS NULL))",
-                canonical_table(&tx)?
-            ),
-            params![current.0.saturating_sub(current.1), current.0],
-            |row| row.get(0),
-        )?;
-        if !incomplete
-            && (periods.contains_key(&current)
-                || repairs.iter().any(|repair| repair.equivalence.is_some()))
+        if periods.contains_key(&current)
+            || repairs.iter().any(|repair| repair.equivalence.is_some())
         {
-            // A source alias/rebind still updates current canonical totals,
-            // without recalculating past saved model/family observations.
-            // An incomplete qualified subset cannot replace the already
-            // saved absolute current value while other sources are pending.
-            let facts = source_events::read_matching(
-                &tx,
-                "WHERE reset_at=?1 AND window_seconds=?2 AND admission_json IS NOT NULL",
-                params![current.0, current.1],
-            )?
-            .into_iter()
-            .map(SessionEvent::try_from)
-            .collect::<Result<Vec<_>>>()?;
-            let totals = sum_session_events(facts.iter())?;
-            if totals != session_model_totals_from_transaction(&tx)? {
-                tx.execute("DELETE FROM session_model_totals", [])?;
-                for total in totals {
-                    tx.execute("INSERT INTO session_model_totals(model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES(?1,?2,?3,?4,?5,?6)",params![total.model,total.total_tokens.to_string(),total.input_tokens.map(|n|n.to_string()),total.cached_input_tokens.map(|n|n.to_string()),total.output_tokens.map(|n|n.to_string()),total.cache_write_input_tokens.map(|n|n.to_string())])?;
+            let incomplete: bool = tx.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM {} WHERE timestamp>=?1 AND timestamp<?2
+                     AND (admission_json IS NULL OR reset_at IS NULL))",
+                    canonical_table(&tx)?
+                ),
+                params![current.0.saturating_sub(current.1), current.0],
+                |row| row.get(0),
+            )?;
+            if !incomplete {
+                let (facts, model_unconfirmed_at) = source_events::read_canonical_projection(
+                    &tx,
+                    "WHERE reset_at=?1 AND window_seconds=?2 AND admission_json IS NOT NULL",
+                    params![current.0, current.1],
+                )?;
+                // Preserve the saved absolute current vector, including new
+                // accepted consumption, until this model prefix is complete.
+                if model_unconfirmed_at.is_none() {
+                    let facts = facts
+                        .into_iter()
+                        .map(SessionEvent::try_from)
+                        .collect::<Result<Vec<_>>>()?;
+                    let totals = sum_session_events(facts.iter())?;
+                    if totals != session_model_totals_from_transaction(&tx)? {
+                        tx.execute("DELETE FROM session_model_totals", [])?;
+                        for total in totals {
+                            tx.execute("INSERT INTO session_model_totals(model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES(?1,?2,?3,?4,?5,?6)",params![total.model,total.total_tokens.to_string(),total.input_tokens.map(|n|n.to_string()),total.cached_input_tokens.map(|n|n.to_string()),total.output_tokens.map(|n|n.to_string()),total.cache_write_input_tokens.map(|n|n.to_string())])?;
+                        }
+                    }
                 }
             }
         }
@@ -1296,7 +1298,7 @@ mod issue659_startup_key_tests {
             .as_nanos();
         let mut snapshots = Snapshots(Vec::new());
         for label in ["before", "after"] {
-            let path = std::env::temp_dir().join(format!(
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
                 "codex-info-issue659-source-keys-{}-{stamp}-{label}.sqlite3",
                 std::process::id()
             ));

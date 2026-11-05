@@ -196,8 +196,14 @@ fn checkpoint_json(checkpoint: &SessionCheckpoint) -> serde_json::Value {
 }
 
 impl UsageStore {
+    pub fn source_preparation_scope(&self) -> Result<impl Drop> {
+        CanonicalSourceScope::begin(&self.connection)
+    }
+
     pub fn canonical_source_snapshot(&self) -> Result<CanonicalSourceSnapshot> {
-        load_snapshot(&self.connection)
+        let scope = CanonicalSourceScope::begin(&self.connection)?;
+        let snapshot = scope.snapshot.borrow().clone();
+        Ok(snapshot)
     }
     /// Includes every generation and every saved suffix of this physical
     /// source. It deliberately bypasses the canonical retirement relation.
@@ -215,6 +221,21 @@ impl UsageStore {
         prefixes: Vec<SourceEquivalencePrefix>,
         inputs: PreparedSourceRepairInputs,
     ) -> Result<PreparedSourceQualificationRepair> {
+        self.prepare_source_equivalence_with_inputs(mode, old_checkpoint, prefixes, || Ok(inputs))
+    }
+
+    /// Materialize repair resources only after the complete candidate proves
+    /// an equivalence. The existing eager entry point remains compatible.
+    pub fn prepare_source_equivalence_with_inputs<F>(
+        &self,
+        mode: SourceEquivalenceMode,
+        old_checkpoint: &SessionCheckpoint,
+        prefixes: Vec<SourceEquivalencePrefix>,
+        prepare_inputs: F,
+    ) -> Result<PreparedSourceQualificationRepair>
+    where
+        F: FnOnce() -> Result<PreparedSourceRepairInputs>,
+    {
         if prefixes.is_empty()
             || (mode == SourceEquivalenceMode::IdenticalPrefixAlias && prefixes.len() < 2)
         {
@@ -304,9 +325,7 @@ impl UsageStore {
                 .and_then(|s| s.account_binding.as_ref())
                 .ok_or_else(|| invalid("equivalence has no source account binding"))?;
             validate_storage_partition_identity(&self.connection, &binding.partition)?;
-            if binding.partition.partition_id != inputs.backup.partition_id
-                || !binding.matches_checkpoint(verified)
-            {
+            if !binding.matches_checkpoint(verified) {
                 return Err(invalid("equivalence partition fence mismatch"));
             }
             for fact in &prefix.qualified_events {
@@ -525,6 +544,10 @@ impl UsageStore {
             .expect("validated")
             .partition
             .clone();
+        let inputs = prepare_inputs()?;
+        if partition.partition_id != inputs.backup.partition_id {
+            return Err(invalid("equivalence partition fence mismatch"));
+        }
         let input_fingerprint = fingerprint(&self.connection, old_checkpoint)?;
         let provenance=serde_json::to_string(&serde_json::json!({"version":2,"mode":mode.name(),"partition":partition,
             "prefixes":prefixes.iter().map(|p|serde_json::json!({"checkpoint":checkpoint_json(&p.checkpoint),"ranges":p.ranges.iter().map(|r|serde_json::json!({"start":r.start_offset.to_string(),"end":r.end_offset.to_string(),"hash":r.record_sha256,"generation":format!("{:032x}",r.prefix_generation)})).collect::<Vec<_>>(),"numeric_records":p.numeric_records,"parser_version":p.parser_version,"source_admission":p.verification_checkpoint.source_admission})).collect::<Vec<_>>(),

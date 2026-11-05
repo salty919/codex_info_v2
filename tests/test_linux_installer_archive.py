@@ -419,7 +419,7 @@ version_python "$generations_dir" "$FIXTURE_GENERATION" "$transaction" "$unit_di
         }
         trace_file = self.home / "stage-hash-trace"
         trace_file.unlink(missing_ok=True)
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 # fixed Bash/env; repository staging code and owned synthetic fixture stdin
             ["/bin/bash", "--noprofile", "--norc", "-s"],
             input=script,
             env={

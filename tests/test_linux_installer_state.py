@@ -90,7 +90,7 @@ update_timer_destination="$HOME/.config/systemd/user/codex-info-update.timer"
                 ' "$installer_destination" "$legacy_combined_unit_destination"'
                 ' "$update_service_destination" "$update_timer_destination"'
             )
-        return subprocess.run(
+        return subprocess.run(  # nosec B603 # fixed Bash/env; repository function and owned synthetic legacy-state arguments
             ["/bin/bash", "--noprofile", "--norc", "-s"],
             input=prefix + installer_function(name) + "\n" + invocation + "\n",
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": str(home)},
