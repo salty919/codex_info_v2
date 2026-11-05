@@ -1547,9 +1547,9 @@ mod tests {
         )
     }
 
-    fn issue659_preserved_values(
-        fixture: &Issue362AsyncFixture,
-    ) -> (Vec<u8>, Vec<u8>, (Option<u64>, String, String)) {
+    type PreservedContinuityValues = (Vec<u8>, Vec<u8>, (Option<u64>, String, String));
+
+    fn issue659_preserved_values(fixture: &Issue362AsyncFixture) -> PreservedContinuityValues {
         let connection = rusqlite::Connection::open(&fixture.options.database).unwrap();
         let price=connection.query_row("SELECT total_dollars,price_version,total_tokens FROM usage_model_history WHERE model='gpt-6.1-sol'",[],|row|Ok((row.get::<_,Option<f64>>(0)?.map(f64::to_bits),row.get(1)?,row.get(2)?))).unwrap();
         (

@@ -6,6 +6,8 @@ mod equivalence;
 pub(super) use equivalence::{canonical_table, is_retired, CanonicalSourceScope};
 pub use equivalence::{CanonicalSourceSnapshot, SourceEquivalenceMode, SourceEquivalencePrefix};
 
+type UnqualifiedSessionSourceKey = (String, String, u64, u64, u128);
+
 #[derive(Clone)]
 pub struct PreparedSourceQualificationRepair {
     checkpoint: SessionCheckpoint,
@@ -521,9 +523,7 @@ impl UsageStore {
     }
 
     /// Register source work only; all numeric/canonical adoption stays at repair.
-    pub fn unqualified_session_source_keys(
-        &self,
-    ) -> Result<BTreeSet<(String, String, u64, u64, u128)>> {
+    pub fn unqualified_session_source_keys(&self) -> Result<BTreeSet<UnqualifiedSessionSourceKey>> {
         let mut statement = self.connection.prepare(
             "SELECT DISTINCT root_identity, relative_path,
                     file_device, file_inode, prefix_generation
