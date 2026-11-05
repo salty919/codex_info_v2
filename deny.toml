@@ -20,6 +20,9 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant is a Slint/winit -> zbus 5 transitive dependency; INFO unmaintained, merged into zbus 6, no compatible patched version; pending upstream Slint migration" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names is a Slint/winit -> zbus 5 transitive dependency; INFO unmaintained, merged into zbus 6, no compatible patched version; pending upstream Slint migration" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is a Slint/winit -> zbus 5 transitive dependency; INFO unmaintained, merged into zbus 6, no compatible patched version; pending upstream Slint migration" },
+    # Refs #659: reviewed 2026-11-06. Maintenance-only; no vulnerability/unsoundness exception.
+    # Authority: https://github.com/RustSec/advisory-db/blob/main/crates/pin-utils/RUSTSEC-2026-0441.md
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils is a build-time Slint 1.17.1 slint-build/slint-macros -> spin_on 0.1.1 transitive dependency; RustSec marks maintenance-only unmaintained with no patched version; latest spin_on 0.1.1 and Slint 1.18.1 still require it; remove this exact exception when upstream replaces pin-utils" },
 ]
 
 [licenses]
