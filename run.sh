@@ -40,14 +40,48 @@ home_dir="${HOME:-}"
 payload="$home_dir/.local/bin/codex_info"
 installer="$home_dir/.local/libexec/codex-info-install.sh"
 
+fixed_link_matches() {
+    python3 - "$1" "$2" <<'PY_FIXED_LINK'
+import os, stat, sys
+destination, expected = sys.argv[1:]
+expected = os.path.normpath(os.path.join(os.path.dirname(destination), expected))
+root, separator, member = expected.rpartition("/current/")
+if not separator or not member or "/" in member:
+    raise SystemExit(1)
+try:
+    target = os.readlink(destination)
+except OSError:
+    raise SystemExit(1)
+if not os.path.isabs(target):
+    target = os.path.join(os.path.dirname(destination), target)
+prefix, separator, tail = target.rpartition("/current/")
+parts = [part for part in tail.split("/") if part not in {"", "."}]
+try:
+    parent_stat = os.stat(prefix)
+    root_stat = os.stat(root)
+except OSError:
+    raise SystemExit(1)
+valid = (
+    bool(separator) and parts == [member] and tail.rsplit("/", 1)[-1] == member
+    and os.path.normpath(prefix) == root
+    and stat.S_ISDIR(parent_stat.st_mode)
+    and (parent_stat.st_dev, parent_stat.st_ino) == (root_stat.st_dev, root_stat.st_ino)
+)
+raise SystemExit(0 if valid else 1)
+PY_FIXED_LINK
+}
+
 require_payload() {
-    [[ -L "$payload" && "$(readlink -- "$payload")" == '../share/codex-info/current/codex_info' && -x "$payload" ]] || {
+    fixed_link_matches "$payload" '../share/codex-info/current/codex_info' && [[ -x "$payload" ]] || {
         printf 'codex-info: E_PAYLOAD_UNAVAILABLE\n' >&2
         exit 1
     }
 }
 
 launch_verified_ui() {
+    unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR
+    export LIBGL_ALWAYS_SOFTWARE='1'
+    export MESA_LOADER_DRIVER_OVERRIDE='llvmpipe'
     exec python3 - "$payload" <<'PY_UI_STARTUP'
 import os
 import selectors
@@ -69,8 +103,14 @@ with tempfile.TemporaryDirectory(prefix="codex-info-ui-") as directory:
     )
     exit_read_fd, exit_write_fd = os.pipe()
     def observe_exit():
-        os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
-        os.write(exit_write_fd, b"X")
+        try:
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+        except ChildProcessError:
+            return
+        try:
+            os.write(exit_write_fd, b"X")
+        except OSError:
+            return
     threading.Thread(target=observe_exit, daemon=True).start()
     try:
         with selectors.DefaultSelector() as events:
@@ -97,7 +137,11 @@ with tempfile.TemporaryDirectory(prefix="codex-info-ui-") as directory:
         try:
             child.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            print("codex-info: E_UI_STARTUP_CHILD_DID_NOT_EXIT", file=sys.stderr)
+            child.kill()
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                print("codex-info: E_UI_STARTUP_CHILD_DID_NOT_EXIT", file=sys.stderr)
         sys.exit(1)
     finally:
         os.close(exit_read_fd)
@@ -124,7 +168,7 @@ fi
 launcher_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_installer="$launcher_dir/packaging/install_linux_bundle.sh"
 installer_ready=0
-if [[ -L "$installer" && "$(readlink -- "$installer")" == '../share/codex-info/current/install.sh' && -x "$installer" ]]; then
+if fixed_link_matches "$installer" '../share/codex-info/current/install.sh' && [[ -x "$installer" ]]; then
     installer_ready=1
 fi
 
@@ -153,7 +197,7 @@ if (( ! installer_ready )); then
             exec "$repository_installer" "--$operation" "${migration_option[@]}"
             ;;
     esac
-    [[ -L "$installer" && "$(readlink -- "$installer")" == '../share/codex-info/current/install.sh' && -x "$installer" ]] || {
+    fixed_link_matches "$installer" '../share/codex-info/current/install.sh' && [[ -x "$installer" ]] || {
         printf 'codex-info: E_HANDOFF_UNAVAILABLE\n' >&2
         exit 1
     }
@@ -180,9 +224,6 @@ if ! "$installer" --start; then
 fi
 
 require_payload
-unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR
-export LIBGL_ALWAYS_SOFTWARE='1'
-export MESA_LOADER_DRIVER_OVERRIDE='llvmpipe'
 # The installed UI is always a REST client.  It must never recreate the
 # retired combined recorder/REST owner if the REST process restarts between
 # installer readiness and UI launch.

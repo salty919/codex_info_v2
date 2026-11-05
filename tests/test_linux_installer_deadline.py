@@ -24,6 +24,8 @@ FUNCTIONS = (
     "rollback_transaction",
     "resume_transaction",
     "perform_install",
+    "preserve_control_prestate",
+    "cleanup_control_prestate",
     "run_update",
 )
 
@@ -32,6 +34,7 @@ MODEL = r'''
 # effective/archive tests own local-recovery manifest and receipt validation.
 manifest_is_local_recovery() { return 1; }
 fixture_root="$FIXTURE_ROOT"
+control_state="$fixture_root/control"
 share_dir="$fixture_root/share"
 backup_dir="$share_dir/legacy-backups"
 generations_dir="$share_dir/generations"
@@ -68,6 +71,7 @@ printf '0\n' > "$fixture_root/codex-info-rest.service.enabled"
 printf 'original-session\n' > "$fixture_root/Session"
 printf 'original-database\n' > "$fixture_root/database"
 printf 'original-control\n' > "$fixture_root/control"
+chmod 600 -- "$fixture_root/control"
 
 for destination_variable in binary_destination recorder_binary_destination rest_binary_destination launcher_destination installer_destination manifest_destination unit_destination rest_unit_destination update_service_destination update_timer_destination; do
     printf -v "$destination_variable" '%s' "$fixture_root/entries/$destination_variable"
@@ -205,6 +209,13 @@ write_control_state() { :; }
 prune_obsolete_generations() { :; }
 preflight_listener_owner() { :; }
 verify_fixed_links_local() { :; }
+# Stable channel/discovery are fixed inputs to this deadline-only oracle.
+# Channel/archive admission is exercised by the full-source suites.
+update_channel_record() { printf 'stable\tdeadline-fixture-channel\n'; }
+verify_update_channel_snapshot() {
+    [[ "$update_channel_snapshot" == $'stable\tdeadline-fixture-channel' ]]
+}
+discover_update_releases() { printf '[]\n' > "$1"; }
 fixture_curl() { printf '[]\n'; }
 select_release() {
     printf 'update\t2.0.0\n'
@@ -386,6 +397,106 @@ class InstallerDeadlineTests(unittest.TestCase):
                     commands,
                 )
 
+
+
+class ActivationReadinessPhaseTests(unittest.TestCase):
+    def probe(self, parent_deadline):
+        source = INSTALLER.read_text()
+        names = ("activate_candidate", "wait_runtime_ready")
+        functions = []
+        for name in names:
+            matches = re.findall(
+                rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", source
+            )
+            self.assertEqual(len(matches), 1, name)
+            functions.append(matches[0])
+        shell = r"""
+set -euo pipefail
+clock="$FIXTURE_ROOT/clock"
+ready="$FIXTURE_ROOT/ready"
+printf '0\n' > "$clock"
+operation_deadline="$PARENT_DEADLINE"
+readiness_deadline=0
+HEALTH_TIMEOUT=30
+update_stage=
+desired_state=running
+TRIGGER=manual
+main_active=1
+rest_active=0
+recorder_override_migrated=0
+candidate_id=candidate
+generations_dir="$FIXTURE_ROOT/generations"
+now_unix() { cat "$clock"; }
+sleep_interval() { printf '%s\n' "$(( $(now_unix) + $1 ))" > "$clock"; }
+manifest_record() {
+    printf '1.0.171\tsource\tmanifest\t%s\n' \
+      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+}
+converge_enable_links() { return 0; }
+reset_failed_main() { return 0; }
+rearm_update_timer() { return 0; }
+recorder_artifact_matches_previous() { return 1; }
+probe_active() { return 0; }
+systemctl_user() {
+    local verb="$1"
+    shift
+    if [[ "$verb" == restart &&
+          "${*: -1}" == codex-info-recorder.service ]]; then
+        # Old stop takes 20s; replacement needs 25s after it starts.
+        # Both are inside their existing individual phase policies.
+        local now
+        now="$(now_unix)"
+        printf '%s\n' "$((now + 20 + 25))" > "$ready"
+        if [[ " $* " != *" --no-block "* ]]; then
+            printf '%s\n' "$((now + 20))" > "$clock"
+        fi
+    fi
+    return 0
+}
+verify_runtime() { (( $(now_unix) >= $(cat "$ready") )); }
+"""
+        with tempfile.TemporaryDirectory(prefix="issue659-activation-phase-") as directory:
+            result = subprocess.run(  # nosec B603 # fixed Bash/env; repository activation functions and literal virtual-clock fixture
+                ["/bin/bash", "--noprofile", "--norc", "-s"],
+                input=shell + "\n" + "\n".join(functions) + r"""
+activate_candidate
+activation_finished="$(now_unix)"
+status=0
+wait_runtime_ready || status="$?"
+printf '%s %s %s %s %s\n' \
+ "$status" "$(now_unix)" "$operation_deadline" \
+ "$readiness_deadline" "$activation_finished"
+""",
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LC_ALL": "C",
+                    "FIXTURE_ROOT": directory,
+                    "PARENT_DEADLINE": str(parent_deadline),
+                },
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        values = result.stdout.strip().split()
+        self.assertEqual(len(values), 5, result.stdout)
+        return tuple(map(int, values))
+
+    def test_old_stop_does_not_consume_replacement_readiness(self):
+        status, now, parent, restored, activation_finished = self.probe(120)
+        self.assertEqual(parent, 120)
+        self.assertEqual(restored, 0)
+        self.assertEqual(
+            status, 0,
+            "replacement did not receive its readiness window after old stop",
+        )
+        self.assertEqual(activation_finished, 20)
+        self.assertEqual(now, 45)
+
+    def test_replacement_readiness_cannot_extend_parent_deadline(self):
+        status, now, parent, restored, _ = self.probe(40)
+        self.assertEqual(status, 1)
+        self.assertEqual(parent, 40)
+        self.assertEqual(restored, 0)
+        self.assertLessEqual(now, parent)
 
 if __name__ == "__main__":
     unittest.main()

@@ -321,7 +321,7 @@ fn read_payload(
     }
     let payload: SnapshotPayload =
         serde_json::from_str(&bytes).map_err(|_| invalid("invalid period evidence snapshot"))?;
-    if payload.rule_version != 1 || encode(&payload)? != bytes {
+    if payload.rule_version != 1 {
         return Err(invalid("noncanonical period evidence snapshot"));
     }
     Ok((payload, bytes))
@@ -405,7 +405,7 @@ impl UsageStore {
             .ok_or_else(|| invalid("invalid exact period"))?;
         let _scope =
             crate::source_qualification_repair::CanonicalSourceScope::begin(&self.connection)?;
-        let mut facts = crate::source_events::read_matching(
+        let (mut facts, first_pending_model) = crate::source_events::read_canonical_projection(
             &self.connection,
             "WHERE reset_at=?1 AND window_seconds=?2 AND timestamp>=?3 AND timestamp<?1",
             params![reset, window, origin],
@@ -424,14 +424,19 @@ impl UsageStore {
                 }
             }
         }
-        let mut incomplete=self.connection.query_row(
+        let mut incomplete=first_pending_model.is_some() || self.connection.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE timestamp>=?1 AND timestamp<?2 AND admission_json IS NULL)",crate::source_qualification_repair::canonical_table(&self.connection)?),
             params![origin,reset],|r|r.get::<_,bool>(0))?;
         if !incomplete {
-            for mut fact in crate::source_events::read_matching(&self.connection,
-                "WHERE reset_at IS NULL AND admission_json IS NOT NULL AND timestamp>=?1 AND timestamp<?2",params![origin,reset])? {
+            let (unassigned,pending_at)=crate::source_events::read_canonical_projection(&self.connection,
+                "WHERE reset_at IS NULL AND admission_json IS NOT NULL AND timestamp>=?1 AND timestamp<?2",params![origin,reset])?;
+            incomplete |= pending_at.is_some();
+            for mut fact in unassigned {
                 prepared.assign(&mut fact)?;
-                if fact.period.is_none() { incomplete=true; break; }
+                if fact.period.is_none() {
+                    incomplete = true;
+                    break;
+                }
             }
         }
         incomplete |= facts.iter().any(|fact| {
@@ -630,11 +635,12 @@ impl UsageStore {
                     &self.connection,
                 )?;
                 for (lower, upper) in changed_ranges {
-                    for fact in crate::source_events::read_matching(
+                    let (qualified, _) = crate::source_events::read_canonical_projection(
                         &self.connection,
                         "WHERE timestamp>=?1 AND timestamp<=?2 AND admission_json IS NOT NULL",
                         params![lower, upper],
-                    )? {
+                    )?;
+                    for fact in qualified {
                         candidates.insert(encode(&fact.source)?, fact);
                     }
                 }
@@ -986,7 +992,7 @@ pub(super) fn reproject_periods(
         if let Some(end) = retained_end {
             crate::mark_retained_history_models_unknown(tx, reset, end)?;
         }
-        let facts = crate::source_events::read_matching(
+        let (facts, model_unconfirmed_at) = crate::source_events::read_canonical_projection(
             tx,
             "WHERE reset_at=?1 AND window_seconds=?2 AND timestamp>=?3 AND timestamp<?1",
             params![reset, window, origin],
@@ -1025,6 +1031,10 @@ pub(super) fn reproject_periods(
         }
         let has_unassigned:bool=tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {} WHERE timestamp>=?1 AND timestamp<?2 AND reset_at IS NULL)",crate::source_qualification_repair::canonical_table(tx)?),params![origin,reset],|r|r.get(0))?;
         let first_unqualified:Option<i64>=tx.query_row(&format!("SELECT min(timestamp) FROM {} WHERE timestamp>=?1 AND timestamp<?2 AND admission_json IS NULL",crate::source_qualification_repair::canonical_table(tx)?),params![origin,reset],|row|row.get(0))?;
+        let first_unqualified = first_unqualified
+            .into_iter()
+            .chain(model_unconfirmed_at)
+            .min();
         let mut prefix = Vec::new();
         let mut cursor = 0;
         let mut source_hasher = Sha256::new();
@@ -1147,7 +1157,9 @@ pub(super) fn reproject_periods(
             }) || !current_saved.is_empty())
                 && first_unqualified
                     .is_some_and(|at| at <= timestamp.saturating_add(59).min(reset - 1))
-                && !owns_projection
+                && (!owns_projection
+                    || model_unconfirmed_at
+                        .is_some_and(|at| at <= timestamp.saturating_add(59).min(reset - 1)))
             {
                 // A proof for one source cannot disprove saved contributions
                 // from another source whose original qualification is absent.
@@ -1350,8 +1362,8 @@ mod tests {
 
     #[test]
     fn snapshot_fixes_pending_inputs_replays_without_writes_and_rejects_parent_tampering() {
-        let root =
-            std::env::temp_dir().join(format!("codex-info-period-snapshot-{}", std::process::id()));
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("codex-info-period-snapshot-{}", std::process::id()));
         let path = root.join("usage.sqlite3");
         let partition = StoragePartitionIdentity {
             schema_version: "codex-info-account-db-v1".into(),
@@ -1465,5 +1477,249 @@ mod tests {
         );
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod issue659_snapshot_spelling_tests {
+    use super::*;
+
+    fn fixture_payload() -> SnapshotPayload {
+        SnapshotPayload {
+            rule_version: 1,
+            partition: StoragePartitionIdentity {
+                schema_version: "codex-info-account-db-v1".into(),
+                profile_scope_id: "11".repeat(16),
+                account_scope_id: "a".repeat(64),
+                storage_epoch: 7,
+                partition_id: "a".repeat(64),
+            },
+            parent: None,
+            input_revision: 0,
+            inputs: Vec::new(),
+            ownership: vec![EventOwnership {
+                start_at: 500,
+                end_at: None,
+            }],
+            previous: Vec::new(),
+        }
+    }
+
+    fn save_fixture(connection: &Connection, bytes: &str) -> SnapshotRef {
+        let reference = SnapshotRef {
+            generation: 1,
+            sha256: digest(bytes),
+        };
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO period_evidence_snapshots\
+                 (generation,sha256,payload_json) VALUES(?1,?2,?3)",
+                params![reference.generation, reference.sha256, bytes],
+            )
+            .unwrap();
+        reference
+    }
+
+    #[test]
+    fn hash_bound_spelling_has_no_extra_admission_rule() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        let payload = fixture_payload();
+        let canonical = encode(&payload).unwrap();
+        let reference = save_fixture(&connection, &canonical);
+        assert_eq!(
+            read_payload(&connection, &reference).unwrap(),
+            (payload.clone(), canonical.clone())
+        );
+        let value: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        let reordered = serde_json::to_string(&value).unwrap();
+        for original in [pretty, reordered] {
+            assert_ne!(original, canonical);
+            assert_eq!(
+                serde_json::from_str::<SnapshotPayload>(&original).unwrap(),
+                payload
+            );
+            let reference = save_fixture(&connection, &original);
+            let before = connection.total_changes();
+            let (decoded, retained) =
+                read_payload(&connection, &reference).expect("HASH_BOUND_SPELLING_REJECTED");
+            assert_eq!(decoded, payload);
+            assert_eq!(retained, original);
+            assert_eq!(digest(&retained), reference.sha256);
+            assert_eq!(connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn required_hash_version_and_typed_shape_remain_enforced() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        let payload = fixture_payload();
+        let bytes = encode(&payload).unwrap();
+        let reference = save_fixture(&connection, &bytes);
+
+        let mut wrong_reference = reference.clone();
+        wrong_reference.sha256 = "0".repeat(64);
+        assert!(read_payload(&connection, &wrong_reference).is_err());
+
+        connection
+            .execute(
+                "UPDATE period_evidence_snapshots \
+                 SET payload_json=payload_json||' ' WHERE generation=1",
+                [],
+            )
+            .unwrap();
+        assert!(read_payload(&connection, &reference).is_err());
+
+        let mut unsupported = payload.clone();
+        unsupported.rule_version = 2;
+        let reference = save_fixture(&connection, &encode(&unsupported).unwrap());
+        assert!(read_payload(&connection, &reference).is_err());
+
+        let reference = save_fixture(&connection, "{");
+        assert!(read_payload(&connection, &reference).is_err());
+
+        let mut unknown = serde_json::to_value(&payload).unwrap();
+        unknown["unexpected_field"] = serde_json::Value::Bool(true);
+        let reference = save_fixture(&connection, &serde_json::to_string(&unknown).unwrap());
+        assert!(read_payload(&connection, &reference).is_err());
+    }
+
+    #[test]
+    #[ignore = "explicit read-only diagnostic against initialized registry references"]
+    fn saved_registry_snapshot_chains_read_without_rewriting() {
+        let history = std::path::PathBuf::from(
+            std::env::var_os("ISSUE659_PERIOD_DIAGNOSTIC_HISTORY")
+                .expect("explicit diagnostic history path is required"),
+        );
+        let registry: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(history.join("account_profile_v1.json")).unwrap(),
+        )
+        .unwrap();
+        let accounts = registry["accounts"].as_object().unwrap();
+        let mut databases = 0;
+        let mut snapshots = 0;
+        for (scope, entry) in accounts {
+            if entry["state"].as_str() != Some("initialized") {
+                continue;
+            }
+            let path = history
+                .join("accounts/v1")
+                .join(scope)
+                .join(format!(
+                    "epoch-{}",
+                    entry["storage_epoch"].as_u64().unwrap()
+                ))
+                .join("usage_history.sqlite3");
+            let connection = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            connection
+                .execute_batch("PRAGMA query_only=ON; BEGIN")
+                .unwrap();
+            let mut cursor = head(&connection).unwrap().map(|value| value.0);
+            let mut partition = None;
+            let mut count = 0;
+            while let Some(reference) = cursor {
+                let (payload, original) =
+                    read_payload(&connection, &reference).unwrap_or_else(|error| {
+                        panic!(
+                            "SAVED_SNAPSHOT_REJECTED database={} generation={} error={error}",
+                            databases, reference.generation
+                        )
+                    });
+                assert_eq!(digest(&original), reference.sha256);
+                if let Some(expected) = partition.as_ref() {
+                    assert_eq!(&payload.partition, expected);
+                } else {
+                    partition = Some(payload.partition.clone());
+                }
+                assert!(payload
+                    .parent
+                    .as_ref()
+                    .is_none_or(|parent| parent.generation < reference.generation));
+                cursor = payload.parent;
+                count += 1;
+            }
+            assert_eq!(connection.total_changes(), 0);
+            connection.execute_batch("ROLLBACK").unwrap();
+            println!(
+                "READ_ONLY_SNAPSHOT_CHAIN database={} snapshots={}",
+                databases, count
+            );
+            databases += 1;
+            snapshots += count;
+        }
+        assert!(databases > 0);
+        assert!(snapshots > 0);
+        println!(
+            "READ_ONLY_SNAPSHOT_COMPLETE databases={} snapshots={}",
+            databases, snapshots
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue659_owned_partial_projection_tests {
+    use super::*;
+
+    #[test]
+    fn owned_projection_cannot_disprove_saved_values_with_an_unconfirmed_model() {
+        const AT: i64 = 1_791_871_200;
+        let (mut store, _, _) =
+            crate::source_events::issue659_raw_evidence_tests::pending_model_projection_store(
+                false,
+            );
+        let saved_usd = 1.234_567_890_123_456_f64;
+        let tx = store.connection.transaction().unwrap();
+        let models = crate::load_saved_model_prices(&tx, AT + 100, AT).unwrap();
+        let source_sha256 = "ab".repeat(32);
+        let value_sha256 = projection_value_sha256(&tx, AT + 100, AT, &models, &source_sha256)
+            .unwrap()
+            .unwrap();
+        let origin = ProjectionOrigin {
+            version: 1,
+            window_seconds: 1000,
+            source_sha256: source_sha256.clone(),
+            value_sha256: value_sha256.clone(),
+        };
+        assert!(valid_projection_origin(
+            &serde_json::to_value(&origin).unwrap()
+        ));
+        assert_eq!(
+            projection_value_sha256(&tx, AT + 100, AT, &models, &origin.source_sha256)
+                .unwrap()
+                .as_deref(),
+            Some(origin.value_sha256.as_str()),
+            "the existing owned-projection precondition must be true"
+        );
+        let originals = OriginalProjectionPrices::from([(
+            (AT + 100, 1000),
+            BTreeMap::from([(
+                AT,
+                OriginalProjectionPrice {
+                    models,
+                    fixed: [Some(saved_usd), None, Some(0.0)],
+                    has_fixed_tokens: true,
+                    projection_origin: Some(origin),
+                },
+            )]),
+        )]);
+        reproject_periods(&tx, &BTreeMap::from([((AT + 100, 1000), AT)]), &originals).unwrap();
+        let (tokens,dollars,unknown_tokens,unknown_dollars):(Option<i64>,Option<f64>,Option<i64>,Option<f64>)=tx.query_row("SELECT sol_tokens,sol_dollars,terra_tokens,terra_dollars FROM usage_history WHERE reset_at=?1 AND timestamp=?2",params![AT+100,AT],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(tokens, Some(100));
+        assert_eq!(dollars.map(f64::to_bits), Some(saved_usd.to_bits()));
+        assert!(unknown_tokens.is_none());
+        assert!(unknown_dollars.is_none());
+        let (total,cache_write,usd,price):(String,Option<String>,Option<f64>,Option<String>)=tx.query_row("SELECT total_tokens,cache_write_input_tokens,total_dollars,price_version FROM usage_model_history WHERE reset_at=?1 AND timestamp=?2 AND model='gpt-6.1-sol'",params![AT+100,AT],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(total, "100");
+        assert!(cache_write.is_none());
+        assert_eq!(usd.map(f64::to_bits), Some(saved_usd.to_bits()));
+        assert_eq!(price.as_deref(), Some("synthetic-saved-v1"));
+        tx.rollback().unwrap();
     }
 }

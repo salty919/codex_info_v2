@@ -346,9 +346,12 @@ pub(super) fn finish(tx: &Transaction<'_>) -> Result<()> {
     if !initialized {
         // One initial ledger pass. Ordinary commits below visit only their
         // changed keys and affected model suffixes, never all source records.
-        for event in
-            crate::source_events::read_matching(tx, "WHERE admission_json IS NOT NULL", [])?
-        {
+        let (qualified, _) = crate::source_events::read_canonical_projection(
+            tx,
+            "WHERE admission_json IS NOT NULL",
+            [],
+        )?;
+        for event in qualified {
             observe(tx, &event)?;
         }
         tx.execute(

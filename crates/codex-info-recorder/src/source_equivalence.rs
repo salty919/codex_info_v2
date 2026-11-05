@@ -303,17 +303,24 @@ impl Recorder {
             if prefixes.len() != expected {
                 continue;
             }
-            if inputs.is_none() {
-                let backup =
-                    UsageStore::backup_generations_partitioned_verified(&database, &identity, 3)?;
-                *inputs = Some(self.writer.prepare_source_repair_inputs(backup)?);
-            }
-            match self.writer.prepare_source_equivalence(
-                mode,
-                old,
-                prefixes,
-                inputs.as_ref().expect("prepared").clone(),
-            ) {
+            let mut input_preparation_failed = false;
+            let result =
+                self.writer
+                    .prepare_source_equivalence_with_inputs(mode, old, prefixes, || {
+                        if inputs.is_none() {
+                            let prepared = UsageStore::backup_generations_partitioned_verified(
+                                &database, &identity, 3,
+                            )
+                            .and_then(|backup| self.writer.prepare_source_repair_inputs(backup));
+                            input_preparation_failed = prepared.is_err();
+                            *inputs = Some(prepared?);
+                        }
+                        Ok(inputs.as_ref().expect("prepared").clone())
+                    });
+            match result {
+                // Resource preparation was fallible before the pending-
+                // candidate match; retain that error propagation exactly.
+                Err(error) if input_preparation_failed => return Err(error.into()),
                 Ok(repair) => repairs.push(repair),
                 Err(error) => {
                     if matches!(&error, UsageStoreError::InvalidImport(message)
