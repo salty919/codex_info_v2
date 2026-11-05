@@ -31,6 +31,8 @@ jobs:
           fetch-depth: 1
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Check Linux installer and update contracts
+        run: env PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -p 'test_linux_*.py' -v
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: llvm-tools-preview

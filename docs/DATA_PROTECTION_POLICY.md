@@ -461,7 +461,7 @@ SQLite transactionとDB/WAL/SHM mutationである。OSがread-only openに伴っ
 partition keyは`(ProfileScopeId, AccountScopeId, StorageEpoch)`であり、各partitionを
 `history/accounts/v1/<AccountScopeId>/epoch-<StorageEpoch>/usage_history.sqlite3`へ物理分離する。
 usage rowの一意keyは各物理DB内の`(reset_at,timestamp)`である。DBにはexactly oneの
-`storage_partition` rowを置き、schema/profile/account/epoch/partition IDと`quick_check`が一致しないfileを開かない。
+`storage_partition` rowを置き、schema/profile/account/epoch/partition IDの不一致を拒否する。通常再起動の全DB quick_checkの扱いは、下記の既存accepted snapshot継続条件に従う。既知のquick_check失敗や実際のopen/read/schemaエラーを成功へ変換しない。
 
 - `ProfileScopeId`: 保存profileを作成した時に生成する128-bit random opaque ID。raw WSL distro、SSH alias、pathを
   DBへ保存しない。
@@ -475,6 +475,24 @@ usage rowの一意keyは各物理DB内の`(reset_at,timestamp)`である。DBに
 永続identityの互換表現は、ProfileScopeIdが16 raw bytesのlowercase hex 32文字、AccountScopeIdとpartition IDが32 raw bytesのlowercase hex 64文字、install keyが32 raw bytesのlowercase hex 64文字である。長さ・文字種を相互に代用せず、大文字や短縮形を黙って正規化しない。StorageEpochは1..UInt64最大値でprofile内一意とし、再利用・wraparoundをしない。
 
 partition IDは、install keyのraw 32 bytesを鍵にした`HMAC-SHA-256`で、messageをASCII `codex-info-storage-partition-v1`、1 byteのNUL、ProfileScopeIdのraw 16 bytes、AccountScopeIdのraw 32 bytes、StorageEpochのunsigned 8-byte big-endianの順に連結して計算し、lowercase hexで保存する。この既存の保存互換契約は、path・login label・JSON表示文字列から推定する別IDへ変更しない。registryとDBのschema/profile/account/epoch/partition IDを同時に照合し、部分一致では採用しない。
+
+初期化済みpartitionの起動時reserve/admitは、registryが参照する正確なaccount/epochと
+canonical DBをauthorityとする。参照先directory/fileのowner・mode・非symlink、
+registry/profile/account/epoch/partition identity、およびDBを開くconsumerのschema・
+quick_check条件を維持する。既知のSQLite journal/WAL/SHM等を実際に扱う場合の
+identity検証も省略しない。
+
+registryが参照しないscope/epoch directory、または初期化済みepoch内の未参照siblingは、
+その存在・名前・名前のUTF-8表現だけで、正しい既存partitionのreserve/admitを拒否する
+理由にしない。backup/rotation/candidateの一時物はcanonical DBやverified backupへ
+昇格させず、locatorは開く・採用・移動・削除しない。通常のreaderとwriter admissionで、
+未参照物を別のstorage authorityとして扱わない。
+新規Allocatedの保存先に既存dataが衝突する場合の拒否、metadata欠損時の推測再生成禁止、
+参照するcanonical pathの不正拒否は維持する。
+
+DB writerのbackup候補は検証・rotationまでの一時物であり、中断やcleanup失敗で残り得る。
+その残存を、無関係な既存partitionが破損した証拠へ変換しない。本修復は既存の候補・
+DB・verified backup・Sessionを削除するcleanup authorityを追加しない。
 
 同一account/profileの再認証は同じpartitionを再利用し、別account/profileは別partitionにする。同時書込みauthorityは
 現在認証済みpartition一つだけとし、非認証accountを推測更新しない。初期化済みpartitionは旧accountを含めて
@@ -662,6 +680,10 @@ token/state/context eventの有効timestampは、RFC3339をUTCへ変換してflo
 root `ordinal`の外部型は、固定producer commit `740e5af33c71225640e0c1c1555c514c2c93ab74`の[RolloutLine](https://github.com/openai/codex/blob/740e5af33c71225640e0c1c1555c514c2c93ab74/codex-rs/history/src/lib.rs#L362-L369)の`Option<u64>`と[JSONL decoder](https://github.com/openai/codex/blob/740e5af33c71225640e0c1c1555c514c2c93ab74/codex-rs/rollout/src/lib.rs#L55-L67)に基づく。[ordinal保存owner](https://github.com/openai/codex/blob/740e5af33c71225640e0c1c1555c514c2c93ab74/codex-rs/rollout/src/ordinal.rs#L16-L53)がlegacy/paginatedの保存位置を区別することを、課金・account・livenessの保証へ拡張しない。ほかの未知root fieldを一括で許可する規則ではない。
 
 固定producerのenvelopeは、上記RolloutLineのtimestamp/optional ordinalと、[RolloutItemWire](https://github.com/openai/codex/blob/740e5af33c71225640e0c1c1555c514c2c93ab74/codex-rs/history/src/rollout_payload.rs#L30-L71)のtype/payloadから成る。response_itemだけはoptional metadataをrootへ持ち、[ResponseItemEnvelope/CodexHarnessMetadata](https://github.com/openai/codex/blob/740e5af33c71225640e0c1c1555c514c2c93ab74/codex-rs/history/src/lib.rs#L52-L72)がhistory-onlyとして分離する。legacyのroot model位置は本表の既存契約を維持する。未知root fieldの一律拒否はproducerが要求するSerde保証ではなく、本製品のstrict live資格条件である。producer decoderが未知fieldを無視できることを、未知のusage/control拡張が本製品のstateに無関係という外部保証へ拡張しない。既知metadataをこの一律条件で誤拒否せず、上記の固定した形・責務を検証する。
+
+resident起動時の履歴修復候補は、未資格eventが属する完全source key（root_identity, relative_path, file_device, file_inode, prefix_generation）の重複しない集合だけを登録する。この集合は読取り予定であり、token/model/periodの採用、source同値関係の確定、退役sourceの復活を認めない。候補登録のために全event payloadまたは履歴proofを展開しない。実際の修復・数値採用では既存のcanonical relation、原本range/hash、account/period資格を同じserial writerとcommit fenceで検証し、旧原本・保存値を保持する。
+
+通常再起動では、前回recorder authorityのpartitionが現在のpartitionと一致し、data_generation・collector_epoch・cycle_seq・last_commit_unixが全て既存形式の有効な非null値で、DBのcollector epochが同じ、DBのgenerationとcycleが前回以上である場合だけ、既存accepted snapshotの継続とする。この場合は起動時backup・lifecycle再分類を繰り返さず、既存のmark initializedとaccount fence付きowner ACKへ進む。NULL・部分tuple・異partition・異epoch・世代後退などで継続を確認できない場合、実account境界、未確認起動では従来のbackupとguarded lifecycle修復を維持する。旧入力のNULL/部分tupleの受理を狭めず、継続未確認として扱う。DB状態の読取り失敗は元エラーを返して旧DB・backupを保持する。継続条件が成立した経路でも既存commit_guardを一回確認し、不成立はAccountBoundaryChangedとして旧状態を保持する。明示的な修復API・採否条件・計算式・backup検証は変更しない。いずれもquotaの元観測時刻や価格を新造せず、修復失敗時は旧原本・保存projectionを保持する。継続条件は、writable open内の全DB走査より前に、既存のread-only identity/schema probeと保存済みcommit tupleから判定する。成立する場合だけ、無関係な履歴全体のquick_check再走査を起動条件にしない。これはDB全体の健全性保証ではない。実際に読むrow/pageの不正は元エラーで返し、既存値・原本を保持する。実接続へ移った後も同じpartitionとcommit継続を結ぶ。未確認・実account境界・新規作成・移行・backup・restore・明示修復の既存full checkは維持する。
 
 #### live状態へ使える原本解析状態
 
@@ -869,6 +891,11 @@ v16の`session_events`は、既存の数値・source keyを保持した同じrow
 保存原本で確認した`cli_version=0.148.0-alpha.9`に対応する外部参照は、OpenAI Codexのcommit `44271b1a725e3265d80adde7886d10e48f08d8cc`とする。これはその版の実装を固定して参照する根拠であり、全版の保存JSONL安定保証ではない。RPCの`thread/tokenUsage/updated`と保存JSONLを同一schemaにしない。[保存wire enum](https://github.com/openai/codex/blob/44271b1a725e3265d80adde7886d10e48f08d8cc/codex-rs/history/src/rollout_payload.rs)、[event/payloadの定義](https://github.com/openai/codex/blob/44271b1a725e3265d80adde7886d10e48f08d8cc/codex-rs/protocol/src/protocol.rs)、[producer](https://github.com/openai/codex/blob/44271b1a725e3265d80adde7886d10e48f08d8cc/codex-rs/core/src/session/mod.rs)を区別して確認する。
 
 同producerの`record_initial_history`は、resume/forkで以前の`TokenUsageInfo`を復元し、paginatedなcopied forkでは継承recordを新しいlocal rolloutへ再掲しない経路を持つ。`history_base`がnullのcopied forkもある。`TokenUsageInfo::new_or_append`が状態なしから0を初期化する経路を持つことだけでは、ある保存fileがその経路だったとは証明できない。このため、byte 0の`session_meta`、`history_base`不在、初回のtotalとlastの一致だけでは、利用開始0・未計上量・model帰属の証拠としない。初回の有効rawは前節のbaseline規則を使い、実際の既知0 counterまたは照合済みの以前のanchor/prefixがある場合だけその位置以後のdeltaを確定する。lastの再加算で初回不足を埋めず、元の継承prefixを検証できる場合は同じ原本復元経路で扱う。
+
+既存writerが保存したsource_admission v2のoptionalなfork_historyは、parent_thread_id（有効な親thread ID）とreading_inherited（boolean）からなる再開状態として保持する。fieldが無い旧v1/v2を引き続き受理し、存在するv2では親IDと現在metadataのthread IDを区別する。未知field全般の黙認や保存JSONからのfield削除へ拡張しない。root session_metaのforked_from_idをこの継承状態へ結び、親session_metaとその後の継承recordを読む間も、採用済みchild metadata/account bindingを親へ置換しない。継承counter・snapshot・response・task/model contextはchildの新規数値・モデルauthorityにせず、元bytesとcheckpointへ保持する。明示されたchild identityの有効thread_settings_applied、または同じchild/sessionに結合したtoken_usage_recordを確認した位置からだけ通常のadmissionを再開する。再開時も既存のbaseline・model・response・account/period資格を必要とし、親の累積値やlastを新規利用へ加算しない。保存済みfork状態の読取り互換はDB/schema変換・checkpointの削除・価格再計算を要求しない。
+
+既存SourceAccountBinding v1のoptionalなcreator_originは、先頭session_metaのRecordPointer（start/end/SHA-256/元timestamp）とownership_start_at/ownership_end_atを保持する。旧field無しのbindingは従来どおり受理する。producerは、同じsource/thread/sessionの元metadataが認証済みcreatorと一致し、作成時刻からRPC完了までを既知の一つの連続account所有区間が覆う場合だけ、このproofを生成する。元recordはbyte 0からの完全な一行で、既存prefix内のrange/hashとfile/path identityを前後確認し、checkpoint/account fenceと同じcommitへ結合する。raw creator account IDは比較時の一時hash以外に保存・出力しない。保存originはRPC proofだけに結合し、正の元時刻・所有開始<=作成時刻<=RPC開始<=RPC終了、および非null所有終了よりRPC終了が前であることを保つ。有効originがあればsourceの時刻資格開始をその作成時刻、なければ従来のRPC開始とし、AcceptedPrefixの既存資格は変更しない。RPC前のresponseも、元response時刻がこの作成以後で、同じ所有開始とRPC終了を含む同じ所有区間に属する場合に限り、従来のsource/model/period/numeric資格へ進める。これはcounter開始0・新しい数値・quota・価格の根拠ではなく、forkの継承recordをchild利用へ昇格させるものでもない。保存済みoriginを捨てる、schema/dataを変換する、未知field全般を黙認する修復は行わない。creator_account_idも同じID入力資格（1..512 Unicode scalar、型・重複検証）を使い、byte数の別上限へ置換しない。欠落/null、型不正または重複の場合はcreator_originを生成しないが、独立した既存metadata/保存値は保持する。
+
 
 次の認識済みrecordは、改行済みJSON object、重要keyの非重複、public範囲のroot timestampと表のpayload型を満たす場合、token counter、model context、taskの開始/停止を変更しない。原本・byte順を保持し、前回anchorを消さず、counterを0へ戻さず、これらのrecordの存在だけでfully-attributedを否定しない。本文やopaque stateの内容からtoken/model/taskを抽出しない。型不正なら通常の未認識recordと同じく原本と前回有効anchorを保持し、当該sourceの完備性を確定しない。
 

@@ -22,6 +22,46 @@ class LinuxUpdateChannelIdentityTests(unittest.TestCase):
         self.addCleanup(self.fixture.tearDown)
         self.fixture.setUp()
 
+
+    def test_no_candidate_does_not_accept_incoherent_local_generation(self):
+        self.fixture.channel("beta")
+        self.fixture.seed()
+        stable = self.fixture.release("1.0.110")
+        self.fixture.publish(stable, [stable])
+        launcher = self.fixture.share / "current/run.sh"
+        launcher.write_bytes(b"#!/bin/sh\nexit 79\n")
+        before = self.fixture.protected()
+        channel = self.fixture.channel_path.read_bytes()
+        control = self.fixture.share / "control-state.json"
+        control_bytes = control.read_bytes()
+        self.fixture.clear_trace()
+
+        # Read-only selection is still a valid no-candidate result, even when
+        # the installed runtime cannot be admitted. It does not repair state.
+        selection = self.fixture.command(
+            "--select-release",
+            "--release-metadata", str(self.fixture.case / "release-list-page1.json"),
+            "--current-version", fixtures.STABLE,
+            "--channel", "beta",
+        )
+        self.assertEqual(
+            selection.returncode, 0, selection.stdout + selection.stderr
+        )
+        self.assertEqual(selection.stdout, "no-candidate\tbeta\n")
+        self.assertEqual(self.fixture.trace(), "")
+        self.assertEqual(self.fixture.protected(), before)
+        self.assertEqual(control.read_bytes(), control_bytes)
+
+        # A mutating update may not report success for the same corrupt local
+        # generation merely because the selected channel has no candidate.
+        result = self.fixture.command("--update")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.protected(), before)
+        self.assertEqual(self.fixture.channel_path.read_bytes(), channel)
+        self.assertEqual(control.read_bytes(), control_bytes)
+        self.assertNotIn("/releases/latest", self.fixture.trace())
+        self.assertNotIn("/download/", self.fixture.trace())
+
     def test_missing_manifest_projection_repairs_same_generation(self):
         self.fixture.seed()
         projection = self.fixture.share / "manifest.json"

@@ -520,6 +520,45 @@ impl UsageStore {
         Ok(Some(rebased))
     }
 
+    /// Register source work only; all numeric/canonical adoption stays at repair.
+    pub fn unqualified_session_source_keys(
+        &self,
+    ) -> Result<BTreeSet<(String, String, u64, u64, u128)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT root_identity, relative_path,
+                    file_device, file_inode, prefix_generation
+             FROM session_events WHERE admission_json IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut keys = BTreeSet::new();
+        for row in rows {
+            let (root, path, device, inode, generation) = row?;
+            validate_session_key(&root, &path)?;
+            let generation = canonical_u128_hex(&generation, "source generation")?;
+            if generation == 0 {
+                return Err(UsageStoreError::InvalidImport(
+                    "source generation is zero".into(),
+                ));
+            }
+            keys.insert((
+                root,
+                path,
+                canonical_u64_text(&device, "source device")?,
+                canonical_u64_text(&inode, "source inode")?,
+                generation,
+            ));
+        }
+        Ok(keys)
+    }
+
     pub fn load_unqualified_session_event_facts(&self) -> Result<Vec<LosslessSessionEvent>> {
         source_events::read_matching(&self.connection, "WHERE admission_json IS NULL", [])
     }
@@ -1221,4 +1260,91 @@ pub(super) fn apply(
         canonical_scope.permit_numeric_corrections(&numerical_periods);
     }
     Ok(periods)
+}
+
+#[cfg(test)]
+mod issue659_startup_key_tests {
+    use super::*;
+
+    #[test]
+    fn issue659_source_key_inventory_preserves_bytes_without_history_decode() {
+        let mut store =
+            UsageStore::initialize_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let transaction = store.connection.transaction().unwrap();
+        ensure_session_event_schema(&transaction).unwrap();
+        transaction.commit().unwrap();
+        for (path, inode, start, qualified) in [
+            ("one.jsonl", "42", 0i64, false),
+            ("one.jsonl", "42", 10, false),
+            ("two.jsonl", "44", 0, false),
+            ("qualified.jsonl", "45", 0, true),
+        ] {
+            store.connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20',?1,'10',?2,'00000000000000000000000000005678',?3,?4,?5,0,1791871200,'gpt-6.1-sol','5','4','1','1','0',?6)", params![path,inode,start,start+10,"00".repeat(32),qualified.then_some("{}")]).unwrap();
+        }
+        store.connection.execute("INSERT INTO source_prefix_repairs(repair_id,payload_json,payload_sha256) VALUES(?1,'{\"version\":2}',?2)", ("11".repeat(32),"00".repeat(32))).unwrap();
+        struct Snapshots(Vec<PathBuf>);
+        impl Drop for Snapshots {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut snapshots = Snapshots(Vec::new());
+        for label in ["before", "after"] {
+            let path = std::env::temp_dir().join(format!(
+                "codex-info-issue659-source-keys-{}-{stamp}-{label}.sqlite3",
+                std::process::id()
+            ));
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            snapshots.0.push(path);
+        }
+        store
+            .connection
+            .backup(DatabaseName::Main, &snapshots.0[0], None)
+            .unwrap();
+        CanonicalSourceScope::reset_test_snapshot_load_count();
+        let actual = store.unqualified_session_source_keys().unwrap();
+        let snapshot_loads = CanonicalSourceScope::test_snapshot_load_count();
+        store
+            .connection
+            .backup(DatabaseName::Main, &snapshots.0[1], None)
+            .unwrap();
+        assert_eq!(
+            actual,
+            BTreeSet::from([
+                (
+                    "unix:10:20".into(),
+                    "one.jsonl".into(),
+                    10u64,
+                    42u64,
+                    0x5678u128
+                ),
+                (
+                    "unix:10:20".into(),
+                    "two.jsonl".into(),
+                    10u64,
+                    44u64,
+                    0x5678u128
+                ),
+            ])
+        );
+        assert_eq!(
+            snapshot_loads, 0,
+            "work registration must not adopt canonical history"
+        );
+        assert_eq!(
+            fs::read(&snapshots.0[0]).unwrap(),
+            fs::read(&snapshots.0[1]).unwrap(),
+            "all database snapshot bytes are preserved"
+        );
+    }
 }

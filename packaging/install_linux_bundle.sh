@@ -327,8 +327,6 @@ module_path = pathlib.Path(sys.argv.pop())
 try:
     if module_image:
         compressed = base64.b64decode(module_image, validate=True)
-        if base64.b64encode(compressed).decode("ascii") != module_image:
-            raise ValueError("embedded version module encoding is invalid")
         with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
             module_bytes = stream.read(1024 * 1024 + 1)
         if len(module_bytes) > 1024 * 1024:
@@ -379,10 +377,10 @@ def canonical_manifest_producer(document):
             and type(proofs[0].get("size")) is int and 0 < proofs[0]["size"] <= 1048576
             and proofs[0].get("mode") == 0o644)
 
-def local_recovery_receipt_valid(document, raw):
+def local_recovery_receipt_valid(document, raw, raw_digest):
     if not str(document.get("run_id", "")).startswith("local-"): return True
     if not canonical_manifest_producer(document) or len(raw) > 1048576: return False
-    if document["run_id"] != "local-" + hashlib.sha256(raw).hexdigest(): return False
+    if document["run_id"] != "local-" + raw_digest: return False
     def unique(items):
         result = {}
         for key, value in items:
@@ -736,8 +734,8 @@ enable_managed_unit() {
         known_enable_link "$unit" "$destination" "$expected" ||
             safe_blocked "foreign enable link for $unit"
     fi
-    mkdir -p -- "$(dirname -- "$destination")"
-    atomic_symlink "$expected" "$destination"
+    mkdir -p -- "$(dirname -- "$destination")" || return 1
+    atomic_symlink "$expected" "$destination" || return 1
     systemctl_user daemon-reload >/dev/null 2>&1 || return 1
     probe_enabled "$unit"
 }
@@ -747,7 +745,7 @@ disable_managed_unit() {
     if [[ -e "$destination" || -L "$destination" ]]; then
         known_enable_link "$unit" "$destination" "$expected" ||
             safe_blocked "foreign enable link for $unit"
-        atomic_unlink "$destination"
+        atomic_unlink "$destination" || return 1
         systemctl_user daemon-reload >/dev/null 2>&1 || return 1
     fi
     ! probe_enabled "$unit"
@@ -862,7 +860,8 @@ control_defaults() {
     desired_state=running; state_boot_id="$(boot_id)"
 }
 load_control_state() {
-    control_defaults; [[ -e "$control_state" ]] || return
+    control_defaults
+    [[ -e "$control_state" || -L "$control_state" ]] || return 0
     [[ -f "$control_state" && ! -L "$control_state" ]] || safe_blocked 'control-state.json is not regular'
     [[ "$(stat -c '%u' -- "$control_state" 2>/dev/null || true)" == "$(id -u)" &&
        "$(stat -c '%a' -- "$control_state" 2>/dev/null || true)" == 600 ]] ||
@@ -907,7 +906,7 @@ if generation and not canonical_generation(generation):
     raise SystemExit("state generation identity is invalid")
 print(json.dumps({"schema":schema,"desired_state":desired,"boot_id":boot,"operation_id":operation,"generation_id":generation,"updated_at_unix":int(timestamp)}, separators=(",",":")))
 PY
-    )"
+    )" || return 1
     atomic_text "$control_state" 600 "$content"
 }
 
@@ -932,8 +931,8 @@ document = {"schema":"codex-info-install-transaction-v1","operation_id":operatio
 if reader_image: document["legacy_reader_image"] = reader_image
 print(json.dumps(document, ensure_ascii=False, indent=2) + "\n", end="")
 PY
-    )"
-    atomic_text "$transaction" 600 "$content"
+    )" || return 1
+    atomic_text "$transaction" 600 "$content" || return 1
     if [[ "${CODEX_INFO_INTERRUPT_PHASE-}" == "$phase" ]]; then exit 75; fi
 }
 read_journal() {
@@ -995,7 +994,6 @@ if staged_image:
     if legacy is None or not isinstance(reader_image,str) or not reader_image or len(reader_image)>98304:
         raise SystemExit("legacy reader image is invalid")
     compressed = base64.b64decode(reader_image, validate=True)
-    if base64.b64encode(compressed).decode()!=reader_image: raise SystemExit("legacy reader encoding is invalid")
     with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as image:
         data = image.read(524289)
     if len(data)>524288 or hashlib.sha256(data).hexdigest()!=reader_hash:
@@ -1071,9 +1069,14 @@ transaction_startup_authorized() {
 
 current_generation() {
     [[ -L "$current_link" ]] || return 0
-    local target; target="$(readlink -- "$current_link")"
-    [[ "$target" == generations/* && "$target" != */*/* ]] || safe_blocked 'current link is invalid'
-    printf '%s\n' "${target#generations/}"
+    local target managed
+    target="$(readlink -f -- "$current_link")" ||
+        safe_blocked 'current generation reference is unavailable'
+    managed="$(readlink -f -- "$generations_dir")" ||
+        safe_blocked 'managed generations directory is unavailable'
+    [[ "${target%/*}" == "$managed" ]] ||
+        safe_blocked 'current generation is outside managed generations'
+    printf '%s\n' "${target##*/}"
 }
 manifest_record() {
     local path="${1:-$manifest_destination}"
@@ -1114,7 +1117,7 @@ for entry in entries:
         raise SystemExit("manifest file identity is invalid")
     paths.append(path_name)
     if path_name in {"codex_info", "codex_info_recorder", "codex_info_rest"}: binaries[path_name]=entry
-if paths != sorted(paths) or set(binaries) != {"codex_info", "codex_info_recorder", "codex_info_rest"}:
+if set(binaries) != {"codex_info", "codex_info_recorder", "codex_info_rest"}:
     raise SystemExit("manifest file entries are invalid")
 if "codex-info" + ".service" in set(paths):
     raise SystemExit("combined recorder/REST unit is forbidden")
@@ -1174,7 +1177,7 @@ if (not isinstance(version,str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[
     raise SystemExit("legacy manifest identity fields are invalid")
 entries=document["files"]
 if not isinstance(entries,list) or not entries: raise SystemExit("legacy manifest files are invalid")
-by_path={}; ordered=[]
+by_path={}
 for entry in entries:
     if not isinstance(entry,dict) or set(entry)!={"path","size","sha256"}: raise SystemExit("legacy manifest entry schema is invalid")
     name=entry["path"]
@@ -1184,8 +1187,7 @@ for entry in entries:
     if (isinstance(entry["size"],bool) or not isinstance(entry["size"],int) or entry["size"]<0 or
         not isinstance(entry["sha256"],str) or not re.fullmatch(r"[0-9a-f]{64}",entry["sha256"])):
         raise SystemExit("legacy manifest file identity is invalid")
-    by_path[name]=entry; ordered.append(name)
-if ordered != sorted(ordered): raise SystemExit("legacy manifest files are not sorted")
+    by_path[name]=entry
 paths={"codex_info":(ui_binary_name,0o755),"codex_info_recorder":(recorder_binary_name,0o755),"codex_info_rest":(rest_binary_name,0o755),"install.sh":(installer_name,0o755),
        "codex-info-recorder.service":(unit_name,0o644),"codex-info-rest.service":(rest_unit_name,0o644),
        "codex-info-update.service":(update_service_name,0o644),
@@ -1235,7 +1237,7 @@ if (not isinstance(version,str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[
     raise SystemExit("legacy combined manifest identity fields are invalid")
 entries=document["files"]
 if not isinstance(entries,list) or not entries: raise SystemExit("legacy combined manifest files are invalid")
-by_path={}; ordered=[]; modes_present=None
+by_path={}; modes_present=None
 for entry in entries:
     if not isinstance(entry,dict) or set(entry) not in ({"path","size","sha256"},{"path","size","sha256","mode"}):
         raise SystemExit("legacy combined manifest entry schema is invalid")
@@ -1251,8 +1253,7 @@ for entry in entries:
         raise SystemExit("legacy combined manifest file identity is invalid")
     if has_mode and (isinstance(entry["mode"],bool) or not isinstance(entry["mode"],int) or entry["mode"] not in {0o644,0o755}):
         raise SystemExit("legacy combined manifest mode is invalid")
-    by_path[name]=entry; ordered.append(name)
-if ordered != sorted(ordered): raise SystemExit("legacy combined manifest files are not sorted")
+    by_path[name]=entry
 paths={"codex_info":(binary_name,0o755),"install.sh":(installer_name,0o755),
        "codex-info.service":(unit_name,0o644),"codex-info-update.service":(update_service_name,0o644),
        "codex-info-update.timer":(update_timer_name,0o644)}
@@ -1343,7 +1344,9 @@ def pairs(items):
         if key in result: raise ValueError("duplicate manifest key")
         result[key] = value
     return result
-try: document = json.loads(manifest_path.read_text(encoding="utf-8"), object_pairs_hook=pairs)
+try:
+    manifest_bytes = manifest_path.read_bytes()
+    document = json.loads(manifest_bytes.decode("utf-8"), object_pairs_hook=pairs)
 except Exception as error: raise SystemExit(str(error))
 required = {"schema","product","version","source_sha","run_id","run_attempt","target","compatibility","glibc_minimum","files"}
 if not isinstance(document, dict) or set(document) != required: raise SystemExit("generation manifest keys are invalid")
@@ -1357,13 +1360,12 @@ if (not isinstance(document["version"], str) or
     raise SystemExit("generation version identity is invalid")
 if not isinstance(document["glibc_minimum"], str) or not re.fullmatch(r"[0-9]+(?:[.][0-9]+)+", document["glibc_minimum"]):
     raise SystemExit("generation glibc identity is invalid")
-manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
 if root.name != document["version"] + "-" + document["source_sha"] + "-" + manifest_hash:
     raise SystemExit("generation directory identity is invalid")
 entries = document["files"]
 if not isinstance(entries, list): raise SystemExit("generation manifest files are invalid")
 expected = set()
-ordered = []
 for entry in entries:
     if not isinstance(entry, dict) or set(entry) != {"path","size","sha256","mode"}: raise SystemExit("generation entry is invalid")
     path = entry["path"]
@@ -1374,13 +1376,11 @@ for entry in entries:
             isinstance(entry["mode"], bool) or not isinstance(entry["mode"], int) or entry["mode"] not in {0o644,0o755}):
         raise SystemExit("generation entry identity is invalid")
     expected.add(path)
-    ordered.append(path)
-if ordered != sorted(ordered): raise SystemExit("generation manifest entries are not sorted")
 actual = set()
 for path in root.rglob("*"):
     if path.is_symlink(): raise SystemExit("generation contains a symlink")
     if path.is_dir():
-        if path.stat().st_uid != os.getuid() or stat.S_IMODE(path.stat().st_mode) != 0o700: raise SystemExit("generation subdirectory is not owner-only")
+        if path.stat().st_uid != os.getuid() or (stat.S_IMODE(path.stat().st_mode) & 0o022) != 0: raise SystemExit("generation subdirectory owner or write permissions differ")
     elif path.is_file():
         if path.stat().st_uid != os.getuid(): raise SystemExit("generation member owner differs")
         actual.add(path.relative_to(root).as_posix())
@@ -1391,9 +1391,10 @@ for entry in entries:
     mode = stat.S_IMODE(path.stat().st_mode)
     expected_mode = entry["mode"]
     if mode != expected_mode or path.stat().st_size != entry["size"]: raise SystemExit("generation mode or size differs")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    member_bytes = path.read_bytes()
+    digest = hashlib.sha256(member_bytes).hexdigest()
     if digest != entry["sha256"]: raise SystemExit("generation digest differs")
-    if entry["path"] == "LOCAL_RECOVERY.json" and not local_recovery_receipt_valid(document, path.read_bytes()): raise SystemExit("local recovery receipt differs")
+    if entry["path"] == "LOCAL_RECOVERY.json" and not local_recovery_receipt_valid(document, member_bytes, digest): raise SystemExit("local recovery receipt differs")
 sum_path = root / "SHA256SUMS"
 if sum_path.stat().st_uid != os.getuid() or stat.S_IMODE(sum_path.stat().st_mode) != 0o644: raise SystemExit("generation checksum owner or mode differs")
 records = {}
@@ -1409,12 +1410,10 @@ for line in lines:
     if name in records: raise SystemExit("generation checksum has duplicate member")
     records[name] = fields[0]
 if set(records) != expected | {"manifest.json"}: raise SystemExit("generation checksum coverage differs")
-for name, digest in records.items():
-    if name == "manifest.json":
-        member = manifest_path
-    else:
-        member = root / name
-    if hashlib.sha256(member.read_bytes()).hexdigest() != digest:
+if records["manifest.json"] != manifest_hash:
+    raise SystemExit("generation checksum digest differs")
+for entry in entries:
+    if records[entry["path"]] != entry["sha256"]:
         raise SystemExit("generation checksum digest differs")
 PY
 }
@@ -1553,7 +1552,8 @@ def validate_generation(name, root_fd):
         require(isinstance(document["glibc_minimum"], str) and
                 re.fullmatch(r"[0-9]+(?:[.][0-9]+)+", document["glibc_minimum"]) is not None,
                 "generation platform identity differs")
-        require(name == document["version"] + "-" + document["source_sha"] + "-" + hashlib.sha256(manifest_bytes).hexdigest(),
+        manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+        require(name == document["version"] + "-" + document["source_sha"] + "-" + manifest_hash,
                 "generation directory identity differs")
         entries = document["files"]
         require(isinstance(entries, list), "generation file list is invalid")
@@ -1572,7 +1572,6 @@ def validate_generation(name, root_fd):
                     type(entry["mode"]) is int and entry["mode"] in {0o644, 0o755},
                     "generation member identity is malformed")
             expected[path] = entry
-        require(list(expected) == sorted(expected), "generation members are not sorted")
         expected_dirs = set()
         for path in expected:
             pieces = path.split("/")
@@ -1589,7 +1588,7 @@ def validate_generation(name, root_fd):
                 child_st = os.stat(child_name, dir_fd=directory_fd, follow_symlinks=False)
                 if stat.S_ISDIR(child_st.st_mode):
                     require(child_path in expected_dirs and child_st.st_uid == uid and
-                            stat.S_IMODE(child_st.st_mode) == 0o700,
+                            (stat.S_IMODE(child_st.st_mode) & 0o022) == 0,
                             "generation contains an unexpected directory")
                     child_fd = os.open(child_name, directory_flags, dir_fd=directory_fd)
                     try:
@@ -1611,10 +1610,11 @@ def validate_generation(name, root_fd):
                     file_identities[child_path] = member_identity
                     if child_path in expected:
                         entry = expected[child_path]
-                        require(len(data) == entry["size"] and hashlib.sha256(data).hexdigest() == entry["sha256"],
+                        member_digest = hashlib.sha256(data).hexdigest()
+                        require(len(data) == entry["size"] and member_digest == entry["sha256"],
                                 "generation payload digest differs")
                         if child_path == "LOCAL_RECOVERY.json":
-                            require(local_recovery_receipt_valid(document, data), "local recovery receipt differs")
+                            require(local_recovery_receipt_valid(document, data, member_digest), "local recovery receipt differs")
         walk(generation_fd, "")
         require(seen_files == expected_files and seen_dirs.keys() == expected_dirs | {""},
                 "generation member set differs")
@@ -1635,7 +1635,7 @@ def validate_generation(name, root_fd):
             require(member not in records, "generation checksum member is duplicated")
             records[member] = fields[0]
         require(set(records) == set(expected) | {"manifest.json"}, "generation checksum coverage differs")
-        require(records["manifest.json"] == hashlib.sha256(manifest_bytes).hexdigest(),
+        require(records["manifest.json"] == manifest_hash,
                 "generation manifest checksum differs")
         for path, entry in expected.items():
             require(records[path] == entry["sha256"], "generation payload checksum differs")
@@ -1644,10 +1644,11 @@ def validate_generation(name, root_fd):
         os.close(generation_fd)
 
 def read_committed_state(root_fd):
-    current_target = os.readlink(current_path)
-    require(current_target.startswith("generations/") and current_target.count("/") == 1,
-            "current generation link is not canonical")
-    current_name = current_target.split("/", 1)[1]
+    current_target = pathlib.Path(current_path).resolve(strict=True)
+    managed_root = pathlib.Path(generations_path).resolve(strict=True)
+    require(current_target.parent == managed_root,
+            "current generation is outside managed generations")
+    current_name = current_target.name
     require(canonical_generation(current_name), "current generation name is invalid")
     journal_fd = os.open(journal_path, file_flags)
     try:
@@ -1894,6 +1895,37 @@ PY
     generation_prune_failed 'verified obsolete generation cleanup did not complete'
     return 1
 }
+fixed_link_matches() {
+    python3 - "$1" "$2" <<'PY_FIXED_LINK'
+import os, stat, sys
+destination, expected = sys.argv[1:]
+expected = os.path.normpath(os.path.join(os.path.dirname(destination), expected))
+root, separator, member = expected.rpartition("/current/")
+if not separator or not member or "/" in member:
+    raise SystemExit(1)
+try:
+    target = os.readlink(destination)
+except OSError:
+    raise SystemExit(1)
+if not os.path.isabs(target):
+    target = os.path.join(os.path.dirname(destination), target)
+prefix, separator, tail = target.rpartition("/current/")
+parts = [part for part in tail.split("/") if part not in {"", "."}]
+try:
+    parent_stat = os.stat(prefix)
+    root_stat = os.stat(root)
+except OSError:
+    raise SystemExit(1)
+valid = (
+    bool(separator) and parts == [member] and tail.rsplit("/", 1)[-1] == member
+    and os.path.normpath(prefix) == root
+    and stat.S_ISDIR(parent_stat.st_mode)
+    and (parent_stat.st_dev, parent_stat.st_ino) == (root_stat.st_dev, root_stat.st_ino)
+)
+raise SystemExit(0 if valid else 1)
+PY_FIXED_LINK
+}
+
 verify_update_timer_registration() {
     # Disabling a linked systemd unit can remove its registration as well as
     # its wants link. The manifested timer payload remains verified separately.
@@ -1901,23 +1933,22 @@ verify_update_timer_registration() {
         ! probe_enabled codex-info-update.timer && ! probe_active codex-info-update.timer
         return
     fi
-    [[ -L "$update_timer_destination" &&
-       "$(readlink -- "$update_timer_destination")" == '../../../.local/share/codex-info/current/codex-info-update.timer' ]]
+    fixed_link_matches "$update_timer_destination" '../../../.local/share/codex-info/current/codex-info-update.timer'
 }
 verify_fixed_links() {
     local destination expected
     for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination"; do
         [[ -L "$destination" ]] || safe_blocked "fixed link missing: $destination"
     done
-    [[ "$(readlink -- "$binary_destination")" == '../share/codex-info/current/codex_info' ]] || safe_blocked 'UI binary link is not canonical'
-    [[ "$(readlink -- "$recorder_binary_destination")" == '../share/codex-info/current/codex_info_recorder' ]] || safe_blocked 'recorder binary link is not canonical'
-    [[ "$(readlink -- "$rest_binary_destination")" == '../share/codex-info/current/codex_info_rest' ]] || safe_blocked 'REST binary link is not canonical'
-    [[ "$(readlink -- "$launcher_destination")" == '../share/codex-info/current/run.sh' ]] || safe_blocked 'launcher link is not canonical'
-    [[ "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' ]] || safe_blocked 'installer link is not canonical'
-    [[ "$(readlink -- "$manifest_destination")" == 'current/manifest.json' ]] || safe_blocked 'manifest link is not canonical'
+    fixed_link_matches "$binary_destination" '../share/codex-info/current/codex_info' || safe_blocked 'UI binary link is not canonical'
+    fixed_link_matches "$recorder_binary_destination" '../share/codex-info/current/codex_info_recorder' || safe_blocked 'recorder binary link is not canonical'
+    fixed_link_matches "$rest_binary_destination" '../share/codex-info/current/codex_info_rest' || safe_blocked 'REST binary link is not canonical'
+    fixed_link_matches "$launcher_destination" '../share/codex-info/current/run.sh' || safe_blocked 'launcher link is not canonical'
+    fixed_link_matches "$installer_destination" '../share/codex-info/current/install.sh' || safe_blocked 'installer link is not canonical'
+    fixed_link_matches "$manifest_destination" 'current/manifest.json' || safe_blocked 'manifest link is not canonical'
     for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination"; do
         expected="../../../.local/share/codex-info/current/$(basename -- "$destination")"
-        [[ "$(readlink -- "$destination")" == "$expected" ]] || safe_blocked "unit link is not canonical"
+        fixed_link_matches "$destination" "$expected" || safe_blocked "unit link is not canonical"
     done
     verify_update_timer_registration || safe_blocked 'update timer registration is not canonical or disabled'
 }
@@ -1926,33 +1957,31 @@ verify_fixed_links_local() {
     for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination"; do
         [[ -L "$destination" ]] || return 1
     done
-    [[ "$(readlink -- "$binary_destination")" == '../share/codex-info/current/codex_info' ]] || return 1
-    [[ "$(readlink -- "$recorder_binary_destination")" == '../share/codex-info/current/codex_info_recorder' ]] || return 1
-    [[ "$(readlink -- "$rest_binary_destination")" == '../share/codex-info/current/codex_info_rest' ]] || return 1
-    [[ "$(readlink -- "$launcher_destination")" == '../share/codex-info/current/run.sh' ]] || return 1
-    [[ "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' ]] || return 1
-    [[ "$(readlink -- "$manifest_destination")" == 'current/manifest.json' ]] || return 1
+    fixed_link_matches "$binary_destination" '../share/codex-info/current/codex_info' || return 1
+    fixed_link_matches "$recorder_binary_destination" '../share/codex-info/current/codex_info_recorder' || return 1
+    fixed_link_matches "$rest_binary_destination" '../share/codex-info/current/codex_info_rest' || return 1
+    fixed_link_matches "$launcher_destination" '../share/codex-info/current/run.sh' || return 1
+    fixed_link_matches "$installer_destination" '../share/codex-info/current/install.sh' || return 1
+    fixed_link_matches "$manifest_destination" 'current/manifest.json' || return 1
     for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination"; do
         expected="../../../.local/share/codex-info/current/$(basename -- "$destination")"
-        [[ "$(readlink -- "$destination")" == "$expected" ]] || return 1
+        fixed_link_matches "$destination" "$expected" || return 1
     done
     verify_update_timer_registration
 }
 verify_local_generation() {
     [[ -L "$current_link" ]] || return 1
-    local target generation
-    target="$(readlink -- "$current_link")"
-    [[ "$target" == generations/* && "$target" != */*/* ]] || return 1
-    generation="${target#generations/}"
+    local generation
+    generation="$(current_generation)" || return 1
     [[ -d "$generations_dir/$generation" && ! -L "$generations_dir/$generation" ]] || return 1
     verify_generation_files "$generations_dir/$generation" || return 1
     if [[ "$desired_state" == removed ]]; then
-        [[ -L "$binary_destination" && "$(readlink -- "$binary_destination")" == '../share/codex-info/current/codex_info' ]] || return 1
-        [[ -L "$recorder_binary_destination" && "$(readlink -- "$recorder_binary_destination")" == '../share/codex-info/current/codex_info_recorder' ]] || return 1
-        [[ -L "$rest_binary_destination" && "$(readlink -- "$rest_binary_destination")" == '../share/codex-info/current/codex_info_rest' ]] || return 1
-        [[ -L "$launcher_destination" && "$(readlink -- "$launcher_destination")" == '../share/codex-info/current/run.sh' ]] || return 1
-        [[ -L "$installer_destination" && "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' ]] || return 1
-        [[ -L "$manifest_destination" && "$(readlink -- "$manifest_destination")" == 'current/manifest.json' ]] || return 1
+        fixed_link_matches "$binary_destination" '../share/codex-info/current/codex_info' || return 1
+        fixed_link_matches "$recorder_binary_destination" '../share/codex-info/current/codex_info_recorder' || return 1
+        fixed_link_matches "$rest_binary_destination" '../share/codex-info/current/codex_info_rest' || return 1
+        fixed_link_matches "$launcher_destination" '../share/codex-info/current/run.sh' || return 1
+        fixed_link_matches "$installer_destination" '../share/codex-info/current/install.sh' || return 1
+        fixed_link_matches "$manifest_destination" 'current/manifest.json' || return 1
         [[ ! -e "$unit_destination" && ! -L "$unit_destination" ]] || return 1
         [[ ! -e "$rest_unit_destination" && ! -L "$rest_unit_destination" ]] || return 1
         [[ ! -e "$update_service_destination" && ! -L "$update_service_destination" ]] || return 1
@@ -1984,27 +2013,14 @@ host=tuple(int(part) for part in host_text.split(".")); required=tuple(int(part)
 if host < required: raise SystemExit("host glibc is older than candidate minimum")
 PY
 }
-extract_bundle_manifest() {
-    local archive="$1" destination="$2"
-    python3 - "$archive" "$destination" <<'PY'
-import pathlib,sys,tarfile
-archive_path,destination=sys.argv[1:]
-try:
-    with tarfile.open(archive_path,"r:gz") as bundle:
-        source=bundle.extractfile("manifest.json")
-        if source is None:
-            raise SystemExit("archive manifest cannot be read")
-        pathlib.Path(destination).write_bytes(source.read())
-except (KeyError,OSError,tarfile.TarError) as error:
-    raise SystemExit(f"archive manifest cannot be read: {error}")
-PY
-}
 
 validate_bundle() {
     local archive="$1" external="$2" destination="$3" checksum="$4" release_digest="${5:-}" validation_limit="$VALIDATE_TIMEOUT"
     [[ -f "$archive" && ! -L "$archive" ]] || die 'bundle archive is not regular'
     [[ "$archive" == *.tar.gz ]] || die 'bundle archive has wrong suffix'
-    [[ -f "$external" && ! -L "$external" ]] || die 'external manifest is not regular'
+    if [[ -z "$release_digest" ]]; then
+        [[ -f "$external" && ! -L "$external" ]] || die 'external manifest is not regular'
+    fi
     if (( operation_deadline > 0 )); then
         validation_limit="$(deadline_timeout "$VALIDATE_TIMEOUT")" || return 1
     fi
@@ -2027,11 +2043,82 @@ def regular_bytes(name):
         return stream.read()
 def identity(metadata):
     return metadata.st_dev,metadata.st_ino,metadata.st_size,metadata.st_mtime_ns,metadata.st_ctime_ns
+
+def stage_published(destination):
+    source_fd=os.open(archive_name,os.O_RDONLY|os.O_NOFOLLOW)
+    with os.fdopen(source_fd,"rb") as source, tempfile.TemporaryFile(dir=destination) as snapshot:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            reject("archive is not regular")
+        digest=hashlib.sha256()
+        while chunk:=source.read(1024*1024):
+            snapshot.write(chunk)
+            digest.update(chunk)
+        if "sha256:"+digest.hexdigest()!=release_digest:
+            reject("archive digest differs")
+        snapshot.flush()
+        snapshot.seek(0)
+        raw=None
+        with tarfile.open(fileobj=snapshot,mode="r:gz") as archive:
+            for member in archive:
+                name=member.name
+                if not name or name.startswith("/") or "\\" in name or name.startswith("./") or any(part in {"",".",".."} for part in name.split("/")) or not member.isfile():
+                    reject("unsafe member")
+                target_path=destination.joinpath(*pathlib.PurePosixPath(name).parts)
+                target_path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+                stream=archive.extractfile(member)
+                if stream is None:
+                    reject("member cannot be read")
+                pieces=[] if name=="manifest.json" else None
+                fd,temporary=tempfile.mkstemp(prefix=".codex-info.",dir=target_path.parent)
+                try:
+                    with os.fdopen(fd,"wb") as output:
+                        while chunk:=stream.read(1024*1024):
+                            output.write(chunk)
+                            if pieces is not None:
+                                pieces.append(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.chmod(temporary,member.mode&0o7777)
+                    os.replace(temporary,target_path)
+                    parent_fd=os.open(target_path.parent,os.O_DIRECTORY)
+                    try:
+                        os.fsync(parent_fd)
+                    finally:
+                        os.close(parent_fd)
+                finally:
+                    try:
+                        os.unlink(temporary)
+                    except FileNotFoundError:
+                        pass
+                if pieces is not None:
+                    raw=b"".join(pieces)
+    if raw is None:
+        reject("generation manifest unavailable")
+    document=json.loads(raw.decode("utf-8"))
+    version=document.get("version") if isinstance(document,dict) else None
+    source_sha=document.get("source_sha") if isinstance(document,dict) else None
+    if not canonical_version(version) or not isinstance(source_sha,str) or not re.fullmatch(r"[0-9a-f]{40}",source_sha):
+        reject("generation identity is invalid")
+    if pathlib.Path(archive_name).name!=f"codex-info-{version}-{target}.tar.gz":
+        reject("archive name")
+    if str(document.get("run_id","")).startswith("local-"):
+        reject("local recovery is not a published Release producer")
+    stage_fd=os.open(destination,os.O_DIRECTORY)
+    try:
+        os.fsync(stage_fd)
+    finally:
+        os.close(stage_fd)
+    signal.alarm(0)
+    print(version,source_sha,hashlib.sha256(raw).hexdigest(),"",sep="\t")
+
 def stage():
     destination=pathlib.Path(destination_name)
     metadata=destination.lstat()
     if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=os.getuid() or
             stat.S_IMODE(metadata.st_mode)!=0o700 or any(destination.iterdir())): reject("stage is not empty and owner-only")
+    if release_digest:
+        stage_published(destination)
+        return
     raw=regular_bytes(manifest_name)
     manifest=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs)
     required={"schema","product","version","source_sha","run_id","run_attempt","target","compatibility","glibc_minimum","files"}
@@ -2046,15 +2133,13 @@ def stage():
     if pathlib.Path(archive_name).name!=f"codex-info-{manifest['version']}-{target}.tar.gz": reject("archive name")
     if not isinstance(manifest["source_sha"],str) or not re.fullmatch(r"[0-9a-f]{40}",manifest["source_sha"]): reject("source")
     if not canonical_manifest_producer(manifest): reject("run id")
-    if release_digest and manifest["run_id"].startswith("local-"):
-        reject("local recovery is not a published Release producer")
     if isinstance(manifest["run_attempt"],bool) or not isinstance(manifest["run_attempt"],int) or manifest["run_attempt"]<1: reject("run attempt")
     if beta_version is not None and beta_version["attempt"]!=str(manifest["run_attempt"]): reject("beta version run attempt differs")
     if manifest["target"]!=target or manifest["compatibility"]!=compatibility: reject("target")
     if not isinstance(manifest["glibc_minimum"],str) or not re.fullmatch(r"[0-9]+(?:[.][0-9]+)+",manifest["glibc_minimum"]): reject("glibc")
     entries=manifest["files"]
     if not isinstance(entries,list) or not entries: reject("files")
-    paths=[]; by_path={}
+    by_path={}
     for entry in entries:
         if not isinstance(entry,dict) or set(entry)!={"path","size","sha256","mode"}: reject("file entry")
         path=entry["path"]
@@ -2063,20 +2148,15 @@ def stage():
         if (isinstance(entry["size"],bool) or not isinstance(entry["size"],int) or entry["size"]<0 or
                 not isinstance(entry["sha256"],str) or not re.fullmatch(r"[0-9a-f]{64}",entry["sha256"]) or
                 isinstance(entry["mode"],bool) or not isinstance(entry["mode"],int) or entry["mode"] not in {0o644,0o755}): reject("file identity")
-        paths.append(path); by_path[path]=entry
-    if paths!=sorted(paths): reject("files not sorted")
-    if release_digest:
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}",release_digest): reject("release digest is invalid")
-        expected_archive_hash=release_digest.removeprefix("sha256:")
-    else:
-        if "codex-info"+".service" in by_path: reject("combined recorder/REST unit is forbidden")
-        required_files={"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh","codex-info-recorder.service","codex-info-rest.service","codex-info-update.service","codex-info-update.timer","LICENSE","COPYRIGHT"}
-        if not required_files.issubset(by_path) or not ({"THIRD_PARTY_NOTICES.md","NOTICE.txt"}&set(by_path)): reject("required member missing")
-        lines=regular_bytes(checksum_name).decode("utf-8").splitlines()
-        if sum(bool(line.strip()) and not line.lstrip().startswith("#") for line in lines)!=1: reject("external checksum must contain exactly one record")
-        fields=lines[0].split() if lines else []
-        if len(fields)!=2 or not re.fullmatch(r"[0-9a-fA-F]{64}",fields[0]) or fields[1].removeprefix("*")!=pathlib.Path(archive_name).name: reject("external checksum record is invalid")
-        expected_archive_hash=fields[0].lower()
+        by_path[path]=entry
+    if "codex-info"+".service" in by_path: reject("combined recorder/REST unit is forbidden")
+    required_files={"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh","codex-info-recorder.service","codex-info-rest.service","codex-info-update.service","codex-info-update.timer","LICENSE","COPYRIGHT"}
+    if not required_files.issubset(by_path) or not ({"THIRD_PARTY_NOTICES.md","NOTICE.txt"}&set(by_path)): reject("required member missing")
+    lines=regular_bytes(checksum_name).decode("utf-8").splitlines()
+    if sum(bool(line.strip()) and not line.lstrip().startswith("#") for line in lines)!=1: reject("external checksum must contain exactly one record")
+    fields=lines[0].split() if lines else []
+    if len(fields)!=2 or not re.fullmatch(r"[0-9a-fA-F]{64}",fields[0]) or fields[1].removeprefix("*")!=pathlib.Path(archive_name).name: reject("external checksum record is invalid")
+    expected_archive_hash=fields[0].lower()
     # Copy and hash the bytes together. Path replacement or in-place changes cannot
     # turn a later archive open into a different validated candidate.
     source_fd=os.open(archive_name,os.O_RDONLY|os.O_NOFOLLOW)
@@ -2095,7 +2175,6 @@ def stage():
                 if not path or path.startswith("/") or "\\" in path or path.startswith("./") or any(part in {"",".",".."} for part in path.split("/")) or not member.isfile(): reject("unsafe member")
                 if path in actual: reject("duplicate member")
                 actual.append(path)
-            if actual!=sorted(actual): reject("members not sorted")
             if set(actual)!=set(by_path)|{"manifest.json","SHA256SUMS"}: reject("member set differs")
             internal=archive.extractfile("manifest.json")
             if internal is None or internal.read()!=raw: reject("manifest bytes differ")
@@ -2111,7 +2190,7 @@ def stage():
             if set(records)!=set(actual)-{"SHA256SUMS"}: reject("SHA256SUMS coverage")
             for path,entry in by_path.items():
                 member=archive.getmember(path)
-                expected_mode=entry["mode"] if release_digest else (0o755 if path in {"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh"} else 0o644)
+                expected_mode=(0o755 if path in {"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh"} else 0o644)
                 if member.mode&0o7777!=expected_mode or expected_mode!=entry["mode"] or member.size!=entry["size"]: reject("mode/size mismatch")
             for path in ("manifest.json","SHA256SUMS"):
                 if archive.getmember(path).mode&0o7777!=0o644: reject("metadata mode mismatch")
@@ -2138,13 +2217,15 @@ def stage():
                     try: os.unlink(temporary)
                     except FileNotFoundError: pass
         if identity(os.fstat(source.fileno()))!=identity(before) or identity(os.lstat(archive_name))!=identity(before): reject("archive changed during staging")
-    if manifest["run_id"].startswith("local-") and not local_recovery_receipt_valid(manifest, (destination / "LOCAL_RECOVERY.json").read_bytes()):
-        reject("local recovery receipt differs")
+    if manifest["run_id"].startswith("local-"):
+        receipt_bytes = (destination / "LOCAL_RECOVERY.json").read_bytes()
+        if not local_recovery_receipt_valid(manifest, receipt_bytes, hashlib.sha256(receipt_bytes).hexdigest()):
+            reject("local recovery receipt differs")
     stage_fd=os.open(destination,os.O_DIRECTORY)
     try: os.fsync(stage_fd)
     finally: os.close(stage_fd)
     signal.alarm(0)
-    recorder_hash="" if release_digest else by_path["codex_info_recorder"]["sha256"]
+    recorder_hash=by_path["codex_info_recorder"]["sha256"]
     print(manifest["version"],manifest["source_sha"],hashlib.sha256(raw).hexdigest(),recorder_hash,sep="\t")
 try: stage()
 except (OSError,tarfile.TarError,UnicodeError,ValueError,TimeoutError) as error: reject(str(error))
@@ -2155,12 +2236,15 @@ publish_candidate() {
     if [[ -e "$final" ]]; then
         [[ -d "$final" && ! -L "$final" ]] || safe_blocked 'candidate path is not a directory'
         if verify_generation_files "$final" >/dev/null 2>&1; then
-            candidate_created=0; rm -r -- "$stage"; return
+            candidate_created=0
+            rm -r -- "$stage" || return 1
+            return 0
         fi
-        mkdir -p -- "$backup_dir"; chmod 700 -- "$backup_dir"
+        mkdir -p -- "$backup_dir" || return 1
+        chmod 700 -- "$backup_dir" || return 1
         candidate_quarantine="$backup_dir/$operation_id-generation-$candidate_id"
         [[ ! -e "$candidate_quarantine" && ! -L "$candidate_quarantine" ]] || safe_blocked 'candidate quarantine collision'
-        python3 - "$final" "$candidate_quarantine" <<'PY'
+        python3 - "$final" "$candidate_quarantine" <<'PY' || return 1
 import os,sys
 from pathlib import Path
 source,destination=map(Path,sys.argv[1:])
@@ -2171,7 +2255,7 @@ for parent in {source.parent,destination.parent}:
     finally: os.close(fd)
 PY
     fi
-    python3 - "$stage" "$final" <<'PY'
+    python3 - "$stage" "$final" <<'PY' || return 1
 import os,sys
 from pathlib import Path
 stage,final=map(Path,sys.argv[1:]); os.replace(stage,final)
@@ -2185,21 +2269,18 @@ backup_legacy_path() {
     local destination="$1"
     if [[ ! -e "$destination" && ! -L "$destination" ]]; then return; fi
     if [[ -L "$destination" ]]; then
-        local resolved link_target expected
-        link_target="$(readlink -- "$destination" 2>/dev/null || true)"
+        local resolved expected
         case "$destination" in
             "$current_link")
-                [[ "$link_target" == generations/* && "$link_target" != */*/* ]] ||
+                [[ -n "$(current_generation)" ]] ||
                     safe_blocked "foreign current symlink: $destination"
+                return
                 ;;
             *)
                 resolved="$(readlink -f -- "$destination" 2>/dev/null || true)"
                 [[ "$resolved" == "$generations_dir/"* ]] || safe_blocked "foreign symlink: $destination"
                 return
         esac
-        resolved="$(readlink -f -- "$destination" 2>/dev/null || true)"
-        [[ "$resolved" == "$generations_dir/"* ]] || safe_blocked "foreign symlink: $destination"
-        return
     fi
     [[ -f "$destination" ]] || safe_blocked "legacy path is not regular: $destination"
     [[ "$(stat -c '%u' -- "$destination" 2>/dev/null || true)" == "$(id -u)" ]] ||
@@ -2219,8 +2300,9 @@ backup_legacy_path() {
         *) backup="$backup_dir/$operation_id-$(basename -- "$destination")" ;;
     esac
     [[ ! -e "$backup" && ! -L "$backup" ]] || safe_blocked 'legacy backup collision'
-    mkdir -p -- "$backup_dir"; chmod 700 -- "$backup_dir"
-    python3 - "$destination" "$backup" <<'PY'
+    mkdir -p -- "$backup_dir" || return 1
+    chmod 700 -- "$backup_dir" || return 1
+    python3 - "$destination" "$backup" <<'PY' || return 1
 import os, sys
 from pathlib import Path
 source, destination = map(Path, sys.argv[1:])
@@ -2230,7 +2312,7 @@ for parent in {source.parent, destination.parent}:
     try: os.fsync(fd)
     finally: os.close(fd)
 PY
-    chmod "$expected_mode" -- "$backup"
+    chmod "$expected_mode" -- "$backup" || return 1
     python3 - "$backup_dir" <<'PY'
 import os,sys
 fd=os.open(sys.argv[1],os.O_DIRECTORY)
@@ -2253,7 +2335,8 @@ backup_legacy_combined_unit() {
         safe_blocked 'legacy combined unit generation path is invalid'
     backup="$backup_dir/$operation_id-codex-info.service"
     [[ ! -e "$backup" && ! -L "$backup" ]] || safe_blocked 'legacy combined unit backup collision'
-    mkdir -p -- "$backup_dir"; chmod 700 -- "$backup_dir"
+    mkdir -p -- "$backup_dir" || return 1
+    chmod 700 -- "$backup_dir" || return 1
     python3 - "$destination" "$backup" <<'PY'
 import os,sys
 from pathlib import Path
@@ -2266,40 +2349,128 @@ for parent in {source.parent,destination.parent}:
 PY
 }
 link_entrypoints() {
-    mkdir -p -- "$local_bin" "$local_libexec" "$unit_dir"
-    atomic_symlink '../share/codex-info/current/codex_info' "$binary_destination"
-    atomic_symlink '../share/codex-info/current/codex_info_recorder' "$recorder_binary_destination"
-    atomic_symlink '../share/codex-info/current/codex_info_rest' "$rest_binary_destination"
-    atomic_symlink '../share/codex-info/current/run.sh' "$launcher_destination"
-    if [[ -z "${legacy_recovery_reader_hash:-}" ]]; then atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"; fi
-    atomic_symlink 'current/manifest.json' "$manifest_destination"
+    mkdir -p -- "$local_bin" "$local_libexec" "$unit_dir" || return 1
+    atomic_symlink '../share/codex-info/current/codex_info' "$binary_destination" || return 1
+    atomic_symlink '../share/codex-info/current/codex_info_recorder' "$recorder_binary_destination" || return 1
+    atomic_symlink '../share/codex-info/current/codex_info_rest' "$rest_binary_destination" || return 1
+    atomic_symlink '../share/codex-info/current/run.sh' "$launcher_destination" || return 1
+    if [[ -z "${legacy_recovery_reader_hash:-}" ]]; then atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination" || return 1; fi
+    atomic_symlink 'current/manifest.json' "$manifest_destination" || return 1
     if [[ "${desired_state-}" == removed ]]; then
         local destination expected
         for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
             [[ -e "$destination" || -L "$destination" ]] || continue
             expected="../../../.local/share/codex-info/current/$(basename -- "$destination")"
-            [[ -L "$destination" && "$(readlink -- "$destination")" == "$expected" ]] ||
+            fixed_link_matches "$destination" "$expected" ||
                 safe_blocked "foreign unit link in removed state: $destination"
-            atomic_unlink "$destination"
+            atomic_unlink "$destination" || return 1
         done
         return 0
     fi
-    atomic_symlink '../../../.local/share/codex-info/current/codex-info-recorder.service' "$unit_destination"
-    atomic_symlink '../../../.local/share/codex-info/current/codex-info-rest.service' "$rest_unit_destination"
-    atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.service' "$update_service_destination"
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info-recorder.service' "$unit_destination" || return 1
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info-rest.service' "$rest_unit_destination" || return 1
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.service' "$update_service_destination" || return 1
     atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.timer' "$update_timer_destination"
 }
+
+preserve_control_prestate() {
+    python3 - "$control_state" "$backup_dir" "$operation_id" <<'PY_CONTROL_PRESTATE'
+import os, pathlib, stat, sys, tempfile
+source, directory = map(pathlib.Path, sys.argv[1:3])
+operation = sys.argv[3]
+if not operation or "/" in operation:
+    raise SystemExit("control prestate operation is not a filename component")
+try:
+    metadata = directory.lstat()
+except FileNotFoundError:
+    directory.mkdir(mode=0o700)
+    metadata = directory.lstat()
+if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+    raise SystemExit("control prestate directory is not private")
+destination = directory / (operation + "-control-state.json")
+if destination.exists() or destination.is_symlink():
+    raise SystemExit("control prestate already exists")
+data = b""
+try:
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+except FileNotFoundError:
+    pass
+else:
+    with os.fdopen(source_fd, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise SystemExit("control prestate source identity differs")
+        data = stream.read()
+fd, temporary = tempfile.mkstemp(prefix=".control-prestate.", dir=directory)
+try:
+    with os.fdopen(fd, "wb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, destination)
+    directory_fd = os.open(directory, os.O_DIRECTORY)
+    try: os.fsync(directory_fd)
+    finally: os.close(directory_fd)
+finally:
+    try: os.unlink(temporary)
+    except FileNotFoundError: pass
+PY_CONTROL_PRESTATE
+}
+cleanup_control_prestate() {
+    python3 - "$backup_dir" "$1" <<'PY_CONTROL_CLEANUP'
+import errno, os, pathlib, stat, sys
+directory = pathlib.Path(sys.argv[1])
+operation = sys.argv[2]
+if not operation or "/" in operation:
+    raise SystemExit("control cleanup operation is not a filename component")
+path = directory / (operation + "-control-state.json")
+try:
+    metadata = path.lstat()
+except FileNotFoundError:
+    metadata = None
+try:
+    parent = directory.lstat()
+except FileNotFoundError:
+    raise SystemExit(0)
+private = (
+    stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.getuid()
+    and stat.S_IMODE(parent.st_mode) == 0o700
+)
+if not private:
+    if metadata is None:
+        raise SystemExit(0)
+    raise SystemExit("control cleanup directory is not private")
+if metadata is not None:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SystemExit("control cleanup record identity differs")
+    path.unlink()
+    fd = os.open(directory, os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+try:
+    directory.rmdir()
+except OSError as error:
+    if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+        raise
+else:
+    fd = os.open(directory.parent, os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+PY_CONTROL_CLEANUP
+}
+
 restore_backups() {
     python3 - "$operation_id" "$backup_dir" "${legacy_recovery_reader_hash:-}" "$installer_destination" \
-        "$incident_recorder_override_destination" "$incident_rest_override_destination" \
+        "$incident_recorder_override_destination" "$incident_rest_override_destination" "$control_state" \
         "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" \
         "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" \
         "$rest_unit_destination" "$legacy_combined_unit_destination" "$update_service_destination" \
         "$update_timer_destination" "$recorder_override_destination" "$incident_recorder_override_destination" \
-        "$incident_rest_override_destination" <<'PY'
-import os,sys
+        "$incident_rest_override_destination" "$control_state" <<'PY'
+import os,stat,sys
 from pathlib import Path
-operation,backup_root,reader_hash,installer,incident_recorder,incident_rest,*destinations=sys.argv[1:]
+operation,backup_root,reader_hash,installer,incident_recorder,incident_rest,control,*destinations=sys.argv[1:]
 backup_root=Path(backup_root)
 for destination_name in reversed(destinations):
     if reader_hash and destination_name == installer: continue
@@ -2313,7 +2484,25 @@ for destination_name in reversed(destinations):
     else:
         backup=backup_root / (operation + "-" + destination.name)
         expected=0o755 if destination.name in {"codex_info","codex_info_recorder","codex_info_rest","codex-info-install.sh"} else 0o644
+    if destination_name == control:
+        expected = 0o600
     if backup.exists() or backup.is_symlink():
+        if destination_name == control:
+            saved = backup.lstat()
+            if not stat.S_ISREG(saved.st_mode) or saved.st_uid != os.getuid() or stat.S_IMODE(saved.st_mode) != 0o600:
+                raise SystemExit("control prestate backup identity differs")
+            if destination.exists() or destination.is_symlink():
+                current = destination.lstat()
+                if not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != 0o600:
+                    raise SystemExit("foreign control record blocks rollback")
+            if saved.st_size == 0:
+                if destination.exists(): destination.unlink()
+                backup.unlink()
+                for parent in {destination.parent, backup.parent}:
+                    fd = os.open(parent, os.O_DIRECTORY)
+                    try: os.fsync(fd)
+                    finally: os.close(fd)
+                continue
         if destination.exists() or destination.is_symlink(): destination.unlink()
         if not backup.is_symlink() and (backup.stat().st_mode & 0o7777) != expected:
             raise SystemExit("legacy backup mode changed before restore")
@@ -2328,11 +2517,10 @@ for destination_name in reversed(destinations):
 PY
 }
 remove_published_entrypoints() {
-    local destination link_target expected
+    local destination expected
     for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
         if [[ "$destination" == "$installer_destination" && -n "${legacy_recovery_reader_hash:-}" ]]; then continue; fi
         [[ -L "$destination" ]] || continue
-        link_target="$(readlink -- "$destination" 2>/dev/null || true)"
         case "$destination" in
             "$binary_destination") expected='../share/codex-info/current/codex_info' ;;
             "$recorder_binary_destination") expected='../share/codex-info/current/codex_info_recorder' ;;
@@ -2342,15 +2530,15 @@ remove_published_entrypoints() {
             "$manifest_destination") expected='current/manifest.json' ;;
             *) expected="../../../.local/share/codex-info/current/$(basename -- "$destination")" ;;
         esac
-        [[ "$link_target" == "$expected" ]] || safe_blocked "foreign or noncanonical symlink during rollback: $destination"
-        atomic_unlink "$destination"
+        fixed_link_matches "$destination" "$expected" || safe_blocked "foreign or noncanonical symlink during rollback: $destination"
+        atomic_unlink "$destination" || return 1
     done
 }
 ensure_entrypoints_for_generation() {
     [[ -n "${previous_id-}" ]] || return 0
     (( previous_combined == 0 )) || return 0
     local destination expected
-    mkdir -p -- "$local_bin" "$local_libexec" "$unit_dir"
+    mkdir -p -- "$local_bin" "$local_libexec" "$unit_dir" || return 1
     for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
         [[ "${desired_state-}" == removed && ("$destination" == "$unit_destination" || "$destination" == "$rest_unit_destination" || "$destination" == "$update_service_destination" || "$destination" == "$update_timer_destination") ]] && continue
         [[ -e "$destination" || -L "$destination" ]] && continue
@@ -2363,7 +2551,7 @@ ensure_entrypoints_for_generation() {
             "$manifest_destination") expected='current/manifest.json' ;;
             *) expected="../../../.local/share/codex-info/current/$(basename -- "$destination")" ;;
         esac
-        atomic_symlink "$expected" "$destination"
+        atomic_symlink "$expected" "$destination" || return 1
     done
 }
 
@@ -2378,7 +2566,7 @@ socket_pid() {
     python3 - "$proc_root" <<'PY'
 import os,pathlib,re,sys
 root=pathlib.Path(sys.argv[1]); tcp=root/"net/tcp"
-if not tcp.exists(): print(""); raise SystemExit(0)
+if not tcp.exists(): raise SystemExit("listener table is unavailable")
 inodes=set()
 for line in tcp.read_text(errors="replace").splitlines()[1:]:
     fields=line.split()
@@ -2661,7 +2849,7 @@ if receipt_name:
     required={"schema","operation_id","generation","recorder","rest","runtime"}
     if not isinstance(receipt,dict) or set(receipt) != required or receipt["schema"] != "codex-info-incident-override-pair-v1" or receipt["operation_id"] != operation or receipt["generation"] != generation:
         fail("rollback receipt authority differs")
-    if not isinstance(receipt["runtime"],dict) or set(receipt["runtime"]) != set(runtime) or receipt["runtime"] != runtime or any(type(v) is not bool for v in runtime.values()):
+    if not isinstance(receipt["runtime"],dict) or set(receipt["runtime"]) != set(runtime) or receipt["runtime"] != runtime or any(type(v) is not bool for v in receipt["runtime"].values()):
         fail("restored service active/enabled intent differs")
 
 def read_properties(raw):
@@ -2716,7 +2904,7 @@ if action == "remove-rest":
     if recorder_override.exists() or recorder_override.is_symlink(): fail("Recorder override was not removed before REST removal")
     try: saved_bytes=base64.b64decode(saved["override_b64"],validate=True)
     except Exception: fail("saved Recorder configuration bytes are invalid")
-    if (base64.b64encode(saved_bytes).decode()!=saved["override_b64"] or saved["override_mode"]!=0o600 or
+    if (saved["override_mode"]!=0o600 or
         saved["override_sha256"]!=hashlib.sha256(saved_bytes).hexdigest()):
         fail("saved Recorder configuration identity is invalid")
     recorder_backup=pathlib.Path(backup_root_name)/(operation+"-recorder-604-hotfix.conf")
@@ -2744,7 +2932,7 @@ for service,(override,hotfix,raw_properties,pid,active,suffix) in paths.items():
         if not isinstance(saved,dict) or set(saved) != keys: fail(service + " saved identity schema is invalid")
         try: saved_bytes=base64.b64decode(saved["override_b64"],validate=True)
         except Exception: fail(service + " saved configuration bytes are invalid")
-        if (base64.b64encode(saved_bytes).decode()!=saved["override_b64"] or saved["override"]!=str(override) or saved["override_mode"]!=0o600 or
+        if (saved["override"]!=str(override) or saved["override_mode"]!=0o600 or
             saved["override_sha256"]!=hashlib.sha256(saved_bytes).hexdigest() or data!=saved_bytes or payload!=saved["executable"]):
             fail(service + " restored configuration or hotfix identity differs from exact prestate")
     current=process("RECORDER" if service=="recorder" else "REST",hotfix,pid,active,payload)
@@ -2779,9 +2967,15 @@ elif action in {"remove-recorder","remove-rest"}:
     path=pathlib.Path(receipt[service]["override"]); expected=base64.b64decode(receipt[service]["override_b64"],validate=True)
     if path.is_symlink() or not path.is_file() or path.stat().st_uid!=os.getuid() or stat.S_IMODE(path.stat().st_mode)!=0o600 or path.read_bytes()!=expected:
         fail(service + " configuration changed before removal")
-    path.unlink(); fd=os.open(path.parent,os.O_DIRECTORY)
-    try: os.fsync(fd)
-    finally: os.close(fd)
+    try:
+        path.unlink(); fd=os.open(path.parent,os.O_DIRECTORY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+    except OSError as error:
+        # Identity conflicts retain the existing refusal status. Only a
+        # verified removal's ordinary I/O failure requests transaction rollback.
+        print("paired configuration removal I/O failed: " + str(error), file=sys.stderr)
+        raise SystemExit(74)
 elif action != "inspect":
     fail("unknown paired migration action")
 elif receipt is not None:
@@ -2994,7 +3188,7 @@ if state["schema"] != "codex-info-recorder-state-v1" or state["pid"] != pid or s
     raise SystemExit("recorder owner identity mismatch")
 if isinstance(state["updated_at_unix"], bool) or not isinstance(state["updated_at_unix"], int) or state["updated_at_unix"] <= 0: raise SystemExit("recorder updated_at_unix is invalid")
 now = int(time.time())
-if state["updated_at_unix"] > now + 5 or now - state["updated_at_unix"] > 150: raise SystemExit("recorder heartbeat is stale")
+if state["updated_at_unix"] > now or now - state["updated_at_unix"] > 150: raise SystemExit("recorder heartbeat is stale")
 write_state = state["write_state"]
 if write_state not in {"idle_no_account","ready","degraded"}: raise SystemExit("recorder write state is invalid")
 partition = state["partition_id_hash"]
@@ -3003,7 +3197,7 @@ if write_state == "idle_no_account" and any(state[key] is not None for key in ("
     raise SystemExit("idle recorder state is inconsistent")
 if write_state in {"ready", "degraded"}:
     if partition is None or any(state[key] is None for key in ("data_generation","collector_epoch","cycle_seq","last_commit_unix")): raise SystemExit("recorder state is incomplete")
-    if state["last_commit_unix"] > now + 5 or now - state["last_commit_unix"] > 150: raise SystemExit("recorder commit is stale")
+    if state["last_commit_unix"] > now or now - state["last_commit_unix"] > 150: raise SystemExit("recorder commit is stale")
 if state["data_generation"] is not None and (isinstance(state["data_generation"], bool) or not isinstance(state["data_generation"], int) or state["data_generation"] <= 0): raise SystemExit("recorder data generation is invalid")
 if state["collector_epoch"] is not None and (not isinstance(state["collector_epoch"], str) or not re.fullmatch(r"[0-9a-f]{32}", state["collector_epoch"]) or set(state["collector_epoch"]) == {"0"}): raise SystemExit("recorder collector epoch is invalid")
 if state["cycle_seq"] is not None and (isinstance(state["cycle_seq"], bool) or not isinstance(state["cycle_seq"], int) or state["cycle_seq"] <= 0): raise SystemExit("recorder cycle is invalid")
@@ -3092,30 +3286,43 @@ allowed_states={"ready","auth_required","error"} if sys.argv[1] == "v4" else {"r
 if document.get("state") not in allowed_states:
     raise SystemExit("details state is unknown")
 observed_at=document.get("observed_at")
-if not (sys.argv[1] == "v4" and document["state"] in {"auth_required","error"} and observed_at is None) and (isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0):
+if not (sys.argv[1] == "v4" and document["state"] in {"auth_required","error"} and observed_at is None) and (isinstance(observed_at,bool) or not isinstance(observed_at,int) or not 1 <= observed_at <= 253402300799):
     raise SystemExit("details observed_at is invalid")
 if sys.argv[1] == "v4":
     required={"api_version","state","observed_at","authenticated","plan_label","quota","models_status","models","active_thread_count","open_session_thread_count"}
     if set(document) != required or document["api_version"] != "v4": raise SystemExit("current schema is unknown")
     def uint(value): return type(value) is int and 0 <= value <= 18446744073709551615
-    if type(document["authenticated"]) is not bool or not (document["plan_label"] is None or isinstance(document["plan_label"],str)): raise SystemExit("current account metadata is invalid")
+    plans={"無料":False,"Go":False,"Plus":False,"Pro":False,"Pro Lite":False,"Team":False,"Business":False,"エンタープライズ":True,"教育":False,"プラン未設定":False}
+    if type(document["authenticated"]) is not bool or not (document["plan_label"] is None or isinstance(document["plan_label"],str) and document["plan_label"] in plans): raise SystemExit("current account metadata is invalid")
+    if document["state"] == "ready" and not document["authenticated"] or document["state"] == "auth_required" and document["authenticated"]: raise SystemExit("current authentication state is inconsistent")
     if not all(uint(document[k]) for k in ("active_thread_count","open_session_thread_count")) or document["active_thread_count"] > document["open_session_thread_count"]: raise SystemExit("current thread counts are invalid")
     quota=document["quota"]
     if quota is not None:
         if not isinstance(quota,dict) or set(quota) != {"remaining_percent","reset_at","window_seconds","monthly"}: raise SystemExit("current quota schema is invalid")
         remaining=quota["remaining_percent"]
-        if type(remaining) not in {int,float} or not 0 <= remaining <= 100 or not uint(quota["reset_at"]) or quota["reset_at"] == 0 or not uint(quota["window_seconds"]) or quota["window_seconds"] == 0 or type(quota["monthly"]) is not bool: raise SystemExit("current quota is invalid")
-    if document["models_status"] not in {"complete","partial","unavailable"} or not isinstance(document["models"],list): raise SystemExit("current models are invalid")
+        if type(remaining) not in {int,float} or not 0 <= remaining <= 100 or type(quota["reset_at"]) is not int or not 1 <= quota["reset_at"] <= 253402300799 or type(quota["window_seconds"]) is not int or quota["window_seconds"] <= 0 or type(quota["monthly"]) is not bool: raise SystemExit("current quota is invalid")
+        if document["plan_label"] is not None and quota["monthly"] != plans[document["plan_label"]]: raise SystemExit("current plan classification is inconsistent")
+    if document["models_status"] not in {"complete","partial","unavailable"} or not isinstance(document["models"],list) or len(document["models"]) > 1024: raise SystemExit("current models are invalid")
     if document["models_status"] == "unavailable" and document["models"]: raise SystemExit("unavailable current models are not empty")
-    previous=""
+    if not document["authenticated"] and (observed_at is not None or document["plan_label"] is not None or quota is not None or document["models"] or document["models_status"] != "unavailable" or document["active_thread_count"] != 0 or document["open_session_thread_count"] != 0): raise SystemExit("current account boundary is not empty")
+    model_ids=set()
     for model in document["models"]:
         if not isinstance(model,dict) or set(model) != {"model","total_tokens","input_tokens","cached_input_tokens","cache_write_input_tokens","output_tokens","estimated_cost"}: raise SystemExit("current model schema is invalid")
-        if not isinstance(model["model"],str) or model["model"] <= previous or not uint(model["total_tokens"]): raise SystemExit("current model identity or total is invalid")
-        previous=model["model"]
-        for key in ("input_tokens","cached_input_tokens","cache_write_input_tokens","output_tokens"):
-            if model[key] is not None and (not uint(model[key]) or model[key] > model["total_tokens"]): raise SystemExit("current component is invalid")
+        key=model["model"]
+        if not isinstance(key,str) or not 1 <= len(key) <= 128 or any(ord(c) < 32 or 127 <= ord(c) <= 159 or 55296 <= ord(c) <= 57343 or ord(c) in {1564,8206,8207} or 8234 <= ord(c) <= 8238 or 8294 <= ord(c) <= 8297 for c in key) or key in model_ids or not uint(model["total_tokens"]): raise SystemExit("current model identity or total is invalid")
+        model_ids.add(key)
+        for key in ("input_tokens","cached_input_tokens","output_tokens"):
+            if not uint(model[key]): raise SystemExit("current component is invalid")
+        write=model["cache_write_input_tokens"]
+        if write is not None and not uint(write): raise SystemExit("current cache write is invalid")
+        if model["input_tokens"] + model["output_tokens"] != model["total_tokens"]: raise SystemExit("current token total is inconsistent")
+        if model["cached_input_tokens"] > model["input_tokens"]: raise SystemExit("current cached input is inconsistent")
+        if write is not None and model["cached_input_tokens"] + write > model["input_tokens"]: raise SystemExit("current cache write is inconsistent")
         cost=model["estimated_cost"]
-        if cost is not None and (not isinstance(cost,dict) or set(cost) != {"price_version","ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars"}): raise SystemExit("current price schema is invalid")
+        if cost is not None:
+            if not isinstance(cost,dict) or set(cost) != {"price_version","ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars"}: raise SystemExit("current price schema is invalid")
+            if not isinstance(cost["price_version"],str) or not cost["price_version"]: raise SystemExit("current price revision is invalid")
+            if any(type(cost[key]) not in {int,float} or not 0 <= cost[key] <= sys.float_info.max for key in ("ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars")): raise SystemExit("current price amount is invalid")
 ' "$current_version" <<< "$details" || return 1
     local recorder_pid
     recorder_pid="$(recorder_systemd_pid)"; [[ "$recorder_pid" != 0 ]] || safe_blocked 'recorder service has no MainPID'
@@ -3132,10 +3339,8 @@ verify_runtime() {
     verify_fixed_links
     legacy_combined_retired || safe_blocked 'legacy combined unit was not retired'
     [[ -L "$current_link" ]] || safe_blocked 'current generation is absent'
-    local target generation info version source manifest_hash binary_hash rest_hash pid recorder_pid before
-    target="$(readlink -- "$current_link")"
-    [[ "$target" == generations/* && "$target" != */*/* ]] || safe_blocked 'current generation link is invalid'
-    generation="${target#generations/}"
+    local generation info version source manifest_hash binary_hash rest_hash pid recorder_pid before
+    generation="$(current_generation)" || return 1
     [[ -d "$generations_dir/$generation" && ! -L "$generations_dir/$generation" ]] || safe_blocked 'current generation directory is invalid'
     info="$(manifest_record)"; IFS=$'\t' read -r version source manifest_hash binary_hash <<<"$info"
     rest_hash="$(manifest_rest_hash)" || safe_blocked 'REST binary digest is unavailable'
@@ -3153,12 +3358,10 @@ verify_runtime() {
     printf 'ready version=%s source=%s generation=%s pid=%s\n' "$version" "$source" "$generation" "$pid"
 }
 verify_ui_source() {
-    local target generation info version source manifest_hash binary_hash rest_hash pid expected_exe resolved listener_pid
+    local generation info version source manifest_hash binary_hash rest_hash pid expected_exe resolved listener_pid
     verify_fixed_links_local || return 1
     [[ -L "$current_link" ]] || return 1
-    target="$(readlink -- "$current_link")"
-    [[ "$target" == generations/* && "$target" != */*/* ]] || return 1
-    generation="${target#generations/}"
+    generation="$(current_generation)" || return 1
     [[ -d "$generations_dir/$generation" && ! -L "$generations_dir/$generation" ]] || return 1
     info="$(manifest_record)" || return 1
     IFS=$'\t' read -r version source manifest_hash binary_hash <<<"$info"
@@ -3166,7 +3369,7 @@ verify_ui_source() {
     [[ "$generation" == "$version-$source-$manifest_hash" ]] || return 1
     verify_generation_files "$generations_dir/$generation" || return 1
     if ! probe_active codex-info-rest.service; then
-        listener_pid="$(socket_pid 2>/dev/null || true)"
+        listener_pid="$(socket_pid)" || return 1
         [[ -z "$listener_pid" ]]
         return
     fi
@@ -3176,7 +3379,7 @@ verify_ui_source() {
     [[ "$resolved" == "$expected_exe" ]] || return 1
     [[ "$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$expected_exe" 2>/dev/null || true)" ]] || return 1
     [[ "$(sha256sum -- "$resolved" 2>/dev/null | awk '{print $1}')" == "$rest_hash" ]] || return 1
-    listener_pid="$(socket_pid 2>/dev/null || true)"
+    listener_pid="$(socket_pid)" || return 1
     [[ -z "$listener_pid" || "$listener_pid" == "$pid" ]]
 }
 verify_legacy_runtime() {
@@ -3220,7 +3423,9 @@ verify_legacy_terminal() {
     else
         ! probe_active codex-info-recorder.service || return 1
         ! probe_active codex-info-rest.service || return 1
-        [[ -z "$(socket_pid 2>/dev/null || true)" ]]
+        local listener_pid
+        listener_pid="$(socket_pid)" || return 1
+        [[ -z "$listener_pid" ]]
     fi
 }
 rearm_update_timer() {
@@ -3290,7 +3495,7 @@ verify_nonrunning_terminal() {
         probe_active codex-info-recorder.service && return 1
         probe_active codex-info-rest.service && return 1
     fi
-    listener_pid="$(socket_pid 2>/dev/null || true)"
+    listener_pid="$(socket_pid)" || return 1
     [[ -z "$listener_pid" ]] || return 1
     verify_local_generation || return 1
     case "$desired" in
@@ -3358,7 +3563,7 @@ legacy_recovery_reader_build() {
     local mode="$1" source
     source="$(legacy_recovery_reader_source)"
     version_python "$source" "$mode" "$legacy_recovery_reader_hash" <<'PY_RECOVERY_READER'
-import base64, gzip, hashlib, os, pathlib, stat, sys
+import base64, gzip, hashlib, io, os, pathlib, stat, sys
 source_path = pathlib.Path(sys.argv[1])
 mode, expected_hash = sys.argv[2:]
 try:
@@ -3383,8 +3588,14 @@ try:
     if body == empty_field:
         lines[index] = embedded_field + ending
         data = b"".join(lines)
-    elif body != embedded_field:
-        raise ValueError("embedded version module changed during recovery")
+    else:
+        if not body.startswith(marker + b"'") or not body.endswith(b"'"):
+            raise ValueError("embedded version module field is invalid")
+        encoded = body[len(marker) + 1:-1]
+        with gzip.GzipFile(fileobj=io.BytesIO(base64.b64decode(encoded, validate=True))) as embedded:
+            existing_module = embedded.read(1024 * 1024 + 1)
+        if existing_module != module_bytes:
+            raise ValueError("embedded version module changed during recovery")
     if len(data) > 524288:
         raise ValueError("legacy reader source with module is too large")
     if mode == "render":
@@ -3585,8 +3796,8 @@ prepare_legacy_recovery_reader() {
 validate_legacy_recovery_installer_binding() {
     legacy_recovery_reader_active && return 0
     if [[ -L "$installer_destination" ]]; then
-        [[ "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' &&
-           "$(stat -c '%u' -- "$installer_destination")" == "$(id -u)" ]] || return 1
+        fixed_link_matches "$installer_destination" '../share/codex-info/current/install.sh' &&
+            [[ "$(stat -c '%u' -- "$installer_destination")" == "$(id -u)" ]] || return 1
         local generation; generation="$(current_generation)"
         [[ "$generation" == "$previous_id" || "$generation" == "$candidate_id" ]] && [[ -n "$generation" ]]
     elif (( ! legacy_combined_generation )); then
@@ -3689,7 +3900,7 @@ validate_legacy_combined_recovery() {
                         cmp -s -- "$destination" "$backup"; }; }; then
                     :
                 else
-                    [[ -L "$destination" && "$(readlink -- "$destination")" == "$expected" ]] ||
+                    fixed_link_matches "$destination" "$expected" ||
                         safe_blocked 'foreign legacy destination blocks recovery'
                 fi
             fi
@@ -3774,39 +3985,40 @@ retire_legacy_combined() {
     previous_combined=1
     if (( legacy_combined_active )); then
         systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 ||
-            safe_blocked 'legacy combined service could not be stopped'
-        wait_inactive codex-info.service || safe_blocked 'legacy combined service did not stop'
+            return 1
+        wait_inactive codex-info.service || return 1
     fi
     if (( legacy_combined_enabled )); then
         systemctl_user disable --no-block codex-info.service >/dev/null 2>&1 ||
-            safe_blocked 'legacy combined service could not be disabled'
-        probe_legacy_combined_enabled && safe_blocked 'legacy combined service remained enabled'
+            return 1
+        probe_legacy_combined_enabled && return 1
     fi
     if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
         validate_legacy_combined_enable_link
-        atomic_unlink "$legacy_combined_enable_destination"
+        atomic_unlink "$legacy_combined_enable_destination" || return 1
     fi
     if probe_active codex-info.service; then
         systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 ||
-            safe_blocked 'legacy combined service restarted during retirement'
-        wait_inactive codex-info.service || safe_blocked 'legacy combined service restarted during retirement'
+            return 1
+        wait_inactive codex-info.service || return 1
     fi
-    listener_pid="$(socket_pid 2>/dev/null || true)"
+    listener_pid="$(socket_pid)" || safe_blocked 'legacy combined listener ownership is unavailable'
     if [[ -n "$listener_pid" ]]; then
         legacy_combined_listener_matches || safe_blocked 'legacy combined listener remained after stop'
         retire_known_unmanaged "$managed_pid"
     fi
-    [[ -z "$(socket_pid 2>/dev/null || true)" ]] || safe_blocked 'legacy combined listener could not be retired'
+    listener_pid="$(socket_pid)" || safe_blocked 'legacy listener ownership is unavailable after retirement'
+    [[ -z "$listener_pid" ]] || safe_blocked 'legacy combined listener could not be retired'
     backup_legacy_combined_unit
 }
 restore_legacy_combined_entrypoints() {
     (( previous_combined && legacy_combined_generation )) || return 0
-    atomic_symlink '../share/codex-info/current/codex_info' "$binary_destination"
-    atomic_symlink '../share/codex-info/current/run.sh' "$launcher_destination"
-    if [[ -z "${legacy_recovery_reader_hash:-}" ]]; then atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"; fi
-    atomic_symlink 'current/manifest.json' "$manifest_destination"
-    atomic_symlink '../../../.local/share/codex-info/current/codex-info.service' "$legacy_combined_unit_destination"
-    atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.service' "$update_service_destination"
+    atomic_symlink '../share/codex-info/current/codex_info' "$binary_destination" || return 1
+    atomic_symlink '../share/codex-info/current/run.sh' "$launcher_destination" || return 1
+    if [[ -z "${legacy_recovery_reader_hash:-}" ]]; then atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination" || return 1; fi
+    atomic_symlink 'current/manifest.json' "$manifest_destination" || return 1
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info.service' "$legacy_combined_unit_destination" || return 1
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.service' "$update_service_destination" || return 1
     atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.timer' "$update_timer_destination"
 }
 restore_legacy_combined_runtime() {
@@ -3822,13 +4034,13 @@ restore_legacy_combined_runtime() {
         if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
             validate_legacy_combined_enable_link
         fi
-        atomic_symlink '../codex-info.service' "$legacy_combined_enable_destination"
+        atomic_symlink '../codex-info.service' "$legacy_combined_enable_destination" || return 1
         systemctl_user daemon-reload >/dev/null 2>&1 || return 1
         probe_legacy_combined_enabled || return 1
     else
         if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
             validate_legacy_combined_enable_link
-            atomic_unlink "$legacy_combined_enable_destination"
+            atomic_unlink "$legacy_combined_enable_destination" || return 1
         fi
         ! probe_legacy_combined_enabled || return 1
     fi
@@ -3860,7 +4072,9 @@ verify_legacy_combined_terminal() {
         wait_legacy_combined_ready
     else
         ! probe_active codex-info.service || return 1
-        [[ -z "$(socket_pid 2>/dev/null || true)" ]]
+        local listener_pid
+        listener_pid="$(socket_pid)" || return 1
+        [[ -z "$listener_pid" ]]
     fi
 }
 recover_legacy_combined_state() {
@@ -4012,12 +4226,18 @@ rollback_transaction() {
             verify_legacy_terminal || ok=0
         else
             [[ ! -L "$current_link" ]] || ok=0
-            [[ -z "$(socket_pid 2>/dev/null || true)" ]] || ok=0
+            local listener_pid=
+            listener_pid="$(socket_pid)" || ok=0
+            [[ -z "$listener_pid" ]] || ok=0
         fi
     fi
     if ((ok)); then
-        write_journal rollback_verified "$reason"
-        write_journal committed rolled_back
+        write_journal rollback_verified "$reason" || safe_blocked 'restored runtime rollback verification journal could not be saved'
+        write_journal committed rolled_back || safe_blocked 'restored runtime rollback commit journal could not be saved'
+        if ! cleanup_control_prestate "$operation_id"; then
+            generation_prune_failed 'verified rollback control prestate cleanup failed'
+            return 1
+        fi
         if (( previous_combined )) && [[ -n "$legacy_recovery_reader_hash" ]]; then
             restore_legacy_recovery_installer || ok=0
             ((ok)) && verify_legacy_combined_terminal || ok=0
@@ -4042,6 +4262,10 @@ resume_transaction() {
     [[ -f "$transaction" ]] || return 0
     read_journal
     if [[ "$journal_phase" == committed ]]; then
+        if ! cleanup_control_prestate "$journal_operation_id"; then
+            generation_prune_failed 'committed operation control prestate cleanup failed'
+            return 1
+        fi
         if [[ -n "${journal_legacy_recovery_reader_hash:-}" ]]; then finish_committed_legacy_recovery; fi
         return 0
     fi
@@ -4060,8 +4284,18 @@ resume_transaction() {
         if [[ "$(current_generation)" == "$candidate_id" ]] && verify_local_generation >/dev/null 2>&1 &&
             { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
             converge_enable_links || safe_blocked 'candidate enable links could not be recovered'
-            write_journal candidate_verified resumed-live-owner
-            write_journal committed resumed
+            if ! write_journal candidate_verified resumed-live-owner; then
+                rollback_transaction "$previous_id" 'resumed transaction journal write failed'
+                die 'resumed transaction journal write failed; previous state restored'
+            fi
+            if ! write_journal committed resumed; then
+                rollback_transaction "$previous_id" 'resumed transaction journal write failed'
+                die 'resumed transaction journal write failed; previous state restored'
+            fi
+            if ! cleanup_control_prestate "$operation_id"; then
+                generation_prune_failed 'resumed operation control prestate cleanup failed'
+                return 1
+            fi
             return 0
         fi
     elif [[ "$journal_phase" == rollback_switched ]] && (( ! previous_combined )); then
@@ -4069,18 +4303,52 @@ resume_transaction() {
             if [[ "$(current_generation)" == "$previous_id" ]] && verify_local_generation >/dev/null 2>&1 &&
                 { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
                 converge_enable_links || safe_blocked 'rollback enable links could not be recovered'
-                write_journal rollback_verified resumed-rollback
-                write_journal committed resumed
+                if ! write_journal rollback_verified resumed-rollback; then
+                    rollback_transaction "$previous_id" 'resumed transaction journal write failed'
+                    die 'resumed transaction journal write failed; previous state restored'
+                fi
+                if ! write_journal committed resumed; then
+                    rollback_transaction "$previous_id" 'resumed transaction journal write failed'
+                    die 'resumed transaction journal write failed; previous state restored'
+                fi
+                if ! cleanup_control_prestate "$operation_id"; then
+                    generation_prune_failed 'resumed operation control prestate cleanup failed'
+                    return 1
+                fi
                 return 0
             fi
         elif legacy_flat_present && verify_legacy_terminal >/dev/null 2>&1; then
-            write_journal rollback_verified resumed-legacy-rollback
-            write_journal committed resumed
+            if ! write_journal rollback_verified resumed-legacy-rollback; then
+                rollback_transaction "$previous_id" 'resumed transaction journal write failed'
+                die 'resumed transaction journal write failed; previous state restored'
+            fi
+            if ! write_journal committed resumed; then
+                rollback_transaction "$previous_id" 'resumed transaction journal write failed'
+                die 'resumed transaction journal write failed; previous state restored'
+            fi
+            if ! cleanup_control_prestate "$operation_id"; then
+                generation_prune_failed 'resumed operation control prestate cleanup failed'
+                return 1
+            fi
             return 0
-        elif [[ ! -L "$current_link" ]] && [[ -z "$(socket_pid 2>/dev/null || true)" ]]; then
-            write_journal rollback_verified resumed-empty-rollback
-            write_journal committed resumed
-            return 0
+        elif [[ ! -L "$current_link" ]]; then
+            local listener_pid
+            listener_pid="$(socket_pid)" || safe_blocked 'listener ownership is unavailable during rollback resume'
+            if [[ -z "$listener_pid" ]]; then
+                if ! write_journal rollback_verified resumed-empty-rollback; then
+                    rollback_transaction "$previous_id" 'resumed transaction journal write failed'
+                    die 'resumed transaction journal write failed; previous state restored'
+                fi
+                if ! write_journal committed resumed; then
+                    rollback_transaction "$previous_id" 'resumed transaction journal write failed'
+                    die 'resumed transaction journal write failed; previous state restored'
+                fi
+                if ! cleanup_control_prestate "$operation_id"; then
+                    generation_prune_failed 'resumed operation control prestate cleanup failed'
+                    return 1
+                fi
+                return 0
+            fi
         fi
     fi
     rollback_transaction "$previous_id" 'resumed rollback'
@@ -4105,13 +4373,13 @@ activate_candidate() {
         if (( ! recorder_override_migrated )) && recorder_artifact_matches_previous "$candidate_recorder_hash"; then
             recorder_reused=1
         else
-            systemctl_user restart --no-block codex-info-recorder.service >/dev/null 2>&1 || return 1
+            systemctl_user restart codex-info-recorder.service >/dev/null 2>&1 || return 1
         fi
     else
-        systemctl_user start --no-block codex-info-recorder.service >/dev/null 2>&1 || return 1
+        systemctl_user start codex-info-recorder.service >/dev/null 2>&1 || return 1
     fi
-    if ((rest_active)); then systemctl_user restart --no-block codex-info-rest.service >/dev/null 2>&1 || return 1
-    else systemctl_user start --no-block codex-info-rest.service >/dev/null 2>&1 || return 1; fi
+    if ((rest_active)); then systemctl_user restart codex-info-rest.service >/dev/null 2>&1 || return 1
+    else systemctl_user start codex-info-rest.service >/dev/null 2>&1 || return 1; fi
 }
 verify_candidate() {
     if [[ -n "$update_stage" ]]; then update_stage=readiness; update_log started; fi
@@ -4123,11 +4391,7 @@ perform_install() {
     local preserved_local_timer_state=
     local install_deadline="$operation_deadline"
     local operation_deadline="$operation_deadline"
-    local release_digest=
-    if [[ "${CODEX_INFO_RELEASE_DIGEST_VERIFIED:-}" == 1 ]]; then
-        release_digest="${CODEX_INFO_RELEASE_ARCHIVE_DIGEST:-}"
-        [[ -n "$release_digest" ]] || die 'verified release archive digest is unavailable'
-    fi
+    local release_digest="${CODEX_INFO_RELEASE_ARCHIVE_DIGEST:-}"
     candidate_stage="$(mktemp -d "$generations_dir/.candidate.XXXXXX")"
     validation="$(validate_bundle "$ARCHIVE" "$MANIFEST" "$candidate_stage" "${CHECKSUM:-$ARCHIVE.sha256}" "$release_digest")" ||
         die 'candidate staging failed before mutation'
@@ -4186,37 +4450,108 @@ perform_install() {
     if [[ "$recorder_execution" == paired-selected ]]; then
         local pair_receipt
         pair_receipt="$(incident_override_pair_receipt)"
-        incident_override_pair_operation remove-recorder "$previous_id" "$pair_receipt" >/dev/null || safe_blocked 'recorder incident override changed before paired migration'
-        write_journal prepared
+        local pair_recorder_status=0
+        incident_override_pair_operation remove-recorder "$previous_id" "$pair_receipt" >/dev/null ||
+            pair_recorder_status=$?
+        case "$pair_recorder_status" in
+            0) ;;
+            74)
+                rollback_transaction "$previous_id" 'paired recorder configuration removal failed'
+                die 'paired recorder configuration removal failed; previous configuration restored'
+                ;;
+            *) safe_blocked 'recorder incident override changed before paired migration' ;;
+        esac
         [[ "$(printenv CODEX_INFO_INTERRUPT_PHASE 2>/dev/null || true)" != incident_recorder_backed_up ]] || exit 75
-        incident_override_pair_operation remove-rest "$previous_id" "$pair_receipt" >/dev/null || safe_blocked 'REST incident override changed before paired migration'
-        write_journal prepared
+        local pair_rest_status=0
+        incident_override_pair_operation remove-rest "$previous_id" "$pair_receipt" >/dev/null ||
+            pair_rest_status=$?
+        case "$pair_rest_status" in
+            0) ;;
+            74)
+                rollback_transaction "$previous_id" 'paired rest configuration removal failed'
+                die 'paired rest configuration removal failed; previous configuration restored'
+                ;;
+            *) safe_blocked 'REST incident override changed before paired migration' ;;
+        esac
         recorder_override_migrated=1
     elif [[ "$recorder_execution" == legacy || "$recorder_execution" == selected ]]; then
-        backup_legacy_path "$recorder_override_destination"
+        if ! backup_legacy_path "$recorder_override_destination"; then
+            rollback_transaction "$previous_id" 'recorder override backup failed'
+            die 'recorder override backup failed; previous generation restored'
+        fi
         recorder_override_migrated=1
-        write_journal prepared
     fi
-    retire_legacy_combined "$managed_pid"
-    enforce_desired_state || safe_blocked 'could not enforce desired runtime state'
+    if ! retire_legacy_combined "$managed_pid"; then
+        rollback_transaction "$previous_id" 'legacy combined retirement failed'
+        die 'legacy combined retirement failed; previous generation restored'
+    fi
+    if ! enforce_desired_state; then
+        rollback_transaction "$previous_id" 'desired runtime convergence failed'
+        die 'desired runtime convergence failed; previous generation restored'
+    fi
     retire_known_unmanaged "$managed_pid"
     for destination in "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
-        if [[ "$destination" != "$installer_destination" || -z "$legacy_recovery_reader_hash" ]]; then backup_legacy_path "$destination"; fi
-        # Persist each legacy move, so a crash between two moves can always
-        # replay the same operation without guessing from mtimes.
-        write_journal prepared
+        if [[ "$destination" != "$installer_destination" || -z "$legacy_recovery_reader_hash" ]]; then
+            if ! backup_legacy_path "$destination"; then
+                rollback_transaction "$previous_id" 'legacy entrypoint backup failed'
+                die 'legacy entrypoint backup failed; previous generation restored'
+            fi
+        fi
     done
-    write_journal legacy_backed_up; link_entrypoints; write_journal entrypoints_linked
-    candidate_final="$generations_dir/$candidate_id"; publish_candidate "$candidate_stage" "$candidate_final"; candidate_stage=
-    if ! verify_generation_files "$candidate_final"; then
-        (( candidate_created )) && rm -r -- "$candidate_final"
-        safe_blocked 'published candidate artifacts are incoherent'
+    if ! write_journal legacy_backed_up; then
+        rollback_transaction "$previous_id" 'legacy backup journal failed'
+        die 'legacy backup journal failed; previous generation restored'
     fi
-    write_journal candidate_published; atomic_symlink "generations/$candidate_id" "$current_link"; write_journal current_switched
-    if [[ -n "$legacy_recovery_reader_hash" ]]; then atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"; fi
+    if ! link_entrypoints; then
+        rollback_transaction "$previous_id" 'entrypoint publication failed'
+        die 'entrypoint publication failed; previous generation restored'
+    fi
+    if ! write_journal entrypoints_linked; then
+        rollback_transaction "$previous_id" 'entrypoint publication journal failed'
+        die 'entrypoint publication journal failed; previous generation restored'
+    fi
+    candidate_final="$generations_dir/$candidate_id"
+    if ! publish_candidate "$candidate_stage" "$candidate_final"; then
+        rollback_transaction "$previous_id" 'candidate publication failed'
+        die 'candidate publication failed; previous generation restored'
+    fi
+    candidate_stage=
+    if ! verify_generation_files "$candidate_final"; then
+        rollback_transaction "$previous_id" 'published candidate artifacts are incoherent'
+        if (( candidate_created )); then
+            rm -r -- "$candidate_final" ||
+                die 'previous generation restored; incoherent candidate cleanup failed'
+        fi
+        die 'published candidate artifacts are incoherent; previous generation restored'
+    fi
+    if ! write_journal candidate_published; then
+        rollback_transaction "$previous_id" 'candidate publication journal failed'
+        die 'candidate publication journal failed; previous generation restored'
+    fi
+    if ! atomic_symlink "generations/$candidate_id" "$current_link"; then
+        rollback_transaction "$previous_id" 'current publication failed'
+        die 'current publication failed; previous generation restored'
+    fi
+    if ! write_journal current_switched; then
+        rollback_transaction "$previous_id" 'current publication journal failed'
+        die 'current publication journal failed; previous generation restored'
+    fi
+    if [[ -n "$legacy_recovery_reader_hash" ]]; then
+        if ! atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"; then
+            rollback_transaction "$previous_id" 'legacy installer handoff failed'
+            die 'legacy installer handoff failed; previous generation restored'
+        fi
+    fi
     if ! activate_candidate; then rollback_transaction "$previous_id" 'candidate activation failed'; die 'candidate activation failed; previous generation restored'; fi
-    write_journal activation_requested
+    if ! write_journal activation_requested; then
+        rollback_transaction "$previous_id" 'activation journal failed'
+        die 'activation journal failed; previous generation restored'
+    fi
     if ! verify_candidate; then rollback_transaction "$previous_id" 'candidate verification failed'; die 'candidate verification failed; previous generation restored'; fi
+    if ! preserve_control_prestate; then
+        rollback_transaction "$previous_id" 'control prestate preservation failed'
+        die 'control prestate preservation failed; previous generation restored'
+    fi
     if ! write_control_state "$desired_state"; then
         rollback_transaction "$previous_id" 'control state publication failed'
         die 'control state publication failed; previous generation restored'
@@ -4226,7 +4561,18 @@ perform_install() {
         rollback_transaction "$previous_id" 'candidate non-running terminal verification failed'
         die 'candidate non-running terminal verification failed; previous generation restored'
     fi
-    write_journal candidate_verified; write_journal committed installed
+    if ! write_journal candidate_verified; then
+        rollback_transaction "$previous_id" 'candidate verification journal failed'
+        die 'candidate verification journal failed; previous generation restored'
+    fi
+    if ! write_journal committed installed; then
+        rollback_transaction "$previous_id" 'commit journal failed'
+        die 'commit journal failed; previous generation restored'
+    fi
+    if ! cleanup_control_prestate "$operation_id"; then
+        generation_prune_failed 'committed control prestate cleanup failed'
+        exit 73
+    fi
     if [[ "$TRIGGER" != startup && "$desired_state" != removed ]]; then
         prune_obsolete_generations || exit 73
     fi
@@ -4288,26 +4634,60 @@ reconcile_recorder_override() {
     write_journal prepared
     if [[ "$execution" == paired-selected ]]; then
         pair_receipt="$(incident_override_pair_receipt)"
-        incident_override_pair_operation remove-recorder "$generation" "$pair_receipt" >/dev/null || safe_blocked 'recorder incident override changed before paired migration'
-        write_journal prepared
+        local pair_recorder_status=0
+        incident_override_pair_operation remove-recorder "$generation" "$pair_receipt" >/dev/null ||
+            pair_recorder_status=$?
+        case "$pair_recorder_status" in
+            0) ;;
+            74)
+                rollback_transaction "$previous_id" 'paired recorder configuration removal failed'
+                die 'paired recorder configuration removal failed; previous configuration restored'
+                ;;
+            *) safe_blocked 'recorder incident override changed before paired migration' ;;
+        esac
         [[ "$(printenv CODEX_INFO_INTERRUPT_PHASE 2>/dev/null || true)" != incident_recorder_backed_up ]] || exit 75
-        incident_override_pair_operation remove-rest "$generation" "$pair_receipt" >/dev/null || safe_blocked 'REST incident override changed before paired migration'
+        local pair_rest_status=0
+        incident_override_pair_operation remove-rest "$generation" "$pair_receipt" >/dev/null ||
+            pair_rest_status=$?
+        case "$pair_rest_status" in
+            0) ;;
+            74)
+                rollback_transaction "$previous_id" 'paired rest configuration removal failed'
+                die 'paired rest configuration removal failed; previous configuration restored'
+                ;;
+            *) safe_blocked 'REST incident override changed before paired migration' ;;
+        esac
     else
-        backup_legacy_path "$recorder_override_destination"
+        if ! backup_legacy_path "$recorder_override_destination"; then
+            rollback_transaction "$previous_id" 'recorder override backup failed'
+            die 'recorder override backup failed; previous state restored'
+        fi
     fi
     recorder_override_migrated=1
-    write_journal current_switched
+    if ! write_journal current_switched; then
+        rollback_transaction "$previous_id" 'recorder override journal write failed'
+        die 'recorder override journal write failed; previous state restored'
+    fi
     if ! activate_candidate; then
         rollback_transaction "$previous_id" 'recorder override activation failed'
         die 'recorder override activation failed; previous configuration restored'
     fi
-    write_journal activation_requested
+    if ! write_journal activation_requested; then
+        rollback_transaction "$previous_id" 'recorder override journal write failed'
+        die 'recorder override journal write failed; previous state restored'
+    fi
     if ! verify_candidate; then
         rollback_transaction "$previous_id" 'recorder override verification failed'
         die 'recorder override verification failed; previous configuration restored'
     fi
-    write_journal candidate_verified
-    write_journal committed override-migrated
+    if ! write_journal candidate_verified; then
+        rollback_transaction "$previous_id" 'recorder override journal write failed'
+        die 'recorder override journal write failed; previous state restored'
+    fi
+    if ! write_journal committed override-migrated; then
+        rollback_transaction "$previous_id" 'recorder override journal write failed'
+        die 'recorder override journal write failed; previous state restored'
+    fi
 }
 run_update() {
     local start update_deadline releases selection info local_coherent=0 discovery_limit update_channel_snapshot update_channel
@@ -4366,15 +4746,17 @@ run_update() {
     if ! select_release "$releases" "$installed_version" "$local_coherent" "$update_channel" >"$selection"; then
         update_failure_with_fallback 'release selection failed'
     fi
-    local state newest; IFS=$'\t' read -r state newest < "$selection"
+    local state newest no_update_message no_update_reason=
+    IFS=$'\t' read -r state newest < "$selection"
     if [[ "$state" == no-candidate ]]; then
-        update_target="$installed_version"; update_stage=selection
-        rm -r -- "$update_root"; update_root=; update_log no-update "no $update_channel candidate"
-        ((QUIET)) || printf 'no %s candidate current=%s\n' "$update_channel" "$installed_version"
-        return 0
+        newest="$installed_version"
+        no_update_reason="no $update_channel candidate"
+        no_update_message="$no_update_reason current=$installed_version"
+    else
+        no_update_message="no update current=$installed_version newest=$newest"
     fi
     update_target="$newest"; update_stage=selection; update_log succeeded
-    if [[ "$state" == no-update ]]; then
+    if [[ "$state" == no-update || "$state" == no-candidate ]]; then
         verify_local_generation || safe_blocked 'no-update local generation is incoherent'
         reconcile_recorder_override "$current_id"
         if [[ "$desired_state" == running ]]; then
@@ -4382,7 +4764,7 @@ run_update() {
                 retire_known_unmanaged 0
                 if [[ "$TRIGGER" == startup ]]; then
                     converge_enable_links || safe_blocked 'startup enable links could not be recovered'
-                    rm -r -- "$update_root"; update_root=; update_log no-update; ((QUIET)) || printf 'no update current=%s newest=%s\n' "$installed_version" "$newest"; return
+                    rm -r -- "$update_root"; update_root=; update_log no-update "$no_update_reason"; ((QUIET)) || printf '%s\n' "$no_update_message"; return
                 fi
                 reset_failed_main || safe_blocked 'could not reset failed managed service'
                 enable_managed_unit codex-info-recorder.service || safe_blocked 'could not enable recorder service'
@@ -4405,7 +4787,7 @@ run_update() {
                 update_failure_with_fallback 'GENERATION_PRUNE_FAILED after verified no-update'
             fi
         fi
-        rm -r -- "$update_root"; update_root=; update_log no-update; ((QUIET)) || printf 'no update current=%s newest=%s\n' "$installed_version" "$newest"; return
+        rm -r -- "$update_root"; update_root=; update_log no-update "$no_update_reason"; ((QUIET)) || printf '%s\n' "$no_update_message"; return
     fi
     [[ "$state" == update ]] || die 'release selection returned unknown state'
     (( $(now_unix) <= update_deadline )) || update_failure_with_fallback 'update overall timeout exceeded before download'
@@ -4414,8 +4796,7 @@ run_update() {
     local archive_path="$update_root/$archive_name" manifest_path="$update_root/manifest.json"
     verify_update_channel_snapshot || update_failure_with_fallback 'update channel changed before download'
     update_stage=download; update_log started
-    download_asset "$archive_url" "$archive_path" "$archive_digest" || update_failure_with_fallback 'release archive download failed'
-    extract_bundle_manifest "$archive_path" "$manifest_path" || update_failure_with_fallback 'release archive manifest is unavailable'
+    download_asset "$archive_url" "$archive_path" || update_failure_with_fallback 'release archive download failed'
     (( $(now_unix) <= update_deadline )) || update_failure_with_fallback 'update overall timeout exceeded before candidate installation'
     local child_limit
     child_limit="$(deadline_timeout "$MANUAL_TIMEOUT")" || update_failure_with_fallback 'update overall timeout exceeded before candidate installation'
@@ -4425,7 +4806,7 @@ run_update() {
     if (( migrate_recorder_override )); then migration_options=(--migrate-recorder-override); fi
     verify_update_channel_snapshot || update_failure_with_fallback 'update channel changed before apply'
     if CODEX_INFO_UPDATE_CHANNEL_SNAPSHOT="$update_channel_snapshot" CODEX_INFO_INTERNAL_TRIGGER="$TRIGGER" CODEX_INFO_DEADLINE="$update_deadline" CODEX_INFO_INSTALL_LOCKED=1 \
-        CODEX_INFO_RELEASE_DIGEST_VERIFIED=1 CODEX_INFO_RELEASE_ARCHIVE_DIGEST="$archive_digest" \
+        CODEX_INFO_RELEASE_ARCHIVE_DIGEST="$archive_digest" \
         CODEX_INFO_UPDATE_TARGET="$newest" \
         timeout --foreground "$child_limit" "$0" --bundle "$archive_path" --manifest "$manifest_path" "${migration_options[@]}"; then
         child_status=0
@@ -4505,14 +4886,13 @@ PY
 }
 
 download_asset() {
-    local url="$1" destination="$2" digest="$3" download_limit
+    local url="$1" destination="$2" download_limit
     download_limit=300
     if (( operation_deadline > 0 )); then
         download_limit="$(deadline_timeout 300)" || return 1
     fi
     "$CURL_BIN" --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time "$download_limit" --output "$destination" "$url" || return 1
     [[ -f "$destination" && ! -L "$destination" ]] || return 1
-    [[ "sha256:$(sha256sum -- "$destination" | awk '{print $1}')" == "$digest" ]] || return 1
 }
 
 readonly_transaction_check() {
@@ -4590,6 +4970,13 @@ if [[ "$ACTION" == status ]]; then
         printf 'status=not-running-by-request\n'
     fi
     exit
+fi
+
+# Authenticate an inherited update handoff before initialization can create
+# a new lock. Initialization still verifies FD9 against the actual L1 inode.
+if [[ "$ACTION" == install && -n "${CODEX_INFO_RELEASE_ARCHIVE_DIGEST:-}" ]]; then
+    [[ "${CODEX_INFO_INSTALL_LOCKED:-}" == 1 && -e /proc/self/fd/9 ]] ||
+        die 'verified-release installation requires the active update transaction'
 fi
 
 initialize_mutating_action
@@ -4717,10 +5104,7 @@ if [[ "$ACTION" == update || "$ACTION" == timer-update ]]; then run_update; exit
 archive_dir="$(cd -- "$(dirname -- "$ARCHIVE")" && pwd)"
 ARCHIVE="$archive_dir/$(basename -- "$ARCHIVE")"
 [[ -n "$MANIFEST" ]] || MANIFEST="${ARCHIVE%.tar.gz}.manifest.json"
-if [[ "${CODEX_INFO_RELEASE_DIGEST_VERIFIED:-}" == 1 ]]; then
-    [[ "$ACTION" == install && "${CODEX_INFO_INSTALL_LOCKED:-}" == 1 && -e /proc/self/fd/9 ]] ||
-        die 'verified-release installation requires the active update transaction'
-else
+if [[ -z "${CODEX_INFO_RELEASE_ARCHIVE_DIGEST:-}" ]]; then
     [[ -n "$CHECKSUM" ]] || CHECKSUM="$ARCHIVE.sha256"
 fi
 update_channel_snapshot="$(update_channel_record)" || exit 1

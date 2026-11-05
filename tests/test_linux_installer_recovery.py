@@ -23,6 +23,7 @@ MEMBERS = {
     "codex-info-update.timer": (b"[Timer]\nOnActiveSec=5min\n", 0o644),
 }
 FUNCTIONS = (
+    "fixed_link_matches",
     "version_python",
     "atomic_text", "atomic_symlink", "atomic_unlink", "write_journal", "read_journal",
     "journal_owner_stale", "current_generation", "legacy_combined_record_at",
@@ -41,6 +42,7 @@ FUNCTIONS = (
     "recover_legacy_reader_handoff", "finish_committed_legacy_recovery",
     "legacy_recovery_reader_image", "legacy_recovery_reader_prior_hash", "seal_legacy_reader_handoff",
     "incident_override_pair_receipt",
+    "cleanup_control_prestate",
 )
 
 MODEL = r"""
@@ -289,7 +291,10 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(self.journal.read_bytes(), document)
         self.assertEqual((self.home / "trace").read_text(), trace)
-        self.assertFalse(list(self.backups.iterdir()))
+        self.assertFalse(
+            self.backups.exists() or self.backups.is_symlink(),
+            "terminal rollback left an unnecessary backup directory",
+        )
 
     def seed_pinned_installer(self):
         # Frozen pre-PR executable; no runtime dependency on Git history or HEAD.
@@ -335,6 +340,53 @@ class LegacyRecoveryTests(unittest.TestCase):
                  "CURRENT_INSTALLER": str(INSTALLER)},
             capture_output=True, text=True, check=False, timeout=8,
         )
+
+
+    def test_normal_stop_failure_restores_owned_prestate_before_return(self):
+        global MODEL
+        self.seed_pinned_installer()
+        self.assertEqual(
+            (self.home / "codex-info.service.active").read_text(), "1\n"
+        )
+        self.assertTrue(self.enable.is_symlink())
+        # The manager has stopped the verified old unit, but the request
+        # returns failure. This is an ordinary external-operation failure,
+        # distinct from the fixture's crash/interrupt checkpoints.
+        stop_failure = r"""
+systemctl_stop_user() {
+    local unit="${@: -1}"
+    printf '0\n' > "$HOME/$unit.active"
+    printf 'stop %s\n' "$unit" >> "$trace"
+    if [[ "$unit" == codex-info.service && ! -e "$HOME/stop-failed-once" ]]; then
+        cp -- "$transaction" "$HOME/failed-stop-journal.json"
+        : > "$HOME/stop-failed-once"
+        return 1
+    fi
+}
+"""
+        anchor = '\nif [[ "$STEP" == install ]]; then\n'
+        self.assertEqual(MODEL.count(anchor), 1)
+        original = MODEL
+        try:
+            MODEL = original.replace(anchor, "\n" + stop_failure + anchor, 1)
+            result = self.run_step("install")
+        finally:
+            MODEL = original
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.home / "stop-failed-once").is_file())
+        failed_at = json.loads((self.home / "failed-stop-journal.json").read_text())
+        self.assertEqual(failed_at["phase"], "prepared")
+        self.assertEqual(failed_at["operation_id"], self.operation)
+        self.assertIn(
+            "stop codex-info.service", (self.home / "trace").read_text()
+        )
+        for name, data in self.sentinels.items():
+            self.assertEqual((self.home / name).read_bytes(), data)
+        self.assertEqual(
+            (self.home / "codex-info.service.active").read_text(), "1\n",
+            "owned legacy runtime was left stopped after a normal stop-command failure",
+        )
+        self.assert_snapshot()
 
     def test_prepared_recovery_uses_installed_startup_executable(self):
         for checkpoint in ("prepared", "retired"):

@@ -10475,10 +10475,17 @@ fn ensure_recorder_gap_ledger_schema(transaction: &rusqlite::Transaction<'_>) ->
     Ok(())
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static ISSUE659_PARTITION_FULL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn validate_storage_partition(
     connection: &Connection,
     expected: &StoragePartitionIdentity,
 ) -> Result<()> {
+    #[cfg(test)]
+    ISSUE659_PARTITION_FULL_CHECKS.set(ISSUE659_PARTITION_FULL_CHECKS.get() + 1);
     let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if quick_check != "ok" {
         return Err(UsageStoreError::InvalidImport(
@@ -10770,6 +10777,45 @@ impl UsageStore {
         path: P,
         identity: &StoragePartitionIdentity,
     ) -> Result<Self> {
+        Self::open_partitioned_body(path, identity, None).map(|(store, _)| store)
+    }
+
+    /// Continue only a complete prior frame matched to this actual partition.
+    pub fn open_partitioned_startup<P: AsRef<Path>>(
+        path: P,
+        identity: &StoragePartitionIdentity,
+        previous: Option<(&str, (u64, u128, u64))>,
+    ) -> Result<(Self, bool)> {
+        Self::open_partitioned_body(path, identity, previous)
+    }
+
+    fn startup_commit_continues(
+        connection: &Connection,
+        identity: &StoragePartitionIdentity,
+        previous: Option<(&str, (u64, u128, u64))>,
+    ) -> Result<bool> {
+        let Some((_, (generation, epoch, cycle))) =
+            previous.filter(|(partition, _)| *partition == identity.partition_id)
+        else {
+            return Ok(false);
+        };
+        let (db_generation,db_epoch,db_cycle):(String,Option<String>,String)=connection.query_row(
+            "SELECT data_generation,collector_epoch,cycle_seq FROM collection_generation WHERE singleton=1",
+            [],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let generation_now = canonical_u64_text(&db_generation, "startup generation")?;
+        let cycle_now = canonical_u64_text(&db_cycle, "startup cycle")?;
+        let epoch_now = db_epoch
+            .as_deref()
+            .map(|s| canonical_u128_hex(s, "startup epoch"))
+            .transpose()?;
+        Ok(epoch_now == Some(epoch) && generation_now >= generation && cycle_now >= cycle)
+    }
+
+    fn open_partitioned_body<P: AsRef<Path>>(
+        path: P,
+        identity: &StoragePartitionIdentity,
+        previous: Option<(&str, (u64, u128, u64))>,
+    ) -> Result<(Self, bool)> {
         let path = path.as_ref();
         if !path.is_absolute() {
             return Err(UsageStoreError::InvalidImport(
@@ -10792,6 +10838,7 @@ impl UsageStore {
             ));
         }
         validate_canonical_history_storage(&probe)?;
+        let initially_continued = Self::startup_commit_continues(&probe, identity, previous)?;
         drop(probe);
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.busy_timeout(Duration::from_secs(2))?;
@@ -10815,9 +10862,15 @@ impl UsageStore {
         ensure_active_thread_snapshot_schema(&transaction)?;
         ensure_canonical_history_constraints(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
-        validate_storage_partition(&transaction, identity)?;
+        let continued = initially_continued
+            && Self::startup_commit_continues(&transaction, identity, previous)?;
+        if continued {
+            validate_storage_partition_metadata(&transaction, identity)?;
+        } else {
+            validate_storage_partition(&transaction, identity)?;
+        }
         transaction.commit()?;
-        Ok(store)
+        Ok((store, continued))
     }
 
     /// Read-only counterpart of [`Self::open_partitioned`].
@@ -16936,6 +16989,103 @@ impl UsageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn issue659_cold_fixture(label: &str) -> (PathBuf, StoragePartitionIdentity) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = database_path(&format!("issue659-cold-{label}-{unique}"));
+        let identity = partition_identity('a', 7);
+        let store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store.connection.execute("UPDATE collection_generation SET data_generation='10',collector_epoch=?1,cycle_seq='5'",[format!("{:032x}",0xabcu128)]).unwrap();
+        store.connection.execute("INSERT INTO session_model_totals(model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('gpt-6.1-sol','5','4','1','1','0')",[]).unwrap();
+        drop(store);
+        (path, identity)
+    }
+    struct Issue659ColdFixture(PathBuf);
+    impl Drop for Issue659ColdFixture {
+        fn drop(&mut self) {
+            remove_database(&self.0);
+        }
+    }
+
+    #[test]
+    fn issue659_cold_open_complete_continuity_does_not_scan_all_history() {
+        let (path, identity) = issue659_cold_fixture("continued");
+        let _cleanup = Issue659ColdFixture(path.clone());
+        ISSUE659_PARTITION_FULL_CHECKS.set(0);
+        let (store, continued) = UsageStore::open_partitioned_startup(
+            &path,
+            &identity,
+            Some((&identity.partition_id, (10, 0xabc, 5))),
+        )
+        .unwrap();
+        let scans = ISSUE659_PARTITION_FULL_CHECKS.get();
+        let original: String = store
+            .connection
+            .query_row(
+                "SELECT total_tokens FROM session_model_totals WHERE model='gpt-6.1-sol'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        println!("complete continuation={continued} whole_database_scans={scans}");
+        assert_eq!(
+            scans, 0,
+            "accepted startup must not scan unrelated DB history"
+        );
+        assert!(continued);
+        assert_eq!(original, "5");
+    }
+
+    #[test]
+    fn issue659_cold_open_unconfirmed_keeps_full_check_and_corrupt_original() {
+        let (path, identity) = issue659_cold_fixture("unconfirmed");
+        let _cleanup = Issue659ColdFixture(path.clone());
+        let other = "b".repeat(64);
+        for previous in [
+            None,
+            Some((other.as_str(), (10, 0xabc, 5))),
+            Some((identity.partition_id.as_str(), (10, 0xdef, 5))),
+            Some((identity.partition_id.as_str(), (11, 0xabc, 5))),
+            Some((identity.partition_id.as_str(), (10, 0xabc, 6))),
+        ] {
+            ISSUE659_PARTITION_FULL_CHECKS.set(0);
+            let (store, continued) =
+                UsageStore::open_partitioned_startup(&path, &identity, previous).unwrap();
+            assert!(!continued);
+            assert_eq!(ISSUE659_PARTITION_FULL_CHECKS.get(), 1);
+            drop(store);
+        }
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('unix:10:20','corrupt.jsonl','10','42','00000000000000000000000000005678',0,0,?1,0,1791871200,'gpt-6.1-sol','1','1','0','0','0')",["00".repeat(32)]).unwrap();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints=OFF")
+            .unwrap();
+        drop(connection);
+        ISSUE659_PARTITION_FULL_CHECKS.set(0);
+        let failed = UsageStore::open_partitioned_startup(&path, &identity, None);
+        assert!(failed
+            .err()
+            .is_some_and(|e| e.to_string().contains("quick_check")));
+        assert_eq!(ISSUE659_PARTITION_FULL_CHECKS.get(), 1);
+        let connection =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT range_end FROM session_events WHERE relative_path='corrupt.jsonl'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
     use chrono::TimeZone;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

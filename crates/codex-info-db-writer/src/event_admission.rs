@@ -137,7 +137,16 @@ impl EventAdmission {
         let owns = |timestamp| {
             self.ownership.contains(timestamp)
                 && match binding.proof {
-                    SourceBindingProof::Rpc { began_at, .. } => timestamp >= began_at,
+                    SourceBindingProof::Rpc {
+                        began_at, ended_at, ..
+                    } => {
+                        timestamp >= began_at
+                            || binding.creator_origin.as_ref().is_some_and(|origin| {
+                                timestamp >= origin.pointer.timestamp
+                                    && self.ownership.start_at == origin.ownership_start_at
+                                    && self.ownership.contains(ended_at)
+                            })
+                    }
                     SourceBindingProof::AcceptedPrefix { .. } => true,
                 }
         };
@@ -266,4 +275,193 @@ impl EventAdmission {
 
 fn valid_time(value: i64) -> bool {
     (1..=crate::MAX_PUBLIC_UNIX_SECONDS).contains(&value)
+}
+
+#[cfg(test)]
+mod issue659_creator_consumers {
+    use crate::{
+        event_admission, source_admission, LosslessSessionEvent, SessionEventSource, TokenFacts,
+    };
+    fn issue604_source_binding_json() -> serde_json::Value {
+        serde_json::json!({
+            "version": 2,
+            "stream": "legacy-counter",
+            "metadata": {"thread_id":"binding-thread", "session_id":"binding-session"},
+            "metadata_qualified": true,
+            "strong_context": null,
+            "previous_raw": null,
+            "response_waiting_for_counter": false,
+            "responses": [],
+            "account_binding": {
+                "version": 1,
+                "partition": {
+                    "schema_version":"codex-info-account-db-v1",
+                    "profile_scope_id":"11".repeat(16),
+                    "account_scope_id":"a".repeat(64),
+                    "storage_epoch":7,
+                    "partition_id":"a".repeat(64)
+                },
+                "root_identity":"unix:10:20",
+                "relative_path":"one.jsonl",
+                "file_device":10,
+                "file_inode":42,
+                "prefix_generation":"00000000000000000000000000005678",
+                "prefix_end":100,
+                "metadata":{"thread_id":"binding-thread", "session_id":"binding-session"},
+                "proof": {
+                    "kind":"rpc",
+                    "began_at":1791871200,
+                    "ended_at":1791871201,
+                    "process": {
+                        "pid":1234,
+                        "starttime_ticks":17,
+                        "executable_device":10,
+                        "executable_inode":20
+                    }
+                }
+            }
+        })
+    }
+
+    fn issue604_creator_origin_event(with_origin: bool) -> LosslessSessionEvent {
+        const AT: i64 = 1_791_871_200;
+        let mut binding = issue604_source_binding_json()["account_binding"].clone();
+        binding["proof"]["began_at"] = serde_json::json!(AT + 100);
+        binding["proof"]["ended_at"] = serde_json::json!(AT + 101);
+        if with_origin {
+            binding["creator_origin"] = serde_json::json!({
+                "pointer":{"start":0,"end":10,"sha256":"11".repeat(32),"timestamp":AT},
+                "ownership_start_at":AT - 10,"ownership_end_at":null
+            });
+        }
+        let ids = source_admission::ResponseIds {
+            thread_id: "binding-thread".into(),
+            session_id: "binding-session".into(),
+            root_turn_id: "root-turn".into(),
+            turn_id: "turn".into(),
+            response_id: "response".into(),
+        };
+        let pointer = |start, end, timestamp| serde_json::json!({"start":start,"end":end,"timestamp":timestamp,"sha256":"22".repeat(32)});
+        let usage = serde_json::json!({"total":5,"input":4,"cached_input":1,"cache_write_input":0,"output":1,"reasoning_output":1});
+        let admission = serde_json::json!({
+            "version":1,"source_binding":binding,"verified_prefix_end":100,
+            "ownership":{"start_at":AT-10,"end_at":null},"period":null,
+            "numeric":{"kind":"response-record","candidate":{
+                "key":ids.key(),"record":{"ids":ids,"usage":usage,"turn_usage":usage,"thread_usage":usage},
+                "pointer":pointer(20,30,AT+3),"session_scope_qualified":true,
+                "root_context":{"model":"gpt-6.1-sol","context":{"turn_id":"turn","root_turn_id":"root-turn","pointer":pointer(10,20,AT+1)}},
+                "classification":{"state":"normal","boundary":{"kind":"record","pointer":{"start":30,"end":40,"sha256":"55".repeat(32)}}}
+            }}
+        });
+        LosslessSessionEvent {
+            source: SessionEventSource {
+                root_identity: "unix:10:20".into(),
+                relative_path: "one.jsonl".into(),
+                file_device: 10,
+                file_inode: 42,
+                prefix_generation: 0x5678,
+                range_start: 0,
+                range_end: 100,
+                record_sha256: "00".repeat(32),
+                event_index: 20,
+            },
+            timestamp: AT + 3,
+            model: "gpt-6.1-sol".into(),
+            tokens: TokenFacts {
+                total: 5,
+                input: Some(4),
+                cached_input: Some(1),
+                cache_write_input: Some(0),
+                output: Some(1),
+            },
+            period: None,
+            admission: Some(
+                serde_json::from_value(admission)
+                    .expect("verified creator origin must be a supported durable proof"),
+            ),
+        }
+    }
+
+    #[test]
+    fn issue604_creator_origin_restores_only_owned_response_before_rpc() {
+        let before = issue604_creator_origin_event(false);
+        assert!(!before.admission.as_ref().unwrap().valid_for(&before, None));
+        let event = issue604_creator_origin_event(true);
+        assert!(event.admission.as_ref().unwrap().valid_for(&event, None));
+        let stored = serde_json::to_string(&event.admission).unwrap();
+        let restored: Option<event_admission::EventAdmission> =
+            serde_json::from_str(&stored).unwrap();
+        assert_eq!(restored, event.admission);
+        assert_eq!(event.tokens.total, 5);
+        assert_eq!(
+            event.period, None,
+            "source ownership cannot invent an official period"
+        );
+        let mut changed = event.clone();
+        changed.admission.as_mut().unwrap().ownership.start_at += 1;
+        assert!(!changed
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&changed, None));
+        let mut changed = event.clone();
+        changed.admission.as_mut().unwrap().ownership.end_at = Some(event.timestamp + 1);
+        assert!(!changed
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&changed, None));
+        let mut inherited = event.clone();
+        if let event_admission::NumericEventProof::ResponseRecord { candidate, .. } =
+            &mut inherited.admission.as_mut().unwrap().numeric
+        {
+            candidate.session_scope_qualified = false;
+        }
+        assert!(!inherited
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&inherited, None));
+    }
+
+    #[test]
+    fn issue604_creator_origin_rejects_broken_continuity_and_pointer() {
+        let event = issue604_creator_origin_event(true);
+        let original = serde_json::to_value(event.admission.as_ref().unwrap()).unwrap();
+        for (pointer, replacement) in [
+            (
+                "/source_binding/creator_origin/pointer/start",
+                serde_json::json!(1),
+            ),
+            (
+                "/source_binding/creator_origin/pointer/end",
+                serde_json::json!(101),
+            ),
+            (
+                "/source_binding/creator_origin/pointer/sha256",
+                serde_json::json!("invalid"),
+            ),
+            (
+                "/source_binding/creator_origin/pointer/timestamp",
+                serde_json::json!(1_791_871_204),
+            ),
+            (
+                "/source_binding/creator_origin/ownership_start_at",
+                serde_json::json!(1_791_871_201),
+            ),
+            (
+                "/source_binding/creator_origin/ownership_end_at",
+                serde_json::json!(1_791_871_301),
+            ),
+            (
+                "/source_binding/proof/ended_at",
+                serde_json::json!(1_791_871_199),
+            ),
+        ] {
+            let mut value = original.clone();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            let changed: event_admission::EventAdmission = serde_json::from_value(value).unwrap();
+            assert!(!changed.valid_for(&event, None), "{pointer}");
+        }
+    }
 }
