@@ -1790,8 +1790,8 @@ combined_log_start="$(wc -l < "$log")"
 run_legacy_install "$archive_v2" "$combined_upgrade_home" >/dev/null
 combined_log="$(tail -n +$((combined_log_start + 1)) "$log")"
 combined_stop_line="$(grep -n -m1 'systemctl --user stop --no-block codex-info.service' <<<"$combined_log" | cut -d: -f1 || true)"
-combined_recorder_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
-combined_rest_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_recorder_start_line="$(grep -n -m1 'systemctl --user start codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_rest_start_line="$(grep -n -m1 'systemctl --user start codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
 [[ -n "$combined_stop_line" && -n "$combined_recorder_start_line" && -n "$combined_rest_start_line" ]] ||
     fail 'combined upgrade did not record old stop and split starts'
 (( combined_stop_line < combined_recorder_start_line && combined_recorder_start_line < combined_rest_start_line )) ||
@@ -1847,8 +1847,8 @@ if run_legacy_install "$archive_v2" "$combined_rollback_home" codex-info-rest.se
 fi
 combined_log="$(tail -n +$((combined_log_start + 1)) "$log")"
 combined_stop_line="$(grep -n -m1 'systemctl --user stop --no-block codex-info.service' <<<"$combined_log" | cut -d: -f1 || true)"
-combined_recorder_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
-combined_rest_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_recorder_start_line="$(grep -n -m1 'systemctl --user start codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_rest_start_line="$(grep -n -m1 'systemctl --user start codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
 combined_old_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info.service' <<<"$combined_log" | tail -n1 | cut -d: -f1 || true)"
 [[ -n "$combined_stop_line" && -n "$combined_recorder_start_line" && -n "$combined_rest_start_line" && -n "$combined_old_start_line" ]] ||
     fail 'combined rollback did not record stop, split activation failure, and old restart'
