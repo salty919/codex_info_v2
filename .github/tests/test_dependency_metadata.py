@@ -3,8 +3,10 @@
 """Offline direct contracts for SEC-DEPENDENCY-AUDIT-01 (Issue #452)."""
 
 import ast
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import pathlib
 import re
@@ -93,11 +95,27 @@ class DependencyMetadataTests(unittest.TestCase):
             module.audit_osv(queries, mock.Mock(side_effect=OSError("offline")))
         with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
             output = pathlib.Path(directory) / "result.json"
-            with mock.patch.object(module, "inventory", return_value={}), mock.patch.object(
-                module, "collect", side_effect=OSError("offline")
+            for error, error_type, reason in (
+                (OSError("offline"), "OSError", "offline"),
+                (TimeoutError("The read operation timed out"), "TimeoutError", "The read operation timed out"),
             ):
-                self.assertEqual(module.main(["--root", str(ROOT), "--output", str(output)]), 1)
-            self.assertEqual(json.loads(output.read_text())["collection_status"], "failed")
+                with self.subTest(error_type=error_type):
+                    failure_log = io.StringIO()
+                    with mock.patch.object(module, "inventory", return_value={}), mock.patch.object(
+                        module, "collect", side_effect=error
+                    ), contextlib.redirect_stderr(failure_log):
+                        self.assertEqual(module.main(["--root", str(ROOT), "--output", str(output)]), 1)
+                    failure_report = json.loads(output.read_text())
+                    self.assertEqual(failure_report["collection_status"], "failed")
+                    self.assertEqual(failure_report["coverage_status"], "inconclusive")
+                    self.assertEqual(failure_report["license_policy_status"], "review_required")
+                    self.assertIn(error_type, failure_report["error"])
+                    self.assertIn(reason, failure_report["error"])
+                    self.assertIn(
+                        failure_report["error"],
+                        failure_log.getvalue(),
+                        "DEPENDENCY_FAILURE_REASON_MISSING_FROM_LOG",
+                    )
             with mock.patch.object(module, "inventory", return_value={}), mock.patch.object(
                 module, "collect", return_value={"collection_status": "complete", "vulnerabilities": ["GHSA-test"]}
             ):

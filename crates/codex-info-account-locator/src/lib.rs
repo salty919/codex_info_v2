@@ -1022,25 +1022,6 @@ fn validate_registry_artifacts_with_metadata(
         return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
     }
 
-    for entry in
-        fs::read_dir(&root).map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?
-    {
-        let entry = entry.map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-        let scope = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-        if decode_fixed::<SCOPE_ID_BYTES>(&scope).is_err()
-            || !metadata.accounts.contains_key(&scope)
-            || !validate_private_directory(
-                &fs::symlink_metadata(entry.path())
-                    .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?,
-            )
-        {
-            return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
-        }
-    }
-
     for (scope, registry) in &metadata.accounts {
         let account_directory = root.join(scope);
         let account_metadata = match fs::symlink_metadata(&account_directory) {
@@ -1057,21 +1038,24 @@ fn validate_registry_artifacts_with_metadata(
             return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
         }
         let epoch_name = format!("epoch-{}", registry.storage_epoch);
-        for entry in fs::read_dir(&account_directory)
-            .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?
-        {
-            let entry = entry.map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-            if name != epoch_name
-                || !validate_private_directory(
-                    &fs::symlink_metadata(entry.path())
-                        .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?,
-                )
+        if registry.state != RegistryState::Initialized {
+            for entry in fs::read_dir(&account_directory)
+                .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?
             {
-                return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+                let entry =
+                    entry.map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
+                if name != epoch_name
+                    || !validate_private_directory(
+                        &fs::symlink_metadata(entry.path())
+                            .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?,
+                    )
+                {
+                    return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+                }
             }
         }
         let epoch_directory = account_directory.join(&epoch_name);
@@ -1093,11 +1077,17 @@ fn validate_registry_artifacts_with_metadata(
             .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?
         {
             let entry = entry.map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
+            let name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(_) if registry.state == RegistryState::Initialized => continue,
+                Err(_) => {
+                    return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
+                }
+            };
             if !is_known_epoch_artifact(&name) {
+                if registry.state == RegistryState::Initialized {
+                    continue;
+                }
                 return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
             }
             let artifact = match artifact_metadata(&entry.path()) {
@@ -1907,6 +1897,85 @@ mod tests {
     }
 
     #[test]
+    fn issue659_initialized_admission_ignores_unreferenced_siblings() {
+        let mut outcomes = Vec::new();
+        for caller in ["reserve", "admit"] {
+            let (codex_home, data_root, scope_a, scope_b, _) = fixture();
+            let at = 1_789_167_600_i64;
+            let expected =
+                ensure_partition_with_activation(&codex_home, &data_root, Some(at)).unwrap();
+            let accounts = accounts_root(&data_root);
+            for (scope, epoch_number) in [(&scope_a, 7), (&scope_b, 13)] {
+                let epoch = accounts.join(scope).join(format!("epoch-{epoch_number}"));
+                for name in [
+                    "literal-unreferenced-artifact",
+                    ".usage_history.sqlite3.backup.tmp-17-0",
+                    ".usage_history.sqlite3.backup-rotate-17-0-1",
+                    ".usage_history.sqlite3.candidate.tmp-17-0",
+                    "usage_history.sqlite3-wal.unowned",
+                ] {
+                    write_private_file(&epoch.join(name), b"preserved unreferenced sibling");
+                }
+            }
+            make_private_directory(&accounts.join("literal-unregistered-scope"));
+            let account = accounts.join(&scope_a);
+            make_private_directory(&account.join("epoch-unreferenced"));
+            let epoch = account.join("epoch-7");
+            make_private_directory(&epoch.join("literal-unreferenced-directory"));
+
+            #[cfg(unix)]
+            let raw_name_file = {
+                use std::os::unix::ffi::OsStringExt;
+                let path = epoch.join(std::ffi::OsString::from_vec(vec![
+                    b'u', b'n', b'r', b'e', b'f', b'-', 0xff,
+                ]));
+                write_private_file(&path, b"preserve exact OS filename");
+                std::os::unix::fs::symlink(
+                    epoch.join("usage_history.sqlite3"),
+                    epoch.join("literal-unreferenced-link"),
+                )
+                .unwrap();
+                path
+            };
+
+            let before_home = snapshot_tree(&codex_home);
+            let before_data = snapshot_tree(&data_root);
+            let result = if caller == "reserve" {
+                reserve_partition_at(&codex_home, &data_root, at + 1)
+            } else {
+                admit_partition(
+                    &codex_home,
+                    &data_root,
+                    &expected,
+                    AccountConfirmation::Saved { began_at: at + 1 },
+                    || Some(at + 2),
+                )
+            };
+            let same_partition = result
+                .as_ref()
+                .map(|partition| partition == &expected)
+                .unwrap_or(false);
+            let unchanged = before_home == snapshot_tree(&codex_home)
+                && before_data == snapshot_tree(&data_root);
+            #[cfg(unix)]
+            let unchanged = unchanged && raw_name_file.is_file();
+            outcomes.push((
+                caller,
+                same_partition,
+                unchanged,
+                result.err().map(LocatorError::kind),
+            ));
+            fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, same, unchanged, error)| { *same && *unchanged && error.is_none() }),
+            "initialized admission must preserve unreferenced siblings: {outcomes:?}"
+        );
+    }
+
+    #[test]
     fn issue604_readonly_partition_ignores_unreferenced_siblings() {
         let mut outcomes = Vec::new();
         {
@@ -2338,7 +2407,6 @@ mod tests {
         for case in [
             "database-disappearance",
             "candidate-disappearance",
-            "unknown-disappearance",
             "metadata-permission-denied",
             #[cfg(unix)]
             "symlink-sidecar",
@@ -2351,7 +2419,6 @@ mod tests {
             let name = match case {
                 "database-disappearance" => "usage_history.sqlite3",
                 "candidate-disappearance" => "usage_history.sqlite3.candidate",
-                "unknown-disappearance" => "usage_history.sqlite3-wal.unowned",
                 _ => "usage_history.sqlite3-wal",
             };
             let artifact = epoch.join(name);
@@ -2379,9 +2446,8 @@ mod tests {
             });
             let rejected =
                 result.err().map(LocatorError::kind) == Some(LocatorErrorKind::RecoveryRequired);
-            // Unknown names must be rejected independently of whether their
-            // metadata callback is reached; GREEN rejects that name earlier.
-            let reached = case == "unknown-disappearance" || triggers == 1;
+            // These cases target referenced DB/SQLite artifacts.
+            let reached = triggers == 1;
             outcomes.push((case, rejected, reached, triggers));
             fs::remove_dir_all(codex_home.parent().unwrap()).unwrap();
         }

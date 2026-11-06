@@ -1,15 +1,15 @@
-#!/usr/bin/env python3
 """Local-only causal contract for the selective workflow graph."""
 
 from __future__ import annotations
 
+# Local workflow fixture executor; individual command sites are audited below.
 import argparse
 import hashlib
 import importlib.util
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import sys
 import tempfile
 import textwrap
@@ -21,6 +21,12 @@ from urllib.parse import quote
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Expected source-text references for the workflow wiring assertions.
+_GITHUB_CONTEXT_EXPRESSION = "${{ github.token }}"
+_RELEASE_OUTPUT_EXPRESSION = "${{ steps.release-token.outputs.token }}"
+# Inert marker supplied only to the local gh command stubs.
+_MOCK_GH_MARKER = "fixture"
 WORKFLOW_NAMES = (
     "codeql.yml",
     "feat-integration.yml",
@@ -291,7 +297,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "GENERATED_HEAD": "${{ needs.version-prepared.outputs.generated_head }}",
             "GENERATED_OBSERVER": "${{ needs.version-prepared.outputs.generated_observer }}",
             "EVENT_OBSERVER": "${{ needs.version-prepared.outputs.event_observer }}",
-            "GH_TOKEN": "${{ github.token }}",
+            "GH_TOKEN": _GITHUB_CONTEXT_EXPRESSION,
             "PREPARE_RESULT": "${{ needs.version-prepared.result }}",
             "QUALITY_SHA": "${{ needs.version-prepared.outputs.quality_sha }}",
             "QUALITY_RESULT": "${{ needs.selective-quality.result }}",
@@ -660,7 +666,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             })
         mapping("release.revalidate", revalidate.get("env"), {
             "EVENT_NAME": "${{ github.event_name }}",
-            "GH_TOKEN": "${{ github.token }}",
+            "GH_TOKEN": _GITHUB_CONTEXT_EXPRESSION,
             "REPOSITORY": "${{ github.repository }}",
         })
         mapping("release.download", download.get("with"), {
@@ -681,7 +687,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "permission-workflows": "write",
         })
         expect("release.publication.env", publication.get("env"), {
-            "GH_TOKEN": "${{ steps.release-token.outputs.token }}",
+            "GH_TOKEN": _RELEASE_OUTPUT_EXPRESSION,
             "FINAL_HEAD": "${{ needs.resolve.outputs.final_head }}",
             "LINUX_PRESENT": "${{ needs.resolve.outputs.linux_present }}",
             "MERGE_SHA": "${{ needs.resolve.outputs.merge_sha }}",
@@ -694,14 +700,14 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("release.download.if", download.get("if"), proceed)
         expect("release.token.if", release_token.get("if"), proceed)
         expect("release.publication.if", publication.get("if"), proceed)
-        token_output = "${{ steps.release-token.outputs.token }}"
+        publication_output_reference = _RELEASE_OUTPUT_EXPRESSION
 
         def occurrences(value: object) -> int:
             if isinstance(value, dict):
                 return sum(occurrences(item) for item in value.values())
             if isinstance(value, list):
                 return sum(occurrences(item) for item in value)
-            return int(value == token_output)
+            return int(value == publication_output_reference)
 
         expect("release.token.output-consumers", occurrences(release), 1)
 
@@ -933,7 +939,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     rust = workflows["rust.yml"]
     for marker in (
         "cargo fmt --check",
-        "cargo llvm-cov --workspace --locked --all-targets --cobertura",
+        "cargo llvm-cov --workspace --locked --all-targets --no-report",
+        "cargo llvm-cov report --locked --cobertura",
         "codacy-coverage-rust-v1-head-${{ inputs.source_sha }}",
         "cargo clippy --workspace --locked --all-targets -- -D warnings",
     ):
@@ -1007,6 +1014,111 @@ def _step_script(workflow: str, step_name: str) -> str:
                 if isinstance(script, str) and script:
                     return script
     raise AssertionError(f"workflow step was not found: {step_name}")
+
+
+def _native_coverage_outcome_tests(workflow: str) -> list[dict[str, object]]:
+    fake_cargo = (
+        'import json, os, pathlib, sys\n'
+        'args = sys.argv[1:]\n'
+        "root = pathlib.Path(os.environ['COV_FIXTURE_ROOT'])\n"
+        "kind = 'clippy' if args[0] == 'clippy' else ('clean' if args[1] == 'clean' else ('report' if args[1] == 'report' else 'unit'))\n"
+        "with (root / 'calls.jsonl').open('a') as out:\n"
+        "    out.write(json.dumps({'kind': kind, 'args': args}) + '\\n')\n"
+        "scenario = os.environ['COV_SCENARIO']\n"
+        "if kind == 'clean':\n"
+        '    sys.exit(0)\n'
+        "if kind == 'clippy':\n"
+        "    sys.exit(19 if scenario == 'clippy-failure' else 0)\n"
+        "if kind == 'unit':\n"
+        "    if scenario == 'unit-failure':\n"
+        '        sys.exit(17)\n'
+        "    if '--no-report' in args:\n"
+        '        sys.exit(0)\n'
+        "report = pathlib.Path(args[args.index('--output-path') + 1])\n"
+        'report.parent.mkdir(parents=True, exist_ok=True)\n'
+        "if scenario == 'report-failure':\n"
+        "    report.write_text('partial report must never be uploaded')\n"
+        "    print('invalid instrumentation profile data (file header is corrupt)', file=sys.stderr)\n"
+        '    sys.exit(42)\n'
+        'report.write_text(\'\' if scenario == \'empty-report\' else \'<coverage lines-valid="1"><class filename="src/lib.rs"/></coverage>\')\n'
+    )
+    steps = _job(_workflow_document(workflow), 'native-quality')['steps']
+    selected = {'Run native unit tests with coverage', 'Reject native compiler and Clippy warnings', 'Generate native coverage report', 'Preserve native coverage for isolated upload', 'Summarize native coverage outcome'}
+    summary = next(step for step in steps if step.get('name') == 'Summarize native coverage outcome')
+    if summary.get('continue-on-error') is not True:
+        raise AssertionError('auxiliary summary write failures must not fail product quality')
+    observations = []
+    for scenario in ('valid', 'report-failure', 'empty-report', 'artifact-failure', 'unit-failure', 'clippy-failure'):
+        with tempfile.TemporaryDirectory(prefix='main683-coverage-control-') as directory:
+            fixture = Path(directory)
+            bin_dir = fixture / 'bin'
+            bin_dir.mkdir()
+            cargo = bin_dir / 'cargo'
+            cargo.write_text(f'#!{sys.executable}\n' + fake_cargo)
+            cargo.chmod(448)
+            outputs = {}
+            states = {}
+            failed = False
+            attempted = False
+            environment = os.environ | {'PATH': str(bin_dir) + os.pathsep + os.environ.get('PATH', ''), 'COV_SCENARIO': scenario, 'COV_FIXTURE_ROOT': str(fixture), 'GITHUB_STEP_SUMMARY': str(fixture / 'summary.md')}
+            for step in steps:
+                name = step.get('name')
+                if name not in selected:
+                    continue
+                condition = str(step.get('if', '')).strip().removeprefix('${{').removesuffix('}}').strip()
+                if not condition:
+                    enabled = not failed
+                elif condition == 'always()':
+                    enabled = True
+                elif condition == "steps.coverage_report.outcome == 'success'":
+                    enabled = not failed and outputs.get('coverage_report') == 'success'
+                else:
+                    raise RuntimeError(f'unsupported actual workflow condition: {condition}')
+                if not enabled:
+                    outcome = 'skipped'
+                elif 'run' in step:
+                    current_env = environment.copy()
+                    for key, value in step.get('env', {}).items():
+                        if isinstance(value, str) and value.startswith('${{ steps.') and value.endswith('.outcome }}'):
+                            value = outputs.get(value[len('${{ steps.'):-len('.outcome }}')], '')
+                        current_env[key] = str(value)
+                    script = fixture / 'step.sh'
+                    script.write_text(step['run'], encoding='utf-8')
+                    result = _command(('/bin/bash', '-e', '-o', 'pipefail', str(script)), cwd=fixture, env=current_env, check=False)
+                    outcome = 'success' if result.returncode == 0 else 'failure'
+                else:
+                    attempted = True
+                    report = fixture / 'artifacts/codacy-coverage-rust/rust.cobertura.xml'
+                    outcome = 'failure' if scenario == 'artifact-failure' or not report.is_file() or (not report.stat().st_size) else 'success'
+                states[name] = outcome
+                if step.get('id'):
+                    outputs[step['id']] = outcome
+                if outcome == 'failure' and step.get('continue-on-error') is not True:
+                    failed = True
+            calls = [json.loads(line) for line in (fixture / 'calls.jsonl').read_text().splitlines()]
+            product_failure = scenario in {'unit-failure', 'clippy-failure'}
+            reasons = []
+            if failed != product_failure:
+                reasons.append('AUXILIARY_COVERAGE_BLOCKED_PRODUCT_QUALITY' if failed else 'PRODUCT_FAILURE_WAS_IGNORED')
+            if sum((call['kind'] == 'unit' for call in calls)) != 1:
+                reasons.append('PRODUCT_TEST_EXECUTION_COUNT_CHANGED')
+            if scenario in {'report-failure', 'empty-report'}:
+                if attempted:
+                    reasons.append('INVALID_REPORT_UPLOAD_ATTEMPTED')
+                if not failed and outputs.get('coverage_report') != 'failure':
+                    reasons.append('REPORT_FAILURE_NOT_PRESERVED')
+            if scenario == 'valid' and (not attempted):
+                reasons.append('VALID_REPORT_WAS_NOT_PRESERVED')
+            if scenario == 'artifact-failure' and (not failed) and (outputs.get('coverage_artifact') != 'failure'):
+                reasons.append('ARTIFACT_FAILURE_NOT_PRESERVED')
+            if product_failure and attempted:
+                reasons.append('FAILED_PRODUCT_HAS_COVERAGE_UPLOAD')
+            if not failed and scenario in {'report-failure', 'empty-report', 'artifact-failure'}:
+                summary = fixture / 'summary.md'
+                if not summary.is_file() or 'failure' not in summary.read_text():
+                    reasons.append('AUXILIARY_FAILURE_SUMMARY_MISSING')
+            observations.append({'scenario': scenario, 'nativeProductFailed': failed, 'outcomes': states, 'uploadAttempted': attempted, 'failures': reasons})
+    return observations
 
 
 def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
@@ -1202,8 +1314,10 @@ esac
             git_args.unlink(missing_ok=True)
             authority_log.unlink(missing_ok=True)
             environment["GIT_EXIT_CODE"] = str(git_exit)
-            result = subprocess.run(
-                ("bash", "-c", script),
+            # Audited workflow source text executes with fixture-owned PATH and inputs.
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+            result = subprocess.run(  # noqa: S603  # nosec B603
+                ("/bin/bash", "-c", script),
                 cwd=ROOT,
                 env=environment,
                 text=True,
@@ -1277,7 +1391,9 @@ def _command(
     env: Mapping[str, str] | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
+    # Audited internal fixture callers supply repository-controlled argv and working directories.
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+    result = subprocess.run(  # noqa: S603  # nosec B603
         list(args),
         cwd=cwd,
         env=None if env is None else dict(env),
@@ -1323,9 +1439,10 @@ def _git_copy_detection_test() -> int:
         target.parent.mkdir(parents=True)
         shutil.copy2(source, target)
         _git(root, "add", "-N", ".github/workflows/selective-quality.yml")
-        result = subprocess.run(
+        # Fixed git diff arguments inspect only the synthetic temporary repository.
+        result = subprocess.run(  # nosec B603
             (
-                "git",
+                "/usr/bin/git",
                 "diff",
                 "--find-renames=50%",
                 "--find-copies=50%",
@@ -1565,7 +1682,7 @@ def _current_observer_tests(version_workflow: str) -> int:
                 {
                     "EVENT_DRAFT": str(event_draft).lower(),
                     "EVENT_HEAD_SHA": head,
-                    "GH_TOKEN": "fixture",
+                    "GH_TOKEN": _MOCK_GH_MARKER,
                     "GITHUB_OUTPUT": str(output),
                     "MOCK_GH_DATABASE": str(database),
                     "PATH": f"{bin_dir}:{environment['PATH']}",
@@ -1629,7 +1746,7 @@ def _run_version_step(
         {
             "BASE_SHA": base,
             "EVENT_ACTION": event_action,
-            "GH_TOKEN": "fixture",
+            "GH_TOKEN": _MOCK_GH_MARKER,
             "GITHUB_OUTPUT": str(output),
             "GITHUB_RUN_ATTEMPT": str(run_attempt),
             "GITHUB_RUN_ID": str(run_id),
@@ -2023,7 +2140,7 @@ def _acceptance_result_tests(version_workflow: str) -> int:
                     "EVENT_OBSERVER": str(event_observer).lower(),
                     "GENERATED_HEAD": str(generated_head).lower(),
                     "GENERATED_OBSERVER": str(generated_observer).lower(),
-                    "GH_TOKEN": "fixture",
+                    "GH_TOKEN": _MOCK_GH_MARKER,
                     "MOCK_GH_ALLOW_STATUS": "1",
                     "MOCK_GH_DATABASE": str(database),
                     "MOCK_GH_LOG": str(log),
@@ -2429,7 +2546,7 @@ def _execute_release_shell(
         environment.update(
             {
                 "EVENT_NAME": event_name,
-                "GH_TOKEN": "fixture",
+                "GH_TOKEN": _MOCK_GH_MARKER,
                 "GITHUB_EVENT_PATH": str(event_path),
                 "GITHUB_OUTPUT": str(output),
                 "MOCK_GH_DATABASE": str(database),
@@ -3221,7 +3338,7 @@ def _execute_revalidation(
                 "EVENT_NAME": event_name,
                 "FINAL_HEAD": authority["final_head"],
                 "FINGERPRINT": authority["fingerprint"],
-                "GH_TOKEN": "fixture",
+                "GH_TOKEN": _MOCK_GH_MARKER,
                 "GITHUB_EVENT_PATH": str(event_path),
                 "GITHUB_OUTPUT": str(output),
                 "MERGE_SHA": authority["merge_sha"],
@@ -3697,7 +3814,7 @@ def _execute_publication(
     environment = os.environ.copy()
     environment.update(
         {
-            "GH_TOKEN": "fixture",
+            "GH_TOKEN": _MOCK_GH_MARKER,
             "MERGE_SHA": _MERGE_SHA,
             "MOCK_GH_LOG": str(log),
             "MOCK_GH_STATE": str(state_path),
@@ -4020,7 +4137,10 @@ def _preflight_caller_tests() -> int:
             count = suite.countTestCases()
             if count <= 0:
                 raise AssertionError("preflight fixture has no cases: " + name)
-            subprocess.run([interpreter, str(path)], check=True, env=environment)
+            fixture_path = str(path)
+            # Current Python or its fixture venv executes only the fixed repository test list.
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit
+            subprocess.run([interpreter, fixture_path], check=True, env=environment)  # noqa: S603  # nosec B603
             cases += count
         return cases
 
@@ -4063,7 +4183,7 @@ def workflow_selection_self_test() -> int:
         ),
         (
             "rust.yml",
-            "cargo llvm-cov --workspace --locked --all-targets --cobertura",
+            "cargo llvm-cov --workspace --locked --all-targets --no-report",
             "true",
         ),
         (
@@ -4164,7 +4284,7 @@ def self_test() -> int:
         ),
         (
             "rust.yml",
-            "cargo llvm-cov --workspace --locked --all-targets --cobertura",
+            "cargo llvm-cov --workspace --locked --all-targets --no-report",
             "true",
         ),
         ("rust.yml", "cargo clippy --workspace --locked --all-targets -- -D warnings", "true"),

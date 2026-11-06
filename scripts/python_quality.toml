@@ -23,6 +23,10 @@ select = [
 external = ["B404", "B603"]
 
 [lint.per-file-ignores]
+# The sole Request follows Client HTTPS, fixed-host, port and authority validation.
+# Keep this audited path exception here: inline S310 noqa is unused in the
+# hosted rule set and therefore fails RUF100 there.
+"**/.github/scripts/dependency_metadata.py" = ["S310"]
 # This offline selector harness executes checked-in Bash with fixed argv;
 # Bandit owns its existing, documented B603 exception.
 "scripts/test_linux_release_selection.py" = ["S603"]

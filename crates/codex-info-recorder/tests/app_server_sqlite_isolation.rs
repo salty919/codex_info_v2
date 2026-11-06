@@ -2214,6 +2214,16 @@ for line in sys.stdin:
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         db.busy_timeout(Duration::from_secs(1)).unwrap();
         db.execute_batch("PRAGMA query_only=ON").unwrap();
+        let schema_ready: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='quota_observations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if !schema_ready {
+            return None;
+        }
         db.query_row(sql, values, |row| {
             Ok((
                 row.get(0)?,
@@ -2314,6 +2324,19 @@ for line in sys.stdin:
         }
     }
     let (root, mut original) = setup();
+    if withhold_initial_quota {
+        // Opening the file precedes publishing its schema in the real writer.
+        let journal_path = root.path().join("data/history/quota/observations.sqlite3");
+        private_directory(journal_path.parent().unwrap());
+        drop(Connection::open(&journal_path).unwrap());
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        eprintln!("PR684_EMPTY_JOURNAL_READINESS_CONTROL");
+        assert!(
+            latest_journal_receipt(root.path()).is_none(),
+            "an unpublished journal schema is not an acquired receipt"
+        );
+        fs::remove_file(journal_path).unwrap();
+    }
     if reactivated {
         let reset: i64 = fs::read_to_string(root.path().join("reset-at"))
             .unwrap()

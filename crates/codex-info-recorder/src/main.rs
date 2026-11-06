@@ -19,7 +19,7 @@ use codex_info_recorder::{
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -806,6 +806,27 @@ where
     Ok(true)
 }
 
+fn reconcile_startup_projection<F>(
+    recorder: &mut Recorder,
+    database: &Path,
+    identity: &StoragePartitionIdentity,
+    continued: bool,
+    commit_guard: F,
+) -> Result<bool, RecorderError>
+where
+    F: FnOnce() -> bool,
+{
+    if continued {
+        if !commit_guard() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        return Ok(false);
+    }
+    let startup_backup =
+        UsageStore::backup_generations_partitioned_verified(database, identity, 3)?;
+    recorder.reconcile_session_lifecycle_guarded(&startup_backup, commit_guard)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if arguments.iter().any(|argument| argument == "--version") {
@@ -911,7 +932,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(RecorderError::AccountBoundaryChanged.into());
         }
         let initialized = (|| -> Result<Recorder, Box<dyn std::error::Error>> {
-            let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
+            let (mut recorder, continued) = Recorder::open_partitioned_startup(
                 RecorderConfig {
                     sessions_root: options.sessions_root.clone(),
                     chunk_bytes: options.chunk_bytes,
@@ -921,15 +942,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 options.partition.activation_timestamp,
                 transition_fingerprint,
                 lifecycle_intervals.clone(),
+                previous_authority
+                    .as_ref()
+                    .and_then(|p| p.partition_id.as_deref().zip(p.committed)),
             )?;
-            let startup_backup = UsageStore::backup_generations_partitioned_verified(
+            if reconcile_startup_projection(
+                &mut recorder,
                 &options.database,
                 &options.identity,
-                3,
-            )?;
-            if recorder.reconcile_session_lifecycle_guarded(&startup_backup, || {
-                recorder_epoch_matches(&options, &startup_epoch, &_profile_lease)
-            })? {
+                continued,
+                || recorder_epoch_matches(&options, &startup_epoch, &_profile_lease),
+            )? {
                 eprintln!("codex-info-recorder repaired session totals across account lifecycles");
             }
             mark_partition_initialized(&options.data_root, &options.partition)
@@ -1455,10 +1478,235 @@ fn default_codex_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_info_recorder::PreviousRecorderAuthority;
+    fn issue659_continuity_fixture(name: &str) -> Issue362AsyncFixture {
+        let mut fixture = issue_362_fixture(name);
+        let connection = rusqlite::Connection::open(&fixture.options.database).unwrap();
+        connection.execute("UPDATE collection_generation SET data_generation='10',collector_epoch='00000000000000000000000000000abc',cycle_seq='5',reset_at=1791874800,latest_quota_reset_at=1791874800,window_seconds=3600",[]).unwrap();
+        connection.execute("INSERT INTO usage_history(timestamp,reset_at,remaining_percent,sol_dollars,terra_dollars,luna_dollars,sol_tokens,terra_tokens,luna_tokens) VALUES(1791871200,1791874800,50,1.25,0,0,5,0,0)",[]).unwrap();
+        connection.execute("INSERT INTO usage_model_history(reset_at,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,model_set_complete,total_dollars,price_version) VALUES(1791874800,1791871200,'gpt-6.1-sol','5','4','1','1','0',1,1.25,'fixture-saved-v1')",[]).unwrap();
+        connection.execute("INSERT INTO session_model_totals(model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens) VALUES('gpt-6.1-sol','5','4','1','1','0')",[]).unwrap();
+        connection.execute("INSERT INTO source_prefix_repairs(repair_id,payload_json,payload_sha256) VALUES(?1,'{\"version\":2}',?2)",("11".repeat(32),"00".repeat(32))).unwrap();
+        for index in 1..=3 {
+            let path = fixture
+                .options
+                .database
+                .with_extension(format!("sqlite3.bak.{index}"));
+            connection
+                .backup(rusqlite::DatabaseName::Main, &path, None)
+                .unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        drop(connection);
+        fs::write(
+            fixture.options.sessions_root.join("original.jsonl"),
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"original\"}}\n",
+        )
+        .unwrap();
+        let state = fixture.recorder.state().unwrap();
+        fixture.state_writer.write_committed(&state, false).unwrap();
+        fixture
+    }
+
+    fn issue659_reopen_continuity_fixture(
+        fixture: Issue362AsyncFixture,
+        previous: Option<&PreviousRecorderAuthority>,
+    ) -> (Issue362AsyncFixture, bool) {
+        let Issue362AsyncFixture {
+            options,
+            epoch,
+            recorder,
+            state_writer,
+            _lease,
+            _temp_dir,
+        } = fixture;
+        drop(recorder);
+        let (recorder, continued) = Recorder::open_partitioned_startup(
+            RecorderConfig {
+                sessions_root: options.sessions_root.clone(),
+                chunk_bytes: options.chunk_bytes,
+            },
+            &options.database,
+            &options.identity,
+            None,
+            None,
+            vec![SessionLifecycleInterval::new(None, None)],
+            previous.and_then(|p| p.partition_id.as_deref().zip(p.committed)),
+        )
+        .unwrap();
+        (
+            Issue362AsyncFixture {
+                options,
+                epoch,
+                recorder,
+                state_writer,
+                _lease,
+                _temp_dir,
+            },
+            continued,
+        )
+    }
+
+    type PreservedContinuityValues = (Vec<u8>, Vec<u8>, (Option<u64>, String, String));
+
+    fn issue659_preserved_values(fixture: &Issue362AsyncFixture) -> PreservedContinuityValues {
+        let connection = rusqlite::Connection::open(&fixture.options.database).unwrap();
+        let price=connection.query_row("SELECT total_dollars,price_version,total_tokens FROM usage_model_history WHERE model='gpt-6.1-sol'",[],|row|Ok((row.get::<_,Option<f64>>(0)?.map(f64::to_bits),row.get(1)?,row.get(2)?))).unwrap();
+        (
+            fixture.state_bytes(),
+            fs::read(fixture.options.sessions_root.join("original.jsonl")).unwrap(),
+            price,
+        )
+    }
+
+    #[test]
+    fn issue659_startup_continuity_reuses_complete_frame_without_history_reclassification() {
+        let fixture = issue659_continuity_fixture("issue659-continuity-complete");
+        let previous = RecorderStateWriter::read_previous_authority(&fixture.options.data_root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.committed, Some((10, 0xabc, 5)));
+        let (mut fixture, continued) = issue659_reopen_continuity_fixture(fixture, Some(&previous));
+        assert!(continued);
+        let before = issue659_preserved_values(&fixture);
+        let db_before = fs::read(&fixture.options.database).unwrap();
+        let wal_before = fs::read(fixture.options.database.with_extension("sqlite3-wal")).ok();
+        let backups: Vec<_> = (1..=3)
+            .map(|index| {
+                fs::read(
+                    fixture
+                        .options
+                        .database
+                        .with_extension(format!("sqlite3.bak.{index}")),
+                )
+                .unwrap()
+            })
+            .collect();
+        let guard_calls = Cell::new(0);
+        let rejected = reconcile_startup_projection(
+            &mut fixture.recorder,
+            &fixture.options.database,
+            &fixture.options.identity,
+            continued,
+            || {
+                guard_calls.set(guard_calls.get() + 1);
+                false
+            },
+        );
+        assert_eq!(
+            guard_calls.get(),
+            1,
+            "normal restart still checks the account fence"
+        );
+        assert!(matches!(
+            rejected,
+            Err(RecorderError::AccountBoundaryChanged)
+        ));
+        let result = reconcile_startup_projection(
+            &mut fixture.recorder,
+            &fixture.options.database,
+            &fixture.options.identity,
+            continued,
+            || true,
+        );
+        let result_ok = matches!(result, Ok(false));
+        let failure = result.err().map(|error| error.to_string());
+        let after = issue659_preserved_values(&fixture);
+        let db_after = fs::read(&fixture.options.database).unwrap();
+        let wal_after = fs::read(fixture.options.database.with_extension("sqlite3-wal")).ok();
+        let backups_after: Vec<_> = (1..=3)
+            .map(|index| {
+                fs::read(
+                    fixture
+                        .options
+                        .database
+                        .with_extension(format!("sqlite3.bak.{index}")),
+                )
+                .unwrap()
+            })
+            .collect();
+        fixture.cleanup();
+        assert!(
+            result_ok,
+            "complete accepted restart must not adopt unrelated historical proof: {failure:?}"
+        );
+        assert_eq!(before, after);
+        assert!(
+            db_before == db_after && wal_before == wal_after,
+            "normal restart preserves database bytes"
+        );
+        assert!(
+            backups == backups_after,
+            "normal restart preserves existing backups"
+        );
+    }
+
+    #[test]
+    fn issue659_startup_continuity_unknown_or_regressed_state_keeps_guarded_repair() {
+        let mut fixture = issue659_continuity_fixture("issue659-continuity-unconfirmed");
+        let original = fixture.state_value();
+        let before = issue659_preserved_values(&fixture);
+        for (field, replacement) in [
+            ("data_generation", Value::Null),
+            ("collector_epoch", Value::Null),
+            ("cycle_seq", Value::Null),
+            ("last_commit_unix", Value::Null),
+            ("partition_id_hash", Value::String("44".repeat(32))),
+            (
+                "collector_epoch",
+                Value::String(format!("{:032x}", 0xdefu128)),
+            ),
+            ("data_generation", Value::from(11u64)),
+            ("cycle_seq", Value::from(6u64)),
+        ] {
+            let mut value = original.clone();
+            value[field] = replacement;
+            fs::write(fixture.state_path(), serde_json::to_vec(&value).unwrap()).unwrap();
+            let previous =
+                RecorderStateWriter::read_previous_authority(&fixture.options.data_root).unwrap();
+            let reopened = issue659_reopen_continuity_fixture(fixture, previous.as_ref());
+            fixture = reopened.0;
+            let continued = reopened.1;
+            assert!(!continued);
+            let backup_inode =
+                fs::metadata(fixture.options.database.with_extension("sqlite3.bak.1"))
+                    .unwrap()
+                    .ino();
+            let calls = Cell::new(0);
+            let result = reconcile_startup_projection(
+                &mut fixture.recorder,
+                &fixture.options.database,
+                &fixture.options.identity,
+                continued,
+                || {
+                    calls.set(calls.get() + 1);
+                    false
+                },
+            );
+            assert_eq!(
+                calls.get(),
+                1,
+                "unconfirmed continuity must reach original account fence: {field}"
+            );
+            assert_ne!(
+                fs::metadata(fixture.options.database.with_extension("sqlite3.bak.1"))
+                    .unwrap()
+                    .ino(),
+                backup_inode,
+                "unconfirmed continuity actually runs the original backup: {field}"
+            );
+            assert!(matches!(result, Err(RecorderError::AccountBoundaryChanged)));
+            let after = issue659_preserved_values(&fixture);
+            assert_eq!(before.1, after.1);
+            assert_eq!(before.2, after.2);
+        }
+        fixture.cleanup();
+    }
+
     use codex_info_db_writer::ActiveThreadRecord;
     use serde_json::Value;
     use std::cell::Cell;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn issue604_checkpoint_recollection_and_stop_do_not_wait_for_inactive_history() {

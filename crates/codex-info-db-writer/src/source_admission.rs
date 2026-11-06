@@ -23,6 +23,15 @@ pub struct SessionMetadata {
     pub session_id: Option<String>,
 }
 
+/// Persisted copied-fork resume state. Parent records are source evidence,
+/// never this child's numeric or model authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkHistory {
+    pub parent_thread_id: String,
+    pub reading_inherited: bool,
+}
+
 /// A successful qualification of this local source in one account database.
 /// Accepted range bytes and per-event ownership still require independent
 /// verification; this record is neither provider billing evidence nor a live
@@ -40,6 +49,19 @@ pub struct SourceAccountBinding {
     pub prefix_end: u64,
     pub metadata: SessionMetadata,
     pub proof: SourceBindingProof,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_origin: Option<CreatorOrigin>,
+}
+
+/// Original first metadata record, matched by the producer to the authenticated
+/// creator and one saved ownership interval covering creation through the RPC.
+/// Raw account identifiers are deliberately not persisted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreatorOrigin {
+    pub pointer: RecordPointer,
+    pub ownership_start_at: i64,
+    pub ownership_end_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -97,6 +119,33 @@ impl SourceAccountBinding {
                 }
                 SourceBindingProof::AcceptedPrefix { anchor } => anchor.valid(self.prefix_end),
             }
+            && self.creator_origin.as_ref().is_none_or(|origin| {
+                let SourceBindingProof::Rpc {
+                    began_at, ended_at, ..
+                } = self.proof
+                else {
+                    return false;
+                };
+                origin.pointer.start == 0
+                    && origin.pointer.valid(self.prefix_end)
+                    && (1..=super::MAX_PUBLIC_UNIX_SECONDS).contains(&origin.ownership_start_at)
+                    && origin.ownership_start_at <= origin.pointer.timestamp
+                    && origin.pointer.timestamp <= began_at
+                    && origin.ownership_end_at.is_none_or(|end| {
+                        (1..=super::MAX_PUBLIC_UNIX_SECONDS).contains(&end) && ended_at < end
+                    })
+            })
+    }
+
+    pub fn eligible_from(&self) -> Option<i64> {
+        match self.proof {
+            SourceBindingProof::Rpc { began_at, .. } => Some(
+                self.creator_origin
+                    .as_ref()
+                    .map_or(began_at, |origin| origin.pointer.timestamp),
+            ),
+            SourceBindingProof::AcceptedPrefix { .. } => None,
+        }
     }
 
     pub fn matches_checkpoint(&self, checkpoint: &super::SessionCheckpoint) -> bool {
@@ -606,6 +655,8 @@ pub struct SourceAdmission {
     pub stream: UsageStream,
     pub metadata: Option<SessionMetadata>,
     pub metadata_qualified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_history: Option<ForkHistory>,
     pub strong_context: Option<StrongContext>,
     /// Original adopted legacy model context; model/kind remain checkpoint facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -638,6 +689,7 @@ impl SourceAdmission {
             stream: UsageStream::LegacyCounter,
             metadata: None,
             metadata_qualified: false,
+            fork_history: None,
             strong_context: None,
             adopted_context: None,
             previous_raw: None,
@@ -674,6 +726,14 @@ impl SourceAdmission {
                     && meta.session_id.as_deref().is_none_or(valid_identifier)
             })
             && (!self.metadata_qualified || self.metadata.is_some())
+            && self.fork_history.as_ref().is_none_or(|fork| {
+                self.version == 2
+                    && valid_identifier(&fork.parent_thread_id)
+                    && self
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|meta| meta.thread_id != fork.parent_thread_id)
+            })
             && self.account_binding.as_ref().is_none_or(|binding| {
                 self.version == 2
                     && self.metadata_qualified
@@ -741,5 +801,193 @@ impl SourceAdmission {
 
     pub fn to_storage(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+}
+
+#[cfg(test)]
+mod issue659_fork_tests {
+    use super::{SessionMetadata, SourceAdmission};
+
+    fn saved() -> serde_json::Value {
+        let mut state = SourceAdmission::from_prefix_start();
+        state.metadata = Some(SessionMetadata {
+            thread_id: "child".into(),
+            session_id: Some("child-session".into()),
+        });
+        state.metadata_qualified = true;
+        serde_json::to_value(state).unwrap()
+    }
+
+    #[test]
+    fn issue659_saved_fork_checkpoint_loads_without_rewriting() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_checkpoints (
+                root_identity TEXT, relative_path TEXT, file_device TEXT,
+                file_inode TEXT, committed_offset INTEGER, discard_until_lf INTEGER,
+                collector_epoch TEXT, cycle_seq TEXT, prefix_generation TEXT,
+                prefix_sha256 TEXT, fully_attributed_from_zero INTEGER,
+                token_baseline_known INTEGER, history_base_pending INTEGER,
+                last_model TEXT, last_task_running INTEGER,
+                context_usage_tokens TEXT, context_window_tokens TEXT,
+                previous_total TEXT, previous_input TEXT, previous_cached_input TEXT,
+                previous_output TEXT, previous_cache_write_input TEXT,
+                last_model_context_kind TEXT, last_model_interval TEXT,
+                source_admission TEXT
+            );",
+            )
+            .unwrap();
+        let plain = serde_json::to_string(&saved()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_checkpoints (
+                root_identity,relative_path,file_device,file_inode,committed_offset,
+                discard_until_lf,collector_epoch,cycle_seq,prefix_generation,
+                prefix_sha256,fully_attributed_from_zero,token_baseline_known,
+                history_base_pending,source_admission
+             ) VALUES ('unix:1:2','fork.jsonl','1','2',100,0,
+                '00000000000000000000000000001234','1',
+                '00000000000000000000000000005678',?1,0,0,0,?2)",
+                rusqlite::params!["00".repeat(32), plain],
+            )
+            .unwrap();
+        assert_eq!(
+            crate::load_session_checkpoints_matching(&connection, "", [])
+                .unwrap()
+                .len(),
+            1,
+            "the ordinary saved-checkpoint control must load",
+        );
+
+        let mut value = saved();
+        value["fork_history"] = serde_json::json!({
+            "parent_thread_id": "parent",
+            "reading_inherited": true
+        });
+        let raw = serde_json::to_string(&value).unwrap();
+        connection
+            .execute(
+                "UPDATE session_checkpoints SET source_admission=?1",
+                [raw.as_str()],
+            )
+            .unwrap();
+        connection.execute_batch("PRAGMA query_only=ON").unwrap();
+        let loaded = crate::load_session_checkpoints_matching(&connection, "", []);
+        assert!(
+            loaded.is_ok(),
+            "saved fork checkpoint must load without schema mutation: {loaded:?}",
+        );
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.len(), 1);
+        let state = loaded[0].source_admission.as_ref().unwrap();
+        assert_eq!(serde_json::to_value(state).unwrap(), value);
+        let after: String = connection
+            .query_row(
+                "SELECT source_admission FROM session_checkpoints",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, raw,
+            "read-only admission must preserve the stored JSON"
+        );
+    }
+
+    #[test]
+    fn issue659_fork_state_keeps_old_and_typed_boundaries() {
+        for version in [1, 2] {
+            let mut value = saved();
+            value["version"] = serde_json::json!(version);
+            let raw = serde_json::to_string(&value).unwrap();
+            assert!(SourceAdmission::from_storage(&raw, 100).is_some());
+        }
+        for inherited in [false, true] {
+            let mut value = saved();
+            value["fork_history"] = serde_json::json!({
+                "parent_thread_id": "parent",
+                "reading_inherited": inherited
+            });
+            let restored =
+                SourceAdmission::from_storage(&serde_json::to_string(&value).unwrap(), 100)
+                    .expect("recognized v2 fork state must survive");
+            assert_eq!(serde_json::to_value(restored).unwrap(), value);
+        }
+        for invalid in [
+            serde_json::json!({"parent_thread_id":"child","reading_inherited":true}),
+            serde_json::json!({"parent_thread_id":"","reading_inherited":false}),
+            serde_json::json!({"parent_thread_id":"parent","reading_inherited":1}),
+            serde_json::json!({"parent_thread_id":"parent","reading_inherited":true,"extra":0}),
+        ] {
+            let mut value = saved();
+            value["fork_history"] = invalid;
+            assert!(
+                SourceAdmission::from_storage(&serde_json::to_string(&value).unwrap(), 100)
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod issue659_readonly_storage_tests {
+    #[test]
+    #[ignore = "requires explicitly selected registry-referenced live databases"]
+    fn issue659_all_referenced_checkpoints_load_readonly() {
+        let paths: Vec<String> = serde_json::from_str(
+            &std::env::var("CODEX_INFO_ISSUE659_READONLY_DATABASES")
+                .expect("explicit readonly database inputs"),
+        )
+        .unwrap();
+        let mut rows = 0usize;
+        let mut deserialize_failures = 0usize;
+        let mut validity_failures = 0usize;
+        let mut sql_load_failures = 0usize;
+        let mut sql_loaded_rows = 0usize;
+        for path in &paths {
+            let connection = rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            connection
+                .execute_batch("PRAGMA query_only=ON; BEGIN")
+                .unwrap();
+            let expected: usize = connection
+                .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |r| r.get(0))
+                .unwrap();
+            {
+                let mut statement = connection.prepare("SELECT source_admission, committed_offset FROM session_checkpoints WHERE source_admission IS NOT NULL").unwrap();
+                let values = statement
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                    .unwrap();
+                for row in values {
+                    let (raw, end) = row.unwrap();
+                    rows += 1;
+                    match serde_json::from_str::<super::SourceAdmission>(&raw) {
+                        Err(_) => deserialize_failures += 1,
+                        Ok(value) => {
+                            if u64::try_from(end).ok().is_none_or(|end| !value.valid(end)) {
+                                validity_failures += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            match crate::load_session_checkpoints_matching(&connection, "", []) {
+                Ok(values) if values.len() == expected => sql_loaded_rows += values.len(),
+                _ => sql_load_failures += 1,
+            }
+        }
+        println!("readonly databases={} payload_rows={} deserialize_failures={} validity_failures={} sql_load_failures={} sql_loaded_rows={}", paths.len(), rows, deserialize_failures, validity_failures, sql_load_failures, sql_loaded_rows);
+        assert!(
+            rows > 0
+                && deserialize_failures == 0
+                && validity_failures == 0
+                && sql_load_failures == 0,
+            "all selected existing storage must decode and SQL-load without mutation"
+        );
     }
 }

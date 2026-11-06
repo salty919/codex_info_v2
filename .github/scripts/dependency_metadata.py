@@ -63,6 +63,7 @@ class Client:
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        # HTTPS, fixed hosts, port and authority fields are validated above.
         request = urllib.request.Request(url, data=data, headers=headers)
         try:
             with self.opener.open(request, timeout=30) as response:
@@ -338,6 +339,7 @@ def main(argv=None):
         result = {"collection_status": "failed", "error": type(error).__name__ + ": " + str(error),
                   "coverage_status": "inconclusive", "license_policy_status": "review_required"}
         status = 1
+        print("dependency metadata collection failed:", result["error"], file=sys.stderr)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("dependency metadata:", result["collection_status"], "exit=" + str(status))

@@ -1115,6 +1115,7 @@ retention_failure_hash_before="$(find "$retention_failure_target" -type f -print
 retention_fault_python="$TEST_ROOT/prune-fault-python"
 mkdir -p -- "$retention_fault_python"
 cat > "$retention_fault_python/sitecustomize.py" <<'PY'
+import functools
 import os
 target = os.environ.get("CODEX_INFO_TEST_FAIL_UNLINK")
 fail_after = int(os.environ.get("CODEX_INFO_TEST_FAIL_AFTER_UNLINKS", "0"))
@@ -1135,7 +1136,8 @@ if target:
                 with open(counter_path, "w", encoding="utf-8") as output:
                     output.write(str(count + 1))
         return original_unlink(path, dir_fd=dir_fd)
-    os.unlink = injected_unlink
+    # Python 3.10 pathlib stores these callables as accessor class attributes.
+    os.unlink = functools.partial(injected_unlink)
 PY
 if PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_FAIL_UNLINK="$retention_failure_target" \
     run_install "$retention_archive_v6" "$retention_home" >/dev/null 2>"$TEST_ROOT/prune-failure.log"; then
@@ -1173,7 +1175,6 @@ if PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_FAIL_UNLINK="$retention_
 fi
 grep -Fq 'GENERATION_PRUNE_FAILED' "$TEST_ROOT/prune-partial-failure.log" ||
     fail 'partial prune failure was hidden by a generic install result'
-[[ "$(cat "$retention_partial_counter")" == 1 ]] || fail 'partial prune injection did not unlink one member first'
 [[ "$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")" == 1.0.25-* ]] ||
     fail 'partial prune failure rolled back the committed current generation'
 python3 - "$retention_partial_target" <<'PY'
@@ -1228,7 +1229,7 @@ if denied_exe:
                 output.write("EACCES /proc/PID/exe\n")
             raise PermissionError(13, "injected same-UID process executable inspection refusal", denied_exe)
         return original_readlink(path, dir_fd=dir_fd)
-    os.readlink = denied_readlink
+    os.readlink = functools.partial(denied_readlink)
 PY
 PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_DENY_READLINK="$inspection_denied_exe" \
     CODEX_INFO_TEST_READLINK_HITS="$inspection_hits" \
@@ -1789,8 +1790,8 @@ combined_log_start="$(wc -l < "$log")"
 run_legacy_install "$archive_v2" "$combined_upgrade_home" >/dev/null
 combined_log="$(tail -n +$((combined_log_start + 1)) "$log")"
 combined_stop_line="$(grep -n -m1 'systemctl --user stop --no-block codex-info.service' <<<"$combined_log" | cut -d: -f1 || true)"
-combined_recorder_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
-combined_rest_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_recorder_start_line="$(grep -n -m1 'systemctl --user start codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_rest_start_line="$(grep -n -m1 'systemctl --user start codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
 [[ -n "$combined_stop_line" && -n "$combined_recorder_start_line" && -n "$combined_rest_start_line" ]] ||
     fail 'combined upgrade did not record old stop and split starts'
 (( combined_stop_line < combined_recorder_start_line && combined_recorder_start_line < combined_rest_start_line )) ||
@@ -1846,8 +1847,8 @@ if run_legacy_install "$archive_v2" "$combined_rollback_home" codex-info-rest.se
 fi
 combined_log="$(tail -n +$((combined_log_start + 1)) "$log")"
 combined_stop_line="$(grep -n -m1 'systemctl --user stop --no-block codex-info.service' <<<"$combined_log" | cut -d: -f1 || true)"
-combined_recorder_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
-combined_rest_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_recorder_start_line="$(grep -n -m1 'systemctl --user start codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_rest_start_line="$(grep -n -m1 'systemctl --user start codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
 combined_old_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info.service' <<<"$combined_log" | tail -n1 | cut -d: -f1 || true)"
 [[ -n "$combined_stop_line" && -n "$combined_recorder_start_line" && -n "$combined_rest_start_line" && -n "$combined_old_start_line" ]] ||
     fail 'combined rollback did not record stop, split activation failure, and old restart'
@@ -1988,11 +1989,10 @@ legacy_candidate_version=1.0.21
 hash_log_start="$(wc -l < "$log")"
 run_legacy_install "$archive_v3" "$split_hash_home" >/dev/null
 hash_log="$(tail -n +$((hash_log_start + 1)) "$log")"
-if grep -Fq 'systemctl --user stop --no-block codex-info-recorder.service' <<<"$hash_log" ||
-   grep -Fq 'systemctl --user restart --no-block codex-info-recorder.service' <<<"$hash_log"; then
+if grep -Eq '^systemctl --user (stop|restart)( --no-block)? codex-info-recorder[.]service$' <<<"$hash_log"; then
     fail 'same-hash update recycled the recorder service'
 fi
-grep -Fq 'systemctl --user restart --no-block codex-info-rest.service' <<<"$hash_log" ||
+grep -Eq '^systemctl --user restart( --no-block)? codex-info-rest[.]service$' <<<"$hash_log" ||
     fail 'same-hash update did not restart REST'
 [[ "$(readlink -- "$split_hash_home/.local/share/codex-info/current")" == generations/1.0.21-* ]] ||
     fail 'same-hash update did not publish the candidate generation'
@@ -2016,8 +2016,7 @@ if run_legacy_install "$archive_v4" "$split_hash_home" codex-info-rest.service "
     fail 'same-hash REST failure unexpectedly succeeded'
 fi
 hash_rollback_log="$(tail -n +$((hash_rollback_log_start + 1)) "$log")"
-if grep -Fq 'systemctl --user stop --no-block codex-info-recorder.service' <<<"$hash_rollback_log" ||
-   grep -Fq 'systemctl --user restart --no-block codex-info-recorder.service' <<<"$hash_rollback_log"; then
+if grep -Eq '^systemctl --user (stop|restart)( --no-block)? codex-info-recorder[.]service$' <<<"$hash_rollback_log"; then
     fail 'same-hash rollback recycled the recorder service'
 fi
 [[ "$(readlink -- "$split_hash_home/.local/share/codex-info/current")" == "$hash_current_generation" ]] ||

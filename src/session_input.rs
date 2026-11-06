@@ -7,6 +7,7 @@
 use chrono::DateTime;
 use codex_info_db_writer::source_admission::{self, ResponseIds, ResponseRecord, ResponseUsage};
 use codex_info_db_writer::{SessionModelContextKind, SessionModelInterval, TokenFacts};
+use sha2::{Digest, Sha256};
 use std::io::{self, BufRead};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -224,6 +225,8 @@ pub enum SessionJsonKey {
     Role,
     Ordinal,
     Metadata,
+    ForkedFromId,
+    CreatorAccountId,
     Other,
 }
 
@@ -258,7 +261,9 @@ impl SessionJsonKey {
     }
 }
 
-const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 55] = [
+const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 57] = [
+    (b"forked_from_id", SessionJsonKey::ForkedFromId),
+    (b"creator_account_id", SessionJsonKey::CreatorAccountId),
     (b"type", SessionJsonKey::Type),
     (b"timestamp", SessionJsonKey::Timestamp),
     (b"model", SessionJsonKey::Model),
@@ -559,6 +564,10 @@ pub struct PayloadSummary {
     pub noop: NoOpShape,
     pub metadata_id: Option<String>,
     pub metadata_id_malformed: bool,
+    pub forked_from_id: Option<String>,
+    pub forked_from_id_malformed: bool,
+    // Ephemeral comparison only. Never retain the raw account identifier.
+    pub creator_account_sha256: Option<[u8; 32]>,
     pub response: ResponsePayloadSummary,
     pub snapshot_non_null: bool,
     pub snapshot: ResponsePayloadSummary,
@@ -648,6 +657,12 @@ impl SessionRecordSummary {
             && self.payload_object
             && self.payload.metadata_id.is_some()
             && !self.payload.metadata_id_malformed
+            && !self.payload.forked_from_id_malformed
+            && self
+                .payload
+                .forked_from_id
+                .as_ref()
+                .is_none_or(|parent| self.payload.metadata_id.as_ref() != Some(parent))
             && self.payload.response.malformed_identifiers & SessionJsonKey::SessionId.bit() == 0
             && (!self.payload.response.session_id_seen
                 || self.payload.response.session_id.is_some())
@@ -806,6 +821,7 @@ impl SessionRecordSummary {
                     SessionJsonKey::Id,
                     SessionJsonKey::SessionId,
                     SessionJsonKey::HistoryBase,
+                    SessionJsonKey::ForkedFromId,
                 ])
             }
             Some("token_usage_record") => {
@@ -1342,6 +1358,17 @@ impl<'a, R: BufRead> SessionRecordInput<'a, R> {
                     let (value, malformed) = self.parse_identifier_value()?;
                     summary.payload.metadata_id = value;
                     summary.payload.metadata_id_malformed = malformed;
+                }
+                SessionJsonKey::CreatorAccountId => {
+                    let (value, malformed) = self.parse_identifier_value()?;
+                    summary.payload.creator_account_sha256 = value
+                        .filter(|_| !malformed)
+                        .map(|value| Sha256::digest(value.as_bytes()).into());
+                }
+                SessionJsonKey::ForkedFromId => {
+                    let (value, malformed) = self.parse_identifier_value()?;
+                    summary.payload.forked_from_id = value;
+                    summary.payload.forked_from_id_malformed = malformed;
                 }
                 SessionJsonKey::ThreadId
                 | SessionJsonKey::SessionId
@@ -2299,4 +2326,61 @@ pub fn read_streaming_record<R: BufRead, E: From<io::Error>>(
         ));
     }
     Ok(RecordRead::Unterminated(input.consumed))
+}
+
+#[cfg(test)]
+mod issue659_fork_metadata_tests {
+    #[test]
+    fn issue659_fork_metadata_keeps_type_duplicates_and_identity() {
+        for (extra, expected) in [
+            ("", true),
+            (",\"forked_from_id\":null", true),
+            (",\"forked_from_id\":\"parent\"", true),
+            (",\"forked_from_id\":false", false),
+            (",\"forked_from_id\":\"child\"", false),
+            (
+                ",\"forked_from_id\":\"parent\",\"forked_from_id\":\"other\"",
+                false,
+            ),
+        ] {
+            let text = format!(
+                "{{\"type\":\"session_meta\",\"timestamp\":\"2026-11-01T00:00:00Z\",\"payload\":{{\"id\":\"child\",\"session_id\":\"child-session\"{extra}}}}}\n"
+            );
+            let mut input = std::io::Cursor::new(text.as_bytes());
+            let record = super::read_streaming_record(&mut input, std::io::Error::other).unwrap();
+            let super::RecordRead::Present(summary, _) = record else {
+                panic!("valid fixture JSON must produce a complete record");
+            };
+            assert_eq!(summary.metadata_shape_valid(), expected, "{extra}");
+        }
+    }
+    #[test]
+    fn issue659_creator_id_uses_unicode_scalar_boundary() {
+        use sha2::Digest;
+        for (scalars, accepted) in [(512usize, true), (513usize, false)] {
+            let account = "あ".repeat(scalars);
+            let text = serde_json::to_string(&serde_json::json!({
+                "type":"session_meta", "timestamp":"2026-11-01T00:00:00Z",
+                "payload":{"id":"child", "session_id":"child-session", "creator_account_id":account}
+            }))
+            .unwrap()
+                + "\n";
+            let mut input = std::io::Cursor::new(text.as_bytes());
+            let super::RecordRead::Present(record, _) =
+                super::read_streaming_record(&mut input, std::io::Error::other).unwrap()
+            else {
+                panic!("complete fixture record");
+            };
+            let hash: [u8; 32] = sha2::Sha256::digest(account.as_bytes()).into();
+            assert_eq!(
+                record.payload.creator_account_sha256,
+                accepted.then_some(hash),
+                "Unicode scalar boundary: {scalars}"
+            );
+            assert!(
+                record.metadata_shape_valid(),
+                "creator failure must preserve independent metadata"
+            );
+        }
+    }
 }

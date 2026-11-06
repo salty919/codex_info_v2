@@ -22,13 +22,12 @@ use codex_info_db_writer::event_admission::{
     NumericEventProof,
 };
 use codex_info_db_writer::source_admission::{
-    ClassificationPointer, PendingResponse, RecordPointer, ResponseClassificationInput,
-    ResponseContext, ResponseModelClassification, SessionMetadata, SourceAccountBinding,
-    SourceAdmission, SourceBindingProof, StrongContext, UsageStream,
+    ClassificationPointer, CreatorOrigin, PendingResponse, RecordPointer,
+    ResponseClassificationInput, ResponseContext, ResponseModelClassification, SessionMetadata,
+    SourceAccountBinding, SourceAdmission, SourceBindingProof, StrongContext, UsageStream,
 };
 use codex_info_db_writer::{
-    finalize_session_timeline_recovery, session_event_has_ambiguous_lineage,
-    session_event_is_replay, session_token_anchor_recovery_id, ActiveThreadRecord,
+    finalize_session_timeline_recovery, session_token_anchor_recovery_id, ActiveThreadRecord,
     ActiveThreadSnapshot, LosslessSessionEvent, QuotaTransition, RecordedSessionSource,
     SessionCheckpoint, SessionCollectionCommit, SessionCollectionState, SessionEvent,
     SessionLifecycleInterval, SessionModelContextKind, SessionModelInterval, SessionModelTotal,
@@ -1456,6 +1455,15 @@ fn request_app_server_before_deadline(
     }
 }
 
+fn thread_read_response_thread(result: &Value) -> Result<&Value, String> {
+    let result_object = result
+        .as_object()
+        .ok_or_else(|| "thread/read response envelope rejected".to_owned())?;
+    result_object
+        .get("thread")
+        .ok_or_else(|| "thread/read response missing thread".to_owned())
+}
+
 fn collect_active_thread_snapshot(
     sessions_root: &Path,
     checkpoints: &[SessionCheckpoint],
@@ -1637,13 +1645,7 @@ fn collect_active_thread_snapshot_from_paths(
                 json!({"threadId": thread_id, "includeTurns": false}),
                 deadline,
             )?;
-            let result_object = result
-                .as_object()
-                .filter(|object| object.len() == 1)
-                .ok_or_else(|| "thread/read response envelope rejected".to_owned())?;
-            let thread_item = result_object
-                .get("thread")
-                .ok_or_else(|| "thread/read response missing thread".to_owned())?;
+            let thread_item = thread_read_response_thread(&result)?;
             let candidate = thread_contract::validate_thread_item(thread_item)
                 .map_err(|_| "thread/read response rejected".to_owned())?;
             let response_path = candidate.path().and_then(|value| {
@@ -3640,6 +3642,8 @@ pub struct RecorderStateWriter {
 pub struct PreviousRecorderAuthority {
     pub partition_id: Option<String>,
     pub transition_fingerprint: String,
+    /// Complete previously committed frame, distinct from accepted partial input.
+    pub committed: Option<(u64, u128, u64)>,
 }
 
 impl RecorderStateWriter {
@@ -3755,6 +3759,7 @@ impl RecorderStateWriter {
             return Ok(Some(PreviousRecorderAuthority {
                 partition_id: None,
                 transition_fingerprint: hex_digest(Sha256::digest(&bytes).as_slice()),
+                committed: None,
             }));
         }
         let partition_id = string("partition_id_hash").ok_or_else(|| {
@@ -3785,9 +3790,18 @@ impl RecorderStateWriter {
                 "recorder state identity or bounds are invalid".to_owned(),
             ));
         }
+        let committed = (|| {
+            object.get("last_commit_unix")?.as_i64()?;
+            Some((
+                object.get("data_generation")?.as_u64()?,
+                u128::from_str_radix(string("collector_epoch")?, 16).ok()?,
+                object.get("cycle_seq")?.as_u64()?,
+            ))
+        })();
         Ok(Some(PreviousRecorderAuthority {
             partition_id: Some(partition_id.to_owned()),
             transition_fingerprint: hex_digest(Sha256::digest(&bytes).as_slice()),
+            committed,
         }))
     }
 
@@ -4317,7 +4331,114 @@ fn source_account_binding(
         prefix_end: checkpoint.committed_offset,
         metadata,
         proof,
+        creator_origin: None,
     }
+}
+
+fn creator_origin_from_record(
+    bytes: &[u8],
+    metadata: &SessionMetadata,
+    authority: &AccountAuthority,
+    intervals: &[SessionLifecycleInterval],
+    began_at: i64,
+    ended_at: i64,
+) -> Option<CreatorOrigin> {
+    let RecordRead::Present(record, consumed) =
+        read_streaming_record(&mut io::Cursor::new(bytes)).ok()?
+    else {
+        return None;
+    };
+    if consumed != bytes.len() as u64
+        || record.outer_type.as_deref() != Some("session_meta")
+        || !record.metadata_shape_valid()
+        || record.timestamp_malformed
+        || record.payload_duplicates & SessionJsonKey::CreatorAccountId.bit() != 0
+        || record.payload.metadata_id.as_deref() != Some(metadata.thread_id.as_str())
+        || record.payload.response.session_id != metadata.session_id
+        || record.payload.creator_account_sha256
+            != Some(Sha256::digest(&authority.account_id.0).into())
+    {
+        return None;
+    }
+    let created_at = DateTime::parse_from_rfc3339(record.timestamp.as_deref()?)
+        .ok()?
+        .timestamp();
+    if !(1..=253_402_300_799).contains(&created_at) || created_at > began_at || began_at > ended_at
+    {
+        return None;
+    }
+    let mut owners = intervals.iter().filter(|owner| {
+        owner
+            .start_at
+            .is_some_and(|start| start > 0 && start <= created_at)
+            && owner.end_at.is_none_or(|end| ended_at < end)
+    });
+    let owner = owners.next()?;
+    if owners.next().is_some() {
+        return None;
+    }
+    Some(CreatorOrigin {
+        pointer: RecordPointer {
+            start: 0,
+            end: consumed,
+            sha256: hex_digest(bytes),
+            timestamp: created_at,
+        },
+        ownership_start_at: owner.start_at?,
+        ownership_end_at: owner.end_at,
+    })
+}
+
+fn read_creator_origin(
+    source: &Source,
+    checkpoint: &SessionCheckpoint,
+    binding: &SourceAccountBinding,
+    authority: &AccountAuthority,
+    intervals: &[SessionLifecycleInterval],
+) -> Option<CreatorOrigin> {
+    let SourceBindingProof::Rpc {
+        began_at, ended_at, ..
+    } = binding.proof
+    else {
+        return None;
+    };
+    let mut file = File::open(&source.path).ok()?;
+    let opened = file.metadata().ok()?;
+    if file_identity(&opened) != (checkpoint.file_device, checkpoint.file_inode)
+        || !source_root_matches_inventory(source).ok()?
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    BufReader::new((&mut file).take(APP_SERVER_MAX_LINE_BYTES as u64 + 1))
+        .read_until(b'\n', &mut bytes)
+        .ok()?;
+    if bytes.len() > APP_SERVER_MAX_LINE_BYTES
+        || bytes.last() != Some(&b'\n')
+        || bytes.len() as u64 > binding.prefix_end
+    {
+        return None;
+    }
+    let origin = creator_origin_from_record(
+        &bytes,
+        &binding.metadata,
+        authority,
+        intervals,
+        began_at,
+        ended_at,
+    )?;
+    let after = file.metadata().ok()?;
+    let path = fs::symlink_metadata(&source.path).ok()?;
+    if path.file_type().is_symlink()
+        || !same_file_identity(&opened, &after)
+        || !same_file_identity(&after, &path)
+        || !source_root_matches_inventory(source).ok()?
+    {
+        return None;
+    }
+    // The caller re-verifies the complete accepted prefix after this read and
+    // commits this proof only with the same checkpoint and current account fence.
+    Some(origin)
 }
 
 fn historical_source_binding(
@@ -4420,6 +4541,7 @@ fn historical_source_binding_in_container(
         proof: SourceBindingProof::AcceptedPrefix {
             anchor: anchor.clone(),
         },
+        creator_origin: None,
     }))
 }
 
@@ -4510,6 +4632,27 @@ impl Recorder {
         transition_fingerprint: Option<&str>,
         lifecycle_intervals: Vec<SessionLifecycleInterval>,
     ) -> Result<Self, RecorderError> {
+        Self::open_partitioned_startup(
+            config,
+            database,
+            identity,
+            activation_timestamp,
+            transition_fingerprint,
+            lifecycle_intervals,
+            None,
+        )
+        .map(|(recorder, _)| recorder)
+    }
+
+    pub fn open_partitioned_startup(
+        config: RecorderConfig,
+        database: impl AsRef<Path>,
+        identity: &StoragePartitionIdentity,
+        activation_timestamp: Option<i64>,
+        transition_fingerprint: Option<&str>,
+        lifecycle_intervals: Vec<SessionLifecycleInterval>,
+        previous: Option<(&str, (u64, u128, u64))>,
+    ) -> Result<(Self, bool), RecorderError> {
         config.validate()?;
         if lifecycle_intervals.is_empty() {
             return Err(RecorderError::Invalid(
@@ -4553,36 +4696,30 @@ impl Recorder {
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
-        if existing_database && !UsageStore::partition_history_is_current(&database, identity)? {
+        let migration_required =
+            existing_database && !UsageStore::partition_history_is_current(&database, identity)?;
+        if migration_required {
             let backup =
                 UsageStore::backup_generations_partitioned_verified(&database, identity, 3)?;
             UsageStore::migrate_partition_history_after_verified_backup(
                 &database, identity, &backup,
             )?;
         }
-        let mut writer = if existing_database {
-            UsageStore::open_partitioned(&database, identity)?
+        let (mut writer, continued) = if existing_database {
+            UsageStore::open_partitioned_startup(
+                &database,
+                identity,
+                if migration_required { None } else { previous },
+            )?
         } else {
-            UsageStore::create_partitioned(&database, identity)?
+            (UsageStore::create_partitioned(&database, identity)?, false)
         };
         let history_now = Utc::now();
         writer.prune_older_than_three_months(history_now)?;
         // Historical source bytes are reconstructed by their bounded owner
         // after publication starts. Opening the partition never runs a full
         // Session recovery pass or converts cached quota into observations.
-        let mut source_event_repair_candidates: BTreeSet<_> = writer
-            .load_unqualified_session_event_facts()?
-            .into_iter()
-            .map(|fact| {
-                (
-                    fact.source.root_identity,
-                    fact.source.relative_path,
-                    fact.source.file_device,
-                    fact.source.file_inode,
-                    fact.source.prefix_generation,
-                )
-            })
-            .collect();
+        let mut source_event_repair_candidates = writer.unqualified_session_source_keys()?;
         source_event_repair_candidates.extend(
             writer
                 .load_session_collection_state()?
@@ -4591,29 +4728,32 @@ impl Recorder {
                 .filter(|checkpoint| checkpoint_requires_parser_reconstruction(checkpoint))
                 .map(source_verification_key),
         );
-        Ok(Self {
-            config,
-            writer,
-            database: Some(database),
-            identity: Some(identity.clone()),
-            _writer_lock: Some(lock),
-            pending: None,
-            historical_pending: None,
-            historical_preparation_owned: false,
-            quota_replay_cursor: Default::default(),
-            last_ranges: Vec::new(),
-            task_backfill: TaskBackfillWorker::start(),
-            activation_timestamp,
-            lifecycle_intervals,
-            account_boundary_epoch,
-            source_verifications: BTreeMap::new(),
-            source_parser_reconstructions: BTreeMap::new(),
-            source_event_repair_candidates,
-            source_original_reconstructions: BTreeMap::new(),
-            rejected_read_containers: BTreeMap::new(),
-            rejected_source_equivalences: BTreeMap::new(),
-            checkpoint_reconciliation_sources: BTreeSet::new(),
-        })
+        Ok((
+            Self {
+                config,
+                writer,
+                database: Some(database),
+                identity: Some(identity.clone()),
+                _writer_lock: Some(lock),
+                pending: None,
+                historical_pending: None,
+                historical_preparation_owned: false,
+                quota_replay_cursor: Default::default(),
+                last_ranges: Vec::new(),
+                task_backfill: TaskBackfillWorker::start(),
+                activation_timestamp,
+                lifecycle_intervals,
+                account_boundary_epoch,
+                source_verifications: BTreeMap::new(),
+                source_parser_reconstructions: BTreeMap::new(),
+                source_event_repair_candidates,
+                source_original_reconstructions: BTreeMap::new(),
+                rejected_read_containers: BTreeMap::new(),
+                rejected_source_equivalences: BTreeMap::new(),
+                checkpoint_reconciliation_sources: BTreeSet::new(),
+            },
+            continued,
+        ))
     }
 
     /// Test/embedding constructor for a caller that already owns a UsageStore.
@@ -4624,19 +4764,7 @@ impl Recorder {
         writer: UsageStore,
     ) -> Result<Self, RecorderError> {
         config.validate()?;
-        let mut source_event_repair_candidates: BTreeSet<_> = writer
-            .load_unqualified_session_event_facts()?
-            .into_iter()
-            .map(|fact| {
-                (
-                    fact.source.root_identity,
-                    fact.source.relative_path,
-                    fact.source.file_device,
-                    fact.source.file_inode,
-                    fact.source.prefix_generation,
-                )
-            })
-            .collect();
+        let mut source_event_repair_candidates = writer.unqualified_session_source_keys()?;
         source_event_repair_candidates.extend(
             writer
                 .load_session_collection_state()?
@@ -4988,6 +5116,7 @@ impl Recorder {
             return self.commit_pending().map(Some);
         }
 
+        let source_preparation = self.writer.source_preparation_scope()?;
         let period_attribution = source_context
             .as_ref()
             .map(|context| {
@@ -5157,25 +5286,26 @@ impl Recorder {
         } else {
             0
         };
-        let mut replayed_events = if period_restarted && period_available {
-            self.writer
-                .load_session_events()?
-                .into_iter()
-                .filter(|event| {
-                    event.timestamp >= reset_at.saturating_sub(window_seconds)
-                        && event.timestamp <= timeline_end
-                        && self.lifecycle_intervals.iter().any(|interval| {
-                            interval
-                                .start_at
-                                .is_none_or(|start| event.timestamp >= start)
-                                && interval.end_at.is_none_or(|end| event.timestamp < end)
-                        })
-                })
-                .map(session_event_to_timed_usage)
-                .collect::<Result<Vec<_>, RecorderError>>()?
-        } else {
-            Vec::new()
-        };
+        let mut replayed_events =
+            if period_restarted && period_available && period_attribution.is_none() {
+                self.writer
+                    .load_session_events()?
+                    .into_iter()
+                    .filter(|event| {
+                        event.timestamp >= reset_at.saturating_sub(window_seconds)
+                            && event.timestamp <= timeline_end
+                            && self.lifecycle_intervals.iter().any(|interval| {
+                                interval
+                                    .start_at
+                                    .is_none_or(|start| event.timestamp >= start)
+                                    && interval.end_at.is_none_or(|end| event.timestamp < end)
+                            })
+                    })
+                    .map(session_event_to_timed_usage)
+                    .collect::<Result<Vec<_>, RecorderError>>()?
+            } else {
+                Vec::new()
+            };
         for event in &replayed_events {
             totals.add(&event.model, event.delta)?;
         }
@@ -5185,7 +5315,20 @@ impl Recorder {
         // account-switch/restart prefix replay is removed before it reaches
         // either totals or history. Proven duplicates are filtered; any
         // non-identical record remains normal source data.
-        let mut admitted_session_events = self.writer.load_session_events()?;
+        let mut admitted_session_events = if period_attribution.is_none() {
+            self.writer.load_session_events()?
+        } else {
+            Vec::new()
+        };
+        let mut replay_identities = if period_attribution.is_some() {
+            self.writer.session_event_replay_identities()?
+        } else {
+            admitted_session_events
+                .iter()
+                .cloned()
+                .map(codex_info_db_writer::SessionEventReplayIdentity::from)
+                .collect()
+        };
 
         let mut source_verifications = BTreeMap::new();
         let mut source_binding_cycle: Option<Result<SourceBindingCycle, String>> = None;
@@ -5610,10 +5753,7 @@ impl Recorder {
                             .source_admission
                             .as_ref()
                             .and_then(|state| state.account_binding.as_ref())
-                            .and_then(|binding| match binding.proof {
-                                SourceBindingProof::Rpc { began_at, .. } => Some(began_at),
-                                _ => None,
-                            }),
+                            .and_then(SourceAccountBinding::eligible_from),
                     });
                     let advanced = reconstruction.advance(
                         source,
@@ -5826,10 +5966,7 @@ impl Recorder {
                             .expect("recovery binding");
                         let ownership = SourceOwnership {
                             intervals: &self.lifecycle_intervals,
-                            eligible_from: match binding.proof {
-                                SourceBindingProof::Rpc { began_at, .. } => Some(began_at),
-                                SourceBindingProof::AcceptedPrefix { .. } => None,
-                            },
+                            eligible_from: binding.eligible_from(),
                         };
                         let advanced = recovery.advance(
                             source,
@@ -5952,10 +6089,7 @@ impl Recorder {
                     }
                 }
                 let eligible_from = if let Some(binding) = proposed_binding.as_ref() {
-                    match binding.proof {
-                        SourceBindingProof::Rpc { began_at, .. } => Some(began_at),
-                        SourceBindingProof::AcceptedPrefix { .. } => None,
-                    }
+                    binding.eligible_from()
                 } else {
                     let cycle = source_binding_cycle
                         .get_or_insert_with(|| SourceBindingCycle::start(context));
@@ -6217,7 +6351,16 @@ impl Recorder {
                     return Err(RecorderError::AccountBoundaryChanged);
                 }
                 let mut qualified = false;
-                if let Ok(binding) = binding {
+                if let Ok(mut binding) = binding {
+                    if binding.creator_origin.is_none() {
+                        binding.creator_origin = read_creator_origin(
+                            source,
+                            &result.checkpoint,
+                            &binding,
+                            &context.epoch.authority,
+                            &self.lifecycle_intervals,
+                        );
+                    }
                     let previous_binding = result
                         .checkpoint
                         .source_admission
@@ -6309,9 +6452,9 @@ impl Recorder {
             let mut ambiguous_lineage = false;
             for candidate in &result.events {
                 if !canonical_sources.is_proved_replay(candidate)?
-                    && admitted_session_events
+                    && replay_identities
                         .iter()
-                        .any(|old| session_event_has_ambiguous_lineage(old, candidate))
+                        .any(|old| old.has_ambiguous_lineage_with(candidate))
                 {
                     ambiguous_lineage = true;
                     break;
@@ -6357,9 +6500,9 @@ impl Recorder {
             }
             let mut admitted_events = Vec::with_capacity(result.events.len());
             for event in result.events {
-                let replay = admitted_session_events
+                let replay = replay_identities
                     .iter()
-                    .any(|existing| session_event_is_replay(existing, &event))
+                    .any(|existing| existing.is_replay_of(&event))
                     || canonical_sources.is_proved_replay(&event)?;
                 if replay {
                     if reset_at > 0
@@ -6377,6 +6520,7 @@ impl Recorder {
                         }
                     }
                 } else {
+                    replay_identities.push(event.clone().into());
                     admitted_session_events.push(event.clone());
                     admitted_events.push(event);
                 }
@@ -6542,9 +6686,9 @@ impl Recorder {
                     let lineage_unresolved = existing
                         .as_ref()
                         .is_none_or(|old| !codex_info_db_writer::same_response(old, &fact))
-                        && admitted_session_events
+                        && replay_identities
                             .iter()
-                            .any(|old| session_event_has_ambiguous_lineage(old, &raw));
+                            .any(|old| old.has_ambiguous_lineage_with(&raw));
                     if lineage_unresolved
                         || !fact
                             .admission
@@ -7110,6 +7254,7 @@ impl Recorder {
             self.activation_timestamp
                 .is_none_or(|boundary| event.timestamp >= boundary)
         });
+        drop(source_preparation);
         self.pending = Some(PendingBatch {
             source_repairs,
             period_attribution,
@@ -7432,10 +7577,7 @@ impl Recorder {
                 }
                 let ownership = SourceOwnership {
                     intervals: &self.lifecycle_intervals,
-                    eligible_from: match saved_binding.map(|binding| &binding.proof) {
-                        Some(SourceBindingProof::Rpc { began_at, .. }) => Some(*began_at),
-                        _ => None,
-                    },
+                    eligible_from: saved_binding.and_then(SourceAccountBinding::eligible_from),
                 };
                 if self
                     .source_original_reconstructions
@@ -10373,12 +10515,6 @@ fn scan_source_with_reader<R: BufRead>(
                 timestamp: original_timestamp,
                 sha256: classification_pointer.sha256.clone(),
             });
-        let response_marker = summary.response_stream_marker();
-        if response_marker {
-            let admission =
-                source_admission.get_or_insert_with(SourceAdmission::from_response_boundary);
-            admission.stream = UsageStream::ResponseRecord;
-        }
         if let Some(admission) = source_admission.as_mut() {
             if summary.outer_type.as_deref() == Some("session_meta") {
                 let next = summary
@@ -10389,14 +10525,35 @@ fn scan_source_with_reader<R: BufRead>(
                         thread_id,
                         session_id: summary.payload.response.session_id.clone(),
                     });
-                let valid = !summary.duplicate_fields
-                    && summary.payload_object
-                    && !summary.payload.metadata_id_malformed
-                    && summary.payload.response.malformed_identifiers
-                        & SessionJsonKey::SessionId.bit()
-                        == 0
-                    && (!summary.payload.response.session_id_seen
-                        || summary.payload.response.session_id.is_some())
+                let inherited_parent = summary.metadata_shape_valid()
+                    && admission.metadata_qualified
+                    && admission.fork_history.as_ref().is_some_and(|fork| {
+                        next.as_ref()
+                            .is_some_and(|meta| meta.thread_id == fork.parent_thread_id)
+                    });
+                if inherited_parent {
+                    admission
+                        .fork_history
+                        .as_mut()
+                        .expect("matched fork lineage")
+                        .reading_inherited = true;
+                    admission.observe_response_classification(
+                        &ResponseClassificationInput::HistoryBoundary,
+                        &classification_pointer,
+                    );
+                    admission.strong_context = None;
+                    admission.adopted_context = None;
+                    admission.previous_raw = None;
+                    admission.response_waiting_for_counter = false;
+                    baseline_known = false;
+                    fully_attributed = false;
+                    previous = TokenSnapshot::default();
+                    model_context = ModelAttributionState::new();
+                    // Keep the exact bytes in the accepted prefix, but never
+                    // replace the RPC-bound current thread with its parent.
+                    continue;
+                }
+                let valid = summary.metadata_shape_valid()
                     && next.as_ref().is_some_and(|next| {
                         admission.metadata.as_ref().is_none_or(|old| {
                             old.thread_id == next.thread_id
@@ -10407,6 +10564,15 @@ fn scan_source_with_reader<R: BufRead>(
                     });
                 if valid {
                     let mut next = next.expect("valid metadata has an identity");
+                    if admission.metadata.is_none() {
+                        admission.fork_history =
+                            summary.payload.forked_from_id.as_ref().map(|parent| {
+                                codex_info_db_writer::source_admission::ForkHistory {
+                                    parent_thread_id: parent.clone(),
+                                    reading_inherited: false,
+                                }
+                            });
+                    }
                     if next.session_id.is_none() {
                         next.session_id = admission
                             .metadata
@@ -10415,6 +10581,9 @@ fn scan_source_with_reader<R: BufRead>(
                     }
                     admission.metadata = Some(next);
                     admission.metadata_qualified = true;
+                    if let Some(fork) = admission.fork_history.as_mut() {
+                        fork.reading_inherited = false;
+                    }
                 } else {
                     admission.metadata_qualified = false;
                     unresolved = true;
@@ -10426,6 +10595,53 @@ fn scan_source_with_reader<R: BufRead>(
                     ));
                 }
             }
+            if admission
+                .fork_history
+                .as_ref()
+                .is_some_and(|fork| fork.reading_inherited)
+            {
+                let current_identity = admission
+                    .metadata
+                    .as_ref()
+                    .filter(|_| admission.metadata_qualified);
+                let current_record = summary.context_envelope_valid()
+                    && summary.payload_duplicates
+                        & (SessionJsonKey::ThreadId.bit() | SessionJsonKey::SessionId.bit())
+                        == 0
+                    && summary.payload.response.malformed_identifiers
+                        & SessionJsonKey::ThreadId.bit()
+                        == 0
+                    && current_identity.is_some_and(|meta| {
+                        summary.payload.response.thread_id.as_deref()
+                            == Some(meta.thread_id.as_str())
+                            && ((summary.event_type() == Some("thread_settings_applied")
+                                && summary.qualified_context_model().is_some())
+                                || (summary.outer_type.as_deref() == Some("token_usage_record")
+                                    && summary.payload.response.record().is_some_and(|record| {
+                                        meta.session_id.as_deref()
+                                            == Some(record.ids.session_id.as_str())
+                                    })))
+                    });
+                if !current_record {
+                    // Parent counters, snapshots, task/model context, and
+                    // responses stay source evidence only. A local byte or
+                    // ordinal position cannot establish child ownership.
+                    continue;
+                }
+                admission
+                    .fork_history
+                    .as_mut()
+                    .expect("inherited history")
+                    .reading_inherited = false;
+            }
+        }
+        let response_marker = summary.response_stream_marker();
+        if response_marker {
+            let admission =
+                source_admission.get_or_insert_with(SourceAdmission::from_response_boundary);
+            admission.stream = UsageStream::ResponseRecord;
+        }
+        if let Some(admission) = source_admission.as_mut() {
             observe_response_classification(
                 admission,
                 &summary,
@@ -14767,6 +14983,190 @@ mod tests {
         assert!(totals.to_totals().is_empty());
     }
 
+    fn issue604_fork_records(at: i64) -> (String, String, String) {
+        let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+        let child = format!(
+            "{}\n",
+            json!({"type":"session_meta","timestamp":time,
+            "payload":{"id":"child","session_id":"child-session",
+            "forked_from_id":"parent","parent_thread_id":"parent"}})
+        );
+        let parent = format!(
+            "{}\n",
+            json!({"type":"session_meta","timestamp":time,
+            "payload":{"id":"parent","session_id":"parent-session"}})
+        );
+        let resume = format!(
+            "{}\n",
+            json!({"type":"thread_settings_applied","timestamp":time,
+            "payload":{"thread_id":"child","model":"gpt-6.1-sol"}})
+        );
+        (child, parent, resume)
+    }
+
+    #[test]
+    fn issue604_fork_lineage_keeps_the_current_source_identity() {
+        let (root, database) = prepare("fork-current-identity");
+        let (child, parent, _) = issue604_fork_records(Utc::now().timestamp() - 30);
+        fs::write(root.join("sessions/one.jsonl"), format!("{child}{parent}")).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        let state = recorder.state().unwrap();
+        let admission = state.checkpoints[0].source_admission.as_ref().unwrap();
+        assert!(admission.metadata_qualified, "an explicitly named fork parent is inherited history, not a source identity replacement");
+        assert_eq!(admission.metadata.as_ref().unwrap().thread_id, "child");
+        assert_eq!(
+            admission.metadata.as_ref().unwrap().session_id.as_deref(),
+            Some("child-session")
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_fork_lineage_rejects_unrelated_metadata() {
+        for explicit_fork in [false, true] {
+            let (root, database) = prepare(&format!("fork-unrelated-{explicit_fork}"));
+            let (child, _, _) = issue604_fork_records(Utc::now().timestamp() - 30);
+            let mut first: Value = serde_json::from_str(child.trim()).unwrap();
+            if !explicit_fork {
+                first["payload"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("forked_from_id");
+            }
+            let foreign = if explicit_fork { "stranger" } else { "parent" };
+            fs::write(root.join("sessions/one.jsonl"), format!("{first}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":foreign,"session_id":"foreign-session"}}))).unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap();
+            assert!(
+                !recorder.state().unwrap().checkpoints[0]
+                    .source_admission
+                    .as_ref()
+                    .unwrap()
+                    .metadata_qualified
+            );
+            drop(recorder);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn issue604_fork_lineage_does_not_count_parent_usage() {
+        let (root, database) = prepare("fork-parent-usage");
+        let at = Utc::now().timestamp() - 30;
+        let (child, parent, resume) = issue604_fork_records(at);
+        let time = DateTime::<Utc>::from_timestamp(at, 0).unwrap().to_rfc3339();
+        let usage = json!({"total_tokens":70,"input_tokens":60,"cached_input_tokens":20,
+            "cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0});
+        let parent_response = json!({"type":"token_usage_record","timestamp":time,"payload":{
+            "thread_id":"parent","session_id":"parent-session","turn_id":"turn",
+            "root_turn_id":"turn","response_id":"parent-response","usage":usage,
+            "turn_token_usage":usage,"thread_token_usage":usage}});
+        fs::write(
+            root.join("sessions/one.jsonl"),
+            format!(
+                "{child}{parent}{}{}{}{parent_response}\n{resume}{}{}",
+                issue604_context_record("turn_context", json!("gpt-6-astra"), at),
+                token(0, at),
+                token(100, at + 1),
+                token(100, at + 2),
+                token(107, at + 3)
+            ),
+        )
+        .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        let events = recorder.writer.load_session_events().unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.total_tokens).sum::<u64>(),
+            7,
+            "parent counters and responses cannot become child consumption"
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].model, "gpt-6.1-sol");
+        let state = recorder.state().unwrap();
+        let admission = state.checkpoints[0].source_admission.as_ref().unwrap();
+        assert!(admission.metadata_qualified);
+        assert!(
+            admission.responses.is_empty(),
+            "inherited responses must not enter the child's response queue"
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue604_fork_lineage_survives_restart_inside_inherited_history() {
+        let (root, database) = prepare("fork-inherited-restart");
+        let at = Utc::now().timestamp() - 30;
+        let (child, parent, resume) = issue604_fork_records(at);
+        let source = root.join("sessions/one.jsonl");
+        fs::write(&source, child).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        drop(recorder);
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{parent}{}{}",
+                    issue604_context_record("turn_context", json!("gpt-6-astra"), at),
+                    token(0, at)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        drop(recorder);
+        OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{resume}{}{}",
+                    token(100, at + 1),
+                    token(100, at + 2),
+                    token(107, at + 3)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 16384), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap();
+        let state = recorder.state().unwrap();
+        assert!(
+            state.checkpoints[0]
+                .source_admission
+                .as_ref()
+                .unwrap()
+                .metadata_qualified
+        );
+        assert_eq!(
+            recorder
+                .writer
+                .load_session_events()
+                .unwrap()
+                .iter()
+                .map(|event| event.total_tokens)
+                .sum::<u64>(),
+            7
+        );
+        drop(recorder);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     pub(crate) fn issue604_parser_state_fixture(
         name: &str,
     ) -> (PathBuf, PathBuf, PathBuf, Recorder, i64) {
@@ -14799,6 +15199,265 @@ mod tests {
             .unwrap();
         assert_eq!(recorder.model_totals().unwrap()["gpt-6.1-sol"].total, 10);
         (root, database, source, recorder, at)
+    }
+
+    #[test]
+    fn issue659_startup_candidates_do_not_adopt_unrelated_history_proof() {
+        let (root, database) = prepare("issue659-startup-candidate-proof");
+        let connection = Connection::open(&database).unwrap();
+        for (path, inode, start, qualified) in [
+            ("one.jsonl", "42", 0i64, false),
+            ("one.jsonl", "42", 10, false),
+            ("two.jsonl", "44", 0, false),
+            ("qualified.jsonl", "45", 0, true),
+        ] {
+            connection.execute("INSERT INTO session_events(root_identity,relative_path,file_device,file_inode,prefix_generation,range_start,range_end,record_sha256,event_index,timestamp,model,total_tokens,input_tokens,cached_input_tokens,output_tokens,cache_write_input_tokens,admission_json) VALUES('unix:10:20',?1,'10',?2,'00000000000000000000000000005678',?3,?4,?5,0,1791871200,'gpt-6.1-sol','5','4','1','1','0',?6)", rusqlite::params![path,inode,start,start+10,"00".repeat(32),qualified.then_some("{}")]).unwrap();
+        }
+        connection.execute("INSERT INTO source_prefix_repairs(repair_id,payload_json,payload_sha256) VALUES(?1,'{\"version\":2}',?2)", ("11".repeat(32),"00".repeat(32))).unwrap();
+        drop(connection);
+        let expected = BTreeSet::from([
+            (
+                "unix:10:20".into(),
+                "one.jsonl".into(),
+                10u64,
+                42u64,
+                0x5678u128,
+            ),
+            (
+                "unix:10:20".into(),
+                "two.jsonl".into(),
+                10u64,
+                44u64,
+                0x5678u128,
+            ),
+        ]);
+        let mut failures = Vec::new();
+        for embedded in [false, true] {
+            let opened = if embedded {
+                UsageStore::open_partitioned(&database, &identity())
+                    .map_err(RecorderError::from)
+                    .and_then(|writer| Recorder::open_with_writer(config(&root, 16384), writer))
+            } else {
+                Recorder::open_partitioned(config(&root, 16384), &database, &identity())
+            };
+            match opened {
+                Ok(recorder) => {
+                    if recorder.source_event_repair_candidates != expected {
+                        failures.push("wrong source key set".to_owned());
+                    }
+                }
+                Err(error) => failures.push(format!("constructor embedded={embedded}: {error}")),
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            failures.is_empty(),
+            "repair candidate registration must not decode unrelated history proof: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn issue604_creator_origin_requires_original_creator_and_continuous_owner() {
+        const AT: i64 = 1_791_871_200;
+        let authority = AccountAuthority {
+            account_id: AccountAuthorityId::from_str("synthetic-origin-account").unwrap(),
+        };
+        let metadata = SessionMetadata {
+            thread_id: "current-thread".into(),
+            session_id: Some("current-session".into()),
+        };
+        let stamp = DateTime::<Utc>::from_timestamp(AT, 0).unwrap().to_rfc3339();
+        let value = json!({"type":"session_meta","timestamp":stamp,"payload":{
+            "id":"current-thread","session_id":"current-session","creator_account_id":"synthetic-origin-account","forked_from_id":"parent-thread"
+        }});
+        let bytes = format!("{value}\n").into_bytes();
+        let owners = [SessionLifecycleInterval::new(Some(AT - 10), None)];
+        let proof =
+            creator_origin_from_record(&bytes, &metadata, &authority, &owners, AT + 100, AT + 101)
+                .unwrap();
+        assert_eq!(proof.pointer.timestamp, AT);
+        assert_eq!(proof.pointer.start, 0);
+        assert_eq!(proof.pointer.end, bytes.len() as u64);
+        assert_eq!(proof.pointer.sha256, hex_digest(&bytes));
+        assert_eq!(proof.ownership_start_at, AT - 10);
+        assert!(!serde_json::to_string(&proof)
+            .unwrap()
+            .contains("synthetic-origin-account"));
+        for (field, replacement) in [
+            ("creator_account_id", json!("another-account")),
+            ("creator_account_id", Value::Null),
+            ("id", json!("parent-thread")),
+            ("session_id", json!("another-session")),
+        ] {
+            let mut invalid = value.clone();
+            invalid["payload"][field] = replacement;
+            assert!(
+                creator_origin_from_record(
+                    format!("{invalid}\n").as_bytes(),
+                    &metadata,
+                    &authority,
+                    &owners,
+                    AT + 100,
+                    AT + 101
+                )
+                .is_none(),
+                "{field}"
+            );
+        }
+        for owners in [
+            vec![SessionLifecycleInterval::new(Some(AT + 1), None)],
+            vec![
+                SessionLifecycleInterval::new(Some(AT - 10), Some(AT + 10)),
+                SessionLifecycleInterval::new(Some(AT + 20), None),
+            ],
+            vec![SessionLifecycleInterval::new(Some(AT - 10), Some(AT + 101))],
+            vec![SessionLifecycleInterval::new(None, None)],
+            vec![owners[0], owners[0]],
+        ] {
+            assert!(creator_origin_from_record(
+                &bytes,
+                &metadata,
+                &authority,
+                &owners,
+                AT + 100,
+                AT + 101
+            )
+            .is_none());
+        }
+        let duplicate = String::from_utf8(bytes.clone()).unwrap().replace(
+            "\"creator_account_id\":",
+            "\"creator_account_id\":\"another-account\",\"creator_account_id\":",
+        );
+        assert!(creator_origin_from_record(
+            duplicate.as_bytes(),
+            &metadata,
+            &authority,
+            &owners,
+            AT + 100,
+            AT + 101
+        )
+        .is_none());
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("timestamp");
+        assert!(creator_origin_from_record(
+            format!("{missing}\n").as_bytes(),
+            &metadata,
+            &authority,
+            &owners,
+            AT + 100,
+            AT + 101
+        )
+        .is_none());
+        assert!(creator_origin_from_record(
+            &bytes[..bytes.len() - 1],
+            &metadata,
+            &authority,
+            &owners,
+            AT + 100,
+            AT + 101
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn issue604_creator_origin_reads_only_the_bound_first_record() {
+        const AT: i64 = 1_791_871_200;
+        let (root, database) = prepare("issue604-origin-bound-first");
+        let path = root.join("sessions/one.jsonl");
+        let authority = AccountAuthority {
+            account_id: AccountAuthorityId::from_str("synthetic-origin-account").unwrap(),
+        };
+        let stamp = DateTime::<Utc>::from_timestamp(AT, 0).unwrap().to_rfc3339();
+        let bytes = format!(
+            "{}\n",
+            json!({"type":"session_meta","timestamp":stamp,"payload":{"id":"current-thread","session_id":"current-session","creator_account_id":"synthetic-origin-account"}})
+        );
+        fs::write(&path, &bytes).unwrap();
+        let source = discover_sources(&root.join("sessions"))
+            .unwrap()
+            .sources
+            .remove(0);
+        let mut totals = ModelTotals::default();
+        let mut events = Vec::new();
+        let result = scan_source(
+            &source,
+            None,
+            false,
+            false,
+            1,
+            1,
+            AT + 3600,
+            AT - 3600,
+            16384,
+            None,
+            None,
+            None,
+            None,
+            &mut totals,
+            &mut events,
+        )
+        .unwrap()
+        .unwrap();
+        let checkpoint = result.checkpoint;
+        let binding = SourceAccountBinding {
+            version: 1,
+            partition: identity(),
+            root_identity: checkpoint.root_identity.clone(),
+            relative_path: checkpoint.relative_path.clone(),
+            file_device: checkpoint.file_device,
+            file_inode: checkpoint.file_inode,
+            prefix_generation: format!("{:032x}", checkpoint.prefix_generation),
+            prefix_end: checkpoint.committed_offset,
+            metadata: SessionMetadata {
+                thread_id: "current-thread".into(),
+                session_id: Some("current-session".into()),
+            },
+            proof: SourceBindingProof::Rpc {
+                began_at: AT + 100,
+                ended_at: AT + 101,
+                process: codex_info_db_writer::source_admission::SourceBindingProcess {
+                    pid: 1,
+                    starttime_ticks: 1,
+                    executable_device: 1,
+                    executable_inode: 1,
+                },
+            },
+            creator_origin: None,
+        };
+        let owners = [SessionLifecycleInterval::new(Some(AT - 10), None)];
+        let origin =
+            read_creator_origin(&source, &checkpoint, &binding, &authority, &owners).unwrap();
+        assert_eq!(origin.pointer.timestamp, AT);
+        let mut enriched = binding.clone();
+        enriched.creator_origin = Some(origin);
+        assert_eq!(enriched.eligible_from(), Some(AT));
+        assert_eq!(binding.eligible_from(), Some(AT + 100));
+        assert_eq!(
+            enriched.proof, binding.proof,
+            "the original RPC time and process are not rewritten"
+        );
+        assert!(enriched.matches_checkpoint(&checkpoint));
+        let mut truncated = binding.clone();
+        truncated.prefix_end = bytes.len() as u64 - 1;
+        assert!(
+            read_creator_origin(&source, &checkpoint, &truncated, &authority, &owners).is_none()
+        );
+        let mut wrong_identity = checkpoint.clone();
+        wrong_identity.file_inode += 1;
+        assert!(
+            read_creator_origin(&source, &wrong_identity, &binding, &authority, &owners).is_none()
+        );
+        fs::write(
+            &path,
+            format!("{{\"type\":\"event_msg\",\"payload\":{{}}}}\n{bytes}"),
+        )
+        .unwrap();
+        assert!(
+            read_creator_origin(&source, &checkpoint, &binding, &authority, &owners).is_none(),
+            "a later metadata record cannot supply the original creator"
+        );
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -16989,10 +17648,82 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    struct Issue659EquivalenceOwnedRoot(PathBuf);
+    #[cfg(target_os = "linux")]
+    impl Drop for Issue659EquivalenceOwnedRoot {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                fs::remove_dir_all(&self.0).expect("remove owned synthetic equivalence fixture");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn issue659_equivalence_backup_bytes(database: &std::path::Path) -> Vec<Option<Vec<u8>>> {
+        (1..=3)
+            .map(|generation| {
+                match fs::read(database.with_extension(format!("sqlite3.bak.{generation}"))) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("synthetic backup observation failed: {error}"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn issue659_empty_source_equivalence_does_not_materialize_backup_inputs() {
+        let fixture = issue604_equivalence_fixture("issue659-empty-equivalence-no-backup");
+        let _owned = Issue659EquivalenceOwnedRoot(fixture.root.clone());
+        let Issue604EquivalenceFixture {
+            database,
+            mut recorder,
+            at,
+            ..
+        } = fixture;
+        let connection = Connection::open(&database).unwrap();
+        // This complete synthetic schema has retained checkpoints/ranges,
+        // but no old raw event inventory to authorize a replacement.
+        connection
+            .execute("DELETE FROM session_events", [])
+            .unwrap();
+        drop(connection);
+        recorder.lifecycle_intervals = vec![SessionLifecycleInterval::new(Some(at - 1), None)];
+        let before = recorder.state().unwrap();
+        let backups = issue659_equivalence_backup_bytes(&database);
+        let period = recorder
+            .writer
+            .prepare_period_attribution(&identity(), &recorder.lifecycle_intervals)
+            .unwrap();
+        let mut inputs = None;
+        let (repairs, handled, _) = recorder
+            .prepare_source_equivalences(&before, &period, &mut inputs)
+            .unwrap();
+        assert!(
+            !handled.is_empty(),
+            "the complete independent-prefix candidate must have been considered"
+        );
+        assert!(repairs.is_empty());
+        assert!(
+            inputs.is_none(),
+            "EMPTY_EQUIVALENCE_ALLOCATED_BACKUP_INPUTS"
+        );
+        assert_eq!(
+            issue659_equivalence_backup_bytes(&database),
+            backups,
+            "a candidate with no originals created or rotated backup generations"
+        );
+        assert_eq!(recorder.state().unwrap(), before);
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn issue604_reuses_rejected_source_equivalence_until_its_fixed_inputs_change() {
         use rustix::fs::inotify;
+        let fixture = issue604_equivalence_fixture("source-equivalence-negative-proof");
+        let _owned = Issue659EquivalenceOwnedRoot(fixture.root.clone());
         let Issue604EquivalenceFixture {
             root,
             database,
@@ -17002,7 +17733,7 @@ mod tests {
             old,
             current,
             ranges,
-        } = issue604_equivalence_fixture("source-equivalence-negative-proof");
+        } = fixture;
         // A well-formed old, unqualified value has no corresponding record
         // in either accepted copy. It must stay pending, without repeatedly
         // reading the same independently accepted bytes after publication.
@@ -17030,14 +17761,20 @@ mod tests {
             .writer
             .prepare_period_attribution(&identity(), &recorder.lifecycle_intervals)
             .unwrap();
+        let original_backups = issue659_equivalence_backup_bytes(&database);
         let mut inputs = None;
         let (repairs, handled, _) = recorder
             .prepare_source_equivalences(&before, &period, &mut inputs)
             .unwrap();
         assert!(repairs.is_empty());
         assert!(
-            inputs.is_some(),
-            "the first complete counterpart proof was attempted"
+            inputs.is_none(),
+            "REJECTED_EQUIVALENCE_ALLOCATED_BACKUP_INPUTS"
+        );
+        assert_eq!(
+            issue659_equivalence_backup_bytes(&database),
+            original_backups,
+            "a rejected complete counterpart proof created or rotated backups"
         );
         assert_eq!(handled.len(), 2);
         let watch =
@@ -25929,5 +26666,336 @@ mod tests {
         )
         .is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issue659_normal_cycle_preserves_pending_saved_response_and_accepts_new_consumption() {
+        struct OwnedFixture(std::path::PathBuf);
+        impl Drop for OwnedFixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let (root, database, source, recorder, epoch, at, response) =
+            issue604_bound_response_prefix_fixture("issue659-normal-pending-identity");
+        let _owned = OwnedFixture(root.clone());
+        let mut recorder = recorder;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap();
+        std::io::Write::write_all(&mut file, response.as_bytes()).unwrap();
+        drop(file);
+        recorder
+            .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+            .unwrap()
+            .unwrap();
+        let before = recorder.state().unwrap();
+        assert_eq!(
+            before
+                .model_totals
+                .iter()
+                .find(|total| total.model == "gpt-6.1-sol")
+                .unwrap()
+                .total_tokens,
+            10,
+            "real producer control must complete first"
+        );
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let original:String=connection.query_row("SELECT admission_json FROM session_events WHERE json_extract(admission_json,'$.numeric.kind')='response-record'",[],|row|row.get(0)).unwrap();
+        let mut admission: codex_info_db_writer::event_admission::EventAdmission =
+            serde_json::from_str(&original).unwrap();
+        let codex_info_db_writer::event_admission::NumericEventProof::ResponseRecord {
+            candidate,
+            ..
+        } = &mut admission.numeric
+        else {
+            unreachable!()
+        };
+        candidate.classification =
+            codex_info_db_writer::source_admission::ResponseModelClassification::AwaitingBoundary;
+        candidate.counter_association =
+            codex_info_db_writer::source_admission::ResponseCounterAssociation::Awaiting;
+        let pending = serde_json::to_string(&admission).unwrap();
+        connection.execute("UPDATE session_events SET admission_json=?1 WHERE json_extract(admission_json,'$.numeric.kind')='response-record'",[&pending]).unwrap();
+        let raw = recorder
+            .writer
+            .source_events_for_qualification_repair(&before.checkpoints[0])
+            .unwrap();
+        assert_eq!(raw.len(), 1);
+        assert!(!raw[0]
+            .admission
+            .as_ref()
+            .unwrap()
+            .valid_for(&raw[0], raw[0].period));
+        recorder
+            .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+            .expect("NORMAL_SOURCE_SCAN_REPLAY_INVENTORY_REJECTED");
+        assert_eq!(
+            recorder.state().unwrap().model_totals,
+            before.model_totals,
+            "an unchanged poll duplicated or lost the saved ten tokens"
+        );
+        let stamp = |time| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(time, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let usage = serde_json::json!({"total_tokens":7,"input_tokens":6,"cached_input_tokens":1,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0});
+        let cumulative = serde_json::json!({"total_tokens":17,"input_tokens":15,"cached_input_tokens":4,"cache_write_input_tokens":2,"output_tokens":2,"reasoning_output_tokens":1});
+        let suffix = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"token_usage_record","timestamp":stamp(at+3),"payload":{"thread_id":"thread","session_id":"session","turn_id":"turn","root_turn_id":"root-turn","response_id":"response-b","usage":usage,"turn_token_usage":cumulative,"thread_token_usage":cumulative}}),
+            serde_json::json!({"type":"event_msg","timestamp":stamp(at+4),"payload":{"type":"token_count","info":{"total_token_usage":cumulative,"last_token_usage":usage}}})
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap();
+        std::io::Write::write_all(&mut file, suffix.as_bytes()).unwrap();
+        drop(file);
+        recorder
+            .run_account_cycle_with_stored_quota_guarded(&root, &epoch, || true)
+            .expect("NORMAL_NEW_QUALIFIED_APPEND_REJECTED")
+            .unwrap();
+        assert_eq!(
+            recorder
+                .state()
+                .unwrap()
+                .model_totals
+                .iter()
+                .find(|total| total.model == "gpt-6.1-sol")
+                .unwrap()
+                .total_tokens,
+            17,
+            "old ten and new seven must be retained exactly once"
+        );
+        let retained:String=connection.query_row("SELECT admission_json FROM session_events WHERE json_extract(admission_json,'$.numeric.candidate.record.ids.response_id')='response-a'",[],|row|row.get(0)).unwrap();
+        assert_eq!(retained, pending);
+    }
+}
+
+#[cfg(test)]
+mod issue659_thread_read_actual_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "explicit read-only typed partition/state and RPC diagnostic"]
+    fn existing_source_accepts_the_production_thread_response() {
+        let inputs: Value = serde_json::from_slice(
+            &fs::read(
+                std::env::var_os("ISSUE659_THREAD_DIAGNOSTIC_INPUTS")
+                    .expect("explicit actual input descriptor is required"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let home = PathBuf::from(inputs["codex_home"].as_str().unwrap());
+        let data_root = PathBuf::from(inputs["data_root"].as_str().unwrap());
+        let partition = codex_info_account_locator::locate_existing_partition(&home, &data_root)
+            .expect("existing initialized current partition must be readable");
+        let located = partition.storage_identity();
+        let identity = StoragePartitionIdentity {
+            schema_version: located.schema_version,
+            profile_scope_id: located.profile_scope_id,
+            account_scope_id: located.account_scope_id,
+            storage_epoch: located.storage_epoch,
+            partition_id: located.partition_id,
+        };
+        let store = UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+            .expect("existing qualified read-only partition reader");
+        let state = store
+            .load_session_collection_state()
+            .expect("existing typed collection/checkpoint/model/quota reader");
+        let sessions = home.join("sessions").canonicalize().unwrap();
+        let source = PathBuf::from(inputs["source"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert!(
+            source.starts_with(&sessions),
+            "selected source must remain under sessions"
+        );
+        let root_info = fs::metadata(&sessions).unwrap();
+        let source_info = fs::metadata(&source).unwrap();
+        let root_key = root_identity(&sessions, &root_info);
+        let relative = source.strip_prefix(&sessions).unwrap().to_str().unwrap();
+        assert!(
+            state.checkpoints.iter().any(|checkpoint| {
+                checkpoint.root_identity == root_key
+                    && checkpoint.relative_path == relative
+                    && checkpoint.file_device == file_device(&source_info)
+                    && checkpoint.file_inode == file_inode(&source_info)
+            }),
+            "selected source must have an existing qualified physical checkpoint"
+        );
+        println!("TYPED_EXISTING_INPUTS_READY custom_sql_getters=0 readonly_partition=true checkpoints_loaded=true existing_source_qualified=true");
+        let metadata = fs::metadata(&source).unwrap();
+        let qualification_deadline = Instant::now() + APP_SERVER_RESPONSE_TIMEOUT;
+        let thread_id =
+            read_session_meta_id(&sessions, &source, &metadata, qualification_deadline).unwrap();
+        let mut connection =
+            AppServerConnection::start("codex-info-recorder-thread-poller", qualification_deadline)
+                .unwrap();
+        let account = request_app_server_before_deadline(
+            &mut connection.input,
+            &connection.output,
+            2,
+            "account/read",
+            json!({}),
+            qualification_deadline,
+        )
+        .unwrap();
+        decode_app_server_account(&account).unwrap();
+        let response = request_app_server_before_deadline(
+            &mut connection.input,
+            &connection.output,
+            3,
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+            qualification_deadline,
+        )
+        .unwrap();
+        let object = response
+            .as_object()
+            .expect("actual response must be an object");
+        assert!(
+            object.contains_key("readState"),
+            "readState-only counterexample not observed"
+        );
+        assert!(object.len() > 1);
+        let generated: Value = serde_json::from_slice(
+            &fs::read(
+                std::env::var_os("ISSUE659_THREAD_DIAGNOSTIC_SCHEMA")
+                    .expect("explicit generated schema evidence is required"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let schema = &generated["schema"];
+        let mut receipt_schema = schema["properties"]["readState"].clone();
+        receipt_schema["definitions"] = json!({
+            "ThreadReadState": schema["definitions"]["ThreadReadState"].clone(),
+            "ThreadUnreadPosition": schema["definitions"]["ThreadUnreadPosition"].clone(),
+        });
+        thread_contract::validate_instance_against_schema(
+            object.get("readState").unwrap(),
+            &receipt_schema,
+        )
+        .expect("actual readState must satisfy its generated source schema");
+        let thread = object
+            .get("thread")
+            .expect("actual response must contain thread");
+        let candidate = thread_contract::validate_thread_item(thread)
+            .expect("actual Thread must satisfy the unchanged complete schema");
+        assert!(
+            candidate.id() == thread_id,
+            "actual thread identity mismatch"
+        );
+        let returned_path = candidate
+            .path()
+            .and_then(|path| {
+                security::canonical_regular_file_under(&sessions, Path::new(path)).ok()
+            })
+            .expect("actual response must reference a regular source under sessions");
+        assert!(
+            returned_path == source,
+            "actual thread source path mismatch"
+        );
+        println!("ACTUAL_THREAD_RESPONSE_VALID object=true readState_present=true readState_schema_valid=true thread_schema_valid=true source_identity_matches=true");
+        drop(connection);
+        let result = collect_active_thread_snapshot_from_paths(
+            &sessions,
+            &BTreeSet::from([source]),
+            &state.checkpoints,
+            &mut LiveRolloutCache::default(),
+        );
+        match result {
+            ActiveThreadPollResult::Snapshot { .. } => {
+                println!("EXISTING_SOURCE_THREAD_READ_ACCEPTED");
+            }
+            ActiveThreadPollResult::Failed(error)
+                if error == "thread/read response envelope rejected" =>
+            {
+                panic!("VALID_READ_STATE_REJECTED: thread/read response envelope rejected");
+            }
+            ActiveThreadPollResult::Failed(error) => {
+                panic!("OTHER_CONSUMER_FAILURE: {error}");
+            }
+            _ => panic!("source did not reach the required RPC consumer"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod issue659_thread_read_response_tests {
+    use super::*;
+
+    fn valid_thread() -> Value {
+        json!({
+            "cliVersion": "0.166.0",
+            "createdAt": 1,
+            "cwd": "/tmp/codex",
+            "ephemeral": false,
+            "id": "thread-1",
+            "modelProvider": "openai",
+            "preview": "synthetic preview",
+            "sessionId": "session-1",
+            "source": "cli",
+            "status": {"type": "idle"},
+            "turns": [],
+            "updatedAt": 1,
+            "name": "synthetic fixture",
+            "path": "/tmp/codex/thread.jsonl"
+        })
+    }
+
+    #[test]
+    fn read_state_metadata_does_not_reject_a_valid_thread() {
+        let thread = valid_thread();
+        let baseline = json!({"thread": thread.clone()});
+        let baseline_item = thread_read_response_thread(&baseline).unwrap();
+        let baseline_candidate = thread_contract::validate_thread_item(baseline_item)
+            .expect("valid independent Thread fixture");
+        for read_state in [
+            Value::Null,
+            json!({"revision": "fixture-revision", "firstUnread": null}),
+        ] {
+            let result = json!({"thread": thread.clone(), "readState": read_state});
+            let item = thread_read_response_thread(&result).expect("VALID_READ_STATE_REJECTED");
+            let candidate = thread_contract::validate_thread_item(item)
+                .expect("auxiliary result metadata cannot change the Thread schema");
+            assert_eq!(item, &thread);
+            assert_eq!(candidate.id(), baseline_candidate.id());
+            assert_eq!(candidate.path(), baseline_candidate.path());
+            assert_eq!(candidate.raw_json(), baseline_candidate.raw_json());
+            assert_eq!(result["thread"], thread);
+        }
+    }
+
+    #[test]
+    fn required_object_thread_and_complete_thread_validation_remain() {
+        for result in [
+            Value::Null,
+            json!(false),
+            json!([]),
+            json!("not an object"),
+            json!({}),
+            json!({"readState": null}),
+        ] {
+            assert!(thread_read_response_thread(&result).is_err());
+        }
+        let mut empty_id = valid_thread();
+        empty_id["id"] = json!("");
+        let mut missing_required = valid_thread();
+        missing_required
+            .as_object_mut()
+            .unwrap()
+            .remove("createdAt");
+        for thread in [Value::Null, json!({}), empty_id, missing_required] {
+            let result = json!({"thread": thread});
+            let item = thread_read_response_thread(&result).unwrap();
+            assert!(thread_contract::validate_thread_item(item).is_err());
+        }
     }
 }
