@@ -3146,14 +3146,14 @@ PY_RESTORED_RECORDER_IDENTITY
     [[ "$after" == "$before" && "$(recorder_systemd_pid)" == "$pid" ]] || safe_blocked 'recorder MainPID/starttime changed during artifact verification'
 }
 recorder_identity_check() {
-    local pid="$1" version="$2" source="$3" manifest_hash="$4" lock_path recorder_path data_root
+    local pid="$1" version="$2" source="$3" manifest_hash="$4" lock_path recorder_path data_root retained_observed_at="${5:-}"
     data_root="$(printenv CODEX_INFO_DATA_DIR || true)"
     [[ -n "$data_root" ]] || data_root="${CODEX_HOME:-$home_dir/.codex}"
     lock_path="$(printenv CODEX_INFO_PROFILE_LOCK || printf '%s/history/usage_record_daemon.lock' "$data_root")"
     recorder_path="$(printenv CODEX_INFO_RECORDER_STATE || printf '%s/history/recorder-state.json' "$data_root")"
-    python3 - "$pid" "$version" "$source" "$manifest_hash" "$lock_path" "$recorder_path" "$proc_root" <<'PY'
+    python3 - "$pid" "$version" "$source" "$manifest_hash" "$lock_path" "$recorder_path" "$proc_root" "$retained_observed_at" <<'PY'
 import json, os, pathlib, re, stat, sys, time
-pid_text, version, source, manifest_hash, lock_name, recorder_name, proc_root = sys.argv[1:]
+pid_text, version, source, manifest_hash, lock_name, recorder_name, proc_root, retained_observed_at = sys.argv[1:]
 pid = int(pid_text)
 def pairs(items):
     result = {}
@@ -3188,7 +3188,8 @@ if state["schema"] != "codex-info-recorder-state-v1" or state["pid"] != pid or s
     raise SystemExit("recorder owner identity mismatch")
 if isinstance(state["updated_at_unix"], bool) or not isinstance(state["updated_at_unix"], int) or state["updated_at_unix"] <= 0: raise SystemExit("recorder updated_at_unix is invalid")
 now = int(time.time())
-if state["updated_at_unix"] > now or now - state["updated_at_unix"] > 150: raise SystemExit("recorder heartbeat is stale")
+retained_error = bool(retained_observed_at) and int(retained_observed_at) <= now and state["write_state"] in {"ready", "degraded"}
+if state["updated_at_unix"] > now or (not retained_error and now - state["updated_at_unix"] > 150): raise SystemExit("recorder heartbeat is stale")
 write_state = state["write_state"]
 if write_state not in {"idle_no_account","ready","degraded"}: raise SystemExit("recorder write state is invalid")
 partition = state["partition_id_hash"]
@@ -3197,7 +3198,7 @@ if write_state == "idle_no_account" and any(state[key] is not None for key in ("
     raise SystemExit("idle recorder state is inconsistent")
 if write_state in {"ready", "degraded"}:
     if partition is None or any(state[key] is None for key in ("data_generation","collector_epoch","cycle_seq","last_commit_unix")): raise SystemExit("recorder state is incomplete")
-    if state["last_commit_unix"] > now or now - state["last_commit_unix"] > 150: raise SystemExit("recorder commit is stale")
+    if state["last_commit_unix"] > now or (not retained_error and now - state["last_commit_unix"] > 150): raise SystemExit("recorder commit is stale")
 if state["data_generation"] is not None and (isinstance(state["data_generation"], bool) or not isinstance(state["data_generation"], int) or state["data_generation"] <= 0): raise SystemExit("recorder data generation is invalid")
 if state["collector_epoch"] is not None and (not isinstance(state["collector_epoch"], str) or not re.fullmatch(r"[0-9a-f]{32}", state["collector_epoch"]) or set(state["collector_epoch"]) == {"0"}): raise SystemExit("recorder collector epoch is invalid")
 if state["cycle_seq"] is not None and (isinstance(state["cycle_seq"], bool) or not isinstance(state["cycle_seq"], int) or state["cycle_seq"] <= 0): raise SystemExit("recorder cycle is invalid")
@@ -3217,7 +3218,7 @@ proc_identity_check() {
     [[ "$owner" == "$pid" ]] || safe_blocked 'listener socket is not owned by MainPID'
 }
 health_readback() {
-    local pid="$1" before="$2" version="$3" source="$4" manifest_hash="$5" binary_hash="$6" response details after after_pid expected_exe health_limit health_now health_remaining readback_deadline current_status current_version
+    local pid="$1" before="$2" version="$3" source="$4" manifest_hash="$5" binary_hash="$6" response details after after_pid expected_exe health_limit health_now health_remaining readback_deadline current_status current_version retained_observed_at
     expected_exe="$generations_dir/$version-$source-$manifest_hash/codex_info_rest"
     if [[ -n "${rollback_incident_pair_receipt:-}" ]]; then
         incident_override_pair_operation inspect \
@@ -3271,6 +3272,7 @@ PY
     elif [[ "$current_status" != 200 ]]; then
         safe_blocked 'current response is unavailable'
     fi
+    retained_observed_at="$(
     python3 -c '
 import json,sys
 def pairs(items):
@@ -3323,10 +3325,12 @@ if sys.argv[1] == "v4":
             if not isinstance(cost,dict) or set(cost) != {"price_version","ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars"}: raise SystemExit("current price schema is invalid")
             if not isinstance(cost["price_version"],str) or not cost["price_version"]: raise SystemExit("current price revision is invalid")
             if any(type(cost[key]) not in {int,float} or not 0 <= cost[key] <= sys.float_info.max for key in ("ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars")): raise SystemExit("current price amount is invalid")
+print(observed_at if sys.argv[1] == "v4" and document["state"] == "error" and document["authenticated"] and observed_at is not None else "")
 ' "$current_version" <<< "$details" || return 1
+    )" || return 1
     local recorder_pid
     recorder_pid="$(recorder_systemd_pid)"; [[ "$recorder_pid" != 0 ]] || safe_blocked 'recorder service has no MainPID'
-    recorder_identity_check "$recorder_pid" "$version" "$source" "$manifest_hash" || return 1
+    recorder_identity_check "$recorder_pid" "$version" "$source" "$manifest_hash" "$retained_observed_at" || return 1
     if [[ -n "${rollback_incident_pair_receipt:-}" ]]; then
         incident_override_pair_operation inspect \
             "$version-$source-$manifest_hash" \
@@ -3450,7 +3454,7 @@ reset_failed_main() {
     systemctl_user reset-failed codex-info-rest.service >/dev/null 2>&1
 }
 repair_known_managed_runtime() {
-    local pid resolved expected generation_path current_path current_info expected_hash actual_hash
+    local pid resolved expected generation_path current_path current_info expected_hash actual_hash candidate_hash rest_pid current_rest_hash
     probe_active codex-info-recorder.service || return 0
     [[ "$TRIGGER" != startup ]] || return 0
     pid="$(recorder_systemd_pid)"; [[ "$pid" != 0 ]] || safe_blocked 'managed recorder service has no MainPID'
@@ -3481,8 +3485,20 @@ repair_known_managed_runtime() {
     else
         safe_blocked 'foreign managed service executable blocks runtime repair'
     fi
+    current_info="$(manifest_record "$current_path/manifest.json")" || safe_blocked 'current generation manifest is unavailable for runtime repair'
+    IFS=$'\t' read -r _ _ _ candidate_hash <<<"$current_info"
+    if [[ "$actual_hash" == "$candidate_hash" ]]; then
+        rest_pid="$(systemd_pid)"
+        current_rest_hash="$(manifest_rest_hash "$current_path/manifest.json")" || safe_blocked 'current REST hash is unavailable for runtime repair'
+        if [[ "$rest_pid" != 0 ]] &&
+            (proc_identity_check "$rest_pid" "$current_rest_hash" "$current_path/codex_info_rest") >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
     reset_failed_main || safe_blocked 'could not reset failed managed service for runtime repair'
-    systemctl_user restart --no-block codex-info-recorder.service >/dev/null 2>&1 || safe_blocked 'could not restart recorder service for runtime repair'
+    if [[ "$actual_hash" != "$candidate_hash" ]]; then
+        systemctl_user restart --no-block codex-info-recorder.service >/dev/null 2>&1 || safe_blocked 'could not restart recorder service for runtime repair'
+    fi
     systemctl_user restart --no-block codex-info-rest.service >/dev/null 2>&1 || safe_blocked 'could not restart REST service for runtime repair'
 }
 verify_nonrunning_terminal() {

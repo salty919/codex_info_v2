@@ -231,8 +231,12 @@ Codex app-server / session JSONL / thread rollout
   account切替の有無は検証済みregistry/partition identityから判定し、nullだけからlogoutを推論しない。
   `degraded`だけからcurrent quotaの取得失敗、履歴pending、またはDB読取り失敗のいずれかを選んで捏造しない。
   quota/models/historyの公開状態はそれぞれ受理したDB domainのauthorityで決め、recorder ownerの健康判定とは区別する。
-  commit未確認・古いcommit・owner失効の間は同accountの旧root/pairを保存した上でsnapshot読取りを503とし、
-  新しいError generationや正常な空データを生成しない。registryが確認したaccount境界は別途strict boundaryを公開する。
+  commit未確認、owner失効、identity不正、未来時刻では同accountの旧root/pairを保存した上でsnapshot読取りを503とし、
+  新しいError generationや正常な空データを生成しない。過去方向の150秒超だけで、同account/partitionの生存owner・
+  process-start/nonce・collector epochが最後の受理済みframeと一致し、他の境界で資格を失っていない場合は、
+  その完全frameの旧値・旧observed_atをerror/degradedとして保持できる（#134 条項13/14）。期限切れstateから
+  新candidateを受理せず、timestamp/commit/ackを更新・補完せず、fresh/readyや現在時刻までのcoverageと扱わない。
+  保持frameがない場合は503とする。registryが確認したaccount境界は別途strict boundaryを公開する。
   DB側のcommit組の正本は`collection_generation` singleton 1の`data_generation,collector_epoch,cycle_seq`であり、
   domainと同じread transactionで検証する。generation/sequenceはcanonical UInt64十進TEXT、epochは32桁lowercase hex
   のUInt128またはNULLとし、epochがNULLであることとsequenceが0であることは同値である。初期値は0/NULL/0であり、

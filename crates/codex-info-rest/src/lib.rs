@@ -1220,6 +1220,16 @@ impl AccountStore {
         same_history_owner(inner.admitted_source.as_ref(), Some(intent))
     }
 
+    fn retain_expired_source(&self, source: Option<&ReaderIntent>) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let retain = inner.current.is_some()
+            && (!inner.reader_unavailable || inner.retained_read_failure)
+            && same_history_owner(inner.admitted_source.as_ref(), source);
+        inner.reader_unavailable = true;
+        inner.retained_read_failure = retain;
+        inner.degraded = true;
+    }
+
     fn mark_unavailable(&self) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.reader_unavailable = true;
@@ -1829,6 +1839,22 @@ impl SnapshotStore {
         self.update_reader_intent(account_id, ReaderIntent::Unconfirmed, reason)
     }
 
+    pub fn recorder_owner_is_published(
+        &self,
+        account_id: &str,
+        notice: &RecorderCommitNotice,
+    ) -> bool {
+        self.account_store(account_id).is_some_and(|account| {
+            let inner = account.inner.read().unwrap_or_else(|p| p.into_inner());
+            inner.current.is_some()
+                && (!inner.reader_unavailable || inner.retained_read_failure)
+                && same_history_owner(
+                    inner.admitted_source.as_ref(),
+                    Some(&ReaderIntent::Recorder(notice.clone())),
+                )
+        })
+    }
+
     pub fn recorder_commit_is_published(
         &self,
         account_id: &str,
@@ -1861,13 +1887,47 @@ impl SnapshotStore {
             .get(account_id)
             .is_some_and(|old| old.as_ref() == &intent)
         {
+            // A new hard boundary can follow an expired-source retention
+            // without changing the coarse Unconfirmed intent.
+            if intent == ReaderIntent::Unconfirmed
+                && !matches!(
+                    reason,
+                    RecorderSourceUnavailableReason::PublicationStale
+                        | RecorderSourceUnavailableReason::CommitStale
+                )
+            {
+                if let Some(account) = self.account_store(account_id) {
+                    let retained = account
+                        .inner
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .retained_read_failure;
+                    account.mark_unavailable();
+                    if retained {
+                        self.diagnostics.record(
+                            "reader_reconcile",
+                            "recorder_source",
+                            reason.as_str(),
+                            None,
+                        );
+                    }
+                }
+            }
             return false;
         }
         if intent == ReaderIntent::Unconfirmed {
             self.diagnostics
                 .record("reader_reconcile", "recorder_source", reason.as_str(), None);
             if let Some(account) = self.account_store(account_id) {
-                account.mark_unavailable();
+                if matches!(
+                    reason,
+                    RecorderSourceUnavailableReason::PublicationStale
+                        | RecorderSourceUnavailableReason::CommitStale
+                ) {
+                    account.retain_expired_source(pending.latest.get(account_id).map(Arc::as_ref));
+                } else {
+                    account.mark_unavailable();
+                }
             }
         } else if pending.latest.get(account_id).is_some_and(|old| {
             old.as_ref() != &ReaderIntent::Unconfirmed
@@ -1999,7 +2059,8 @@ impl SnapshotStore {
             return;
         };
         if **intent == ReaderIntent::Unconfirmed {
-            account.mark_unavailable();
+            // Source reconciliation already made the atomic retention or
+            // revocation decision; no unconfirmed completion may replace it.
             return;
         }
         if let (ReaderIntent::Recorder(notice), Ok((_, commit))) = (intent.as_ref(), &candidate) {
@@ -2576,23 +2637,12 @@ fn run_reader_worker(store: &SnapshotStore) {
         };
         let at = (store.publication_clock)();
         for (id, intent) in jobs {
-            let Some(account) = store.account_store(&id) else {
+            let Some(_account) = store.account_store(&id) else {
                 continue;
             };
             if *intent == ReaderIntent::Unconfirmed {
-                let pending = store
-                    .reader_control
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                if !pending.stopped
-                    && pending
-                        .latest
-                        .get(&id)
-                        .is_some_and(|latest| Arc::ptr_eq(latest, &intent))
-                {
-                    account.mark_unavailable();
-                }
+                // The source observer already chose retained error or hard
+                // unavailability. No DB candidate exists for this intent.
                 continue;
             }
             let candidate = at
@@ -4895,6 +4945,128 @@ mod tests {
             2,
             "availability recovery alone is not a publication"
         );
+    }
+
+    #[test]
+    fn issue659_expired_source_keeps_error_frame_and_history_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("expired-source.sqlite3");
+        let reader = issue604_time_projection_fixture(&path);
+        let store = SnapshotStore::new(reader);
+        let notice = issue604_commit_notice(1);
+        assert!(store.notify_recorder_commit("account-1", notice.clone()));
+        let intent = Arc::clone(&store.reader_control.pending.lock().unwrap().latest["account-1"]);
+        store.complete_reader_candidate(
+            "account-1",
+            &intent,
+            store.prepare_reader_candidate_at("account-1", 1_800_000_600),
+        );
+        let before = store.snapshot_account("account-1").unwrap();
+        let counter = store.issuer.lock().unwrap().counter;
+        let mut server = serialization_listener(store);
+        let address = server.local_addr();
+        let current_request = "GET /v4/current HTTP/1.1\r\nHost:x\r\n\r\n";
+        let normal = request(address, current_request);
+        assert!(
+            normal.starts_with("HTTP/1.1 200"),
+            "normal fixture: {normal}"
+        );
+        let normal_json: Value = serde_json::from_str(body(&normal)).unwrap();
+        assert_eq!(
+            normal_json["state"], "ready",
+            "normal fixture must be complete"
+        );
+        let history = request(
+            address,
+            "GET /v3/history?period=1800604800 HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(
+            history.starts_with("HTTP/1.1 200"),
+            "history fixture: {history}"
+        );
+        let history_json: Value = serde_json::from_str(body(&history)).unwrap();
+        let cursor = history_json["resume_cursor"]
+            .as_str()
+            .expect("fixture history has a resume cursor");
+
+        assert!(server.store.mark_recorder_source_unavailable_with_reason(
+            "account-1",
+            RecorderSourceUnavailableReason::PublicationStale,
+        ));
+        let unconfirmed =
+            Arc::clone(&server.store.reader_control.pending.lock().unwrap().latest["account-1"]);
+        // The queued unconfirmed completion must preserve the source decision.
+        server.store.complete_reader_candidate(
+            "account-1",
+            &unconfirmed,
+            Err(ReaderError::InvalidValue(
+                "unconfirmed recorder source".into(),
+            )),
+        );
+        let expired = request(address, current_request);
+        assert!(
+            expired.starts_with("HTTP/1.1 200"),
+            "EXPIRED_SAME_OWNER_LAST_GOOD_WAS_HIDDEN: {expired}"
+        );
+        let expired_json: Value = serde_json::from_str(body(&expired)).unwrap();
+        assert_eq!(expired_json["state"], "error");
+        for (key, value) in normal_json.as_object().unwrap() {
+            if key != "state" {
+                assert_eq!(&expired_json[key], value, "retained field {key}");
+            }
+        }
+        assert_ne!(published_pair(&expired), published_pair(&normal));
+        assert!(Arc::ptr_eq(
+            &before,
+            &server.store.snapshot_account("account-1").unwrap()
+        ));
+        assert_eq!(server.store.issuer.lock().unwrap().counter, counter);
+        let delta = request(
+            address,
+            &format!(
+                "GET /v3/history?period=1800604800&cursor={cursor} HTTP/1.1\r\nHost:x\r\n\r\n"
+            ),
+        );
+        assert!(
+            delta.starts_with("HTTP/1.1 200"),
+            "source age cannot invalidate unchanged history prefix: {delta}"
+        );
+        let delta_json: Value = serde_json::from_str(body(&delta)).unwrap();
+        assert_eq!(delta_json["resume_cursor"], cursor);
+        assert!(delta_json["history_samples"].as_array().unwrap().is_empty());
+
+        assert!(server.store.notify_recorder_commit("account-1", notice));
+        let fresh =
+            Arc::clone(&server.store.reader_control.pending.lock().unwrap().latest["account-1"]);
+        server.store.complete_reader_candidate(
+            "account-1",
+            &fresh,
+            server
+                .store
+                .prepare_reader_candidate_at("account-1", 1_800_000_600),
+        );
+        let recovered = request(address, current_request);
+        assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
+        assert_eq!(
+            serde_json::from_str::<Value>(body(&recovered)).unwrap(),
+            normal_json
+        );
+        assert_eq!(published_pair(&recovered), published_pair(&normal));
+
+        assert!(server.store.mark_recorder_source_unavailable_with_reason(
+            "account-1",
+            RecorderSourceUnavailableReason::IdentityInvalid,
+        ));
+        assert!(request(address, current_request).starts_with("HTTP/1.1 503"));
+        server.store.mark_recorder_source_unavailable_with_reason(
+            "account-1",
+            RecorderSourceUnavailableReason::PublicationStale,
+        );
+        assert!(
+            request(address, current_request).starts_with("HTTP/1.1 503"),
+            "expiry cannot resurrect a frame already revoked at an identity boundary"
+        );
+        server.shutdown();
     }
 
     #[test]
