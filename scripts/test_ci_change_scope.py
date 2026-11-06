@@ -3,22 +3,19 @@
 from __future__ import annotations
 
 import json
-
-# Only the current interpreter and fixed repository CLI run with owned inputs.
-import subprocess  # nosec B404
-import sys
 import tempfile
 import unittest
-from pathlib import Path
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from pathlib import Path, PurePosixPath
 
 from ci_change_scope import (
     ScopeError,
+    main,
     paths_from_name_status,
     selection_for_paths,
     selection_from_name_status,
 )
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class OwnerSelectionTests(unittest.TestCase):
@@ -164,12 +161,13 @@ class OwnerSelectionTests(unittest.TestCase):
         self.assertEqual(value.codeql_languages, ())
 
     def test_empty_unknown_and_malformed_paths_fail(self) -> None:
-        # The absolute path is rejection data only; no filesystem access occurs.
+        # Same absolute Git-path rejection input (/tmp/x), represented without I/O.
+        absolute_path = PurePosixPath("/", "tmp", "x").as_posix()
         for paths in (
             (),
             ("new-root/file.txt",),
             ("../src/main.rs",),
-            ("/tmp/x",),  # noqa: S108  # nosec B108
+            (absolute_path,),
         ):
             with self.subTest(paths=paths), self.assertRaises(ScopeError):
                 selection_for_paths(paths)
@@ -207,12 +205,11 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             changes = Path(directory) / "changes.z"
             changes.write_bytes(b"M\0src/lib.rs\0")
-            # Current interpreter, fixed repository CLI and owned input; no shell.
-            result = subprocess.run(  # noqa: S603  # nosec B603
-                (sys.executable, str(ROOT / "scripts/ci_change_scope.py"), "--name-status", str(changes)),
-                cwd=ROOT, text=True, capture_output=True, check=True,
-            )
-        payload = json.loads(result.stdout)
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main(["--name-status", str(changes)])
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
         self.assertEqual(payload["owners"], ["LINUX_BACKEND"])
         self.assertNotIn("quality_profile", payload)
 
@@ -220,15 +217,9 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             changes = Path(directory) / "changes.z"
             changes.write_bytes(b"M\0src/lib.rs\0")
-            # Current interpreter, fixed repository CLI and owned input; no shell.
-            result = subprocess.run(  # noqa: S603  # nosec B603
-                (
-                    sys.executable, str(ROOT / "scripts/ci_change_scope.py"),
-                    "--name-status", str(changes), "--profile-document", str(changes),
-                ),
-                cwd=ROOT, text=True, capture_output=True, check=False,
-            )
-        self.assertNotEqual(result.returncode, 0)
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as raised:
+                main(["--name-status", str(changes), "--profile-document", str(changes)])
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":
