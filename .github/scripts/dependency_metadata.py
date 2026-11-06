@@ -64,7 +64,7 @@ class Client:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
         # HTTPS, fixed hosts, port and authority fields are validated above.
-        request = urllib.request.Request(url, data=data, headers=headers)  # noqa: S310
+        request = urllib.request.Request(url, data=data, headers=headers)
         try:
             with self.opener.open(request, timeout=30) as response:
                 body = response.read(LIMIT + 1)
