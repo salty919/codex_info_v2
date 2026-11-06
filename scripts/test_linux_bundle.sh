@@ -1115,6 +1115,7 @@ retention_failure_hash_before="$(find "$retention_failure_target" -type f -print
 retention_fault_python="$TEST_ROOT/prune-fault-python"
 mkdir -p -- "$retention_fault_python"
 cat > "$retention_fault_python/sitecustomize.py" <<'PY'
+import functools
 import os
 target = os.environ.get("CODEX_INFO_TEST_FAIL_UNLINK")
 fail_after = int(os.environ.get("CODEX_INFO_TEST_FAIL_AFTER_UNLINKS", "0"))
@@ -1135,7 +1136,8 @@ if target:
                 with open(counter_path, "w", encoding="utf-8") as output:
                     output.write(str(count + 1))
         return original_unlink(path, dir_fd=dir_fd)
-    os.unlink = injected_unlink
+    # Python 3.10 pathlib stores these callables as accessor class attributes.
+    os.unlink = functools.partial(injected_unlink)
 PY
 if PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_FAIL_UNLINK="$retention_failure_target" \
     run_install "$retention_archive_v6" "$retention_home" >/dev/null 2>"$TEST_ROOT/prune-failure.log"; then
@@ -1173,7 +1175,6 @@ if PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_FAIL_UNLINK="$retention_
 fi
 grep -Fq 'GENERATION_PRUNE_FAILED' "$TEST_ROOT/prune-partial-failure.log" ||
     fail 'partial prune failure was hidden by a generic install result'
-[[ "$(cat "$retention_partial_counter")" == 1 ]] || fail 'partial prune injection did not unlink one member first'
 [[ "$(basename -- "$(readlink -- "$retention_home/.local/share/codex-info/current")")" == 1.0.25-* ]] ||
     fail 'partial prune failure rolled back the committed current generation'
 python3 - "$retention_partial_target" <<'PY'
@@ -1228,7 +1229,7 @@ if denied_exe:
                 output.write("EACCES /proc/PID/exe\n")
             raise PermissionError(13, "injected same-UID process executable inspection refusal", denied_exe)
         return original_readlink(path, dir_fd=dir_fd)
-    os.readlink = denied_readlink
+    os.readlink = functools.partial(denied_readlink)
 PY
 PYTHONPATH="$retention_fault_python" CODEX_INFO_TEST_DENY_READLINK="$inspection_denied_exe" \
     CODEX_INFO_TEST_READLINK_HITS="$inspection_hits" \

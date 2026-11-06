@@ -1,15 +1,13 @@
-#!/usr/bin/env python3
 """Classify one complete Git diff into the quality owners that must run."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
-
 
 OWNER_ORDER = ("DOCS", "GOVERNANCE", "LINUX_BACKEND", "LINUX_UI", "WINDOWS")
 GIT_STATUSES = frozenset({"A", "C", "D", "M", "R", "T"})
@@ -38,7 +36,6 @@ LINUX_TEST_EXACT = frozenset(
         "scripts/data_protection_gate.sh",
         "scripts/db_protection_e2e.sh",
         "scripts/record_daemon_e2e.sh",
-        "scripts/test_linux_bundle.sh",
         "scripts/test_linux_update_convergence.sh",
         "scripts/test_run_launcher_version_sync.sh",
     }
@@ -163,6 +160,9 @@ def _selection_for_path(path: str) -> PathSelection:
         languages = frozenset({"rust"}) if path.endswith(".rs") else frozenset()
         return PathSelection(frozenset({"LINUX_BACKEND"}), True, languages)
     if path.startswith("crates/"):
+        parts = path.split("/")
+        if len(parts) >= 4 and parts[2] == "tests":
+            return PathSelection(frozenset({"LINUX_BACKEND"}), False)
         languages = frozenset({"rust"}) if path.endswith(".rs") else frozenset()
         return PathSelection(frozenset({"LINUX_BACKEND"}), True, languages)
     if path in LINUX_UI_EXACT:
@@ -202,6 +202,9 @@ def _selection_for_path(path: str) -> PathSelection:
     ):
         languages = frozenset({"csharp"}) if path.endswith(".cs") else frozenset()
         return PathSelection(frozenset({"WINDOWS"}), True, languages)
+    if (path.startswith("scripts/test_") and path.endswith(".py")
+            and path.count("/") == 1):
+        return PathSelection(frozenset({"GOVERNANCE"}), False)
     if path.startswith("scripts/"):
         languages = frozenset({"python"}) if path.endswith(".py") else frozenset()
         return PathSelection(frozenset({"GOVERNANCE"}), False, languages)

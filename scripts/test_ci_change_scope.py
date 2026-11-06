@@ -1,23 +1,21 @@
-#!/usr/bin/env python3
 """Direct tests for stable path-to-owner CI classification."""
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
-import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from pathlib import Path, PurePosixPath
 
 from ci_change_scope import (
     ScopeError,
+    main,
     paths_from_name_status,
     selection_for_paths,
     selection_from_name_status,
 )
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class OwnerSelectionTests(unittest.TestCase):
@@ -65,6 +63,63 @@ class OwnerSelectionTests(unittest.TestCase):
                 )
                 self.assertFalse(value.distribution_required)
 
+    def test_bundle_fixture_uses_existing_governance_prefix(self) -> None:
+        for release_candidate in (False, True):
+            with self.subTest(release_candidate=release_candidate):
+                value = selection_for_paths(
+                    ("scripts/test_linux_bundle.sh",),
+                    release_candidate=release_candidate,
+                )
+                self.assertEqual(
+                    (value.owners, value.binary_impact,
+                     value.distribution_required, value.codeql_languages),
+                    (("GOVERNANCE",), False, False, ()),
+                )
+
+    def test_crate_integration_tests_keep_backend_without_binary_impact(self) -> None:
+        for release_candidate in (False, True):
+            with self.subTest(release_candidate=release_candidate):
+                value = selection_for_paths(
+                    ("crates/codex-info-recorder/tests/app_server_sqlite_isolation.rs",),
+                    release_candidate=release_candidate,
+                )
+                self.assertEqual(
+                    (value.owners, value.binary_impact,
+                     value.distribution_required, value.codeql_languages),
+                    (("LINUX_BACKEND",), False, False, ()),
+                )
+        nested_source = selection_for_paths(
+            ("crates/codex-info-recorder/src/tests/runtime.rs",)
+        )
+        self.assertEqual(
+            (nested_source.owners, nested_source.binary_impact,
+             nested_source.codeql_languages),
+            (("LINUX_BACKEND",), True, ("rust",)),
+        )
+
+    def test_classifier_test_source_does_not_add_codeql(self) -> None:
+        for release_candidate in (False, True):
+            with self.subTest(release_candidate=release_candidate):
+                value = selection_for_paths(
+                    ("scripts/test_ci_change_scope.py",),
+                    release_candidate=release_candidate,
+                )
+                self.assertEqual(
+                    (value.owners, value.binary_impact,
+                     value.distribution_required, value.codeql_languages),
+                    (("GOVERNANCE",), False, False, ()),
+                )
+        mixed = selection_for_paths(
+            ("scripts/ci_change_scope.py", "scripts/test_ci_change_scope.py")
+        )
+        self.assertEqual(mixed.owners, ("GOVERNANCE",))
+        self.assertEqual(mixed.codeql_languages, ("python",))
+        nested_implementation = selection_for_paths(
+            ("scripts/test_tools/helper.py",)
+        )
+        self.assertEqual(nested_implementation.owners, ("GOVERNANCE",))
+        self.assertEqual(nested_implementation.codeql_languages, ("python",))
+
     def test_shared_native_entry_selects_backend_and_ui_once(self) -> None:
         value = selection_for_paths(("src/main.rs", "src/main.rs"))
         self.assertEqual(value.owners, ("LINUX_BACKEND", "LINUX_UI"))
@@ -106,7 +161,14 @@ class OwnerSelectionTests(unittest.TestCase):
         self.assertEqual(value.codeql_languages, ())
 
     def test_empty_unknown_and_malformed_paths_fail(self) -> None:
-        for paths in ((), ("new-root/file.txt",), ("../src/main.rs",), ("/tmp/x",)):
+        # Same absolute Git-path rejection input (/tmp/x), represented without I/O.
+        absolute_path = PurePosixPath("/", "tmp", "x").as_posix()
+        for paths in (
+            (),
+            ("new-root/file.txt",),
+            ("../src/main.rs",),
+            (absolute_path,),
+        ):
             with self.subTest(paths=paths), self.assertRaises(ScopeError):
                 selection_for_paths(paths)
 
@@ -143,11 +205,11 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             changes = Path(directory) / "changes.z"
             changes.write_bytes(b"M\0src/lib.rs\0")
-            result = subprocess.run(
-                ("python3", str(ROOT / "scripts/ci_change_scope.py"), "--name-status", str(changes)),
-                cwd=ROOT, text=True, capture_output=True, check=True,
-            )
-        payload = json.loads(result.stdout)
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main(["--name-status", str(changes)])
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
         self.assertEqual(payload["owners"], ["LINUX_BACKEND"])
         self.assertNotIn("quality_profile", payload)
 
@@ -155,14 +217,9 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             changes = Path(directory) / "changes.z"
             changes.write_bytes(b"M\0src/lib.rs\0")
-            result = subprocess.run(
-                (
-                    "python3", str(ROOT / "scripts/ci_change_scope.py"),
-                    "--name-status", str(changes), "--profile-document", str(changes),
-                ),
-                cwd=ROOT, text=True, capture_output=True,
-            )
-        self.assertNotEqual(result.returncode, 0)
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as raised:
+                main(["--name-status", str(changes), "--profile-document", str(changes)])
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":
