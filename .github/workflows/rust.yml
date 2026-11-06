@@ -54,24 +54,43 @@ jobs:
         run: cargo fmt --check
       - name: Run native unit tests with coverage
         run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --locked --all-targets --no-report -- --nocapture
+      - name: Reject native compiler and Clippy warnings
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - name: Generate native coverage report
+        id: coverage_report
+        continue-on-error: true
+        run: |
           mkdir -p artifacts/codacy-coverage-rust
-          cargo llvm-cov --workspace --locked --all-targets --cobertura \
-            --output-path artifacts/codacy-coverage-rust/rust.cobertura.xml \
-            -- --nocapture
           report=artifacts/codacy-coverage-rust/rust.cobertura.xml
+          cargo llvm-cov report --locked --cobertura --output-path "$report"
           test -s "$report"
           grep -Eq 'lines-valid="[1-9][0-9]*"' "$report"
           if grep -Eq 'filename="(/|[A-Za-z]:[\\/])' "$report"; then
             echo 'Rust Cobertura contains a runner-specific path.' >&2
             exit 1
           fi
-      - name: Reject native compiler and Clippy warnings
-        run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - name: Preserve native coverage for isolated upload
+        id: coverage_artifact
+        if: steps.coverage_report.outcome == 'success'
+        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: codacy-coverage-rust-v1-head-${{ inputs.source_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifacts/codacy-coverage-rust/rust.cobertura.xml
           if-no-files-found: error
+      - name: Summarize native coverage outcome
+        if: always()
+        continue-on-error: true
+        env:
+          REPORT_OUTCOME: ${{ steps.coverage_report.outcome }}
+          ARTIFACT_OUTCOME: ${{ steps.coverage_artifact.outcome }}
+        run: |
+          printf '### Native coverage (auxiliary)\n\nReport: %s\n\nArtifact transfer: %s\n' \
+            "$REPORT_OUTCOME" "$ARTIFACT_OUTCOME" >>"$GITHUB_STEP_SUMMARY"
+          if [[ "$REPORT_OUTCOME" == failure || "$ARTIFACT_OUTCOME" == failure ]]; then
+            echo '::warning::Coverage generation or transfer failed; coverage is unavailable. Product tests and Clippy retain their own results.'
+          fi
       - name: Verify recorder and REST compile-time boundary
         run: bash scripts/check_recorder_rest_boundary.sh --static-only

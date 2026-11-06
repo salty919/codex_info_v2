@@ -492,6 +492,8 @@ Linuxに実装された対応surfaceにも同じデータの意味と取得失�
   candidateがない通常UI品質ではUIだけをbuildし、使用しないREST・recorder executableをbuildしない。
   Rustの依存コンパイル成果物はrunner OS・compiler・依存・build設定に応じてcacheへ保存し、製品sourceや製品版番号だけの
   変更で依存全体を再buildしない。workspace製品とcoverage reportは再生成し、cache hitをtest成功へ読み替えない。
+  coverageは同じtest実行から得る補助品質情報とし、製品test・Clippyの合否と集計・転送の成功／失敗／未生成を分離して表示する。
+  coverageだけの失敗をselected-quality・acceptanceの追加blocking条件にせず、不正・不完全なreportをCodacyへ送信しない（Issue #202）。
   native unit/Clippy、配布build、Windows、CodeQLは相互の終了待ちを追加せず並列実行を維持する。
   Windows評価・candidateはWINDOWS ownerが実際に選択された場合だけ実行する。`feat/next`向けPRは、PR本文や機能名の申告を
   品質選択へ使用しない。そのPRのevent base/headの完全差分を使い、mainからfeatへ既に積み上がった別PRの変更を再選択しない。

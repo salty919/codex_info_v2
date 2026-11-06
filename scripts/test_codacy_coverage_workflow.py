@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from workflow_quality_gate import _native_coverage_outcome_tests
+
 ROOT = Path(__file__).resolve().parents[1]
 RUST = (ROOT / ".github/workflows/rust.yml").read_text(encoding="utf-8")
 WINDOWS = (ROOT / ".github/workflows/windows-client.yml").read_text(encoding="utf-8")
@@ -22,9 +24,18 @@ def forbid(source: str, marker: str) -> None:
 
 
 def main() -> int:
+    native_observations = _native_coverage_outcome_tests(RUST)
+    for observation in native_observations:
+        if observation['failures']:
+            raise AssertionError(f"native coverage control failed: {observation}")
+        print(f"codacy-coverage-control: scenario={observation['scenario']} PASS")
     for marker in (
         "cargo-llvm-cov@0.9.0",
-        "cargo llvm-cov --workspace --locked --all-targets --cobertura",
+        "cargo llvm-cov --workspace --locked --all-targets --no-report",
+        "cargo llvm-cov report --locked --cobertura",
+        "if: steps.coverage_report.outcome == 'success'",
+        "REPORT_OUTCOME: ${{ steps.coverage_report.outcome }}",
+        "ARTIFACT_OUTCOME: ${{ steps.coverage_artifact.outcome }}",
         "codacy-coverage-rust-v1-head-${{ inputs.source_sha }}",
         "if-no-files-found: error",
     ):
@@ -70,7 +81,7 @@ def main() -> int:
     ):
         forbid(UPLOAD, marker)
 
-    print("codacy-coverage-workflow-test: PASS cases=4")
+    print(f"codacy-coverage-workflow-test: PASS cases={4 + len(native_observations)} native_control_cases={len(native_observations)}")
     return 0
 
 

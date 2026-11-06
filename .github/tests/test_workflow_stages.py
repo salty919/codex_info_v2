@@ -338,9 +338,10 @@ class LinuxBuildFlowTests(unittest.TestCase):
                     bindings = self.bindings(caller, inputs)
                     for job in workflow(name)['jobs'].values():
                         for step in job['steps']:
-                            if expression(step.get('if', True), bindings):
-                                builds.extend(line.strip() for line in step.get('run', '').splitlines()
-                                              if 'cargo build ' in line)
+                            step_builds = [line.strip() for line in step.get('run', '').splitlines()
+                                           if 'cargo build ' in line]
+                            if step_builds and expression(step.get('if', True), bindings):
+                                builds.extend(step_builds)
                 self.assertEqual(len(builds), 1, builds)
                 if release:
                     self.assertIn('--target "$LINUX_BUNDLE_TARGET"', builds[0])
