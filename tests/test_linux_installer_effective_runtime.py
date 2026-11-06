@@ -996,6 +996,36 @@ with open(root / "ui-exit-permission", "rb") as permission: permission.read(1)
             "active_thread_count": 0, "open_session_thread_count": 0,
         }
 
+    def test_issue659_expired_owner_with_retained_error_current_is_available(self):
+        installed = self.command(INSTALLER, "--bundle", self.local_recovery_bundle())
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        self.canonical_process_fixture()
+        started = self.command(self.installed, "--start")
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+
+        state_path = self.home / ".codex/history/recorder-state.json"
+        state = json.loads(state_path.read_text())
+        last_commit = int(time.time()) - 151
+        state.update(
+            write_state="degraded", partition_id_hash="a" * 64,
+            data_generation=1, collector_epoch="b" * 32, cycle_seq=1,
+            last_commit_unix=last_commit, updated_at_unix=last_commit,
+        )
+        state_path.write_text(json.dumps(state) + "\n")
+        before = state_path.read_bytes()
+        self.env.update(
+            FAKE_CURRENT_STATUS="200",
+            FAKE_CURRENT_BODY=json.dumps(self.wire_error_model_frame()),
+            FAKE_REJECT_LEGACY_DETAILS="1",
+        )
+        result = self.command(self.installed, "--verify-runtime")
+        self.assertEqual(
+            result.returncode, 0,
+            "RETAINED_ERROR_CURRENT_AGE_WAS_REJECTED: " + result.stdout + result.stderr,
+        )
+        self.assertEqual(state_path.read_bytes(), before, "readiness must not forge progress")
+        self.preserved_profile()
+
     def probe_wire_model_frame(self, frame):
         self.env.update(
             FAKE_CURRENT_STATUS="200", FAKE_CURRENT_BODY=json.dumps(frame),

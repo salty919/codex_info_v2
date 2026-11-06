@@ -2002,6 +2002,59 @@ grep -Eq '^systemctl --user restart( --no-block)? codex-info-rest[.]service$' <<
     fail 'same-hash update preserved a recorder with the wrong artifact hash'
 printf 'case same-recorder-hash update preserves recorder PID: PASS\n'
 
+# A retained, byte-identical recorder remains valid on the next control call.
+# Its predecessor inode is intentional, not a reason to recycle either service.
+write_release "$archive_v3"
+hash_followup_current="$(readlink -- "$split_hash_home/.local/share/codex-info/current")"
+for hash_followup_case in --update --start repair-rest; do
+    hash_followup_action="$hash_followup_case"
+    if [[ "$hash_followup_case" == repair-rest ]]; then
+        # The existing fake REST start restores its loopback listener. This
+        # tests required REST repair without inventing a new process fixture.
+        hash_followup_action=--start
+        : > "$fake_proc/net/tcp"
+    fi
+    hash_followup_begin="$(wc -l < "$log")"
+    hash_followup_output="$TEST_ROOT/same-hash-followup-${hash_followup_case#--}.log"
+    if ! HOME="$split_hash_home" CODEX_HOME="$split_hash_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_LEGACY_ENABLED_FILE="$split_hash_home/.legacy-enabled" \
+        FAKE_LEGACY_ACTIVE_FILE="$split_hash_home/.legacy-active" FAKE_LEGACY_PID_FILE="$split_hash_home/.legacy-pid" \
+        FAKE_LEGACY_PID=6100 FAKE_LEGACY_ENABLE_PATH="$split_hash_home/.config/systemd/user/default.target.wants/codex-info.service" \
+        FAKE_SPLIT_MISSING_IS_ACTIVE=1 \
+        FAKE_MAIN_ACTIVE_FILE="$split_hash_home/.recorder-active" FAKE_REST_ACTIVE_FILE="$split_hash_home/.rest-active" \
+        FAKE_MAIN_PID="$legacy_recorder_pid" FAKE_REST_PID="$legacy_rest_pid" \
+        FAKE_RECORDER_REFRESH="$split_hash_home/.codex/history" FAKE_PROC_ROOT="$fake_proc" \
+        FAKE_REST_SOCKET_NET_FILE="$fake_proc/net/tcp" FAKE_REST_SOCKET_CONTENT="$split_socket_content" \
+        FAKE_TIMER_ACTIVE_FILE="$split_hash_home/.timer-active" \
+        FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" \
+        TMPDIR="$update_tmp" CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        FAKE_HEALTH_VERSION=1.0.21 \
+        bash "$split_hash_home/.local/libexec/codex-info-install.sh" "$hash_followup_action" >"$hash_followup_output" 2>&1; then
+        cat "$hash_followup_output" >&2
+        fail "same-hash followup control failed: $hash_followup_action"
+    fi
+    hash_followup_log="$(tail -n +$((hash_followup_begin + 1)) "$log")"
+    if grep -Eq '^systemctl --user (stop|restart)( --no-block)? codex-info-recorder[.]service$' <<<"$hash_followup_log"; then
+        printf '%s\n' "$hash_followup_log" >&2
+        fail "SAME_HASH_FOLLOWUP_RECYCLED_RUNNING_SERVICE: $hash_followup_action"
+    fi
+    if [[ "$hash_followup_case" == repair-rest ]]; then
+        grep -Eq '^systemctl --user restart( --no-block)? codex-info-rest[.]service$' <<<"$hash_followup_log" ||
+            fail 'same-hash recorder suppressed required REST listener repair'
+    elif grep -Eq '^systemctl --user (stop|restart)( --no-block)? codex-info-rest[.]service$' <<<"$hash_followup_log"; then
+        printf '%s\n' "$hash_followup_log" >&2
+        fail "SAME_HASH_FOLLOWUP_RECYCLED_RUNNING_SERVICE: $hash_followup_action"
+    fi
+    [[ "$(readlink -- "$split_hash_home/.local/share/codex-info/current")" == "$hash_followup_current" ]] ||
+        fail 'same-hash followup changed the current generation'
+    [[ "$(readlink -- "$fake_proc/$legacy_recorder_pid/exe")" == "$split_hash_home/.local/share/codex-info/generations/$hash_previous_generation/codex_info_recorder" &&
+       -f "$split_hash_home/.recorder-active" && -f "$split_hash_home/.rest-active" ]] ||
+        fail 'same-hash followup did not retain the original active recorder inode'
+    printf 'case same-recorder-hash followup %s: PASS\n' "$hash_followup_case"
+done
+printf 'case same-recorder-hash no-update/start preserves split runtime: PASS\n'
+
+
 # A REST activation failure must roll back to the predecessor while retaining
 # the already-running recorder. The fail-once marker lets rollback restore
 # REST without making the fixture emulate a second recorder lifecycle.

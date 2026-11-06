@@ -92,6 +92,14 @@ enum RecorderPublication {
         last_commit_unix: Option<i64>,
         degraded: bool,
     },
+    Expired {
+        owner: RecorderOwner,
+        partition_id: String,
+        commit: CollectionCommit,
+        last_commit_unix: i64,
+        degraded: bool,
+        reason: RecorderSourceUnavailableReason,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +116,27 @@ impl RecorderPublication {
                 owner,
                 partition_id,
                 commit: Some(commit),
+                degraded,
+                ..
+            } => Some(RecorderCommitNotice {
+                pid: owner.pid,
+                process_starttime: owner.process_starttime,
+                owner_nonce: owner.nonce.clone(),
+                partition_id: partition_id.clone(),
+                commit: *commit,
+                degraded: *degraded,
+            }),
+            _ => None,
+        }
+    }
+    // This is an ownership witness for retaining an existing frame,
+    // never a fresh notification authorizing a new DB candidate.
+    fn expired_notice(&self) -> Option<RecorderCommitNotice> {
+        match self {
+            Self::Expired {
+                owner,
+                partition_id,
+                commit,
                 degraded,
                 ..
             } => Some(RecorderCommitNotice {
@@ -362,11 +391,26 @@ fn run() -> Result<(), String> {
                     })
                 {
                     if let Some(id) = server.store().default_account_id() {
-                        server.store().mark_recorder_source_unavailable_with_reason(
-                            &id,
-                            source_unavailable_reason
-                                .unwrap_or(RecorderSourceUnavailableReason::Unspecified),
-                        );
+                        let mut reason = source_unavailable_reason
+                            .unwrap_or(RecorderSourceUnavailableReason::Unspecified);
+                        if matches!(
+                            reason,
+                            RecorderSourceUnavailableReason::PublicationStale
+                                | RecorderSourceUnavailableReason::CommitStale
+                        ) {
+                            let same_owner = publication
+                                .as_ref()
+                                .and_then(RecorderPublication::expired_notice)
+                                .is_some_and(|notice| {
+                                    server.store().recorder_owner_is_published(&id, &notice)
+                                });
+                            if !same_owner {
+                                reason = RecorderSourceUnavailableReason::IdentityInvalid;
+                            }
+                        }
+                        server
+                            .store()
+                            .mark_recorder_source_unavailable_with_reason(&id, reason);
                     }
                 } else {
                     server
@@ -592,6 +636,20 @@ fn recorder_source_unavailable_reason(
                 Reason::Unspecified
             }
         }
+        Ok(RecorderPublication::Expired {
+            partition_id: published_partition,
+            last_commit_unix,
+            reason,
+            ..
+        }) => {
+            if published_partition != partition_id {
+                Reason::PartitionMismatch
+            } else if activation_at.is_some_and(|activation| *last_commit_unix < activation) {
+                Reason::BeforeActivation
+            } else {
+                *reason
+            }
+        }
     }
 }
 
@@ -700,11 +758,9 @@ fn read_recorder_publication_at(
     let updated_at = object
         .get("updated_at_unix")
         .and_then(Value::as_i64)
-        .filter(|value| {
-            *value > 0 && *value <= now && now - *value <= RECORDER_STATE_FRESHNESS_SECS
-        })
+        .filter(|value| *value > 0 && *value <= now)
         .ok_or_else(|| "recorder publication is stale".to_owned())?;
-    let _ = updated_at;
+    let publication_expired = now - updated_at > RECORDER_STATE_FRESHNESS_SECS;
     let publication = match object.get("write_state").and_then(Value::as_str) {
         Some("idle_no_account") => {
             for key in [
@@ -717,6 +773,9 @@ fn read_recorder_publication_at(
                 if object.get(key) != Some(&Value::Null) {
                     return Err("idle recorder publication is inconsistent".to_owned());
                 }
+            }
+            if publication_expired {
+                return Err("recorder publication is stale".to_owned());
             }
             Ok(RecorderPublication::Idle { owner })
         }
@@ -736,6 +795,9 @@ fn read_recorder_publication_at(
                 .into_iter()
                 .all(|key| object.get(key) == Some(&Value::Null))
             {
+                if publication_expired {
+                    return Err("recorder publication is stale".to_owned());
+                }
                 return Ok((
                     RecorderPublication::Active {
                         owner,
@@ -754,9 +816,7 @@ fn read_recorder_publication_at(
             let last_commit_unix = object
                 .get("last_commit_unix")
                 .and_then(Value::as_i64)
-                .filter(|value| {
-                    *value > 0 && *value <= now && now - *value <= RECORDER_STATE_FRESHNESS_SECS
-                })
+                .filter(|value| *value > 0 && *value <= now)
                 .ok_or_else(|| "recorder commit is stale".to_owned())?;
             if !object
                 .get("data_generation")
@@ -773,25 +833,41 @@ fn read_recorder_publication_at(
             {
                 return Err("recorder generation is invalid".to_owned());
             }
-            Ok(RecorderPublication::Active {
-                owner,
-                partition_id: partition_id.to_owned(),
-                commit: Some(CollectionCommit {
-                    generation: object["data_generation"]
-                        .as_u64()
-                        .expect("validated generation"),
-                    collector_epoch: Some(
-                        u128::from_str_radix(
-                            object["collector_epoch"].as_str().expect("validated epoch"),
-                            16,
-                        )
-                        .expect("validated epoch"),
-                    ),
-                    cycle_seq: object["cycle_seq"].as_u64().expect("validated sequence"),
-                }),
-                last_commit_unix: Some(last_commit_unix),
-                degraded: write_state == "degraded",
-            })
+            let commit = CollectionCommit {
+                generation: object["data_generation"]
+                    .as_u64()
+                    .expect("validated generation"),
+                collector_epoch: Some(
+                    u128::from_str_radix(
+                        object["collector_epoch"].as_str().expect("validated epoch"),
+                        16,
+                    )
+                    .expect("validated epoch"),
+                ),
+                cycle_seq: object["cycle_seq"].as_u64().expect("validated sequence"),
+            };
+            if publication_expired || now - last_commit_unix > RECORDER_STATE_FRESHNESS_SECS {
+                Ok(RecorderPublication::Expired {
+                    owner,
+                    partition_id: partition_id.to_owned(),
+                    commit,
+                    last_commit_unix,
+                    degraded: write_state == "degraded",
+                    reason: if publication_expired {
+                        RecorderSourceUnavailableReason::PublicationStale
+                    } else {
+                        RecorderSourceUnavailableReason::CommitStale
+                    },
+                })
+            } else {
+                Ok(RecorderPublication::Active {
+                    owner,
+                    partition_id: partition_id.to_owned(),
+                    commit: Some(commit),
+                    last_commit_unix: Some(last_commit_unix),
+                    degraded: write_state == "degraded",
+                })
+            }
         }
         _ => Err("recorder write state is invalid".to_owned()),
     }?;
@@ -989,7 +1065,10 @@ mod tests {
                 outcomes.push((
                     field,
                     offset,
-                    super::read_recorder_publication_at(root.path(), NOW).is_ok(),
+                    super::read_recorder_publication_at(root.path(), NOW)
+                        .ok()
+                        .and_then(|(publication, _)| publication.commit_notice())
+                        .is_some(),
                 ));
                 assert_eq!(
                     fs::read(root.path().join("history/recorder-state.json")).unwrap(),
@@ -1014,6 +1093,31 @@ mod tests {
             ],
             "only positive timestamps in the exact closed interval [now-150,now] are fresh"
         );
+    }
+
+    #[test]
+    fn issue659_expired_live_owner_is_not_a_fresh_commit() {
+        const NOW: i64 = 1_800_000_600;
+        let root = tempfile::tempdir().unwrap();
+        for heartbeat_fresh in [false, true] {
+            let mut value = issue604_live_recorder_state();
+            value["updated_at_unix"] =
+                serde_json::json!(if heartbeat_fresh { NOW } else { NOW - 186 });
+            value["last_commit_unix"] = serde_json::json!(NOW - 186);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            write_issue604_recorder_state(root.path(), &bytes);
+            let (publication, _) = super::read_recorder_publication_at(root.path(), NOW)
+                .expect("EXPIRED_SAME_OWNER_IDENTITY_WAS_DISCARDED");
+            assert!(
+                publication.commit_notice().is_none(),
+                "an expired real commit cannot become fresh through heartbeat alone"
+            );
+            assert_eq!(
+                fs::read(root.path().join("history/recorder-state.json")).unwrap(),
+                bytes,
+                "classification cannot rewrite timestamps, identity or commit"
+            );
+        }
     }
 
     #[test]
