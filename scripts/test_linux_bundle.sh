@@ -1989,11 +1989,10 @@ legacy_candidate_version=1.0.21
 hash_log_start="$(wc -l < "$log")"
 run_legacy_install "$archive_v3" "$split_hash_home" >/dev/null
 hash_log="$(tail -n +$((hash_log_start + 1)) "$log")"
-if grep -Fq 'systemctl --user stop --no-block codex-info-recorder.service' <<<"$hash_log" ||
-   grep -Fq 'systemctl --user restart --no-block codex-info-recorder.service' <<<"$hash_log"; then
+if grep -Eq '^systemctl --user (stop|restart)( --no-block)? codex-info-recorder[.]service$' <<<"$hash_log"; then
     fail 'same-hash update recycled the recorder service'
 fi
-grep -Fq 'systemctl --user restart --no-block codex-info-rest.service' <<<"$hash_log" ||
+grep -Eq '^systemctl --user restart( --no-block)? codex-info-rest[.]service$' <<<"$hash_log" ||
     fail 'same-hash update did not restart REST'
 [[ "$(readlink -- "$split_hash_home/.local/share/codex-info/current")" == generations/1.0.21-* ]] ||
     fail 'same-hash update did not publish the candidate generation'
@@ -2017,8 +2016,7 @@ if run_legacy_install "$archive_v4" "$split_hash_home" codex-info-rest.service "
     fail 'same-hash REST failure unexpectedly succeeded'
 fi
 hash_rollback_log="$(tail -n +$((hash_rollback_log_start + 1)) "$log")"
-if grep -Fq 'systemctl --user stop --no-block codex-info-recorder.service' <<<"$hash_rollback_log" ||
-   grep -Fq 'systemctl --user restart --no-block codex-info-recorder.service' <<<"$hash_rollback_log"; then
+if grep -Eq '^systemctl --user (stop|restart)( --no-block)? codex-info-recorder[.]service$' <<<"$hash_rollback_log"; then
     fail 'same-hash rollback recycled the recorder service'
 fi
 [[ "$(readlink -- "$split_hash_home/.local/share/codex-info/current")" == "$hash_current_generation" ]] ||
