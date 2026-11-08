@@ -8,6 +8,7 @@ using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Core.Tests;
 using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
@@ -22,7 +23,7 @@ public sealed class GraphPlotControlTests
 {
     private const string PublishedPairHeader = "Codex-Info-Published-Pair";
     private const string CanonicalPublishedPair =
-        "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
+        "00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
     private static bool IsRenderableModel(string model) =>
         model is "ASTRA" or "LUNA" or "SOL" or "TERRA";
@@ -1740,24 +1741,13 @@ public sealed class GraphPlotControlTests
         var handler = new DetailsFixtureHandler(responseBytes);
 
         using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchDetailsAsync(CancellationToken.None);
+        var result = await WirePresentationFixture.Details(client, handler.Document);
 
-        Assert.Equal(3, handler.RequestCount);
-        Assert.Equal(HttpStatusCode.OK, handler.StatusCode);
-        Assert.Equal(HttpMethod.Get, handler.LastRequest?.Method);
-        Assert.Equal(
-            "http://127.0.0.1:8787/v1/details",
-            handler.LastRequest?.RequestUri?.AbsoluteUri);
-        Assert.Equal(responseBytes, handler.ReturnedBytes);
-        Assert.Equal(responseBytes.LongLength, handler.ContentLength);
-        Assert.Equal("application/json; charset=utf-8", handler.ContentType);
-        Assert.True(handler.NoStore);
-        Assert.Equal([CanonicalPublishedPair], handler.PublishedPairValues);
-
+        Assert.Equal(new[] { "/state", "/history/periods", "/history" }, handler.Gets.Select(path => path.Split('?')[0]));
         Assert.True(result.IsSuccess);
         Assert.Null(result.Failure);
         var snapshot = Assert.IsType<ApiDetailsSnapshot>(result.Snapshot);
-        Assert.Equal(CanonicalPublishedPair, snapshot.PublishedPair?.ToString());
+        Assert.Matches("^[0-9a-f]{64}$", snapshot.PublishedPair!.ToString());
 
         var expectedPeriodStart = root.GetProperty("expected_period_start").GetInt64();
         var expectedPeriodEnd = root.GetProperty("expected_period_end").GetInt64();
@@ -1877,16 +1867,16 @@ public sealed class GraphPlotControlTests
 
         var handler = new SplitHistoryFixtureHandler(periodBody, historyBody, pair, periodId);
         using var client = new LoopbackStatusClient(handler);
-        var periodsResult = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
-        var pageResult = await client.FetchHistoryPageAsync(periodId, cancellationToken: CancellationToken.None);
+        var periodsResult = await client.FetchHistoryPeriodsAsync("account-1", CancellationToken.None);
+        var pageResult = await client.FetchHistoryPageAsync(accountId: "account-1", periodId: periodId, cancellationToken: CancellationToken.None);
 
         Assert.True(periodsResult.IsSuccess);
         Assert.True(pageResult.IsSuccess);
-        Assert.Equal(4, handler.RequestCount);
+        Assert.Equal(2, handler.RequestCount);
         var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
         var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
-        Assert.Equal(pair, periods.PublishedPair.ToString());
-        Assert.Equal(periods.PublishedPair, page.PublishedPair);
+        Assert.Matches("^[0-9a-f]{64}$", periods.PublishedPair.ToString());
+        Assert.Matches("^[0-9a-f]{64}$", page.PublishedPair.ToString());
         var parsedPeriod = Assert.Single(periods.Periods);
         Assert.Equal(periodId, parsedPeriod.Id);
         Assert.Equal(parsedPeriod.ResetAt, page.Samples.Select(sample => sample.ResetAt).Distinct().Single());
@@ -1978,16 +1968,16 @@ public sealed class GraphPlotControlTests
             periodId);
         using var client = new LoopbackStatusClient(handler);
 
-        var periodsResult = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
+        var periodsResult = await client.FetchHistoryPeriodsAsync("account-1", CancellationToken.None);
         var pageResult = await client.FetchHistoryPageAsync(
-            periodId,
+            accountId: "account-1", periodId: periodId,
             cancellationToken: CancellationToken.None);
 
         Assert.True(periodsResult.IsSuccess);
         Assert.True(pageResult.IsSuccess);
         var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
         var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
-        Assert.Equal(periods.PublishedPair, page.PublishedPair);
+        Assert.Matches("^[0-9a-f]{64}$", page.PublishedPair.ToString());
         var period = Assert.Single(periods.Periods) with { Samples = page.Samples };
         var endpoint = period.Samples[^1];
         var sol = endpoint.Models.Single(model => model.Name == "SOL");
@@ -2076,15 +2066,15 @@ public sealed class GraphPlotControlTests
         var periodId = periodElement.GetProperty("id").GetString()!;
         var handler = new SplitHistoryFixtureHandler(periodBody, historyBody, pair, periodId);
         using var client = new LoopbackStatusClient(handler);
-        var periodsResult = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
-        var pageResult = await client.FetchHistoryPageAsync(periodId, cancellationToken: CancellationToken.None);
+        var periodsResult = await client.FetchHistoryPeriodsAsync("account-1", CancellationToken.None);
+        var pageResult = await client.FetchHistoryPageAsync(accountId: "account-1", periodId: periodId, cancellationToken: CancellationToken.None);
         Assert.True(periodsResult.IsSuccess);
         Assert.True(pageResult.IsSuccess);
-        Assert.Equal(4, handler.RequestCount);
+        Assert.Equal(2, handler.RequestCount);
         var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
         var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
-        Assert.Equal(periods.PublishedPair, page.PublishedPair);
-        Assert.Equal(pair, periods.PublishedPair.ToString());
+        Assert.Matches("^[0-9a-f]{64}$", page.PublishedPair.ToString());
+        Assert.Matches("^[0-9a-f]{64}$", periods.PublishedPair.ToString());
         var parsedPeriod = Assert.Single(periods.Periods, candidate => candidate.Id == periodId);
         var period = parsedPeriod with { Samples = page.Samples };
         var samples = GraphWindowViewModel.BuildGraphSamples(period, period.EndAt);
@@ -2226,13 +2216,13 @@ public sealed class GraphPlotControlTests
         var periodId = periodElement.GetProperty("id").GetString()!;
         var handler = new SplitHistoryFixtureHandler(periodBody, historyBody, pair, periodId);
         using var client = new LoopbackStatusClient(handler);
-        var periodsResult = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
-        var pageResult = await client.FetchHistoryPageAsync(periodId, cancellationToken: CancellationToken.None);
+        var periodsResult = await client.FetchHistoryPeriodsAsync("account-1", CancellationToken.None);
+        var pageResult = await client.FetchHistoryPageAsync(accountId: "account-1", periodId: periodId, cancellationToken: CancellationToken.None);
         Assert.True(periodsResult.IsSuccess);
         Assert.True(pageResult.IsSuccess);
         var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
         var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
-        Assert.Equal(periods.PublishedPair, page.PublishedPair);
+        Assert.Matches("^[0-9a-f]{64}$", page.PublishedPair.ToString());
         var parsedPeriod = Assert.Single(periods.Periods, candidate => candidate.Id == periodId);
         var period = parsedPeriod with { Samples = page.Samples };
         var samples = GraphWindowViewModel.BuildGraphSamples(period, period.EndAt);
@@ -2560,18 +2550,18 @@ public sealed class GraphPlotControlTests
         var handler = new SplitHistoryFixtureHandler(periodsBody, historyBody, pair, periodId);
         using var client = new LoopbackStatusClient(handler);
 
-        var periodsResult = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
+        var periodsResult = await client.FetchHistoryPeriodsAsync("account-1", CancellationToken.None);
         var pageResult = await client.FetchHistoryPageAsync(
-            periodId,
+            accountId: "account-1", periodId: periodId,
             cancellationToken: CancellationToken.None);
 
         Assert.True(periodsResult.IsSuccess);
         Assert.True(pageResult.IsSuccess);
-        Assert.Equal(4, handler.RequestCount);
+        Assert.Equal(2, handler.RequestCount);
         var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
         var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
-        Assert.Equal(pair, periods.PublishedPair.ToString());
-        Assert.Equal(periods.PublishedPair, page.PublishedPair);
+        Assert.Matches("^[0-9a-f]{64}$", periods.PublishedPair.ToString());
+        Assert.Matches("^[0-9a-f]{64}$", page.PublishedPair.ToString());
         var parsedPeriod = Assert.Single(periods.Periods);
         var period = parsedPeriod with { Samples = page.Samples };
         var origin = period.StartAt;
@@ -2855,13 +2845,13 @@ public sealed class GraphPlotControlTests
         var handler = new DetailsFixtureHandler(
             Encoding.UTF8.GetBytes(root.GetProperty("details_response").GetRawText()));
         using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchDetailsAsync(CancellationToken.None);
+        var result = await WirePresentationFixture.Details(client, handler.Document);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(2, handler.RequestCount);
-        Assert.Equal("http://127.0.0.1:8787/v2/details", handler.LastRequest?.RequestUri?.AbsoluteUri);
+        Assert.Equal(3, handler.RequestCount);
+        Assert.All(handler.Gets, path => Assert.DoesNotContain("/v", path));
         var snapshot = Assert.IsType<ApiDetailsSnapshot>(result.Snapshot);
-        Assert.Equal("v2", snapshot.ApiVersion);
+        Assert.Equal("", snapshot.ApiVersion);
         Assert.Equal(6, snapshot.HistorySamples.Count);
         Assert.All(
             snapshot.HistorySamples,
@@ -5740,10 +5730,10 @@ public sealed class GraphPlotControlTests
     {
         var handler = new DetailsFixtureHandler(Encoding.UTF8.GetBytes(response.GetRawText()));
         using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchDetailsAsync(CancellationToken.None);
+        var result = await WirePresentationFixture.Details(client, handler.Document);
         Assert.True(result.IsSuccess);
         Assert.Null(result.Failure);
-        Assert.Equal(3, handler.RequestCount);
+        Assert.Equal(2 + response.GetProperty("history_periods").GetArrayLength() + (response.TryGetProperty("threads", out var rows) && rows.GetArrayLength() > 0 ? 1 : 0), handler.RequestCount);
         return Assert.IsType<ApiDetailsSnapshot>(result.Snapshot);
     }
 
@@ -5803,126 +5793,27 @@ public sealed class GraphPlotControlTests
         }
     }
 
-    private sealed class DetailsFixtureHandler(byte[] body) : HttpMessageHandler
+    private sealed class DetailsFixtureHandler : WireFacadeFixture
     {
-        private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
-        private readonly byte[] body = body.ToArray();
-        private readonly bool servesV2 = Encoding.UTF8.GetString(body).Contains(
-            "\"api_version\":\"v2\"",
-            StringComparison.Ordinal) || Encoding.UTF8.GetString(body).Contains(
-                "\"api_version\": \"v2\"",
-                StringComparison.Ordinal);
-
-        public int RequestCount { get; private set; }
-
-        public HttpRequestMessage? LastRequest { get; private set; }
-
-        public HttpStatusCode StatusCode { get; private set; }
-
-        public byte[] ReturnedBytes { get; private set; } = [];
-
-        public long? ContentLength { get; private set; }
-
-        public string? ContentType { get; private set; }
-
-        public bool NoStore { get; private set; }
-
-        public IReadOnlyList<string> PublishedPairValues { get; private set; } = [];
-
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
+        public JsonElement Document { get; }
+        public int RequestCount => Gets.Count;
+        public DetailsFixtureHandler(byte[] body)
         {
-            RequestCount++;
-            Assert.Equal(HttpMethod.Get, request.Method);
-            if (request.RequestUri?.AbsolutePath == "/v3/details")
-            {
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
-            }
-            if (request.RequestUri?.AbsolutePath == "/v2/details")
-            {
-                if (!servesV2)
-                {
-                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
-                }
-            }
-            else
-            {
-                Assert.Equal(DetailsEndpoint, request.RequestUri?.AbsoluteUri);
-            }
-            LastRequest = request;
-
-            var response = new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new ByteArrayContent(body),
-            };
-            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json")
-            {
-                CharSet = "utf-8",
-            };
-            response.Content.Headers.ContentLength = body.LongLength;
-            response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
-            response.Headers.TryAddWithoutValidation(
-                PublishedPairHeader,
-                CanonicalPublishedPair);
-
-            StatusCode = response.StatusCode;
-            ReturnedBytes = body;
-            ContentLength = response.Content.Headers.ContentLength;
-            ContentType = response.Content.Headers.ContentType?.ToString();
-            NoStore = response.Headers.CacheControl?.NoStore == true;
-            PublishedPairValues = response.Headers
-                .GetValues(PublishedPairHeader)
-                .ToArray();
-            return Task.FromResult(response);
+            using var parsed = JsonDocument.Parse(body); Document = parsed.RootElement.Clone();
+            Rows = target => target.StartsWith("/state?", StringComparison.Ordinal) ? [new(["main"], "main", WirePresentationFixture.MainRecord(Document))]
+                : target.StartsWith("/history/periods?", StringComparison.Ordinal) ? WirePresentationFixture.Periods(Document)
+                : target.StartsWith("/threads?", StringComparison.Ordinal) ? WirePresentationFixture.Threads(Document)
+                : WirePresentationFixture.History(Document, Uri.UnescapeDataString(target.Split("period=")[1].Split('&')[0]));
         }
     }
-
-    private sealed class SplitHistoryFixtureHandler(
-        byte[] periodsBody,
-        byte[] historyBody,
-        string pair,
-        string periodId) : HttpMessageHandler
+    private sealed class SplitHistoryFixtureHandler : WireFacadeFixture
     {
-        private readonly byte[] periodsBody = periodsBody.ToArray();
-        private readonly byte[] historyBody = historyBody.ToArray();
-
-        public int RequestCount { get; private set; }
-
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
+        public int RequestCount => Gets.Count;
+        public SplitHistoryFixtureHandler(byte[] periodsBody, byte[] historyBody, string pair, string periodId)
         {
-            RequestCount++;
-            Assert.Equal(HttpMethod.Get, request.Method);
-            var path = request.RequestUri?.AbsolutePath;
-            // This fixture is a v3 server. Each newer directory must return
-            // exact 404 so the real compatibility path can reach its body.
-            if (path is "/v5/history/periods" or "/v4/history/periods")
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
-            var body = path switch
-            {
-                "/v3/history/periods" => periodsBody,
-                "/v3/history" => historyBody,
-                _ => throw new Xunit.Sdk.XunitException($"Unexpected fixture request: {request.RequestUri}"),
-            };
-            if (path == "/v3/history")
-            {
-                Assert.Equal($"?period={Uri.EscapeDataString(periodId)}", request.RequestUri?.Query);
-            }
-
-            var response = new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new ByteArrayContent(body),
-            };
-            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json")
-            {
-                CharSet = "utf-8",
-            };
-            response.Content.Headers.ContentLength = body.LongLength;
-            response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
-            response.Headers.TryAddWithoutValidation(PublishedPairHeader, pair);
-            return Task.FromResult(response);
+            using var periods = JsonDocument.Parse(periodsBody); var p = periods.RootElement.Clone();
+            using var history = JsonDocument.Parse(historyBody); var h = history.RootElement.Clone();
+            Rows = target => target.StartsWith("/history/periods?", StringComparison.Ordinal) ? WirePresentationFixture.Periods(p) : WirePresentationFixture.History(h, periodId);
         }
     }
 

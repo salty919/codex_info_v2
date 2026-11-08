@@ -6,9 +6,11 @@ shopt -s nullglob
 # isolated below one temporary profile; no GitHub workflow or installed
 # service is touched.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-UI_BINARY="$ROOT_DIR/target/release/codex_info"
-RECORDER_BINARY="$ROOT_DIR/target/release/codex_info_recorder"
-REST_BINARY="$ROOT_DIR/target/release/codex_info_rest"
+E2E_BIN_DIR="${CODEX_INFO_E2E_BIN_DIR:-$ROOT_DIR/target/release}"
+[[ "$E2E_BIN_DIR" == /* ]] || { echo 'cli-contract-e2e: absolute candidate bin directory required' >&2; exit 1; }
+UI_BINARY="$E2E_BIN_DIR/codex_info"
+RECORDER_BINARY="$E2E_BIN_DIR/codex_info_recorder"
+REST_BINARY="$E2E_BIN_DIR/codex_info_rest"
 ROOT_VERSION="$(awk '
     /^\[package\]$/ { in_package=1; next }
     /^\[/ { in_package=0 }
@@ -30,19 +32,17 @@ fail() {
     exit 1
 }
 
-# A listening health endpoint is not a ready account snapshot. Use the split
-# current resource for readiness so unrelated legacy history compatibility
-# cannot hide a valid current quota/model snapshot.
+# One qualified receiver per scoped test profile. It waits for actual changes,
+# not timer-driven HTTP snapshot polls. Each underlying request retains 3s/1s.
+wire_snapshot() {
+    local port="$1" resource="$2" output="$3"; shift 3
+    python3 "$ROOT_DIR/tests/fixtures/wire_e2e_snapshot.py" --probe "$WIRE_PROBE" \
+        --port "$port" --cache "$tmp_root/wire-receipts" --resource "$resource" --output "$output" "$@"
+}
 wait_for_ready_current() {
-    local port="$1" minimum_model_total="$2" current_body='' current_status=''
-    local current_prefix="$tmp_root/current-last" current_reason="$tmp_root/current-last.reason"
-    for _ in $(seq 1 40); do
-        capture_http_response "$current_prefix" "http://127.0.0.1:$port/v4/current"
-        current_status="$(cat "$current_prefix.status" 2>/dev/null || true)"
-        current_body="$(cat "$current_prefix.body" 2>/dev/null || true)"
-        if [[ "$current_status" != 200 ]]; then
-            printf 'current HTTP status was %s\n' "$current_status" >"$current_reason"
-        elif python3 - "$current_body" "$minimum_model_total" "$current_reason" <<'PY_CURRENT' >/dev/null 2>&1
+    local port="$1" minimum_model_total="$2" current_body='' current_reason="$tmp_root/current-last.reason"
+    current_body="$(wire_snapshot "$port" current "$tmp_root/current-last" --min-total "$minimum_model_total")" || return 1
+    python3 - "$current_body" "$minimum_model_total" "$current_reason" <<'PY_CURRENT' || return 1
 import json
 import math
 import sys
@@ -63,13 +63,13 @@ def finite_nonnegative(value):
 try:
     current = json.loads(sys.argv[1])
     expected = {
-        "api_version", "state", "observed_at", "authenticated", "plan_label",
-        "quota", "models", "active_thread_count", "open_session_thread_count",
+        "acquisition_state", "selection", "thread_summary", "observed_at", "authenticated", "plan_label",
+        "quota", "models",
         "models_status",
     }
     if not isinstance(current, dict) or set(current) != expected:
         reject("current schema is unknown")
-    if current["api_version"] != "v4" or current["state"] != "ready" or current["authenticated"] is not True:
+    if current["acquisition_state"] != "ready" or current["authenticated"] is not True:
         reject("current is not ready/authenticated")
     if not uint(current["observed_at"]) or current["observed_at"] <= 0:
         reject("current observed_at is invalid")
@@ -86,10 +86,16 @@ try:
             or not uint(quota["window_seconds"]) or quota["window_seconds"] <= 0
             or type(quota["monthly"]) is not bool):
         reject("current quota values are invalid")
-    if (not uint(current["active_thread_count"])
-            or not uint(current["open_session_thread_count"])
-            or current["active_thread_count"] > current["open_session_thread_count"]):
-        reject("current thread counts are invalid")
+    summary = current["thread_summary"]
+    if summary is not None:
+        if (not isinstance(summary, dict) or set(summary) != {"open_count", "running_count", "unknown_activity_count", "by_model"}
+                or any(not uint(summary[key]) for key in ("open_count", "running_count", "unknown_activity_count"))
+                or summary["running_count"] + summary["unknown_activity_count"] > summary["open_count"]
+                or sum(row["open_count"] for row in summary["by_model"]) != summary["open_count"]):
+            reject("current thread summary is invalid")
+    selection = current["selection"]
+    if not isinstance(selection, dict) or set(selection) != {"account_id", "login_id", "is_current"}:
+        reject("confirmed current selection is missing")
     if current["models_status"] not in {"complete", "partial", "unavailable"}:
         reject("current models_status is invalid")
     if not isinstance(current["models"], list):
@@ -99,7 +105,7 @@ try:
         "cache_write_input_tokens", "output_tokens", "estimated_cost",
     }
     estimated_cost_keys = {
-        "price_version", "ordinary_input_dollars", "cached_input_dollars",
+        "price_revision", "ordinary_input_dollars", "cached_input_dollars",
         "cache_write_input_dollars", "output_dollars", "total_dollars",
     }
     for model in current["models"]:
@@ -121,66 +127,27 @@ try:
         cost = model["estimated_cost"]
         if cost is not None:
             if (not isinstance(cost, dict) or set(cost) != estimated_cost_keys
-                    or not isinstance(cost["price_version"], str)
-                    or any(not finite_nonnegative(cost[key]) for key in estimated_cost_keys - {"price_version"})):
+                    or not isinstance(cost["price_revision"], str)
+                    or any(not finite_nonnegative(cost[key]) for key in estimated_cost_keys - {"price_revision"})):
                 reject("current estimated_cost is invalid")
     model_total = sum(model["total_tokens"] for model in current["models"])
     if model_total < int(sys.argv[2]):
         reject("current model total has not reached the owned append")
     with open(reason_path, "w", encoding="utf-8") as handle:
-        handle.write("validated v4 current observation\n")
+        handle.write("validated Main observation\n")
 except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
     with open(reason_path, "w", encoding="utf-8") as handle:
-        handle.write("v4 current validation failed: " + str(error) + "\n")
+        handle.write("Main validation failed: " + str(error) + "\n")
     raise SystemExit(1)
 PY_CURRENT
-        then
-            printf '%s\n' "$current_body"
-            return 0
-        fi
-        sleep 0.1
-    done
-    echo "REST current did not reach model total $minimum_model_total (HTTP $current_status): $(cat "$current_reason" 2>/dev/null || true)" >&2
-    return 1
+    printf '%s\n' "$current_body"
 }
-
-capture_http_response() {
-    local prefix="$1" url="$2" status=''
-    : >"$prefix.headers"
-    : >"$prefix.body"
-    status="$(curl --silent --max-time 1 --dump-header "$prefix.headers" \
-        --output "$prefix.body" --write-out '%{http_code}' "$url" 2>/dev/null || true)"
-    printf '%s\n' "$status" >"$prefix.status"
-}
-
 wait_for_history_snapshot() {
-    local port="$1" expected_reset="$2" phase="$3" expectation="$4"
-    local expected_total="$5" period_id="" last_reason="$tmp_root/history-last.reason"
-    local directory_prefix="$tmp_root/history-last-directory"
-    local page_prefix="$tmp_root/history-last-page"
-    local directory_status='' page_status='' directory_result='' pair=''
-    local page_url='' output_body='' discover_period=0
-    if (($# >= 6)); then
-        period_id="$6"
-    fi
+    local port="$1" expected_reset="$2" phase="$3" expectation="$4" expected_total="$5" period_id="${6:-}"
+    local last_reason="$tmp_root/history-last.reason" directory_prefix="$tmp_root/history-last-directory" page_prefix="$tmp_root/history-$phase"
     if [[ -z "$period_id" ]]; then
-        discover_period=1
-    fi
-
-    for _ in $(seq 1 40); do
-        directory_result=''
-        pair=''
-        if ((discover_period == 1)); then
-            capture_http_response "$directory_prefix" \
-                "http://127.0.0.1:$port/v5/history/periods"
-            directory_status="$(cat "$directory_prefix.status" 2>/dev/null || true)"
-            if [[ "$directory_status" != 200 ]]; then
-                printf 'directory HTTP status was %s\n' "$directory_status" >"$last_reason"
-                sleep 0.1
-                continue
-            fi
-            directory_result="$(python3 - "$directory_prefix.body" "$directory_prefix.headers" \
-                "$expected_reset" "$last_reason" 2>/dev/null <<'PY_HISTORY_DIRECTORY' || true
+        wire_snapshot "$port" periods "$directory_prefix" --reset "$expected_reset" >/dev/null || return 1
+        period_id="$(python3 - "$directory_prefix.json" "$directory_prefix.meta.json" "$expected_reset" "$last_reason" <<'PY_HISTORY_DIRECTORY'
 import json
 import re
 import sys
@@ -200,21 +167,19 @@ try:
     with open(body_path, encoding="utf-8") as handle:
         directory = json.load(handle)
     if not isinstance(directory, dict) or set(directory) != {
-        "api_version", "history_periods", "next_cursor"
-    } or directory["api_version"] != "v5":
-        reject("v5 history directory schema is invalid")
-    if directory["next_cursor"] is not None:
-        reject("v5 history directory unexpectedly has an unread page")
-    periods = directory["history_periods"]
+        "periods"
+    }:
+        reject("period directory schema is invalid")
+    periods = directory["periods"]
     if not isinstance(periods, list):
-        reject("v5 history directory periods are invalid")
+        reject("period directory periods are invalid")
     expected_reset = int(reset_text)
     matching = []
     for period in periods:
         if not isinstance(period, dict) or set(period) != {
             "id", "start_at", "end_at", "reset_at", "label", "current", "origin_at"
         }:
-            reject("v5 history period schema is invalid")
+            reject("period period schema is invalid")
         if (not isinstance(period["id"], str) or not 1 <= len(period["id"]) <= 512
                 or any(unicodedata.category(c) in {"Cc", "Cs"}
                        or ord(c) in {0x061C, 0x200E, 0x200F, 0x202A, 0x202B,
@@ -224,47 +189,32 @@ try:
                 or not uint(period["reset_at"]) or not isinstance(period["label"], str)
                 or type(period["current"]) is not bool
                 or (period["origin_at"] is not None and not uint(period["origin_at"]))):
-            reject("v5 history period values are invalid")
+            reject("period period values are invalid")
         if period["reset_at"] == expected_reset:
             matching.append(period)
     if len(matching) != 1 or matching[0]["current"] is not True:
-        reject("v5 directory did not contain one current period for the exact quota reset")
+        reject("period directory did not contain one current period for the exact quota reset")
 
-    with open(headers_path, "rb") as handle:
-        raw_headers = handle.read().splitlines()
-    pairs = []
-    for raw in raw_headers:
-        name, separator, value = raw.partition(b":")
-        if separator and name.strip().lower() == b"codex-info-published-pair":
-            pairs.append(value.strip().decode("ascii", "strict"))
-    if len(pairs) != 1 or not re.fullmatch(r"v1:[0-9a-f]{64}", pairs[0]):
-        reject("v5 directory published-pair header is missing or malformed")
+    metadata = json.load(open(headers_path, encoding="utf-8"))
+    if (set(metadata) != {"view_key", "image", "complete"} or metadata["complete"] is not True
+            or metadata["view_key"][0] != "/history/periods" or not metadata["image"]):
+        reject("period directory image is not qualified")
     with open(reason_path, "w", encoding="utf-8") as handle:
-        handle.write("waiting for an exact v5 history period\n")
-    print(matching[0]["id"] + "\t" + pairs[0])
+        handle.write("validated complete period directory\n")
+    print(matching[0]["id"])
 except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
-    reject("v5 history directory validation failed: " + str(error))
+    reject("period directory validation failed: " + str(error))
 PY_HISTORY_DIRECTORY
-)"
-            if [[ -z "$directory_result" ]]; then
-                sleep 0.1
-                continue
-            fi
-            IFS=$'\t' read -r period_id pair <<<"$directory_result"
-        fi
-
-        encoded_period_id="$(python3 -c 'import sys; from urllib.parse import quote; print(quote(sys.argv[1], safe=""))' "$period_id")"
-        page_url="http://127.0.0.1:$port/v3/history?period=$encoded_period_id"
-        capture_http_response "$page_prefix" "$page_url"
-        page_status="$(cat "$page_prefix.status" 2>/dev/null || true)"
-        if [[ "$page_status" != 200 ]]; then
-            printf 'history page HTTP status was %s\n' "$page_status" >"$last_reason"
-            sleep 0.1
-            continue
-        fi
-        if python3 - "$page_prefix.body" "$page_prefix.headers" "$expected_reset" \
-            "$expectation" "$expected_total" "$pair" "$last_reason" \
-            <<'PY_HISTORY_PAGE' >/dev/null 2>&1
+)" || return 1
+        printf '%s\n' "$period_id" >"$tmp_root/history-period-id.txt"
+    fi
+    local conditions=()
+    case "$expectation" in
+        confirmed) conditions+=(--min-total "$expected_total" --sample-source confirmed) ;;
+        recorded) conditions+=(--min-total "$expected_total" --sample-source legacy-unknown) ;;
+    esac
+    wire_snapshot "$port" history "$page_prefix" --period "$period_id" "${conditions[@]}" >/dev/null || return 1
+    python3 - "$page_prefix.json" "$page_prefix.meta.json" "$expected_reset" "$expectation" "$expected_total" '' "$last_reason" <<'PY_HISTORY_PAGE' || return 1
 import json
 import math
 import re
@@ -287,18 +237,12 @@ try:
     with open(body_path, encoding="utf-8") as handle:
         page = json.load(handle)
     if not isinstance(page, dict) or set(page) != {
-        "api_version", "history_samples", "history_gaps", "next_cursor", "resume_cursor"
-    } or page["api_version"] != "v3":
-        reject("v3 history page schema is invalid")
-    if page["next_cursor"] is not None:
-        reject("v3 history page unexpectedly has an unread page")
-    samples = page["history_samples"]
-    if not isinstance(samples, list) or not isinstance(page["history_gaps"], list):
-        reject("v3 history collections are invalid")
-    if samples and (not isinstance(page["resume_cursor"], str) or not page["resume_cursor"]):
-        reject("v3 history resume cursor is missing for a non-empty page")
-    if not samples and page["resume_cursor"] is not None:
-        reject("empty v3 history page has a resume cursor")
+        "period_id", "samples", "gaps", "local_usage"
+    }:
+        reject("history page schema is invalid")
+    samples = page["samples"]
+    if not isinstance(samples, list) or not isinstance(page["gaps"], list) or not isinstance(page["local_usage"], list):
+        reject("history collections are invalid")
     expected_reset = int(reset_text)
     expected_total = int(total_text) if total_text else None
     expected_source = {"confirmed": "confirmed", "recorded": "legacy-unknown"}.get(expectation)
@@ -311,20 +255,20 @@ try:
             "models", "models_complete", "model_source",
         }
         if not isinstance(sample, dict) or set(sample) != sample_keys:
-            reject("v3 history sample schema is invalid")
+            reject("history sample schema is invalid")
         if (not uint(sample["timestamp"]) or not uint(sample["reset_at"])
                 or sample["reset_at"] != expected_reset):
-            reject("v3 history sample does not belong to the exact requested reset")
+            reject("history sample does not belong to the exact requested reset")
         remaining = sample["remaining_percent"]
         if remaining is not None and not finite_percent(remaining):
-            reject("v3 history quota value is invalid")
+            reject("history quota value is invalid")
         if remaining is not None:
             saw_quota = True
         if (sample["task_active_since_previous"] is not None
                 and type(sample["task_active_since_previous"]) is not bool):
-            reject("v3 history task state is invalid")
+            reject("history task state is invalid")
         if type(sample["models_complete"]) is not bool or not isinstance(sample["model_source"], str):
-            reject("v3 history model metadata is invalid")
+            reject("history model metadata is invalid")
         models = sample["models"]
         if models is None:
             if sample["models_complete"] or sample["model_source"] not in {
@@ -336,13 +280,13 @@ try:
                 saw_unavailable = True
             continue
         if not isinstance(models, list):
-            reject("v3 history models are invalid")
+            reject("history models are invalid")
         for model in models:
             if not isinstance(model, dict) or not {"model", "total_tokens"}.issubset(model):
-                reject("v3 history model schema is invalid")
+                reject("history model schema is invalid")
             if (not isinstance(model["model"], str) or not model["model"]
                     or not uint(model["total_tokens"])):
-                reject("v3 history model value is invalid")
+                reject("history model value is invalid")
             if (expectation in {"confirmed", "recorded"}
                     and sample["model_source"] == expected_source
                     and (expectation != "recorded" or sample["models_complete"] is False)
@@ -351,81 +295,43 @@ try:
                 saw_expected_model = True
 
     if not samples:
-        reject("v3 history page has no retained observation for the requested reset")
+        reject("history page has no retained observation for the requested reset")
     if expectation == "unavailable" and (not saw_quota or not saw_unavailable):
         reject("pre-append history did not retain quota with nullable unavailable model data")
     if expectation in {"confirmed", "recorded"} and not saw_expected_model:
-        reject("v3 history did not expose the exact " + expected_source + " gpt-5.6-luna total")
+        reject("history did not expose the exact " + expected_source + " gpt-5.6-luna total")
 
-    with open(headers_path, "rb") as handle:
-        raw_headers = handle.read().splitlines()
-    pairs = []
-    for raw in raw_headers:
-        name, separator, value = raw.partition(b":")
-        if separator and name.strip().lower() == b"codex-info-published-pair":
-            pairs.append(value.strip().decode("ascii", "strict"))
-    if len(pairs) != 1 or not re.fullmatch(r"v1:[0-9a-f]{64}", pairs[0]):
-        reject("v3 history published-pair header is missing or malformed")
-    if expected_pair and pairs[0] != expected_pair:
-        reject("v5 directory and v3 history published pairs changed during acquisition")
+    metadata = json.load(open(headers_path, encoding="utf-8"))
+    if (set(metadata) != {"view_key", "image", "complete"} or metadata["complete"] is not True
+            or metadata["view_key"][0] != "/history" or not metadata["image"]
+            or metadata["view_key"][1]["period"] != page["period_id"]):
+        reject("history image/period is not qualified")
     with open(reason_path, "w", encoding="utf-8") as handle:
-        handle.write("validated v3 history observation\n")
+        handle.write("validated complete history observation\n")
 except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
-    reject("v3 history validation failed: " + str(error))
+    reject("history validation failed: " + str(error))
 PY_HISTORY_PAGE
-        then
-            cp -- "$page_prefix.body" "$tmp_root/history-$phase.json"
-            cp -- "$page_prefix.headers" "$tmp_root/history-$phase.headers"
-            if ((discover_period == 1)); then
-                printf '%s\n' "$period_id" >"$tmp_root/history-period-id.txt"
-            fi
-            output_body="$(cat "$page_prefix.body")"
-            printf '%s\n' "$output_body"
-            return 0
-        fi
-        sleep 0.1
-    done
-    echo "REST v3 history did not satisfy $expectation for reset $expected_reset: $(cat "$last_reason" 2>/dev/null || true)" >&2
-    return 1
-}
-
-assert_v1_history_unavailable() {
-    local port="$1" response='' status='' body='' prefix="$tmp_root/v1-last"
-    capture_http_response "$prefix" "http://127.0.0.1:$port/v1/details"
-    response="$(cat "$prefix.body"; printf '\n%s' "$(cat "$prefix.status")")"
-    status="${response##*$'\n'}"
-    body="${response%$'\n'*}"
-    if [[ "$status" != '503' ]]; then
-        printf 'v1 details returned HTTP %s; expected 503\n' "$status" >"$prefix.reason"
-        fail "v1 details should reject unrepresentable history with 503 (got $status)"
-    fi
-    if python3 - "$body" <<'PY_V1_UNAVAILABLE' >/dev/null 2>&1
-import json
-import sys
-
-body = json.loads(sys.argv[1])
-if body != {"api_version": "v1", "error": "history_unavailable"}:
-    raise SystemExit("v1 history error wire changed")
-PY_V1_UNAVAILABLE
-    then
-        printf 'validated v1 history_unavailable response\n' >"$prefix.reason"
-    else
-        printf 'v1 details body did not match history_unavailable\n' >"$prefix.reason"
-        fail 'v1 details returned an unexpected error body'
-    fi
+    cat "$page_prefix.json"
 }
 
 [[ "$ROOT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
     || fail 'root Cargo.toml package version is unavailable'
 
-for command in curl python3 rg sha256sum sqlite3 ss stat; do
+for command in python3 rg sha256sum sqlite3 ss stat; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
 if [[ ! -x "$UI_BINARY" || ! -x "$RECORDER_BINARY" || ! -x "$REST_BINARY" ]]; then
+    [[ -z "${CODEX_INFO_E2E_BIN_DIR:-}" ]] || fail 'explicit candidate binaries are missing'
     command -v cargo >/dev/null || fail 'cargo is required to build missing release binaries'
     (cd -- "$ROOT_DIR" && cargo build --release --locked \
         -p codex_info -p codex-info-recorder -p codex-info-rest)
 fi
+WIRE_PROBE="${CODEX_INFO_E2E_PROBE:-$E2E_BIN_DIR/examples/wire_api_probe}"
+if [[ ! -x "$WIRE_PROBE" ]]; then
+    [[ -z "${CODEX_INFO_E2E_BIN_DIR:-}" ]] || fail 'explicit candidate wire probe is missing'
+    (cd -- "$ROOT_DIR" && cargo build --release --locked -p codex_info --example wire_api_probe)
+fi
+[[ -f "$WIRE_PROBE" && -x "$WIRE_PROBE" && ! -L "$WIRE_PROBE" ]] || fail 'wire probe is not an executable regular file'
 for binary in "$UI_BINARY" "$RECORDER_BINARY" "$REST_BINARY"; do
     [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] \
         || fail "release binary is not an executable regular file: $binary"
@@ -652,36 +558,14 @@ env "${common_env[@]}" "$REST_BINARY" --port "$port" \
     >"$tmp_root/rest.log" 2>&1 &
 rest_pid="$!"
 wait_for_process_matches "$rest_pid" "$REST_BINARY" 'initial REST'
-for _ in $(seq 1 80); do
-    if curl --fail --silent --max-time 1 \
-        "http://127.0.0.1:$port/v1/health" >/dev/null 2>&1; then
-        break
-    fi
-    sleep 0.1
-done
-curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health" >/dev/null \
-    || fail 'REST health did not become ready'
-health_body="$(curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health")"
-current_body="$(wait_for_ready_current "$port" 0)" \
-    || fail 'initial REST current did not expose a ready authenticated quota'
-python3 - "$health_body" "$current_body" "$ROOT_VERSION" <<'PY'
-import json
-import sys
-
-health = json.loads(sys.argv[1])
-if set(health) != {"api_version", "service", "product_version"}:
-    raise SystemExit("health wire key set changed")
-if (health["api_version"] != "v1" or health["service"] != "codex-info"
-        or health["product_version"] != sys.argv[3]):
-    raise SystemExit("health wire identity changed")
-current = json.loads(sys.argv[2])
-expected = {
-    "api_version", "state", "observed_at", "authenticated", "plan_label", "quota",
-    "models", "active_thread_count", "open_session_thread_count", "models_status",
-}
-if set(current) != expected or current["api_version"] != "v4":
-    raise SystemExit("current wire key set or identity changed")
-if current["models_status"] != "unavailable" or current["models"] != []:
+runtime_body="$(wire_snapshot "$port" runtime "$tmp_root/runtime-start")" || fail 'REST runtime did not become ready'
+current_body="$(wait_for_ready_current "$port" 0)" || fail 'initial Main did not expose a ready authenticated quota'
+python3 - "$runtime_body" "$current_body" "$ROOT_VERSION" <<'PY'
+import json, sys
+runtime=json.loads(sys.argv[1]);current=json.loads(sys.argv[2])
+if set(runtime)!={"rest_product_version","recorder_product_version","recorder_status"} or runtime["rest_product_version"]!=sys.argv[3]:
+    raise SystemExit("REST runtime identity changed")
+if current["models_status"]!="unavailable" or current["models"]!=[]:
     raise SystemExit("unowned pre-boundary Session counters became current model usage")
 PY
 ss -ltnH "sport = :$port" | rg -q "127[.]0[.]0[.]1:$port" \
@@ -797,11 +681,11 @@ print(current["quota"]["reset_at"])
 PY_CURRENT_RESET
 )" || fail 'initial current quota reset could not be read'
 wait_for_history_snapshot "$port" "$history_reset_at" before-append unavailable 0 '' \
-    >/dev/null || fail 'pre-append v3 history did not retain the nullable unavailable observation'
+    >/dev/null || fail 'pre-append history did not retain the nullable unavailable observation'
 history_period_id="$(cat "$tmp_root/history-period-id.txt" 2>/dev/null || true)"
 [[ -n "$history_period_id" ]] \
     || fail 'v5 directory did not select a public current period id'
-assert_v1_history_unavailable "$port"
+
 
 pre_append_ranges="$(sqlite3 "$database" 'SELECT COUNT(*) FROM session_ranges;')"
 [[ ! -e "$data_root/history/usage_history.sqlite3" ]] \
@@ -951,10 +835,10 @@ printf '%s\n' "$current_before" >"$current_before_file"
 # Public recorded groups and original confirmed observations have separate identities.
 wait_for_history_snapshot "$port" "$history_reset_at" after-append recorded 10 \
     "$history_period_id" >/dev/null \
-    || fail 'public v3 history did not expose the exact recorded model total 10'
+    || fail 'public history did not expose the exact recorded model total 10'
 wait_for_history_snapshot "$port" "$history_reset_at" after-append-raw confirmed 10 \
     "$history_reset_at" >/dev/null \
-    || fail 'raw v3 history did not preserve the exact confirmed model total 10'
+    || fail 'raw history did not preserve the exact confirmed model total 10'
 
 # Current quota/model values and nullable history are independent API
 # resources. Compare each to the recorder's committed SQLite facts without
@@ -1040,36 +924,22 @@ rest_pid="$!"
 wait_for_process_matches "$rest_pid" "$REST_BINARY" 'restarted REST'
 [[ "$rest_pid" != "$recorder_pid" && "$rest_pid" != "$rest_pid_before" ]] \
     || fail 'REST restart did not create a distinct process'
-for _ in $(seq 1 80); do
-    if curl --fail --silent --max-time 1 \
-        "http://127.0.0.1:$port/v1/health" >/dev/null 2>&1; then
-        break
-    fi
-    sleep 0.1
-done
-restart_health_body="$(curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health")" \
-    || fail 'REST did not recover after restart'
-python3 - "$restart_health_body" "$ROOT_VERSION" <<'PY'
-import json
-import sys
-
-health = json.loads(sys.argv[1])
-if set(health) != {"api_version", "service", "product_version"}:
-    raise SystemExit("restart health wire key set changed")
-if (health["api_version"], health["service"], health["product_version"]) != (
-    "v1", "codex-info", sys.argv[2]
-):
-    raise SystemExit("restart health wire identity changed")
+restart_runtime_body="$(wire_snapshot "$port" runtime "$tmp_root/runtime-restart")" || fail 'REST did not recover after restart'
+python3 - "$restart_runtime_body" "$ROOT_VERSION" <<'PY'
+import json,sys
+runtime=json.loads(sys.argv[1])
+if set(runtime)!={"rest_product_version","recorder_product_version","recorder_status"} or runtime["rest_product_version"]!=sys.argv[2]:
+    raise SystemExit("restart runtime identity changed")
 PY
 current_after="$(wait_for_ready_current "$port" "$current_models")" \
     || fail 'restarted REST current did not expose the committed model generation'
 # Public recorded groups and original confirmed observations have separate identities.
 wait_for_history_snapshot "$port" "$history_reset_at" after-restart recorded 20 \
     "$history_period_id" >/dev/null \
-    || fail 'public v3 history did not expose the exact recorded model total 20'
+    || fail 'public history did not expose the exact recorded model total 20'
 wait_for_history_snapshot "$port" "$history_reset_at" after-restart-raw confirmed 20 \
     "$history_reset_at" >/dev/null \
-    || fail 'raw v3 history did not preserve the exact confirmed model total 20'
+    || fail 'raw history did not preserve the exact confirmed model total 20'
 python3 - "$current_before_file" "$current_after" "$database" <<'PY'
 import json
 import sqlite3

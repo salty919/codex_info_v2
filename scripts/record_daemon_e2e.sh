@@ -26,14 +26,17 @@ fail() {
     exit 1
 }
 
-for command in awk curl date python3 rg sed sqlite3 ss stat tail tr xprop xwininfo xdpyinfo; do
+for command in awk date python3 rg sed sqlite3 ss stat tail tr xprop xwininfo xdpyinfo; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
 
-RECORDER_BINARY="$ROOT_DIR/target/release/codex_info_recorder"
-REST_BINARY="$ROOT_DIR/target/release/codex_info_rest"
-UI_BINARY="$ROOT_DIR/target/release/codex_info"
-for binary in "$RECORDER_BINARY" "$REST_BINARY" "$UI_BINARY"; do
+E2E_BIN_DIR="${CODEX_INFO_E2E_BIN_DIR:-$ROOT_DIR/target/release}"
+[[ "$E2E_BIN_DIR" == /* ]] || fail 'absolute candidate bin directory required'
+RECORDER_BINARY="$E2E_BIN_DIR/codex_info_recorder"
+REST_BINARY="$E2E_BIN_DIR/codex_info_rest"
+UI_BINARY="$E2E_BIN_DIR/codex_info"
+WIRE_PROBE="$E2E_BIN_DIR/examples/wire_api_probe"
+for binary in "$RECORDER_BINARY" "$REST_BINARY" "$UI_BINARY" "$WIRE_PROBE"; do
     [[ -f "$binary" && -x "$binary" ]] || fail "build executable first: $binary"
 done
 
@@ -285,7 +288,7 @@ wait_for_quota_observation() {
 }
 
 read_account_activation() {
-    python3 - "$case_data/history/account_profile_v1.json" <<'PY'
+    python3 - "$case_data/history/account_profile_v1.json" <<'PY' || return 1
 import json
 import sys
 
@@ -479,50 +482,61 @@ wait_for_recorder_generation() {
     return 1
 }
 
-health_body() {
-    curl --fail --silent --show-error --max-time 1 \
-        "http://127.0.0.1:$case_port/v1/health"
+# The same qualified receiver owns all test resource images. Only actual
+# change notifications release a pending observation; there is no HTTP poll.
+wire_snapshot() {
+    local resource="$1" output="$2"; shift 2
+    python3 "$ROOT_DIR/tests/fixtures/wire_e2e_snapshot.py" --probe "$WIRE_PROBE" \
+        --port "$case_port" --cache "$case_root/wire-receipts" \
+        --resource "$resource" --output "$output" "$@"
+}
+
+runtime_body() {
+    wire_snapshot runtime "$case_root/runtime-last"
 }
 
 wait_for_rest() {
     for _ in $(seq 1 60); do
         if process_matches_scope "$rest_pid" rest \
-            && [[ "$(listener_count "$case_port")" == 1 ]] \
-            && health_body >/dev/null 2>&1; then
-            return 0
+            && [[ "$(listener_count "$case_port")" == 1 ]]; then
+            runtime_body >/dev/null 2>&1
+            return $?
         fi
         sleep 0.25
     done
     return 1
 }
 
-assert_health() {
+assert_runtime() {
     local body="$1"
-    python3 - "$body" "$ROOT_VERSION" <<'PY'
+    python3 - "$body" "$ROOT_VERSION" <<'PY_RUNTIME'
 import json
 import sys
 
 document = json.loads(sys.argv[1])
-root_version = sys.argv[2]
-if set(document) != {"api_version", "service", "product_version"}:
-    raise SystemExit("REST health key set changed")
-if (document["api_version"] != "v1" or document["service"] != "codex-info"
-        or document["product_version"] != root_version):
-    raise SystemExit("REST health identity changed")
-if not isinstance(document["product_version"], str) or not document["product_version"]:
-    raise SystemExit("REST health product version is empty")
-PY
+if set(document) != {"rest_product_version", "recorder_product_version", "recorder_status"}:
+    raise SystemExit("runtime key set changed")
+if document["rest_product_version"] != sys.argv[2]:
+    raise SystemExit("runtime product version changed")
+if document["recorder_status"] not in {"available", "mismatch", "unavailable"}:
+    raise SystemExit("runtime recorder status is invalid")
+if document["recorder_status"] in {"available", "mismatch"}:
+    if not isinstance(document["recorder_product_version"], str) or not document["recorder_product_version"]:
+        raise SystemExit("available recorder version is empty")
+elif document["recorder_product_version"] is not None:
+    raise SystemExit("unavailable recorder version was fabricated")
+PY_RUNTIME
 }
 
 assert_current_file() {
-    local body_path="$1" headers_path="$2" expected_reset="$3" expected_total="$4"
-    python3 - "$body_path" "$headers_path" "$expected_reset" "$expected_total" <<'PY'
+    local body_path="$1" metadata_path="$2" expected_reset="$3" expected_total="$4"
+    python3 - "$body_path" "$metadata_path" "$expected_reset" "$expected_total" <<'PY' || return 1
 import json
 import math
 import re
 import sys
 
-body_path, headers_path, reset_text, total_text = sys.argv[1:]
+body_path, metadata_path, reset_text, total_text = sys.argv[1:]
 
 def reject(reason):
     raise ValueError(reason)
@@ -534,25 +548,30 @@ try:
     with open(body_path, encoding="utf-8") as handle:
         current = json.load(handle)
     expected_keys = {
-        "api_version", "state", "observed_at", "authenticated", "plan_label",
-        "quota", "models", "active_thread_count", "open_session_thread_count",
-        "models_status",
+        "acquisition_state", "selection", "thread_summary", "observed_at", "authenticated", "plan_label",
+        "quota", "models", "models_status",
     }
     if not isinstance(current, dict) or set(current) != expected_keys:
-        reject("v4 current schema is invalid")
-    if (current["api_version"] != "v4" or current["state"] != "ready"
-            or current["authenticated"] is not True):
-        reject("v4 current is not ready and authenticated")
+        reject("Main schema is invalid")
+    if (current["acquisition_state"] != "ready" or current["authenticated"] is not True):
+        reject("Main is not ready and authenticated")
     if not uint(current["observed_at"]) or current["observed_at"] <= 0:
-        reject("v4 current observed_at is invalid")
+        reject("Main observed_at is invalid")
     if current["plan_label"] is not None and not isinstance(current["plan_label"], str):
-        reject("v4 current plan_label is invalid")
-    if (not uint(current["active_thread_count"])
-            or not uint(current["open_session_thread_count"])
-            or current["active_thread_count"] > current["open_session_thread_count"]):
-        reject("v4 current thread counts are invalid")
+        reject("Main plan_label is invalid")
+    summary = current["thread_summary"]
+    if summary is not None:
+        if (not isinstance(summary, dict) or set(summary) != {
+                "open_count", "running_count", "unknown_activity_count", "by_model"}
+                or any(not uint(summary[k]) for k in ("open_count", "running_count", "unknown_activity_count"))
+                or summary["running_count"] + summary["unknown_activity_count"] > summary["open_count"]
+                or sum(row["open_count"] for row in summary["by_model"]) != summary["open_count"]):
+            reject("Main thread summary is invalid")
+    selection = current["selection"]
+    if not isinstance(selection, dict) or set(selection) != {"account_id", "login_id", "is_current"}:
+        reject("Main confirmed selection is missing")
     if current["models_status"] != "partial":
-        reject("v4 current did not preserve the partial model status")
+        reject("Main did not preserve the partial model status")
 
     expected_reset = int(reset_text)
     if str(expected_reset) != reset_text:
@@ -568,18 +587,18 @@ try:
     if not isinstance(quota, dict) or set(quota) != {
         "remaining_percent", "reset_at", "window_seconds", "monthly"
     }:
-        reject("v4 current quota schema is invalid")
+        reject("Main quota schema is invalid")
     remaining = quota["remaining_percent"]
     if (type(remaining) not in (int, float) or not math.isfinite(remaining)
             or abs(float(remaining) - 44.0) >= 1e-9
             or not uint(quota["reset_at"]) or quota["reset_at"] != expected_reset
             or not uint(quota["window_seconds"]) or quota["window_seconds"] != 604800
             or quota["monthly"] is not False):
-        reject("v4 current quota does not match the pinned weekly observation")
+        reject("Main quota does not match the pinned weekly observation")
 
     models = current["models"]
     if not isinstance(models, list):
-        reject("v4 current models is not an array")
+        reject("Main models is not an array")
     pending = False
     if not models:
         pending = True
@@ -591,34 +610,31 @@ try:
             "model", "total_tokens", "input_tokens", "cached_input_tokens",
             "cache_write_input_tokens", "output_tokens", "estimated_cost",
         }:
-            reject("v4 current model schema is invalid")
+            reject("Main model schema is invalid")
         if model["model"] != "gpt-5.6-luna":
             reject("fixture current contains an unexpected model identity")
         for key in ("total_tokens", "input_tokens", "cached_input_tokens", "output_tokens"):
             if not uint(model[key]):
-                reject("v4 current token component is invalid")
+                reject("Main token component is invalid")
         if model["cache_write_input_tokens"] is not None or model["estimated_cost"] is not None:
             reject("fixture cache-write or price was fabricated")
         if (model["total_tokens"] != model["input_tokens"] + model["output_tokens"]
                 or model["cached_input_tokens"] > model["input_tokens"]):
-            reject("v4 current model token components are inconsistent")
+            reject("Main model token components are inconsistent")
         if model["total_tokens"] > expected_total:
-            reject("v4 current model total exceeded the owned append")
+            reject("Main model total exceeded the owned append")
         if model["total_tokens"] < expected_total:
             pending = True
         elif ((model["input_tokens"], model["cached_input_tokens"], model["output_tokens"])
                 != expected_components[expected_total]):
-            reject("v4 current model components differ from the exact Session counters")
+            reject("Main model components differ from the exact Session counters")
 
-    with open(headers_path, "rb") as handle:
-        headers = handle.read().splitlines()
-    pairs = []
-    for line in headers:
-        name, separator, value = line.partition(b":")
-        if separator and name.strip().lower() == b"codex-info-published-pair":
-            pairs.append(value.strip().decode("ascii", "strict"))
-    if len(pairs) != 1 or not re.fullmatch(r"v1:[0-9a-f]{64}", pairs[0]):
-        reject("v4 current published-pair header is missing or malformed")
+    with open(metadata_path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if (set(metadata) != {"view_key", "image", "complete"} or metadata["complete"] is not True
+            or metadata["view_key"] != ["/state", {"parts": "main", "account": None}]
+            or not isinstance(metadata["image"], str) or not metadata["image"]):
+        reject("Main image is not qualified")
     if pending:
         raise SystemExit(75)
 except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
@@ -627,14 +643,14 @@ PY
 }
 
 assert_history_file() {
-    local body_path="$1" headers_path="$2" expected_reset="$3" expected_total="$4"
-    python3 - "$body_path" "$headers_path" "$expected_reset" "$expected_total" <<'PY'
+    local body_path="$1" metadata_path="$2" expected_reset="$3" expected_total="$4"
+    python3 - "$body_path" "$metadata_path" "$expected_reset" "$expected_total" <<'PY' || return 1
 import json
 import math
 import re
 import sys
 
-body_path, headers_path, reset_text, total_text = sys.argv[1:]
+body_path, metadata_path, reset_text, total_text = sys.argv[1:]
 
 def reject(reason):
     raise ValueError(reason)
@@ -645,19 +661,13 @@ def uint(value):
 try:
     with open(body_path, encoding="utf-8") as handle:
         page = json.load(handle)
-    if not isinstance(page, dict) or set(page) != {
-        "api_version", "history_samples", "history_gaps", "next_cursor", "resume_cursor"
-    } or page["api_version"] != "v3":
-        reject("v3 history page schema is invalid")
-    if page["next_cursor"] is not None:
-        reject("v3 history page has an unexpected next cursor")
-    samples = page["history_samples"]
-    if not isinstance(samples, list) or not isinstance(page["history_gaps"], list):
-        reject("v3 history collections are invalid")
-    if samples and (not isinstance(page["resume_cursor"], str) or not page["resume_cursor"]):
-        reject("v3 history resume cursor is missing")
-    if not samples and page["resume_cursor"] is not None:
-        reject("empty v3 history page has a resume cursor")
+    if not isinstance(page, dict) or set(page) != {"period_id", "samples", "gaps", "local_usage"}:
+        reject("history schema is invalid")
+    if not isinstance(page["period_id"], str) or not page["period_id"]:
+        reject("history period identity is missing")
+    samples = page["samples"]
+    if any(not isinstance(page[k], list) for k in ("samples", "gaps", "local_usage")):
+        reject("history collections are invalid")
 
     expected_reset = int(reset_text)
     if str(expected_reset) != reset_text:
@@ -673,40 +683,40 @@ try:
             "timestamp", "reset_at", "remaining_percent", "task_active_since_previous",
             "models", "models_complete", "model_source",
         }:
-            reject("v3 history sample schema is invalid")
+            reject("history sample schema is invalid")
         if (not uint(sample["timestamp"]) or not uint(sample["reset_at"])
                 or sample["reset_at"] != expected_reset):
-            reject("v3 history sample does not belong to the exact requested reset")
+            reject("history sample does not belong to the exact requested reset")
         remaining = sample["remaining_percent"]
         if remaining is not None and (
                 type(remaining) not in (int, float) or not math.isfinite(remaining)
                 or not 0 <= remaining <= 100):
-            reject("v3 history quota value is invalid")
+            reject("history quota value is invalid")
         if remaining is not None and abs(float(remaining) - 44.0) < 1e-9:
             saw_quota = True
         task_state = sample["task_active_since_previous"]
         if task_state is not None and type(task_state) is not bool:
-            reject("v3 history task state is invalid")
+            reject("history task state is invalid")
         if type(sample["models_complete"]) is not bool:
-            reject("v3 history models_complete is invalid")
+            reject("history models_complete is invalid")
         source = sample["model_source"]
         if not isinstance(source, str) or source not in {
             "confirmed", "legacy-unknown", "reconstructed-from-session", "unknown", "unavailable"
         }:
-            reject("v3 history model source is invalid")
+            reject("history model source is invalid")
         models = sample["models"]
         if models is None:
             if sample["models_complete"] or source not in {
                 "reconstructed-from-session", "unknown", "unavailable"
             }:
-                reject("nullable v3 history models are not marked incomplete")
+                reject("nullable history models are not marked incomplete")
             continue
         if not isinstance(models, list):
-            reject("v3 history models is not an array or null")
+            reject("history models is not an array or null")
         if source in {"reconstructed-from-session", "unknown", "unavailable"} and models is not None:
-            reject("unqualified v3 history source did not preserve nullable model data")
+            reject("unqualified history source did not preserve nullable model data")
         if sample["models_complete"] and source != "confirmed":
-            reject("complete v3 history model set lacks confirmed source")
+            reject("complete history model set lacks confirmed source")
         for model in models:
             allowed_model_keys = {
                 "model", "total_tokens", "input_tokens", "cached_input_tokens",
@@ -714,9 +724,9 @@ try:
             }
             if (not isinstance(model, dict) or not {"model", "total_tokens"}.issubset(model)
                     or not set(model).issubset(allowed_model_keys)):
-                reject("v3 history model schema is invalid")
+                reject("history model schema is invalid")
             if not isinstance(model["model"], str) or not model["model"] or not uint(model["total_tokens"]):
-                reject("v3 history model identity or total is invalid")
+                reject("history model identity or total is invalid")
             for key in allowed_model_keys - {"model", "total_tokens"}:
                 if key not in model:
                     continue
@@ -726,34 +736,32 @@ try:
                 else:
                     valid = uint(value)
                 if not valid:
-                    reject("v3 history optional model component is invalid")
+                    reject("history optional model component is invalid")
             if ("input_tokens" in model and "output_tokens" in model
                     and model["total_tokens"] != model["input_tokens"] + model["output_tokens"]):
-                reject("v3 history model token components are inconsistent")
+                reject("history model token components are inconsistent")
             if ("cached_input_tokens" in model and "input_tokens" in model
                     and model["cached_input_tokens"] > model["input_tokens"]):
-                reject("v3 history cached tokens exceed input tokens")
+                reject("history cached tokens exceed input tokens")
             if ("cache_write_input_tokens" in model and "cached_input_tokens" in model
                     and "input_tokens" in model
                     and model["cached_input_tokens"] + model["cache_write_input_tokens"]
                     > model["input_tokens"]):
-                reject("v3 history cache components exceed input tokens")
+                reject("history cache components exceed input tokens")
             if model["model"] == "gpt-5.6-luna":
                 max_luna_total = max(max_luna_total or 0, model["total_tokens"])
                 if source == "confirmed" and model["total_tokens"] == expected_total:
                     confirmed_target = True
                 if model["total_tokens"] > expected_total:
-                    reject("v3 history model total exceeded the owned append")
+                    reject("history model total exceeded the owned append")
 
-    with open(headers_path, "rb") as handle:
-        headers = handle.read().splitlines()
-    pairs = []
-    for line in headers:
-        name, separator, value = line.partition(b":")
-        if separator and name.strip().lower() == b"codex-info-published-pair":
-            pairs.append(value.strip().decode("ascii", "strict"))
-    if len(pairs) != 1 or not re.fullmatch(r"v1:[0-9a-f]{64}", pairs[0]):
-        reject("v3 history published-pair header is missing or malformed")
+    with open(metadata_path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if (set(metadata) != {"view_key", "image", "complete"} or metadata["complete"] is not True
+            or metadata["view_key"][0] != "/history"
+            or metadata["view_key"][1].get("period") != page["period_id"]
+            or not isinstance(metadata["image"], str) or not metadata["image"]):
+        reject("history image is not qualified")
     if (not samples or not saw_quota or max_luna_total is None
             or max_luna_total < expected_total or not confirmed_target):
         raise SystemExit(75)
@@ -762,108 +770,55 @@ except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeE
 PY
 }
 
-capture_http_response() {
-    local prefix="$1" url="$2" status=""
-    : >"$prefix.headers"
-    : >"$prefix.body"
-    status="$(curl --silent --max-time 1 --dump-header "$prefix.headers" \
-        --output "$prefix.body" --write-out '%{http_code}' "$url" 2>/dev/null || true)"
-    printf '%s\n' "$status" >"$prefix.status"
-}
-
 save_rest_failure() {
     local prefix="$1" label="$2" suffix
-    for suffix in status body headers reason; do
+    for suffix in json snapshot.json meta.json reason; do
         [[ -f "$prefix.$suffix" ]] && cp -- "$prefix.$suffix" "$case_root/$label-failure.$suffix"
     done
-    printf 'REST %s failed: HTTP %s; %s\n' "$label" \
-        "$(cat "$prefix.status" 2>/dev/null || true)" \
-        "$(cat "$prefix.reason" 2>/dev/null || true)" >&2
-    if [[ -s "$prefix.body" ]]; then
-        printf 'REST %s body: ' "$label" >&2
-        cat "$prefix.body" >&2
-        printf '\n' >&2
-    fi
+    printf 'REST %s failed: %s\n' "$label" "$(cat "$prefix.reason" 2>/dev/null || true)" >&2
+    [[ ! -s "$prefix.json" ]] || cat "$prefix.json" >&2
     return 0
 }
 
 fetch_current() {
     local path="$1" expected_reset="$2" expected_total="$3" phase="$4"
-    local prefix="$case_root/current-$phase-last" status="" assertion_status=0 attempt
-    for attempt in $(seq 1 80); do
-        capture_http_response "$prefix" "http://127.0.0.1:$case_port/v4/current"
-        status="$(cat "$prefix.status" 2>/dev/null || true)"
-        if [[ "$status" == 503 ]]; then
-            printf 'HTTP 503; waiting for expected current projection\n' >"$prefix.reason"
-            sleep 0.1
-            continue
-        fi
-        if [[ "$status" != 200 ]]; then
-            printf 'unexpected current HTTP status %s\n' "$status" >"$prefix.reason"
-            save_rest_failure "$prefix" "current-$phase"
-            return 1
-        fi
-        if assert_current_file "$prefix.body" "$prefix.headers" "$expected_reset" \
-            "$expected_total" 2>"$prefix.reason"; then
-            cp -- "$prefix.body" "$path"
-            cp -- "$prefix.headers" "$path.headers"
-            cp -- "$prefix.status" "$path.status"
-            return 0
-        else
-            assertion_status=$?
-        fi
-        if ((assertion_status == 75)); then
-            sleep 0.1
-            continue
-        fi
+    local prefix="$case_root/current-$phase-last"
+    if ! wire_snapshot current "$prefix" --min-total "$expected_total" >/dev/null 2>"$prefix.reason"; then
         save_rest_failure "$prefix" "current-$phase"
         return 1
-    done
-    save_rest_failure "$prefix" "current-$phase"
-    return 1
+    fi
+    if ! assert_current_file "$prefix.json" "$prefix.meta.json" "$expected_reset" \
+        "$expected_total" 2>"$prefix.reason"; then
+        save_rest_failure "$prefix" "current-$phase"
+        return 1
+    fi
+    cp -- "$prefix.json" "$path"
+    cp -- "$prefix.meta.json" "$path.meta.json"
 }
 
 fetch_history() {
     local path="$1" expected_reset="$2" expected_total="$3" phase="$4"
-    local prefix="$case_root/history-$phase-last" status="" assertion_status=0 attempt
-    for attempt in $(seq 1 80); do
-        capture_http_response "$prefix" \
-            "http://127.0.0.1:$case_port/v3/history?period=$expected_reset"
-        status="$(cat "$prefix.status" 2>/dev/null || true)"
-        if [[ "$status" == 503 ]]; then
-            printf 'HTTP 503; waiting for expected history projection\n' >"$prefix.reason"
-            sleep 0.1
-            continue
-        fi
-        if [[ "$status" != 200 ]]; then
-            printf 'unexpected history HTTP status %s\n' "$status" >"$prefix.reason"
-            save_rest_failure "$prefix" "history-$phase"
-            return 1
-        fi
-        if assert_history_file "$prefix.body" "$prefix.headers" "$expected_reset" \
-            "$expected_total" 2>"$prefix.reason"; then
-            cp -- "$prefix.body" "$path"
-            cp -- "$prefix.headers" "$path.headers"
-            cp -- "$prefix.status" "$path.status"
-            return 0
-        else
-            assertion_status=$?
-        fi
-        if ((assertion_status == 75)); then
-            sleep 0.1
-            continue
-        fi
+    local prefix="$case_root/history-$phase-last"
+    # This selector is the fixture-declared stored period, not a reset parsed
+    # from a server-issued opaque ID. The returned logical keys qualify it.
+    if ! wire_snapshot history "$prefix" --period "$expected_reset" \
+        --min-total "$expected_total" --sample-source confirmed >/dev/null 2>"$prefix.reason"; then
         save_rest_failure "$prefix" "history-$phase"
         return 1
-    done
-    save_rest_failure "$prefix" "history-$phase"
-    return 1
+    fi
+    if ! assert_history_file "$prefix.json" "$prefix.meta.json" "$expected_reset" \
+        "$expected_total" 2>"$prefix.reason"; then
+        save_rest_failure "$prefix" "history-$phase"
+        return 1
+    fi
+    cp -- "$prefix.json" "$path"
+    cp -- "$prefix.meta.json" "$path.meta.json"
 }
 
 read_projection_snapshot() {
     local expected_reset="$1" history_path="$2" expected_total="$3" history_timestamp
     is_uint "$expected_reset" && is_uint "$expected_total" || return 1
-    history_timestamp="$(python3 - "$history_path" "$expected_reset" "$expected_total" <<'PY'
+    history_timestamp="$(python3 - "$history_path" "$expected_reset" "$expected_total" <<'PY' || return 1
 import json
 import sys
 
@@ -872,7 +827,7 @@ expected_reset = int(reset_text)
 expected_total = int(total_text)
 with open(history_path, encoding="utf-8") as handle:
     page = json.load(handle)
-samples = page.get("history_samples") if isinstance(page, dict) else None
+samples = page.get("samples") if isinstance(page, dict) else None
 if not isinstance(samples, list):
     raise SystemExit("accepted REST history has no sample array")
 timestamps = []
@@ -919,7 +874,7 @@ COMMIT;"
 
 assert_current_matches_sqlite() {
     local path="$1" snapshot="$2" expected_reset="$3"
-    python3 - "$path" "$snapshot" "$expected_reset" <<'PY'
+    python3 - "$path" "$snapshot" "$expected_reset" <<'PY' || return 1
 import json
 import math
 import sys
@@ -953,22 +908,22 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 quota = current["quota"]
 if (quota["reset_at"] != quota_reset or quota["window_seconds"] != quota_window
         or abs(float(quota["remaining_percent"]) - quota_remaining) >= 1e-9):
-    fail("REST v4 current quota differs from the same SQLite read transaction")
+    fail("REST Main quota differs from the same SQLite read transaction")
 if len(current["models"]) != 1:
-    fail("REST v4 current model row is missing")
+    fail("REST Main model row is missing")
 model = current["models"][0]
 current_values = (
     model["total_tokens"], model["input_tokens"],
     model["cached_input_tokens"], model["output_tokens"],
 )
 if current_values != session_values or model["cache_write_input_tokens"] != session_cache_write:
-    fail("REST v4 current token components differ from session_model_totals")
+    fail("REST Main token components differ from session_model_totals")
 PY
 }
 
 assert_history_matches_sqlite() {
     local path="$1" snapshot="$2" expected_reset="$3"
-    python3 - "$path" "$snapshot" "$expected_reset" <<'PY'
+    python3 - "$path" "$snapshot" "$expected_reset" <<'PY' || return 1
 import json
 import sys
 
@@ -997,23 +952,23 @@ cache_write = None if history[8] == "<NULL>" else int(history[8])
 with open(sys.argv[1], encoding="utf-8") as handle:
     page = json.load(handle)
 matched = []
-for sample in page["history_samples"]:
+for sample in page["samples"]:
     if sample["timestamp"] != timestamp or sample["reset_at"] != reset_at:
         continue
     for entry in sample["models"] or []:
         if entry["model"] == model_name and sample["model_source"] == "confirmed":
             matched.append(entry)
 if len(matched) != 1:
-    fail("REST v3 history does not expose the same confirmed SQLite observation once")
+    fail("REST history does not expose the same confirmed SQLite observation once")
 entry = matched[0]
 for key, value in values.items():
     if entry.get(key) != value:
-        fail("REST v3 history model component differs from same-reset SQLite observation")
+        fail("REST history model component differs from same-reset SQLite observation")
 if cache_write is None:
     if "cache_write_input_tokens" in entry:
-        fail("REST v3 history fabricated an unknown cache-write component")
+        fail("REST history fabricated an unknown cache-write component")
 elif entry.get("cache_write_input_tokens") != cache_write:
-    fail("REST v3 history cache-write component differs from SQLite")
+    fail("REST history cache-write component differs from SQLite")
 PY
 }
 
@@ -1157,21 +1112,21 @@ assert_one_scoped_process recorder "$recorder_pid" 'recorder projection'
 launch_rest rest-initial
 assert_one_scoped_process rest "$rest_pid" 'REST startup'
 [[ "$rest_pid" != "$recorder_pid" ]] || fail 'recorder and REST share a PID'
-wait_for_rest || fail 'REST did not become healthy over the recorder SQLite database'
-assert_health "$(health_body)" || fail 'REST health contract failed'
+wait_for_rest || fail 'REST did not become ready over the recorder SQLite database'
+assert_runtime "$(runtime_body)" || fail 'REST runtime contract failed'
 current_before="$case_root/current-before.json"
 history_before="$case_root/history-before.json"
 fetch_current "$current_before" "$fixture_reset_at" 120 before \
-    || fail 'REST did not publish the exact v4 current projection after recorder append'
+    || fail 'REST did not publish the exact Main projection after recorder append'
 fetch_history "$history_before" "$fixture_reset_at" 120 before \
-    || fail 'REST did not publish the exact v3 history projection after recorder append'
+    || fail 'REST did not publish the exact history projection after recorder append'
 projection_before="$(read_projection_snapshot "$fixture_reset_at" "$history_before" 120 2>/dev/null || true)"
 [[ -n "$projection_before" ]] \
     || fail 'read-only SQLite projection snapshot is unavailable'
 assert_current_matches_sqlite "$current_before" "$projection_before" "$fixture_reset_at" \
-    || fail 'REST v4 current differs from the same SQLite quota/model transaction'
+    || fail 'REST Main differs from the same SQLite quota/model transaction'
 assert_history_matches_sqlite "$history_before" "$projection_before" "$fixture_reset_at" \
-    || fail 'REST v3 history differs from the same-reset SQLite model observation'
+    || fail 'REST history differs from the same-reset SQLite model observation'
 
 generation_before="$first_generation"
 epoch_before="$first_epoch"
@@ -1227,16 +1182,16 @@ wait_for_rest || fail 'REST did not recover after restart'
 current_after="$case_root/current-after.json"
 history_after="$case_root/history-after.json"
 fetch_current "$current_after" "$fixture_reset_at" 240 after \
-    || fail 'REST restart did not recover the exact v4 current model generation'
+    || fail 'REST restart did not recover the exact Main model generation'
 fetch_history "$history_after" "$fixture_reset_at" 240 after \
-    || fail 'REST restart did not recover the exact v3 history model generation'
+    || fail 'REST restart did not recover the exact history model generation'
 projection_after="$(read_projection_snapshot "$fixture_reset_at" "$history_after" 240 2>/dev/null || true)"
 [[ -n "$projection_after" ]] \
     || fail 'read-only SQLite projection snapshot after restart is unavailable'
 assert_current_matches_sqlite "$current_after" "$projection_after" "$fixture_reset_at" \
-    || fail 'REST v4 current after restart differs from the same SQLite transaction'
+    || fail 'REST Main after restart differs from the same SQLite transaction'
 assert_history_matches_sqlite "$history_after" "$projection_after" "$fixture_reset_at" \
-    || fail 'REST v3 history after restart differs from the same-reset SQLite observation'
+    || fail 'REST history after restart differs from the same-reset SQLite observation'
 
 # The UI receives only the REST endpoint in this invocation. Its executable,
 # marker, and port are checked independently, while recorder and REST PIDs

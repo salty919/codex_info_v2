@@ -213,6 +213,7 @@ impl PeriodIndex {
         self.fingerprints == other.fingerprints
     }
 
+    #[cfg(test)]
     pub(crate) fn resume(&self, rows: &[PublicHistoryObservationV3], position: usize) -> String {
         let sample = &rows[self.samples[position]];
         format!(

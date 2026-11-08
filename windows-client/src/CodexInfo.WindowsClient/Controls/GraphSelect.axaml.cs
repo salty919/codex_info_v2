@@ -140,7 +140,7 @@ public partial class GraphSelect : ToggleButton
         var groups = (ItemsSource?.OfType<ApiHistoryPeriod>() ?? [])
             .GroupBy(period => TimeZoneInfo.ConvertTime(DateTimeOffset.FromUnixTimeSeconds(period.StartAt), LocalizationService.DisplayTimeZone)
                 .ToString("yyyy/MM/dd", CultureInfo.InvariantCulture))
-            .OrderByDescending(group => group.Key, StringComparer.Ordinal).ToArray();
+            .ToArray(); // Preserve the ViewModel's current-group/Prev/Next order.
         dateGroups.Clear();
         foreach (var group in groups)
         {

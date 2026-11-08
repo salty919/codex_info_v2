@@ -1,6 +1,7 @@
 <!-- codex-info-requirement-owner: DATA -->
 <!-- codex-info-master-ids:
 REST-LOG-RETENTION-482
+CLIENT-RECEIPT-CACHE-690
 QUOTA-DURABLE-604
 RECORDER-MODEL-01
 CUM-138-01
@@ -24,13 +25,27 @@ U128-19
 
 # Codex Info データ保護規約
 
+
+## CLIENT-RECEIPT-CACHE-690 — UI共有の永続受領cache
+
+Refs #690。これはUIの派生受領cacheでありrecorder DB/取得原本/backupを変更しない。wire field・hashはWIRE ownerに従う。
+
+- 同一consumer/profileの全画面で一つだけ使用する。通常再起動・画面切替・再接続でID/受領manifestを消して初回転送へ戻さない。cacheは利用者だけが読み書きできる領域へ置き、認証token/raw AccountKey/private pathを保存しない。
+- 途中受信は完全fragmentのbytes、永続offset、受領台帳を同じtransactionで確定する。途中fragmentを確定しない。socket到達や送信済みを受領確定と呼ばない。
+- 型/内容/参照/source資格と必要pageの確認が完了してから、確定manifestと表示imageを同じtransactionで交換する。それまでは旧表示を保持し、既知値を0/空へ置換しない。
+- ack消失では永続台帳/manifestをmetadataで照合する。prefix identity/hash/offsetが一致した先だけを再開する。server再起動/変更log不在でも現在imageの未一致枝と比較し、受領済み本文を再送しない。
+- consumer identity anchorを受領cache directory外へ永続化する。cache directoryが消失してanchorが残る場合はcache_missingとし、初回IDを再発行しない。
+- cache破損/全損は接続errorでないcache_recovery_required。検証済み復元元があれば復元/照合し、なければ自動本文再送を停止する。consumerの付替えによる迂回をしない。
+- account/所有境界をcache identityとviewに保持し、別accountへ参照/last-goodを流用しない。APIの既存保持窓を外れ、受理済み/進行中viewと再開から参照されない派生cacheだけを解放できる。取得原本や保存価格をcache都合で消去しない。
+
+
 ## QUOTA-DURABLE-604 — 利用枠の取得原本と再処理
 
 公式quotaの取得原本を先に永続化し、期間判定・Session集計・公開をその原本のconsumerにする。取得原本は派生履歴を複製する互換表ではなく、Session JSONLと同じ再処理入力である。`HISTORY-CANONICAL-134`はSession由来のmodel履歴と旧混合履歴を所有する。その判定を公式quota原本の採否に使わない。
 
 1. 完全な公式quota応答のpayload、取得時刻、取得順序、credentialを含まないaccount scopeを、quota解釈・期間採否・通知queue・Session処理より先にdurable commitする。解釈不能な応答も保持する。token、raw AccountKey、account/read payload、login IDは保存しない。
 2. 通知queueは原本を所有しない。満杯、最新値への集約、consumer停止、前回batch再試行で保存済み原本を削除・上書き・処理済みにしない。quota取得とSession集計は独立して進む。 residentはaccount/partitionとprofile leaseを確保後、Session DB初期化・復旧より先にquota原本取得を開始する。Session writerを開始できない間も原本を保存し、writer復旧後に再処理する。
-3. 不変な原本IDと取得順序を使用し、解釈済み公式quotaと適用済みIDをaccount DBの`quota_receipts`へ同じtransactionでcommitする。commit前の停止は同じ原本から再開し、commit後の通知欠落は二重加算しない。現在quotaは取得順序が最後の受理済み公式応答とし、過去再生やローカル時計の前後で巻き戻さない。履歴quotaも同じ受理済み記録から直接投影し、Session由来の派生履歴への二度目の書込みや別の完了位置を必要としない。同じexact reset/minuteでは最後に取得した公式観測を表示し、その前の観測も取得原本・受理済み記録から削除しない。異なるexact resetが同minuteにある場合は双方を保持し、旧detailsを含む公開sampleもWIREのexact keyごとの規則に従う。modelはexactな`reset_at`とminuteが一致する観測だけを結合する。modelの欠落・読取り失敗・旧quotaとの不一致を公式quotaの破棄理由にしない。履歴projectionのSQL失敗・公開domainの不成立も、別に受理済みの現在quotaを取り消さない。正常なreset総件数は公開domainの不成立に含めない。真正の履歴projection失敗では生成できない履歴だけを明示的に利用不能とする。旧v1〜v3 detailsの一体投影は現在値を含めたError応答とするが、独立したv4 currentの取得状態・models_statusを履歴失敗だけで変更しない。current自身の失敗と初回Error応答の表示はWIREのcurrent契約とsurface admissionに従う。有効なmodel・threadを0や未取得へ置換しない。空履歴を正常な履歴として返さず、保存済み原本・receipt・Session eventは変更しない。
+3. 不変な原本IDと取得順序を使用し、解釈済み公式quotaと適用済みIDをaccount DBの`quota_receipts`へ同じtransactionでcommitする。commit前の停止は同じ原本から再開し、commit後の通知欠落は二重加算しない。現在quotaは取得順序が最後の受理済み公式応答とし、過去再生やローカル時計の前後で巻き戻さない。履歴quotaも同じ受理済み記録から直接投影し、Session由来の派生履歴への二度目の書込みや別の完了位置を必要としない。同じexact reset/minuteでは最後に取得した公式観測を表示し、その前の観測も取得原本・受理済み記録から削除しない。異なるexact resetが同minuteにある場合は双方を保持し、旧detailsを含む公開sampleもWIREのexact keyごとの規則に従う。modelはexactな`reset_at`とminuteが一致する観測だけを結合する。modelの欠落・読取り失敗・旧quotaとの不一致を公式quotaの破棄理由にしない。履歴projectionのSQL失敗・公開domainの不成立も、別に受理済みの現在quotaを取り消さない。正常なreset総件数は公開domainの不成立に含めない。真正の履歴projection失敗では生成できない履歴だけを明示的に利用不能とする。履歴imageの失敗だけで独立したstate mainの取得状態・models_statusを変更しない。current自身の失敗と初回Error応答の表示はWIREのcurrent契約とsurface admissionに従う。有効なmodel・threadを0や未取得へ置換しない。空履歴を正常な履歴として返さず、保存済み原本・receipt・Session eventは変更しない。
    受理済みreceiptのcommitでは、同じexact reset/minuteのquota投影を同じtransaction内で保存する。既存model minuteがあれば`usage_history.remaining_percent`と対応するdurable observationの同fieldだけを取得順で更新し、model・token成分・保存USD bits・価格revision・source・coverageは変更しない。modelの無いminuteは`model_source=unavailable`かつmodel数値NULLのdurable observationとし、0 token/0 USDのmodel rowを作らない。後着receipt、Session解析失敗、集合未完備、別periodの同minuteを理由にこの保存を待たせない。既存DBの復旧では、原本・account/epoch・所有区間・exact keyが一致する公式receiptを根拠とし、NULL補完、quota-only行の新設、既知quotaとの競合を分ける。競合前の値は非回転backupに保持し、公式receiptの取得順をquotaだけの優先順位とする。receiptと取得原本は変更しない。
 4. account確認前後が不一致の応答も原本として保持し、確認済みaccountへ推測で帰属させない。原本保存と公開資格を別の状態として扱う。 当該accountへの受理済み記録があれば、再起動後の公開に新しいAPI応答や通知を要求しない。取得障害時も受理済みquotaを障害状態とともに公開する。
 5. 保存失敗時は成功通知・処理済み更新・新しい応答による未保存値の上書きを行わず、未保存応答を保持して保存再開を所有し、障害を公開する。保存後の解析・集計・公開失敗でも原本を保持し、再起動後に未反映分を再処理する。 未解釈の原本は後続の解釈可能な応答を止めず、未処理として残す。過去の未処理件数と現在の取得成否は区別する。取得順で後続の確認済み公式応答が解釈・保存できた場合、過去の未解釈原本だけを理由に現在値を取得失敗としない。最新の確認が終了した入力が未解釈なら障害とし、受理済み記録と同じtransactionで保存する。通信・原本保存の成否と、保存済み入力の解釈成否を独立して保持する。正常な後続原本の保存後に再起動しても、再生で解釈障害から回復でき、新たなAPI応答や通知を必要としない。実際の通信・保存失敗は引き続き障害として公開し、過去の原本を再生しただけで取り消さない。取得・再生の障害状態はthread記録の有無に依存せずgenerationとともに永続化・公開する。
@@ -442,7 +457,7 @@ health候補がmalformed、oversize、foreign listener、schema/header不一致�
 
 ### 8.3 DP-REST-002 / RC-140 — server faultとatomic pair
 
-HTTP要求が公開済みrootを取得できない場合の503、応答生成の500/切断はWIRE ownerへ従う。その要求でDBやpublished pairを変更せず、clientは該当surfaceのlast-goodを保持する。一方、publisherが受理済みquota・有効model・threadと、真正の履歴projection失敗を一つの新generationとして構成できる場合は、`QUOTA-DURABLE-604`に従って旧v1〜v3のcurrent/detailsをerror、履歴resourceを利用不能として公開する。独立したv4 currentのstate・models_statusは履歴失敗だけで変更しない。recorderがadmissionした取得状態の失敗と、REST reader/publisher自身がcommit済みdomainを読めない失敗の区別はPRODUCT `REST-172`とWIREのHTTP失敗境界へ従い、後者からrecorderのError generationを作らない。同じ所有資格のlast-goodを保持できる通常のDB I/O失敗では、PRODUCT `REST-172`のHTTP 200・degraded pair・回復時の通常pairを維持する。未構築frame、所有資格の失効、domain/source拒否は同条の503境界に従う。旧status/detailsのS1+D0禁止は版を混ぜる採用の禁止であり、独立surfaceの正常更新を止める規則ではない。
+HTTP要求が公開済みrootを取得できない場合の503、応答生成の500/切断はWIRE ownerへ従う。その要求でDBやpublished pairを変更せず、clientは該当surfaceのlast-goodを保持する。2026-11-07の明示要求（Refs #690）で旧v1〜v4のroute/schemaと版別fallbackは廃止した。publisherが受理済みquota・有効model・threadと真正の履歴projection失敗を持つ場合も、`QUOTA-DURABLE-604`のsource資格を保ち、独立した/state mainのacquisition_state・models_statusを履歴だけの未準備・失敗から変更しない。履歴surfaceは改定WIREの正常なpending/syncとlast-good保持で区別する。recorderがadmissionした取得状態の失敗と、REST reader/publisher自身がcommit済みdomainを読めない失敗の区別はPRODUCT `REST-172`とWIREのHTTP失敗境界へ従い、後者からrecorderのError generationを作らない。同じ所有資格のlast-goodを保持できる通常のDB I/O失敗では、PRODUCT `REST-172`のHTTP 200・degraded pair・回復時の通常pairを維持する。未構築frame、所有資格の失効、domain/source拒否は同条の503境界に従う。旧status/detailsのS1+D0禁止は版を混ぜる採用の禁止であり、独立surfaceの正常更新を止める規則ではない。
 logout/account境界のstrict emptyはPRODUCTとWIREのsecurity visibility transitionに従い、旧accountを一括で消去する。新しい境界generationの公開と、clientで旧accountを不可視にする処理を区別し、HTTP要求からDBやpublicationを書き換えない。
 
 ### 8.4 DP-REST-003 / RC-141 — request resource owner
@@ -509,7 +524,7 @@ canonical AccountKeyはowner-only・regular・0600・1..65536 bytesで前後iden
 前後`account/read`が不一致ならquota/thread取得結果とその公開更新だけを棄却し、raw AccountKeyが一致するSession記録は継続する。
 raw AccountKeyとtokenはpath、profile metadata、DB、journal、log、RESTへ保存しない。login IDは1..254 Unicode scalar、
 trim済み・control文字なしを再検証し、owner-only account registryと当該account DBの表示label、およびloopback限定
-`GET /v3/accounts`のnullable `login_id`にだけ使用する。login IDの取得・保存失敗はusage記録を停止させない。
+`GET /state`のaccount projectionsのnullable `login_id`にだけ使用する。login IDの取得・保存失敗はusage記録を停止させない。
 
 #### 記録上のaccount所有区間と未確認境界
 

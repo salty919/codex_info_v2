@@ -7,6 +7,8 @@
 mod account_scope;
 #[cfg(test)]
 mod daemon;
+mod ui_wire;
+mod ui_wire_readback;
 
 use chrono::{DateTime, Months, Utc};
 use codex_info::app_server_sqlite::PreparedGeneration;
@@ -15,14 +17,15 @@ use codex_info::protocol_contract;
 use codex_info::security;
 #[cfg(test)]
 use codex_info::server::{
-    legacy_history_models_v3, ApiServer, PublicDetailedModelUsage, PublicHistorySample,
+    legacy_history_models_v3, validate_public_threads, ApiServer, PublicDetailedModelUsage,
+    PublicDetails, PublicDetailsV2, PublicHistoryObservation, PublicHistorySample,
 };
 use codex_info::server::{
-    validate_public_threads, ApiServerConfig, PublicDetails, PublicDetailsV2, PublicDetailsV3,
-    PublicHistoryGap, PublicHistoryModelUsageV3, PublicHistoryObservation,
+    ApiServerConfig, PublicDetailsV3, PublicHistoryGap, PublicHistoryModelUsageV3,
     PublicHistoryObservationV3, PublicHistoryPeriod, PublicModelCostV3, PublicModelUsageV3,
     PublicQuota, PublicState, PublicThread, PublicThreadActivityStatus,
 };
+#[cfg(test)]
 use codex_info::thread_contract::{self, ThreadTopologyNode};
 #[cfg(test)]
 use codex_info::thread_contract::{ThreadCycleAccumulator, ThreadCycleOutcome};
@@ -48,9 +51,11 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::fs::{self, OpenOptions};
 #[cfg(test)]
-use std::io::{BufRead, Seek, SeekFrom};
-use std::io::{BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{BufReader, Write};
+use std::net::SocketAddr;
+#[cfg(test)]
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Child;
@@ -328,6 +333,7 @@ impl TokenSnapshot {
     }
 }
 
+#[cfg(test)]
 const LOCAL_ESTIMATE_PRICE_VERSION: &str = "LOCAL_ESTIMATE_V1_2026-08-14";
 const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ASTRA_PRICE_PER_MILLION: (f64, f64, f64, f64) = (10.0, 1.0, 12.5, 50.0);
@@ -3933,6 +3939,7 @@ fn main_sample_from_observation(
     })
 }
 
+#[cfg(test)]
 fn main_sample_from_public_observation(
     observation: &PublicHistoryObservation,
 ) -> Option<UsageHistorySample> {
@@ -3955,6 +3962,7 @@ fn main_sample_from_public_observation(
     })
 }
 
+#[cfg(test)]
 fn store_observation_from_public(
     observation: &PublicHistoryObservation,
 ) -> usage_store::UsageHistoryObservation {
@@ -13412,6 +13420,7 @@ impl PendingRecorderBatch {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 struct StagedServiceCurrentBundle {
     pair: String,
@@ -13424,6 +13433,7 @@ struct StagedServiceCurrentBundle {
 /// account-scope hashes, filesystem paths, or backend authority values.
 type ServiceAccountV3 = codex_info_rest_contract::PublicAccountV3;
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ServiceAccountsV3Document {
@@ -13553,6 +13563,9 @@ struct CodexInfoState {
     /// closed; history samples remain lazy and are fetched only for an open
     /// graph.
     service_current_snapshot: Option<PublicDetailsV3>,
+    wire_active: bool,
+    wire_summary: Option<(ActiveThreadSummary, ActiveThreadSummary)>,
+    wire_runtime: Option<codex_info_rest_contract::PublicRuntimeVersions>,
     service_current_models_status: Option<ServiceCurrentModelsStatus>,
     service_current_active_thread_count: Option<u64>,
     service_current_pair: Option<String>,
@@ -13595,13 +13608,16 @@ struct CodexInfoState {
     service_selected_account_id: Option<String>,
     service_accounts_supported: bool,
     service_accounts_known: bool,
+    #[cfg(test)]
     service_accounts_last_poll: Instant,
+    #[cfg(test)]
     service_accounts_force_poll: bool,
     service_accounts_error: Option<String>,
     #[cfg(test)]
     acknowledged_recorder_commit: Option<AcknowledgedRecorderCommit>,
 }
 
+#[cfg(test)]
 fn validation_active_count(threads: &[PublicThread]) -> u64 {
     threads
         .iter()
@@ -13614,6 +13630,7 @@ fn validation_active_count(threads: &[PublicThread]) -> u64 {
         .count() as u64
 }
 
+#[cfg(test)]
 fn visible_public_threads(threads: &[PublicThread]) -> Vec<&PublicThread> {
     let by_id = threads
         .iter()
@@ -13647,6 +13664,7 @@ fn visible_public_threads(threads: &[PublicThread]) -> Vec<&PublicThread> {
         .collect()
 }
 
+#[cfg(test)]
 fn stage_service_current_bundle(
     previous_pair: Option<&str>,
     published_pair: String,
@@ -14394,6 +14412,9 @@ impl CodexInfoState {
             service_published_pair: None,
             service_v3_published_pair: None,
             service_current_snapshot: None,
+            wire_active: false,
+            wire_summary: None,
+            wire_runtime: None,
             service_current_models_status: None,
             service_current_active_thread_count: None,
             service_current_pair: None,
@@ -14426,7 +14447,9 @@ impl CodexInfoState {
             service_selected_account_id: None,
             service_accounts_supported: false,
             service_accounts_known: false,
+            #[cfg(test)]
             service_accounts_last_poll: service_now,
+            #[cfg(test)]
             service_accounts_force_poll: true,
             service_accounts_error: None,
             #[cfg(test)]
@@ -14559,6 +14582,9 @@ impl CodexInfoState {
             service_published_pair: None,
             service_v3_published_pair: None,
             service_current_snapshot: None,
+            wire_active: false,
+            wire_summary: None,
+            wire_runtime: None,
             service_current_models_status: None,
             service_current_active_thread_count: None,
             service_current_pair: None,
@@ -14589,7 +14615,9 @@ impl CodexInfoState {
             service_selected_account_id: None,
             service_accounts_supported: false,
             service_accounts_known: false,
+            #[cfg(test)]
             service_accounts_last_poll: resident_now,
+            #[cfg(test)]
             service_accounts_force_poll: false,
             service_accounts_error: None,
             #[cfg(test)]
@@ -15163,6 +15191,7 @@ impl CodexInfoState {
         self.service_published_pair = None;
         self.service_v3_published_pair = None;
         self.service_current_snapshot = None;
+        self.wire_summary = None;
         self.service_current_models_status = None;
         self.service_current_active_thread_count = None;
         self.service_current_pair = None;
@@ -15235,6 +15264,7 @@ impl CodexInfoState {
         true
     }
 
+    #[cfg(test)]
     fn apply_service_accounts(
         &mut self,
         document: ServiceAccountsV3Document,
@@ -15415,6 +15445,7 @@ impl CodexInfoState {
         self.apply_service_details_v2(published_pair, PublicDetailsV2::from(details))
     }
 
+    #[cfg(test)]
     fn apply_service_details_v2(
         &mut self,
         published_pair: String,
@@ -15565,6 +15596,7 @@ impl CodexInfoState {
         self.service_v3_published_pair = None;
         self.service_current_pair = Some(published_pair.clone());
         self.service_current_snapshot = None;
+        self.wire_summary = None;
         self.service_current_models_status = None;
         self.service_current_active_thread_count = Some(self.active_threads.len() as u64);
         self.service_split_capable = false;
@@ -15585,6 +15617,7 @@ impl CodexInfoState {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn apply_service_details_v3(
         &mut self,
         published_pair: String,
@@ -15789,6 +15822,7 @@ impl CodexInfoState {
     /// count, public-document, and topology check. Keeping this body
     /// infallible prevents Main from ever observing a new current count with
     /// old or empty per-model rows.
+    #[cfg(test)]
     fn commit_service_current_bundle(&mut self, staged: StagedServiceCurrentBundle) -> bool {
         let StagedServiceCurrentBundle {
             pair: published_pair,
@@ -15925,6 +15959,7 @@ impl CodexInfoState {
             || previous_threads != self.active_threads
     }
 
+    #[cfg(test)]
     fn apply_service_history_resource(
         &mut self,
         published_pair: String,
@@ -15992,6 +16027,7 @@ impl CodexInfoState {
         Ok(changed)
     }
 
+    #[cfg(test)]
     fn apply_service_history_periods_resource(
         &mut self,
         published_pair: String,
@@ -16034,6 +16070,7 @@ impl CodexInfoState {
         Ok(changed)
     }
 
+    #[cfg(test)]
     fn apply_service_threads_resource(
         &mut self,
         published_pair: String,
@@ -16531,6 +16568,7 @@ impl CodexInfoState {
         self.selected_reset_at = None;
         self.selected_history_period = "履歴なし".into();
         self.service_current_snapshot = None;
+        self.wire_summary = None;
         self.service_current_models_status = None;
         self.service_current_active_thread_count = None;
         self.service_current_pair = None;
@@ -17453,6 +17491,7 @@ impl CodexInfoState {
         self.apply_thread_error_for_admission(auth_epoch, &admission, message)
     }
 
+    #[cfg(test)]
     fn refresh_partial_failure_status(&mut self) {
         if let Some(current) = self.service_current_snapshot.as_ref() {
             match current.state {
@@ -17823,9 +17862,14 @@ impl CodexInfoState {
             // An empty period list is confirmed only after an empty page has
             // committed for the same pair. A retained page or an initial
             // page-less state is still waiting for the history resource.
-            return self.service_history_period_id.is_some()
-                || self.service_history_pair.as_deref() != Some(history_pair);
+            return !self.wire_active
+                && (self.service_history_period_id.is_some()
+                    || self.service_history_pair.as_deref() != Some(history_pair));
         };
+        if self.wire_active {
+            return self.service_history_pair.is_none()
+                || self.service_history_period_id.as_deref() != Some(selected_period.id.as_str());
+        }
         self.service_history_pair.as_deref() != Some(history_pair)
             || self.service_history_period_id.as_deref() != Some(selected_period.id.as_str())
     }
@@ -17850,10 +17894,10 @@ impl CodexInfoState {
                     })
                     .map(|candidate| candidate.id.as_str());
                 let already_committed = same_selection
-                    && self
-                        .service_current_pair
-                        .as_deref()
-                        .is_some_and(|pair| self.service_history_pair.as_deref() == Some(pair))
+                    && (self.wire_active && self.service_history_pair.is_some()
+                        || self.service_current_pair.as_deref().is_some_and(|pair| {
+                            self.service_history_pair.as_deref() == Some(pair)
+                        }))
                     && selected_period_id.is_some()
                     && self.service_history_period_id.as_deref() == selected_period_id;
                 self.service_history_pending_reset_at =
@@ -20185,12 +20229,20 @@ impl CodexInfoState {
         });
         // Main is one presentation projection over one admitted row set. The
         // wire count remains an admission check, never a second UI authority.
-        let thread_summary = active_thread_summary(&self.active_threads);
-        let running_summary = active_thread_summary(
-            self.active_threads
-                .iter()
-                .filter(|thread| thread.activity_status == PublicThreadActivityStatus::Running),
-        );
+        let thread_summary = if self.wire_active {
+            self.wire_summary.map(|s| s.0).unwrap_or_default()
+        } else {
+            active_thread_summary(&self.active_threads)
+        };
+        let running_summary = if self.wire_active {
+            self.wire_summary.map(|s| s.1).unwrap_or_default()
+        } else {
+            active_thread_summary(
+                self.active_threads
+                    .iter()
+                    .filter(|thread| thread.activity_status == PublicThreadActivityStatus::Running),
+            )
+        };
         let show_generated =
             self.service_published_pair.is_none() || self.service_v3_published_pair.is_some();
         let model_count = |running, generated| {
@@ -20226,12 +20278,21 @@ impl CodexInfoState {
             );
         } else {
             ui.set_active_thread_count(0);
-            ui.set_active_thread_sol_count("0".into());
-            ui.set_active_thread_terra_count("0".into());
-            ui.set_active_thread_luna_count("0".into());
-            ui.set_active_thread_astra_count("0".into());
-            ui.set_active_thread_other_count("0".into());
-            ui.set_active_thread_count_label(self.i18n.format_thread_count(0).into());
+            let count = if self.wire_active && self.wire_summary.is_none() {
+                "—"
+            } else {
+                "0"
+            };
+            ui.set_active_thread_sol_count(count.into());
+            ui.set_active_thread_terra_count(count.into());
+            ui.set_active_thread_luna_count(count.into());
+            ui.set_active_thread_astra_count(count.into());
+            ui.set_active_thread_other_count(count.into());
+            ui.set_active_thread_count_label(if self.wire_active && self.wire_summary.is_none() {
+                "—".into()
+            } else {
+                self.i18n.format_thread_count(0).into()
+            });
         }
     }
 
@@ -20881,17 +20942,25 @@ const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:8787";
 // Transport completion must fit the standalone REST server's own three-second
 // request budget. Performance-derived polling values are intentionally left
 // to the separately planned post-optimization measurement work.
+#[cfg(test)]
 const SERVICE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const BACKGROUND_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
 const DETAILS_RESPONSE_MAX_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(test)]
 const DETAILS_RESPONSE_HEADER_MAX_BYTES: usize = 8 * 1024;
+#[cfg(test)]
 const STALE_CURSOR_RESPONSE_MAX_BYTES: usize = 1024;
+#[cfg(test)]
 const SERVICE_HISTORY_EXACT_STALE_CURSOR: &str = "exact_stale_cursor_response";
+#[cfg(test)]
 const SERVICE_HISTORY_STALE_PREFIX: &str = "stale_cursor";
 
+#[cfg(test)]
 struct UniqueJsonValue(Value);
 
+#[cfg(test)]
 impl<'de> Deserialize<'de> for UniqueJsonValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -20901,8 +20970,10 @@ impl<'de> Deserialize<'de> for UniqueJsonValue {
     }
 }
 
+#[cfg(test)]
 struct UniqueJsonVisitor;
 
+#[cfg(test)]
 impl<'de> serde::de::Visitor<'de> for UniqueJsonVisitor {
     type Value = UniqueJsonValue;
 
@@ -20982,6 +21053,7 @@ impl<'de> serde::de::Visitor<'de> for UniqueJsonVisitor {
     }
 }
 
+#[cfg(test)]
 fn decode_unique_json(bytes: &[u8]) -> Result<Value, String> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let UniqueJsonValue(value) =
@@ -20990,6 +21062,7 @@ fn decode_unique_json(bytes: &[u8]) -> Result<Value, String> {
     Ok(value)
 }
 
+#[cfg(test)]
 fn valid_published_pair(value: &str) -> bool {
     value.len() == 67
         && value.starts_with("v1:")
@@ -20999,6 +21072,7 @@ fn valid_published_pair(value: &str) -> bool {
         && value[35..].bytes().any(|byte| byte != b'0')
 }
 
+#[cfg(test)]
 fn published_pair_is_fresh(previous: Option<&str>, candidate: &str) -> Result<bool, String> {
     if !valid_published_pair(candidate) {
         return Err("invalid details generation header".into());
@@ -21022,6 +21096,7 @@ fn published_pair_is_fresh(previous: Option<&str>, candidate: &str) -> Result<bo
     Ok(true)
 }
 
+#[cfg(test)]
 fn parse_details_document(bytes: &[u8]) -> Result<PublicDetails, String> {
     let mut document = decode_unique_json(bytes)?;
     let object = document
@@ -21089,6 +21164,7 @@ fn parse_details_document(bytes: &[u8]) -> Result<PublicDetails, String> {
     Ok(details)
 }
 
+#[cfg(test)]
 fn parse_details_v2_document(bytes: &[u8]) -> Result<PublicDetailsV2, String> {
     let mut document = decode_unique_json(bytes)?;
     let object = document
@@ -21159,6 +21235,7 @@ fn parse_details_v2_document(bytes: &[u8]) -> Result<PublicDetailsV2, String> {
     Ok(details)
 }
 
+#[cfg(test)]
 fn sanitize_untrusted_history_observation_v3(observation: &mut PublicHistoryObservationV3) {
     match observation.model_source.as_str() {
         "confirmed" if observation.models_complete && observation.models.is_some() => {}
@@ -21190,6 +21267,7 @@ fn sanitize_untrusted_history_observation_v3(observation: &mut PublicHistoryObse
 /// Remove model numerics from rows whose source cannot authorize them before
 /// typed decoding. This isolates an old/broken REST row without allowing its
 /// payload shape to reject otherwise valid observations in the same page.
+#[cfg(test)]
 fn sanitize_untrusted_history_json_rows(rows: &mut Value) {
     let Some(rows) = rows.as_array_mut() else {
         return;
@@ -21213,6 +21291,7 @@ fn sanitize_untrusted_history_json_rows(rows: &mut Value) {
     }
 }
 
+#[cfg(test)]
 fn sanitize_untrusted_history_v2_json_rows(rows: &mut Value) {
     let Some(rows) = rows.as_array_mut() else {
         return;
@@ -21245,12 +21324,14 @@ fn sanitize_untrusted_history_v2_json_rows(rows: &mut Value) {
     }
 }
 
+#[cfg(test)]
 fn sanitize_untrusted_history_v3(samples: &mut [PublicHistoryObservationV3]) {
     for sample in samples {
         sanitize_untrusted_history_observation_v3(sample);
     }
 }
 
+#[cfg(test)]
 fn parse_details_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
     let mut document = decode_unique_json(bytes)?;
     let object = document
@@ -21346,6 +21427,7 @@ fn parse_details_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
     Ok(details)
 }
 
+#[cfg(test)]
 struct ServiceDetailsHttpResponse {
     status: u16,
     pair: Option<String>,
@@ -21360,6 +21442,7 @@ fn request_service_details(
     request_service_details_with_etag(address, route, None)
 }
 
+#[cfg(test)]
 fn request_service_details_with_etag(
     address: SocketAddr,
     route: &str,
@@ -21373,6 +21456,7 @@ fn request_service_details_with_etag(
     )
 }
 
+#[cfg(test)]
 fn service_response_remaining(deadline: Instant) -> Result<Duration, String> {
     deadline
         .checked_duration_since(Instant::now())
@@ -21380,6 +21464,7 @@ fn service_response_remaining(deadline: Instant) -> Result<Duration, String> {
         .ok_or_else(|| "details response deadline exceeded".to_owned())
 }
 
+#[cfg(test)]
 fn request_service_details_with_etag_and_timeout(
     address: SocketAddr,
     route: &str,
@@ -21561,6 +21646,7 @@ fn request_service_details_with_etag_and_timeout(
     })
 }
 
+#[cfg(test)]
 fn fetch_service_runtime_versions(
     address: SocketAddr,
 ) -> Result<codex_info_rest_contract::PublicRuntimeVersions, String> {
@@ -21642,6 +21728,7 @@ where
     Ok((pair, parse_details_v2_document(&response.body)?))
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 enum ServiceDetailsV3Fetch {
     FreshV3 {
@@ -21657,6 +21744,7 @@ enum ServiceDetailsV3Fetch {
     },
 }
 
+#[cfg(test)]
 fn response_published_pair(response: &ServiceDetailsHttpResponse) -> Result<String, String> {
     response
         .pair
@@ -21664,6 +21752,7 @@ fn response_published_pair(response: &ServiceDetailsHttpResponse) -> Result<Stri
         .ok_or_else(|| "missing details generation header".to_owned())
 }
 
+#[cfg(test)]
 fn fetch_service_details_v3_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
@@ -21718,6 +21807,7 @@ enum ServiceCurrentModelsStatus {
     Unavailable,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ServiceCurrentV3Document {
@@ -21732,6 +21822,7 @@ struct ServiceCurrentV3Document {
     open_session_thread_count: Option<u64>,
 }
 
+#[cfg(test)]
 fn parse_service_current_document(
     bytes: &[u8],
     version: &str,
@@ -21820,6 +21911,7 @@ fn parse_service_current_document(
     Ok((details, models_status))
 }
 
+#[cfg(test)]
 fn parse_service_history_periods_document(
     bytes: &[u8],
 ) -> Result<Vec<PublicHistoryPeriod>, String> {
@@ -21905,6 +21997,7 @@ fn parse_service_history_periods_document(
     Ok(periods)
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 struct ServiceHistoryPage {
     next_cursor: Option<String>,
@@ -21914,6 +22007,7 @@ struct ServiceHistoryPage {
     local_usage: Option<codex_info_rest_contract::recorded_usage::LocalUsage>,
 }
 
+#[cfg(test)]
 fn parse_service_history_page_document(bytes: &[u8]) -> Result<ServiceHistoryPage, String> {
     let mut document = decode_unique_json(bytes)?;
     let object = document
@@ -21998,6 +22092,7 @@ fn parse_service_history_page_document(bytes: &[u8]) -> Result<ServiceHistoryPag
     })
 }
 
+#[cfg(test)]
 fn parse_service_threads_document(
     bytes: &[u8],
 ) -> Result<(Option<u64>, Vec<PublicThread>), String> {
@@ -22036,6 +22131,7 @@ fn parse_service_threads_document(
     Ok((None, threads))
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 enum ServiceCurrentFetch {
     Fresh {
@@ -22049,6 +22145,7 @@ enum ServiceCurrentFetch {
     },
 }
 
+#[cfg(test)]
 fn fetch_service_current_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
@@ -22099,14 +22196,17 @@ where
     Ok(ServiceCurrentFetch::Legacy(legacy))
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 enum ServiceResourceFetch<T> {
     Fresh { pair: String, value: T },
     NotModified { pair: String },
 }
 
+#[cfg(test)]
 type ServiceThreadsResource = (Option<u64>, Vec<PublicThread>);
 
+#[cfg(test)]
 fn fetch_service_history_periods_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
@@ -22156,6 +22256,7 @@ fn valid_public_account_id(value: &str) -> bool {
         && number.parse::<u64>().is_ok()
 }
 
+#[cfg(test)]
 fn validate_service_accounts(document: &ServiceAccountsV3Document) -> Result<(), String> {
     if document.api_version != "v3" {
         return Err("accounts document api_version is not v3".into());
@@ -22168,6 +22269,7 @@ fn validate_service_accounts(document: &ServiceAccountsV3Document) -> Result<(),
     .map_err(|error| format!("accounts document violates v3 contract: {error}"))
 }
 
+#[cfg(test)]
 fn parse_service_accounts_v3_document(bytes: &[u8]) -> Result<ServiceAccountsV3Document, String> {
     let mut document = decode_unique_json(bytes)?;
     let object = document
@@ -22215,6 +22317,7 @@ fn service_main_account_options(accounts: &[ServiceAccountV3]) -> Vec<(String, b
 /// Add the selected public account to current v4 and every v3 data read. `/v3/accounts` is
 /// the directory itself and therefore intentionally has no account selector.
 /// Legacy v1/v2 fallback routes remain unchanged.
+#[cfg(test)]
 fn service_route_with_account(route: &str, account_id: Option<&str>) -> String {
     if (!route.starts_with("/v3/")
         && !route.starts_with("/v4/")
@@ -22234,6 +22337,7 @@ fn service_route_with_account(route: &str, account_id: Option<&str>) -> String {
     )
 }
 
+#[cfg(test)]
 fn percent_encode_query_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -22248,6 +22352,7 @@ fn percent_encode_query_component(value: &str) -> String {
     encoded
 }
 
+#[cfg(test)]
 fn service_history_route(period_id: &str, cursor: Option<&str>) -> String {
     let mut route = format!(
         "/v3/history?period={}",
@@ -22260,6 +22365,7 @@ fn service_history_route(period_id: &str, cursor: Option<&str>) -> String {
     route
 }
 
+#[cfg(test)]
 fn is_exact_stale_cursor_response(response: &ServiceDetailsHttpResponse) -> bool {
     // `request_service_details_with_etag` has already required no-store,
     // exact JSON content type, exact Content-Length, connection close, and no
@@ -22281,6 +22387,7 @@ fn is_exact_stale_cursor_response(response: &ServiceDetailsHttpResponse) -> bool
         && object.get("error").and_then(Value::as_str) == Some("stale_cursor")
 }
 
+#[cfg(test)]
 fn fetch_service_history_page<F>(
     mut request: F,
     period_id: &str,
@@ -22315,6 +22422,7 @@ where
     Ok(ServiceResourceFetch::Fresh { pair, value: page })
 }
 
+#[cfg(test)]
 fn fetch_service_threads_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
@@ -22355,6 +22463,7 @@ enum LaunchMode {
     /// The public binary is a REST client. Recorder and REST are separate
     /// packaged executables and are never started by this process.
     Ui(ApiServerConfig),
+    Readback(ApiServerConfig),
     /// Print CLI usage without starting a daemon or UI.
     Help,
 }
@@ -22390,6 +22499,10 @@ where
         [] => default_service_config().map(LaunchMode::Ui),
         [value] if value == "--help" || value == "--h" || value == "-h" => Ok(LaunchMode::Help),
         [value] if value == "--ui" => default_service_config().map(LaunchMode::Ui),
+        [value] if value == "--wire-readback" => default_service_config().map(LaunchMode::Readback),
+        [readback, port, value] if readback == "--wire-readback" && port == "--port" => {
+            service_config_for_port(value).map(LaunchMode::Readback)
+        }
         // These were legacy combined-service controls. Reject them before
         // probing, stopping, binding, or spawning anything.
         [stop] if stop == "--stop" => Err(I18n::detect().language().launch_help().to_owned()),
@@ -22419,6 +22532,7 @@ enum ServiceEndpointState {
     Unrecognized,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VersionedServiceHealth {
@@ -22443,6 +22557,7 @@ enum ServiceHealthDocument {
     Legacy(LegacyServiceHealth),
 }
 
+#[cfg(test)]
 fn is_product_version(value: &str) -> bool {
     codex_info_rest_contract::valid_runtime_version(value)
 }
@@ -22536,6 +22651,7 @@ fn service_endpoint_state(address: SocketAddr) -> ServiceEndpointState {
     }
 }
 
+#[cfg(test)]
 fn service_is_healthy(address: SocketAddr) -> bool {
     let timeout = Duration::from_millis(150);
     let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
@@ -22672,14 +22788,19 @@ fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) 
 }
 
 const SERVICE_CURRENT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
 const SERVICE_ACCOUNTS_POLL_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
 const SERVICE_HISTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
 const SERVICE_THREADS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
 fn service_poll_due(last_poll: Instant, force: bool, interval: Duration, now: Instant) -> bool {
     force || (now >= last_poll && now.duration_since(last_poll) >= interval)
 }
 
+#[cfg(test)]
 fn merge_service_history_samples(
     mut base: Vec<PublicHistoryObservationV3>,
     incoming: Vec<PublicHistoryObservationV3>,
@@ -22713,6 +22834,7 @@ fn merge_service_history_samples(
     Ok(rows.into_values().collect())
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServiceCurrentPollOutcome {
     NotDue,
@@ -22720,6 +22842,7 @@ enum ServiceCurrentPollOutcome {
     Failure,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServiceAccountsPollOutcome {
     NotDue,
@@ -22728,6 +22851,7 @@ enum ServiceAccountsPollOutcome {
     Failure,
 }
 
+#[cfg(test)]
 fn service_accounts_ready(state: &CodexInfoState) -> bool {
     state.service_accounts_known
         && (!state.service_accounts_supported
@@ -22735,6 +22859,7 @@ fn service_accounts_ready(state: &CodexInfoState) -> bool {
             || state.service_selected_account_id.is_some())
 }
 
+#[cfg(test)]
 fn poll_service_accounts_with<F>(
     state: &mut CodexInfoState,
     now: Instant,
@@ -22810,6 +22935,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn poll_service_current_resources_with<F>(
     state: &mut CodexInfoState,
     now: Instant,
@@ -22986,6 +23112,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn poll_service_current_resources(
     state: &mut CodexInfoState,
     service_endpoint: SocketAddr,
@@ -22997,6 +23124,7 @@ fn poll_service_current_resources(
     })
 }
 
+#[cfg(test)]
 fn poll_service_graph_resources(
     state: &mut CodexInfoState,
     service_endpoint: SocketAddr,
@@ -23009,6 +23137,7 @@ fn poll_service_graph_resources(
     });
 }
 
+#[cfg(test)]
 fn request_graph_resource_with_origin<F>(
     route: &str,
     prior: Option<&str>,
@@ -23040,6 +23169,7 @@ where
     request(route, prior)
 }
 
+#[cfg(test)]
 fn request_service_directory_v5<F>(
     route: &str,
     request: &mut F,
@@ -23158,13 +23288,11 @@ fn select_service_history_and_poll(
     label: &str,
     service_endpoint: SocketAddr,
 ) {
-    select_service_history_and_poll_with(state, label, Instant::now(), |route, if_none_match| {
-        request_graph_resource_with_origin(route, if_none_match, |route, prior| {
-            request_service_details_with_etag(service_endpoint, route, prior)
-        })
-    });
+    let _ = service_endpoint;
+    state.select_history(label);
 }
 
+#[cfg(test)]
 fn select_service_history_and_poll_with<F>(
     state: &mut CodexInfoState,
     label: &str,
@@ -23177,6 +23305,7 @@ fn select_service_history_and_poll_with<F>(
     poll_service_graph_resources_with(state, now, true, request);
 }
 
+#[cfg(test)]
 fn poll_service_graph_resources_with<F>(
     state: &mut CodexInfoState,
     now: Instant,
@@ -23459,6 +23588,7 @@ fn poll_service_graph_resources_with<F>(
     }
 }
 
+#[cfg(test)]
 fn poll_service_threads_resources_with<F>(state: &mut CodexInfoState, now: Instant, mut request: F)
 where
     F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
@@ -23511,29 +23641,14 @@ where
     }
 }
 
+#[cfg(test)]
 fn poll_service_threads_resources(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
     poll_service_threads_resources_with(state, Instant::now(), |route, if_none_match| {
         request_service_details_with_etag(service_endpoint, route, if_none_match)
     });
 }
 
-fn run_ui_service_timer_cycle_with_windows(
-    state: &mut CodexInfoState,
-    service_endpoint: SocketAddr,
-    graph_open: bool,
-    threads_open: bool,
-) {
-    run_ui_service_timer_cycle_with_owner_check(
-        state,
-        service_endpoint,
-        graph_open,
-        threads_open,
-        // The UI trusts only the REST health contract. Recorder ownership is
-        // deliberately outside this process and must not gate client reads.
-        service_is_healthy,
-    );
-}
-
+#[cfg(test)]
 fn run_ui_service_timer_cycle_with_owner_check(
     state: &mut CodexInfoState,
     service_endpoint: SocketAddr,
@@ -23551,6 +23666,7 @@ fn run_ui_service_timer_cycle_with_owner_check(
     );
 }
 
+#[cfg(test)]
 fn run_ui_service_timer_cycle_with_owner_check_and_current_poll(
     state: &mut CodexInfoState,
     service_endpoint: SocketAddr,
@@ -24511,16 +24627,7 @@ fn run_ui(
                 let japanese = state_ref.i18n.language().code() == "ja";
                 window
                     .set_runtime_versions_text(native_runtime_versions_text(None, japanese).into());
-                let weak_window = window.as_weak();
-                thread::spawn(move || {
-                    let runtime = fetch_service_runtime_versions(service_endpoint).ok();
-                    let text = native_runtime_versions_text(runtime.as_ref(), japanese);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(window) = weak_window.upgrade() {
-                            window.set_runtime_versions_text(text.into());
-                        }
-                    });
-                });
+
                 drop(state_ref);
                 let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
             }
@@ -24601,6 +24708,8 @@ fn run_ui(
     let threads_window_for_timer = Rc::clone(&threads_window);
     let settings_window_for_timer = Rc::clone(&settings_window);
     let timer = Timer::default();
+    let wire_worker =
+        (!state.borrow().preview).then(|| ui_wire::Worker::start(service_config.listen_addr()));
     if !state.borrow().preview {
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
             if let Some(ui) = weak_ui.upgrade() {
@@ -24627,12 +24736,14 @@ fn run_ui(
                     .as_ref()
                     .is_some_and(|window| window.window().is_visible());
                 let mut state = state.borrow_mut();
-                run_ui_service_timer_cycle_with_windows(
-                    &mut state,
-                    service_config.listen_addr(),
-                    graph_open,
-                    threads_open,
-                );
+                let settings_open = settings_window_for_timer
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|window| window.window().is_visible());
+                if let Some(worker) = wire_worker.as_ref() {
+                    worker.tick(&mut state, graph_open, threads_open, settings_open);
+                }
+                state.poll_auth_control();
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
                     // Keep the period selector responsive and stable while
@@ -24650,6 +24761,13 @@ fn run_ui(
                 if let Some(window) = settings_window_for_timer.borrow().as_ref() {
                     if window.window().is_visible() {
                         sync_settings_accounts(&state, window);
+                        window.set_runtime_versions_text(
+                            native_runtime_versions_text(
+                                state.wire_runtime.as_ref(),
+                                state.i18n.language().code() == "ja",
+                            )
+                            .into(),
+                        );
                     }
                 }
             }
@@ -24680,6 +24798,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui_client_only_mode().map_err(std::io::Error::other)?;
             run_ui(None, config)
         }
+        LaunchMode::Readback(config) => ui_wire_readback::run(config.listen_addr()),
         LaunchMode::Help => {
             let language = I18n::detect().language();
             let help =

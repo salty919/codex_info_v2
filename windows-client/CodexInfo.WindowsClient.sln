@@ -11,6 +11,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodexInfo.WindowsClient.Cor
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodexInfo.WindowsClient.Presentation.Tests", "tests\CodexInfo.WindowsClient.Presentation.Tests\CodexInfo.WindowsClient.Presentation.Tests.csproj", "{E5E14B9B-15A3-4B7F-972C-AF4B22E5C926}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodexInfo.WindowsClient.E2E.FixtureHost", "tests\CodexInfo.WindowsClient.E2E.FixtureHost\CodexInfo.WindowsClient.E2E.FixtureHost.csproj", "{4A514BE1-8B35-4F43-BA25-690F14F2B32B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -69,6 +71,18 @@ Global
 		{E5E14B9B-15A3-4B7F-972C-AF4B22E5C926}.Release|x64.Build.0 = Release|Any CPU
 		{E5E14B9B-15A3-4B7F-972C-AF4B22E5C926}.Release|x86.ActiveCfg = Release|Any CPU
 		{E5E14B9B-15A3-4B7F-972C-AF4B22E5C926}.Release|x86.Build.0 = Release|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Debug|x64.Build.0 = Debug|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Debug|x86.Build.0 = Debug|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Release|x64.ActiveCfg = Release|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Release|x64.Build.0 = Release|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Release|x86.ActiveCfg = Release|Any CPU
+		{4A514BE1-8B35-4F43-BA25-690F14F2B32B}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

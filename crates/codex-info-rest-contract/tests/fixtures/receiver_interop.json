@@ -1,0 +1,283 @@
+{
+  "pages": [
+    {
+      "data": {
+        "changes": [
+          {
+            "account": null,
+            "base_image": null,
+            "removes": [],
+            "sets": [
+              {
+                "key": [
+                  "main"
+                ],
+                "value": {
+                  "ref": 19
+                }
+              }
+            ],
+            "target_image": "0367276e4f0d040f3f40e1e638703d4883a2558633870d9bb5b06303867e7cbd",
+            "view_id": "main-view"
+          }
+        ],
+        "completed_views": [
+          "main-view"
+        ],
+        "definitions": [
+          {
+            "id": 1,
+            "kind": "text",
+            "value": "ready"
+          },
+          {
+            "id": 2,
+            "kind": "bool",
+            "value": true
+          },
+          {
+            "id": 3,
+            "kind": "null",
+            "value": null
+          },
+          {
+            "id": 4,
+            "kind": "u64",
+            "value": 0
+          },
+          {
+            "id": 5,
+            "kind": "f64",
+            "value": 1.0
+          },
+          {
+            "id": 6,
+            "kind": "f64",
+            "value": 0.0
+          },
+          {
+            "id": 7,
+            "kind": "f64",
+            "value": -0.0
+          },
+          {
+            "id": 8,
+            "kind": "f64",
+            "value": 2.0
+          },
+          {
+            "id": 9,
+            "kind": "text",
+            "value": "stored"
+          },
+          {
+            "id": 10,
+            "kind": "f64",
+            "value": 3.0
+          },
+          {
+            "id": 11,
+            "kind": "model_cost",
+            "value": {
+              "cache_write_input_dollars": {
+                "ref": 5
+              },
+              "cached_input_dollars": {
+                "ref": 6
+              },
+              "ordinary_input_dollars": {
+                "ref": 7
+              },
+              "output_dollars": {
+                "ref": 8
+              },
+              "price_revision": {
+                "ref": 9
+              },
+              "total_dollars": {
+                "ref": 10
+              }
+            }
+          },
+          {
+            "id": 12,
+            "kind": "u64",
+            "value": 18446744073709551615
+          },
+          {
+            "id": 13,
+            "kind": "text",
+            "value": "codex"
+          },
+          {
+            "id": 14,
+            "kind": "model_usage",
+            "value": {
+              "cache_write_input_tokens": {
+                "ref": 3
+              },
+              "cached_input_tokens": {
+                "ref": 4
+              },
+              "estimated_cost": {
+                "ref": 11
+              },
+              "input_tokens": {
+                "ref": 12
+              },
+              "model": {
+                "ref": 13
+              },
+              "output_tokens": {
+                "ref": 4
+              },
+              "total_tokens": {
+                "ref": 12
+              }
+            }
+          },
+          {
+            "id": 15,
+            "kind": "list",
+            "value": [
+              {
+                "ref": 14
+              }
+            ]
+          },
+          {
+            "id": 16,
+            "kind": "text",
+            "value": "complete"
+          },
+          {
+            "id": 17,
+            "kind": "i64",
+            "value": 100
+          },
+          {
+            "id": 18,
+            "kind": "text",
+            "value": "fixed"
+          },
+          {
+            "id": 19,
+            "kind": "main",
+            "value": {
+              "acquisition_state": {
+                "ref": 1
+              },
+              "authenticated": {
+                "ref": 2
+              },
+              "models": {
+                "ref": 15
+              },
+              "models_status": {
+                "ref": 16
+              },
+              "observed_at": {
+                "ref": 17
+              },
+              "plan_label": {
+                "ref": 18
+              },
+              "quota": {
+                "ref": 3
+              },
+              "selection": {
+                "ref": 3
+              },
+              "thread_summary": {
+                "ref": 3
+              }
+            }
+          }
+        ],
+        "delivery_id": "delivery-100",
+        "fragments": [],
+        "next_cursor": null,
+        "patches": [],
+        "result": "data"
+      },
+      "main_id": 19,
+      "root": "a02879fdf9c7fb6c574d7f0b02c1a9f6e3689c131435041a393883b3a3c35918",
+      "view_keys": {
+        "main-view": [
+          "/state",
+          {
+            "account": null,
+            "parts": "main"
+          }
+        ]
+      }
+    },
+    {
+      "data": {
+        "changes": [
+          {
+            "account": null,
+            "base_image": "0367276e4f0d040f3f40e1e638703d4883a2558633870d9bb5b06303867e7cbd",
+            "removes": [],
+            "sets": [
+              {
+                "key": [
+                  "main"
+                ],
+                "value": {
+                  "ref": 21
+                }
+              }
+            ],
+            "target_image": "db0ab85e3e9636066f4575823e0feb84115ea24bf8e616988946552ef0df1dab",
+            "view_id": "main-view"
+          }
+        ],
+        "completed_views": [
+          "main-view"
+        ],
+        "definitions": [
+          {
+            "id": 20,
+            "kind": "i64",
+            "value": 101
+          }
+        ],
+        "delivery_id": "delivery-101",
+        "fragments": [],
+        "next_cursor": null,
+        "patches": [
+          {
+            "base": {
+              "ref": 19
+            },
+            "id": 21,
+            "kind": "main",
+            "ops": [
+              {
+                "op": "set",
+                "path": "/observed_at",
+                "value": {
+                  "ref": 20
+                }
+              }
+            ]
+          }
+        ],
+        "result": "data"
+      },
+      "main_id": 21,
+      "root": "26a4b70288e7a3c6fb25da70cc813832c52540b5104c1a4a25aec98c7b9c399a",
+      "view_keys": {
+        "main-view": [
+          "/state",
+          {
+            "account": null,
+            "parts": "main"
+          }
+        ]
+      }
+    }
+  ],
+  "source": "Rust/.NET receiver parity; fixed values anchored by independent Python byte vectors"
+}

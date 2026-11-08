@@ -11,6 +11,7 @@ import os
 import pathlib
 import re
 import shutil
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -25,6 +26,38 @@ BUNDLE_TEST = ROOT / "scripts/test_linux_bundle.sh"
 BUILDER = ROOT / "scripts/build_linux_bundle.sh"
 RECORDER_PID = 70001
 REST_PID = 70002
+
+# The fake installed UI models its public --wire-readback entrypoint. Literal
+# legacy-shaped domain fixtures are translated only inside this offline mock.
+READBACK_PREFIX = r'''#!/usr/bin/python3
+import json, os, pathlib, sys
+if sys.argv[1:] == ["--wire-readback"]:
+    manifest = pathlib.Path(__file__).parent / "manifest.json"
+    version = json.loads(manifest.read_text())["version"]
+    status = os.environ.get("FAKE_CURRENT_STATUS", "200")
+    with pathlib.Path(os.environ["FAKE_LOG"]).open("a") as log:
+        log.write("wire-readback " + status + "\n")
+    if status != "200" or os.environ.get("FAKE_HEALTH_FAIL_VERSION") == version:
+        raise SystemExit(1)
+    value = json.loads(os.environ.get("FAKE_CURRENT_BODY", "null"))
+    if value is None:
+        value = dict(state="auth_required", observed_at=None, authenticated=False,
+                     plan_label=None, quota=None, models_status="unavailable", models=[],
+                     active_thread_count=0, open_session_thread_count=0)
+    value.pop("api_version", None)
+    value["acquisition_state"] = value.pop("state")
+    running, opened = value.pop("active_thread_count"), value.pop("open_session_thread_count")
+    value["selection"] = dict(account_id="account-1", login_id=None, is_current=True)
+    value["thread_summary"] = dict(open_count=opened, running_count=running,
+        unknown_activity_count=0, by_model=[dict(model=None, open_count=opened)] if opened else [])
+    for model in value["models"]:
+        cost = model.get("estimated_cost")
+        if cost is not None and "price_version" in cost:
+            cost["price_revision"] = cost.pop("price_version")
+    print(json.dumps(dict(main=value, runtime=dict(rest_product_version=version,
+        recorder_product_version=version, recorder_status="available"))))
+    raise SystemExit(0)
+'''
 
 
 def digest(path):
@@ -206,8 +239,11 @@ class EffectiveRecorderUpdateTests(unittest.TestCase):
         source = INSTALLER.read_text()
         function = source.split("health_readback() {\n", 1)[1].split("\n}\n", 1)[0]
         urls = "\n".join(re.findall(r"^(?:HEALTH|CURRENT|DETAILS)_URL=.*$", source, re.M))
+        generation = self.current().resolve(strict=True)
+        version, source_id, manifest_hash = generation.name.split("-")
         shell = """set -euo pipefail
-generations_dir=/unused
+generations_dir="$(dirname "$(readlink -f "$HOME/.local/share/codex-info/current")")"
+share_dir="$HOME/.local/share/codex-info"
 HEALTH_TIMEOUT=30
 readiness_deadline=0
 CURL_BIN=curl
@@ -218,7 +254,7 @@ proc_starttime() { printf 101; }
 systemd_pid() { printf 7; }
 recorder_systemd_pid() { printf 8; }
 safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
-""" + urls + "\nhealth_readback() {\n" + function + "\n}\nhealth_readback 7 101 1.0.19 source manifest hash\n"
+""" + urls + "\nhealth_readback() {\n" + function + "\n}\nhealth_readback 7 101 " + " ".join(map(shlex.quote, (version, source_id, manifest_hash, "hash"))) + "\n"
         return subprocess.run(  # noqa: S603 -- repository function and isolated fake HTTP environment.  # nosec B603 B607
             ["/bin/bash", "--noprofile", "--norc", "-c", shell], env=self.env,
             capture_output=True, text=True, check=False, timeout=5,
@@ -243,7 +279,9 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
             if name == "codex_info_recorder" and recorder_bytes is not None:
                 path.write_bytes(recorder_bytes)
             elif name == "codex_info" and ui_bytes is not None:
-                path.write_bytes(ui_bytes)
+                path.write_bytes(self.ui_with_readback(ui_bytes))
+            elif name == "codex_info":
+                path.write_bytes(self.ui_with_readback(b"#!/bin/sh\nexit 0\n"))
             else:
                 path.write_text(f"trusted fixture product {name} {version}\n")
             path.chmod(0o755)
@@ -254,6 +292,14 @@ safe_blocked() { printf '%s\\n' "$*" >&2; exit 3; }
         )
         self.assertEqual(result.returncode, 0, "fixture bundle build failed:\n" + result.stderr)
         return self.root / f"output/codex-info-{version}-x86_64-unknown-linux-gnu.tar.gz"
+
+    @staticmethod
+    def ui_with_readback(payload):
+        continuation = ("\nimport tempfile\n"
+                        "handle,path=tempfile.mkstemp(prefix='fixture-ui-',dir=os.environ['TMPDIR'])\n"
+                        "with os.fdopen(handle,'wb') as stream: stream.write(" + repr(payload) + ")\n"
+                        "os.chmod(path,0o700)\nos.execv(path,[path,*sys.argv[1:]])\n")
+        return (READBACK_PREFIX + continuation).encode()
 
     def local_recovery_bundle(self, version="1.0.19", ui_bytes=None):
         archive = self.bundle(version, "2" * 40, recorder_bytes=b"local repaired recorder\n",
@@ -1942,7 +1988,7 @@ exec /usr/bin/python3 -B "$@"
                         FAKE_REJECT_LEGACY_DETAILS="1")
         result = self.current_readiness()
         log = pathlib.Path(self.env["FAKE_LOG"]).read_text()
-        self.assertIn("current-v4 200", log, result.stdout + result.stderr + log)
+        self.assertIn("wire-readback 200", log, result.stdout + result.stderr + log)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("rejected-legacy-details", log)
         self.preserved_profile()
@@ -1999,7 +2045,7 @@ exec /usr/bin/python3 -B "$@"
         result = self.current_readiness()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         log = pathlib.Path(self.env["FAKE_LOG"]).read_text()[len(before):]
-        self.assertIn("current-v4 503", log)
+        self.assertIn("wire-readback 503", log)
         self.assertNotIn("/v1/details", log)
         self.preserved_profile()
 
@@ -2876,15 +2922,32 @@ class CurrentModelIdentityTests(unittest.TestCase):
     def probe(self, document):
         source = INSTALLER.read_text()
         owner = source.index("health_readback() {\n")
-        marker = "    python3 -c '\n"
+        marker = "retained_observed_at=\"$(python3 -c '\n"
         start = source.index(marker, owner) + len(marker)
         end = source.index(
-            "\n' \"$current_version\" <<< \"$details\" || return 1", start
+            "\n' \"$version\" <<< \"$response\")\" || return 1", start
         )
         validator = source[start:end]
+        # The old literal domain cases remain independent oracles. Translate
+        # their field spelling at this test boundary, not through a public API.
+        document = json.loads(json.dumps(document))
+        document.pop("api_version")
+        document["acquisition_state"] = document.pop("state")
+        running = document.pop("active_thread_count")
+        opened = document.pop("open_session_thread_count")
+        document["selection"] = {"default_account_id": "account-1", "selected_account_id": "account-1"}
+        document["thread_summary"] = {"open_count": opened, "running_count": running,
+                                      "unknown_activity_count": 0,
+                                      "by_model": [{"model": None, "open_count": opened}] if opened else []}
+        for model in document["models"]:
+            cost = model["estimated_cost"]
+            if cost is not None:
+                cost["price_revision"] = cost.pop("price_version")
+        response = {"main": document, "runtime": {"rest_product_version": "1.0.19",
+                    "recorder_product_version": "1.0.19", "recorder_status": "available"}}
         return subprocess.run(  # noqa: S603 -- repository validator with fixture JSON passed only on stdin.
-            [sys.executable, "-B", "-c", validator, "v4"],
-            input=json.dumps(document), text=True, capture_output=True,
+            [sys.executable, "-B", "-c", validator, "1.0.19"],
+            input=json.dumps(response), text=True, capture_output=True,
             check=False, timeout=5,
         )
 

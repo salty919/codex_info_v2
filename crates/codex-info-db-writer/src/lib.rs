@@ -709,7 +709,6 @@ const LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION: i64 = 10;
 const MODEL_PRICING_PREVIOUS_SCHEMA_VERSION: i64 = 11;
 const SESSION_TOKEN_ANCHOR_PREVIOUS_SCHEMA_VERSION: i64 = 12;
 const MAX_LOGIN_ID_SCALARS: usize = 254;
-const MAX_ACTIVE_THREADS: usize = 256;
 const MAX_ACTIVE_THREAD_ID_SCALARS: usize = 512;
 const MAX_ACTIVE_THREAD_TITLE_SCALARS: usize = 512;
 const MAX_ACTIVE_THREAD_MODEL_SCALARS: usize = 128;
@@ -924,11 +923,6 @@ fn canonical_active_thread_snapshot(snapshot: &ActiveThreadSnapshot) -> Result<(
             field: "active thread snapshot",
             value: snapshot.observed_at,
         });
-    }
-    if snapshot.threads.len() > MAX_ACTIVE_THREADS {
-        return Err(UsageStoreError::InvalidImport(
-            "active thread snapshot contains too many threads".into(),
-        ));
     }
     let mut ids = BTreeSet::new();
     let mut threads = snapshot.threads.clone();
@@ -17619,6 +17613,29 @@ mod tests {
             is_subagent: false,
             depth: Some(0),
         }
+    }
+
+    #[test]
+    fn active_thread_storage_keeps_more_than_one_wire_page() {
+        let snapshot = ActiveThreadSnapshot {
+            observed_at: 1_800_000_060,
+            threads: (0..257)
+                .map(|id| active_thread(&format!("thread-{id}"), 1_800_000_000))
+                .collect(),
+        };
+        let (_, encoded) = canonical_active_thread_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
+                .unwrap()
+                .len(),
+            257
+        );
+        let mut invalid = snapshot;
+        invalid.threads[256].id = invalid.threads[0].id.clone();
+        assert!(
+            canonical_active_thread_snapshot(&invalid).is_err(),
+            "removing a transport page bound must retain source identity validation"
+        );
     }
 
     #[test]

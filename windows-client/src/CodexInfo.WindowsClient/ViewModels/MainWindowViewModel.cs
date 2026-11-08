@@ -144,6 +144,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     /// <summary>The bounded resource transport, when the v3 split contract is available.</summary>
     internal ILoopbackResourceClient? SplitResourceClient => detailsClient as ILoopbackResourceClient;
+    internal IUiChangeClient? UiChangeClient => detailsClient as IUiChangeClient;
+    internal void SetApiViewVisible(string view, bool visible) { if (detailsClient is ILoopbackUiClient client) client.SetViewVisible(view, visible); }
+
     internal ILoopbackRuntimeVersionsClient? RuntimeVersionsClient =>
         detailsClient as ILoopbackRuntimeVersionsClient ?? healthClient as ILoopbackRuntimeVersionsClient;
 
@@ -274,6 +277,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     public string UpdateButtonText => update?.ActionText ?? Texts.UpdateButtonText;
 
     public bool ShowLastReceived => IsAuthenticated &&
+        !HasCurrentDataApiError &&
         !IsUpdateNotificationVisible &&
         !IsRetryVisible &&
         !IsRefreshingVisible;
@@ -305,7 +309,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 return !disposed &&
                     !initialLoadPending &&
                     !refreshing &&
-                    hasConnectionFailure &&
+                    (hasConnectionFailure || detailsFailure == DetailsFetchFailure.Response) &&
                     !IsAuthRequired &&
                     !IsUpdateActionVisible;
             }
@@ -386,9 +390,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     public bool HasActiveThreads => !historicalActivitySuppressed && ActiveThreadCount > 0;
 
     public bool HasLiveThreadSummary => !historicalActivitySuppressed && !IsSelectedAccountHistorical &&
-        detailsSnapshot is { State: ApiState.Ready or ApiState.Error, Authenticated: true };
+        detailsSnapshot is { State: ApiState.Ready or ApiState.Error, Authenticated: true } &&
+        (!detailsSnapshot.UseStoredPrices || detailsSnapshot.ThreadSummary is not null);
 
-    public bool HasNoActiveThreads => !historicalActivitySuppressed && !HasActiveThreads;
+    public bool HasNoActiveThreads => !historicalActivitySuppressed && !HasActiveThreads &&
+        (detailsSnapshot?.UseStoredPrices != true || detailsSnapshot.ThreadSummary is not null);
 
     public bool HasHistoricalThreadNotice => historicalActivitySuppressed;
 
@@ -397,9 +403,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// model breakdown use the same accepted rows. Legacy details retain their
     /// running-only scalar contract.
     /// </summary>
-    public ulong ActiveThreadCount => detailsSnapshot is { ApiVersion: "v3" or "v4" } v3
-        ? (ulong)v3.Threads.Count
-        : detailsSnapshot?.ActiveThreadCount ?? 0;
+    public ulong ActiveThreadCount => detailsSnapshot?.ThreadSummary?.OpenCount ??
+        (detailsSnapshot is { ApiVersion: "v3" or "v4" } rows ? (ulong)rows.Threads.Count : detailsSnapshot?.ActiveThreadCount ?? 0);
 
     public string ActiveThreadCountLabel => historicalActivitySuppressed
         ? Texts.UnavailableValue
@@ -547,6 +552,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string EstimatedCostText => detailsSnapshot switch
     {
+        { UseStoredPrices: true } snapshot => FormatV3EstimatedCost(snapshot.Models),
         { ApiVersion: "v3" or "v4" } snapshot => FormatV3EstimatedCost(snapshot.Models),
         { } snapshot => snapshot.EstimatedCostLabel,
         _ => Texts.EstimatedUnavailable,
@@ -618,6 +624,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         get
         {
+            if (detailsFailure == DetailsFetchFailure.CacheRecovery) return Texts.LanguageCode == "ja" ? "受領データの復旧が必要です。接続エラーではありません。" : "The received-data cache requires recovery.";
             if (IsHistoricalDetails && detailsFailure is null)
             {
                 var historical = detailsSnapshot?.State == ApiState.Error
@@ -630,7 +637,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 presentationState.ToString(),
                 authLaunchFailed,
                 detailsSnapshot is not null);
-            return IsRetryVisible && lastReceivedAt is not null
+            return (IsRetryVisible || HasCurrentDataApiError) && lastReceivedAt is not null
                 ? $"{detail} {LastReceivedText}"
                 : detail;
         }
@@ -745,6 +752,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         return true;
     }
 
+    internal async Task EnsureAccountContextAsync(CancellationToken token)
+    {
+        if (detailsClient is not ILoopbackUiClient client || SelectedAccountId is not { } id) return;
+        var context = await client.FetchAccountContextAsync(id, token).ConfigureAwait(false);
+        if (context is not null) await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => ApplyAccountContext(context));
+    }
+    internal void ApplyAccountContext(ApiAccount context)
+    {
+        lock (stateGate)
+        {
+            if (selectedAccount?.Id != context.Id || SameOwnershipIntervals(selectedAccount.OwnershipIntervals, context.OwnershipIntervals) && selectedAccount.ActivationAt == context.ActivationAt && selectedAccount.DeactivationAt == context.DeactivationAt) return;
+            selectedAccount = selectedAccount with { ActivationAt = context.ActivationAt, DeactivationAt = context.DeactivationAt, OwnershipIntervals = context.OwnershipIntervals };
+            Notify(nameof(SelectedAccount));
+        }
+    }
     private bool ApplyAccountsSnapshot(ApiAccountsSnapshot snapshot)
     {
         var previousId = selectedAccount?.Id;
@@ -927,9 +949,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         try
         {
-            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
-            while (await timer.WaitForNextTickAsync(cancellationToken))
+            if (detailsClient is not IUiChangeClient changes) return;
+            var revision = changes.ChangeRevision;
+            while (!cancellationToken.IsCancellationRequested)
             {
+                revision = await changes.WaitForChangeAsync(revision, cancellationToken);
                 await RunPeriodicRefreshAsync();
             }
         }
@@ -1172,6 +1196,49 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private async Task FetchCycleAsync(GenerationContext context, CancellationToken cancellationToken)
     {
+        if (detailsClient is ILoopbackUiClient uiClient)
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(TimeSpan.FromSeconds(3));
+            try
+            {
+                string? requested; lock (stateGate) requested = selectedAccount is { IsCurrent: false } ? selectedAccount.Id : null;
+                var result = await uiClient.FetchMainAsync(requested, includeChoices: uiClient.AccountChoicesVisible, deadline.Token);
+                MutateIfCurrent(context, () =>
+                {
+                    if (result.Choices is { } choices) ApplyAccountsSnapshot(choices);
+                    if (result.Current is not { } current)
+                    {
+                        if (result.Failure is { } failure && failure != DetailsFetchFailure.Pending)
+                        {
+                            detailsFailure = failure;
+                            Notify(nameof(DetailsStatusText));
+                            Notify(nameof(DetailsStatusAutomationText));
+                            ApplyFailure(failure);
+                        }
+                        return;
+                    }
+                    if (result.Choices is null && current.Selection is null && selectedAccount?.IsCurrent == true) ApplyAccountsSnapshot(new ApiAccountsSnapshot(null, accounts.Select(account => account with { IsCurrent = false }).ToArray()));
+                    if (result.Choices is null && current.Selection is { IsCurrent: true } selection)
+                    {
+                        // Main.selection owns identity and labels, not the
+                        // independently received account_context projection.
+                        var acceptedContext = selectedAccount?.Id == selection.Id
+                            ? selectedAccount : accounts.FirstOrDefault(account => account.Id == selection.Id);
+                        if (acceptedContext is not null)
+                            selection = selection with { ActivationAt = acceptedContext.ActivationAt, DeactivationAt = acceptedContext.DeactivationAt, OwnershipIntervals = acceptedContext.OwnershipIntervals };
+                        var selectionChoices = accounts.Where(account => account.Id != selection.Id).Select(account => account with { IsCurrent = false }).Append(selection).ToArray();
+                        ApplyAccountsSnapshot(new ApiAccountsSnapshot(selection.Id, selectionChoices));
+                    }
+                    if (selectedAccount?.Id != current.AccountId && current.AccountId is not null) { accountRefreshPending = true; return; }
+                    if (detailsSnapshot?.PublishedPair == current.PublishedPair && detailsSnapshot.ModelsStatus == current.ModelsStatus && !hasConnectionFailure && detailsFailure is null && presentationState is not (ClientPresentationState.TransportError or ClientPresentationState.ResponseError)) return;
+                    ApplyCurrentGeneration(current, Array.Empty<ApiThreadDetails>());
+                });
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+            catch (OperationCanceledException) { MutateIfCurrent(context, () => ApplyFailure(DetailsFetchFailure.Transport)); }
+            return;
+        }
         try
         {
             var health = await healthClient.FetchHealthAsync(cancellationToken);
@@ -1641,7 +1708,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         var historical = IsHistoricalSnapshot(validatedDetails);
         acceptedWireOpenSessionThreadCount = validatedDetails.OpenSessionThreadCount;
         acceptedWireActiveThreadCount = validatedDetails.ActiveThreadCount;
-        if ((validatedDetails.ApiVersion is "v3" or "v4") && !historical)
+        if (validatedDetails.ThreadSummary is null && (validatedDetails.ApiVersion is "v3" or "v4") && !historical)
         {
             var visibleThreads = WithoutStoppedParentSubtrees(validatedDetails.Threads);
             validatedDetails = validatedDetails with
@@ -1660,7 +1727,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 ? DateTimeOffset.FromUnixTimeSeconds(observedAt)
                 : null
             : DateTimeOffset.Now;
-        hasConnectionFailure = !historical && validatedDetails.State == ApiState.Error;
+        hasConnectionFailure = false;
         authLaunchFailed = false;
         authLaunchSucceeded = false;
         presentationState = historical
@@ -1756,6 +1823,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             "概算 —")
         {
             ApiVersion = current.ApiVersion,
+            UseStoredPrices = true,
+            ThreadSummary = historical ? null : current.ThreadSummary,
             ModelsStatus = current.ModelsStatus,
             OpenSessionThreadCount = historical ? 0 : current.OpenSessionThreadCount,
             PublishedPair = current.PublishedPair,
@@ -1798,8 +1867,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void ApplyFailure(DetailsFetchFailure failure)
     {
-        hasConnectionFailure = true;
-        presentationState = failure == DetailsFetchFailure.Response
+        if (failure == DetailsFetchFailure.Pending) return;
+        hasConnectionFailure = failure == DetailsFetchFailure.Transport;
+        presentationState = failure is DetailsFetchFailure.Response or DetailsFetchFailure.CacheRecovery
             ? ClientPresentationState.ResponseError
             : ClientPresentationState.TransportError;
         NotifyStatusProperties();
@@ -2138,11 +2208,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             return 0;
         }
 
+        if (detailsSnapshot.ThreadSummary is { } summary) return checked((int)summary.ByModel.Where(row => ClassifyThreadModel(row.Model ?? "", "") == model).Aggregate(0UL, (sum, row) => checked(sum + row.OpenCount)));
         return detailsSnapshot.Threads.Count(thread => ClassifyThreadModel(thread.Model, thread.ModelLabel) == model);
     }
 
     private string FormatThreadModelCount(string model, int generated)
     {
+        if (detailsSnapshot?.ThreadSummary is { } summary)
+        {
+            var count = summary.ByModel.Where(row => ClassifyThreadModel(row.Model ?? "", "") == model).Aggregate(0UL, (sum, row) => checked(sum + row.RunningCount));
+            return generated == 0 ? "0" : string.Create(CultureInfo.CurrentCulture, $"{count}（{generated}）");
+        }
         if (generated == 0 || detailsSnapshot is not { ApiVersion: "v3" or "v4" } snapshot)
         {
             return generated.ToString(CultureInfo.CurrentCulture);

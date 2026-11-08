@@ -22,17 +22,20 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     private bool saveFailed;
     private ApiRuntimeVersionsSnapshot? runtimeVersions;
     private bool refreshingVersions;
+    private readonly CancellationTokenSource visibilityLifetime = new();
 
     public SettingsViewModel(ClientSettingsStore store, MainWindowViewModel? main = null)
     {
         this.store = store;
         this.main = main;
+        main?.SetApiViewVisible("settings", true);
         selectedLanguageCode = LocalizationService.Current.LanguageCode;
         selectedTimeZoneId = App.CurrentSettings.TimeZoneId;
         selectedThemeId = App.CurrentSettings.ThemeId;
         LanguageOptions = new ReadOnlyCollection<UiText>(LocalizationService.Languages.ToList());
         LocalizationService.LanguageChanged += OnLanguageChanged;
         if (main is not null) main.PropertyChanged += OnMainPropertyChanged;
+        if (main?.UiChangeClient is not null) _ = WatchRuntimeAsync(visibilityLifetime.Token);
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -129,6 +132,13 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _ => Texts.LanguageCode == "ja" ? "稼働バージョンを取得できません" : "Runtime version unavailable",
     };
 
+    private async Task WatchRuntimeAsync(CancellationToken token)
+    {
+        if (main?.UiChangeClient is not { } client) return;
+        try { while (!token.IsCancellationRequested) { var revision = client.ChangeRevision; await RefreshRuntimeVersionsAsync(); await client.WaitForChangeAsync(revision, token); } }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+    }
+
     public async Task RefreshRuntimeVersionsAsync()
     {
         if (refreshingVersions) return;
@@ -196,8 +206,14 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         return true;
     }
 
+    private bool disposed;
     public void Dispose()
     {
+        if (disposed) return;
+        disposed = true;
+        main?.SetApiViewVisible("settings", false);
+        visibilityLifetime.Cancel();
+        visibilityLifetime.Dispose();
         ThemePalette.Apply(App.CurrentSettings.ThemeId);
         LocalizationService.LanguageChanged -= OnLanguageChanged;
         if (main is not null) main.PropertyChanged -= OnMainPropertyChanged;

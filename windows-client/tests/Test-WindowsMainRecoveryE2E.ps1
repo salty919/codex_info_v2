@@ -6,98 +6,42 @@ $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw 'Main recovery runner has syntax errors.' }
-$server = $ast.Find({ param($node)
-    $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
-    $node.Value.Contains('public static class CodexInfoWindowsE2EFixtureServer')
-}, $true)
-if ($null -eq $server) { throw 'Real HTTP fixture definition is missing.' }
-Add-Type -TypeDefinition $server.Value
-$fault = [CodexInfoWindowsE2EFixtureServer].GetField('CurrentUnavailable')
-if ($null -eq $fault) { throw 'Current HTTP failure cannot be exercised by the native Main acceptance path.' }
-
-function Read-RecoveryResponse {
-    param([string]$Route)
-    $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$script:recoveryPort$Route")
-    $request.Proxy = $null
-    $request.Timeout = 5000
-    $response = $null
-    try { $response = $request.GetResponse() }
-    catch [Net.WebException] {
-        if ($null -eq $_.Exception.Response) { throw }
-        $response = $_.Exception.Response
-    }
-    try {
-        $reader = [IO.StreamReader]::new($response.GetResponseStream())
-        try {
-            return @{ Status = [int]$response.StatusCode; Body = $reader.ReadToEnd(); Pair = $response.Headers['Codex-Info-Published-Pair'] }
-        }
-        finally { $reader.Dispose() }
-    }
-    finally { $response.Dispose() }
-}
-
+. (Join-Path $PSScriptRoot 'E2E-WireContractFixture.ps1')
+function Assert-E2E { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
+Initialize-E2EWireContractFixture
+$documents = New-E2EFixtureDocuments
+Start-E2EWireFixture -Documents $documents
 try {
-    if (-not [CodexInfoWindowsE2EFixtureServer]::Start('{}', '{"accounts":[]}', '{"api_version":"v3","quota":72,"active_thread_count":2,"open_session_thread_count":4}', '{}', '{}', '{}', '{}', '{}', '{}', 'fixture-pair', '1.2.3', 0)) {
-        throw 'Could not start the isolated HTTP fixture.'
-    }
-    $script:recoveryPort = [CodexInfoWindowsE2EFixtureServer]::BoundPort()
+    $baseline = @(Read-E2EWireContract '/state?parts=main')[0]
+    Assert-E2E ($baseline.quota.remaining_percent -eq 72 -and $baseline.models.Count -eq 3 -and $baseline.thread_summary.open_count -eq 4) 'Known baseline usage is missing.'
     foreach ($unavailable in @($false, $true, $false)) {
-        $fault.SetValue($null, $unavailable)
-        $current = Read-RecoveryResponse '/v3/current?account=account-7'
-        if ($unavailable) {
-            if ($current.Status -ne 503 -or -not [string]::IsNullOrEmpty($current.Pair)) {
-                throw 'Unavailable current must return HTTP 503 without a published pair.'
-            }
+        [CodexInfoWindowsE2EFixtureServer]::CurrentUnavailable = $unavailable
+        if ($unavailable) { $null = Read-E2EWireContract '/state?parts=main' -ExpectedStatus 503 }
+        else {
+            $current = @(Read-E2EWireContract '/state?parts=main')[0]
+            Assert-E2E (($current | ConvertTo-Json -Depth 40 -Compress) -ceq ($baseline | ConvertTo-Json -Depth 40 -Compress)) 'Recovery changed the recorded payload.'
         }
-        elseif ($current.Status -ne 200 -or $current.Body -cne '{"api_version":"v3","quota":72,"active_thread_count":2,"open_session_thread_count":4}' -or $current.Pair -cne 'fixture-pair') {
-            throw 'Healthy and recovered current must return the unchanged recorded payload and pair.'
-        }
-        $health = Read-RecoveryResponse '/v1/health'
-        $accounts = Read-RecoveryResponse '/v3/accounts'
-        if ($health.Status -ne 200 -or $accounts.Status -ne 200 -or $accounts.Body -cne '{"accounts":[]}') {
-            throw 'Current failure must not change health or account discovery.'
-        }
+        $runtime = @(Read-E2EWireContract '/state?parts=runtime')[0]
+        $choices = @(Read-E2EWireContract '/state?parts=account_choices')[0]
+        Assert-E2E ($runtime.rest_product_version -ceq '1.2.3' -and $choices.default_account_id -ceq 'account-7') 'Main failure must not change UI runtime or account choices.'
     }
-    $authentication = [CodexInfoWindowsE2EFixtureServer].GetField('AuthenticationRequired')
-    if ($null -eq $authentication) { throw 'Setup cannot exercise an unauthenticated current response.' }
-    $authentication.SetValue($null, $true)
-    $unauthenticated = Read-RecoveryResponse '/v3/current?account=account-7'
-    $body = $unauthenticated.Body | ConvertFrom-Json
-    if ($unauthenticated.Status -ne 200 -or $unauthenticated.Pair -cne 'fixture-pair' -or
-        $body.state -cne 'auth_required' -or $body.authenticated -ne $false -or
-        $null -ne $body.quota -or $null -ne $body.plan_label -or $null -ne $body.observed_at -or
-        @($body.models).Count -ne 0 -or $body.active_thread_count -ne 0) {
-        throw 'Unauthenticated current must contain no invented usage or plan.'
-    }
-    $authentication.SetValue($null, $false)
-    $recovered = Read-RecoveryResponse '/v3/current?account=account-7'
-    if ($recovered.Status -ne 200 -or $recovered.Body -cne '{"api_version":"v3","quota":72,"active_thread_count":2,"open_session_thread_count":4}') { throw 'Authentication recovery changed the original payload.' }
-    $v4 = [CodexInfoWindowsE2EFixtureServer].GetField('PartialCurrentV4')
-    if ($null -eq $v4) { throw 'Native Main cannot exercise a v4 partial current response.' }
-    if ((Read-RecoveryResponse '/v4/current?account=account-7').Status -ne 404) { throw 'Legacy fixture must retain exact v4 fallback.' }
-    $v4.SetValue($null, $true)
-    $partial = Read-RecoveryResponse '/v4/current?account=account-7'
-    $body = $partial.Body | ConvertFrom-Json
-    if ($partial.Status -ne 200 -or $partial.Pair -cne 'fixture-pair' -or
-        $body.api_version -cne 'v4' -or $body.models_status -cne 'partial' -or $body.quota -ne 72 -or
-        $body.active_thread_count -ne 2 -or $body.open_session_thread_count -ne 4) {
-        throw 'Partial v4 must preserve the recorded current values and pair.'
-    }
-    $empty = [CodexInfoWindowsE2EFixtureServer].GetField('EmptyThreads')
-    if ($null -eq $empty) { throw 'Native Threads cannot exercise a confirmed empty generation.' }
-    $empty.SetValue($null, $true)
-    $body = (Read-RecoveryResponse '/v4/current?account=account-7').Body | ConvertFrom-Json
-    $threads = (Read-RecoveryResponse '/v3/threads?account=account-7').Body | ConvertFrom-Json
-    if ($body.active_thread_count -ne 0 -or $body.open_session_thread_count -ne 0 -or
-        @($threads.threads).Count -ne 0 -or $body.quota -ne 72) {
-        throw 'Empty Threads must clear both counts and rows without changing quota.'
-    }
-    $empty.SetValue($null, $false)
-    $v4.SetValue($null, $false)
-    if ((Read-RecoveryResponse '/v4/current?account=account-7').Status -ne 404) { throw 'V4 fixture state did not reset.' }
-    Write-Host 'windows-main-recovery-fixture: PASS healthy, unavailable, authentication, v4 partial, empty threads and recovery'
-}
-finally { [CodexInfoWindowsE2EFixtureServer]::Stop() }
+    [CodexInfoWindowsE2EFixtureServer]::AuthenticationRequired = $true
+    $body = @(Read-E2EWireContract '/state?parts=main')[0]
+    Assert-E2E ($body.acquisition_state -ceq 'auth_required' -and -not $body.authenticated -and $null -eq $body.quota -and $null -eq $body.plan_label -and $null -eq $body.observed_at -and @($body.models).Count -eq 0 -and $null -eq $body.thread_summary) 'Unauthenticated Main must not invent usage or a plan.'
+    [CodexInfoWindowsE2EFixtureServer]::AuthenticationRequired = $false
+    [CodexInfoWindowsE2EFixtureServer]::PartialModels = $true
+    $body = @(Read-E2EWireContract '/state?parts=main')[0]
+    Assert-E2E ($body.models_status -ceq 'partial' -and $body.quota.remaining_percent -eq 72 -and ($body.models | ConvertTo-Json -Depth 20 -Compress) -ceq ($baseline.models | ConvertTo-Json -Depth 20 -Compress)) 'Partial known models must retain their exact token and price facts.'
+    [CodexInfoWindowsE2EFixtureServer]::EmptyThreads = $true
+    $body = @(Read-E2EWireContract '/state?parts=main')[0]
+    $threads = @(Read-E2EWireContract '/threads?account=account-7')
+    Assert-E2E ($body.thread_summary.open_count -eq 0 -and $body.thread_summary.running_count -eq 0 -and $threads.Count -eq 0 -and $body.quota.remaining_percent -eq 72) 'Confirmed empty Threads must clear counts and rows while retaining quota.'
+    [CodexInfoWindowsE2EFixtureServer]::EmptyThreads = $false
+    [CodexInfoWindowsE2EFixtureServer]::PartialModels = $false
+    $restored = @(Read-E2EWireContract '/state?parts=main')[0]
+    Assert-E2E (($restored | ConvertTo-Json -Depth 40 -Compress) -ceq ($baseline | ConvertTo-Json -Depth 40 -Compress)) 'Fixture controls must restore the exact baseline.'
+    Write-Host 'windows-main-recovery-fixture: PASS healthy, HTTP failure, authentication, partial known facts, empty threads and exact recovery'
+} finally { [CodexInfoWindowsE2EFixtureServer]::Stop() }
 
 $oracle = $ast.Find({ param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and

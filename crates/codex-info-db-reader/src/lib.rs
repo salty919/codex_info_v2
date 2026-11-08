@@ -91,7 +91,6 @@ const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
 const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
 const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
-const MAX_ACTIVE_THREADS: usize = 256;
 const MAX_ACTIVE_THREAD_JSON_BYTES: usize = 1024 * 1024;
 const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799;
 const MAX_LOGIN_ID_SCALARS: usize = 254;
@@ -108,6 +107,7 @@ pub struct DbSnapshot {
     pub has_pending_ranges: bool,
     /// Current acquisition health, independent of historical pending work.
     pub acquisition_degraded: bool,
+    pub thread_snapshot_known: bool,
     /// Current publication health and model completeness are independent.
     pub current: CurrentPublication,
     pub details: PublicDetails,
@@ -754,7 +754,7 @@ impl DbReader {
             transaction.commit()?;
             return Ok(None);
         };
-        let (_, acquisition_degraded) = read_active_thread_snapshot_or_degraded_for_intervals(
+        let (_, acquisition_degraded, _) = read_active_thread_snapshot_or_degraded_for_intervals(
             &transaction,
             &self.read_intervals,
         );
@@ -794,10 +794,11 @@ impl DbReader {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let commit = read_collection_commit(&transaction)?;
-        let (threads, acquisition_degraded) = read_active_thread_snapshot_or_degraded_for_intervals(
-            &transaction,
-            &self.read_intervals,
-        );
+        let (threads, acquisition_degraded, thread_snapshot_known) =
+            read_active_thread_snapshot_or_degraded_for_intervals(
+                &transaction,
+                &self.read_intervals,
+            );
         let history_is_canonical = self.expected_partition_identity.is_some();
         let quota = read_latest_quota_receipt(&transaction)?;
         let current_models = quota.as_ref().map(|receipt| {
@@ -1074,6 +1075,7 @@ impl DbReader {
             history_available,
             has_pending_ranges,
             acquisition_degraded,
+            thread_snapshot_known,
             current,
             details,
             models_v3,
@@ -1419,9 +1421,9 @@ struct StoredActiveThread {
 fn read_active_thread_snapshot_or_degraded_for_intervals(
     connection: &Connection,
     intervals: &ReadIntervals,
-) -> (Vec<PublicThread>, bool) {
+) -> (Vec<PublicThread>, bool, bool) {
     read_active_thread_snapshot_for_intervals(connection, intervals)
-        .unwrap_or_else(|_| (Vec::new(), true))
+        .unwrap_or_else(|_| (Vec::new(), true, false))
 }
 
 impl<'de> Deserialize<'de> for StoredActiveThread {
@@ -1627,9 +1629,9 @@ fn active_thread_table_shape(connection: &Connection) -> Result<bool, ReaderErro
 fn read_active_thread_snapshot_for_intervals(
     connection: &Connection,
     intervals: &ReadIntervals,
-) -> Result<(Vec<PublicThread>, bool), ReaderError> {
+) -> Result<(Vec<PublicThread>, bool, bool), ReaderError> {
     if !table_exists(connection, "active_thread_snapshot")? {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), false, false));
     }
     let has_degraded = active_thread_table_shape(connection)?;
     let count: i64 =
@@ -1659,7 +1661,7 @@ fn read_active_thread_snapshot_for_intervals(
         })
         .optional()?
     else {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), false, false));
     };
     if singleton != 1 {
         return Err(ReaderError::Schema(
@@ -1676,7 +1678,7 @@ fn read_active_thread_snapshot_for_intervals(
     // lifecycle intervals must not be reused merely because an individual
     // row's updated_at happens to fall inside an older interval.
     if !intervals.contains(observed_at) {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), false, false));
     }
     if !matches!(acquisition_degraded, 0 | 1) {
         return Err(ReaderError::InvalidValue(
@@ -1692,9 +1694,6 @@ fn read_active_thread_snapshot_for_intervals(
         serde_json::from_str(&threads_json).map_err(|error| {
             ReaderError::InvalidValue(format!("active thread JSON is invalid: {error}"))
         })?;
-    if stored.len() > MAX_ACTIVE_THREADS {
-        return Err(ReaderError::TooManyRows(stored.len()));
-    }
     let mut ids = HashSet::with_capacity(stored.len());
     for thread in &stored {
         if !ids.insert(thread.id.as_str()) {
@@ -1741,7 +1740,7 @@ fn read_active_thread_snapshot_for_intervals(
         ..PublicDetails::default()
     };
     validation.validate()?;
-    Ok((threads, acquisition_degraded == 1))
+    Ok((threads, acquisition_degraded == 1, true))
 }
 
 #[derive(Clone, Debug)]
@@ -12526,5 +12525,26 @@ mod tests {
             1_000,
             "legacy data is retained as display-only history"
         );
+    }
+}
+
+#[cfg(test)]
+mod wire_thread_known_tests {
+    use super::*;
+    #[test]
+    fn missing_thread_collection_is_unknown_but_recorded_empty_is_known() {
+        let connection = Connection::open_in_memory().unwrap();
+        let intervals = ReadIntervals::default();
+        let (rows, failed, known) =
+            read_active_thread_snapshot_or_degraded_for_intervals(&connection, &intervals);
+        assert!(rows.is_empty());
+        assert!(!failed);
+        assert!(!known);
+        connection.execute_batch("CREATE TABLE active_thread_snapshot(singleton INTEGER PRIMARY KEY,observed_at INTEGER NOT NULL,threads_json TEXT NOT NULL,acquisition_degraded INTEGER NOT NULL DEFAULT 0);INSERT INTO active_thread_snapshot VALUES(1,1800000000,'[]',0)").unwrap();
+        let (rows, failed, known) =
+            read_active_thread_snapshot_or_degraded_for_intervals(&connection, &intervals);
+        assert!(rows.is_empty());
+        assert!(!failed);
+        assert!(known);
     }
 }

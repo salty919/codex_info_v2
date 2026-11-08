@@ -6,6 +6,8 @@
 //! process boundary visible to Cargo as well as to the runtime.
 
 use serde::{Deserialize, Serialize};
+
+pub mod wire;
 use std::collections::HashSet;
 
 pub mod model_names;
@@ -123,7 +125,6 @@ pub const MAX_PUBLIC_MODELS: usize = 3;
 pub const MAX_PUBLIC_MODELS_V3: usize = 1_024;
 pub const MAX_PUBLIC_HISTORY_SAMPLES: usize = 31 * 24 * 60;
 pub const MAX_PUBLIC_HISTORY_GAPS: usize = 4_096;
-pub const MAX_PUBLIC_THREADS: usize = 256;
 pub const MAX_PUBLIC_ACCOUNTS: usize = 256;
 pub const MAX_PUBLIC_ID_SCALARS: usize = 512;
 pub const MAX_PUBLIC_LOGIN_ID_SCALARS: usize = 254;
@@ -569,7 +570,6 @@ impl PublicDetails {
         if self.models.len() > MAX_PUBLIC_MODELS
             || self.history_samples.len() > history_limit
             || self.history_gaps.len() > MAX_PUBLIC_HISTORY_GAPS
-            || self.threads.len() > MAX_PUBLIC_THREADS
         {
             return Err(ContractError::TooManyItems);
         }
@@ -737,9 +737,6 @@ impl PublicDetails {
     }
 
     fn validate_threads(&self) -> Result<(), ContractError> {
-        if self.threads.len() > MAX_PUBLIC_THREADS {
-            return Err(ContractError::TooManyItems);
-        }
         let mut thread_ids = HashSet::with_capacity(self.threads.len());
         for thread in &self.threads {
             if !valid_text(&thread.id, MAX_PUBLIC_ID_SCALARS)
