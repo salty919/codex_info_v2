@@ -1,0 +1,120 @@
+{
+  "source": "Refs #690; fixed typed byte preimages from the approved wire contract; Python hashlib/struct oracle, independent of production Rust/.NET codecs",
+  "values": [
+    {
+      "name": "null",
+      "kind": "null",
+      "value": null,
+      "canonical": "null",
+      "preimage_hex": "10",
+      "digest": "c555eab45d08845ae9f10d452a99bfcb06f74a50b988fe7e48dd323789b88ee3"
+    },
+    {
+      "name": "false",
+      "kind": "bool",
+      "value": false,
+      "canonical": "false",
+      "preimage_hex": "11",
+      "digest": "4a64a107f0cb32536e5bce6c98c393db21cca7f4ea187ba8c4dca8b51d4ea80a"
+    },
+    {
+      "name": "true",
+      "kind": "bool",
+      "value": true,
+      "canonical": "true",
+      "preimage_hex": "12",
+      "digest": "f299791cddd3d6664f6670842812ef6053eb6501bd6282a476bbbf3ee91e750c"
+    },
+    {
+      "name": "u64_max",
+      "kind": "u64",
+      "value": 18446744073709551615,
+      "canonical": "18446744073709551615",
+      "preimage_hex": "13ffffffffffffffff",
+      "digest": "358a1255d40f18b6780f21c02a89f0642333ee6930edf9d61dafe412312a5b72"
+    },
+    {
+      "name": "f64_one",
+      "kind": "f64",
+      "value": "3ff0000000000000",
+      "canonical": "1",
+      "preimage_hex": "153ff0000000000000",
+      "digest": "3cd0b7d4081e229148884fdbe95b50f927b41cd6ee892ba14ce74183622f89db"
+    },
+    {
+      "name": "f64_positive_zero",
+      "kind": "f64",
+      "value": "0000000000000000",
+      "canonical": "0.0",
+      "preimage_hex": "150000000000000000",
+      "digest": "470b103921f87d93995c30158d09a9dfa63a467ca8295d1a5577872302135186"
+    },
+    {
+      "name": "f64_negative_zero",
+      "kind": "f64",
+      "value": "8000000000000000",
+      "canonical": "-0.0",
+      "preimage_hex": "158000000000000000",
+      "digest": "17d5073ccd91a1cb6ea12c995814705a6baa2e9e5ef9436363ff347c3f65b29f"
+    },
+    {
+      "name": "missing_field",
+      "kind": "object",
+      "value": {},
+      "preimage_hex": "180000000000000000",
+      "digest": "0e394e7c8a2b32c9e46a3b1f6cf2a289463acab5bc5321529e59afd9815eeb98"
+    },
+    {
+      "name": "null_field",
+      "kind": "object",
+      "value": {
+        "a": null
+      },
+      "preimage_hex": "180000000000000001000000000000000161c555eab45d08845ae9f10d452a99bfcb06f74a50b988fe7e48dd323789b88ee3",
+      "digest": "d14c177692ad2a0684b04ea161671860a5de61754041edc55a96585d6640a9ef"
+    },
+    {
+      "name": "resolved_ref",
+      "kind": "ref",
+      "value": {
+        "ref": 7
+      },
+      "definitions": {
+        "7": {
+          "kind": "f64",
+          "bits": "3ff0000000000000"
+        }
+      },
+      "digest": "3cd0b7d4081e229148884fdbe95b50f927b41cd6ee892ba14ce74183622f89db"
+    },
+    {
+      "name": "model_cost_schema_f64",
+      "kind": "model_cost",
+      "value": {
+        "price_revision": "fixed",
+        "ordinary_input_dollars": 1,
+        "cached_input_dollars": 0,
+        "cache_write_input_dollars": -0.0,
+        "output_dollars": 2,
+        "total_dollars": 3
+      },
+      "preimage_hex": "180000000000000006000000000000001963616368655f77726974655f696e7075745f646f6c6c61727317d5073ccd91a1cb6ea12c995814705a6baa2e9e5ef9436363ff347c3f65b29f00000000000000146361636865645f696e7075745f646f6c6c617273470b103921f87d93995c30158d09a9dfa63a467ca8295d1a557787230213518600000000000000166f7264696e6172795f696e7075745f646f6c6c6172733cd0b7d4081e229148884fdbe95b50f927b41cd6ee892ba14ce74183622f89db000000000000000e6f75747075745f646f6c6c61727398bb34e5aabfaef8f9c10f11efa798e8b63af70cecceea023922ff6f1b9c5753000000000000000e70726963655f7265766973696f6ecbd3244db342190c37f91081232d17a516f678a33634d4f8350a258981fb00ef000000000000000d746f74616c5f646f6c6c617273ade820b3102a88adefd8f3b7fba95b271f3afa9dc9bebfe846ab6a1f99426655",
+      "digest": "e32b9e68c5e5663d102dd53f40b97e4a4e16bac2f38419585ae833c51da73d0f"
+    }
+  ],
+  "manifest": {
+    "empty": "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986",
+    "one_leaf": "367ccd2c717ea055efa1469c33092ccbcbac0a2812561a0ef0a14f474ed6e9b2",
+    "two_leaves": "74d7ae845444fef32328dbe964daa3c97ce19afebfc27e85b067b7193d28a9c8",
+    "entries": [
+      {
+        "key": "[\"a\"]",
+        "value_digest": "3cd0b7d4081e229148884fdbe95b50f927b41cd6ee892ba14ce74183622f89db"
+      },
+      {
+        "key": "[\"b\"]",
+        "value_digest": "358a1255d40f18b6780f21c02a89f0642333ee6930edf9d61dafe412312a5b72"
+      }
+    ]
+  }
+}

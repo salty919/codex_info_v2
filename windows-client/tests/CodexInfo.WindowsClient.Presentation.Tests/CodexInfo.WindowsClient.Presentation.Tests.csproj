@@ -20,6 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="../CodexInfo.WindowsClient.Core.Tests/WireFacadeFixture.cs" Link="WireFacadeFixture.cs" />
     <ProjectReference Include="../../src/CodexInfo.WindowsClient/CodexInfo.WindowsClient.csproj" />
     <None Include="../../../tests/fixtures/graph_delayed_quota.json"
           Link="Fixtures/graph_delayed_quota.json"

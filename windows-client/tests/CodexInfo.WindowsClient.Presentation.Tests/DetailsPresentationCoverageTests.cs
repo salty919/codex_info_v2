@@ -210,7 +210,8 @@ public sealed class DetailsPresentationCoverageTests
     [InlineData(GraphMetric.Dollars)]
     public async Task GraphWindow_CancelledLargeBuildCannotOverwriteLatestPeriod(GraphMetric metric)
     {
-        var first = CreateLargePeriod("first", 2_100_000, 2_104_600, seed: 1);
+        // Select the initial period by the explicit current marker, not wire array order.
+        var first = CreateLargePeriod("first", 2_100_000, 2_104_600, seed: 1) with { Current = true };
         var second = CreateLargePeriod("second", 2_110_000, 2_114_600, seed: 2);
         using var main = await StartMainAsync(CreateDetails(new[] { first, second }, Array.Empty<ApiThreadDetails>()));
         var pendingUi = new ConcurrentQueue<Action>();
@@ -291,7 +292,7 @@ public sealed class DetailsPresentationCoverageTests
     [Fact]
     public async Task GraphWindow_SplitResourcePublicationDoesNotRetriggerHistoryFetch()
     {
-        var pair = PublishedPairIdentity.Create($"v1:{new string('a', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('a', 64)}");
         var period = CreateSmallPeriod("current", 4_000_000, 4_000_120, current: true, remaining: 80, token: 100);
         var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
         var resourceClient = new CountingHistoryResourceClient(details, period, pair);
@@ -325,7 +326,7 @@ public sealed class DetailsPresentationCoverageTests
     [Fact]
     public async Task GraphWindow_PeriodSwitchKeepsLoadingDistinctFromConfirmedEmpty()
     {
-        var pair = PublishedPairIdentity.Create($"v1:{new string('9', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('9', 64)}");
         var current = CreateSmallPeriod("current", 4_100_000, 4_100_120, current: true, remaining: 80, token: 100);
         var empty = new ApiHistoryPeriod("empty", 4_200_000, 4_200_120, false, "empty");
         var details = CreateDetails([current, empty], Array.Empty<ApiThreadDetails>());
@@ -357,7 +358,7 @@ public sealed class DetailsPresentationCoverageTests
     [Fact]
     public async Task GraphWindow_FailedPeriodSwitchKeepsAcceptedSelectorAndSceneTogether()
     {
-        var pair = PublishedPairIdentity.Create($"v1:{new string('8', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('8', 64)}");
         var current = CreateSmallPeriod("current", 4_300_000, 4_300_120, current: true, remaining: 80, token: 100);
         var rejected = new ApiHistoryPeriod("rejected", 4_400_000, 4_400_120, false, "rejected");
         var details = CreateDetails([current, rejected], Array.Empty<ApiThreadDetails>());
@@ -418,7 +419,7 @@ public sealed class DetailsPresentationCoverageTests
     public async Task GraphWindow_ExactStaleCursorRetriesHeadOnceAndPreservesResetStateAcrossFailures()
     {
         const long start = 6_000_000;
-        var pair = PublishedPairIdentity.Create($"v1:{new string('b', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('b', 64)}");
         var samples = new[]
         {
             new ApiHistorySample(start, start + 120, 96, 1, 0, 0, 1, 0, 0),
@@ -478,8 +479,8 @@ public sealed class DetailsPresentationCoverageTests
     public async Task GraphWindow_PublishedPairAdvanceRealignsOnceWithoutFalseFailure()
     {
         const long start = 6_100_000;
-        var firstPair = PublishedPairIdentity.Create($"v1:{new string('c', 64)}");
-        var secondPair = PublishedPairIdentity.Create($"v1:{new string('d', 64)}");
+        var firstPair = PublishedPairIdentity.Create($"{new string('c', 64)}");
+        var secondPair = PublishedPairIdentity.Create($"{new string('d', 64)}");
         var period = new ApiHistoryPeriod("pair-period", start, start + 120, false, "pair-period");
         var firstSample = new ApiHistorySample(start, start + 120, 96, 1, 0, 0, 1, 0, 0);
         var secondSample = new ApiHistorySample(start + 60, start + 120, 95, 20, 0, 0, 20, 0, 0);
@@ -544,8 +545,8 @@ public sealed class DetailsPresentationCoverageTests
             current: true,
             remaining: 95,
             token: 300);
-        var firstPair = PublishedPairIdentity.Create($"v1:{new string('f', 64)}");
-        var nextPair = PublishedPairIdentity.Create($"v1:{new string('a', 64)}");
+        var firstPair = PublishedPairIdentity.Create($"{new string('f', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"{new string('a', 64)}");
         var initialDetails = CreateDetails([oldCurrent, historical], Array.Empty<ApiThreadDetails>()) with
         {
             Quota = new ApiQuota(80, oldResetAt, windowSeconds, false),
@@ -645,8 +646,8 @@ public sealed class DetailsPresentationCoverageTests
             current: true,
             remaining: 95,
             token: 300);
-        var firstPair = PublishedPairIdentity.Create($"v1:{new string('7', 64)}");
-        var nextPair = PublishedPairIdentity.Create($"v1:{new string('8', 64)}");
+        var firstPair = PublishedPairIdentity.Create($"{new string('7', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"{new string('8', 64)}");
         var initialDetails = CreateDetails([oldCurrent, historical], Array.Empty<ApiThreadDetails>()) with
         {
             Quota = new ApiQuota(80, oldResetAt, windowSeconds, false),
@@ -724,8 +725,8 @@ public sealed class DetailsPresentationCoverageTests
         var oldCurrent = CreateSmallPeriod("old-current", oldResetAt - windowSeconds, oldResetAt, true, 80, 100);
         var historical = CreateSmallPeriod("historical", oldResetAt - 2 * windowSeconds, oldResetAt - windowSeconds, false, 70, 50);
         var newCurrent = CreateSmallPeriod("new-current", oldResetAt, newResetAt, true, 95, 300);
-        var firstPair = PublishedPairIdentity.Create($"v1:{new string('b', 64)}");
-        var nextPair = PublishedPairIdentity.Create($"v1:{new string('c', 64)}");
+        var firstPair = PublishedPairIdentity.Create($"{new string('b', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"{new string('c', 64)}");
         var initialDetails = CreateDetails([oldCurrent, historical], Array.Empty<ApiThreadDetails>()) with
         {
             Quota = new ApiQuota(80, oldResetAt, windowSeconds, false),
@@ -790,8 +791,8 @@ public sealed class DetailsPresentationCoverageTests
         const long windowSeconds = 7 * 24 * 60 * 60;
         var resetAt = now + 300;
         var current = CreateSmallPeriod("current", resetAt - windowSeconds, resetAt, true, 80, 100);
-        var firstPair = PublishedPairIdentity.Create($"v1:{new string('d', 64)}");
-        var nextPair = PublishedPairIdentity.Create($"v1:{new string('e', 64)}");
+        var firstPair = PublishedPairIdentity.Create($"{new string('d', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"{new string('e', 64)}");
         var initialDetails = CreateDetails([current], Array.Empty<ApiThreadDetails>()) with
         {
             Quota = new ApiQuota(80, resetAt, windowSeconds, false),
@@ -846,7 +847,7 @@ public sealed class DetailsPresentationCoverageTests
             Quota = new ApiQuota(95, end, end - start, false),
             ObservedAt = now,
         };
-        var pair = PublishedPairIdentity.Create($"v1:{new string('1', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('1', 64)}");
         var resourceClient = new CountingHistoryResourceClient(details, period, pair);
         using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
         var pendingUi = new ConcurrentQueue<Action>();
@@ -904,7 +905,7 @@ public sealed class DetailsPresentationCoverageTests
         {
             Quota = new ApiQuota(100, end, end - start, false),
         };
-        var pair = PublishedPairIdentity.Create($"v1:{new string('5', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('5', 64)}");
         var resourceClient = new CountingHistoryResourceClient(details, period, pair);
         using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
         var pendingUi = new ConcurrentQueue<Action>();
@@ -957,7 +958,7 @@ public sealed class DetailsPresentationCoverageTests
         {
             Quota = new ApiQuota(95, end, end - start, false),
         };
-        var pair = PublishedPairIdentity.Create($"v1:{new string('2', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('2', 64)}");
         var resourceClient = new CountingHistoryResourceClient(details, period, pair);
         using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
         var pendingUi = new ConcurrentQueue<Action>();
@@ -1007,7 +1008,7 @@ public sealed class DetailsPresentationCoverageTests
         const long end = start + 3_600;
         var period = CreateSingleAstraPeriod("historical", start, end, current: false, firstObservation, 95, 257, 42.5) with { OriginAt = start };
         var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
-        var pair = PublishedPairIdentity.Create($"v1:{new string('3', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('3', 64)}");
         var resourceClient = new CountingHistoryResourceClient(details, period, pair);
         using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
         var pendingUi = new ConcurrentQueue<Action>();
@@ -1062,7 +1063,7 @@ public sealed class DetailsPresentationCoverageTests
         const long end = start + 3_600;
         var period = CreateSingleAstraPeriod("current-window", start, end, current: true, firstObservation, 95, 257, 42.5) with { OriginAt = start };
         var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
-        var pair = PublishedPairIdentity.Create($"v1:{new string('4', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('4', 64)}");
         var resourceClient = new CountingHistoryResourceClient(details, period, pair);
         using var main = new MainWindowViewModel(new StaticCombinedClient(DetailsFetchResult.Success(details)), resourceClient);
         var pendingUi = new ConcurrentQueue<Action>();
@@ -1111,7 +1112,7 @@ public sealed class DetailsPresentationCoverageTests
     public async Task GraphWindow_DuplicateTimestampsRejectWholeCandidateAndPreserveLastGood()
     {
         const long start = 6_200_000;
-        var pair = PublishedPairIdentity.Create($"v1:{new string('e', 64)}");
+        var pair = PublishedPairIdentity.Create($"{new string('e', 64)}");
         var period = new ApiHistoryPeriod("duplicate-period", start, start + 180, false, "duplicate-period");
         var samples = new[]
         {

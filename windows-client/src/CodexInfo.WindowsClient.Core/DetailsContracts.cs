@@ -8,6 +8,8 @@ public enum DetailsFetchFailure
 {
     Transport,
     Response,
+    Pending,
+    CacheRecovery,
 }
 
 /// <summary>
@@ -28,6 +30,8 @@ public sealed record ApiDetailsSnapshot(
     string EstimatedCostLabel)
 {
     /// <summary>Distinct threads whose canonical Session is currently open.</summary>
+    public ApiThreadSummary? ThreadSummary { get; init; }
+    public bool UseStoredPrices { get; init; }
     public ulong OpenSessionThreadCount { get; init; } = ActiveThreadCount;
 
     /// <summary>The wire contract version of this accepted details document.</summary>
@@ -545,6 +549,8 @@ public sealed record ApiCurrentSnapshot(
     ulong ActiveThreadCount,
     PublishedPairIdentity PublishedPair)
 {
+    public ApiThreadSummary? ThreadSummary { get; init; }
+    public ApiAccount? Selection { get; init; }
     public ulong OpenSessionThreadCount { get; init; } = ActiveThreadCount;
 
     /// <summary>Null for older API generations that do not report model completeness.</summary>
@@ -728,3 +734,6 @@ public sealed record AccountsFetchResult(
     public static AccountsFetchResult FromFailure(DetailsFetchFailure failure) =>
         new(null, failure);
 }
+
+public sealed record ApiThreadModelCount(string? Model, ulong OpenCount, ulong RunningCount, ulong UnknownActivityCount);
+public sealed record ApiThreadSummary(ulong OpenCount, ulong RunningCount, ulong UnknownActivityCount, IReadOnlyList<ApiThreadModelCount> ByModel);

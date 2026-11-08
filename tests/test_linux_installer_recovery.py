@@ -46,6 +46,9 @@ FUNCTIONS = (
 )
 
 MODEL = r"""
+# Two virtual readiness ticks exercise timeout without a wall-clock sleep.
+# The production deadline and the subprocess eight-second guard stay intact.
+HEALTH_TIMEOUT=2
 # This fixture stages an ordinary published candidate. Full-source
 # effective/archive tests own local-recovery manifest and receipt validation.
 manifest_is_local_recovery() { return 1; }

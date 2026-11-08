@@ -19,8 +19,7 @@ public enum ApiState
 /// </summary>
 public readonly record struct PublishedPairIdentity
 {
-    private const int WireLength = 67;
-    private const string Prefix = "v1:";
+    private const int WireLength = 64;
     private readonly string? _value;
 
     private PublishedPairIdentity(string value)
@@ -31,12 +30,12 @@ public readonly record struct PublishedPairIdentity
     internal static bool TryCreate(string value, out PublishedPairIdentity identity)
     {
         identity = default;
-        if (value.Length != WireLength || !value.StartsWith(Prefix, StringComparison.Ordinal))
+        if (value.Length != WireLength)
         {
             return false;
         }
 
-        for (var index = Prefix.Length; index < value.Length; index++)
+        for (var index = 0; index < value.Length; index++)
         {
             var character = value[index];
             if (!IsLowerHex(character))

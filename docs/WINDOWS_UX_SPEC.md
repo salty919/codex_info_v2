@@ -429,20 +429,21 @@ SSH/WSL childはshell、cmd、PowerShellを介さず、実行ファイルと個�
 
 ### 3.2 日常監視
 
-Mainを既定の到達先とし、保存済みselectorで次回自動再接続する。接続確認・poll・同一generationの
-自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
+Mainを既定の到達先とし、保存済みselectorで次回自動再接続する。接続確認・同一generationの
+再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンと変更通知を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
 
-Mainはstrict validation済み`/v4/current`、GraphはWIREのversion優先順位に従うdirectoryと選択期間のv3 history page、Threadsは`/v3/threads`を使う。account selectorは`/v3/accounts`の非秘密IDを使い、起動時の既定と起動後の選択維持は`ACCOUNT-LIFECYCLE-134`に従う。`default_account_id=null`の新規起動または現accountへの追従中は選択中accountを0件にし、Linux/Windowsとも旧accountのidentity、quota、reset、model、threadを同じ境界で消去して、selectorなしのcurrent resourceが確認した`auth_required`、`initializing`、`error`の該当状態を表示する。default nullだけを未認証の証拠にしない。選択変更時はMain、Graph、Threadsの旧account値、pair、cursor、pending、errorを一括破棄し、選択accountのresourceだけを再取得する。各data取得cycleは必要なsnapshot応答が全て同じaccountかつ同じpublished pairの場合だけatomic置換する。global account catalogはWIREに従って独立受理し、明示選択した歴史accountのdata pairとの一致を要求しない。catalog更新からdata pair/cursorを作らず、account選択の境界だけを適用する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v4/current`のexact404だけ`/v3/current`、さらにexact404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
-exact 404でlegacy details modeへ入った接続は、一つの受理済みdetails rootをMain、Graph、Threadsへ同時投影し、split routeを追加要求しない。再接続時に`/v4/current`から能力判定をやり直す。
-Mainは10秒、Graph差分はopen中60秒、Threadsはopen中5秒で確認し、Graph/Threadsを閉じている間は対応requestを送らない。SQLite、別pair、認証control応答でfieldを補完せず、quota/history/threadの再収集、
-値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は該当surfaceだけが同じlast-good rootを保持し、他surfaceやrecorderを変更しない。
-Mainが新しいcurrent/threads bundleを受理した周期には、開いたThreads詳細も同じthread行と0件状態へ直ちに追従する。独立5秒取得を追加せず、Main受理前に始めた独立応答で追従結果を戻さない。
+2026-11-07の明示要求（Refs #690）により、本節の版別route、exact404 fallback、固定間隔poll、global published pairによる取得整列は廃止する。WIREの版番号なし単一契約だけを使う。
+Mainはstrict validation済み`GET /state?parts=main`の1応答で、確認済みaccount選択、quota、model/価格、表示対象thread集合の集計を受理する。Mainの件数だけを得るためのThreads全件取得を追加しない。Settingsが可視で必要な時だけ同じ`/state`の`account_choices`/`runtime` projectionを要求する。Graphは必要な`account_context`と、選択用途または実表示窓に対応する`/history/periods`、該当期間の`/history`を使う。Threadsが可視の時だけ`/threads`を使う。
+起動時の既定と起動後の選択維持は`ACCOUNT-LIFECYCLE-134`に従う。`default_account_id=null`の新規起動または現accountへの追従中は選択中accountを0件にし、旧accountのidentity、quota、reset、model、threadの表示を同じ境界で消去して、selectorなしMainが確認した`auth_required`、`initializing`、`error`を表示する。default nullだけを未認証の証拠にしない。明示選択の変更では旧account向け未完了要求を取消し、表示binding、選択cursor、pending/errorを新対象へ切り替える。全画面の永続受領台帳は保持し、受領済み同一内容を選択変更で二重転送しない。
+各surfaceは同じaccountの必要なimmutable view/imageが完全に確定した時だけatomic置換する。無関係なresourceのglobal世代一致を要求せず、catalog更新からdata image/cursorを作らない。page/fragment途中の履歴を完全な画面として表示せず、変更分と既受領prefixの資格をWIREで照合してから反映する。source更新や再接続で本文先頭を初回扱いにして再送しない。
+初回取得後は共有`POST /subscription`の変更通知で必要な未受領差分だけを取得する。固定間隔のMain/Graph/Threads snapshot取得、304だけのpoll、閉じた画面の購読・取得は禁止する。UIが使うprojection単位で同時呼出を合流し、必要partの追加で既存呼出の期限を延長しない。GETの全体3秒・server1秒はWIREに従う。
+SQLite、別account、認証control応答でfieldを補完せず、quota/history/threadをUIで再収集・再計算しない。同一minuteのmerge/max/last/null化も行わない。候補拒否時は該当surfaceだけが同じlast-goodを保持し、他surfaceやrecorderを変更しない。Main集計とThreads詳細はそれぞれ必要な値のimageへ従い、開いたThreadsも自身の変更通知で0件を含めて更新する。Mainに不要なtitle/contextだけの変更でMainを再取得しない。
 
 明示選択IDの消失でPRODUCTが未選択へ遷移させた場合は、Main/Graph/Threadsの旧account値と未完了要求を同じ境界で破棄する。
 Mainは「アカウント未選択」と、設定から表示対象を選べることを表示localeで示し、primary CTAを「設定」とする。
 quota/model/threadの未知を0や100%で表示せず、selectorなしdata要求によって別のdefault accountを表示しない。
-未選択中もglobal catalogの通常確認、Settings、Legal、Window操作は利用可能である。新規起動やcurrent追従中の
+未選択中も必要なMain選択通知と、Settings内のcatalog確認、Legal、Window操作は利用可能である。新規起動やcurrent追従中の
 default nullでは、前段のselectorなしstrict boundary表示を使う。この二つの未選択理由を相互に置換しない。
 
 ### 3.3 詳細・設定・法的情報
@@ -564,7 +565,7 @@ fresh startupで未受理の値は`—`/既存の未取得表現とする。mode
 - Windowsの表示モードは「週期間」（既定）、「24時間」、「1週間」、「1か月」とする。表示mode群と中央の日時・期間欄の列間に12 DIPを追加し、従来の中央欄marginを維持する。「週期間」は以下の既存reset期間の範囲を維持する。固定時間モードは表示窓だけを独立させ、右端を現在時刻、幅をそれぞれ86,400秒／604,800秒とする。未観測の終端から現在時刻までは空白であり、観測値を延長しない。Linuxの表示・操作は変更しない（Issue #554、#600）。
 - 「1か月」は表示timezoneの暦月を曜日7列のカレンダーで表示する。中央見出しは対象年月（yyyy/MM）だけを示し、選択済みモード名と日付範囲を重複表示しない。日曜／週初曜日は表示cultureに従い、月初前・月末後は空欄、未来日は日付のみとする。前後移動は暦月単位で未来月へ進めない。各日には全モデル（未知modelを含む）の合計使用量を一つ表示し、モデル別棒・曲線・軸・凡例は表示しない。ドル／トークン切替を日別合計へ連動し、ドルは小数2桁、トークンは日ごとの使用量を一目で比較できるよう、100万以上を四捨五入した整数のM単位（1 M = 1,000,000 tokens）、100万未満を桁区切り整数とする。日別値の文字サイズを維持し、通常幅と最小幅で量と単位を省略せずに表示する。正確なトークン数はtooltipとアクセシビリティ名に桁区切り整数で残し、保存値・集計値は丸めない。モデル表示ON/OFFは日別合計へ影響しない。日別値の採否は`G137-GRAPH-01`を維持し、記録分／未計測を区別、価格不明のモデルがある日の既知部分だけを全額として表示しない。今日を枠で示し、現在／過去の未計測日は「—」、未来日は値を出さない。正の利用記録がない日は背景と文字を控えめにし、利用記録のある日を優先して読めるようにする。記録分0と未計測はそれぞれの値・状態を残し、部分記録や未計測を一日未使用の確証へ読み替えない。最小幅ではセルを7列のまま保ち、縦方向へscroll可能とする。
 - 固定時間モードの「＜」「＞」は窓の全幅だけ移動する。過去へ移動した右端は更新中も固定し、24時間／1週間間の変更でも維持する。現在へ到達すると現在追従へ戻り、未来へは進めない。週期間モードの「＜」「＞」は、後述のselectorと同じ全page受理済みselectable表示順を平坦化した一つの配列を使う。「＜」は選択index+1、「＞」はindex-1を選ぶ。先頭では「＞」、末尾では「＜」を無効にし、空または単件では両方を無効にする。取得directoryだけのquota/gap-only過去IDへ移動せず、固定日数を加減しない。期間の取得・失敗時保持・選択IDの意味をselectorと共有する。
-- 表示窓に重なる全reset期間を同じaccount・published pairから完全に受理する。週期間・24時間・1週間では各期間をPRODUCTの累計・残量・欠測規則で個別投影してから表示窓に切り出し、期間をまたぐ線・idle帯・累計の足算を作らない。月表示では同じ受理済みraw履歴を日別投影に使う。数値軸と時刻軸は本節「数値軸・時刻軸の値と座標」に従う。空の時間窓でも選択した期間の軸を保つ。
+- 表示窓に重なる全reset期間を同じaccountの各期間の完全なimmutable imageから受理する。週期間・24時間・1週間では各期間をPRODUCTの累計・残量・欠測規則で個別投影してから表示窓に切り出し、期間をまたぐ線・idle帯・累計の足算を作らない。月表示では同じ受理済みraw履歴を日別投影に使う。数値軸と時刻軸は本節「数値軸・時刻軸の値と座標」に従う。空の時間窓でも選択した期間の軸を保つ。
 - 週期間・24時間・1週間では表示タイムゾーンの日付が変わる0時に、幅0.5px・不透明度30%の白い細線を引く。公開された各期間の開始時刻`start_at`が表示窓内にある場合、その位置に幅1px・不透明度70%の黄色系テーマ解決色（`#E6B85C`）の区切り線をグラフ内だけに描く。期間識別に使う`reset_at`や予定リセット日時を実際の切替位置として描かない。区切り時刻をサンプルの増減や欠測、表示窓の左端から推定せず、同じ開始時刻は1本にまとめ、日付境界と重なった場合は期間区切り線を優先する。夏時間のある地域も現地暦の日付境界を用い、86,400秒ごとの線で代用しない。上部は本節の3段構成とし、空の固定高さ行を置かない。940×640と最小700×480で操作とplotが重ならない。
 - 更新では受理済みの画面・軸・日時を保持し、全候補の準備後にまとめて切り替える。失敗と遅延応答によって部分的な期間や古い表示窓を公開しない。account変更では別accountの画面を保持しない。期間ごとの描画用geometryを再利用し、固定窓では範囲内と境界の描画点だけを渡す。元履歴を間引き・書換えせず、滑らかさのために観測値を変更しない。
 - 期間、ドル/トークン、Remaining/LUNA/TERRA/SOL/ASTRAの操作を上部固定帯に置く。
@@ -770,9 +771,8 @@ fresh startupで未受理の値は`—`/既存の未取得表現とする。mode
 - WSL/remote/one-session raw recovery、ArgumentListと保存しない資格情報は本節とSECURITYのWindows bootstrap境界を正本とする。
   認証の順序は次段落、失敗時の操作は4.6、single supervisor/tunnel/reapは4.6末尾に従う。
 
-Setupの順序はserver/API prepare→listener→readiness `GET /health`→strict `GET /v4/current`（exact404だけv3 current、さらにexact404の旧serviceだけv3 details→v2→v1）→
-必要時だけauth-start→別auth-check→新しいstrict currentで固定する。auth-start/auth-checkはcontrol-onlyであり、
-応答を表示rootへmergeしない。healthだけ、またはcontrol成功だけでdata readyとしない。
+Setupの順序はserver/API prepare→listener→strict `GET /state?parts=main`による実data read-back→
+必要時だけ既存auth-start→認証確認操作内のfresh strict Main取得とする。独立health route、版別能力判定、旧版fallbackは使わない。auth-startと接続準備はcontrol-onlyであり、その応答を表示rootへmergeしない。listenerやcontrol成功だけでdata readyとしない。
 
 RC-121のprofile別action意味論も固定する。WSLのserver prepare/service start、Remoteのinstall/tunnel/raw
 tunnelはそれぞれ独立したvisible+enabled Tab step/UIA actionであり、`action.StartForward`へ丸めない。
@@ -886,14 +886,11 @@ Settingsから開く場合は`WIN-CONNECTION-GUIDANCE-603`に従って接続設�
 | 認証確認で有効なfresh bundleを受理したが`auth_required` | 認証は未完了 | pendingの認証sessionがあれば「認証を確認」を再び操作可能にする。pendingがなければ「認証を開始」。成功したprocess exitだけでreadyにしない |
 | 認証確認のcontrol段階だけ成功（raw embedded adapter） | 認証済みdataは未受理 | 同じ確認action内でfresh strict currentと必要なthreads bundleを1回取得し、その受理結果へ遷移。installed Linux/Windowsに独立したauth-check RPCを追加しない |
 | 認証確認で認証済みのfresh bundleを受理 | 公開dataで認証状態を確認できた | この受理済みbundleをatomicに表示し、pending認証sessionを終了する。成功を理由に二度目のbundle取得を追加しない。`state=error`やpartial等の表示は受理した値と上記の状態規則に従い、認証済みだけでreadyとしない |
-| Graph/Threads独立取得失敗 | 対象surfaceだけlast-goodと失敗を保持 | そのsurfaceの選択/通常周期で再取得。Mainを失敗に変更せず、Windowを勝手に前面化しない |
+| Graph/Threads独立取得失敗 | 対象surfaceだけlast-goodと失敗を保持 | そのsurfaceの明示操作または変更通知で再取得。Mainを失敗に変更せず、Windowを勝手に前面化しない |
 | Settings保存失敗 | 旧active設定とtheme以外のdraftを保持しWindowを閉じない。theme選択/previewは`WIN-THEME-422`に従って保存済み値へ戻す | 「保存」で現在のdraftを再試行可能。取消/Closeはdraftを破棄し、保存成功を偽装しない |
 | 未知の失敗種別 | 成功とは判断できない | 同surfaceの一般取得失敗へ分類して再試行可能。新たな自動復旧commandや未知値を作らない |
 
-Mainのpositive bundle失敗時は、失敗が確定したmonotonic時刻から10秒後を次の取得時刻とし、currentを条件headerなしで1回取得する。
-その時刻より前、および取得中はMain再試行とSettings「状態を更新」の同じMain取得部分を無効にし、「再試行待ち」または「取得中」を表示する。
-force入力をqueueして期限を短縮・延長せず、Graphと独立Threadsのrequestも開始しない。Windowの開閉やlast-goodの閲覧は可能とする。
-再取得も失敗した場合はその失敗確定時刻から次の10秒待機とし、一つのcallback内で反復しない。成功したMain bundleだけが待機・errorを解除する。
+旧positive current/threads bundleの10秒反復取得は、Main単回応答と変更通知へ移行したため廃止する。TransportとHTTP/Responseは表示分類を分け、両者とも既存「再試行」で同surfaceの取得を1回開始できる。取得中はMain再試行とSettingsの同じMain取得操作を無効にし、連打をqueueしない。正常なpreparing/sync/partial/確認済み空を接続失敗へ変換しない。接続断の同generation自動再接続は1回だけとし、失敗後は既存操作または対象の確定変更を待つ。無限retryや固定pollを追加しない。
 認証主体/表示account/接続設定generationの確定変更では旧generationの待機とin-flight応答を破棄し、新対象の通常起動手順へ進む。
 同じ対象でのforce、Window開閉、操作連打はgeneration変更ではない。
 

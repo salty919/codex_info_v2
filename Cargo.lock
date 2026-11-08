@@ -804,6 +804,8 @@ dependencies = [
 name = "codex-info-rest"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "bytes",
  "chrono",
  "codex-info-account-locator",
  "codex-info-db-reader",
@@ -811,26 +813,33 @@ dependencies = [
  "codex-info-recorder",
  "codex-info-rest-contract",
  "getrandom 0.3.4",
+ "h2",
+ "http",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
 name = "codex-info-rest-contract"
 version = "1.0.48"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "codex_info"
-version = "1.0.173"
+version = "1.0.174"
 dependencies = [
  "axum",
+ "base64",
+ "bytes",
  "chrono",
  "chrono-tz",
  "codex-info-db-writer",
@@ -838,8 +847,10 @@ dependencies = [
  "codex-info-rest-contract",
  "fontique",
  "getrandom 0.3.4",
+ "h2",
  "hex",
  "hmac",
+ "http",
  "iana-time-zone",
  "raw-window-handle",
  "rusqlite",
@@ -1420,6 +1431,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1776,6 +1793,25 @@ name = "grid"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
+
+[[package]]
+name = "h2"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "half"
@@ -5028,6 +5064,7 @@ version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
@@ -5046,6 +5083,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "libc",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

@@ -4,7 +4,9 @@
 using System.Net;
 using System.Net.Http.Headers;
 using CodexInfo.WindowsClient.Controls;
+using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Core.Tests;
 using CodexInfo.WindowsClient.Graphing;
 using Xunit;
 
@@ -46,7 +48,7 @@ public sealed class GraphRecordedUsageContractTests
         GraphMetric metric, bool quotaOnlyTail, double luna, double sol, string amount)
     {
         using var client = new LoopbackStatusClient(new HistoryHandler(quotaOnlyTail));
-        var result = await client.FetchHistoryPageAsync("1792385949");
+        var result = await client.FetchHistoryPageAsync(accountId: "account-1", periodId: "1792385949");
         Assert.True(result.IsSuccess);
         var scene = GraphScene.Create(result.Page!.Samples, metric, 1791781149, 1791803280);
 
@@ -79,12 +81,10 @@ public sealed class GraphRecordedUsageContractTests
         }
     }
 
-    private sealed class HistoryHandler(bool quotaOnlyTail) : HttpMessageHandler
+    private sealed class HistoryHandler : WireFacadeFixture
     {
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request, CancellationToken cancellationToken)
+        public HistoryHandler(bool quotaOnlyTail)
         {
-            Assert.Equal("/v3/history", request.RequestUri!.AbsolutePath);
             const string json = """
                 {"api_version":"v3","history_gaps":[],"next_cursor":null,"resume_cursor":"saved-row",
                  "history_samples":[
@@ -101,21 +101,13 @@ public sealed class GraphRecordedUsageContractTests
                     {"model":"gpt-6-luna","total_tokens":26657919,"total_dollars":0.51055206},
                     {"model":"gpt-6.1-sol","total_tokens":10027685,"total_dollars":1.911146}]}]}
                 """;
-            var response = new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent(quotaOnlyTail
-                    ? json[..^2] + """
+            using var parsed = JsonDocument.Parse(quotaOnlyTail ? json[..^2] + """
                         ,{"timestamp":1791803280,"reset_at":1792385949,"remaining_percent":54,
                           "model_source":"unavailable","models_complete":false,
                           "task_active_since_previous":null,"models":null}]}
-                        """
-                    : json),
-            };
-            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
-            response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
-            response.Headers.TryAddWithoutValidation("Codex-Info-Published-Pair",
-                "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001");
-            return Task.FromResult(response);
+                        """ : json);
+            var document = parsed.RootElement.Clone();
+            Rows = _ => WirePresentationFixture.History(document, "1792385949");
         }
     }
 }

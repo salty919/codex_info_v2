@@ -19,9 +19,9 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class MainWindowViewModelTests
 {
     private const string CanonicalPublishedPair =
-        "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
+        "00112233445566778899aabbccddeeff00000000000000000000000000000001";
     private const string OtherPublishedPair =
-        "v1:ffeeddccbbaa9988776655443322110000000000000000000000000000000002";
+        "ffeeddccbbaa9988776655443322110000000000000000000000000000000002";
 
     [Fact]
     public void CombinedClientRequiresTheFixedHealthReadinessBoundary()
@@ -458,7 +458,7 @@ public sealed class MainWindowViewModelTests
     [Fact]
     public async Task OpenThreadsAcceptedEmptyNeedsNoIndependentRequest()
     {
-        using var main = new MainWindowViewModel(new SingleCurrentClient(CurrentSnapshot(activeThreadCount: 0)));
+        using var main = new MainWindowViewModel(new SingleCurrentClient(CurrentSnapshot(activeThreadCount: 0) with { ThreadSummary = new(0, 0, 0, []) }));
         main.Start();
         await EventuallyAsync(() => main.HasDetails && !main.IsStartupLoading);
         using var threads = new ThreadsWindowViewModel(main, action => action());
@@ -544,7 +544,7 @@ public sealed class MainWindowViewModelTests
     public async Task AcceptedZeroCurrentKeepsLiveThreadSummaryWithoutFetchingThreads()
     {
         using var viewModel = new MainWindowViewModel(
-            new SingleCurrentClient(CurrentSnapshot(activeThreadCount: 0)));
+            new SingleCurrentClient(CurrentSnapshot(activeThreadCount: 0) with { ThreadSummary = new(0, 0, 0, []) }));
 
         Assert.False(viewModel.HasLiveThreadSummary);
         viewModel.Start();
@@ -574,7 +574,8 @@ public sealed class MainWindowViewModelTests
             new ApiQuota(45, 2, 604800, false),
             [new ApiDetailsModelUsage("gpt-6-astra", 10, 0, 0, 0, 0, 0) { TotalTokens = 10 }],
             activeThreadCount,
-            PublishedPair(CanonicalPublishedPair));
+            PublishedPair(CanonicalPublishedPair))
+        { ThreadSummary = new(activeThreadCount, activeThreadCount, 0, activeThreadCount == 0 ? [] : [new("gpt-6-astra", activeThreadCount, activeThreadCount, 0)]) };
         ThreadsFetchResult[] threadResults = activeThreadCount == 0
             ? []
             : [ThreadsFetchResult.Success(new ApiThreadsSnapshot(
@@ -1220,12 +1221,14 @@ public sealed class MainWindowViewModelTests
         Assert.Equal(0, viewModel.ActiveOtherCount);
     }
 
-    [Fact]
-    public async Task InitialFailureExposesOneRetryAndRecoversThroughOneExplicitGeneration()
+    [Theory]
+    [InlineData(DetailsFetchFailure.Transport)]
+    [InlineData(DetailsFetchFailure.Response)]
+    public async Task InitialFailureExposesOneRetryAndRecoversThroughOneExplicitGeneration(DetailsFetchFailure failure)
     {
         var supervisor = new RecordingSupervisor();
         var client = new BlockingRetryClient(
-            DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport),
+            DetailsFetchResult.FromFailure(failure),
             DetailsFetchResult.Success(ValidSnapshot(observedAt: 2)));
         using var viewModel = new MainWindowViewModel(client, client, supervisor);
 
@@ -1247,6 +1250,29 @@ public sealed class MainWindowViewModelTests
         Assert.False(viewModel.IsRetryVisible);
         Assert.Equal(1, supervisor.RestartExplicitCount);
         Assert.Equal(2, client.CallCount);
+    }
+
+    [Theory]
+    [InlineData(DetailsFetchFailure.Transport)]
+    [InlineData(DetailsFetchFailure.Response)]
+    public async Task VersionlessMainFailurePublishesErrorAndExistingRetryWithoutLegacyCalls(DetailsFetchFailure failure)
+    {
+        var client = new FailedUiClient(failure);
+        using var viewModel = new MainWindowViewModel(client);
+        var notifiedError = new System.Collections.Concurrent.ConcurrentQueue<string?>();
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (viewModel.DetailsStatusAutomationText == "error") notifiedError.Enqueue(args.PropertyName);
+        };
+
+        viewModel.Start();
+        await EventuallyAsync(() => !viewModel.IsStartupLoading && viewModel.DetailsStatusAutomationText == "error");
+
+        Assert.True(viewModel.IsRetryVisible);
+        Assert.Contains(nameof(MainWindowViewModel.DetailsStatusText), notifiedError);
+        Assert.Contains(nameof(MainWindowViewModel.DetailsStatusAutomationText), notifiedError);
+        Assert.False(viewModel.HasDetails);
+        Assert.Equal(1, client.CallCount);
     }
 
     [Fact]
@@ -2840,6 +2866,25 @@ public sealed class MainWindowViewModelTests
             var call = Interlocked.Increment(ref index);
             return Task.FromResult(results[Math.Min(call - 1, results.Length - 1)]);
         }
+    }
+
+    private sealed class FailedUiClient(DetailsFetchFailure failure) : HealthyDetailsClientBase, ILoopbackUiClient
+    {
+        public int CallCount { get; private set; }
+        public long ChangeRevision => 0;
+        public bool AccountChoicesVisible => false;
+        public Task<long> WaitForChangeAsync(long after, CancellationToken token) => new TaskCompletionSource<long>().Task.WaitAsync(token);
+        public Task<UiMainResult> FetchMainAsync(string? accountId, bool includeChoices, CancellationToken token = default)
+        {
+            CallCount++;
+            return Task.FromResult(new UiMainResult(null, null, failure));
+        }
+        public Task CheckAsync(CancellationToken token = default) => Task.CompletedTask;
+        public void SetViewVisible(string view, bool visible) { }
+        public Task<ApiAccount?> FetchAccountContextAsync(string accountId, CancellationToken token = default) => throw new InvalidOperationException("Failed Main must not request account context.");
+        public Task<HistoryPeriodsFetchResult> FetchWindowPeriodsAsync(string accountId, long from, long until, CancellationToken token = default) => throw new InvalidOperationException("Failed Main must not request periods.");
+        public override Task<HealthFetchResult> FetchHealthAsync(CancellationToken token = default) => throw new InvalidOperationException("Versionless Main must not request legacy health.");
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken token = default) => throw new InvalidOperationException("Versionless Main must not request legacy details.");
     }
 
     private sealed class BlockingRetryClient(

@@ -3235,99 +3235,62 @@ health_readback() {
     health_remaining=$((readback_deadline - health_now))
     (( health_remaining > 0 )) || safe_blocked 'health readiness deadline expired'
     health_limit=$health_remaining
-    response="$("$CURL_BIN" --fail --silent --show-error --proto '=http' --max-time "$health_limit" "$HEALTH_URL")" || safe_blocked 'health request failed'
+    response="$(CODEX_INFO_WIRE_READBACK_CACHE_PATH="$share_dir/readback-receipts" CODEX_INFO_WIRE_READBACK_BUDGET_MS="$((health_limit * 1000))" \
+        "$generations_dir/$version-$source-$manifest_hash/codex_info" --wire-readback)" || safe_blocked 'UI API readback failed'
     after="$(proc_starttime "$pid" 2>/dev/null || true)"
-    [[ -n "$before" && "$after" == "$before" ]] || safe_blocked 'MainPID/starttime changed during health'
+    [[ -n "$before" && "$after" == "$before" ]] || safe_blocked 'MainPID/starttime changed during readback'
     after_pid="$(systemd_pid)"
-    [[ "$after_pid" == "$pid" ]] || safe_blocked 'systemd MainPID changed during health'
-    python3 - "$response" "$version" "$source" "$manifest_hash" <<'PY' || return 1
-import json,sys
+    [[ "$after_pid" == "$pid" ]] || safe_blocked 'systemd MainPID changed during readback'
+    retained_observed_at="$(python3 -c '
+import json,sys,math
 def pairs(items):
-    result={}
-    for key,value in items:
-        if key in result: raise ValueError("duplicate health key")
-        result[key]=value
-    return result
-try: document=json.loads(sys.argv[1],object_pairs_hook=pairs)
-except Exception as error: raise SystemExit(str(error))
-if not isinstance(document,dict): raise SystemExit("health is not an object")
-if set(document) != {"api_version","service","product_version"}:
-    raise SystemExit("health schema is unknown")
-if document["api_version"] != "v1" or document["service"] != "codex-info" or document["product_version"] != sys.argv[2]:
-    raise SystemExit("health identity mismatch")
-PY
-    health_now="$(now_unix)" || safe_blocked 'details clock is unavailable'
-    health_limit=$((readback_deadline - health_now))
-    (( health_limit > 0 )) || safe_blocked 'details readiness deadline expired'
-    response="$("$CURL_BIN" --silent --show-error --proto '=http' --max-time "$health_limit" --write-out $'\n%{http_code}' "$CURRENT_URL")" || safe_blocked 'current request failed'
-    current_status="${response##*$'\n'}"
-    details="${response%$'\n'*}"
-    current_version=v4
-    if [[ "$current_status" == 404 ]]; then
-        health_now="$(now_unix)" || safe_blocked 'details clock is unavailable'
-        health_limit=$((readback_deadline - health_now))
-        (( health_limit > 0 )) || safe_blocked 'details readiness deadline expired'
-        details="$("$CURL_BIN" --fail --silent --show-error --proto '=http' --max-time "$health_limit" "$DETAILS_URL")" || safe_blocked 'details request failed'
-        current_version=legacy
-    elif [[ "$current_status" != 200 ]]; then
-        safe_blocked 'current response is unavailable'
-    fi
-    retained_observed_at="$(
-    python3 -c '
-import json,sys
-def pairs(items):
-    result={}
-    for key,value in items:
-        if key in result: raise ValueError("duplicate details key")
-        result[key]=value
-    return result
-try: document=json.load(sys.stdin,object_pairs_hook=pairs)
-except Exception as error: raise SystemExit(str(error))
-if not isinstance(document,dict): raise SystemExit("details is not an object")
-allowed_states={"ready","auth_required","error"} if sys.argv[1] == "v4" else {"ready","auth_required"}
-if document.get("state") not in allowed_states:
-    raise SystemExit("details state is unknown")
-observed_at=document.get("observed_at")
-if not (sys.argv[1] == "v4" and document["state"] in {"auth_required","error"} and observed_at is None) and (isinstance(observed_at,bool) or not isinstance(observed_at,int) or not 1 <= observed_at <= 253402300799):
-    raise SystemExit("details observed_at is invalid")
-if sys.argv[1] == "v4":
-    required={"api_version","state","observed_at","authenticated","plan_label","quota","models_status","models","active_thread_count","open_session_thread_count"}
-    if set(document) != required or document["api_version"] != "v4": raise SystemExit("current schema is unknown")
-    def uint(value): return type(value) is int and 0 <= value <= 18446744073709551615
-    plans={"無料":False,"Go":False,"Plus":False,"Pro":False,"Pro Lite":False,"Team":False,"Business":False,"エンタープライズ":True,"教育":False,"プラン未設定":False}
-    if type(document["authenticated"]) is not bool or not (document["plan_label"] is None or isinstance(document["plan_label"],str) and document["plan_label"] in plans): raise SystemExit("current account metadata is invalid")
-    if document["state"] == "ready" and not document["authenticated"] or document["state"] == "auth_required" and document["authenticated"]: raise SystemExit("current authentication state is inconsistent")
-    if not all(uint(document[k]) for k in ("active_thread_count","open_session_thread_count")) or document["active_thread_count"] > document["open_session_thread_count"]: raise SystemExit("current thread counts are invalid")
-    quota=document["quota"]
-    if quota is not None:
-        if not isinstance(quota,dict) or set(quota) != {"remaining_percent","reset_at","window_seconds","monthly"}: raise SystemExit("current quota schema is invalid")
-        remaining=quota["remaining_percent"]
-        if type(remaining) not in {int,float} or not 0 <= remaining <= 100 or type(quota["reset_at"]) is not int or not 1 <= quota["reset_at"] <= 253402300799 or type(quota["window_seconds"]) is not int or quota["window_seconds"] <= 0 or type(quota["monthly"]) is not bool: raise SystemExit("current quota is invalid")
-        if document["plan_label"] is not None and quota["monthly"] != plans[document["plan_label"]]: raise SystemExit("current plan classification is inconsistent")
-    if document["models_status"] not in {"complete","partial","unavailable"} or not isinstance(document["models"],list) or len(document["models"]) > 1024: raise SystemExit("current models are invalid")
-    if document["models_status"] == "unavailable" and document["models"]: raise SystemExit("unavailable current models are not empty")
-    if not document["authenticated"] and (observed_at is not None or document["plan_label"] is not None or quota is not None or document["models"] or document["models_status"] != "unavailable" or document["active_thread_count"] != 0 or document["open_session_thread_count"] != 0): raise SystemExit("current account boundary is not empty")
-    model_ids=set()
-    for model in document["models"]:
-        if not isinstance(model,dict) or set(model) != {"model","total_tokens","input_tokens","cached_input_tokens","cache_write_input_tokens","output_tokens","estimated_cost"}: raise SystemExit("current model schema is invalid")
-        key=model["model"]
-        if not isinstance(key,str) or not 1 <= len(key) <= 128 or any(ord(c) < 32 or 127 <= ord(c) <= 159 or 55296 <= ord(c) <= 57343 or ord(c) in {1564,8206,8207} or 8234 <= ord(c) <= 8238 or 8294 <= ord(c) <= 8297 for c in key) or key in model_ids or not uint(model["total_tokens"]): raise SystemExit("current model identity or total is invalid")
-        model_ids.add(key)
-        for key in ("input_tokens","cached_input_tokens","output_tokens"):
-            if not uint(model[key]): raise SystemExit("current component is invalid")
-        write=model["cache_write_input_tokens"]
-        if write is not None and not uint(write): raise SystemExit("current cache write is invalid")
-        if model["input_tokens"] + model["output_tokens"] != model["total_tokens"]: raise SystemExit("current token total is inconsistent")
-        if model["cached_input_tokens"] > model["input_tokens"]: raise SystemExit("current cached input is inconsistent")
-        if write is not None and model["cached_input_tokens"] + write > model["input_tokens"]: raise SystemExit("current cache write is inconsistent")
-        cost=model["estimated_cost"]
-        if cost is not None:
-            if not isinstance(cost,dict) or set(cost) != {"price_version","ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars"}: raise SystemExit("current price schema is invalid")
-            if not isinstance(cost["price_version"],str) or not cost["price_version"]: raise SystemExit("current price revision is invalid")
-            if any(type(cost[key]) not in {int,float} or not 0 <= cost[key] <= sys.float_info.max for key in ("ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars")): raise SystemExit("current price amount is invalid")
-print(observed_at if sys.argv[1] == "v4" and document["state"] == "error" and document["authenticated"] and observed_at is not None else "")
-' "$current_version" <<< "$details" || return 1
-    )" || return 1
+    value={}
+    for key,item in items:
+        if key in value: raise ValueError("duplicate readback key")
+        value[key]=item
+    return value
+root=json.load(sys.stdin,object_pairs_hook=pairs)
+if set(root)!={"main","runtime"}: raise SystemExit("UI readback projections are invalid")
+runtime=root["runtime"]
+if set(runtime)!={"rest_product_version","recorder_product_version","recorder_status"} or runtime["rest_product_version"]!=sys.argv[1]: raise SystemExit("runtime identity mismatch")
+if runtime["recorder_status"] not in {"available","unavailable","mismatch"}: raise SystemExit("runtime source state is invalid")
+doc=root["main"]
+if set(doc)!={"acquisition_state","observed_at","authenticated","plan_label","selection","quota","models_status","models","thread_summary"}: raise SystemExit("Main schema is invalid")
+state=doc["acquisition_state"]
+if state not in {"ready","auth_required","error"} or type(doc["authenticated"]) is not bool: raise SystemExit("acquisition state is invalid")
+observed=doc["observed_at"]
+if observed is not None and (type(observed) is not int or not 1<=observed<=253402300799): raise SystemExit("observed_at is invalid")
+if state=="ready" and (not doc["authenticated"] or observed is None): raise SystemExit("ready qualification is invalid")
+if state=="auth_required" and doc["authenticated"]: raise SystemExit("authentication state is inconsistent")
+def uint(value): return type(value) is int and 0<=value<=18446744073709551615
+plans={"無料":False,"Go":False,"Plus":False,"Pro":False,"Pro Lite":False,"Team":False,"Business":False,"エンタープライズ":True,"教育":False,"プラン未設定":False}
+if not (doc["plan_label"] is None or isinstance(doc["plan_label"],str) and doc["plan_label"] in plans): raise SystemExit("account plan is invalid")
+summary=doc["thread_summary"]
+if summary is not None:
+    if set(summary)!={"open_count","running_count","unknown_activity_count","by_model"} or not all(uint(summary[key]) for key in ("open_count","running_count","unknown_activity_count")) or summary["running_count"]+summary["unknown_activity_count"]>summary["open_count"]: raise SystemExit("thread summary is invalid")
+    if not isinstance(summary["by_model"],list) or sum(row["open_count"] for row in summary["by_model"])!=summary["open_count"]: raise SystemExit("thread model count is invalid")
+quota=doc["quota"]
+if quota is not None:
+    if set(quota)!={"remaining_percent","reset_at","window_seconds","monthly"} or type(quota["remaining_percent"]) not in {int,float} or not 0<=quota["remaining_percent"]<=100 or type(quota["reset_at"]) is not int or not 1<=quota["reset_at"]<=253402300799 or type(quota["window_seconds"]) is not int or quota["window_seconds"]<=0 or type(quota["monthly"]) is not bool: raise SystemExit("quota is invalid")
+    if doc["plan_label"] is not None and quota["monthly"]!=plans[doc["plan_label"]]: raise SystemExit("plan classification is inconsistent")
+if doc["models_status"] not in {"complete","partial","unavailable"} or not isinstance(doc["models"],list) or len(doc["models"])>1024: raise SystemExit("models are invalid")
+if doc["models_status"]=="unavailable" and doc["models"]: raise SystemExit("unavailable models contain values")
+if not doc["authenticated"] and (observed is not None or doc["plan_label"] is not None or quota is not None or doc["models"] or doc["models_status"]!="unavailable" or summary is not None and any(summary[key] for key in ("open_count","running_count","unknown_activity_count"))): raise SystemExit("account boundary is not empty")
+ids=set()
+for model in doc["models"]:
+    if set(model)!={"model","total_tokens","input_tokens","cached_input_tokens","cache_write_input_tokens","output_tokens","estimated_cost"}: raise SystemExit("model schema is invalid")
+    name=model["model"]
+    if not isinstance(name,str) or not 1<=len(name)<=128 or any(ord(c)<32 or 127<=ord(c)<=159 or 55296<=ord(c)<=57343 or ord(c) in {1564,8206,8207} or 8234<=ord(c)<=8238 or 8294<=ord(c)<=8297 for c in name) or name in ids: raise SystemExit("model identity is invalid")
+    ids.add(name)
+    if not all(uint(model[key]) for key in ("total_tokens","input_tokens","cached_input_tokens","output_tokens")) or model["input_tokens"]+model["output_tokens"]!=model["total_tokens"] or model["cached_input_tokens"]>model["input_tokens"]: raise SystemExit("token facts are invalid")
+    write=model["cache_write_input_tokens"]
+    if write is not None and (not uint(write) or model["cached_input_tokens"]+write>model["input_tokens"]): raise SystemExit("cache write is invalid")
+    cost=model["estimated_cost"]
+    if cost is not None:
+        if set(cost)!={"price_revision","ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars"} or not isinstance(cost["price_revision"],str) or not cost["price_revision"]: raise SystemExit("price revision is invalid")
+        if any(type(cost[key]) not in {int,float} or not math.isfinite(cost[key]) or cost[key]<0 for key in ("ordinary_input_dollars","cached_input_dollars","cache_write_input_dollars","output_dollars","total_dollars")): raise SystemExit("price amount is invalid")
+print(observed if state=="error" and doc["authenticated"] and observed is not None else "")
+' "$version" <<< "$response")" || return 1
     local recorder_pid
     recorder_pid="$(recorder_systemd_pid)"; [[ "$recorder_pid" != 0 ]] || safe_blocked 'recorder service has no MainPID'
     recorder_identity_check "$recorder_pid" "$version" "$source" "$manifest_hash" "$retained_observed_at" || return 1

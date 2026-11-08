@@ -19,7 +19,7 @@ public sealed class GraphWindowRangeTests
     private const long WeekSeconds = 604_800;
     private const long FixedNow = 1_800_000_000;
     private static readonly PublishedPairIdentity Pair = PublishedPairIdentity.Create(
-        $"v1:{new string('f', 64)}");
+        $"{new string('f', 64)}");
 
     [Fact]
     public async Task Issue646ResetSelectorUsesTokenDirectoryWhileTimeWindowKeepsQuotaHistory()
@@ -680,7 +680,7 @@ public sealed class GraphWindowRangeTests
         {
             Samples = oldSamples,
         };
-        var nextPair = PublishedPairIdentity.Create($"v1:{new string('a', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"{new string('a', 64)}");
         var latestPeriod = period with
         {
             Samples = oldSamples
@@ -744,7 +744,7 @@ public sealed class GraphWindowRangeTests
         {
             Samples = [period.Samples[0] with { SolDollars = 73 }],
         };
-        var nextPair = PublishedPairIdentity.Create($"v1:{new string('b', 64)}");
+        var nextPair = PublishedPairIdentity.Create($"{new string('b', 64)}");
         var initialDetails = CreateDetails([period], Pair);
         var latestDetails = CreateDetails([updatedPeriod], nextPair, FixedNow + 1);
         using var main = new MainWindowViewModel(new SequenceDetailsClient(initialDetails, latestDetails));
@@ -1363,7 +1363,7 @@ public sealed class GraphWindowRangeTests
             }
 
             var pagePair = periodId == MismatchPairForPeriodId
-                ? PublishedPairIdentity.Create($"v1:{new string('e', 64)}")
+                ? PublishedPairIdentity.Create($"{new string('e', 64)}")
                 : pair;
             return HistoryPageFetchResult.Success(new ApiHistoryPage(
                 period.Id,

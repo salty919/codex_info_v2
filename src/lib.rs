@@ -19,3 +19,6 @@ pub mod session_input;
 pub mod thread_contract;
 pub mod thread_state;
 pub mod usage_store;
+
+/// Single versionless loopback client shared by the Unix UI and CLI.
+pub mod wire_client;
