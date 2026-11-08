@@ -22,6 +22,26 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphSelectInteractionTests
 {
     [Fact]
+    public Task CurrentDateGroupRetainsTheSelectorAndNavigationOrder() => RunOnUiThread(() =>
+    {
+        var previousZone = LocalizationService.DisplayTimeZone.Id;
+        LocalizationService.SetTimeZone("UTC");
+        Window? window = null;
+        try
+        {
+            var current = new ApiHistoryPeriod("current", DateTimeOffset.Parse("2026-10-12T10:00:00Z").ToUnixTimeSeconds(), 1_900_000_000, true, "Current");
+            var laterHistory = current with { Id = "later-history", StartAt = current.StartAt + 86400, Current = false };
+            var selector = new GraphSelect { GroupPeriodsByDate = true, ItemsSource = new[] { current, laterHistory }, SelectedItem = current };
+            window = new Window { Content = selector };
+            window.Show();
+            var groups = selector.FindControl<TreeView>("PeriodTree")!.ItemsSource!.Cast<PeriodDateGroup>().ToArray();
+            Assert.Equal(new[] { "2026/10/12", "2026/10/13" }, groups.Select(group => group.Label));
+            Assert.Equal(new[] { "current", "later-history" }, groups.SelectMany(group => group.Periods).Select(period => period.Id));
+        }
+        finally { window?.Close(); LocalizationService.SetTimeZone(previousZone); }
+    });
+
+    [Fact]
     public async Task GroupedPeriodSelectionUsesPopupPaletteAfterThemeChanges()
     {
         var previousTheme = ThemePalette.CurrentId;

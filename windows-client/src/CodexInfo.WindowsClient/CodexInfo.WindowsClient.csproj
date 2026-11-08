@@ -40,4 +40,7 @@
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.1" />
     <PackageReference Include="ScottPlot.Avalonia" Version="5.1.59" />
   </ItemGroup>
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.Net.SocketsHttpHandler.Http2FlowControl.DisableDynamicWindowSizing" Value="true" />
+  </ItemGroup>
 </Project>

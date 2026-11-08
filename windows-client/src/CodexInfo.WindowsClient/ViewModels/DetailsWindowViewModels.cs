@@ -194,6 +194,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     internal GraphWindowViewModel(MainWindowViewModel main, Action<Action> postToUi, Func<long> getUnixTimeSeconds)
     {
         this.main = main;
+        main.SetApiViewVisible("graph", true);
         this.postToUi = postToUi;
         this.getUnixTimeSeconds = getUnixTimeSeconds;
         observedMainQuotaBoundary = ReadMainQuotaBoundary(main.DetailsSnapshot);
@@ -995,6 +996,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         disposed = true;
+        main.SetApiViewVisible("graph", false);
         Volatile.Write(ref pendingGraphRequest, null);
         Volatile.Write(ref pendingQuotaBoundaryRefresh, null);
         timeWindowRequestCancellation?.Cancel();
@@ -2154,15 +2156,18 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         try
         {
+            var changes = resourceClient as IUiChangeClient;
+            var revision = changes?.ChangeRevision ?? 0;
             await RefreshSplitResourceAsync(
                     initial: true,
                     requestedPeriodId: null,
                     cancellationToken)
                 .ConfigureAwait(false);
 
-            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(60));
-            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            if (changes is null) return;
+            while (!cancellationToken.IsCancellationRequested)
             {
+                revision = await changes.WaitForChangeAsync(revision, cancellationToken).ConfigureAwait(false);
                 await RefreshSplitResourceAsync(
                         initial: false,
                         requestedPeriodId: selectedPeriod is { Current: false } ? selectedPeriod.Id : null,
@@ -2181,7 +2186,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         string? requestedPeriodId,
         CancellationToken cancellationToken)
     {
-        if (timeWindowRequestPending || Volatile.Read(ref pendingGraphRequest) is not null)
+        if (Volatile.Read(ref pendingGraphRequest) is { } pending)
+        {
+            await RestartPendingGraphRequestAsync(pending, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (timeWindowRequestPending)
         {
             return;
         }
@@ -2255,7 +2266,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
-            var allowCached = !forceRefresh && windowPublishedPair is not null;
+            try { await main.EnsureAccountContextAsync(cancellationToken).ConfigureAwait(false); }
+            catch (WirePendingException) { return; }
+            var allowCached = resourceClient is not ILoopbackUiClient && !forceRefresh && windowPublishedPair is not null;
             for (var alignmentAttempt = 0;
                 alignmentAttempt < MaxSplitGenerationAlignmentAttempts;
                 alignmentAttempt++)
@@ -2265,9 +2278,12 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                     return;
                 }
 
-                var periodsResult = accountId is not null && accountResourceClient is not null
-                    ? await accountResourceClient.FetchHistoryPeriodsAsync(accountId, cancellationToken).ConfigureAwait(false)
-                    : await resourceClient.FetchHistoryPeriodsAsync(cancellationToken).ConfigureAwait(false);
+                var periodsResult = resourceClient is ILoopbackUiClient live && accountId is not null
+                    ? await live.FetchWindowPeriodsAsync(accountId, bounds.StartAt, checked(bounds.EndAt + 1), cancellationToken).ConfigureAwait(false)
+                    : accountId is not null && accountResourceClient is not null
+                        ? await accountResourceClient.FetchHistoryPeriodsAsync(accountId, cancellationToken).ConfigureAwait(false)
+                        : await resourceClient.FetchHistoryPeriodsAsync(cancellationToken).ConfigureAwait(false);
+                if (periodsResult.Failure == DetailsFetchFailure.Pending) return;
                 if (!IsCurrentWindowRequest(revision, accountId, accountGeneration, explicitRequest))
                 {
                     return;
@@ -2437,13 +2453,14 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 return WindowPeriodFetchResult.Stale;
             }
+            if (pageResult.Failure == DetailsFetchFailure.Pending) return WindowPeriodFetchResult.Stale;
             if (!pageResult.IsSuccess || pageResult.Page is not { } page ||
                 accountId is not null && page.AccountId != accountId ||
                 page.PeriodId != period.Id)
             {
                 return WindowPeriodFetchResult.Failure;
             }
-            if (page.PublishedPair != expectedPair)
+            if (resourceClient is not ILoopbackUiClient && page.PublishedPair != expectedPair)
             {
                 return WindowPeriodFetchResult.PairMismatch;
             }
@@ -2532,6 +2549,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
+            try { await main.EnsureAccountContextAsync(cancellationToken).ConfigureAwait(false); }
+            catch (WirePendingException) { return; }
             var candidateResourcePeriod = resourcePeriod;
             var candidateResourceNextCursor = resourceNextCursor;
             var candidateCursorResetRequired = resourceCursorResetRequired;
@@ -2542,6 +2561,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 ? await accountResourceClient.FetchSelectableHistoryPeriodsAsync(accountId, cancellationToken)
                 : await resourceClient.FetchSelectableHistoryPeriodsAsync(cancellationToken)
                 .ConfigureAwait(false);
+            if (periodsResult.Failure == DetailsFetchFailure.Pending) return;
             if (!periodsResult.IsSuccess || periodsResult.Snapshot is not { } periodsSnapshot)
             {
                 PublishSplitResourceFailure(
@@ -2648,6 +2668,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                     resumeCursor = null;
                     continue;
                 }
+                if (pageResult.Failure == DetailsFetchFailure.Pending) return;
                 if (!pageResult.IsSuccess || pageResult.Page is not { } page ||
                     (accountId is not null && page.AccountId != accountId) ||
                     page.PeriodId != stagedPeriod.Id)
@@ -2666,7 +2687,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                     return;
                 }
 
-                if (page.PublishedPair != periodsSnapshot.PublishedPair)
+                if (resourceClient is not ILoopbackUiClient && page.PublishedPair != periodsSnapshot.PublishedPair)
                 {
                     if (generationAlignmentAttempts >= MaxSplitGenerationAlignmentAttempts)
                     {
@@ -3090,7 +3111,20 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private static IReadOnlyList<ApiHistoryPeriod> FormatPeriodsForDisplay(
         IEnumerable<ApiHistoryPeriod> source)
     {
-        var formatted = source.Select(FormatPeriodForDisplay).ToArray();
+        // The wire is a set of immutable bindings. The established selector
+        // order also owns Prev/Next; a provider's enumeration cannot own it.
+        var idComparer = Comparer<string>.Create((left, right) =>
+            System.Text.Encoding.UTF8.GetBytes(left).AsSpan().SequenceCompareTo(System.Text.Encoding.UTF8.GetBytes(right)));
+        var formatted = source
+            .GroupBy(period => TimeZoneInfo.ConvertTime(DateTimeOffset.FromUnixTimeSeconds(period.StartAt), LocalizationService.DisplayTimeZone)
+                .ToString("yyyy/MM/dd", CultureInfo.InvariantCulture))
+            .OrderByDescending(group => group.Any(period => period.Current))
+            .ThenByDescending(group => group.Key, StringComparer.Ordinal)
+            .SelectMany(group => group.OrderByDescending(period => period.Current)
+                .ThenByDescending(period => period.StartAt)
+                .ThenByDescending(period => period.ResetAt)
+                .ThenByDescending(period => period.Id, idComparer))
+            .Select(FormatPeriodForDisplay).ToArray();
         var totals = formatted
             .GroupBy(period => period.Label, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
@@ -3509,6 +3543,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
     internal ThreadsWindowViewModel(MainWindowViewModel main, Action<Action> postToUi)
     {
         this.main = main;
+        main.SetApiViewVisible("threads", true);
         this.postToUi = postToUi;
         resourceClient = main.SplitResourceClient;
         accountResourceClient = main.AccountResourceClient;
@@ -3604,6 +3639,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         disposed = true;
+        main.SetApiViewVisible("threads", false);
         if (resourcePollingCancellation is not null)
         {
             resourcePollingCancellation.Cancel();
@@ -3686,10 +3722,13 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         try
         {
+            var changes = resourceClient as IUiChangeClient;
+            var revision = changes?.ChangeRevision ?? 0;
             await RefreshSplitResourceAsync(cancellationToken).ConfigureAwait(false);
-            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
-            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            if (changes is null) return;
+            while (!cancellationToken.IsCancellationRequested)
             {
+                revision = await changes.WaitForChangeAsync(revision, cancellationToken).ConfigureAwait(false);
                 await RefreshSplitResourceAsync(cancellationToken).ConfigureAwait(false);
             }
         }
@@ -3758,12 +3797,14 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         postToUi(() =>
         {
             if (disposed ||
+                resourceClient is not ILoopbackUiClient && !ReferenceEquals(mainGeneration, main.DetailsSnapshot) ||
                 accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration) ||
-                !ReferenceEquals(main.DetailsSnapshot, mainGeneration))
+                main.IsSelectedAccountHistorical)
             {
                 return;
             }
 
+            if (result.Failure == DetailsFetchFailure.Pending) return;
             if (!result.IsSuccess || result.Snapshot is not { } snapshot)
             {
                 hasLoadError = true;
@@ -3782,7 +3823,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
-            if (mainGeneration is null || snapshot.PublishedPair != mainGeneration.PublishedPair ||
+            if (mainGeneration is null ||
                 (ulong)snapshot.Threads.Count != main.AcceptedWireOpenSessionThreadCount ||
                 (ulong)snapshot.Threads.Count(thread =>
                     thread.ActivityStatus == ApiThreadActivityStatus.Running) != main.AcceptedWireActiveThreadCount)

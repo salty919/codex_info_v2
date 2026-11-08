@@ -11,7 +11,7 @@ namespace CodexInfo.WindowsClient.Core.Tests;
 public sealed class RecordedScopeClientTests
 {
     [Fact]
-    public async Task ProductionCurrentStartsWithV4WithoutRecordedScopeDependency()
+    public async Task ProductionCurrentUsesOnlyMainWithoutRecordedScopeDependency()
     {
         const string current = """
             {"api_version":"v4","models_status":"partial","state":"ready","observed_at":1792228061,
@@ -22,21 +22,22 @@ public sealed class RecordedScopeClientTests
              "cached_input_dollars":2,"cache_write_input_dollars":3,"output_dollars":4,"total_dollars":10}}],
              "active_thread_count":0,"open_session_thread_count":0}
             """;
-        var paths = new List<string>();
-        using var client = new LoopbackStatusClient(new Handler(request =>
-        {
-            paths.Add(request.RequestUri!.AbsolutePath);
-            return request.RequestUri.AbsolutePath == "/v4/current"
-                ? Json(current) : new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
-        }));
+        using var doc = System.Text.Json.JsonDocument.Parse(current);
+        var value = System.Text.Json.Nodes.JsonNode.Parse(current)!.AsObject();
+        value.Remove("api_version"); value["acquisition_state"] = value["state"]!.DeepClone(); value.Remove("state");
+        value.Remove("active_thread_count"); value.Remove("open_session_thread_count");
+        value["selection"] = System.Text.Json.JsonSerializer.SerializeToNode(new { account_id = "account-1", is_current = true, login_id = (string?)null });
+        value["thread_summary"] = null;
+        var cost = value["models"]![0]!["estimated_cost"]!.AsObject(); cost["price_revision"] = cost["price_version"]!.DeepClone(); cost.Remove("price_version");
+        using var handler = new WireFacadeFixture { Rows = _ => [new(["main"], "main", WireFacadeFixture.Element(value))] };
+        using var client = new LoopbackStatusClient(handler);
         var result = await client.FetchCurrentAsync();
-        Assert.Equal(new[] { "/v4/current" }, paths);
+        Assert.Equal(new[] { "/state?parts=main" }, handler.Gets);
         Assert.True(result.IsSuccess);
-        Assert.Equal("v4", result.Snapshot!.ApiVersion);
-        var model = Assert.Single(result.Snapshot.Models);
+        var model = Assert.Single(result.Snapshot!.Models);
         Assert.Equal(13UL, model.TotalTokens);
         Assert.Equal(10d, model.EstimatedTotalDollars);
-        Assert.Equal(ApiCurrentModelsStatus.Partial, result.Snapshot.ModelsStatus);
+        Assert.Equal(ApiCurrentModelsStatus.Partial, result.Snapshot!.ModelsStatus);
     }
 
     internal static HttpResponseMessage Json(string body)

@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Text;
 using System.Xml.Linq;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Core.Tests;
 using CodexInfo.WindowsClient.Settings;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
@@ -426,7 +427,9 @@ public sealed class Issue481SettingsTests
             Assert.Equal("1.2.3", typeof(SettingsViewModel).GetProperty("RestVersion")!.GetValue(settings));
             Assert.Equal("1.2.2", typeof(SettingsViewModel).GetProperty("RecorderVersion")!.GetValue(settings));
             Assert.Equal("mismatch", typeof(SettingsViewModel).GetProperty("RuntimeVersionState")!.GetValue(settings));
+            var revision = client.ChangeRevision;
             handler.Unavailable = true;
+            await client.WaitForChangeAsync(revision, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2));
             await (Task)refresh.Invoke(settings, null)!;
             Assert.Equal(settings.Texts.UnavailableValue, typeof(SettingsViewModel).GetProperty("RestVersion")!.GetValue(settings));
             Assert.Equal(settings.Texts.UnavailableValue, typeof(SettingsViewModel).GetProperty("RecorderVersion")!.GetValue(settings));
@@ -485,18 +488,9 @@ public sealed class Issue481SettingsTests
         }
     }
 
-    private sealed class RuntimeHandler : HttpMessageHandler
+    private sealed class RuntimeHandler : WireFacadeFixture
     {
-        public bool Unavailable { get; set; }
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
-        {
-            Assert.Equal("/v1/runtime", request.RequestUri!.AbsolutePath);
-            var response = new HttpResponseMessage(Unavailable ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK)
-            {
-                Content = new StringContent("{\"api_version\":\"v1\",\"rest_version\":\"1.2.3\",\"recorder_version\":\"1.2.2\",\"recorder_status\":\"mismatch\"}", Encoding.UTF8, "application/json"),
-            };
-            response.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoStore = true };
-            return Task.FromResult(response);
-        }
+        public bool Unavailable { get => Status == HttpStatusCode.ServiceUnavailable; set { Status = value ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK; NotifyChanged(); } }
+        public RuntimeHandler() => Rows = _ => [new(["runtime"], "runtime", Element(new { rest_product_version = "1.2.3", recorder_product_version = "1.2.2", recorder_status = "mismatch" }))];
     }
 }

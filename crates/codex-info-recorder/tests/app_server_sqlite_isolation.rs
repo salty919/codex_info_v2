@@ -4974,6 +4974,12 @@ fn thread_cycle_uses_one_deadline_across_initialize_and_read() {
         matches!(result, ActiveThreadPollResult::Failed(_)),
         "slow thread/read response must fail at the cycle deadline"
     );
+    if let ActiveThreadPollResult::Failed(reason) = &result {
+        assert!(
+            reason.contains("deadline") || reason.contains("timed out"),
+            "the deadline oracle must not accept an earlier admission failure: {reason}"
+        );
+    }
     assert!(
         elapsed < Duration::from_secs(20),
         "cycle exceeded the 20-second oracle: {elapsed:?}"

@@ -10,7 +10,7 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 internal static class PublishedPairTestFixtures
 {
     private const string CanonicalValue =
-        "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
+        "00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
     public static PublishedPairIdentity Canonical => Create(CanonicalValue);
 

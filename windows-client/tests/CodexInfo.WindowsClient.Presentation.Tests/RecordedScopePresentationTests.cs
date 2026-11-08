@@ -1,11 +1,14 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
+using Avalonia.Headless;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Reflection;
 using CodexInfo.WindowsClient.Controls;
+using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Core.Tests;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.ViewModels;
@@ -34,38 +37,45 @@ public sealed class RecordedScopePresentationTests : IDisposable
     [Fact]
     public async Task ExistingGraphKeepsDateGroupsLocalMonthCurvesAndAllModelTotals()
     {
-        using var handler = new FixtureHandler { ExistingUi = true };
-        using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchCurrentAsync("account-1");
-        Assert.True(result.IsSuccess);
-        Assert.Equal("v4", result.Snapshot!.ApiVersion);
-        var threads = await client.FetchThreadsAsync("account-1");
-        Assert.True(threads.IsSuccess);
-        Assert.Equal(result.Snapshot.PublishedPair, threads.Snapshot!.PublishedPair);
-        using var main = CreateMain(client, result.Snapshot, threads.Snapshot.Threads);
-        Assert.Equal("13", Assert.Single(main.Models).TotalTokensText);
-        Assert.Contains("10.00", main.EstimatedCostText, StringComparison.Ordinal);
-        Assert.Equal(1UL, main.ActiveThreadCount);
-        Assert.Single(main.DetailsSnapshot!.Threads);
-        using var graph = CreateGraph(main);
-        await Settled(graph);
-        Assert.Equal(new[] { "1792823932" }, graph.Periods.Select(period => period.Id));
-        Assert.DoesNotContain(handler.Paths, path => path.StartsWith("/v6/", StringComparison.Ordinal));
-        var line = GraphPlotProjection.BuildModelLines(graph.Scene, graph.Scene.Sol);
-        Assert.NotEmpty(line.Rising.X);
-        Assert.Contains(1_000_000d, line.Rising.Y);
-        Assert.Contains(2_000_000d, line.Rising.Y);
-        graph.ShowSol = false;
-        graph.SelectedTimeRange = GraphTimeRange.CalendarMonth;
-        await Settled(graph);
-        Assert.Equal("2026/10", graph.RangeLabel);
-        Assert.True(graph.IsMonthView);
-        Assert.False(graph.HasLinePlot);
-        Assert.Contains(graph.CalendarDays, day => day.ValueText == "2 M");
-        graph.IsTokensMetric = false;
-        await Settled(graph);
-        Assert.Contains(graph.CalendarDays, day => day.ValueText == "$5.00");
-        Assert.False(graph.ShowSol);
+        using var session = HeadlessUnitTestSession.StartNew(typeof(GraphSelectInteractionTests.TestApplication));
+        await session.Dispatch<bool>(async () =>
+        {
+
+            using var handler = new FixtureHandler { ExistingUi = true };
+            using var client = new LoopbackStatusClient(handler);
+            var result = await client.FetchCurrentAsync("account-1");
+            Assert.True(result.IsSuccess);
+            Assert.Matches("^[0-9a-f]{64}$", result.Snapshot!.PublishedPair.ToString());
+            var threads = await client.FetchThreadsAsync("account-1");
+            Assert.True(threads.IsSuccess);
+            Assert.Matches("^[0-9a-f]{64}$", threads.Snapshot!.PublishedPair.ToString());
+            using var main = CreateMain(client, result.Snapshot, threads.Snapshot.Threads);
+            Assert.Equal("13", Assert.Single(main.Models).TotalTokensText);
+            Assert.Contains("10.00", main.EstimatedCostText, StringComparison.Ordinal);
+            Assert.Equal(1UL, main.ActiveThreadCount);
+            Assert.Single(main.DetailsSnapshot!.Threads);
+            using var graph = CreateGraph(main);
+            await Settled(graph);
+            Assert.Equal(new[] { "1792823932" }, graph.Periods.Select(period => period.Id));
+            Assert.Null(main.SelectedAccount!.OwnershipIntervals); // [] asserts no intervals; it does not assert non-ownership.
+            Assert.DoesNotContain(handler.Paths, path => path.StartsWith("/v6/", StringComparison.Ordinal));
+            var line = GraphPlotProjection.BuildModelLines(graph.Scene, graph.Scene.Sol);
+            Assert.NotEmpty(line.Rising.X);
+            Assert.Contains(1_000_000d, line.Rising.Y);
+            Assert.Contains(2_000_000d, line.Rising.Y);
+            graph.ShowSol = false;
+            graph.SelectedTimeRange = GraphTimeRange.CalendarMonth;
+            await Settled(graph);
+            Assert.Equal("2026/10", graph.RangeLabel);
+            Assert.True(graph.IsMonthView);
+            Assert.False(graph.HasLinePlot);
+            Assert.Contains(graph.CalendarDays, day => day.ValueText == "2 M");
+            graph.IsTokensMetric = false;
+            await Settled(graph);
+            Assert.Contains(graph.CalendarDays, day => day.ValueText == "$5.00");
+            Assert.False(graph.ShowSol);
+            return true;
+        }, CancellationToken.None);
     }
 
     private static MainWindowViewModel CreateMain(LoopbackStatusClient client, ApiCurrentSnapshot current,
@@ -96,17 +106,19 @@ public sealed class RecordedScopePresentationTests : IDisposable
             Task.FromResult(HealthFetchResult.Success(new("v1", "codex-info", "1.0.0")));
     }
 
-    private sealed class FixtureHandler : HttpMessageHandler
+    private sealed class FixtureHandler : WireFacadeFixture
     {
-        internal readonly List<string> Paths = [];
+        internal IReadOnlyList<string> Paths => Gets;
         internal bool ExistingUi;
 
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        public FixtureHandler() { Rows = Read; }
+        private IReadOnlyList<FixtureRow> Read(string target)
         {
-            var uri = request.RequestUri!;
-            Paths.Add(uri.PathAndQuery);
-            if (ExistingUi && uri.AbsolutePath == "/v4/current")
-                return Task.FromResult(Response("""
+            var uri = new Uri("http://127.0.0.1" + target);
+            if (ExistingUi && uri.AbsolutePath == "/state" && uri.Query.Contains("parts=account_context", StringComparison.Ordinal))
+                return [new(["account_context", "account-1"], "account_context", Element(new { id = "account-1", activation_at = 1L, deactivation_at = (long?)null, ownership_intervals = Array.Empty<object>() }))];
+            if (ExistingUi && uri.AbsolutePath == "/state")
+                return RowsFrom(target, """
                     {"api_version":"v4","models_status":"partial","state":"ready","observed_at":1792228061,
                      "authenticated":true,"plan_label":"Plus","quota":{"remaining_percent":88,"reset_at":1792823932,
                      "window_seconds":604800,"monthly":false},"models":[{"model":"ASTRA","total_tokens":13,
@@ -114,22 +126,22 @@ public sealed class RecordedScopePresentationTests : IDisposable
                      "estimated_cost":{"price_version":"ASTRA_USER_2026-09-05","ordinary_input_dollars":1,
                      "cached_input_dollars":2,"cache_write_input_dollars":3,"output_dollars":4,"total_dollars":10}}],
                      "active_thread_count":1,"open_session_thread_count":1}
-                    """));
-            if (ExistingUi && uri.AbsolutePath == "/v3/threads")
-                return Task.FromResult(Response("""
+                    """);
+            if (ExistingUi && uri.AbsolutePath == "/threads")
+                return RowsFrom(target, """
                     {"api_version":"v3","threads":[{"id":"thread-1","title":"active","parent_thread_id":null,
                      "model":"ASTRA","model_label":"ASTRA","total_tokens":13,"context_usage_tokens":null,
                      "context_window_tokens":null,"created_at":1,"last_user_message_at":1,"is_subagent":false,
                      "depth":0,"activity_status":"running"}]}
-                    """));
-            if (ExistingUi && uri.AbsolutePath.StartsWith("/v5/history/periods", StringComparison.Ordinal))
-                return Task.FromResult(Response("""
+                    """);
+            if (ExistingUi && uri.AbsolutePath.StartsWith("/history/periods", StringComparison.Ordinal))
+                return RowsFrom(target, """
                     {"api_version":"v5","history_periods":[{"id":"1792823932","start_at":1792219132,
                      "end_at":1792228061,"reset_at":1792823932,"origin_at":null,"current":true,"label":"existing period"}],
                      "next_cursor":null}
-                    """));
-            if (ExistingUi && uri.AbsolutePath == "/v3/history")
-                return Task.FromResult(Response("""
+                    """);
+            if (ExistingUi && uri.AbsolutePath == "/history")
+                return RowsFrom(target, """
                     {"api_version":"v3","history_gaps":[],"next_cursor":null,"resume_cursor":"existing-last",
                      "history_samples":[
                       {"timestamp":1792227960,"reset_at":1792823932,"remaining_percent":89,
@@ -140,18 +152,17 @@ public sealed class RecordedScopePresentationTests : IDisposable
                        "model_source":"legacy-unknown","models_complete":false,"models":[
                         {"model":"gpt-6.1-sol","total_tokens":2000000,"total_dollars":5},
                         {"model":"gpt-6-astra","total_tokens":3000000,"total_dollars":7.5}]}]}
-                    """));
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                    """);
+            throw new InvalidOperationException("Unexpected wire fixture target: " + target);
         }
 
-        private HttpResponseMessage Response(string body)
+        private IReadOnlyList<FixtureRow> RowsFrom(string target, string body)
         {
-            var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(body) };
-            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
-            response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
-            response.Headers.TryAddWithoutValidation("Codex-Info-Published-Pair",
-                "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001");
-            return response;
+            using var parsed = JsonDocument.Parse(body); var document = parsed.RootElement;
+            if (target.StartsWith("/state?", StringComparison.Ordinal)) return [new(["main"], "main", WirePresentationFixture.MainRecord(document))];
+            if (target.StartsWith("/threads?", StringComparison.Ordinal)) return WirePresentationFixture.Threads(document);
+            if (target.StartsWith("/history/periods?", StringComparison.Ordinal)) return WirePresentationFixture.Periods(document);
+            return WirePresentationFixture.History(document, "1792823932");
         }
     }
 }

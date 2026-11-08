@@ -7,6 +7,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Core.Tests;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
@@ -17,10 +18,9 @@ public sealed class ModelUsageDisplayContractTests
 {
     private const string PublishedPairHeader = "Codex-Info-Published-Pair";
     private const string PublishedPair =
-        "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
+        "00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
     [Theory]
-    [InlineData("v3", null)]
     [InlineData("v4", "complete")]
     [InlineData("v4", "partial")]
     public async Task V3ParserAndPresentationMatchTheSharedCrossPlatformOracle(
@@ -59,10 +59,8 @@ public sealed class ModelUsageDisplayContractTests
             var result = await client.FetchCurrentAsync(CancellationToken.None);
 
             Assert.True(result.IsSuccess);
-            Assert.Equal(apiVersion, result.Snapshot!.ApiVersion);
-            Assert.Equal(
-                apiVersion == "v3" ? ["/v4/current", "/v3/current"] : ["/v4/current"],
-                handler.Paths);
+            Assert.Matches("^[0-9a-f]{64}$", result.Snapshot!.PublishedPair.ToString());
+            Assert.Equal(new[] { "/state?parts=main" }, handler.Gets);
             Assert.Equal(modelsStatus switch
             {
                 "complete" => ApiCurrentModelsStatus.Complete,
@@ -138,35 +136,12 @@ public sealed class ModelUsageDisplayContractTests
         }
     }
 
-    private sealed class CurrentFixtureHandler(byte[] body, string apiVersion) : HttpMessageHandler
+    private sealed class CurrentFixtureHandler : WireFacadeFixture
     {
-        private readonly byte[] body = body.ToArray();
-        public List<string> Paths { get; } = [];
-
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
+        public CurrentFixtureHandler(byte[] body, string apiVersion)
         {
-            Assert.Equal(HttpMethod.Get, request.Method);
-            var path = request.RequestUri!.AbsolutePath;
-            Paths.Add(path);
-            if (apiVersion == "v3" && path == "/v4/current")
-            {
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
-            }
-            Assert.Equal($"/{apiVersion}/current", path);
-            var response = new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new ByteArrayContent(body),
-            };
-            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json")
-            {
-                CharSet = "utf-8",
-            };
-            response.Content.Headers.ContentLength = body.LongLength;
-            response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
-            response.Headers.TryAddWithoutValidation(PublishedPairHeader, PublishedPair);
-            return Task.FromResult(response);
+            using var parsed = JsonDocument.Parse(body); var main = WirePresentationFixture.MainRecord(parsed.RootElement);
+            Rows = _ => [new(["main"], "main", main)];
         }
     }
 }

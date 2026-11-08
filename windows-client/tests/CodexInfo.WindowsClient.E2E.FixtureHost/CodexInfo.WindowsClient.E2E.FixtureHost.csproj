@@ -1,0 +1,16 @@
+<!-- Copyright (C) 2026 salty919 -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>CodexInfo.WindowsClient.E2E.FixtureHost</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/CodexInfo.WindowsClient.Core/CodexInfo.WindowsClient.Core.csproj" />
+    <RuntimeHostConfigurationOption Include="System.Net.SocketsHttpHandler.Http2FlowControl.DisableDynamicWindowSizing" Value="true" />
+  </ItemGroup>
+</Project>

@@ -12,27 +12,41 @@ use codex_info_db_reader::{
     CollectionCommit, CurrentPublication, DbReader, DbSnapshot, HistoryArchive, ReaderError,
 };
 use codex_info_rest_contract::{
-    PublicAccountV3, PublicAccountsV3, PublicDetails, PublicDetailsV2, PublicDetailsV3,
-    PublicRuntimeVersions, PublicState, PublishedPair, API_VERSION, API_VERSION_V2, API_VERSION_V3,
+    PublicAccountV3, PublicAccountsV3, PublicDetails, PublicRuntimeVersions, PublicState,
+    PublishedPair,
+};
+#[cfg(test)]
+use codex_info_rest_contract::{
+    PublicDetailsV2, PublicDetailsV3, API_VERSION, API_VERSION_V2, API_VERSION_V3,
 };
 use diagnostics::FailureLog;
 use history::{HistoryIndex, PeriodIndex};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+#[cfg(test)]
+use std::io::Read;
+use std::io::{self, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener};
+#[cfg(test)]
+use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod transport;
+
+#[cfg(test)]
 const MAX_REQUEST_LINE_BYTES: usize = 2_048;
 const MAX_HEADER_BYTES: usize = 8 * 1_024;
+#[cfg(test)]
 const MAX_HEADER_COUNT: usize = 32;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(test)]
 const MAX_HISTORY_PAGE: usize = 1_024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const READER_FRESHNESS: Duration = Duration::from_secs(60);
@@ -182,6 +196,7 @@ fn record_history_row_visit() {
 
 #[derive(Debug, Default)]
 struct DirectoryPages {
+    #[cfg(test)]
     sequences: Mutex<BTreeMap<(usize, usize), DirectorySequence>>,
 }
 
@@ -192,6 +207,7 @@ impl PartialEq for DirectoryPages {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct DirectorySequence {
     pages: BTreeMap<usize, Vec<u8>>,
@@ -206,6 +222,7 @@ pub struct PublishedSnapshot {
     pub history_available: bool,
     pub has_pending_ranges: bool,
     pub acquisition_degraded: bool,
+    pub thread_snapshot_known: bool,
     pub current: CurrentPublication,
     pub details: PublicDetails,
     pub models_v3: Vec<codex_info_rest_contract::PublicModelUsageV3>,
@@ -221,6 +238,7 @@ pub struct PublishedSnapshot {
 }
 
 impl PublishedSnapshot {
+    #[cfg(test)]
     fn response_pair(&self, read_failed: bool) -> Cow<'_, str> {
         if !read_failed {
             return Cow::Borrowed(&self.pair);
@@ -289,6 +307,7 @@ impl PublishedSnapshot {
             pair: String::new(),
             has_pending_ranges: snapshot.has_pending_ranges,
             acquisition_degraded: snapshot.acquisition_degraded,
+            thread_snapshot_known: snapshot.thread_snapshot_known,
             history_available: snapshot.history_available,
             current: snapshot.current,
             details: snapshot.details,
@@ -341,6 +360,7 @@ impl PublishedSnapshot {
             data_hash,
             has_pending_ranges: false,
             acquisition_degraded: false,
+            thread_snapshot_known: false,
             history_available: true,
             current: CurrentPublication::unavailable(details.state),
             details,
@@ -359,12 +379,40 @@ impl PublishedSnapshot {
 }
 
 fn exact_fact<T: serde::Serialize>(left: &T, right: &T) -> bool {
-    // Compare every typed field, including optional knownness and binary64
-    // signed zero, without reducing the evidence to a digest.
-    serde_json::to_vec(left)
-        .ok()
-        .zip(serde_json::to_vec(right).ok())
-        .is_some_and(|(left, right)| left == right)
+    // Preserve every typed field and signed-zero spelling. The right side
+    // compares against the first byte stream without allocating a second
+    // encoded copy; equality is not reduced to a hash.
+    let Ok(expected) = serde_json::to_vec(left) else {
+        return false;
+    };
+    struct Compare<'a> {
+        expected: &'a [u8],
+        position: usize,
+    }
+    impl Write for Compare<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self
+                .expected
+                .get(self.position..self.position.saturating_add(bytes.len()))
+                != Some(bytes)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "different qualified fact",
+                ));
+            }
+            self.position += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut compare = Compare {
+        expected: &expected,
+        position: 0,
+    };
+    serde_json::to_writer(&mut compare, right).is_ok() && compare.position == expected.len()
 }
 
 fn common_facts_equal<T: serde::Serialize>(
@@ -431,7 +479,8 @@ fn raw_member_has_token_usage(
 }
 
 fn same_public_domain(previous: &PublishedSnapshot, candidate: &PublishedSnapshot) -> bool {
-    if previous.history_available != candidate.history_available
+    if previous.thread_snapshot_known != candidate.thread_snapshot_known
+        || previous.history_available != candidate.history_available
         || previous.current.models_status != candidate.current.models_status
         || (if previous.acquisition_degraded {
             PublicState::Error
@@ -443,16 +492,18 @@ fn same_public_domain(previous: &PublishedSnapshot, candidate: &PublishedSnapsho
             candidate.current.state
         })
         || !exact_fact(
-            &details_v1(previous, previous.acquisition_degraded),
-            &details_v1(candidate, candidate.acquisition_degraded),
-        )
-        || !exact_fact(
-            &details_v2_for_wire(previous, previous.acquisition_degraded),
-            &details_v2_for_wire(candidate, candidate.acquisition_degraded),
-        )
-        || !exact_fact(
-            &details_v3(previous, previous.acquisition_degraded),
-            &details_v3(candidate, candidate.acquisition_degraded),
+            &(
+                &previous.details,
+                &previous.models_v3,
+                &previous.history_samples_v2,
+                &previous.history_samples_v3,
+            ),
+            &(
+                &candidate.details,
+                &candidate.models_v3,
+                &candidate.history_samples_v2,
+                &candidate.history_samples_v3,
+            ),
         )
     {
         return false;
@@ -760,7 +811,9 @@ struct StoreInner {
 
 #[derive(Clone, Copy)]
 struct HistoryFreshness {
+    #[cfg(test)]
     verified_at: i64,
+    #[cfg(test)]
     current: bool,
 }
 
@@ -1185,6 +1238,7 @@ impl AccountStore {
         } else {
             inner.current.as_ref()
         };
+        #[cfg(test)]
         let freshness = route
             .history_resource()
             .then(|| {
@@ -1192,7 +1246,9 @@ impl AccountStore {
                 let window = history.publication_window()?;
                 let current = inner.current.as_ref()?.reprojection_witness.as_ref()?;
                 Some(HistoryFreshness {
+                    #[cfg(test)]
                     verified_at: window.at,
+                    #[cfg(test)]
                     current: history.collection_commit() == current.collection_commit()
                         && current
                             .publication_window()
@@ -1200,6 +1256,8 @@ impl AccountStore {
                 })
             })
             .flatten();
+        #[cfg(not(test))]
+        let freshness = None;
         (
             frame.cloned(),
             inner.reader_unavailable && !inner.retained_read_failure,
@@ -1316,10 +1374,13 @@ pub struct SnapshotStore {
     reader_control: ReaderControl,
     boundary: RwLock<BoundaryPublication>,
     recorder_version_reader: RwLock<Option<RecorderVersionReader>>,
+    wire_signal: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    wire_prepared: tokio::sync::watch::Sender<u64>,
     publication_clock: PublicationClock,
     #[cfg(test)]
     history_candidate_ready: Option<Arc<dyn Fn() + Send + Sync>>,
-    diagnostics: FailureLog,
+    diagnostics: Arc<FailureLog>,
 }
 
 struct BoundaryPublication {
@@ -1437,10 +1498,13 @@ impl SnapshotStore {
                 accounts: public,
             }),
             recorder_version_reader: RwLock::new(None),
+            wire_signal: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            wire_prepared: tokio::sync::watch::channel(0).0,
             publication_clock: Arc::new(utc_unix_seconds),
             #[cfg(test)]
             history_candidate_ready: None,
-            diagnostics: FailureLog::default(),
+            diagnostics: Arc::new(FailureLog::default()),
         })
     }
 
@@ -1486,10 +1550,13 @@ impl SnapshotStore {
                 stores: BTreeMap::new(),
             }),
             recorder_version_reader: RwLock::new(None),
+            wire_signal: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            wire_prepared: tokio::sync::watch::channel(0).0,
             publication_clock: Arc::new(utc_unix_seconds),
             #[cfg(test)]
             history_candidate_ready: None,
-            diagnostics: FailureLog::default(),
+            diagnostics: Arc::new(FailureLog::default()),
         })
     }
 
@@ -1506,6 +1573,7 @@ impl SnapshotStore {
         default_account_id: impl Into<String>,
     ) -> Result<bool, RestServerError> {
         let default_account_id = default_account_id.into();
+        let _wire_wake = transport::Wake(self);
         accounts.sort_by(|left, right| {
             right
                 .is_current
@@ -1618,6 +1686,7 @@ impl SnapshotStore {
             .recorder_version_reader
             .write()
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(reader));
+        self.wire_signal.send_modify(|revision| *revision += 1);
     }
 
     fn runtime_versions(&self) -> PublicRuntimeVersions {
@@ -2020,6 +2089,7 @@ impl SnapshotStore {
         mut candidate: Result<(PublishedSnapshot, Option<CollectionCommit>), ReaderError>,
         lane: ReaderLane,
     ) {
+        let _wire_wake = transport::Wake(self);
         // Keep this guard through root exchange. Accepting a newer intent and
         // publishing its predecessor cannot cross each other at this boundary.
         let pending = self
@@ -2247,6 +2317,7 @@ impl SnapshotStore {
     }
 
     fn stop_reader(&self) {
+        let _wire_wake = transport::Wake(self);
         let mut pending = self
             .reader_control
             .pending
@@ -2261,6 +2332,7 @@ impl SnapshotStore {
     }
 
     pub fn publish_account_boundary(&self, state: PublicState) {
+        let _wire_wake = transport::Wake(self);
         debug_assert!(state != PublicState::Ready);
         let mut pending = self
             .reader_control
@@ -2313,6 +2385,7 @@ impl SnapshotStore {
     }
 
     pub fn clear_account_boundary(&self) {
+        let _wire_wake = transport::Wake(self);
         let mut issuer = self.issuer.lock().unwrap_or_else(|p| p.into_inner());
         let mut global = self.boundary.write().unwrap_or_else(|p| p.into_inner());
         if global.snapshot.is_none() {
@@ -2399,7 +2472,7 @@ impl RestServer {
         let worker_store = Arc::clone(&store);
         let worker = thread::Builder::new()
             .name("codex-info-rest".to_owned())
-            .spawn(move || serve(listener, worker_store, worker_stop))
+            .spawn(move || transport::serve(listener, worker_store, worker_stop))
             .map_err(RestServerError::Listener)?;
         let reader_worker = match start_reader_worker(Arc::clone(&store)) {
             Ok(reader_worker) => reader_worker,
@@ -2463,6 +2536,7 @@ impl Drop for RestServer {
     }
 }
 
+#[cfg(test)]
 fn serve(listener: TcpListener, store: Arc<SnapshotStore>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Acquire) && !store.publication_failed() {
         match listener.accept() {
@@ -2685,41 +2759,64 @@ fn run_reader_worker(store: &SnapshotStore) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Route {
+    #[cfg(test)]
     Health,
+    #[cfg(test)]
     Runtime,
+    #[cfg(test)]
     Details,
+    #[cfg(test)]
     DetailsV2,
+    #[cfg(test)]
     DetailsV3,
+    #[cfg(test)]
     AccountsV3,
+    #[cfg(test)]
     CurrentV3,
     CurrentV4,
+    #[cfg(test)]
     HistoryPeriodsV3,
+    #[cfg(test)]
     SelectableHistoryPeriodsV3,
+    #[cfg(test)]
     HistoryPeriodsV4,
+    #[cfg(test)]
     SelectableHistoryPeriodsV4,
+    #[cfg(test)]
     HistoryPeriodsV5,
+    #[cfg(test)]
     SelectableHistoryPeriodsV5,
     HistoryV3,
+    #[cfg(test)]
     ThreadsV3,
 }
 
 impl Route {
-    fn history_resource(self) -> bool {
+    #[cfg(test)]
+    fn directory_v5(self) -> bool {
         matches!(
             self,
-            Self::Details
-                | Self::DetailsV2
-                | Self::DetailsV3
-                | Self::HistoryPeriodsV3
-                | Self::SelectableHistoryPeriodsV3
-                | Self::HistoryPeriodsV4
-                | Self::SelectableHistoryPeriodsV4
-                | Self::HistoryPeriodsV5
-                | Self::SelectableHistoryPeriodsV5
-                | Self::HistoryV3
+            Self::HistoryPeriodsV5 | Self::SelectableHistoryPeriodsV5
         )
     }
+    fn history_resource(self) -> bool {
+        match self {
+            Self::HistoryV3 => true,
+            #[cfg(test)]
+            Self::Details
+            | Self::DetailsV2
+            | Self::DetailsV3
+            | Self::HistoryPeriodsV3
+            | Self::SelectableHistoryPeriodsV3
+            | Self::HistoryPeriodsV4
+            | Self::SelectableHistoryPeriodsV4
+            | Self::HistoryPeriodsV5
+            | Self::SelectableHistoryPeriodsV5 => true,
+            _ => false,
+        }
+    }
 
+    #[cfg(test)]
     fn label(self) -> &'static str {
         match self {
             Self::Health => "/v1/health",
@@ -2740,6 +2837,7 @@ impl Route {
             Self::ThreadsV3 => "/v3/threads",
         }
     }
+    #[cfg(test)]
     fn v3(self) -> bool {
         matches!(
             self,
@@ -2757,15 +2855,9 @@ impl Route {
                 | Self::ThreadsV3
         )
     }
-
-    fn directory_v5(self) -> bool {
-        matches!(
-            self,
-            Self::HistoryPeriodsV5 | Self::SelectableHistoryPeriodsV5
-        )
-    }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct Request {
     method: String,
@@ -2778,6 +2870,7 @@ struct Request {
     local_usage: bool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParseError {
     BadRequest,
@@ -2785,6 +2878,7 @@ enum ParseError {
     BodyNotAllowed,
 }
 
+#[cfg(test)]
 fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
     let mut route_label = "unparsed";
     let request = match read_request(stream) {
@@ -3059,6 +3153,7 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
     }
 }
 
+#[cfg(test)]
 fn write_route_error(stream: &mut TcpStream, log: &FailureLog, route: &str, error: RouteError) {
     match error {
         RouteError::StaleCursor => write_json_response(
@@ -3109,6 +3204,7 @@ fn write_route_error(stream: &mut TcpStream, log: &FailureLog, route: &str, erro
     }
 }
 
+#[cfg(test)]
 fn read_request(stream: &mut TcpStream) -> Result<Request, ParseError> {
     let started = Instant::now();
     let mut data = Vec::with_capacity(4 * 1_024);
@@ -3216,6 +3312,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ParseError> {
     })
 }
 
+#[cfg(test)]
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -3223,6 +3320,7 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+#[cfg(test)]
 fn parse_etag(value: &str) -> Result<String, ParseError> {
     let value = value.trim();
     if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
@@ -3239,6 +3337,7 @@ fn parse_etag(value: &str) -> Result<String, ParseError> {
     Ok(pair.to_owned())
 }
 
+#[cfg(test)]
 type ParsedTarget = (
     Option<Route>,
     Option<String>,
@@ -3246,6 +3345,7 @@ type ParsedTarget = (
     Option<String>,
 );
 
+#[cfg(test)]
 fn valid_account_selector(value: &str) -> bool {
     let Some(epoch) = value.strip_prefix("account-") else {
         return false;
@@ -3256,6 +3356,7 @@ fn valid_account_selector(value: &str) -> bool {
     epoch > 0 && value == format!("account-{epoch}")
 }
 
+#[cfg(test)]
 fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
     if target.is_empty() || target.contains('#') || !target.starts_with('/') {
         return Err(ParseError::BadRequest);
@@ -3364,13 +3465,17 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteError {
+    #[cfg(test)]
     Serialization,
+    #[cfg(test)]
     HistoryUnavailable,
     UnknownPeriod,
     StaleCursor,
+    #[cfg(test)]
     ResourceTooLarge,
 }
 
+#[cfg(test)]
 fn serialize_route(
     snapshot: &PublishedSnapshot,
     route: Route,
@@ -3381,6 +3486,7 @@ fn serialize_route(
     serialize_route_with_budget(snapshot, route, period, cursor, degraded, MAX_BODY_BYTES)
 }
 
+#[cfg(test)]
 fn serialize_route_with_budget(
     snapshot: &PublishedSnapshot,
     route: Route,
@@ -3532,6 +3638,7 @@ fn serialize_route_with_budget(
     }
 }
 
+#[cfg(test)]
 fn validate_compatibility_history_capacity(snapshot: &PublishedSnapshot) -> Result<(), RouteError> {
     let limit = codex_info_rest_contract::MAX_PUBLIC_HISTORY_SAMPLES;
     if snapshot.details.history_samples.len() > limit
@@ -3573,6 +3680,7 @@ fn directory_indices(archive: &HistoryArchive, history: &HistoryIndex) -> [Vec<u
     [all, selectable]
 }
 
+#[cfg(test)]
 fn directory_kind(route: Route) -> (usize, char) {
     match route {
         Route::HistoryPeriodsV5 => (0, 'a'),
@@ -3581,11 +3689,13 @@ fn directory_kind(route: Route) -> (usize, char) {
     }
 }
 
+#[cfg(test)]
 fn directory_cursor(snapshot: &PublishedSnapshot, route: Route, offset: usize) -> String {
     let (_, kind) = directory_kind(route);
     format!("d1.{}.{kind}.{offset}", &snapshot.pair[3..])
 }
 
+#[cfg(test)]
 fn directory_start(
     snapshot: &PublishedSnapshot,
     route: Route,
@@ -3614,6 +3724,7 @@ fn directory_start(
     Ok(offset)
 }
 
+#[cfg(test)]
 #[derive(serde::Serialize)]
 struct DirectoryPeriodV5<'a> {
     id: &'a str,
@@ -3625,6 +3736,7 @@ struct DirectoryPeriodV5<'a> {
     origin_at: Option<i64>,
 }
 
+#[cfg(test)]
 fn serialize_directory(
     snapshot: &PublishedSnapshot,
     route: Route,
@@ -3704,6 +3816,7 @@ fn serialize_directory(
     Ok(body)
 }
 
+#[cfg(test)]
 fn details_v3(snapshot: &PublishedSnapshot, degraded: bool) -> PublicDetailsV3 {
     let details_v2 = details_v2(snapshot);
     let mut details = PublicDetailsV3::from_v2_with_models_and_history(
@@ -3720,6 +3833,7 @@ fn details_v3(snapshot: &PublishedSnapshot, degraded: bool) -> PublicDetailsV3 {
     details
 }
 
+#[cfg(test)]
 fn details_v1(snapshot: &PublishedSnapshot, degraded: bool) -> PublicDetails {
     let mut details = snapshot.details.clone();
     details.threads = legacy_running_rows(&details.threads);
@@ -3730,12 +3844,14 @@ fn details_v1(snapshot: &PublishedSnapshot, degraded: bool) -> PublicDetails {
     details
 }
 
+#[cfg(test)]
 fn details_v2(snapshot: &PublishedSnapshot) -> PublicDetailsV2 {
     let mut details = PublicDetailsV2::from(&snapshot.details);
     details.history_samples = snapshot.history_samples_v2.clone();
     details
 }
 
+#[cfg(test)]
 fn details_v2_for_wire(snapshot: &PublishedSnapshot, degraded: bool) -> PublicDetailsV2 {
     let mut details = details_v2(snapshot);
     details.threads = legacy_running_rows(&details.threads);
@@ -3746,6 +3862,7 @@ fn details_v2_for_wire(snapshot: &PublishedSnapshot, degraded: bool) -> PublicDe
     details
 }
 
+#[cfg(test)]
 fn legacy_running_rows(
     threads: &[codex_info_rest_contract::PublicThread],
 ) -> Vec<codex_info_rest_contract::PublicThread> {
@@ -3765,6 +3882,7 @@ fn legacy_running_rows(
         .collect()
 }
 
+#[cfg(test)]
 fn flatten_with_version<T: serde::Serialize>(
     version: &str,
     value: &T,
@@ -3821,6 +3939,7 @@ fn history_selection<'a>(
     Ok((archive, indexed, start))
 }
 
+#[cfg(test)]
 fn serialize_history(
     snapshot: &PublishedSnapshot,
     period: Option<&str>,
@@ -3829,6 +3948,7 @@ fn serialize_history(
     serialize_json(&history_document(snapshot, period, cursor)?)
 }
 
+#[cfg(test)]
 fn history_document(
     snapshot: &PublishedSnapshot,
     period: Option<&str>,
@@ -3877,6 +3997,7 @@ fn history_document(
     }))
 }
 
+#[cfg(test)]
 fn serialize_history_extended(
     snapshot: &PublishedSnapshot,
     period: Option<&str>,
@@ -3922,10 +4043,12 @@ fn serialize_history_extended(
     serialize_json(&document)
 }
 
+#[cfg(test)]
 fn serialize_json(value: &Value) -> Result<Vec<u8>, RouteError> {
     serde_json::to_vec(value).map_err(|_| RouteError::Serialization)
 }
 
+#[cfg(test)]
 fn health_body() -> Vec<u8> {
     serde_json::to_vec(&json!({
         "api_version": API_VERSION,
@@ -3941,11 +4064,13 @@ fn health_body() -> Vec<u8> {
     .expect("fixed health body")
 }
 
+#[cfg(test)]
 fn error_body(error: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({"api_version": API_VERSION, "error": error}))
         .expect("fixed error body")
 }
 
+#[cfg(test)]
 fn write_json_response(
     stream: &mut TcpStream,
     log: &FailureLog,
@@ -3958,6 +4083,7 @@ fn write_json_response(
     write_json_response_with_history(stream, log, route, status, body, (pair, None), not_modified);
 }
 
+#[cfg(test)]
 fn write_json_response_with_history(
     stream: &mut TcpStream,
     log: &FailureLog,
@@ -4057,6 +4183,9 @@ pub fn loopback_addr(port: &str) -> Result<SocketAddr, RestServerError> {
 }
 
 #[cfg(test)]
+mod transport_tests;
+
+#[cfg(test)]
 mod tests {
     include!("report_group_alias_tests.rs");
     use super::*;
@@ -4064,6 +4193,205 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn unversioned_http2_state_bootstraps_only_requested_main() {
+        let mut server = RestServer::start_without_account(
+            PublicState::Initializing,
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let address = server.local_addr();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            let (mut client, connection) = h2::client::handshake(socket).await.unwrap();
+            let connection = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let empty = codex_info_rest_contract::wire::manifest_root(&[])
+                .unwrap()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let request = http::Request::builder()
+                .uri(format!("http://{address}/state?parts=main"))
+                .header("codex-info-cache-root", empty)
+                .header("codex-info-budget-ms", "3000")
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(3), response)
+                .await
+                .expect("the public call must finish within its common deadline")
+                .expect("the UI requires a real HTTP/2 response");
+            assert_eq!(response.status(), 200);
+            assert!(
+                response.headers().get("codex-info-consumer").is_some(),
+                "fresh-profile bootstrap must issue its receiver identity"
+            );
+            let mut body = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(data) = body.data().await {
+                let data = data.unwrap();
+                bytes.extend_from_slice(&data);
+                body.flow_control().release_capacity(data.len()).unwrap();
+            }
+            let page: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(page["result"], "data");
+            assert!(page.get("api_version").is_none());
+            let definitions = page["definitions"].as_array().unwrap();
+            assert!(definitions
+                .iter()
+                .any(|definition| definition["kind"] == "main"));
+            assert!(
+                !definitions.iter().any(|definition| matches!(
+                    definition["kind"].as_str(),
+                    Some("runtime" | "account_choices" | "account_context")
+                )),
+                "Main must not fetch Settings or account-list payloads"
+            );
+            connection.abort();
+        });
+        server.shutdown();
+    }
+
+    #[test]
+    fn unversioned_http2_retires_old_urls_and_keeps_runtime_separate() {
+        let mut server = RestServer::start_without_account(
+            PublicState::Initializing,
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let address = server.local_addr();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            let (mut client, connection) = h2::client::handshake(socket).await.unwrap();
+            let connection = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            for path in [
+                "/health",
+                "/v1/health",
+                "/v1/runtime",
+                "/v1/details",
+                "/v2/details",
+                "/v3/details",
+                "/v3/accounts",
+                "/v3/current",
+                "/v4/current",
+                "/v3/history/periods",
+                "/v3/history/periods/selectable",
+                "/v4/history/periods",
+                "/v4/history/periods/selectable",
+                "/v5/history/periods",
+                "/v5/history/periods/selectable",
+                "/v3/history",
+                "/v3/threads",
+            ] {
+                let request = http::Request::builder()
+                    .uri(format!("http://{address}{path}"))
+                    .body(())
+                    .unwrap();
+                let (response, _) = client.send_request(request, true).unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(3), response)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), 404, "retired URL {path}");
+            }
+            let empty = codex_info_rest_contract::wire::manifest_root(&[])
+                .unwrap()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let request = http::Request::builder()
+                .uri(format!("http://{address}/state?parts=runtime"))
+                .header("codex-info-cache-root", empty)
+                .header("codex-info-budget-ms", "3000")
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(3), response)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let mut body = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(data) = body.data().await {
+                let data = data.unwrap();
+                bytes.extend_from_slice(&data);
+                body.flow_control().release_capacity(data.len()).unwrap();
+            }
+            let page: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(page["result"], "data");
+            let definitions = page["definitions"].as_array().unwrap();
+            assert!(definitions
+                .iter()
+                .any(|definition| definition["kind"] == "runtime"));
+            assert!(!definitions.iter().any(|definition| matches!(
+                definition["kind"].as_str(),
+                Some("main" | "account_choices" | "account_context")
+            )));
+            assert!(!String::from_utf8(bytes).unwrap().contains("api_version"));
+            connection.abort();
+        });
+        server.shutdown();
+    }
+
+    #[test]
+    fn unversioned_ui_routes_are_registered_and_legacy_routes_removed() {
+        // This route set comes from the 2026-11-07 user-approved UI contract.
+        // It intentionally does not infer required resources from Route.
+        for target in [
+            "/state?parts=main",
+            "/history/periods?account=account-7&purpose=selectable",
+            "/history?account=account-7&period=1802678400",
+            "/threads?account=account-7",
+            "/subscription",
+        ] {
+            let route = codex_info_rest_contract::wire::request::Target::parse(target)
+                .expect("valid UI resource target");
+            assert!(
+                route.is_some(),
+                "required UI resource is unavailable: {target}"
+            );
+        }
+        for target in [
+            "/health",
+            "/v1/health",
+            "/v1/runtime",
+            "/v1/details",
+            "/v2/details",
+            "/v3/details",
+            "/v3/accounts",
+            "/v3/current",
+            "/v4/current",
+            "/v3/history/periods",
+            "/v3/history/periods/selectable",
+            "/v4/history/periods",
+            "/v4/history/periods/selectable",
+            "/v5/history/periods",
+            "/v5/history/periods/selectable",
+            "/v3/history",
+            "/v3/threads",
+        ] {
+            let route = codex_info_rest_contract::wire::request::Target::parse(target)
+                .expect("old path is not an input error");
+            assert!(
+                route.is_none(),
+                "retired API resource remains exposed: {target}"
+            );
+        }
+    }
 
     #[test]
     fn issue604_unapproved_recorded_routes_are_not_exposed() {
@@ -4188,6 +4516,7 @@ mod tests {
                 data_hash: "a".repeat(64),
                 has_pending_ranges: false,
                 acquisition_degraded: false,
+                thread_snapshot_known: true,
                 history_available: true,
                 current: CurrentPublication::unavailable(PublicState::Ready),
                 retained_history: HistoryArchive {
@@ -4356,7 +4685,7 @@ mod tests {
 
     #[test]
     fn issue_481_runtime_versions_are_available_without_an_account() {
-        let server = RestServer::start_without_account(
+        let server = legacy_fixture_without_account(
             PublicState::AuthRequired,
             "127.0.0.1:0".parse().unwrap(),
         )
@@ -4410,6 +4739,7 @@ mod tests {
             pair: "pair".to_owned(),
             has_pending_ranges: false,
             acquisition_degraded: false,
+            thread_snapshot_known: true,
             history_available: true,
             current: CurrentPublication::unavailable(details.state),
             details,
@@ -4479,6 +4809,7 @@ mod tests {
             pair: "pair".to_owned(),
             has_pending_ranges: false,
             acquisition_degraded: false,
+            thread_snapshot_known: true,
             history_available: true,
             current: CurrentPublication::unavailable(details.state),
             details,
@@ -4519,12 +4850,12 @@ mod tests {
 
     #[test]
     fn issue604_standalone_listener_uses_a_new_epoch_for_each_publisher() {
-        let first = RestServer::start_without_account(
+        let first = legacy_fixture_without_account(
             PublicState::Initializing,
             "127.0.0.1:0".parse().unwrap(),
         )
         .unwrap();
-        let second = RestServer::start_without_account(
+        let second = legacy_fixture_without_account(
             PublicState::Initializing,
             "127.0.0.1:0".parse().unwrap(),
         )
@@ -5569,7 +5900,7 @@ mod tests {
         )
         .unwrap();
         store.publication_clock = Arc::new(move || Some(at));
-        let server = RestServer::start_with_store(store, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server = legacy_fixture_with_store(store, "127.0.0.1:0".parse().unwrap()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while server.store.snapshot_account("account-1").is_none() {
             assert!(Instant::now() < deadline, "fixture account did not publish");
@@ -6278,8 +6609,7 @@ mod tests {
                 let _ = release_rx.lock().unwrap().recv();
             }
         }));
-        let mut server =
-            RestServer::start_with_store(store, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut server = legacy_fixture_with_store(store, "127.0.0.1:0".parse().unwrap()).unwrap();
         let store = server.store();
         let wait_frame = |generation: u64, history: bool| {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -6877,6 +7207,51 @@ mod tests {
         }
     }
 
+    // Archived H1 shape/ETag assertions remain data-preservation oracles.
+    // They never start the product listener. Public versionless transport,
+    // cursor/receipt behavior and deadline/capacity use the actual H2 tests.
+    fn legacy_fixture_server(
+        reader: DbReader,
+        address: SocketAddr,
+    ) -> Result<RestServer, RestServerError> {
+        legacy_fixture_with_store(
+            SnapshotStore::new_with_accounts(
+                vec![AccountReader::new("account-1", 1, true, None, None, reader)],
+                "account-1",
+            )?,
+            address,
+        )
+    }
+    fn legacy_fixture_without_account(
+        state: PublicState,
+        address: SocketAddr,
+    ) -> Result<RestServer, RestServerError> {
+        legacy_fixture_with_store(SnapshotStore::try_new_without_account(state)?, address)
+    }
+    fn legacy_fixture_with_store(
+        store: SnapshotStore,
+        address: SocketAddr,
+    ) -> Result<RestServer, RestServerError> {
+        let listener = TcpListener::bind(address).map_err(RestServerError::Bind)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(RestServerError::Listener)?;
+        let local_addr = listener.local_addr().map_err(RestServerError::Listener)?;
+        let store = Arc::new(store);
+        let stop = Arc::new(AtomicBool::new(false));
+        let captured = Arc::clone(&store);
+        let stopped = Arc::clone(&stop);
+        let worker = thread::spawn(move || serve(listener, captured, stopped));
+        let reader_worker = start_reader_worker(Arc::clone(&store))?;
+        Ok(RestServer {
+            local_addr,
+            stop,
+            worker: Some(worker),
+            reader_worker: Some(reader_worker),
+            store,
+        })
+    }
+
     fn request(address: SocketAddr, request: &str) -> String {
         let mut stream = TcpStream::connect(address).expect("connect");
         // Existing HTTP fixtures use x as an authority placeholder. Bind it
@@ -6958,6 +7333,7 @@ mod tests {
                 data_hash: format!("{generation:064x}"),
                 has_pending_ranges: false,
                 acquisition_degraded: false,
+                thread_snapshot_known: true,
                 history_available: true,
                 current: CurrentPublication::unavailable(details.state),
                 retained_history: HistoryArchive {
@@ -7086,6 +7462,7 @@ mod tests {
             data_hash: format!("{generation:064x}"),
             has_pending_ranges: snapshot.has_pending_ranges,
             acquisition_degraded: snapshot.acquisition_degraded,
+            thread_snapshot_known: snapshot.thread_snapshot_known,
             history_available: snapshot.history_available,
             current: snapshot.current,
             details: snapshot.details,
@@ -7622,6 +7999,7 @@ mod tests {
                 data_hash: format!("{:064x}", 1),
                 has_pending_ranges: false,
                 acquisition_degraded: false,
+                thread_snapshot_known: true,
                 history_available: true,
                 current: CurrentPublication::unavailable(details.state),
                 retained_history: HistoryArchive {
@@ -8486,7 +8864,7 @@ mod tests {
             .execute_batch("DELETE FROM usage_history; DELETE FROM durable_state;")
             .unwrap();
         let reader = DbReader::open(&path).unwrap();
-        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut server = legacy_fixture_server(reader, "127.0.0.1:0".parse().unwrap()).unwrap();
         for state in ["initializing", "auth_required"] {
             if state == "auth_required" {
                 server
@@ -9871,7 +10249,7 @@ mod tests {
                     "fixture account {id} must publish before HTTP assertions"
                 );
             }
-            RestServer::start_with_store(store, "127.0.0.1:0".parse().unwrap())
+            legacy_fixture_with_store(store, "127.0.0.1:0".parse().unwrap())
                 .expect("published multi-account fixture server")
         }
 
@@ -10062,7 +10440,7 @@ mod tests {
         )
         .expect("account fixture store");
         store.publication_clock = Arc::new(|| Some(1_800_000_120));
-        let mut server = RestServer::start_with_store(store, "127.0.0.1:0".parse().unwrap())
+        let mut server = legacy_fixture_with_store(store, "127.0.0.1:0".parse().unwrap())
             .expect("account server");
 
         let deadline = Instant::now() + Duration::from_secs(5);

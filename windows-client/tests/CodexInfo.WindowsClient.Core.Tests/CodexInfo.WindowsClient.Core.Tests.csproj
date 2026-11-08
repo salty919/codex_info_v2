@@ -18,6 +18,11 @@
     </PackageReference>
   </ItemGroup>
   <ItemGroup>
+    <None Include="../../../crates/codex-info-rest-contract/tests/fixtures/receiver_interop.json" Link="receiver_interop.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../crates/codex-info-rest-contract/tests/fixtures/wire_vectors.json" Link="wire_vectors.json" CopyToOutputDirectory="PreserveNewest" />
     <ProjectReference Include="../../src/CodexInfo.WindowsClient.Core/CodexInfo.WindowsClient.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.Net.SocketsHttpHandler.Http2FlowControl.DisableDynamicWindowSizing" Value="true" />
   </ItemGroup>
 </Project>

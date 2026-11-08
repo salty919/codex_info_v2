@@ -99,7 +99,7 @@ public static class PreviewEnvironment
 public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
 {
     private const string PreviewPublishedPairValue =
-        "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
+        "00112233445566778899aabbccddeeff00000000000000000000000000000001";
     private static readonly PublishedPairIdentity PreviewPublishedPair =
         PublishedPairIdentity.Create(PreviewPublishedPairValue);
     private readonly ApiDetailsSnapshot details;

@@ -38,7 +38,11 @@ hex = "0.4"
 # HTTPの解析・接続処理は実績のある実装へ委譲する。APIはloopback限定の
 # 読み取り専用スナップショットであり、UIやCodex RPCをHTTP workerから触らない。
 axum = "0.8.4"
-tokio = { version = "1", features = ["net", "rt", "signal", "sync", "time"] }
+h2 = "0.4.18"
+http = "1"
+bytes = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["net", "rt", "signal", "sync", "time", "macros", "io-util"] }
 # X11を明示し、WSLgでWayland/EGL経路を選ばない。ソフトウェア描画はrun.shの
 # llvmpipe設定とも整合し、GPUドライバがなくても起動できる。
 slint = { version = "1.17.1", default-features = false, features = ["std", "compat-1-2", "backend-winit-x11", "renderer-software", "raw-window-handle-06", "unstable-winit-030"] }
@@ -59,3 +63,7 @@ slint-build = "1.17.1"
 [[test]]
 name = "security"
 path = "src/security.rs"
+
+[[example]]
+name = "wire_api_probe"
+path = "tests/fixtures/wire_api_probe.rs"
